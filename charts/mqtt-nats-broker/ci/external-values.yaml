@@ -1,0 +1,4 @@
+# The external topology against a NATS the operator runs.
+topology: external
+broker:
+  natsURLs: nats://nats:4222

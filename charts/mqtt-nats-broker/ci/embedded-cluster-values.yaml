@@ -1,0 +1,5 @@
+# The embedded-NATS image, three peers of one JetStream cluster.
+topology: embedded
+embedded:
+  cluster:
+    enabled: true

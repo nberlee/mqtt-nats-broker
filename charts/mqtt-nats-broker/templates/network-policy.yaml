@@ -1,0 +1,4 @@
+{{- include "mqtt-nats-broker.defaultValues" . }}
+{{- if and (include "mqtt-nats-broker.clustered" $) .Values.networkPolicy.enabled }}
+{{- include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "network-policy.yaml" "ctx" $) .Values.networkPolicy) }}
+{{- end }}

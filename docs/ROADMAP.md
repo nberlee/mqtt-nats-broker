@@ -9728,51 +9728,65 @@ reads](findings/resolved.md#f-054).
 
 ### Helm chart
 
-- [ ] Add a production Helm chart for the broker.
+- [x] Add a production Helm chart for the broker. **Done 2026-10-25**
+  (`docs/ARCHITECTURE.md` "The Helm chart"): `charts/mqtt-nats-broker`, unpublished, the
+  image tags placeholders like the example's. At the user's request (2026-10-25) it is
+  customizable the way the official NATS chart is, with that chart's helpers (copied,
+  Apache-2.0, names prefixed): `merge` and `patch` on every rendered object, `$tplYaml`
+  in values, and `extraResources`, so any pod-spec field, volume, init container or
+  sidecar can be added from `values.yaml`. Also by the user's decision (2026-10-25), a
+  bare install is one embedded broker with its own JetStream (`topology: embedded`).
 
-- [ ] Include Deployment, Service, TLS mounts, probes, resources, security
-  context, autoscaling options, PodDisruptionBudget, and graceful termination.
+- [x] Include Deployment, Service, TLS mounts, probes, resources, security
+  context, autoscaling options, PodDisruptionBudget, and graceful termination. **Done
+  2026-10-25**: the example's Restricted pod, probes and grace (75 s embedded), TLS from a
+  directory-mounted `kubernetes.io/tls` Secret with optional client CA and plaintext
+  beside it, WebSocket, a PodDisruptionBudget of one, an optional HorizontalPodAutoscaler
+  (external topology only), and Service links off.
 
-- [ ] Support an external NATS/JetStream cluster.
+- [x] Support an external NATS/JetStream cluster. **Done 2026-10-25**: `topology:
+  external` with `broker.natsURLs`.
 
-- [ ] Add the official NATS chart as an optional dependency.
+- [x] Add the official NATS chart as an optional dependency. **Done 2026-10-25**: `nats`
+  2.15.1, the server version the broker is built against, `condition: nats.enabled`,
+  `Chart.lock` committed. Its defaults make a default install safe for the broker:
+  JetStream with `default_max_consumers: -1`, the broker's account with the deny ACL for
+  anonymous MQTT clients, the credentials from the broker's Secret, NATS Box off, and
+  Restricted Pod Security on its pod. A clustered dependency is refused without
+  authenticated routes (holistic review H1: the shipped cluster variants first rendered an
+  open route port); the shipped cluster values take the route credentials from a Secret
+  through kubelet expansion. The broker's URL follows the dependency's rendered Service
+  name, namespace and port.
 
-- [ ] Expose the dependency configuration under `nats:` so users can place
-  normal NATS chart values there without translating every field.
+- [x] Expose the dependency configuration under `nats:` so users can place
+  normal NATS chart values there without translating every field. **Done 2026-10-25**.
 
-- [ ] Offer the broker as an extra container in the official NATS chart's pods.
-  The user asked (2026-10-25, with the plaintext-beside-TLS item) for a Kubernetes example
-  "maybe with NATS embedded"; that example is topology 1 below and lands here, not in
-  `docs/deploy/kubernetes`, whose README points to this bullet.
-  Filed 2026-10-24 by the user's decision on deployment topologies (section 4, the
-  embedded-NATS bullet): this is topology 3. It uses the external-NATS image, added
-  through the NATS chart's own `values.yaml`, and connects to `localhost:4222`. Offer
-  it, and the separate Deployment (topology 2), each with a single NATS server and
-  with a JetStream cluster. **Shutdown ordering is the design point.** Kubernetes gives
-  ordinary containers no termination order, but the broker needs NATS through the
-  MQTT drain and through the backend close that follows it: `main.go` runs
-  `BeginShutdown` to completion, then the deferred `be.Close()` drains and flushes
-  the service connection. So NATS must outlive the broker process. Native sidecar
-  ordering does this only with NATS as the sidecar, since sidecars stop after the main
-  containers; making the broker the sidecar reverses the dependency. Otherwise use a
-  preStop hook on the NATS container that waits for the broker to exit.
-  Topology 1 (the embedded image, section 4) needs, single or clustered:
-  - a StatefulSet with `podManagementPolicy: Parallel`;
-  - a headless Service with `publishNotReadyAddresses: true`, so route names resolve
-    before any pod is ready;
-  - a PVC per pod with `fsGroup: 65532`;
-  - a PodDisruptionBudget allowing one disruption;
-  - a startupProbe bounding the JetStream wait, during which HTTP is not served;
-  - `server_name` from the pod name;
-  - the four credential variables and the route credentials
-    (`MQTTNB_EMBEDDED_ROUTE_USER/PASS`, `MQTTNB_EMBEDDED_ROUTES`) from Secrets;
-  - a NetworkPolicy limiting the route port to the broker pods, and route TLS on an
-    untrusted network.
+- [x] Offer the broker as an extra container in the official NATS chart's pods. **Done
+  2026-10-25** as values for that chart, `docs/deploy/nats-chart-shared-pod` (one server,
+  and a three-server cluster on top), and the three topologies are each single-server
+  and clustered. The shutdown design point is resolved by replacing the NATS
+  container's preStop hook: in the pod's shared PID namespace it waits for the broker
+  process to exit, then enters lame duck; the grace is 120 s. Topology 1, the embedded
+  example the user asked for with the plaintext-beside-TLS item, is `topology: embedded`:
+  a Parallel StatefulSet, a headless Service publishing not-ready addresses, a claim per
+  pod with `fsGroup: 65532`, a PodDisruptionBudget of one, a startupProbe of ten
+  minutes, the four credential variables and the route credentials from Secrets (the
+  route URLs expanded by the kubelet, so the password is never in the manifest), and a
+  NetworkPolicy limiting the route port to the broker's pods. `server_name` is the pod
+  name in the clustered form; one server runs the image's baked configuration, which has
+  none and needs none. Route TLS on an untrusted network is the operator's: a
+  `configMap.merge` of `data.nats.conf` replaces the configuration. Shared-pod startup
+  is unordered, a stated residual in `docs/CONFORMANCE.md`.
 
-  See `docs/ARCHITECTURE.md` "Embedded NATS".
-
-- [ ] Add Helm lint, template, install, upgrade, rollback, and optional-NATS
-  tests to CI.
+- [x] Add Helm lint, template, install, upgrade, rollback, and optional-NATS
+  tests to CI. **Done 2026-10-25**: `make helm-check` (CI `helm-chart`: lint and render
+  every shipped variant and the shared-pod values with helm v4.3.1, judged against the
+  binary by `cmd/mqtt-nats-broker/helm_chart_test.go`) and `make helm-smoke` (CI
+  `helm-install`, amd64 and arm64: a kind cluster under Restricted Pod Security, every
+  topology, upgrade and rollback judged by the release history and live pod specs, the
+  dependency's reload, and the shared pod's shutdown order). The kind install shows
+  Restricted admission for the chart's pod, which carries the example deployment's
+  settings; the example itself is not installed.
 
 - [ ] Package and publish the chart as an OCI artifact in GitHub Container
   Registry only as part of an alpha release.

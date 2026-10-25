@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.statefulSet.name }}
+  labels:
+    {{- include "mqtt-nats-broker.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      {{- include "mqtt-nats-broker.selectorLabels" $ | nindent 6 }}
+  serviceName: {{ .Values.headlessService.name }}
+  # Every peer is part of the quorum the others wait for, so none may wait for another to
+  # become ready first.
+  podManagementPolicy: Parallel
+  template:
+    {{- with .Values.podTemplate }}
+    {{- include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "pod-template.yaml" "ctx" $) .) | nindent 4 }}
+    {{- end }}
+  volumeClaimTemplates:
+  {{- with .Values.embedded.storage }}
+  - {{ include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "data-pvc.yaml" "ctx" $) .) | nindent 4 }}
+  {{- end }}

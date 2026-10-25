@@ -1,0 +1,58 @@
+{{- $embedded := include "mqtt-nats-broker.embedded" $ }}
+{{- $clustered := include "mqtt-nats-broker.clustered" $ }}
+metadata:
+  labels:
+    {{- include "mqtt-nats-broker.labels" $ | nindent 4 }}
+  {{- if $clustered }}
+  annotations:
+    # Roll the pods when the nats-server configuration changes: there is no reload.
+    checksum/config: {{ include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "config-map.yaml" "ctx" $) $.Values.configMap) | sha256sum }}
+  {{- end }}
+spec:
+  containers:
+  {{- with .Values.container }}
+  - {{ include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "broker-container.yaml" "ctx" $) .) | nindent 4 }}
+  {{- end }}
+  # The broker needs no Kubernetes API credentials.
+  automountServiceAccountToken: false
+  # Service links would inject <SERVICE>_PORT-style variables, and a Service whose name
+  # maps onto an MQTTNB_ setting (one named mqttnb sets MQTTNB_PORT) would configure the
+  # broker.
+  enableServiceLinks: false
+  {{- with .Values.image.pullSecretNames }}
+  imagePullSecrets:
+  {{- range . }}
+  - name: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  terminationGracePeriodSeconds: {{ .Values.podTemplate.terminationGracePeriodSeconds }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    {{- if $embedded }}
+    # The JetStream store's claim is made writable for the image's group (storage-driver
+    # dependent).
+    fsGroup: 65532
+    {{- end }}
+    seccompProfile:
+      type: RuntimeDefault
+  {{- with .Values.podTemplate.topologySpreadConstraints }}
+  topologySpreadConstraints:
+  {{- range $k, $v := . }}
+  - {{ merge (dict "topologyKey" $k "labelSelector" (dict "matchLabels" (include "mqtt-nats-broker.selectorLabels" $ | fromYaml))) $v | toYaml | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  {{- if or .Values.mqtt.tls.enabled $clustered }}
+  volumes:
+  {{- if .Values.mqtt.tls.enabled }}
+  - name: mqtt-tls
+    secret:
+      secretName: {{ .Values.mqtt.tls.secretName | quote }}
+  {{- end }}
+  {{- if $clustered }}
+  - name: config
+    configMap:
+      name: {{ .Values.configMap.name | quote }}
+  {{- end }}
+  {{- end }}

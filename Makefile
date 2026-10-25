@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -12,6 +12,19 @@ SOAK_DIR  ?= /tmp/mqtt-nats-broker-soak
 
 # The kustomize the example deployment is rendered with (see `kubernetes-render`).
 KUSTOMIZE_VERSION := v5.8.1
+
+# The helm the chart is checked with, and the kind and kubectl its cluster install uses
+# (see `helm-check` and `helm-smoke`). helm and kind are go-installed, version-pinned
+# builds authenticated by the Go checksum database; kubectl is the release binary of the
+# kind node's Kubernetes version, checked against the pinned digests. Helm keeps its
+# cache, configuration and data under bin/, never in the user's home.
+HELM_VERSION    := v4.3.1
+KIND_VERSION    := v0.33.0
+KUBECTL_VERSION := v1.37.0
+KUBECTL_SHA256_amd64 := 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
+KUBECTL_SHA256_arm64 := 922df28df248cc00a9e025f947704f1d1482de64ece54cfe57e61f19eaf1eef3
+HELM_ENV := HELM_CACHE_HOME=$(CURDIR)/bin/helm-home/cache HELM_CONFIG_HOME=$(CURDIR)/bin/helm-home/config HELM_DATA_HOME=$(CURDIR)/bin/helm-home/data
+HELM_CHART := charts/mqtt-nats-broker
 
 build: ## Build the binary for the host platform
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o mqtt-nats-broker ./cmd/mqtt-nats-broker
@@ -85,6 +98,27 @@ image-smoke-embedded: ## Build the embedded-NATS image for the host platform and
 kubernetes-render: ## Render docs/deploy/kubernetes (base and TLS overlay) with the pinned kustomize and check the output against the binary
 	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/kustomize/kustomize/v5@$(KUSTOMIZE_VERSION)
 	MQTTNB_KUSTOMIZE=$(CURDIR)/bin/kustomize go test -count=1 -v -run '^TestKubernetesManifestRender$$' ./cmd/mqtt-nats-broker/
+
+helm-check: ## Lint and render the Helm chart and the topology-3 NATS chart values with the pinned helm, and check the output against the binary
+	GOBIN=$(CURDIR)/bin go install helm.sh/helm/v4/cmd/helm@$(HELM_VERSION)
+	$(HELM_ENV) bin/helm repo add --force-update nats https://nats-io.github.io/k8s/helm/charts/
+	$(HELM_ENV) bin/helm dependency build $(HELM_CHART)
+	for f in $(HELM_CHART)/ci/*.yaml; do $(HELM_ENV) bin/helm lint --strict $(HELM_CHART) -f $$f || exit 1; done
+	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml
+	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml -f docs/deploy/nats-chart-shared-pod/values-cluster.yaml
+	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm go test -count=1 -v -run '^(TestHelmChartStatic|TestHelmChart|TestHelmChartRefusals|TestHelmChartExtensionPoints|TestNATSChartSharedPod)$$' ./cmd/mqtt-nats-broker/
+
+helm-smoke: helm-check ## Install the chart in a kind cluster, every topology, with both images built for the host (needs Docker)
+	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/kind@$(KIND_VERSION)
+	arch=$$(go env GOARCH); want=$$(case $$arch in amd64) echo $(KUBECTL_SHA256_amd64);; arm64) echo $(KUBECTL_SHA256_arm64);; esac); \
+	if ! echo "$$want  bin/kubectl" | sha256sum -c --status 2>/dev/null; then \
+		curl -fsSL -o bin/kubectl https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/linux/$$arch/kubectl && \
+		echo "$$want  bin/kubectl" | sha256sum -c && chmod 0755 bin/kubectl; fi
+	docker build --build-arg VERSION=$(VERSION) -t mqtt-nats-broker:helm-smoke .
+	docker build --target embedded --build-arg VERSION=$(VERSION) -t mqtt-nats-broker:helm-smoke-embedded .
+	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm MQTTNB_KIND=$(CURDIR)/bin/kind MQTTNB_KUBECTL=$(CURDIR)/bin/kubectl \
+		MQTTNB_HELM_SMOKE_IMAGE=mqtt-nats-broker:helm-smoke MQTTNB_HELM_SMOKE_EMBEDDED_IMAGE=mqtt-nats-broker:helm-smoke-embedded \
+		go test -count=1 -v -timeout 60m ./test/helmsmoke/
 
 docker-multiarch: ## Build (and optionally push) the multi-arch image
 	docker buildx build --platform linux/amd64,linux/arm64 \

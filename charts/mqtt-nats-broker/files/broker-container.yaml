@@ -1,0 +1,177 @@
+{{- $embedded := include "mqtt-nats-broker.embedded" $ }}
+{{- $clustered := include "mqtt-nats-broker.clustered" $ }}
+{{- $secret := .Values.broker.credentials.secretName }}
+{{- /* The default identity is optional only against a NATS the operator runs: the
+embedded configurations and the dependency's account block reference it. */}}
+{{- $defaultOptional := and (not $embedded) (not .Values.nats.enabled) }}
+{{- $tls := .Values.mqtt.tls }}
+name: broker
+{{ include "mqtt-nats-broker.image" $ }}
+env:
+{{- if not $embedded }}
+- name: MQTTNB_NATS_URLS
+  value: {{ include "mqtt-nats-broker.natsURLs" $ | quote }}
+{{- end }}
+# The service identity. Its account must deny every MQTT identity $MQTT.>, $JS.>,
+# $KV.> and $O.> (docs/ARCHITECTURE.md, "What a deployment must allow").
+- name: MQTTNB_NATS_USER
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret | quote }}
+      key: user
+- name: MQTTNB_NATS_PASS
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret | quote }}
+      key: password
+- name: MQTTNB_DEFAULT_USER
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret | quote }}
+      key: default-user
+      {{- if $defaultOptional }}
+      optional: true
+      {{- end }}
+- name: MQTTNB_DEFAULT_PASS
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret | quote }}
+      key: default-password
+      {{- if $defaultOptional }}
+      optional: true
+      {{- end }}
+{{- if $clustered }}
+# The cluster configuration (files/nats-cluster.conf, embedded/nats-cluster.conf in the
+# repository) names this pod by its stable name and authenticates every route. The route
+# credentials are expanded by the kubelet from the two variables above them, so the
+# password stays in its Secret.
+- name: MQTTNB_NATS_EMBEDDED_CONFIG
+  value: /etc/mqtt-nats-broker/cluster/nats.conf
+- name: MQTTNB_EMBEDDED_SERVER_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+- name: MQTTNB_EMBEDDED_ROUTE_USER
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.embedded.cluster.routeSecretName | quote }}
+      key: user
+- name: MQTTNB_EMBEDDED_ROUTE_PASS
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.embedded.cluster.routeSecretName | quote }}
+      key: password
+{{- $routes := list }}
+{{- range $i := until (int .Values.replicas) }}
+{{- $routes = append $routes (printf "nats-route://$(MQTTNB_EMBEDDED_ROUTE_USER):$(MQTTNB_EMBEDDED_ROUTE_PASS)@%s-%d.%s:6222" $.Values.statefulSet.name $i $.Values.headlessService.name) }}
+{{- end }}
+- name: MQTTNB_EMBEDDED_ROUTES
+  value: {{ printf "[%s]" (join ", " $routes) | quote }}
+- name: MQTTNB_STREAM_REPLICAS
+  value: {{ .Values.replicas | toString | quote }}
+{{- else if .Values.broker.streamReplicas }}
+- name: MQTTNB_STREAM_REPLICAS
+  value: {{ .Values.broker.streamReplicas | toString | quote }}
+{{- end }}
+- name: MQTTNB_LOG_LEVEL
+  value: {{ .Values.broker.logLevel | quote }}
+# Grace after SIGTERM before clients are disconnected (values.yaml, broker.drainDelay).
+- name: MQTTNB_DRAIN_DELAY
+  value: {{ .Values.broker.drainDelay | quote }}
+{{- if $tls.enabled }}
+- name: MQTTNB_PORT
+  value: {{ $tls.port | toString | quote }}
+- name: MQTTNB_TLS_CERT
+  value: /etc/mqtt-tls/tls.crt
+- name: MQTTNB_TLS_KEY
+  value: /etc/mqtt-tls/tls.key
+{{- with $tls.caKey }}
+- name: MQTTNB_TLS_CA
+  value: {{ printf "/etc/mqtt-tls/%s" . | quote }}
+{{- end }}
+{{- if $tls.plaintext }}
+- name: MQTTNB_PLAIN_PORT
+  value: {{ .Values.mqtt.port | toString | quote }}
+{{- end }}
+{{- else }}
+- name: MQTTNB_PORT
+  value: {{ .Values.mqtt.port | toString | quote }}
+{{- end }}
+{{- if .Values.mqtt.websocket.enabled }}
+- name: MQTTNB_WS_PORT
+  value: {{ .Values.mqtt.websocket.port | toString | quote }}
+- name: MQTTNB_WS_PATH
+  value: {{ .Values.mqtt.websocket.path | quote }}
+{{- end }}
+{{- with .Values.broker.env }}
+{{- include "mqtt-nats-broker.env" . }}
+{{- end }}
+ports:
+- name: mqtt
+  containerPort: {{ $tls.enabled | ternary $tls.port .Values.mqtt.port }}
+{{- if and $tls.enabled $tls.plaintext }}
+- name: mqtt-plain
+  containerPort: {{ .Values.mqtt.port }}
+{{- end }}
+{{- if .Values.mqtt.websocket.enabled }}
+- name: mqtt-ws
+  containerPort: {{ .Values.mqtt.websocket.port }}
+{{- end }}
+{{- if $clustered }}
+- name: route
+  containerPort: 6222
+{{- end }}
+- name: health
+  containerPort: 8080
+{{- if $embedded }}
+# The JetStream wait runs before HTTP is served and has no timeout of its own: this
+# bounds it at ten minutes.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  periodSeconds: 5
+  failureThreshold: 120
+{{- end }}
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: health
+  # One failed probe withdraws the endpoint, so a drain is seen within one period.
+  periodSeconds: 2
+  failureThreshold: 1
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: health
+  periodSeconds: 10
+  failureThreshold: 3
+{{- with .Values.container.resources }}
+resources:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+    - ALL
+{{- if or $tls.enabled $embedded }}
+volumeMounts:
+{{- if $tls.enabled }}
+# A directory, never a subPath: the kubelet updates a projected Secret in place, and the
+# broker re-reads the files every MQTTNB_TLS_RELOAD_INTERVAL.
+- name: mqtt-tls
+  mountPath: /etc/mqtt-tls
+  readOnly: true
+{{- end }}
+{{- if $embedded }}
+- name: data
+  mountPath: /data
+{{- end }}
+{{- if $clustered }}
+- name: config
+  mountPath: /etc/mqtt-nats-broker/cluster
+  readOnly: true
+{{- end }}
+{{- end }}

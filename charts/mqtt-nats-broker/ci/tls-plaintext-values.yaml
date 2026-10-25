@@ -1,0 +1,9 @@
+# TLS on 8883 with plaintext on 1883 beside it.
+topology: external
+broker:
+  natsURLs: nats://nats:4222
+mqtt:
+  tls:
+    enabled: true
+    secretName: mqtt-nats-broker-tls
+    plaintext: true

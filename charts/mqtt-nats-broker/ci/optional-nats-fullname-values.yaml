@@ -1,0 +1,5 @@
+# The dependency renamed by fullnameOverride alone: the broker follows it.
+topology: external
+nats:
+  enabled: true
+  fullnameOverride: jetstream

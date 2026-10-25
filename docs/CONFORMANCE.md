@@ -6415,6 +6415,34 @@ External mode is unaffected.
   keeps the broker waiting, logging every 10 s, with HTTP not yet served; the
   orchestrator's startupProbe is the bound.
 
+### The Helm chart: what it leaves to the operator, and what the install does not show
+
+Not an MQTT conformance item; the limits of `docs/ARCHITECTURE.md` "The Helm chart".
+
+- **Shared-pod startup is not ordered.** In the official NATS chart's pods
+  (`docs/deploy/nats-chart-shared-pod`) the broker and NATS start together. The
+  external-NATS broker fails fast when its server does not accept yet or JetStream does
+  not answer, exits, and is restarted by the kubelet with its usual backoff until it does;
+  on a clustered cold start that lasts until the JetStream meta leader is elected. The
+  same holds for the external topology's broker beside a NATS dependency that is still
+  starting. No ordering mechanism is added: a postStart gate on the NATS container would
+  block the pod with no bound while a cluster forms.
+- **What a customization adds is outside the checks.** `merge`, `patch` and
+  `extraResources` can change any field, the security context and the probes included;
+  the checks judge what the chart ships.
+- **Route credentials must be URL-safe.** They are expanded into route URLs by the
+  kubelet, for the embedded cluster and the clustered NATS dependency alike, and the chart
+  cannot read the Secret to check them.
+- **The NATS dependency's route port has no NetworkPolicy.** Its routes are
+  authenticated; limiting who can reach the port is the operator's (`extraResources`).
+- **One embedded server has no `server_name`.** It runs the image's baked configuration,
+  so its name is the server's generated one, as with the image run directly.
+- **The kind install** (`make helm-smoke`) is one node with local-path storage. It does
+  not show a cloud load balancer (the tests reach the Service through a port-forward),
+  scheduling spread across nodes, NetworkPolicy enforcement (the policy is rendered and
+  judged statically, not exercised), `fsGroup` on a storage driver that applies it, or
+  endpoint propagation timing during a drain.
+
 ### A TLS reload reaches new handshakes only
 
 Not an MQTT conformance item; the operational limits of `docs/ARCHITECTURE.md` "TLS material

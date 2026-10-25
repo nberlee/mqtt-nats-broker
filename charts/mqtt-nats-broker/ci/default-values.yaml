@@ -1,0 +1,2 @@
+# No values: the default, one embedded broker with its own JetStream.
+{}

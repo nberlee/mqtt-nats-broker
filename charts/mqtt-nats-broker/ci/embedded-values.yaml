@@ -1,0 +1,2 @@
+# The embedded-NATS image, one JetStream server.
+topology: embedded

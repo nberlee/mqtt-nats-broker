@@ -1,0 +1,4 @@
+{{- include "mqtt-nats-broker.defaultValues" . }}
+{{- if and (eq .Values.topology "external") .Values.autoscaling.enabled }}
+{{- include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "horizontal-pod-autoscaler.yaml" "ctx" $) .Values.autoscaling) }}
+{{- end }}

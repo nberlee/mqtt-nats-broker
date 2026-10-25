@@ -1,0 +1,374 @@
+############################################################
+# mqtt-nats-broker
+#
+# Every rendered object has a `merge` (deep-merged into the object; a list in it replaces
+# the chart's list) and a `patch` (an RFC 6902 JSON patch applied after the merge; use
+# `op: add` with a path ending in `/-` to append to a list the chart renders). Values may
+# carry `$tplYaml` / `$tplYamlSpread` templates, resolved before the merge and the patch.
+# This is the official NATS chart's convention, with the same helpers. See README.md.
+############################################################
+
+# defaults to the chart name
+nameOverride:
+# defaults to "<release>-<chart>", or the release name if it contains the chart name
+fullnameOverride:
+
+# embedded (the default): the embedded-NATS image, each pod running its own JetStream
+#   server in-process (a StatefulSet), one server or a clustered set
+#   (embedded.cluster.enabled). A bare install is one broker with its own JetStream.
+# external: N stateless broker frontends (a Deployment) in front of a NATS/JetStream
+#   deployment they do not run: an existing one (broker.natsURLs) or the optional
+#   dependency (nats.enabled).
+topology: embedded
+
+# external topology: frontends, default 3; ignored while autoscaling is enabled.
+# embedded topology: JetStream peers, default 1, or 3 when clustered; a cluster needs an
+# odd count of at least 3.
+replicas:
+
+############################################################
+# image
+############################################################
+image:
+  repository: ghcr.io/nberlee/mqtt-nats-broker
+  # defaults to the chart's appVersion; the embedded topology appends "-embedded", the
+  # embedded-NATS image's tag (docs/ARCHITECTURE.md, "The runtime image")
+  tag:
+  # if digest is provided, it overrides tag (and the "-embedded" suffix)
+  digest:
+  # if fullImageName is provided, it overrides repository, tag and digest
+  fullImageName:
+  pullPolicy:
+  # names of existing image pull Secrets
+  pullSecretNames: []
+
+############################################################
+# broker settings (environment of the broker container)
+############################################################
+broker:
+  # external topology: the NATS URLs, comma separated (nats:// or tls://, never with
+  # credentials in them). Defaults to the client Service of the optional dependency when
+  # nats.enabled; required otherwise.
+  natsURLs:
+
+  credentials:
+    # An existing Secret the chart never creates. Keys:
+    #   user, password                  the broker's NATS service identity (required)
+    #   default-user, default-password  the NATS identity anonymous MQTT clients get;
+    #     optional against a NATS you run yourself, required with nats.enabled and in
+    #     the embedded topology, whose configurations reference them
+    secretName: mqtt-nats-broker-nats
+
+  # JetStream replicas of the broker's streams; 0 is automatic. The embedded cluster
+  # always uses its replica count. With a clustered optional dependency, set it to the
+  # NATS cluster size.
+  streamReplicas: 0
+
+  logLevel: info
+
+  # Grace after SIGTERM before clients are disconnected: /readyz turns 503 at once, and
+  # this is a best-effort allowance for the endpoint to leave the Service and the load
+  # balancer before the drain. Raise podTemplate.terminationGracePeriodSeconds with it.
+  drainDelay: 10s
+
+  # Extra environment, appended after the chart's own: NAME: value, or
+  # NAME: {valueFrom: ...}.
+  env: {}
+
+############################################################
+# MQTT listeners
+############################################################
+mqtt:
+  # The plaintext listener, unless tls.enabled (then see tls.plaintext).
+  port: 1883
+
+  tls:
+    enabled: false
+    port: 8883
+    # An existing kubernetes.io/tls Secret (tls.crt, tls.key), mounted as a directory so
+    # that a renewal reaches new handshakes without a restart.
+    secretName:
+    # A key in the same Secret holding a CA bundle; set it to verify client certificates.
+    caKey:
+    # Also serve plaintext MQTT on `port` beside TLS, for clients that cannot do TLS yet.
+    # Credentials and payloads cross it in clear, and no client certificate is checked.
+    plaintext: false
+
+  # MQTT over WebSocket; TLS when tls.enabled.
+  websocket:
+    enabled: false
+    port: 8083
+    path: /mqtt
+
+############################################################
+# embedded topology
+############################################################
+embedded:
+  cluster:
+    # Run `replicas` peers of one JetStream cluster, routes on port 6222.
+    enabled: false
+    # An existing Secret with the route credentials, keys user and password. Both are
+    # embedded in route URLs and must be URL-safe: letters, digits, "-", ".", "_", "~".
+    routeSecretName: mqtt-nats-broker-routes
+
+  # The JetStream store, one PersistentVolumeClaim per pod.
+  storage:
+    size: 10Gi
+    # defaults to the cluster's default StorageClass
+    storageClassName:
+    # merge or patch the volume claim template
+    # https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/persistent-volume-claim-v1/
+    merge: {}
+    patch: []
+
+############################################################
+# deployment (external topology)
+############################################################
+deployment:
+  # merge or patch the deployment
+  # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/deployment-v1/
+  merge: {}
+  patch: []
+  # defaults to the fullname
+  name:
+
+############################################################
+# stateful set (embedded topology)
+############################################################
+statefulSet:
+  # merge or patch the stateful set
+  # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/stateful-set-v1/
+  merge: {}
+  patch: []
+  # defaults to the fullname
+  name:
+
+############################################################
+# deployment / stateful set -> pod template
+############################################################
+podTemplate:
+  # How long the kubelet waits after SIGTERM. A budget, not a bound: drainDelay (10 s),
+  # then the client drain's deadline (10 s), the health server's shutdown (5 s) and the
+  # NATS service connection's close (up to 20 s), plus 15 s of headroom; the embedded
+  # topology adds 15 s for the in-process server's shutdown. Defaults to 60 (external) or
+  # 75 (embedded). Raise it with drainDelay.
+  terminationGracePeriodSeconds:
+
+  # map of topologyKey: topologySpreadConstraint; the labelSelector is added to match
+  # the broker's pods, e.g.
+  #   topologySpreadConstraints:
+  #     kubernetes.io/hostname:
+  #       maxSkew: 1
+  #       whenUnsatisfiable: DoNotSchedule
+  topologySpreadConstraints: {}
+
+  # merge or patch the pod template, e.g. initContainers, volumes, nodeSelector,
+  # tolerations, affinity, annotations
+  # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/
+  merge: {}
+  patch: []
+
+############################################################
+# pod template -> broker container
+############################################################
+container:
+  # The broker derives its Go soft memory limit from limits.memory (90 %); set GOMEMLIMIT
+  # in broker.env only to override that.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi
+
+  # merge or patch the container, e.g. volumeMounts
+  # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#Container
+  merge: {}
+  patch: []
+
+############################################################
+# service: the MQTT listeners (never the health port)
+############################################################
+service:
+  # A TCP (L4) load balancer spreads MQTT clients across the frontends; a session
+  # survives a reconnect to any instance, since its state lives in JetStream.
+  type: LoadBalancer
+  # merge or patch the service
+  # https://kubernetes.io/docs/reference/kubernetes-api/service-resources/service-v1/
+  merge: {}
+  patch: []
+  # defaults to the fullname
+  name:
+
+############################################################
+# headless service (embedded topology): pod DNS names for the routes
+############################################################
+headlessService:
+  # merge or patch the headless service
+  merge: {}
+  patch: []
+  # defaults to "<fullname>-headless"
+  name:
+
+############################################################
+# config map (embedded cluster): the nats-server configuration
+############################################################
+configMap:
+  # merge or patch the config map
+  merge: {}
+  patch: []
+  # defaults to "<fullname>-config"
+  name:
+
+############################################################
+# pod disruption budget: one pod at a time (an R3 quorum survives one loss)
+############################################################
+podDisruptionBudget:
+  enabled: true
+  # merge or patch the pod disruption budget
+  # https://kubernetes.io/docs/reference/kubernetes-api/policy-resources/pod-disruption-budget-v1/
+  merge: {}
+  patch: []
+  # defaults to the fullname
+  name:
+
+############################################################
+# horizontal pod autoscaler (external topology only)
+############################################################
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  # merge or patch the horizontal pod autoscaler
+  # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/horizontal-pod-autoscaler-v2/
+  merge: {}
+  patch: []
+  # defaults to the fullname
+  name:
+
+############################################################
+# network policy (embedded cluster): the route port only from the broker's own pods
+############################################################
+networkPolicy:
+  enabled: true
+  # merge or patch the network policy
+  # https://kubernetes.io/docs/reference/kubernetes-api/policy-resources/network-policy-v1/
+  merge: {}
+  patch: []
+  # defaults to the fullname
+  name:
+
+############################################################
+# extra user-defined resources, e.g.
+#   extraResources:
+#   - apiVersion: monitoring.coreos.com/v1
+#     kind: PodMonitor
+#     metadata:
+#       name:
+#         $tplYaml: >
+#           {{ include "mqtt-nats-broker.fullname" $ | quote }}
+############################################################
+extraResources: []
+
+############################################################
+# nats: the official NATS chart (https://github.com/nats-io/k8s, helm/charts/nats),
+# installed beside the broker when enabled. Everything under this key is that chart's own
+# values, untranslated. The defaults below make it a JetStream server the broker can use:
+# the broker's account, the deny ACL for anonymous MQTT clients, the consumer limit the
+# broker needs, and Restricted Pod Security.
+############################################################
+nats:
+  enabled: false
+
+  config:
+    jetstream:
+      enabled: true
+      merge:
+        limits:
+          # The broker's streams carry one consumer per subscription; the server's
+          # default cap is 1000 (docs/ARCHITECTURE.md, default_max_consumers).
+          default_max_consumers: -1
+    merge:
+      accounts:
+        MQTT:
+          jetstream: enabled
+          users:
+            # The broker's service identity. An MQTT client presenting these
+            # credentials acts with its rights, so they must stay private.
+            - user: << $MQTTNB_NATS_USER >>
+              password: << $MQTTNB_NATS_PASS >>
+            # The identity anonymous MQTT clients get, denied the broker's internals
+            # (docs/ARCHITECTURE.md, "What a deployment must allow").
+            - user: << $MQTTNB_DEFAULT_USER >>
+              password: << $MQTTNB_DEFAULT_PASS >>
+              permissions:
+                publish:
+                  deny:
+                    - $MQTT.>
+                    - $JS.>
+                    - $KV.>
+                    - $O.>
+                subscribe:
+                  deny:
+                    - $MQTT.>
+                    - $JS.>
+                    - $KV.>
+                    - $O.>
+
+  # The four variables the account block references, from the broker's credentials
+  # Secret. The name must equal broker.credentials.secretName; the chart refuses a
+  # mismatch.
+  container:
+    env:
+      MQTTNB_NATS_USER:
+        valueFrom:
+          secretKeyRef:
+            name: mqtt-nats-broker-nats
+            key: user
+      MQTTNB_NATS_PASS:
+        valueFrom:
+          secretKeyRef:
+            name: mqtt-nats-broker-nats
+            key: password
+      MQTTNB_DEFAULT_USER:
+        valueFrom:
+          secretKeyRef:
+            name: mqtt-nats-broker-nats
+            key: default-user
+      MQTTNB_DEFAULT_PASS:
+        valueFrom:
+          secretKeyRef:
+            name: mqtt-nats-broker-nats
+            key: default-password
+    merge:
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+  reloader:
+    merge:
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+
+  podTemplate:
+    merge:
+      spec:
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
+
+  natsBox:
+    enabled: false

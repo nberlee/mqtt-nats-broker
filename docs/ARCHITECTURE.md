@@ -15540,9 +15540,11 @@ replace must name an existing value, and an add may not overwrite a mapping key.
 `go install`, a version-pinned build authenticated by the Go checksum database. It
 renders the base and the TLS overlay and applies the same checks to the output.
 
-Not verified: admission by a real API server, including Pod Security admission; Secret
-projection with these modes in a cluster; and endpoint propagation timing. A cluster
-install belongs to the Helm chart's CI.
+Not verified here: admission by a real API server, including Pod Security admission;
+Secret projection with these modes in a cluster; and endpoint propagation timing. The
+Helm chart's kind install (see "The Helm chart") shows Restricted admission and Secret
+projection for the chart's pod, which carries the same settings; the example itself is
+not installed, and endpoint propagation timing is not verified anywhere.
 
 ## Embedded NATS
 
@@ -15647,6 +15649,119 @@ deadline (10 s by default) closes it, and the client reports `io: read/write on 
 pipe` instead of the server's error. Recorded in `docs/known-upstream-issues.md`
 (INPROCESS-REFUSAL) and stated in `docs/CONFORMANCE.md`; the broker does not work around
 it.
+
+## The Helm chart
+
+`charts/mqtt-nats-broker` deploys the broker in the three topologies, each single-server
+or clustered: **embedded** (`topology: embedded`, the default, and with no other values
+one server): the embedded-NATS image in a StatefulSet, one server or
+`embedded.cluster.enabled` peers of one JetStream cluster; **external**
+(`topology: external`): N stateless frontends, a Deployment, against a NATS the
+operator runs (`broker.natsURLs`) or the official NATS chart as an optional dependency
+(`nats.enabled`); and **shared pod**: the external-NATS image as an extra
+container in the official NATS chart's own pods, which is not this chart but values for
+that one (`docs/deploy/nats-chart-shared-pod`). The chart is unpublished: it is
+packaged with the alpha release.
+
+**Customization is the NATS chart's convention, with its helpers.** Every rendered object
+has a `merge` (deep-merged; a list in it replaces the chart's) and a `patch` (RFC 6902,
+applied after the merge; `/-` appends), values may carry `$tplYaml`, and
+`extraResources` adds arbitrary objects. `templates/_jsonpatch.tpl` and
+`templates/_tplYaml.tpl` are copied from nats-io/k8s at the commit of chart 2.15.1
+(Apache-2.0, `NOTICE`), with every `define` and `include` prefixed `mqtt-nats-broker.`:
+Helm's named templates are one namespace across the chart and its subcharts, and the
+dependency defines the unprefixed names. The order is the NATS chart's: `$tplYaml` is
+resolved over the values once (`mqtt-nats-broker.defaultValues`, which also validates
+them and fills in object names), then each object is rendered from `files/`, merged and
+patched.
+
+**The optional dependency's defaults make it a server the broker can use**, because a
+default install must not reproduce the embedded-NATS item's security find: JetStream on,
+`default_max_consumers: -1` (the cap the broker needs; `enforceEmbeddedOptions` covers
+in-process servers only), an account `MQTT` with the service user and the default user
+from the broker's credentials Secret, the default user denied `$MQTT.>`, `$JS.>`,
+`$KV.>` and `$O.>` both ways, NATS Box off, and Restricted Pod Security on the server's
+pod and containers (uid, gid and fsGroup 1000; the chart already keeps the pid file in an
+emptyDir and the configuration in a ConfigMap, and its reloader signals the server as
+the same user). A clustered dependency must authenticate its routes, for the reason the
+embedded enforcement refuses an unauthenticated route listener: anyone who reaches it
+joins as a peer, past every client ACL. The chart refuses `nats.config.cluster.enabled`
+without route authorization, route URL credentials or route TLS, and
+`ci/optional-nats-cluster-values.yaml` (like the shared pod's `values-cluster.yaml`)
+shows the form that keeps the credentials out of the manifest: an `authorization` block
+and a route list referencing `NATS_CLUSTER_USER` and `NATS_CLUSTER_PASS` from the Secret
+`mqtt-nats-broker-routes`, the list built by `$tplYaml` from the server count and
+expanded by the kubelet. Everything under `nats:` is that chart's own values,
+untranslated, and this chart's `$tplYaml` pass leaves them to that chart. The
+broker's `MQTTNB_NATS_URLS` follows the dependency's Service the way that chart names it
+(`service.name`, `fullnameOverride`, `nameOverride`, `namespaceOverride`, the client
+port); the chart refuses the dependency with its client Service or port disabled, and a
+credentials Secret on the server's container other than the broker's.
+
+**Embedded.** The StatefulSet carries what "Embedded NATS" lists for Kubernetes:
+`podManagementPolicy: Parallel`, a headless Service with `publishNotReadyAddresses`, a
+claim `data` per pod at the image's `/data` with `fsGroup: 65532`, a startupProbe on
+`/healthz` bounding the JetStream wait at ten minutes, a PodDisruptionBudget of one, and
+when clustered a NetworkPolicy admitting the route port only from the broker's pods. One
+server runs the image's baked configuration, which has no `server_name`: a standalone
+server has no peer that names it. A cluster runs `embedded/nats-cluster.conf` from a
+ConfigMap (the chart's copy, `files/nats-cluster.conf`, is held byte-identical by a
+test, since Helm cannot read outside the chart), with `server_name` the pod name, and its
+route list built so the route password never appears in the manifest: the route user and
+password come from their Secret as environment variables, and the route URLs reference
+them as `$(MQTTNB_EMBEDDED_ROUTE_USER):$(MQTTNB_EMBEDDED_ROUTE_PASS)`, which the kubelet
+expands from the variables declared before. Both must therefore be URL-safe. The stream
+replicas are the peer count. A configuration change rolls the pods (a checksum
+annotation), since the embedded server has no reload. Autoscaling is refused, and so is
+an even or sub-three peer count.
+
+**Shared pod: NATS must outlive the broker.** The NATS chart's `nats` container enters
+lame duck mode in its preStop hook, which the kubelet runs while it signals the broker,
+and lame duck evicts the broker's service connection while the broker is still in its
+drain delay, its client drain, or the `be.Close()` that drains and flushes that
+connection. Neither container can be made to stop after the other through sidecar
+ordering (sidecars stop after the main containers, and the NATS chart owns the `nats`
+container), so the values replace that preStop hook: in the pod's shared PID namespace
+it waits while `pgrep -f '^/usr/local/bin/mqtt-nats-broker( |$)'` matches, then signals
+lame duck. The pattern is anchored at the start of the command line so that it matches
+the broker and never the hook's own shell or `pgrep`; `pgrep -x mqtt-nats-broker` would
+never match, since BusyBox compares argv[0] (the absolute path) or comm (15 characters;
+the name is 16). The grace is 120 s: the broker's 60, the lame duck window (10 + 30 s)
+and the NATS chart's stated 20 s. The broker's stream replicas follow the NATS cluster
+size through `$tplYaml`. Startup is not ordered: see `docs/CONFORMANCE.md`.
+
+**What checks it.** The contract has two halves. What the chart ships, every variant
+under `charts/mqtt-nats-broker/ci` and the shared-pod values in both forms, is judged by
+`cmd/mqtt-nats-broker/helm_chart_test.go` against a closed inventory, as the example
+deployment is: exactly the variant's objects; no field outside the set the chart
+renders; exactly the variant's environment, each name read by `internal/config` or by the
+cluster configuration, accepted by `config.Load`, credentials from their Secret keys, and
+`$(...)` only as the two route references; the listeners, probes, grace and Service as
+for the example; the embedded configuration loaded by nats-server with the environment
+the kubelet gives peer 0 and accepted by `enforceEmbeddedOptions`, its store on the
+claim's mount; the dependency's and the shared pod's rendered configuration parsed with
+JetStream, the consumer limit and the deny ACL; Restricted settings on every container
+rendered; and render refusals for what the broker cannot run. What a user adds through
+`merge`, `patch` or `extraResources` is outside it, since changing any field is the
+point; `TestHelmChartExtensionPoints` shows each hook lands where `values.yaml` says and
+that an append keeps what the chart renders. The static half (helper names, the
+configuration copy, block-style values) runs in `make test`; the renders in
+`make helm-check` (CI `helm-chart`), with helm v4.3.1 go-installed into `bin/`.
+
+`make helm-smoke` (CI `helm-install`, native amd64 and arm64) installs into a kind
+cluster, every namespace enforcing Restricted Pod Security, with both images retagged to
+the chart's own references so the shipped values run unchanged: the external topology with
+the dependency, single and clustered, MQTT through JetStream and a retained message
+outliving every broker pod; TLS from a `kubernetes.io/tls` Secret; the embedded topology,
+single and clustered, serving with a peer deleted; on every clustered form, a router
+presenting no credentials refused with `Authorization Violation`; `helm upgrade` and `helm
+rollback`, judged by the release history and the live pod specs rather than by a round
+trip old pods could serve; the dependency's reloader applying a configuration change
+without a restart; and the shared pod, single and clustered, deleted under a connected
+client: in the `nats` container's own log the broker's service connection closes as
+`Client Closed` before lame duck is entered, and a QoS 1 round trip completes inside the
+drain delay. Upgrade and rollback are Helm release-lifecycle checks; nothing in them
+handles a persisted-format change.
 
 ## C5 recovery reservation ownership
 

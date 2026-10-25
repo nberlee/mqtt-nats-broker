@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.deployment.name }}
+  labels:
+    {{- include "mqtt-nats-broker.labels" $ | nindent 4 }}
+spec:
+  # Stateless: scale freely. On the first start against an account whose broker-owned
+  # $MQTT_* streams do not exist yet, replicas provision them concurrently; a replica that
+  # sees a partial set rescans for up to 30 s, and the restart converges the rest
+  # (docs/ARCHITECTURE.md, "The ten streams are one recreation unit").
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mqtt-nats-broker.selectorLabels" $ | nindent 6 }}
+  template:
+    {{- with .Values.podTemplate }}
+    {{- include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "pod-template.yaml" "ctx" $) .) | nindent 4 }}
+    {{- end }}

@@ -1,0 +1,4 @@
+{{- include "mqtt-nats-broker.defaultValues" . }}
+{{- if include "mqtt-nats-broker.clustered" $ }}
+{{- include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "config-map.yaml" "ctx" $) .Values.configMap) }}
+{{- end }}

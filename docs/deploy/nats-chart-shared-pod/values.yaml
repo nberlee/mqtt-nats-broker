@@ -1,0 +1,207 @@
+# Values for the official NATS chart (https://github.com/nats-io/k8s, helm/charts/nats,
+# version 2.15.1) that run mqtt-nats-broker as an extra container in every NATS pod,
+# connected to its own server over loopback. One server; values-cluster.yaml on top makes
+# it a three-server JetStream cluster. README.md has the prerequisites and the install
+# command. Everything here is that chart's own values.
+
+config:
+  jetstream:
+    enabled: true
+    merge:
+      limits:
+        # The broker's streams carry one consumer per subscription; the server's default
+        # cap is 1000 (docs/ARCHITECTURE.md, default_max_consumers).
+        default_max_consumers: -1
+  merge:
+    accounts:
+      MQTT:
+        jetstream: enabled
+        users:
+          # The broker's service identity. An MQTT client presenting these credentials
+          # acts with its rights, so they must stay private.
+          - user: << $MQTTNB_NATS_USER >>
+            password: << $MQTTNB_NATS_PASS >>
+          # The identity anonymous MQTT clients get, denied the broker's internals
+          # (docs/ARCHITECTURE.md, "What a deployment must allow").
+          - user: << $MQTTNB_DEFAULT_USER >>
+            password: << $MQTTNB_DEFAULT_PASS >>
+            permissions:
+              publish:
+                deny:
+                  - $MQTT.>
+                  - $JS.>
+                  - $KV.>
+                  - $O.>
+              subscribe:
+                deny:
+                  - $MQTT.>
+                  - $JS.>
+                  - $KV.>
+                  - $O.>
+
+container:
+  # The variables the account block references, on the nats container: the broker's
+  # environment is its own.
+  env:
+    MQTTNB_NATS_USER:
+      valueFrom:
+        secretKeyRef:
+          name: mqtt-nats-broker-nats
+          key: user
+    MQTTNB_NATS_PASS:
+      valueFrom:
+        secretKeyRef:
+          name: mqtt-nats-broker-nats
+          key: password
+    MQTTNB_DEFAULT_USER:
+      valueFrom:
+        secretKeyRef:
+          name: mqtt-nats-broker-nats
+          key: default-user
+    MQTTNB_DEFAULT_PASS:
+      valueFrom:
+        secretKeyRef:
+          name: mqtt-nats-broker-nats
+          key: default-password
+  merge:
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+  patch:
+    # NATS must outlive the broker process: the broker drains its MQTT clients and then
+    # drains and flushes its NATS connection, and lame duck mode would evict that
+    # connection mid-drain. So the server waits, in the shared PID namespace, for the
+    # broker process to exit, and only then enters lame duck mode. The pattern is
+    # anchored at the start of the command line: it matches the broker's
+    # /usr/local/bin/mqtt-nats-broker and never this hook's own shell or pgrep.
+    # (pgrep -x cannot match it: BusyBox compares argv[0], the absolute path, or the
+    # 15-character comm, and the name is 16.)
+    - op: replace
+      path: /lifecycle/preStop/exec/command
+      value:
+        - /bin/sh
+        - -c
+        - while pgrep -f '^/usr/local/bin/mqtt-nats-broker( |$)' >/dev/null; do sleep 1; done; exec nats-server -sl=ldm=/var/run/nats/nats.pid
+
+reloader:
+  merge:
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+
+service:
+  patch:
+    - op: add
+      path: /spec/ports/-
+      value:
+        name: mqtt
+        port: 1883
+        targetPort: mqtt
+
+podTemplate:
+  # The broker's budget (60 s: drain delay, client drain, health server, NATS close,
+  # headroom), then lame duck (config.lameDuckGracePeriod 10 s + config.lameDuckDuration
+  # 30 s), then the chart's stated 20 s shutdown overhead.
+  terminationGracePeriodSeconds: 120
+  merge:
+    spec:
+      # The chart sets it while the reloader is enabled; the preStop wait needs it
+      # either way.
+      shareProcessNamespace: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+  patch:
+    - op: add
+      path: /spec/containers/-
+      value:
+        name: broker
+        # Illustrative and unpublished: no release exists yet. Replace it with a
+        # published release tag or digest of the external-NATS image.
+        image: ghcr.io/nberlee/mqtt-nats-broker:0.1.0-alpha.1
+        env:
+          - name: MQTTNB_NATS_URLS
+            value: nats://127.0.0.1:4222
+          - name: MQTTNB_NATS_USER
+            valueFrom:
+              secretKeyRef:
+                name: mqtt-nats-broker-nats
+                key: user
+          - name: MQTTNB_NATS_PASS
+            valueFrom:
+              secretKeyRef:
+                name: mqtt-nats-broker-nats
+                key: password
+          - name: MQTTNB_DEFAULT_USER
+            valueFrom:
+              secretKeyRef:
+                name: mqtt-nats-broker-nats
+                key: default-user
+          - name: MQTTNB_DEFAULT_PASS
+            valueFrom:
+              secretKeyRef:
+                name: mqtt-nats-broker-nats
+                key: default-password
+          # Every peer's stream replicas: the cluster size, or 1.
+          - name: MQTTNB_STREAM_REPLICAS
+            value:
+              $tplYaml: >
+                {{ ternary .Values.config.cluster.replicas 1 .Values.config.cluster.enabled | toString | quote }}
+          - name: MQTTNB_LOG_LEVEL
+            value: info
+          # Grace after SIGTERM before clients are disconnected, for the endpoint to
+          # leave the Service and the load balancer first.
+          - name: MQTTNB_DRAIN_DELAY
+            value: 10s
+          - name: MQTTNB_PORT
+            value: "1883"
+        ports:
+          - name: mqtt
+            containerPort: 1883
+          - name: health
+            containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          periodSeconds: 2
+          failureThreshold: 1
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: "1"
+            memory: 256Mi
+        # The image's own numeric identity, not the NATS containers' 1000.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+          seccompProfile:
+            type: RuntimeDefault
+
+# NATS Box is a separate Deployment that inherits none of the security settings above.
+natsBox:
+  enabled: false

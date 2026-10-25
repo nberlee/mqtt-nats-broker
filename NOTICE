@@ -16,3 +16,11 @@ Apache License, Version 2.0.
 The original NATS source files retain their upstream copyright headers. This
 project adapts that code to run as a standalone MQTT broker against an external
 NATS/JetStream cluster.
+
+The Helm chart's JSON patch and $tplYaml helpers
+(charts/mqtt-nats-broker/templates/_jsonpatch.tpl and _tplYaml.tpl) are copied from
+the NATS Helm charts (https://github.com/nats-io/k8s, helm/charts/nats), which are
+licensed under the Apache License, Version 2.0, with their template names prefixed.
+
+    Copyright The NATS Authors
+    Licensed under the Apache License, Version 2.0

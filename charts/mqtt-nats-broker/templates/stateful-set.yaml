@@ -1,0 +1,4 @@
+{{- include "mqtt-nats-broker.defaultValues" . }}
+{{- if include "mqtt-nats-broker.embedded" $ }}
+{{- include "mqtt-nats-broker.loadMergePatch" (merge (dict "file" "stateful-set.yaml" "ctx" $) .Values.statefulSet) }}
+{{- end }}

@@ -1,0 +1,11 @@
+# The dependency with its own Service name, namespace and client port.
+topology: external
+nats:
+  enabled: true
+  fullnameOverride: jetstream
+  namespaceOverride: messaging
+  service:
+    name: jetstream-client
+  config:
+    nats:
+      port: 4333

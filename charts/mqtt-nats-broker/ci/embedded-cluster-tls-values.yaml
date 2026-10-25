@@ -1,0 +1,9 @@
+# The embedded cluster serving MQTT over TLS.
+topology: embedded
+embedded:
+  cluster:
+    enabled: true
+mqtt:
+  tls:
+    enabled: true
+    secretName: mqtt-nats-broker-tls

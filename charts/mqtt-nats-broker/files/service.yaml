@@ -1,0 +1,26 @@
+{{- $tls := .Values.mqtt.tls }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.service.name }}
+  labels:
+    {{- include "mqtt-nats-broker.labels" $ | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "mqtt-nats-broker.selectorLabels" $ | nindent 4 }}
+  # The MQTT listeners only: the health port is never exposed.
+  ports:
+  - name: mqtt
+    port: {{ $tls.enabled | ternary $tls.port .Values.mqtt.port }}
+    targetPort: mqtt
+  {{- if and $tls.enabled $tls.plaintext }}
+  - name: mqtt-plain
+    port: {{ .Values.mqtt.port }}
+    targetPort: mqtt-plain
+  {{- end }}
+  {{- if .Values.mqtt.websocket.enabled }}
+  - name: mqtt-ws
+    port: {{ .Values.mqtt.websocket.port }}
+    targetPort: mqtt-ws
+  {{- end }}

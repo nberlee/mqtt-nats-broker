@@ -1,0 +1,32 @@
+{{- $tls := .Values.mqtt.tls }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.networkPolicy.name }}
+  labels:
+    {{- include "mqtt-nats-broker.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mqtt-nats-broker.selectorLabels" $ | nindent 6 }}
+  policyTypes:
+  - Ingress
+  ingress:
+  # Anyone who reaches an authenticated route port still cannot join, but only peers
+  # need to reach it.
+  - from:
+    - podSelector:
+        matchLabels:
+          {{- include "mqtt-nats-broker.selectorLabels" $ | nindent 10 }}
+    ports:
+    - port: route
+  # The MQTT listeners and the health port (the kubelet's probes) from anywhere.
+  - ports:
+    - port: mqtt
+    {{- if and $tls.enabled $tls.plaintext }}
+    - port: mqtt-plain
+    {{- end }}
+    {{- if .Values.mqtt.websocket.enabled }}
+    - port: mqtt-ws
+    {{- end }}
+    - port: health

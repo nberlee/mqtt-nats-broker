@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.headlessService.name }}
+  labels:
+    {{- include "mqtt-nats-broker.labels" $ | nindent 4 }}
+spec:
+  clusterIP: None
+  # Route names must resolve before any peer is ready: a peer becomes ready only once the
+  # quorum it routes to has formed.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mqtt-nats-broker.selectorLabels" $ | nindent 4 }}
+  {{- if include "mqtt-nats-broker.clustered" $ }}
+  ports:
+  - name: route
+    port: 6222
+    targetPort: route
+  {{- end }}

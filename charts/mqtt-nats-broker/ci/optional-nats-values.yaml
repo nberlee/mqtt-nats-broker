@@ -1,0 +1,4 @@
+# The external topology with the official NATS chart beside it, one server.
+topology: external
+nats:
+  enabled: true

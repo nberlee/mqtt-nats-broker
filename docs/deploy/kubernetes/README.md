@@ -18,9 +18,11 @@ kubectl apply -k docs/deploy/kubernetes/overlays/tls  # TLS
 kubectl apply -k docs/deploy/kubernetes/overlays/tls-plaintext  # TLS 8883 + plaintext 1883
 ```
 
-This example runs the broker against an external NATS. The embedded-NATS deployment
-(the broker and its JetStream peer in one pod, a StatefulSet) is section 5's topology
-bullet in `docs/ROADMAP.md`.
+This example runs the broker against an external NATS. The Helm chart in
+`charts/mqtt-nats-broker` also deploys the embedded-NATS topology (the broker and its
+JetStream server in one pod, a StatefulSet, one server or a cluster) and the official NATS
+chart beside the broker; `docs/deploy/nats-chart-shared-pod` runs the broker inside the
+official NATS chart's own pods.
 
 The plaintext base provides no transport encryption. Use it on a trusted network or
 behind separately configured TLS termination.

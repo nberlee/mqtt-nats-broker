@@ -201,6 +201,45 @@ jobs:
       - name: render and check
         run: make kubernetes-render
 
+  helm-chart:
+    name: helm chart lint and render
+    # Lints and renders the Helm chart (charts/mqtt-nats-broker: every shipped variant under
+    # ci/) and the topology-3 values for the official NATS chart with the pinned helm, and
+    # checks the output against the binary (cmd/mqtt-nats-broker/helm_chart_test.go).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: lint, render and check
+        run: make helm-check
+
+  helm-install:
+    name: helm install (${{ matrix.platform }})
+    # Installs the chart into a kind cluster with both images built for the runner: every
+    # topology under Restricted Pod Security, MQTT through JetStream, upgrade and
+    # rollback, the NATS dependency's reload, and the shared pod's shutdown order
+    # (test/helmsmoke). Native, like the image jobs.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: install and check
+        run: make helm-smoke
+
   image-external:
     name: image-external (${{ matrix.platform }})
     # Runs the external-NATS image itself, natively on each architecture, under a pod's

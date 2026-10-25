@@ -1,0 +1,8 @@
+# MQTT over TLS on 8883.
+topology: external
+broker:
+  natsURLs: nats://nats:4222
+mqtt:
+  tls:
+    enabled: true
+    secretName: mqtt-nats-broker-tls

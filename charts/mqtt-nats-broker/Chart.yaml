@@ -1,0 +1,22 @@
+apiVersion: v2
+name: mqtt-nats-broker
+description: An MQTT 3.1.1 and 5.0 broker over NATS JetStream.
+type: application
+# Illustrative and unpublished: no release exists yet, and the chart is published only as
+# part of an alpha release (docs/ROADMAP.md, section 5).
+version: 0.1.0-alpha.1
+appVersion: 0.1.0-alpha.1
+keywords:
+  - mqtt
+  - nats
+  - jetstream
+home: https://github.com/nberlee/mqtt-nats-broker
+sources:
+  - https://github.com/nberlee/mqtt-nats-broker
+dependencies:
+  # The official NATS chart, for an install that runs its own NATS beside the broker.
+  # Pinned to the nats-server version the broker is built and tested against (go.mod).
+  - name: nats
+    version: 2.15.1
+    repository: https://nats-io.github.io/k8s/helm/charts/
+    condition: nats.enabled

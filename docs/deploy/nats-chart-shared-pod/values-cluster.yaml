@@ -1,0 +1,40 @@
+# On top of values.yaml: three NATS servers in one JetStream cluster, a broker in each
+# pod, the broker's streams replicated three ways. Needs the Secret mqtt-nats-broker-routes
+# (user, password), the route credentials.
+config:
+  cluster:
+    enabled: true
+    replicas: 3
+    # Authenticated routes: a router that cannot present these credentials is refused,
+    # so reaching port 6222 is not joining the cluster (an unauthenticated route listener
+    # would let anyone who reaches it read and inject account traffic past every client
+    # ACL). The credentials come from the Secret mqtt-nats-broker-routes as NATS_CLUSTER_USER
+    # and NATS_CLUSTER_PASS; the route list, NATS_ROUTES, references them and is expanded by
+    # the kubelet, so no credential is in the rendered configuration. Both must be URL-safe.
+    merge:
+      authorization:
+        user: << $NATS_CLUSTER_USER >>
+        password: << $NATS_CLUSTER_PASS >>
+      routes: << $NATS_ROUTES >>
+
+container:
+  env:
+    # The route credentials, and the route list built from them (sorted after them, as the
+    # kubelet expands only variables declared earlier).
+    NATS_CLUSTER_USER:
+      valueFrom:
+        secretKeyRef:
+          name: mqtt-nats-broker-routes
+          key: user
+    NATS_CLUSTER_PASS:
+      valueFrom:
+        secretKeyRef:
+          name: mqtt-nats-broker-routes
+          key: password
+    NATS_ROUTES:
+      $tplYaml: >
+        {{- $routes := list }}
+        {{- range $i := until (int .Values.config.cluster.replicas) }}
+        {{- $routes = append $routes (printf "nats://$(NATS_CLUSTER_USER):$(NATS_CLUSTER_PASS)@%s-%d.%s:%d" $.Values.statefulSet.name $i $.Values.headlessService.name (int $.Values.config.cluster.port)) }}
+        {{- end }}
+        {{ printf "[%s]" (join ", " $routes) | quote }}

@@ -2,6 +2,8 @@
 /mqtt-nats-broker
 /bin/
 /dist/
+# The chart's fetched dependency (helm dependency build; Chart.lock pins it)
+/charts/mqtt-nats-broker/charts/
 *.exe
 
 # Test / coverage
