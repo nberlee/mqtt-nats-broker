@@ -274,3 +274,25 @@ func TestMQTTOptionsWebSocket(t *testing.T) {
 		t.Fatal("ws-no-tls without TLS was accepted")
 	}
 }
+
+// TestMQTTOptionsPlainPort: -plain-port reaches the core as the plaintext listener beside the
+// TLS one, on the MQTT host, and the pair passes the core's validation.
+func TestMQTTOptionsPlainPort(t *testing.T) {
+	cfg := config.Default()
+	if p := mqttOptions(cfg, nil).MQTT.PlainPort; p != 0 {
+		t.Fatalf("PlainPort with -plain-port unset = %d, want 0", p)
+	}
+	certPath, keyPath, _ := tlsFiles(t)
+	cfg.TLSCert, cfg.TLSKey, cfg.MQTTPort, cfg.PlainPort = certPath, keyPath, 8883, 1883
+	src, err := resolveTLS(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := mqttOptions(cfg, src)
+	if opts.MQTT.PlainPort != 1883 || opts.MQTT.Port != 8883 || opts.MQTT.TLSConfig == nil {
+		t.Fatalf("MQTT options = port %d, plain %d, TLS %v", opts.MQTT.Port, opts.MQTT.PlainPort, opts.MQTT.TLSConfig != nil)
+	}
+	if err := mqtt.ValidateOptions(opts); err != nil {
+		t.Fatalf("refused: %v", err)
+	}
+}

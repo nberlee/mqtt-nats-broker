@@ -746,7 +746,7 @@ func TestWSUpgradeFailuresReleaseSetup(t *testing.T) {
 			cfg := s.mqttWSListenerConfig(&s.getOpts().MQTT)
 			l := newWSFaultListener(fc)
 			t.Cleanup(func() { _ = l.Close() })
-			go s.acceptConnections(l, "fault", func(conn net.Conn) { s.createMQTTClient(conn, cfg) })
+			go s.acceptConnections(l, "fault", func(conn net.Conn) { s.createMQTTClient(conn, false, cfg) })
 
 			deadline := time.Now().Add(5 * time.Second)
 			for !fc.isClosed() {

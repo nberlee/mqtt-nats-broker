@@ -43,8 +43,9 @@ import (
 //   - the fields: none outside the set the example sets (checkKeys);
 //   - the environment: exactly the example's variable names, each one internal/config
 //     reads, accepted by config.Load, credentials from their Secret keys;
-//   - the listeners: MQTT and health bound to every address, on exactly those two
-//     distinct container ports, and only MQTT behind the Service;
+//   - the listeners: MQTT and health bound to every address, on exactly the variant's
+//     distinct container ports (plus mqtt-plain beside TLS, on PlainPort), and only the
+//     MQTT ports behind the Service;
 //   - the probes: served by healthMux, on the health port;
 //   - the grace: the drain delay plus the shutdown budgets plus headroom;
 //   - the stated security defaults: the Restricted fields, no token, a tagged image;
@@ -95,15 +96,28 @@ func TestKubernetesManifest(t *testing.T) {
 	dep, svc := baseWorkload(t, root)
 
 	t.Run("Base", func(t *testing.T) {
-		checkBrokerWorkload(t, dep, svc, false)
+		checkBrokerWorkload(t, dep, svc, listeners{})
 	})
 
+	tlsDep := applyPatchFile(t, dep, filepath.Join(root, "components/tls/deployment-patch.yaml"))
+	tlsSvc := applyPatchFile(t, svc, filepath.Join(root, "components/tls/service-patch.yaml"))
 	t.Run("TLSComponent", func(t *testing.T) {
-		tlsDep := applyPatchFile(t, dep, filepath.Join(root, "components/tls/deployment-patch.yaml"))
-		tlsSvc := applyPatchFile(t, svc, filepath.Join(root, "components/tls/service-patch.yaml"))
-		checkBrokerWorkload(t, tlsDep, tlsSvc, true)
+		checkBrokerWorkload(t, tlsDep, tlsSvc, listeners{tls: true})
+	})
+
+	// The plaintext component applies on top of the TLS one, as its overlay lists them.
+	t.Run("TLSAndPlaintextComponents", func(t *testing.T) {
+		checkBrokerWorkload(t,
+			applyPatchFile(t, tlsDep, filepath.Join(root, "components/plaintext/deployment-patch.yaml")),
+			applyPatchFile(t, tlsSvc, filepath.Join(root, "components/plaintext/service-patch.yaml")),
+			listeners{tls: true, plain: true})
 	})
 }
+
+// listeners names an example variant by the MQTT listeners it serves: the base serves
+// plaintext on its one listener; tls makes that listener TLS; plain adds the plaintext
+// listener beside TLS.
+type listeners struct{ tls, plain bool }
 
 // TestKubernetesManifestRender renders the base and the TLS overlay with the kustomize
 // binary MQTTNB_KUSTOMIZE names (make kubernetes-render installs the pinned version)
@@ -115,15 +129,16 @@ func TestKubernetesManifestRender(t *testing.T) {
 	}
 	root := manifestRoot(t)
 	for _, tc := range []struct {
-		dir     string
-		wantTLS bool
+		dir  string
+		want listeners
 	}{
-		{"base", false},
-		{"overlays/tls", true},
+		{"base", listeners{}},
+		{"overlays/tls", listeners{tls: true}},
+		{"overlays/tls-plaintext", listeners{tls: true, plain: true}},
 	} {
 		t.Run(tc.dir, func(t *testing.T) {
 			dep, svc := renderWorkload(t, bin, filepath.Join(root, tc.dir))
-			checkBrokerWorkload(t, dep, svc, tc.wantTLS)
+			checkBrokerWorkload(t, dep, svc, tc.want)
 		})
 	}
 }
@@ -313,9 +328,11 @@ func loadKustomization(t *testing.T, dir string) kustomization {
 func checkKustomizations(t *testing.T, root string) {
 	referenced := map[string]bool{}
 	want := map[string]struct{ apiVersion, kind string }{
-		"base":           {"kustomize.config.k8s.io/v1beta1", "Kustomization"},
-		"components/tls": {"kustomize.config.k8s.io/v1alpha1", "Component"},
-		"overlays/tls":   {"kustomize.config.k8s.io/v1beta1", "Kustomization"},
+		"base":                   {"kustomize.config.k8s.io/v1beta1", "Kustomization"},
+		"components/tls":         {"kustomize.config.k8s.io/v1alpha1", "Component"},
+		"components/plaintext":   {"kustomize.config.k8s.io/v1alpha1", "Component"},
+		"overlays/tls":           {"kustomize.config.k8s.io/v1beta1", "Kustomization"},
+		"overlays/tls-plaintext": {"kustomize.config.k8s.io/v1beta1", "Kustomization"},
 	}
 	for _, file := range manifestFiles(t, root) {
 		if filepath.Base(file) != "kustomization.yaml" {
@@ -360,9 +377,11 @@ func checkKustomizations(t *testing.T, root string) {
 					name, p.Path, p.Target.Group, p.Target.Version, p.Target.Kind, p.Target.Name)
 			}
 		}
-		if name == "overlays/tls" {
-			if !slices.Equal(k.Resources, []string{"../../base"}) || !slices.Equal(k.Components, []string{"../../components/tls"}) {
-				t.Errorf("overlays/tls: resources %v components %v, want the base and the tls component", k.Resources, k.Components)
+		// Each overlay is exactly the base and its components, in order: the plaintext
+		// component patches a TLS workload, so it comes after tls.
+		if want, ok := overlayComponents[name]; ok {
+			if !slices.Equal(k.Resources, []string{"../../base"}) || !slices.Equal(k.Components, want) {
+				t.Errorf("%s: resources %v components %v, want the base and %v", name, k.Resources, k.Components, want)
 			}
 		}
 	}
@@ -550,9 +569,15 @@ func deepCopy(v any) any {
 	return v
 }
 
-// checkBrokerWorkload judges a Deployment and Service against the binary. wantTLS says
-// whether the MQTT listener must be TLS from the mounted Secret.
-func checkBrokerWorkload(t *testing.T, dep, svc map[string]any, wantTLS bool) {
+// overlayComponents is each overlay's exact component list.
+var overlayComponents = map[string][]string{
+	"overlays/tls":           {"../../components/tls"},
+	"overlays/tls-plaintext": {"../../components/tls", "../../components/plaintext"},
+}
+
+// checkBrokerWorkload judges a Deployment and Service against the binary, for the variant
+// that serves the listeners want names.
+func checkBrokerWorkload(t *testing.T, dep, svc map[string]any, want listeners) {
 	t.Helper()
 	pod := mustMap(t, dep, "spec", "template", "spec")
 	containers := mustList(t, pod, "containers")
@@ -570,10 +595,13 @@ func checkBrokerWorkload(t *testing.T, dep, svc map[string]any, wantTLS bool) {
 		t.Errorf("image %q: name a release tag or digest, not latest or nothing", image)
 	}
 
-	cfg := checkEnvironment(t, c, wantTLS)
-	ports := containerPorts(t, c)
+	cfg := checkEnvironment(t, c, want)
+	ports := containerPorts(t, c, want)
 	if ports["mqtt"] != cfg.MQTTPort {
 		t.Errorf("container port mqtt %d, but the broker listens on %d", ports["mqtt"], cfg.MQTTPort)
+	}
+	if ports["mqtt-plain"] != cfg.PlainPort {
+		t.Errorf("container port mqtt-plain %d, but the plaintext listener is on %d", ports["mqtt-plain"], cfg.PlainPort)
 	}
 	httpHost, httpPort, err := net.SplitHostPort(cfg.HTTPAddr)
 	if err != nil {
@@ -592,8 +620,8 @@ func checkBrokerWorkload(t *testing.T, dep, svc map[string]any, wantTLS bool) {
 
 	checkProbes(t, c)
 	checkGrace(t, pod, cfg)
-	checkService(t, dep, svc, cfg)
-	checkTLS(t, pod, c, cfg, wantTLS)
+	checkService(t, dep, svc, cfg, want)
+	checkTLS(t, pod, c, cfg, want.tls)
 }
 
 // leaf marks a field whose value the checks below judge, or which carries no setting
@@ -741,18 +769,22 @@ var (
 		"MQTTNB_NATS_URLS", "MQTTNB_NATS_USER", "MQTTNB_NATS_PASS", "MQTTNB_DEFAULT_USER",
 		"MQTTNB_DEFAULT_PASS", "MQTTNB_LOG_LEVEL", "MQTTNB_DRAIN_DELAY",
 	}
-	exampleTLSEnv = []string{"MQTTNB_PORT", "MQTTNB_TLS_CERT", "MQTTNB_TLS_KEY"}
+	exampleTLSEnv   = []string{"MQTTNB_PORT", "MQTTNB_TLS_CERT", "MQTTNB_TLS_KEY"}
+	examplePlainEnv = []string{"MQTTNB_PLAIN_PORT"}
 )
 
 // checkEnvironment requires exactly the example's variables, each one the binary reads,
 // the credentials to come from the expected Secret keys, and returns the configuration
 // the binary derives from the environment.
-func checkEnvironment(t *testing.T, c map[string]any, wantTLS bool) *config.Config {
+func checkEnvironment(t *testing.T, c map[string]any, want listeners) *config.Config {
 	t.Helper()
 	known := configEnvNames(t)
 	allowed := slices.Clone(exampleEnv)
-	if wantTLS {
+	if want.tls {
 		allowed = append(allowed, exampleTLSEnv...)
+	}
+	if want.plain {
+		allowed = append(allowed, examplePlainEnv...)
 	}
 	wantRefs := map[string]struct {
 		key      string
@@ -862,21 +894,33 @@ func configEnvNames(t *testing.T) map[string]bool {
 	return names
 }
 
-// containerPorts requires exactly the two listeners, mqtt and health, and returns their
-// numbers. Like the fields, the set is closed: a third name could alias a listener (the
-// health port under another name) past the Service check.
-func containerPorts(t *testing.T, c map[string]any) map[string]int {
+// containerPorts requires exactly the variant's listeners (mqtt and health, and
+// mqtt-plain beside TLS) on distinct numbers, and returns them. Like the fields, the set
+// is closed: another name could alias a listener (the health port under another name)
+// past the Service check.
+func containerPorts(t *testing.T, c map[string]any, want listeners) map[string]int {
 	t.Helper()
+	names := []string{"mqtt", "health"}
+	if want.plain {
+		names = append(names, "mqtt-plain")
+	}
 	ports := map[string]int{}
+	numbers := map[int]string{}
 	for _, p := range mustList(t, c, "ports") {
 		n, _ := mustField(t, p, "containerPort").(int)
-		ports[str(mustField(t, p, "name"))] = n
+		name := str(mustField(t, p, "name"))
+		if other, dup := numbers[n]; dup {
+			t.Errorf("%s and %s share port %d: every listener binds every address, so one cannot start", other, name, n)
+		}
+		ports[name], numbers[n] = n, name
 	}
-	if len(ports) != 2 || ports["mqtt"] == 0 || ports["health"] == 0 || len(mustList(t, c, "ports")) != 2 {
-		t.Errorf("container ports %v: want exactly mqtt and health", ports)
+	if len(ports) != len(names) || len(mustList(t, c, "ports")) != len(names) {
+		t.Errorf("container ports %v: want exactly %v", ports, names)
 	}
-	if ports["mqtt"] == ports["health"] {
-		t.Errorf("mqtt and health share port %d: both listeners bind every address, so one cannot start", ports["mqtt"])
+	for _, name := range names {
+		if ports[name] == 0 {
+			t.Errorf("container ports %v: want exactly %v", ports, names)
+		}
 	}
 	return ports
 }
@@ -931,8 +975,8 @@ func checkGrace(t *testing.T, pod map[string]any, cfg *config.Config) {
 }
 
 // checkService requires the Service to select exactly this Deployment's pods and to
-// expose the MQTT listener and nothing else.
-func checkService(t *testing.T, dep, svc map[string]any, cfg *config.Config) {
+// expose the MQTT listeners and nothing else.
+func checkService(t *testing.T, dep, svc map[string]any, cfg *config.Config, want listeners) {
 	t.Helper()
 	labels := mustMap(t, dep, "spec", "template", "metadata", "labels")
 	selector := mustMap(t, svc, "spec", "selector")
@@ -944,13 +988,20 @@ func checkService(t *testing.T, dep, svc map[string]any, cfg *config.Config) {
 			t.Errorf("Service selector %s=%v does not match the pod labels %v", k, v, labels)
 		}
 	}
-	// Exactly one port, the MQTT listener: the health listener is never exposed.
-	svcPorts := mustList(t, svc, "spec", "ports")
-	if len(svcPorts) != 1 || str(mustField(t, svcPorts[0], "targetPort")) != "mqtt" {
-		t.Fatalf("Service ports %v: want exactly one, targeting mqtt", svcPorts)
+	// Exactly the MQTT listeners, each on its own port: the health listener is never
+	// exposed.
+	wantPorts := map[string]int{"mqtt": cfg.MQTTPort}
+	if want.plain {
+		wantPorts["mqtt-plain"] = cfg.PlainPort
 	}
-	if port, _ := mustField(t, svcPorts[0], "port").(int); port != cfg.MQTTPort {
-		t.Errorf("Service port %d for the MQTT listener on %d", port, cfg.MQTTPort)
+	svcPorts := mustList(t, svc, "spec", "ports")
+	got := map[string]int{}
+	for _, p := range svcPorts {
+		port, _ := mustField(t, p, "port").(int)
+		got[str(mustField(t, p, "targetPort"))] = port
+	}
+	if len(svcPorts) != len(wantPorts) || fmt.Sprint(got) != fmt.Sprint(wantPorts) {
+		t.Fatalf("Service ports %v (target: port): want exactly %v", got, wantPorts)
 	}
 }
 

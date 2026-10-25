@@ -461,3 +461,38 @@ func TestCommandLineErrorsNeverRepeatArguments(t *testing.T) {
 		}
 	}
 }
+
+// TestPlainPort: the plaintext listener beside TLS loads from either route, is off by
+// default, and is refused where it would not be a second listener: without TLS (port is
+// then already plaintext), on the TLS listener's port, or out of range.
+func TestPlainPort(t *testing.T) {
+	tlsArgs := []string{"-tls-cert", "/c.pem", "-tls-key", "/k.pem", "-port", "8883"}
+	if c, err := Load(nil); err != nil || c.PlainPort != 0 {
+		t.Fatalf("default: Load = %+v, %v; want plain-port 0", c, err)
+	}
+	if c, err := Load(append(tlsArgs, "-plain-port", "1883")); err != nil || c.PlainPort != 1883 || c.MQTTPort != 8883 {
+		t.Fatalf("flag: Load = %+v, %v", c, err)
+	}
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("MQTTNB_PLAIN_PORT", "1883")
+		if c, err := Load(tlsArgs); err != nil || c.PlainPort != 1883 {
+			t.Fatalf("Load = %+v, %v", c, err)
+		}
+	})
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"without TLS", []string{"-plain-port", "1883"}, "plain-port requires tls-cert and tls-key"},
+		{"the TLS port", append(tlsArgs[:4:4], "-port", "8883", "-plain-port", "8883"), "is the TLS listener's port"},
+		{"negative", append(tlsArgs[:6:6], "-plain-port", "-1"), "invalid plain-port"},
+		{"too big", append(tlsArgs[:6:6], "-plain-port", "65536"), "invalid plain-port"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(tc.args); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load(%q) = %v, want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+}

@@ -1,0 +1,6 @@
+- op: add
+  path: /spec/ports/-
+  value:
+    name: mqtt-plain
+    port: 1883
+    targetPort: mqtt-plain

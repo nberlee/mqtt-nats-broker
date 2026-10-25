@@ -1,0 +1,18 @@
+# Plaintext MQTT on 1883 beside the TLS listener on 8883, for clients that cannot do TLS
+# yet. Select it after the tls component: without TLS, the base already serves
+# plaintext. Credentials and payloads cross this port in clear, and no client
+# certificate is checked on it.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - path: deployment-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: mqtt-nats-broker
+  - path: service-patch.yaml
+    target:
+      version: v1
+      kind: Service
+      name: mqtt-nats-broker

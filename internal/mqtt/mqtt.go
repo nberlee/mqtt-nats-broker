@@ -511,9 +511,11 @@ var (
 type srvMQTT struct {
 	listener net.Listener
 	// wsListener is the MQTT-over-WebSocket listener; nil when it is disabled.
-	wsListener  net.Listener
-	listenerErr error
-	sessmgr     mqttSessionManager
+	wsListener net.Listener
+	// plainListener is the plaintext MQTT listener beside a TLS one; nil when it is disabled.
+	plainListener net.Listener
+	listenerErr   error
+	sessmgr       mqttSessionManager
 	// originKey is a per-server-run random secret keying the HMACs that
 	// authenticate No Local: the stamp's per-filter tags on delivered and stored
 	// messages (nolocal_stamp.go) and the origin marker on retained messages. It

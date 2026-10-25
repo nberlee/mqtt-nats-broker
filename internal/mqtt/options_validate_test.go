@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"crypto/tls"
 	"errors"
 	"math"
 	"net"
@@ -69,6 +70,23 @@ func TestStartRefusesInvalidOptions(t *testing.T) {
 			o.MQTT.Port = 18830
 			o.MQTT.Websocket = WebsocketOpts{Host: "127.0.0.1", Port: 18830}
 		}, "is the MQTT listener's address"},
+		{"plaintext port too low", func(o *Options) { o.MQTT.TLSConfig = &tls.Config{}; o.MQTT.PlainPort = -2 }, "plaintext port must be in [-1..65535]"},
+		{"plaintext port too high", func(o *Options) { o.MQTT.TLSConfig = &tls.Config{}; o.MQTT.PlainPort = 65536 }, "plaintext port must be in [-1..65535]"},
+		{"plaintext port without TLS", func(o *Options) { o.MQTT.PlainPort = -1 }, "no TLS is configured"},
+		{"plaintext port beside allow_non_tls", func(o *Options) {
+			o.MQTT.TLSConfig = &tls.Config{}
+			o.MQTT.PlainPort = -1
+			o.AllowNonTLS = true
+		}, "the TLS port stays TLS-only"},
+		{"plaintext port on the MQTT address", func(o *Options) {
+			o.MQTT.TLSConfig = &tls.Config{}
+			o.MQTT.Port, o.MQTT.PlainPort = 18831, 18831
+		}, "is the MQTT listener's address"},
+		{"plaintext port on the websocket address", func(o *Options) {
+			o.MQTT.TLSConfig = &tls.Config{}
+			o.MQTT.PlainPort = 18832
+			o.MQTT.Websocket = WebsocketOpts{Host: "127.0.0.1", Port: 18832}
+		}, "is the websocket listener's address"},
 		{"websocket path relative", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "mqtt"} }, "websocket path"},
 		{"websocket path with a query", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "/mqtt?x"} }, "websocket path"},
 		{"websocket path with a fragment", func(o *Options) { o.MQTT.Websocket = WebsocketOpts{Port: -1, Path: "/mqtt#x"} }, "websocket path"},
@@ -119,6 +137,12 @@ func TestStartAcceptsBoundaryOptions(t *testing.T) {
 		{"tls timeout largest representable", func(o *Options) { o.MQTT.TLSTimeout = timeoutLargestSeconds }},
 		{"empty pin set", func(o *Options) { o.MQTT.TLSPinnedCerts = PinnedCertSet{} }},
 		{"response information at the length limit", func(o *Options) { o.MQTT.ResponseInformation = strings.Repeat("r", 0xFFFF) }},
+		// -1 is an independent ephemeral allocation for each listener, never a collision.
+		{"plaintext, TLS and websocket all ephemeral", func(o *Options) {
+			o.MQTT.TLSConfig = &tls.Config{}
+			o.MQTT.PlainPort = -1
+			o.MQTT.Websocket = WebsocketOpts{Port: -1}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			o := validOptions()

@@ -1,0 +1,10 @@
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: MQTTNB_PLAIN_PORT
+    value: "1883"
+- op: add
+  path: /spec/template/spec/containers/0/ports/-
+  value:
+    name: mqtt-plain
+    containerPort: 1883

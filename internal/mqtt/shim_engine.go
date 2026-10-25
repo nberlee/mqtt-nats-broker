@@ -102,6 +102,11 @@ type Options struct {
 type MQTTOpts struct {
 	Host string
 	Port int
+	// PlainPort adds a plaintext MQTT listener on Host beside the TLS one on Port: 0
+	// disables it, -1 binds an ephemeral port. Refused without TLSConfig, since without TLS
+	// Port already serves plaintext. A connection's mode is its listener's, so this one never
+	// handshakes, never sniffs, and never sees the client CA.
+	PlainPort int
 
 	AuthTimeout    float64
 	TLSTimeout     float64

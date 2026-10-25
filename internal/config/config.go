@@ -36,7 +36,11 @@ type Config struct {
 	// MQTT listener.
 	MQTTHost string
 	MQTTPort int
-	MaxConns int
+	// PlainPort, when nonzero, adds a plaintext MQTT listener on MQTTHost beside the TLS
+	// one on MQTTPort, so one broker serves 1883 and 8883 together. It exists only beside
+	// TLS: without TLS, MQTTPort is already the plaintext listener.
+	PlainPort int
+	MaxConns  int
 	// ConnectTimeout bounds how long an accepted connection may hold a socket, a
 	// registration and a readLoop without having sent a CONNECT. Fail-closed:
 	// there is no value that disables the bound, so 0 and negative are refused
@@ -177,6 +181,7 @@ func Load(args []string) (*Config, error) {
 	c.ConsumerRep = envInt("MQTTNB_CONSUMER_REPLICAS", c.ConsumerRep)
 	c.MQTTHost = env("MQTTNB_HOST", c.MQTTHost)
 	c.MQTTPort = envInt("MQTTNB_PORT", c.MQTTPort)
+	c.PlainPort = envInt("MQTTNB_PLAIN_PORT", c.PlainPort)
 	c.MaxConns = envInt("MQTTNB_MAX_CONNS", c.MaxConns)
 	c.KeepAliveMax = envInt("MQTTNB_KEEPALIVE_MAX", c.KeepAliveMax)
 	c.ResponseInfo = env("MQTTNB_RESPONSE_INFO", c.ResponseInfo)
@@ -280,6 +285,7 @@ func registerFlags(fs *flag.FlagSet, c *Config) {
 	fs.IntVar(&c.ConsumerRep, "consumer-replicas", c.ConsumerRep, "JetStream consumer replicas (0=follow stream)")
 	fs.StringVar(&c.MQTTHost, "host", c.MQTTHost, "MQTT listen host")
 	fs.IntVar(&c.MQTTPort, "port", c.MQTTPort, "MQTT listen port")
+	fs.IntVar(&c.PlainPort, "plain-port", c.PlainPort, "additional plaintext MQTT listen port beside the TLS -port (0=disabled; requires -tls-cert/-tls-key)")
 	fs.IntVar(&c.MaxConns, "max-conns", c.MaxConns, "max concurrent MQTT clients (0=unlimited)")
 	fs.IntVar(&c.KeepAliveMax, "keepalive-max", c.KeepAliveMax, "MQTT 5.0 Server Keep Alive cap in seconds (0=no override)")
 	fs.StringVar(&c.ResponseInfo, "response-info", c.ResponseInfo, "MQTT 5.0 Response Information base topic (empty=never sent)")
@@ -341,6 +347,15 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid tls-reload-interval %s (must be > 0)", c.TLSReloadInterval)
 	}
 	// The core reads -1 as an ephemeral port, which is not an operator setting.
+	if c.PlainPort < 0 || c.PlainPort > 65535 {
+		return fmt.Errorf("invalid plain-port %d (0 disables, else 1-65535)", c.PlainPort)
+	}
+	if c.PlainPort != 0 && !c.TLSEnabled() {
+		return fmt.Errorf("plain-port requires tls-cert and tls-key: without TLS, port is already the plaintext listener")
+	}
+	if c.PlainPort != 0 && c.PlainPort == c.MQTTPort {
+		return fmt.Errorf("plain-port %d is the TLS listener's port", c.PlainPort)
+	}
 	if c.WSPort < 0 || c.WSPort > 65535 {
 		return fmt.Errorf("invalid ws-port %d (0 disables, else 1-65535)", c.WSPort)
 	}

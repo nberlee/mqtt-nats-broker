@@ -119,6 +119,7 @@ Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
 | `-keepalive-max` | `MQTTNB_KEEPALIVE_MAX` | `0` (no override) | MQTT 5.0 Server Keep Alive cap (seconds) |
 | `-response-info` | `MQTTNB_RESPONSE_INFO` | | MQTT 5.0 Response Information base topic |
 | `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS (set `-port 8883`) |
+| `-plain-port` | `MQTTNB_PLAIN_PORT` | `0` (off) | Additional plaintext MQTT listener beside the TLS `-port` (requires `-tls-cert`/`-tls-key`). Credentials and payloads cross it in clear, and no client certificate is checked on it |
 | `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS (requires cert+key) |
 | `-tls-reload-interval` | `MQTTNB_TLS_RELOAD_INTERVAL` | `10s` | How often the TLS files are re-read for a renewal. Must be `> 0` |
 | `-ws-port` | `MQTTNB_WS_PORT` | `0` (off) | MQTT over WebSocket listen port; the other `-ws-*` flags require it |
@@ -143,10 +144,12 @@ unlimited. A failure to read the limit is logged and does not stop startup
 
 Setting `-tls-cert` and `-tls-key` turns the MQTT listener into a TLS listener;
 adding `-tls-ca` additionally requires and verifies client certificates (mTLS).
-The broker serves **one** MQTT-over-TCP listener: `-port` selects it in either mode, and there
-is no implicit port change when the TLS flags are set — TLS deployments should
-pass `-port 8883` (the conventional MQTT-over-TLS port). Serving plaintext 1883
-and TLS 8883 simultaneously is not supported.
+`-port` selects the MQTT-over-TCP listener in either mode, and there is no implicit
+port change when the TLS flags are set: TLS deployments should pass `-port 8883` (the
+conventional MQTT-over-TLS port). To serve plaintext 1883 and TLS 8883 at once, while
+clients move to TLS, add `-plain-port 1883` beside TLS. Credentials and payloads cross
+that port in clear, and no client certificate is checked on it
+([details](docs/ARCHITECTURE.md#plaintext-mqtt-beside-tls)).
 
 TLS configuration fails closed: an unreadable or invalid certificate, key, or
 client CA aborts startup before anything is bound, so a broken TLS setup can

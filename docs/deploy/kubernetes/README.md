@@ -6,11 +6,21 @@ deployment they do not run. It is a kustomize tree:
 - `base`: the Deployment and a LoadBalancer Service, plaintext MQTT on 1883.
 - `components/tls`: MQTT over TLS on 8883 from a mounted Secret.
 - `overlays/tls`: the base with the TLS component, the entry point for TLS.
+- `components/plaintext`: plaintext MQTT on 1883 beside TLS on 8883, for clients that
+  cannot do TLS yet. Credentials and payloads cross 1883 in clear, and no client
+  certificate is checked on it.
+- `overlays/tls-plaintext`: the base with the TLS and plaintext components, both ports
+  on one Service.
 
 ```sh
 kubectl apply -k docs/deploy/kubernetes/base          # plaintext
 kubectl apply -k docs/deploy/kubernetes/overlays/tls  # TLS
+kubectl apply -k docs/deploy/kubernetes/overlays/tls-plaintext  # TLS 8883 + plaintext 1883
 ```
+
+This example runs the broker against an external NATS. The embedded-NATS deployment
+(the broker and its JetStream peer in one pod, a StatefulSet) is section 5's topology
+bullet in `docs/ROADMAP.md`.
 
 The plaintext base provides no transport encryption. Use it on a trusted network or
 behind separately configured TLS termination.

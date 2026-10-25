@@ -160,3 +160,18 @@ func TestRunRefusesNATSURLCredentialsBeforeStartup(t *testing.T) {
 		})
 	}
 }
+
+// TestRunRefusesPlainPortWithoutTLSBeforeStartup: a plaintext listener beside a TLS one that
+// does not exist is refused before NATS is dialed or the health port is bound.
+func TestRunRefusesPlainPortWithoutTLSBeforeStartup(t *testing.T) {
+	isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
+	httpAddr := reservedAddr(t)
+	err := run([]string{"-nats", "nats://" + reservedAddr(t), "-http-addr", httpAddr, "-plain-port", "1883"})
+	if err == nil || !strings.Contains(err.Error(), "plain-port requires tls-cert and tls-key") {
+		t.Fatalf("run() = %v, want the plain-port refusal", err)
+	}
+	if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
+		_ = c.Close()
+		t.Errorf("health server is listening on %s after a refused startup", httpAddr)
+	}
+}

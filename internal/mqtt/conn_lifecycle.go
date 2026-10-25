@@ -64,8 +64,8 @@ func (s *Server) startMQTT() {
 		s.Fatalf("Unable to listen for MQTT connections: %v", err)
 		return
 	}
-	// Both listeners are bound before either accepts, so a WebSocket bind failure leaves
-	// nothing open and nothing accepting: Start returns the error with the MQTT port free.
+	// Every listener is bound before any accepts, so a WebSocket or plaintext bind failure
+	// leaves nothing open and nothing accepting: Start returns the error with every port free.
 	var wl net.Listener
 	if ws := &o.Websocket; ws.Port != 0 {
 		wport := ws.Port
@@ -84,17 +84,43 @@ func (s *Server) startMQTT() {
 			ws.Port = wl.Addr().(*net.TCPAddr).Port
 		}
 	}
+	var pl net.Listener
+	if o.PlainPort != 0 {
+		pport := o.PlainPort
+		if pport == -1 {
+			pport = 0
+		}
+		pl, err = natsListen("tcp", net.JoinHostPort(o.Host, strconv.Itoa(pport)))
+		if err != nil {
+			_ = hl.Close()
+			if wl != nil {
+				_ = wl.Close()
+			}
+			s.mqtt.listenerErr = err
+			s.mu.Unlock()
+			s.Fatalf("Unable to listen for plaintext MQTT connections: %v", err)
+			return
+		}
+		if pport == 0 {
+			o.PlainPort = pl.Addr().(*net.TCPAddr).Port
+		}
+	}
 	if port == 0 {
 		o.Port = hl.Addr().(*net.TCPAddr).Port
 	}
 	s.mqtt.listener = hl
 	s.mqtt.wsListener = wl
+	s.mqtt.plainListener = pl
 	scheme := "mqtt"
 	if o.TLSConfig != nil {
 		scheme = "tls"
 	}
 	s.Noticef("Listening for MQTT clients on %s://%s:%d", scheme, o.Host, o.Port)
-	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, nil) })
+	go s.acceptConnections(hl, "MQTT", func(conn net.Conn) { s.createMQTTClient(conn, false, nil) })
+	if pl != nil {
+		s.Noticef("Listening for MQTT clients on mqtt://%s:%d", o.Host, o.PlainPort)
+		go s.acceptConnections(pl, "plaintext MQTT", func(conn net.Conn) { s.createMQTTClient(conn, true, nil) })
+	}
 	if wl != nil {
 		cfg := s.mqttWSListenerConfig(o)
 		wscheme := "ws"
@@ -102,7 +128,7 @@ func (s *Server) startMQTT() {
 			wscheme = "wss"
 		}
 		s.Noticef("Listening for MQTT over WebSocket clients on %s://%s:%d%s", wscheme, o.Websocket.Host, o.Websocket.Port, cfg.path)
-		go s.acceptConnections(wl, "MQTT over WebSocket", func(conn net.Conn) { s.createMQTTClient(conn, cfg) })
+		go s.acceptConnections(wl, "MQTT over WebSocket", func(conn net.Conn) { s.createMQTTClient(conn, false, cfg) })
 	}
 	s.mu.Unlock()
 }
@@ -124,12 +150,13 @@ func (s *Server) mqttWSListenerConfig(o *MQTTOpts) *wsListenerConfig {
 // The comments have been kept to minimum to reduce code size. Check createClient() for
 // more details.
 //
-// ws is nil for the MQTT listener and the listener's handshake configuration for the
-// WebSocket one. Setup runs registration, then the TLS handshake, then the WebSocket
+// ws is nil for the TCP listeners and the listener's handshake configuration for the
+// WebSocket one; plain marks the plaintext listener beside TLS, whose connections never
+// handshake whatever TLSConfig holds. Setup runs registration, then the TLS handshake, then the WebSocket
 // upgrade, then the CONNECT deadline: the upgrade comes after registration so that the
 // shutdown drain, which closes the rawConn of every registered client, also releases a setup
 // goroutine stalled in it.
-func (s *Server) createMQTTClient(conn net.Conn, ws *wsListenerConfig) *client {
+func (s *Server) createMQTTClient(conn net.Conn, plain bool, ws *wsListenerConfig) *client {
 	opts := s.getOpts()
 
 	maxPay := int32(opts.MaxPayload)
@@ -182,7 +209,7 @@ func (s *Server) createMQTTClient(conn net.Conn, ws *wsListenerConfig) *client {
 	s.clientWG.Add(1)
 
 	mqttTestSetupStage(c, "registered")
-	tlsRequired := opts.MQTT.TLSConfig != nil
+	tlsRequired := opts.MQTT.TLSConfig != nil && !plain
 	if ws != nil {
 		// The WebSocket listener's mode is fixed by configuration; the AllowNonTLS
 		// first-byte sniffing below belongs to the MQTT listener alone.
@@ -355,7 +382,37 @@ func ValidateOptions(o *Options) error {
 	if len(mo.TLSPinnedCerts) > 0 {
 		return errors.New("mqtt TLS certificate pinning is not supported")
 	}
+	if err := validatePlainListenerOptions(mo, o.AllowNonTLS); err != nil {
+		return err
+	}
 	return validateWebsocketOptions(mo)
+}
+
+// validatePlainListenerOptions refuses a plaintext listener that would not be the second
+// listener it claims to be: one without TLS beside it (Port is then already plaintext), one
+// beside allowNonTLS (which would also admit plaintext on Port, so the TLS listener would not
+// be TLS-only), or one on another listener's address. -1 is an independent ephemeral
+// allocation, never a collision.
+func validatePlainListenerOptions(mo *MQTTOpts, allowNonTLS bool) error {
+	if mo.PlainPort < -1 || mo.PlainPort > 65535 {
+		return fmt.Errorf("mqtt plaintext port must be in [-1..65535] (0 disables, -1 ephemeral), got %d", mo.PlainPort)
+	}
+	if mo.PlainPort == 0 {
+		return nil
+	}
+	if mo.TLSConfig == nil {
+		return errors.New("mqtt plaintext port is set but no TLS is configured, so the MQTT listener is already plaintext")
+	}
+	if allowNonTLS {
+		return errors.New("mqtt plaintext port and allow_non_tls are both set: plaintext belongs on the plaintext port, and the TLS port stays TLS-only")
+	}
+	if mo.PlainPort > 0 && mo.PlainPort == mo.Port {
+		return fmt.Errorf("mqtt plaintext listener %s:%d is the MQTT listener's address", mo.Host, mo.PlainPort)
+	}
+	if mo.PlainPort > 0 && mo.PlainPort == mo.Websocket.Port && mo.Websocket.Host == mo.Host {
+		return fmt.Errorf("mqtt plaintext listener %s:%d is the websocket listener's address", mo.Host, mo.PlainPort)
+	}
+	return nil
 }
 
 // validateWebsocketOptions refuses a WebSocket configuration whose effect would differ from

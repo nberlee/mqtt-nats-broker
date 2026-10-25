@@ -9403,14 +9403,14 @@ reads](findings/resolved.md#f-054).
   - the expiry warning skipped on refused and in-flux checks, or flagged globally;
   - the soak's classifier blind to `internal/tlsreload`.
 
-- [ ] **Serve plaintext and TLS MQTT at once, for example 1883 and 8883.** Filed
+- [x] **Serve plaintext and TLS MQTT at once, for example 1883 and 8883.** Filed
   2026-10-25 by the user's decision, which reverses the earlier one above ("one
   listener, `-port` selects it in either mode ... serving 1883 and 8883 at once is not
   supported"). Today the TCP listener is plaintext or TLS, never both, so a deployment
   moving clients to TLS needs two Deployments or a cutover. The second WebSocket listener
   (`-ws-port`, with `-ws-no-tls`) is the precedent for a second listener in the core.
   What the item has to settle:
-  - the flags: a separate TLS port beside `-port`, how each is enabled, the defaults, and
+  - the flags: a second listener beside `-port`, how each is enabled, the defaults, and
     whether the README's "no implicit port change" rule still holds;
   - what is shared and what is per listener: the `-max-conns` bound, the CONNECT
     deadline, readiness (`/readyz` only once both are up), and shutdown closing both
@@ -9420,6 +9420,52 @@ reads](findings/resolved.md#f-054).
   - the example deployment: `docs/deploy/kubernetes` (section 5) checks exactly two
     container ports and one Service port, so a dual-listener option there needs its own
     port and Service entries and the test's closed sets widened to match.
+
+  **Done 2026-10-25, with the user's addition:** "add a Kubernetes example of this
+  feature, maybe with NATS embedded". Decided by consult (`-port` versus a new TLS port;
+  the example's scope):
+  - **Flags.** `-port` keeps its meaning: plaintext, or TLS when `-tls-cert`/`-tls-key`
+    are set, like `-ws-port`, so the "no implicit port change" rule holds. A new
+    `-plain-port` / `MQTTNB_PLAIN_PORT`, off by default, adds a plaintext listener on
+    `-host` beside TLS: `-port 8883 -tls-cert … -tls-key … -plain-port 1883`. It is
+    refused without TLS, on `-port`'s value, on the WebSocket address, and beside the
+    programmatic `AllowNonTLS` (which would sniff plaintext onto the TLS port).
+  - **Mode per listener.** `createMQTTClient` takes the listener's mode. The plaintext
+    listener never handshakes, sniffs or asks for a client certificate, and `-tls-ca`
+    binds the TLS port only.
+  - **Shared.** `MaxConn`, the per-connection CONNECT deadline, one TLS reload, bind
+    atomicity across all three listeners, a synchronous close in `BeginShutdown`, and
+    readiness after every listener accepts. Credentials and payloads cross the plaintext
+    port in clear, stated in `docs/ARCHITECTURE.md` "Plaintext MQTT beside TLS" and the
+    README.
+  - **The example.** `components/plaintext` and `overlays/tls-plaintext` serve 8883 and
+    1883 on one Service. The manifest test's closed sets are per variant: env, container
+    ports (`mqtt-plain` equal to `PlainPort`) and Service ports. The overlay order (tls,
+    then plaintext) is checked statically. Embedded NATS is NOT in this item: it is a
+    design of its own (StatefulSet, PVCs, route credentials), recorded in the section 5
+    topology bullet, which the example's README cross-references.
+
+  Tests: config and wiring (untagged); core validation rows, including all three
+  listeners ephemeral (untagged); and tagged `internal/mqtt/mqtt_plain_listener_test.go`:
+  - both modes served;
+  - the client CA required on TLS only;
+  - a bind failure releasing the MQTT and WebSocket ports;
+  - the close checked while the shutdown worker is held;
+  - `MaxConn` shared in both admission orders;
+  - the CONNECT deadline on the plaintext port, slots released.
+
+  Fifteen mutations were run, and each fails its paired test, static and render where
+  paired:
+  - the mode not carried;
+  - `AllowNonTLS` accepted beside the plaintext port;
+  - the close moved into the asynchronous lifecycle;
+  - a bind failure leaving WebSocket open;
+  - the TLS requirement removed (core and config), and each collision check removed
+    (core `-port`, core WebSocket, config `-port`);
+  - `MaxConn` per listener;
+  - the manifest's plaintext Service port missing, its env value off its container port,
+    the plaintext env in the TLS overlay, the components reordered (static only: the
+    render still succeeds), and the plaintext Service port aimed at health.
 
 ### WebSocket
 
@@ -9695,6 +9741,9 @@ reads](findings/resolved.md#f-054).
   normal NATS chart values there without translating every field.
 
 - [ ] Offer the broker as an extra container in the official NATS chart's pods.
+  The user asked (2026-10-25, with the plaintext-beside-TLS item) for a Kubernetes example
+  "maybe with NATS embedded"; that example is topology 1 below and lands here, not in
+  `docs/deploy/kubernetes`, whose README points to this bullet.
   Filed 2026-10-24 by the user's decision on deployment topologies (section 4, the
   embedded-NATS bullet): this is topology 3. It uses the external-NATS image, added
   through the NATS chart's own `values.yaml`, and connects to `localhost:4222`. Offer

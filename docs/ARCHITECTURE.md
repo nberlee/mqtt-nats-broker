@@ -14122,12 +14122,15 @@ only the CLI contract and settings outside `Options`: a port greater than 0 (the
 core accepts 0 and -1 as ephemeral), a connect timeout greater than 0 (the core
 reads a nonpositive one as the default), NATS URLs without credentials (see "What a
 deployment must allow"), the JetStream domain token, TLS file
-pairing, the TLS reload interval (greater than 0), the drain delay, the log level, and
+pairing, the TLS reload interval (greater than 0), the drain delay, the log level,
+`-plain-port` (0 to 65535, only with TLS, not `-port`'s value), and
 the WebSocket flags (`-ws-port` 0 to 65535, `-ws-handshake-timeout` greater than 0, and no
 other `-ws-*` flag without `-ws-port`). `ValidateOptions` checks the WebSocket options
 themselves: a port, a setting for a disabled listener, the MQTT listener's own address, a
 path that is not an escaped absolute path, an allowed origin that is not
-`scheme://host[:port]`, and a plaintext opt-out without TLS.
+`scheme://host[:port]`, and a plaintext opt-out without TLS. It checks the plaintext
+listener beside TLS too: its range, TLS configured, no `AllowNonTLS`, and a positive port
+that is not the MQTT or WebSocket listener's (see "Plaintext MQTT beside TLS").
 The TLS files themselves are judged by `internal/tlsreload`, the same validation at
 startup and at every reload (see "TLS material reload").
 
@@ -14851,6 +14854,38 @@ including a check it was running. Each read opens and closes its file. A superse
 material is released once the last connection admitted under it has gone, and the
 resource soak checks that, per configuration and per client-CA pool.
 
+## Plaintext MQTT beside TLS
+
+`-plain-port` (`MQTTNB_PLAIN_PORT`, off by default) adds a plaintext MQTT listener on the
+`-host` address beside the TLS listener on `-port`, so one broker serves 8883 and 1883 at
+once while clients move to TLS. `-port` keeps its meaning: plaintext, or TLS when
+`-tls-cert`/`-tls-key` are set, the same rule the WebSocket listener follows. So
+`-plain-port` is refused without TLS, since `-port` is then already the plaintext
+listener, and on `-port`'s own value. The core refuses it on the WebSocket listener's
+address too, and beside the programmatic `AllowNonTLS` (which would also admit plaintext
+on `-port`, so the TLS listener would not be TLS-only). An ephemeral request (`-1`, tests
+only) is never a collision.
+
+**A connection's mode is its listener's.** `createMQTTClient` takes the listener's mode:
+on the plaintext listener `tlsRequired` is false whatever `TLSConfig` holds, so the
+connection never handshakes and never sees the client CA. Since `AllowNonTLS` is
+refused beside it, the TLS listener never sniffs a plaintext connection in either. A
+client certificate is required (`-tls-ca`) on the TLS listener only. This is two ports
+with fixed modes, not upstream's `AllowNonTLS`, which guesses the mode per connection on
+one port and holds a silent peer for the TLS timeout.
+
+**What is shared.** `MaxConn` counts the clients of every listener (one `s.clients`
+map). The CONNECT deadline is per connection. There is one `TLSConfig` and one reload,
+which the plaintext listener does not use. Every listener is bound before any accepts,
+so a failed bind closes those already bound and Start fails with every port free.
+`BeginShutdown` closes all three synchronously, and readiness turns true only after
+`serveMQTT` returns with every listener accepting.
+
+**In clear.** On the plaintext listener MQTT credentials (auth passthrough's user and
+password) and payloads cross the network unencrypted, and no client certificate is
+checked, even with `-tls-ca`. That is the operator's choice in enabling it, stated
+here and in the README, not a conformance residual.
+
 ## MQTT over WebSocket
 
 A second listener, enabled by `-ws-port`, carries MQTT over WebSocket (RFC 6455) and secure
@@ -15426,7 +15461,9 @@ test covers.
 `docs/deploy/kubernetes` is the example for topology 2 (the broker as its own
 Deployment, NATS elsewhere) with the external-NATS image. It is a kustomize tree: `base`
 (a Deployment and a LoadBalancer Service, plaintext MQTT), `components/tls` (a Component
-of two JSON6902 patches) and `overlays/tls` (the base with the component). Its README
+of two JSON6902 patches), `overlays/tls` (the base with it), `components/plaintext`
+(1883 beside TLS, see "Plaintext MQTT beside TLS"), and `overlays/tls-plaintext` (the
+base with tls then plaintext, the order the plaintext patches assume). Its README
 lists the prerequisites. All configuration is environment, so that the TLS component
 adds to it and the test evaluates it with the binary's own loader.
 
@@ -15487,8 +15524,10 @@ the manifest (a request above its limit, a malformed quantity):
   from its Secret key and none in a literal (no `@`, and NATS URLs name `nats://` or
   `tls://`), and `config.Load` accepting the environment;
 - both listeners bound to every address (the kubelet probes, and the Service forwards
-  to, the pod IP), on exactly two distinct container ports, `mqtt` and `health`; the Service
-  selects the pods and has exactly one port, MQTT, so health is never exposed;
+  to, the pod IP), on exactly the variant's distinct container ports (`mqtt` and
+  `health`, plus `mqtt-plain` beside TLS, equal to `PlainPort`); the Service selects the
+  pods and has exactly the MQTT ports (`mqtt`, plus `mqtt-plain` in the dual variant), so
+  health is never exposed;
 - the probe paths are served by `healthMux` (liveness 200, readiness 503 before ready);
 - the grace is at least the drain delay plus the three exported budgets plus the
   headroom;

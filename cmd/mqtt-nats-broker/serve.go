@@ -57,6 +57,8 @@ func mqttOptions(cfg *config.Config, tlsSrc *tlsreload.Source) *mqtt.Options {
 		opts.MQTT.TLSConfig = tlsSrc.ServerConfig()
 		opts.MQTT.TLSTimeout = mqttTLSHandshakeTimeout
 	}
+	// The plaintext listener beside TLS; config.Validate has refused it without TLS.
+	opts.MQTT.PlainPort = cfg.PlainPort
 	if cfg.WSPort != 0 {
 		host := cfg.WSHost
 		if host == "" {

@@ -102,6 +102,15 @@ func (s *Server) Addr() net.Addr {
 	return s.mqtt.listener.Addr()
 }
 
+// PlainAddr returns the bound plaintext MQTT listener address beside TLS, or nil when that
+// listener is disabled.
+func (s *Server) PlainAddr() net.Addr {
+	if s.mqtt.plainListener == nil {
+		return nil
+	}
+	return s.mqtt.plainListener.Addr()
+}
+
 // WSAddr returns the bound MQTT-over-WebSocket listener address, or nil when that listener
 // is disabled.
 func (s *Server) WSAddr() net.Addr {
@@ -145,6 +154,9 @@ func (s *Server) BeginShutdown() <-chan struct{} {
 		if s.mqtt.wsListener != nil {
 			_ = s.mqtt.wsListener.Close()
 		}
+		if s.mqtt.plainListener != nil {
+			_ = s.mqtt.plainListener.Close()
+		}
 		go s.runShutdown()
 	})
 	return s.shutdownDone
@@ -185,6 +197,9 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 // (willWorkerWG, admitted via admitWillWorker) drain before quitCh closes.
 func (s *Server) runShutdown() {
 	defer close(s.shutdownDone)
+	if h := mqttTestShutdownEntryV.Load(); h != nil {
+		(*h)(s)
+	}
 
 	deadline := time.Now().Add(ShutdownDrainTimeout)
 

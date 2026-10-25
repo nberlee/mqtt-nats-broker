@@ -39,7 +39,7 @@ fails if the exit does not happen.
 | Resource | Owner | Ends on | Joined by shutdown | Verdict |
 |---|---|---|---|---|
 | `runShutdown` | server | all phases complete | is the lifecycle | verified |
-| accept loop (`acceptConnections`) | server | listener closed during shutdown; errors while running back off | untracked; exits on the synchronous listener close | D6 fixed; verified |
+| accept loop (`acceptConnections`), one per listener: MQTT, the plaintext listener beside TLS (`-plain-port`), WebSocket | server | listener closed during shutdown; errors while running back off | untracked; each exits on its listener's synchronous close in `BeginShutdown` (`TestMQTTPlainListenerClosedByBeginShutdown`) | D6 fixed; verified |
 | connection setup (`createMQTTClient`) | connection | setup done; TLS and peek deadlines | `connSetupWG` | carried |
 | `readLoop` | connection | read or parse error, then `disconnect` | `clientWG` | carried |
 | `writeLoop` | connection | returns at once | `grWG` | carried |

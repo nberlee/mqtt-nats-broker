@@ -1021,6 +1021,9 @@ var (
 	// mqttTestShutdownClientsJoinedV runs when shutdown Phase 1's clientWG wait returned. Nil in
 	// production.
 	mqttTestShutdownClientsJoinedV atomic.Pointer[func()]
+	// mqttTestShutdownEntryV runs on entry to runShutdown, after BeginShutdown has closed the
+	// listeners. Nil in production.
+	mqttTestShutdownEntryV atomic.Pointer[func(s *Server)]
 	// mqttTestClosedClientEntryV runs on entry to mqttHandleClosedClient. Nil in production.
 	mqttTestClosedClientEntryV atomic.Pointer[func(c *client)]
 	// mqttTestReadLoopErrorV runs when the readLoop's handling of a packet ends the connection
