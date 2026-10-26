@@ -521,7 +521,7 @@ func (sess *mqttSession) disarmIfNonresident(as *mqttAccountSessionManager) bool
 	// then finds an unarmed session, while an implementation that released the lock lets it
 	// through to find an armed one and schedule nothing. Without the seam the two orders
 	// are a scheduling accident and the regression is untestable.
-	if hook := mqttTestExclusionReclaimDisarmHook; hook != nil {
+	if hook := mqttTestExclusionReclaimDisarmHook.Get(); hook != nil {
 		hook()
 	}
 	sess.mu.Lock()
@@ -532,7 +532,7 @@ func (sess *mqttSession) disarmIfNonresident(as *mqttAccountSessionManager) bool
 
 // mqttTestExclusionReclaimDisarmHook runs inside disarmIfNonresident's critical section,
 // between the nonresident observation and the disarm. Nil in production.
-var mqttTestExclusionReclaimDisarmHook func()
+var mqttTestExclusionReclaimDisarmHook = new(mqttKnob[func()])
 
 // snapshotExclusionReclaimLocked_ takes the next batch of exclusions to confirm, and reports
 // whether the read budget was met — which is what tells the caller to retry at the short

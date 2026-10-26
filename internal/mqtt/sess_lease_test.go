@@ -529,9 +529,9 @@ func TestMQTTLeasedHandlerRefusalDoesNotWriteTheFreshIncarnation(t *testing.T) {
 // QoS 2 message was the observable cost.
 func TestMQTTRetirementWaitsForAnAdmittedRoute(t *testing.T) {
 	e := testNewInflightEnv(t, "lease-drain-waits")
-	prev := mqttIncarnationDrainTimeout
-	mqttIncarnationDrainTimeout = 3 * time.Second
-	t.Cleanup(func() { mqttIncarnationDrainTimeout = prev })
+	prev := mqttIncarnationDrainTimeout.Get()
+	mqttIncarnationDrainTimeout.Set(3 * time.Second)
+	t.Cleanup(func() { mqttIncarnationDrainTimeout.Set(prev) })
 
 	e.sess.mu.Lock()
 	e.sess.c = e.c
@@ -592,9 +592,9 @@ func TestMQTTRetirementWaitsForAnAdmittedRoute(t *testing.T) {
 // destroying state.
 func TestMQTTRetirementCeilingRefusesAndPreservesTheIncumbent(t *testing.T) {
 	e := testNewInflightEnv(t, "lease-ceiling")
-	prev := mqttIncarnationDrainTimeout
-	mqttIncarnationDrainTimeout = 250 * time.Millisecond
-	t.Cleanup(func() { mqttIncarnationDrainTimeout = prev })
+	prev := mqttIncarnationDrainTimeout.Get()
+	mqttIncarnationDrainTimeout.Set(250 * time.Millisecond)
+	t.Cleanup(func() { mqttIncarnationDrainTimeout.Set(prev) })
 
 	e.sess.mu.Lock()
 	e.sess.c = e.c
@@ -643,9 +643,9 @@ func TestMQTTRetirementCeilingRefusesAndPreservesTheIncumbent(t *testing.T) {
 // composition rather than for the bound retirement.
 func TestMQTTClearDrainsAnUnboundIncarnation(t *testing.T) {
 	e := testNewInflightEnv(t, "lease-unbound-drain")
-	prev := mqttIncarnationDrainTimeout
-	mqttIncarnationDrainTimeout = 250 * time.Millisecond
-	t.Cleanup(func() { mqttIncarnationDrainTimeout = prev })
+	prev := mqttIncarnationDrainTimeout.Get()
+	mqttIncarnationDrainTimeout.Set(250 * time.Millisecond)
+	t.Cleanup(func() { mqttIncarnationDrainTimeout.Set(prev) })
 
 	e.sess.mu.Lock()
 	e.sess.c = nil
@@ -693,9 +693,9 @@ func TestMQTTClearDrainsAnUnboundIncarnation(t *testing.T) {
 // CONNECT for this client ID happened to arrive.
 func TestMQTTPendingDiscardFinisherRetriesThroughAHeldGate(t *testing.T) {
 	e := testNewInflightEnv(t, "lease-pending-gate")
-	prevItvl := mqttPendingDiscardRetryItvl
-	mqttPendingDiscardRetryItvl = 5 * time.Millisecond
-	t.Cleanup(func() { mqttPendingDiscardRetryItvl = prevItvl })
+	prevItvl := mqttPendingDiscardRetryItvl.Get()
+	mqttPendingDiscardRetryItvl.Set(5 * time.Millisecond)
+	t.Cleanup(func() { mqttPendingDiscardRetryItvl.Set(prevItvl) })
 
 	// Park the obligation the way the ceiling does, on a drained closing tracker.
 	e.sess.mu.Lock()
@@ -910,9 +910,9 @@ func TestMQTTPendingDiscardRefusesAStaleObject(t *testing.T) {
 // referenced consumers would keep the orphan sweep away from them indefinitely.
 func TestMQTTPendingDiscardWorkerCompletesWhenAdmissionIsRefused(t *testing.T) {
 	e := testNewInflightEnv(t, "lease-admission-refused")
-	prev := mqttIncarnationDrainTimeout
-	mqttIncarnationDrainTimeout = 2 * time.Second
-	t.Cleanup(func() { mqttIncarnationDrainTimeout = prev })
+	prev := mqttIncarnationDrainTimeout.Get()
+	mqttIncarnationDrainTimeout.Set(2 * time.Second)
+	t.Cleanup(func() { mqttIncarnationDrainTimeout.Set(prev) })
 
 	// Shutdown has closed worker admission.
 	e.s.closeWillDispatch()

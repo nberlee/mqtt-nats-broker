@@ -813,11 +813,11 @@ func TestMQTTv5TakeoverDisconnectEndingSurvivesCancelledHandoff(t *testing.T) {
 
 	// The refused takeover jailed the client ID as a flapper; a reconnect inside the jail
 	// is closed before it reaches the session at all, which would test nothing.
-	checkFor(t, 2*mqttSessJailDur+testMQTTTimeout, 50*time.Millisecond, func() error {
+	checkFor(t, 2*mqttSessJailDur.Get()+testMQTTTimeout, 50*time.Millisecond, func() error {
 		f.asm.mu.Lock()
 		tm, jailed := f.asm.flappers[cid]
 		f.asm.mu.Unlock()
-		if jailed && time.Since(tm) <= mqttSessJailDur {
+		if jailed && time.Since(tm) <= mqttSessJailDur.Get() {
 			return fmt.Errorf("%q is still jailed as a flapper", cid)
 		}
 		return nil

@@ -125,7 +125,7 @@ var mqttExpiryRetryAfterRetiring = time.Second
 // admitted routes and queued effects to complete. It is on the order of the JS API
 // timeout: a wedged owner turns into a bounded discard ceiling, never an unbounded
 // wait or a disposal under a live owner.
-var mqttIncarnationDrainTimeout = 2 * mqttDefaultJSAPITimeout
+var mqttIncarnationDrainTimeout = newMQTTKnob(2 * mqttDefaultJSAPITimeout)
 
 // clearWithSelfLease is clear() for a caller that holds its own lease on the
 // incarnation being discarded (expireSessionFired fires holding its fire-time lease):
@@ -156,7 +156,7 @@ func (sess *mqttSession) clearInner(noWait bool, selfLease *mqttLease,
 	if selfLease != nil {
 		t.promote(selfLease)
 	}
-	ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+	ceiling := time.NewTimer(mqttIncarnationDrainTimeout.Get())
 	drained := t.waitDrained(ceiling.C)
 	ceiling.Stop()
 	if !drained {

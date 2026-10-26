@@ -647,7 +647,7 @@ func TestWSConnWaitingPongFollowsAClearedDeadline(t *testing.T) {
 	tc.mu.Lock()
 	pongDL := tc.writes[len(tc.writes)-1].dl
 	tc.mu.Unlock()
-	if pongDL.IsZero() || !near(pongDL, time.Now().Add(mqttWriteDeadline), 2*time.Second) {
+	if pongDL.IsZero() || !near(pongDL, time.Now().Add(mqttWriteDeadline.Get()), 2*time.Second) {
 		t.Fatalf("Pong written under %v, want its own bound", pongDL)
 	}
 	if !tc.currentWriteDL().IsZero() {
@@ -678,7 +678,7 @@ func TestWSConnClearDuringAPongKeepsThePongBound(t *testing.T) {
 	}
 	_ = w.SetWriteDeadline(time.Time{})
 	got := tc.currentWriteDL()
-	if got.IsZero() || got.Equal(stale) || !near(got, time.Now().Add(mqttWriteDeadline), 2*time.Second) {
+	if got.IsZero() || got.Equal(stale) || !near(got, time.Now().Add(mqttWriteDeadline.Get()), 2*time.Second) {
 		t.Fatalf("after the clear the socket holds %v during the Pong, want the Pong's own bound", got)
 	}
 	close(gate)

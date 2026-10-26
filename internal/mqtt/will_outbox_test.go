@@ -685,7 +685,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 			return fmt.Errorf("load publishing record: %v", err)
 		}
 		rec1.ClaimOwner = "peer-node"
-		rec1.ClaimUntil = time.Now().Add(mqttWillClaimLease).UnixNano()
+		rec1.ClaimUntil = time.Now().Add(mqttWillClaimLease.Get()).UnixNano()
 		s2, serr := asm.jsa.storeWillOutboxCAS(subject, s1, rec1)
 		if serr != nil {
 			return fmt.Errorf("advance record to a higher sequence: %w", serr)
@@ -711,7 +711,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	// No further lease-recovery cycle: the record stays gone and the Will was
 	// published exactly once across a full lease window (a broken reconcile would
 	// re-fire and publish twice).
-	time.Sleep(mqttWillClaimLease + mqttWillClaimInterval + 200*time.Millisecond)
+	time.Sleep(mqttWillClaimLease.Get() + mqttWillClaimInterval.Get() + 200*time.Millisecond)
 	if rec, _, err := asm.jsa.loadWillOutbox(asm.domainTk, subject); err != nil || rec != nil {
 		t.Fatalf("record reappeared after lease window (err=%v rec=%v)", err, rec)
 	}
@@ -891,7 +891,7 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 			pub := *rec
 			pub.State = mqttWillPublishing
 			pub.ClaimOwner = s.NodeName()
-			pub.ClaimUntil = time.Now().Add(mqttWillClaimLease).UnixNano()
+			pub.ClaimUntil = time.Now().Add(mqttWillClaimLease.Get()).UnixNano()
 			if _, aerr := asm.jsa.storeWillOutboxCAS(subject, seq, &pub); aerr != nil {
 				return 0, fmt.Errorf("advance-to-publishing failed: %v", aerr)
 			}
@@ -1262,12 +1262,13 @@ func testMQTTHasWillState(t testing.TB, asm *mqttAccountSessionManager, want mqt
 // parallel. Nothing in this package calls t.Parallel.
 func withLongWillScan(t *testing.T) {
 	t.Helper()
-	prevInterval, prevLease := mqttWillClaimInterval, mqttWillClaimLease
-	mqttWillClaimInterval = 30 * time.Second
+	prevInterval, prevLease := mqttWillClaimInterval.Get(), mqttWillClaimLease.Get()
+	mqttWillClaimInterval.Set(30 * time.Second)
 	// Keep the lease above the interval, as production does.
-	mqttWillClaimLease = 60 * time.Second
+	mqttWillClaimLease.Set(60 * time.Second)
 	t.Cleanup(func() {
-		mqttWillClaimInterval, mqttWillClaimLease = prevInterval, prevLease
+		mqttWillClaimInterval.Set(prevInterval)
+		mqttWillClaimLease.Set(prevLease)
 	})
 }
 
@@ -1764,7 +1765,7 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 	publishing := *pending
 	publishing.State = mqttWillPublishing
 	publishing.ClaimOwner = "someone-else"
-	publishing.ClaimUntil = time.Now().Add(mqttWillClaimLease).UnixNano()
+	publishing.ClaimUntil = time.Now().Add(mqttWillClaimLease.Get()).UnixNano()
 	if _, err := asm.jsa.storeWillOutboxCAS(subject, staleSeq, &publishing); err != nil {
 		t.Fatalf("advance record to publishing: %v", err)
 	}

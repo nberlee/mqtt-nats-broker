@@ -60,7 +60,7 @@ import (
 // mqttInboundWindow bounds a connection's reserved positions. A PUBLISH or PUBREL arriving at
 // a full pipe waits for space before its packet lease is taken (back-pressure on the socket).
 // A variable only so a test can fill it.
-var mqttInboundWindow = 1024
+var mqttInboundWindow = newMQTTKnob(1024)
 
 var (
 	// errMQTTInboundAborted reports work refused or dropped because the connection's abort
@@ -452,7 +452,7 @@ func (p *mqttInboundPipe) enqueueLocked(j *mqttInboundJob) {
 func (p *mqttInboundPipe) waitSpace() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for len(p.jobs) >= mqttInboundWindow {
+	for len(p.jobs) >= mqttInboundWindow.Get() {
 		if !p.waitLocked() {
 			return errMQTTInboundAborted
 		}

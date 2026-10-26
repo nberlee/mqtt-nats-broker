@@ -503,7 +503,7 @@ func (s *Server) pendingDiscardFinisher(asm *mqttAccountSessionManager,
 				return
 			}
 			select {
-			case <-time.After(mqttPendingDiscardRetryItvl):
+			case <-time.After(mqttPendingDiscardRetryItvl.Get()):
 			case <-s.quitCh:
 				return
 			}
@@ -514,7 +514,7 @@ func (s *Server) pendingDiscardFinisher(asm *mqttAccountSessionManager,
 // mqttPendingDiscardRetryItvl is how long the pending-discard finisher waits before
 // re-attempting the client-ID gate. Short, because the common case is the parking
 // caller's own gate hold, which ends within one bounded teardown.
-var mqttPendingDiscardRetryItvl = 25 * time.Millisecond
+var mqttPendingDiscardRetryItvl = newMQTTKnob(25 * time.Millisecond)
 
 // finishPendingDiscard claims a parked retirement-pending discard and completes it.
 //
@@ -898,7 +898,7 @@ func (s *Server) armPendingDiscardWorker(t *mqttIncarnationTracker, finisher fun
 		return
 	}
 	if !s.admitWillWorker() {
-		ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+		ceiling := time.NewTimer(mqttIncarnationDrainTimeout.Get())
 		defer ceiling.Stop()
 		select {
 		case <-drained:

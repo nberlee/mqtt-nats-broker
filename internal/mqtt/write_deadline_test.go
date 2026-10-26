@@ -229,9 +229,9 @@ func (testStubAddr) String() string  { return "test" }
 // not scale with it, and the restore runs after every goroutine has been joined.
 func testShortWriteDeadline(t *testing.T, d time.Duration) {
 	t.Helper()
-	prev := mqttWriteDeadline
-	mqttWriteDeadline = d
-	t.Cleanup(func() { mqttWriteDeadline = prev })
+	prev := mqttWriteDeadline.Get()
+	mqttWriteDeadline.Set(d)
+	t.Cleanup(func() { mqttWriteDeadline.Set(prev) })
 }
 
 // testStalledClient wires a stalled connection into a client the way production
@@ -467,7 +467,7 @@ func TestF035CapSelectsTheEarlierBound(t *testing.T) {
 		}
 	})
 
-	t.Run("a longer remaining budget loses to mqttWriteDeadline", func(t *testing.T) {
+	t.Run("a longer remaining budget loses to mqttWriteDeadline.Get()", func(t *testing.T) {
 		c, sc := testStalledClient(t)
 		sc.setWritable(true)
 		cap := time.Now().Add(time.Hour)
@@ -479,8 +479,8 @@ func TestF035CapSelectsTheEarlierBound(t *testing.T) {
 		if len(all) != 2 {
 			t.Fatalf("deadlines = %v, want an install and a clear", all)
 		}
-		if !all[0].Before(before.Add(mqttWriteDeadline + 100*time.Millisecond)) {
-			t.Fatalf("installed %v, want at most now+mqttWriteDeadline: a far cap must not widen the bound", all[0])
+		if !all[0].Before(before.Add(mqttWriteDeadline.Get() + 100*time.Millisecond)) {
+			t.Fatalf("installed %v, want at most now+mqttWriteDeadline.Get(): a far cap must not widen the bound", all[0])
 		}
 	})
 
@@ -573,7 +573,7 @@ func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 		}
 	})
 
-	t.Run("mqttWriteDeadline caps the write when the budget is later", func(t *testing.T) {
+	t.Run("mqttWriteDeadline.Get() caps the write when the budget is later", func(t *testing.T) {
 		testShortWriteDeadline(t, 200*time.Millisecond)
 		s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
 		c, sc := testDrainableClient(t, s)
@@ -587,8 +587,8 @@ func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 		if len(all) == 0 {
 			t.Fatal("the drain installed no deadline at all")
 		}
-		if !all[0].Before(before.Add(mqttWriteDeadline + 100*time.Millisecond)) {
-			t.Fatalf("the drain installed %v, want at most now+mqttWriteDeadline: a far drain budget must not widen the bound", all[0])
+		if !all[0].Before(before.Add(mqttWriteDeadline.Get() + 100*time.Millisecond)) {
+			t.Fatalf("the drain installed %v, want at most now+mqttWriteDeadline.Get(): a far drain budget must not widen the bound", all[0])
 		}
 	})
 
@@ -1046,7 +1046,7 @@ func TestF035ShutdownCapIsCapturedBeforeContending(t *testing.T) {
 	}
 	// Captured before contending, the cap is at most start+mqttWriteDeadline.
 	// Computed after wmu was won, it would be roughly the incumbent's timeout later.
-	if drainDeadline.After(start.Add(mqttWriteDeadline + 200*time.Millisecond)) {
-		t.Fatalf("the drain's write got a deadline of %v, more than mqttWriteDeadline after the drain step began at %v: the cap was computed AFTER the wmu wait, so contention silently renewed the budget", drainDeadline, start)
+	if drainDeadline.After(start.Add(mqttWriteDeadline.Get() + 200*time.Millisecond)) {
+		t.Fatalf("the drain's write got a deadline of %v, more than mqttWriteDeadline.Get() after the drain step began at %v: the cap was computed AFTER the wmu wait, so contention silently renewed the budget", drainDeadline, start)
 	}
 }

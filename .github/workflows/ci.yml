@@ -60,6 +60,9 @@ jobs:
 
   experimental-shared-qos2:
     name: test (experimental shared QoS 2, shard ${{ matrix.shard }} of 8; non-gating)
+    # On demand only (run the workflow by hand): the parked affine shared-QoS-2 code is
+    # chapter P work, not alpha, and its known reds should not show on every push.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 60

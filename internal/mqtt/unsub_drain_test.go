@@ -297,6 +297,10 @@ func TestMQTTDrainDiscardsWithheldDeliveries(t *testing.T) {
 	testMQTTPublish(t, pc, pr, 1, false, false, "withheld/topic", 1, []byte("payload"))
 	_, pi := testMQTTReadPublishV5(t, r, "withheld/topic", []byte("payload"))
 
+	// From here until the read after UNSUBSCRIBE, AckWait (250 ms) re-offers the
+	// transmitted message whenever it lapses, between any two of the reads below.
+	redelivered := filterRedeliveries(t, r, "withheld/topic", []byte("payload"), pi)
+
 	// The second cannot be transmitted while the first is unacknowledged.
 	testMQTTPublish(t, pc, pr, 1, false, false, "withheld/topic", 2, []byte("withheld"))
 	testMQTTExpectNothing(t, r)
@@ -328,6 +332,7 @@ func TestMQTTDrainDiscardsWithheldDeliveries(t *testing.T) {
 
 	// Completing the transmitted one retires the drain; the withheld message is
 	// never delivered.
+	redelivered.remove()
 	_, got := testMQTTReadPublishV5(t, r, "withheld/topic", []byte("payload"))
 	if got != pi {
 		t.Errorf("redelivered identifier = %v, want the original %v", got, pi)
@@ -340,6 +345,160 @@ func TestMQTTDrainDiscardsWithheldDeliveries(t *testing.T) {
 		return nil
 	})
 	testMQTTExpectNothing(t, r)
+}
+
+// redeliveryFilter sits under a test's reader while a transmitted QoS 1 message stays
+// unacknowledged under a short AckWait. JetStream re-offers it each time AckWait lapses,
+// and that retransmission is legitimate: what I5 forbids is transmitting the WITHHELD
+// message, not resending the transmitted one. The filter drops exactly that resend, a DUP
+// QoS 1 PUBLISH with the message's topic, packet identifier and payload, and passes every
+// other frame through, so the assertions above it see any withheld message, any other
+// identifier and every control packet as they would with no timer running.
+type redeliveryFilter struct {
+	r       *mqttReader
+	conn    mqttIOReader
+	topic   string
+	payload []byte
+	pi      uint16
+	in, out []byte
+	dropped int
+}
+
+func filterRedeliveries(t *testing.T, r *mqttReader, topic string, payload []byte, pi uint16) *redeliveryFilter {
+	t.Helper()
+	if r.hasMore() || len(r.pbuf) > 0 {
+		t.Fatal("the reader holds unread bytes; the filter would not see them")
+	}
+	f := &redeliveryFilter{r: r, conn: r.reader, topic: topic, payload: payload, pi: pi}
+	r.reader = f
+	return f
+}
+
+// remove puts the connection back under the reader, handing it the bytes the filter
+// had read but not yet passed on.
+func (f *redeliveryFilter) remove() {
+	leftover := append(f.out, f.in...)
+	f.r.reader = f.conn
+	if len(leftover) > 0 {
+		f.r.reset(leftover)
+	}
+}
+
+func (f *redeliveryFilter) SetReadDeadline(d time.Time) error { return f.conn.SetReadDeadline(d) }
+
+func (f *redeliveryFilter) Read(p []byte) (int, error) {
+	for len(f.out) == 0 {
+		if frame, rest, ok := testMQTTNextFrame(f.in); ok {
+			f.in = rest
+			if f.isRedelivery(frame) {
+				f.dropped++
+			} else {
+				f.out = append(f.out, frame...)
+			}
+			continue
+		}
+		var buf [512]byte
+		n, err := f.conn.Read(buf[:])
+		f.in = append(f.in, buf[:n]...)
+		if err != nil {
+			if _, _, ok := testMQTTNextFrame(f.in); !ok {
+				return 0, err
+			}
+		}
+	}
+	n := copy(p, f.out)
+	f.out = f.out[n:]
+	return n, nil
+}
+
+// isRedelivery reports whether frame is a DUP QoS 1 PUBLISH of exactly the filtered
+// message in MQTT 5.0 framing: its topic, its identifier, an empty property section
+// (the broker sends the resend with none) and its payload. Anything else, a malformed
+// frame included, is not dropped and reaches the assertions.
+func (f *redeliveryFilter) isRedelivery(frame []byte) bool {
+	// The resend is short, so its remaining length is one byte (the minimal encoding of a
+	// length below 128); a longer encoding of the same length is malformed and passes.
+	if frame[0] != mqttPacketPub|mqttPubFlagDup|mqttPubQos1 || frame[1]&0x80 != 0 || int(frame[1]) != len(frame)-2 {
+		return false
+	}
+	body := frame[2:]
+	if len(body) < 2 {
+		return false
+	}
+	tl := int(body[0])<<8 | int(body[1])
+	if len(body) < 2+tl+3 || string(body[2:2+tl]) != f.topic {
+		return false
+	}
+	body = body[2+tl:]
+	if uint16(body[0])<<8|uint16(body[1]) != f.pi || body[2] != 0 {
+		return false
+	}
+	return string(body[3:]) == string(f.payload)
+}
+
+// testMQTTNextFrame splits the first whole MQTT packet off b, if b holds one.
+func testMQTTNextFrame(b []byte) (frame, rest []byte, ok bool) {
+	if len(b) < 2 {
+		return nil, b, false
+	}
+	length, mult, i := 0, 1, 1
+	for ; ; i++ {
+		if i >= len(b) || i > 4 {
+			return nil, b, false
+		}
+		length += int(b[i]&0x7f) * mult
+		mult *= 128
+		if b[i]&0x80 == 0 {
+			break
+		}
+	}
+	end := i + 1 + length
+	if end > len(b) {
+		return nil, b, false
+	}
+	return b[:end], b[end:], true
+}
+
+// TestRedeliveryFilterDropsOnlyTheExactResend pins what the filter may hide: the exact DUP
+// QoS 1 resend, and nothing that differs from it in any field.
+func TestRedeliveryFilterDropsOnlyTheExactResend(t *testing.T) {
+	f := &redeliveryFilter{topic: "withheld/topic", payload: []byte("payload"), pi: 1}
+	frame := func(first byte, topic string, pi uint16, props []byte, payload string) []byte {
+		body := append([]byte{byte(len(topic) >> 8), byte(len(topic))}, topic...)
+		body = append(body, byte(pi>>8), byte(pi))
+		body = append(body, props...)
+		body = append(body, payload...)
+		return append([]byte{first, byte(len(body))}, body...)
+	}
+	dupQoS1 := mqttPacketPub | mqttPubFlagDup | mqttPubQos1
+	exact := []byte{58, 26, 0, 14, 119, 105, 116, 104, 104, 101, 108, 100, 47, 116, 111, 112, 105, 99, 0, 1, 0, 112, 97, 121, 108, 111, 97, 100}
+	for _, c := range []struct {
+		name  string
+		frame []byte
+		drop  bool
+	}{
+		{"the exact resend (as CI received it)", exact, true},
+		{"the withheld message", frame(dupQoS1, "withheld/topic", 1, []byte{0}, "withheld"), false},
+		{"another identifier", frame(dupQoS1, "withheld/topic", 2, []byte{0}, "payload"), false},
+		{"another topic", frame(dupQoS1, "other/topic", 1, []byte{0}, "payload"), false},
+		{"not marked DUP", frame(mqttPacketPub|mqttPubQos1, "withheld/topic", 1, []byte{0}, "payload"), false},
+		{"QoS 2", frame(mqttPacketPub|mqttPubFlagDup|mqttPubQoS2, "withheld/topic", 1, []byte{0}, "payload"), false},
+		{"a property present", frame(dupQoS1, "withheld/topic", 1, []byte{2, 0x01, 0x01}, "payload"), false},
+		{"an invalid property", frame(dupQoS1, "withheld/topic", 1, []byte{2, 0x01, 0xff}, "payload"), false},
+		{"an overlong property length", frame(dupQoS1, "withheld/topic", 1, []byte{0x80, 0x80, 0x80, 0x80, 0x00}, "payload"), false},
+		// Malformed: claims 5 property bytes, then the payload follows where an empty
+		// section's would; only the property-length check refuses it.
+		{"a property length with no properties", frame(dupQoS1, "withheld/topic", 1, []byte{5}, "payload"), false},
+		{"truncated", frame(dupQoS1, "withheld/topic", 1, nil, ""), false},
+		// The pinned resend with its remaining length (26) encoded in 2, 3 and 4 bytes.
+		{"a two-byte remaining length", append([]byte{58, 0x9a, 0x00}, exact[2:]...), false},
+		{"a three-byte remaining length", append([]byte{58, 0x9a, 0x80, 0x00}, exact[2:]...), false},
+		{"a four-byte remaining length", append([]byte{58, 0x9a, 0x80, 0x80, 0x00}, exact[2:]...), false},
+	} {
+		if got := f.isRedelivery(c.frame); got != c.drop {
+			t.Errorf("%s: dropped = %v, want %v", c.name, got, c.drop)
+		}
+	}
 }
 
 // TestMQTTDrainRefusedUnderStreamConsumerLimit is test 26: where the messages
@@ -630,9 +789,9 @@ func TestMQTTDrainSurvivesOrphanSweep(t *testing.T) {
 	// before the shutdown one: deferred calls run last-registered-first, so this
 	// ordering is what puts the restore AFTER the server (and the periodic sweep
 	// goroutine that reads this variable) has stopped.
-	origGrace := mqttOrphanSweepGrace
-	mqttOrphanSweepGrace = -time.Second
-	defer func() { mqttOrphanSweepGrace = origGrace }()
+	origGrace := mqttOrphanSweepGrace.Get()
+	mqttOrphanSweepGrace.Set(-time.Second)
+	defer func() { mqttOrphanSweepGrace.Set(origGrace) }()
 
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

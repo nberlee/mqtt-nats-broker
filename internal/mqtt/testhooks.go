@@ -21,6 +21,30 @@ import (
 	"time"
 )
 
+// mqttKnob is a package setting a test may change: an interval, a bound, or a hook. Servers
+// started by other tests can still be reading it on their own goroutines when a test
+// changes it, so every read and write is atomic; production only reads. A zero knob holds
+// the zero value (a nil hook).
+type mqttKnob[T any] struct{ p atomic.Pointer[T] }
+
+func newMQTTKnob[T any](v T) *mqttKnob[T] {
+	k := new(mqttKnob[T])
+	k.Set(v)
+	return k
+}
+
+// Get is the knob's current value.
+func (k *mqttKnob[T]) Get() T {
+	if v := k.p.Load(); v != nil {
+		return *v
+	}
+	var zero T
+	return zero
+}
+
+// Set changes the knob for every reader from now on.
+func (k *mqttKnob[T]) Set(v T) { k.p.Store(&v) }
+
 // Test hook: called once sweepSessionExpiries has finished a full pass over the
 // records. A test seeding an already-overdue record needs to know that the
 // STARTUP pass is behind it — that pass is launched asynchronously from the

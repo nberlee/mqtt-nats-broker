@@ -421,15 +421,15 @@ var (
 	mqttPingResponse     = []byte{mqttPacketPingResp, 0x0}
 	mqttProtoName        = []byte("MQTT")
 	mqttOldProtoName     = []byte("MQIsdp")
-	mqttSessJailDur      = mqttSessFlappingJailDur
-	mqttFlapCleanItvl    = mqttSessFlappingCleanupInterval
-	mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL
+	mqttSessJailDur      = newMQTTKnob(mqttSessFlappingJailDur)
+	mqttFlapCleanItvl    = newMQTTKnob(mqttSessFlappingCleanupInterval)
+	mqttRetainedCacheTTL = newMQTTKnob(mqttDefaultRetainedCacheTTL)
 	// How old a consumer must be before the orphan sweep may delete it: a plain
 	// session durable is created before the record save that references it, so a
 	// young unreferenced consumer may just be mid-SUBSCRIBE. A var so tests can
 	// shorten it; the orphan QoS 2 sweep additionally supports an instance-scoped
 	// override, because it is read by a goroutine a test cannot synchronize with.
-	mqttOrphanSweepGrace = 5 * time.Minute
+	mqttOrphanSweepGrace = newMQTTKnob(5 * time.Minute)
 	// Ceiling on how long a delivery waits for a gate to release its subscription:
 	// the reconciliation phase's per-subscription gate, and the connection-scoped
 	// restore verdict. The bound exists so a CONNECT that dies without releasing —
@@ -444,7 +444,7 @@ var (
 	// timed-out wait is a DISTINCT verdict from a refusal and why the two classes
 	// carrying no withheld marker (PUBREL, affine copies) NAK on it rather than
 	// returning. See mqttTransmissionTimedOut and mqttSub.phaseGate.
-	mqttPhaseGateWaitMax = 30 * time.Second
+	mqttPhaseGateWaitMax = newMQTTKnob(30 * time.Second)
 )
 
 var (

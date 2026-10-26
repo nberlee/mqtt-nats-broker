@@ -908,8 +908,8 @@ func init() {
 	// Speed up the delayed-Will claim loop for tests: firing granularity is the
 	// scan interval (production defaults are 5s/30s), so a short interval keeps
 	// will-delay tests fast while keeping the lease safely above it.
-	mqttWillClaimInterval = 50 * time.Millisecond
-	mqttWillClaimLease = 2 * time.Second
+	mqttWillClaimInterval.Set(50 * time.Millisecond)
+	mqttWillClaimLease.Set(2 * time.Second)
 }
 
 // testMQTTNumPendingWills returns the number of delayed Wills currently pending
@@ -9221,9 +9221,9 @@ func TestMQTTv5CleanStartDrainCeilingRefusesWithServerBusy(t *testing.T) {
 	// The ceiling is restored only AFTER the server has shut down: the incumbent's close is
 	// processed by the server after the test body returns, and its discard reads this global.
 	// Restored first (defers run last-registered first), the restore raced that read.
-	prev := mqttIncarnationDrainTimeout
-	mqttIncarnationDrainTimeout = 300 * time.Millisecond
-	defer func() { mqttIncarnationDrainTimeout = prev }()
+	prev := mqttIncarnationDrainTimeout.Get()
+	mqttIncarnationDrainTimeout.Set(300 * time.Millisecond)
+	defer func() { mqttIncarnationDrainTimeout.Set(prev) }()
 
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)

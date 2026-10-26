@@ -464,7 +464,7 @@ func TestSharedConsInRecordIsRefusedAtEveryIngress(t *testing.T) {
 
 		// Age every candidate past the sweep's grace window, or nothing is eligible and
 		// the assertion below would hold for the wrong reason.
-		e.asm.sweepOrphanedConsumersBefore(e.s, time.Now().Add(2*mqttOrphanSweepGrace))
+		e.asm.sweepOrphanedConsumersBefore(e.s, time.Now().Add(2*mqttOrphanSweepGrace.Get()))
 
 		if ci, err := e.asm.jsa.lookupConsumer(mqttStreamName, orphan); err != nil || ci == nil {
 			t.Fatalf("the unrelated orphan was DELETED (%v), so the sweep continued past a record "+

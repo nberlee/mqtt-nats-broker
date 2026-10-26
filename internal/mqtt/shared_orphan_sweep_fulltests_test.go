@@ -158,9 +158,9 @@ func TestMQTTSharedSubscriptionOrphanSweepRetiresUnderTheGroupRecord(t *testing.
 	s.Shutdown()
 	// Restored in a Cleanup, which runs after every defer — so after the restarted broker's
 	// shutdown, when no sweep goroutine can still read it.
-	oldGrace := mqttOrphanSweepGrace
-	t.Cleanup(func() { mqttOrphanSweepGrace = oldGrace })
-	mqttOrphanSweepGrace = 0
+	oldGrace := mqttOrphanSweepGrace.Get()
+	t.Cleanup(func() { mqttOrphanSweepGrace.Set(oldGrace) })
+	mqttOrphanSweepGrace.Set(0)
 	o.MQTT.Port = -1
 	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)

@@ -9357,10 +9357,9 @@ reads](findings/resolved.md#f-054).
   QoS 1 subscriber took 39.9 s (5.0 msg/s, median gap 203 ms), 60 took 10 s (6.0 msg/s,
   121 ms); the same 200 to a QoS 0 subscriber took 49 ms, and accepting the QoS 1
   publishes took 88 ms. So the slowdown is in outbound QoS 1 delivery and reproduces
-  without NFS or replication; how much the storage adds on top, and whether QoS 2 delivery
-  has the same ceiling, is not measured. At this rate a burst to a QoS 1 subscriber, such
-  as Home Assistant or Node-RED resubscribing after a restart, would take minutes. What
-  is known: the JetStream path benchmark above measured about 105 requests per QoS 1
+  without NFS or replication. At this rate a burst to a QoS 1 subscriber, such as Home
+  Assistant or Node-RED resubscribing after a restart, would take minutes. What is
+  known: the JetStream path benchmark above measured about 105 requests per QoS 1
   delivery, about 98 of them message GETs on `$MQTT_inflight` (the outbound obligation
   records), at 48-65 ms against an in-process server; it also found that almost every
   delivery's first admission attempt loses its CAS on the source consumer's resource
@@ -9372,7 +9371,32 @@ reads](findings/resolved.md#f-054).
   QoS 1 and QoS 2 delivery to one subscriber (and to several), the profile of one
   delivery, and a change that raises the rate without giving up an invariant
   `docs/ARCHITECTURE.md` states, or a stated residual in `docs/CONFORMANCE.md` with the
-  measured ceiling if the cost is the design's.
+  measured ceiling if the cost is the design's. Possibly the same cause, unconfirmed:
+  the Paho interoperability suite's `test_flow_control2` (Receive Maximum with many QoS 1
+  and 2 messages) failed in CI on 2026-10-26 against its baseline, after passing in the
+  run before; check it against the benchmark before treating it separately.
+
+  Measured against stock nats-server 2.15.1's own MQTT listener on the same 3-node
+  cluster and NFS storage, both with their MQTT streams file-backed at R3 (checked with
+  `nats stream report`), publishing to pod 0 and receiving on pod 1 (operator,
+  2026-10-26):
+
+  | Test | nats-server 2.15.1 | mqtt-nats-broker |
+  |---|---|---|
+  | QoS 0 latency at 2 msg/s, median | 1.4 ms | 1.3 ms |
+  | QoS 1 latency at 2 msg/s, median | 4.5 ms | 79 ms |
+  | QoS 2 latency at 2 msg/s, median | 10.7 ms | 179 ms |
+  | QoS 0 burst of 100 | 943 msg/s | 886 msg/s |
+  | QoS 1 burst of 100 | 788 msg/s | 4 msg/s (28 s) |
+  | QoS 2 burst of 100 | 420 msg/s | 3 msg/s (33 s) |
+
+  So QoS 0 matches, and QoS 1 and 2 are 15-20 times slower at a steady rate and 100-200
+  times slower in a burst on the same storage; nats-server's listener pays about one store
+  and one acknowledgement per message. QoS 2 delivery shows the same ceiling, so the
+  deliverable covers it. Also seen in that run, to reproduce here: a QoS 2 SUBSCRIBE was
+  refused when the client identifier was reused about a second after its previous
+  connection closed (not with unique identifiers); a quick reconnect with the same
+  identifier should not be refused.
 
 ### NATS platform follow-ups
 

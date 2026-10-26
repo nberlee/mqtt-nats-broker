@@ -69,9 +69,15 @@ func TestResourceWebSocketChurn(t *testing.T) {
 	prevRate := runtime.MemProfileRate
 	runtime.MemProfileRate = 4096
 	t.Cleanup(func() { runtime.MemProfileRate = prevRate })
-	prevJail, prevFlap, prevTTL := mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL
-	mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL = 50*time.Millisecond, 250*time.Millisecond, 500*time.Millisecond
-	t.Cleanup(func() { mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL = prevJail, prevFlap, prevTTL })
+	prevJail, prevFlap, prevTTL := mqttSessJailDur.Get(), mqttFlapCleanItvl.Get(), mqttRetainedCacheTTL.Get()
+	mqttSessJailDur.Set(50 * time.Millisecond)
+	mqttFlapCleanItvl.Set(250 * time.Millisecond)
+	mqttRetainedCacheTTL.Set(500 * time.Millisecond)
+	t.Cleanup(func() {
+		mqttSessJailDur.Set(prevJail)
+		mqttFlapCleanItvl.Set(prevFlap)
+		mqttRetainedCacheTTL.Set(prevTTL)
+	})
 
 	o := testMQTTDefaultOptions()
 	o.MQTT.Websocket = WebsocketOpts{Host: "127.0.0.1", Port: -1, HandshakeTimeout: 200 * time.Millisecond}

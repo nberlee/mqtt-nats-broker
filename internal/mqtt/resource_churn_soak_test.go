@@ -416,7 +416,7 @@ func quiesce(t *testing.T, s *Server, as *mqttAccountSessionManager, persistent 
 	t.Helper()
 	deadline := time.Now().Add(resourceSoakQuiesce)
 	// The sweeps run on their own timers; wait past one full period of each.
-	time.Sleep(2*mqttFlapCleanItvl + 2*mqttRetainedCacheTTL + 2*time.Second)
+	time.Sleep(2*mqttFlapCleanItvl.Get() + 2*mqttRetainedCacheTTL.Get() + 2*time.Second)
 	for {
 		rc := countResources(s, as)
 		var pending []string
@@ -537,9 +537,15 @@ func TestResourceChurnSingleBroker(t *testing.T) {
 	prevRate := runtime.MemProfileRate
 	runtime.MemProfileRate = 4096
 	t.Cleanup(func() { runtime.MemProfileRate = prevRate })
-	prevJail, prevFlap, prevTTL := mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL
-	mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL = 50*time.Millisecond, 250*time.Millisecond, 500*time.Millisecond
-	t.Cleanup(func() { mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL = prevJail, prevFlap, prevTTL })
+	prevJail, prevFlap, prevTTL := mqttSessJailDur.Get(), mqttFlapCleanItvl.Get(), mqttRetainedCacheTTL.Get()
+	mqttSessJailDur.Set(50 * time.Millisecond)
+	mqttFlapCleanItvl.Set(250 * time.Millisecond)
+	mqttRetainedCacheTTL.Set(500 * time.Millisecond)
+	t.Cleanup(func() {
+		mqttSessJailDur.Set(prevJail)
+		mqttFlapCleanItvl.Set(prevFlap)
+		mqttRetainedCacheTTL.Set(prevTTL)
+	})
 
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second

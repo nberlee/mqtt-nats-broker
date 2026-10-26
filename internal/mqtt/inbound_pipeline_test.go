@@ -1073,9 +1073,9 @@ func TestMQTTInboundPipeRegistrationsAndJoin(t *testing.T) {
 // is still held (M18: the close does not fire the abort latch). The service-account
 // invalidation's close fires it too.
 func TestMQTTInboundPipeShutdownAbortsEveryWait(t *testing.T) {
-	prevWindow := mqttInboundWindow
-	mqttInboundWindow = 2
-	t.Cleanup(func() { mqttInboundWindow = prevWindow })
+	prevWindow := mqttInboundWindow.Get()
+	mqttInboundWindow.Set(2)
+	t.Cleanup(func() { mqttInboundWindow.Set(prevWindow) })
 
 	t.Run("shutdown", func(t *testing.T) {
 		f := newInboundPipeFix(t, "pipe-shut-a", nil)
@@ -1434,9 +1434,9 @@ func TestMQTTInboundPipeSameIdentifierChain(t *testing.T) {
 // TestMQTTInboundPipeLeases: queued jobs take their leases in FIFO order (M15a), and a started
 // job owns one (M15b).
 func TestMQTTInboundPipeLeases(t *testing.T) {
-	prev := mqttIncarnationDrainTimeout
-	mqttIncarnationDrainTimeout = 3 * time.Second
-	t.Cleanup(func() { mqttIncarnationDrainTimeout = prev })
+	prev := mqttIncarnationDrainTimeout.Get()
+	mqttIncarnationDrainTimeout.Set(3 * time.Second)
+	t.Cleanup(func() { mqttIncarnationDrainTimeout.Set(prev) })
 
 	type ev struct {
 		event  string

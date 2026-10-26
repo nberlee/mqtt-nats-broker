@@ -1341,9 +1341,9 @@ func TestMQTTReconcileForeignWriteDuringPhase(t *testing.T) {
 	if replacementDur == "" || replacementDur == oldDur {
 		t.Fatalf("expected the phase to have minted a replacement (got %q)", replacementDur)
 	}
-	origGrace := mqttOrphanSweepGrace
-	mqttOrphanSweepGrace = -time.Second
-	defer func() { mqttOrphanSweepGrace = origGrace }()
+	origGrace := mqttOrphanSweepGrace.Get()
+	mqttOrphanSweepGrace.Set(-time.Second)
+	defer func() { mqttOrphanSweepGrace.Set(origGrace) }()
 	asm.sweepOrphanedConsumers(s)
 	if !testReconcileConsumerPresent(t, asm, replacementDur) {
 		t.Fatalf("the orphan sweep deleted %q although its name was never retired", replacementDur)
@@ -2542,9 +2542,9 @@ func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 	// Hold the phase open past the gate wait: the lookup hook sleeps while the
 	// consumer's delivery is parked on the gate, so the wait expires and the
 	// attempt is skipped — the exact case the finding names.
-	restoreWait := mqttPhaseGateWaitMax
-	mqttPhaseGateWaitMax = 300 * time.Millisecond
-	defer func() { mqttPhaseGateWaitMax = restoreWait }()
+	restoreWait := mqttPhaseGateWaitMax.Get()
+	mqttPhaseGateWaitMax.Set(300 * time.Millisecond)
+	defer func() { mqttPhaseGateWaitMax.Set(restoreWait) }()
 
 	asm := testMQTTGetGlobalASM(t, s)
 	asm.mu.Lock()

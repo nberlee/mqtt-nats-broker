@@ -306,7 +306,7 @@ func (o mqttPubRelIntentOutcome) intentRecorded() bool {
 // mqttTestResolverAckRoutePublish fires at ENTRY to the resolver's ordinary-publish AckRoute
 // decision, before the acquisition comparison (F-097 T29/M37/M38 witness): the allocation, the
 // register's acquisition and the binding's. Nil in production.
-var mqttTestResolverAckRoutePublish func(alloc string, curAcq, bindingAcq uint64)
+var mqttTestResolverAckRoutePublish = new(mqttKnob[func(alloc string, curAcq, bindingAcq uint64)])
 
 // resolvePubRelIntent rereads the slot after an intent CAS the caller could not see land.
 //
@@ -368,7 +368,7 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) (out m
 				// (subject, PI, nonce, lineage, source, QoS) and the binding belongs to this
 				// session's generation and epoch; the acquisition decides: a moved counter is a
 				// successor transmission, never retargeted, and the binding retires (Other).
-				if testHook := mqttTestResolverAckRoutePublish; testHook != nil {
+				if testHook := mqttTestResolverAckRoutePublish.Get(); testHook != nil {
 					testHook(b.nonce, cur.Acq, b.acq)
 				}
 				if cur.Acq == b.acq {

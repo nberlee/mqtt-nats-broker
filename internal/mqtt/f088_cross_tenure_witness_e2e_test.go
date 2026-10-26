@@ -911,7 +911,7 @@ func (w *testF088XWorld) coldOnA(t *testing.T) (*mqttSession, []testF088Cancel, 
 		w.asmA.mu.Lock()
 		tm, jailed := w.asmA.flappers[w.cid]
 		w.asmA.mu.Unlock()
-		if jailed && time.Since(tm) <= mqttSessJailDur {
+		if jailed && time.Since(tm) <= mqttSessJailDur.Get() {
 			return fmt.Errorf("fixture: the client ID is still jailed on A")
 		}
 		return nil

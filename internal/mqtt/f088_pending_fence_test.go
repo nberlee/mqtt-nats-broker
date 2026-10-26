@@ -100,7 +100,7 @@ func TestF088PendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 
 			var mu sync.Mutex
 			var claimed bool
-			mqttTestClaimRecoveredHook = func(in []mqttRecoveredInflightReg) {
+			mqttTestClaimRecoveredHook.Set(func(in []mqttRecoveredInflightReg) {
 				for _, r := range in {
 					if r.rec != nil && r.rec.Nonce == fence.Nonce {
 						mu.Lock()
@@ -108,8 +108,8 @@ func TestF088PendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 						mu.Unlock()
 					}
 				}
-			}
-			t.Cleanup(func() { mqttTestClaimRecoveredHook = nil })
+			})
+			t.Cleanup(func() { mqttTestClaimRecoveredHook.Set(nil) })
 			var deleted []uint64
 			e.asm.mu.Lock()
 			e.asm.testInflightDelete = func(seq uint64) error {

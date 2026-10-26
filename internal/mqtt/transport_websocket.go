@@ -355,7 +355,7 @@ func (w *wsConn) Write(p []byte) (int, error) {
 // provoked gives up at the same instant, whether it is writing or waiting for the slot.
 func (w *wsConn) writeControl(op wsOpCode, payload []byte) error {
 	w.dmu.Lock()
-	ctlDL := earliestDeadline(time.Now().Add(mqttWriteDeadline), w.readDL)
+	ctlDL := earliestDeadline(time.Now().Add(mqttWriteDeadline.Get()), w.readDL)
 	w.dmu.Unlock()
 	if err := w.acquire(func() time.Time {
 		return earliestDeadline(ctlDL, earliestDeadline(w.readDL, w.appDL))

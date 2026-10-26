@@ -512,7 +512,7 @@ CHECK:
 	if tm, ok := asm.flappers[cid]; ok {
 		// If the last time it tried to connect was more than 1 sec ago,
 		// then accept and remove from flappers map.
-		if time.Since(tm) > mqttSessJailDur {
+		if time.Since(tm) > mqttSessJailDur.Get() {
 			asm.removeSessFromFlappersLocked(cid)
 		} else {
 			// Will hold this client for a second and then close it. We
@@ -525,7 +525,7 @@ CHECK:
 			asm.mu.Unlock()
 			select {
 			case <-s.quitCh:
-			case <-time.After(mqttSessJailDur):
+			case <-time.After(mqttSessJailDur.Get()):
 			}
 			c.closeConnection(DuplicateClientID)
 			return ErrConnectionClosed
@@ -928,7 +928,7 @@ restoreSession:
 		pendingTracker := es.leases
 		es.mu.Unlock()
 		if pendingTracker.isRetirementPending() {
-			ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+			ceiling := time.NewTimer(mqttIncarnationDrainTimeout.Get())
 			joined := pendingTracker.waitDrained(ceiling.C)
 			ceiling.Stop()
 			if !joined {

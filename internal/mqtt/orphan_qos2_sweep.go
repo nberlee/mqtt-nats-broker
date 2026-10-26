@@ -332,7 +332,7 @@ func (as *mqttAccountSessionManager) orphanGrace() time.Duration {
 	if as.testOrphanGrace != nil {
 		return *as.testOrphanGrace
 	}
-	return mqttOrphanSweepGrace
+	return mqttOrphanSweepGrace.Get()
 }
 
 func (as *mqttAccountSessionManager) qos2ReleaseGrace() time.Duration {

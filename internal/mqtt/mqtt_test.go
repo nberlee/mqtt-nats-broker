@@ -3370,11 +3370,11 @@ func TestMQTTFlappingSession(t *testing.T) {
 	// under -race, and the jailed reconnect and its read come after it. At 250 ms the entry was
 	// gone (the cleanup tick reaps it) before the check below could see it. The cleanup interval
 	// stays longer than the jail, as the final absence check requires.
-	mqttSessJailDur = time.Second
-	mqttFlapCleanItvl = 1200 * time.Millisecond
+	mqttSessJailDur.Set(time.Second)
+	mqttFlapCleanItvl.Set(1200 * time.Millisecond)
 	defer func() {
-		mqttSessJailDur = mqttSessFlappingJailDur
-		mqttFlapCleanItvl = mqttSessFlappingCleanupInterval
+		mqttSessJailDur.Set(mqttSessFlappingJailDur)
+		mqttFlapCleanItvl.Set(mqttSessFlappingCleanupInterval)
 	}()
 
 	o := testMQTTDefaultOptions()
@@ -3438,7 +3438,7 @@ func TestMQTTFlappingSession(t *testing.T) {
 				t.Fatal("Did not find the client ID in the flappers map")
 			}
 			// Wait for more than the cleanup interval
-			time.Sleep(mqttFlapCleanItvl + 100*time.Millisecond)
+			time.Sleep(mqttFlapCleanItvl.Get() + 100*time.Millisecond)
 		} else if present {
 			t.Fatal("The client ID should have been cleared from the map")
 		}
@@ -3610,8 +3610,8 @@ func TestMQTTPersistRetainedMsg(t *testing.T) {
 }
 
 func TestMQTTRetainedMsgCleanup(t *testing.T) {
-	mqttRetainedCacheTTL = 250 * time.Millisecond
-	defer func() { mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL }()
+	mqttRetainedCacheTTL.Set(250 * time.Millisecond)
+	defer func() { mqttRetainedCacheTTL.Set(mqttDefaultRetainedCacheTTL) }()
 
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -3630,7 +3630,7 @@ func TestMQTTRetainedMsgCleanup(t *testing.T) {
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
 	testMQTTCheckPubMsg(t, c, r, "foo", mqttPubQos1|mqttPubFlagRetain, []byte("msg"))
 
-	time.Sleep(2 * mqttRetainedCacheTTL)
+	time.Sleep(2 * mqttRetainedCacheTTL.Get())
 
 	// Make sure not in cache anymore
 	asm := testMQTTGetAccountSessionManager(t, s, "cache")
@@ -5059,8 +5059,8 @@ func TestMQTTSliceHeadersAndDecodeRetainedMessage(t *testing.T) {
 }
 
 func TestMQTTRetainedMsgRemovedFromMapIfNotInStream(t *testing.T) {
-	mqttRetainedCacheTTL = 250 * time.Millisecond
-	defer func() { mqttRetainedCacheTTL = mqttDefaultRetainedCacheTTL }()
+	mqttRetainedCacheTTL.Set(250 * time.Millisecond)
+	defer func() { mqttRetainedCacheTTL.Set(mqttDefaultRetainedCacheTTL) }()
 
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -5114,7 +5114,7 @@ func TestMQTTRetainedMsgRemovedFromMapIfNotInStream(t *testing.T) {
 	require_NoError(t, err)
 
 	// Wait for more than the cache TTL
-	time.Sleep(2 * mqttRetainedCacheTTL)
+	time.Sleep(2 * mqttRetainedCacheTTL.Get())
 
 	checkRetained(_EMPTY_)
 

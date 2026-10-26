@@ -1306,9 +1306,9 @@ func TestGateTimeoutOnASucceedingResumeDoesNotStall(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	prevMax := mqttPhaseGateWaitMax
-	mqttPhaseGateWaitMax = 300 * time.Millisecond
-	defer func() { mqttPhaseGateWaitMax = prevMax }()
+	prevMax := mqttPhaseGateWaitMax.Get()
+	mqttPhaseGateWaitMax.Set(300 * time.Millisecond)
+	defer func() { mqttPhaseGateWaitMax.Set(prevMax) }()
 
 	id := "f050-timeout"
 	const topic, sid = "f050to/plain", "f050to.plain"
@@ -1396,9 +1396,9 @@ func TestGateTimeoutNaksAStoredPubRel(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 	b := &testQ2AffBroker{s: s, o: o, topic: "f050relto/topic", group: "f050reltogrp"}
 
-	prevMax := mqttPhaseGateWaitMax
-	mqttPhaseGateWaitMax = 300 * time.Millisecond
-	defer func() { mqttPhaseGateWaitMax = prevMax }()
+	prevMax := mqttPhaseGateWaitMax.Get()
+	mqttPhaseGateWaitMax.Set(300 * time.Millisecond)
+	defer func() { mqttPhaseGateWaitMax.Set(prevMax) }()
 
 	id := "f050-relto"
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
@@ -1503,9 +1503,9 @@ func TestGateTimeoutNaksAnAffineCopy(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 	b := &testQ2AffBroker{s: s, o: o, topic: "f050affto/topic", group: "f050afftogrp"}
 
-	prevMax := mqttPhaseGateWaitMax
-	mqttPhaseGateWaitMax = 100 * time.Millisecond
-	defer func() { mqttPhaseGateWaitMax = prevMax }()
+	prevMax := mqttPhaseGateWaitMax.Get()
+	mqttPhaseGateWaitMax.Set(100 * time.Millisecond)
+	defer func() { mqttPhaseGateWaitMax.Set(prevMax) }()
 
 	id := "f050-affto"
 	c, r := b.member(t, id, 300)
@@ -1602,9 +1602,9 @@ func TestGateTimeoutNaksAnUndeliveredAffineCopy(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 	b := &testQ2AffBroker{s: s, o: o, topic: "f050undel/topic", group: "f050undelgrp"}
 
-	prevMax := mqttPhaseGateWaitMax
-	mqttPhaseGateWaitMax = 100 * time.Millisecond
-	defer func() { mqttPhaseGateWaitMax = prevMax }()
+	prevMax := mqttPhaseGateWaitMax.Get()
+	mqttPhaseGateWaitMax.Set(100 * time.Millisecond)
+	defer func() { mqttPhaseGateWaitMax.Set(prevMax) }()
 
 	id := "f050-undel"
 	c, _ := b.member(t, id, 300)

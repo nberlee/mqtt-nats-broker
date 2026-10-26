@@ -837,12 +837,12 @@ func TestMQTTExclusionReclaimRestorationCannotRaceTheDisarm(t *testing.T) {
 	// the lock lets it complete, observe an armed flag, schedule nothing, and lose the
 	// continuation when the disarm below then clears that flag.
 	restored := make(chan struct{})
-	mqttTestExclusionReclaimDisarmHook = func() {
+	mqttTestExclusionReclaimDisarmHook.Set(func() {
 		go func() { defer close(restored); rig.as.addSession(rig.sess, true) }()
 		// Long enough for an unsynchronised restoration to get all the way through.
 		time.Sleep(100 * time.Millisecond)
-	}
-	t.Cleanup(func() { mqttTestExclusionReclaimDisarmHook = nil })
+	})
+	t.Cleanup(func() { mqttTestExclusionReclaimDisarmHook.Set(nil) })
 
 	rig.sess.runExclusionReclaim(mqttExclusionReclaimDelay)
 	<-restored

@@ -106,8 +106,8 @@ const (
 )
 
 var (
-	mqttWillClaimLease    = mqttWillDefaultClaimLease
-	mqttWillClaimInterval = mqttWillDefaultClaimInterval
+	mqttWillClaimLease    = newMQTTKnob(mqttWillDefaultClaimLease)
+	mqttWillClaimInterval = newMQTTKnob(mqttWillDefaultClaimInterval)
 )
 
 // How many times a claimant re-samples the acceptance cutoff before deciding. A
@@ -926,7 +926,7 @@ func (as *mqttAccountSessionManager) willClaimLoop(s *Server, closeCh chan struc
 	if h := mqttTestWillInitialScanDoneV.Load(); h != nil {
 		(*h)(as)
 	}
-	tt := time.NewTicker(mqttWillClaimInterval)
+	tt := time.NewTicker(mqttWillClaimInterval.Get())
 	defer tt.Stop()
 	for {
 		select {
@@ -1130,7 +1130,7 @@ ahead:
 // mqttWillAheadBudget bounds the early-cancellation phase for one pass. Half the
 // claim interval, so the phase cannot make the loop miss its own tick: this is
 // cleanup, and a due Will always outranks it.
-func mqttWillAheadBudget() time.Duration { return mqttWillClaimInterval / 2 }
+func mqttWillAheadBudget() time.Duration { return mqttWillClaimInterval.Get() / 2 }
 
 // willScanResult tells scanWillOutbox whether to keep walking records after a
 // claim attempt, or to stop because a transient/global failure reading the
@@ -1195,7 +1195,7 @@ func (as *mqttAccountSessionManager) claimLease() time.Duration {
 	d := as.testClaimLease
 	as.mu.RUnlock()
 	if d <= 0 {
-		return mqttWillClaimLease
+		return mqttWillClaimLease.Get()
 	}
 	return d
 }

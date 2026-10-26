@@ -45,7 +45,7 @@ func mqttPhaseGateWaitFor(c *client) time.Duration {
 			wait = aw
 		}
 	}
-	return min(wait, mqttPhaseGateWaitMax)
+	return min(wait, mqttPhaseGateWaitMax.Get())
 }
 
 // How often to re-run the session-expiry sweep for an account.
@@ -1403,7 +1403,7 @@ func (s *Server) mqttDetermineReplicas() int {
 func (as *mqttAccountSessionManager) addSessToFlappersLocked(clientID string) {
 	as.flappers[clientID] = time.Now()
 	if as.flapTimer == nil {
-		as.flapTimer = time.AfterFunc(mqttFlapCleanItvl, func() {
+		as.flapTimer = time.AfterFunc(mqttFlapCleanItvl.Get(), func() {
 			as.mu.Lock()
 			defer as.mu.Unlock()
 			// In case of shutdown, this will be nil
@@ -1412,11 +1412,11 @@ func (as *mqttAccountSessionManager) addSessToFlappersLocked(clientID string) {
 			}
 			now := time.Now()
 			for cID, tm := range as.flappers {
-				if now.Sub(tm) > mqttSessJailDur {
+				if now.Sub(tm) > mqttSessJailDur.Get() {
 					delete(as.flappers, cID)
 				}
 			}
-			as.flapTimer.Reset(mqttFlapCleanItvl)
+			as.flapTimer.Reset(mqttFlapCleanItvl.Get())
 		})
 	}
 }
@@ -1482,7 +1482,7 @@ func mqttStoreSessionRecordCASBody(jsa *mqttJSA, domainTk string, b []byte, idHa
 // (fail closed: never delete on a partial view). Runs from the account
 // session manager's sweep go routine. Spec5 [4.8.2].
 func (as *mqttAccountSessionManager) sweepOrphanedConsumers(s *Server) {
-	as.sweepOrphanedConsumersBefore(s, time.Now().Add(-mqttOrphanSweepGrace))
+	as.sweepOrphanedConsumersBefore(s, time.Now().Add(-mqttOrphanSweepGrace.Get()))
 }
 
 // sweepOrphanedConsumersBefore is sweepOrphanedConsumers with the eligibility cutoff as a

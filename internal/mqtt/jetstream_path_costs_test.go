@@ -1279,11 +1279,13 @@ func TestMQTTJetStreamPathCosts(t *testing.T) {
 	}
 	// Nothing periodic runs inside a window: the claim loop and the sweep ticker are pushed out
 	// past every case (their initial passes still run at each broker start, and are waited for).
-	prevWill, prevLease := mqttWillClaimInterval, mqttWillClaimLease
-	mqttWillClaimInterval, mqttWillClaimLease = 10*time.Minute, 20*time.Minute
+	prevWill, prevLease := mqttWillClaimInterval.Get(), mqttWillClaimLease.Get()
+	mqttWillClaimInterval.Set(10 * time.Minute)
+	mqttWillClaimLease.Set(20 * time.Minute)
 	restoreSweep := setMQTTSessionExpirySweepInterval(time.Hour)
 	t.Cleanup(func() {
-		mqttWillClaimInterval, mqttWillClaimLease = prevWill, prevLease
+		mqttWillClaimInterval.Set(prevWill)
+		mqttWillClaimLease.Set(prevLease)
 		restoreSweep()
 	})
 	jsPathInstallWorkerSeams(t)

@@ -959,9 +959,9 @@ func TestWillTimingInvariantHolds(t *testing.T) {
 	// The contract is "0 resolves the PACKAGE VALUE", not "0 resolves 30s": other
 	// tests shorten that value deliberately, so asserting the constant here would be
 	// asserting their absence.
-	if as.claimLease() != mqttWillClaimLease {
+	if as.claimLease() != mqttWillClaimLease.Get() {
 		t.Fatalf("an unconfigured manager must resolve the package value %v, got %v",
-			mqttWillClaimLease, as.claimLease())
+			mqttWillClaimLease.Get(), as.claimLease())
 	}
 	for _, lease := range []time.Duration{0, 90 * time.Millisecond} {
 		as.testClaimLease = lease

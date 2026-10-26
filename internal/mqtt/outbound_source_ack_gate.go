@@ -208,7 +208,7 @@ func (sess *mqttSession) submitSourceAck(reply string, confirm bool, owner mqttS
 	mqttObserveSourceAck(reply, true)
 	p.enqueue()
 	sess.mu.Unlock()
-	if hook := mqttTestSourceAckWaitHook; hook != nil {
+	if hook := mqttTestSourceAckWaitHook.Get(); hook != nil {
 		hook(sess)
 	}
 	if err := p.wait(); err != nil {
@@ -219,7 +219,7 @@ func (sess *mqttSession) submitSourceAck(reply string, confirm bool, owner mqttS
 
 // mqttTestSourceAckWaitHook observes a confirmed acknowledgement's wait, which runs with sess.mu
 // released. Nil in production.
-var mqttTestSourceAckWaitHook func(sess *mqttSession)
+var mqttTestSourceAckWaitHook = new(mqttKnob[func(sess *mqttSession)])
 
 // mqttPreparedAck is one confirmed acknowledgement split into its three steps, so the submission
 // can be linearized under a lock while the wait is not.

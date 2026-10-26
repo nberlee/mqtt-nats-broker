@@ -244,7 +244,7 @@ func TestMQTTWillOutboxScanRefusesUnsupportedRecords(t *testing.T) {
 	})
 	// Two further scan intervals: a refusal that merely arrives late is not a
 	// refusal.
-	time.Sleep(3 * mqttWillClaimInterval)
+	time.Sleep(3 * mqttWillClaimInterval.Get())
 
 	// Per variant first, so a failure names the invariant that stopped holding;
 	// the account-wide count then catches anything seeded but not enumerated.
@@ -295,7 +295,7 @@ func TestMQTTWillOutboxScanRefusesUnsupportedExpiredClaim(t *testing.T) {
 		}
 		return nil
 	})
-	time.Sleep(3 * mqttWillClaimInterval)
+	time.Sleep(3 * mqttWillClaimInterval.Get())
 
 	for _, f := range refused {
 		t.Run(f.name, func(t *testing.T) {
@@ -335,7 +335,7 @@ func TestMQTTWillOutboxScanNeverReapsUnsupportedTerminalRecord(t *testing.T) {
 		}
 		return nil
 	})
-	time.Sleep(3 * mqttWillClaimInterval)
+	time.Sleep(3 * mqttWillClaimInterval.Get())
 
 	for _, f := range refused {
 		t.Run(f.name, func(t *testing.T) {

@@ -508,7 +508,7 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnationChecked(sess *mqttSe
 	t.close()
 
 	// 2. DRAIN, holding nothing.
-	ceiling := time.NewTimer(mqttIncarnationDrainTimeout)
+	ceiling := time.NewTimer(mqttIncarnationDrainTimeout.Get())
 	drained := t.waitDrained(ceiling.C)
 	ceiling.Stop()
 	if !drained {

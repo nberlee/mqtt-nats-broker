@@ -197,7 +197,7 @@ func TestMQTTWillOutboxReplicatedLeaderFailover(t *testing.T) {
 
 	// No duplicate across a full lease-recovery window (a short "expect nothing"
 	// would only prove no immediate second packet).
-	testMQTTExpectNothingFor(t, rs, mqttWillClaimLease+mqttWillClaimInterval)
+	testMQTTExpectNothingFor(t, rs, mqttWillClaimLease.Get()+mqttWillClaimInterval.Get())
 }
 
 // TestMQTTWillOutboxReplicatedNodeCatchup: a follower that is OFFLINE while the
@@ -281,7 +281,7 @@ func TestMQTTWillOutboxReplicatedNodeCatchup(t *testing.T) {
 		t.Fatalf("outbox not empty after follower catch-up, got %d\n%s", n, c.describe())
 	}
 	// ...nor re-fire the Will across a full lease-recovery window.
-	testMQTTExpectNothingFor(t, rs, mqttWillClaimLease+mqttWillClaimInterval)
+	testMQTTExpectNothingFor(t, rs, mqttWillClaimLease.Get()+mqttWillClaimInterval.Get())
 }
 
 // testMQTTExpectNothingFor asserts no packet arrives on r for the full window d.

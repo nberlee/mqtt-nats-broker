@@ -144,7 +144,7 @@ func (as *mqttAccountSessionManager) processRetainedMsg(sub *subscription, c *cl
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) cleanupRetainedMessageCache(s *Server, closeCh chan struct{}) {
-	tt := time.NewTicker(mqttRetainedCacheTTL)
+	tt := time.NewTicker(mqttRetainedCacheTTL.Get())
 	defer tt.Stop()
 	for {
 		select {
@@ -725,7 +725,7 @@ func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm *mq
 	if rm == nil {
 		return
 	}
-	rm.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL)
+	rm.expiresFromCache = time.Now().Add(mqttRetainedCacheTTL.Get())
 	if onlyReplace {
 		if _, ok := as.rmsCache.Load(subject); !ok {
 			return

@@ -352,7 +352,7 @@ func (c *client) writeFramePartLocked(data []byte, cap time.Time) error {
 	if c.nc == nil {
 		return fmt.Errorf("the socket went away mid-frame")
 	}
-	d := time.Now().Add(mqttWriteDeadline)
+	d := time.Now().Add(mqttWriteDeadline.Get())
 	if !cap.IsZero() && cap.Before(d) {
 		d = cap
 	}

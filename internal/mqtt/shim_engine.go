@@ -1220,7 +1220,7 @@ func (c *client) doTLSServerHandshake(kind string, cfg *tls.Config, timeout floa
 // DISCONNECT able to block its writer for as long as a non-reading client lasts.
 // Same value as upstream's DEFAULT_FLUSH_DEADLINE. A var, not a const, only so
 // tests can shorten it; there is no operator knob.
-var mqttWriteDeadline = 10 * time.Second
+var mqttWriteDeadline = newMQTTKnob(10 * time.Second)
 
 // writeSocket writes the full buffer to the client socket, serialized against
 // concurrent writers (the parse goroutine and NATS delivery goroutines) by wmu.
@@ -1261,7 +1261,7 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 	if c.outBind != nil && !c.outBind.mayWrite() {
 		return nil
 	}
-	d := time.Now().Add(mqttWriteDeadline)
+	d := time.Now().Add(mqttWriteDeadline.Get())
 	if !cap.IsZero() && cap.Before(d) {
 		d = cap
 	}
@@ -1472,7 +1472,7 @@ func (c *client) shutdownDisconnect(deadline time.Time) {
 		// interval instead of the one it started with. Computing it before entering
 		// makes the wmu wait consume the cap, which is what a drain budget means.
 		// An already-spent budget stays in the past and fails the write at once.
-		cap := time.Now().Add(mqttWriteDeadline)
+		cap := time.Now().Add(mqttWriteDeadline.Get())
 		if !deadline.IsZero() && deadline.Before(cap) {
 			cap = deadline
 		}

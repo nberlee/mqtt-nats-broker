@@ -3037,15 +3037,15 @@ func testF097QoS2AckRouteFix(t *testing.T, clientID string, failReads int32) *te
 	}
 	r := &testF097QoS2AckRoute{testLateAckFix: f, b: b, failReads: failReads}
 	r.wire = testRow2Wire(f.e)
-	mqttTestResolverAckRoutePublish = func(alloc string, curAcq, bindingAcq uint64) {
+	mqttTestResolverAckRoutePublish.Set(func(alloc string, curAcq, bindingAcq uint64) {
 		if alloc != b.nonce {
 			return
 		}
 		r.mu.Lock()
 		r.seen = append(r.seen, testF097ResolverSeen{worker: !r.foreground.Load(), curAcq: curAcq, bindingAcq: bindingAcq})
 		r.mu.Unlock()
-	}
-	t.Cleanup(func() { mqttTestResolverAckRoutePublish = nil })
+	})
+	t.Cleanup(func() { mqttTestResolverAckRoutePublish.Set(nil) })
 	f.e.asm.mu.Lock()
 	f.e.asm.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
 		if subject == f.subject && r.armed.Load() {

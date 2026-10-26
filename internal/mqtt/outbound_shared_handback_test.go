@@ -350,8 +350,8 @@ func TestSourceAckGateRevalidatesTheOwnerAndWaitsUnlocked(t *testing.T) {
 			lockedDuringWait = true
 		}
 	}
-	mqttTestSourceAckWaitHook = hook
-	defer func() { mqttTestSourceAckWaitHook = nil }()
+	mqttTestSourceAckWaitHook.Set(hook)
+	defer func() { mqttTestSourceAckWaitHook.Set(nil) }()
 	_, _ = sess.submitSourceAck(reply, true, nil)
 	if lockedDuringWait {
 		t.Fatal("the confirmed acknowledgement waited with sess.mu held")

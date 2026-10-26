@@ -6535,7 +6535,7 @@ func (sess *mqttSession) confirmInflightRegister(c *client, l mqttLandedRegister
 // mqttTestClaimRecoveredHook observes every batch the affine claim pass receives, so a fixture can
 // witness that the recovery partition diverted a pending fence BEFORE it (F-088 T33). Nil in
 // production.
-var mqttTestClaimRecoveredHook func(in []mqttRecoveredInflightReg)
+var mqttTestClaimRecoveredHook = new(mqttKnob[func(in []mqttRecoveredInflightReg)])
 
 // subjectHoldsOwnPendingFence reports whether pi's subject in generation gen holds the pending
 // cancellation fence of allocation nonce. A read that does not resolve answers false, which
@@ -9121,7 +9121,7 @@ const (
 func (sess *mqttSession) claimRecoveredInflight(c *client, in []mqttRecoveredInflightReg, scope mqttInflightClaimScope) (
 	owned, closed, opaque, displaced, withheld []mqttRecoveredInflightReg,
 ) {
-	if hook := mqttTestClaimRecoveredHook; hook != nil {
+	if hook := mqttTestClaimRecoveredHook.Get(); hook != nil {
 		hook(in)
 	}
 	if len(in) == 0 {

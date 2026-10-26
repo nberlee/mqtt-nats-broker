@@ -144,9 +144,15 @@ func TestResourceTLSReloadChurn(t *testing.T) {
 	runtime.MemProfileRate = 4096
 	t.Cleanup(func() { runtime.MemProfileRate = prevRate })
 	// quiesce waits out two periods of each sweep; shorten them as the single-broker soak does.
-	prevJail, prevFlap, prevTTL := mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL
-	mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL = 50*time.Millisecond, 250*time.Millisecond, 500*time.Millisecond
-	t.Cleanup(func() { mqttSessJailDur, mqttFlapCleanItvl, mqttRetainedCacheTTL = prevJail, prevFlap, prevTTL })
+	prevJail, prevFlap, prevTTL := mqttSessJailDur.Get(), mqttFlapCleanItvl.Get(), mqttRetainedCacheTTL.Get()
+	mqttSessJailDur.Set(50 * time.Millisecond)
+	mqttFlapCleanItvl.Set(250 * time.Millisecond)
+	mqttRetainedCacheTTL.Set(500 * time.Millisecond)
+	t.Cleanup(func() {
+		mqttSessJailDur.Set(prevJail)
+		mqttFlapCleanItvl.Set(prevFlap)
+		mqttRetainedCacheTTL.Set(prevTTL)
+	})
 
 	first := newTLSGeneration(t)
 	proj := newTLSProjection(t, first.cert, first.key, first.ca.CertPEM)

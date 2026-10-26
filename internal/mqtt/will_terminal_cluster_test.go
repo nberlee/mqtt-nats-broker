@@ -40,9 +40,9 @@ func TestMQTTWillOutboxReplicatedTerminalDoneStands(t *testing.T) {
 	// would ALSO refuse the publisher worker, which is the very thing the paired
 	// mutation has to be able to reach. Set before the broker starts, so the loop
 	// never has a short tick; its one initial pass runs over an empty outbox.
-	prevInterval := mqttWillClaimInterval
-	mqttWillClaimInterval = 10 * time.Minute
-	t.Cleanup(func() { mqttWillClaimInterval = prevInterval })
+	prevInterval := mqttWillClaimInterval.Get()
+	mqttWillClaimInterval.Set(10 * time.Minute)
+	t.Cleanup(func() { mqttWillClaimInterval.Set(prevInterval) })
 
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
