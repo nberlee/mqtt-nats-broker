@@ -1062,3 +1062,20 @@ from keep their full history.
   `docs/findings/runtime-correctness.md`, accepted as a nonblocking residual
   (`docs/CONFORMANCE.md`, "F-126"). Owed for its own fix: a controlled starvation witness,
   a remedy design, and a measurement of whether the next reconnect recovers.
+- **`TestMQTTDrainLevelUpCoversBothConsumers`: "expected one started delivery per
+  consumer, got map[child:1]".** Met 2026-10-26 while making the first GitHub CI runs
+  green (it did not fail in CI). Pre-existing: under `-race`, run in isolation and
+  interleaved, 9 of 30 at `37b2b09` and 10 of 30 on that fix's tree. The assertion fails
+  before the UNSUBSCRIBE, so before any drain: of the first two packets read (AckWait
+  250 ms), both carried the child subscription's payload and none the parent's. Mechanism:
+  untraced; a parent delivery arriving late, a duplicate of the child's ordered ahead of
+  it, and a lost parent delivery are all unexcluded. **Disposition: open**; owed: trace
+  the packet order and both consumers' state in a failing run before attributing it, and
+  file a §0.3 finding only if it shows loss.
+- **`testRigServerDown` does not wait for the server's background goroutines.** Met
+  2026-10-26 by the Codex consult on the tagged suite's data races: the rig teardown
+  (`rig_server_test.go`) waits for the three Will groups but not for `s.grWG`, which
+  tracks workers such as the retained-cache cleanup, so a rig's goroutines can outlive its
+  test. The races it allowed are closed by the atomic `mqttKnob` settings; a leftover
+  worker can still act on a later test's hooks. **Disposition: open**; owed: wait for
+  `s.grWG` in the teardown, and check the other test-server teardowns for the same gap.
