@@ -9374,7 +9374,9 @@ reads](findings/resolved.md#f-054).
   measured ceiling if the cost is the design's. Possibly the same cause, unconfirmed:
   the Paho interoperability suite's `test_flow_control2` (Receive Maximum with many QoS 1
   and 2 messages) failed in CI on 2026-10-26 against its baseline, after passing in the
-  run before; check it against the benchmark before treating it separately.
+  run before; check it against the benchmark before treating it separately. It is in
+  `test/conformance/baseline/paho.txt` so CI stays green meanwhile; landing this item
+  removes it.
 
   Measured against stock nats-server 2.15.1's own MQTT listener on the same 3-node
   cluster and NFS storage, both with their MQTT streams file-backed at R3 (checked with

@@ -836,11 +836,19 @@ func TestMQTTExclusionReclaimRestorationCannotRaceTheDisarm(t *testing.T) {
 	// rather than hoped for. Holding as.mu across the disarm makes it block here; releasing
 	// the lock lets it complete, observe an armed flag, schedule nothing, and lose the
 	// continuation when the disarm below then clears that flag.
+	// The seam fires for every disarm in the process, including this session's own armed
+	// timer racing the direct call below, so it acts once and only for this session.
 	restored := make(chan struct{})
-	mqttTestExclusionReclaimDisarmHook.Set(func() {
-		go func() { defer close(restored); rig.as.addSession(rig.sess, true) }()
-		// Long enough for an unsynchronised restoration to get all the way through.
-		time.Sleep(100 * time.Millisecond)
+	var once sync.Once
+	mqttTestExclusionReclaimDisarmHook.Set(func(s *mqttSession) {
+		if s != rig.sess {
+			return
+		}
+		once.Do(func() {
+			go func() { defer close(restored); rig.as.addSession(rig.sess, true) }()
+			// Long enough for an unsynchronised restoration to get all the way through.
+			time.Sleep(100 * time.Millisecond)
+		})
 	})
 	t.Cleanup(func() { mqttTestExclusionReclaimDisarmHook.Set(nil) })
 
