@@ -193,7 +193,7 @@ func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
 				"exchange exists to protect")
 		}
 
-		// The downgrade converts it into a drain, which is d554f13's guarantee.
+		// The downgrade converts it into a drain, which is 6515a7b's guarantee.
 		if codes := testMQTTSubV5(t, cl, r, 2, []mqttV5SubFilter{{topic: topic, opts: 0}}); len(codes) != 1 || codes[0] != 0 {
 			t.Fatalf("SUBACK for the downgrade: %v", codes)
 		}

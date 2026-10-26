@@ -607,7 +607,7 @@ func TestF088CancellationBeforeOpeningLeavesNoUnsettledPlaceholder(t *testing.T)
 	t.Parallel()
 	// THE STRUCTURAL HALF: no early return was added to the opening or ahead of the deferred
 	// settlement by this change. The return statements of the two opening functions are frozen
-	// at their HEAD 7dd2c3e count (read from the HEAD source when this was written), and in the
+	// at their HEAD 660a82e count (read from the HEAD source when this was written), and in the
 	// admission body the deferred finishAdmissionCustody is the statement right after the
 	// opening's own refusal, with no return before it but that refusal's.
 	t.Run("structural", func(t *testing.T) {

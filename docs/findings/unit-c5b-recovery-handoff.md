@@ -44,7 +44,7 @@ TestUnitCDisposalDisplacedRecovery and TestUnitCRecoveryRouting supply the
 T-C25a-c displacement/landed routing controls. The hold remains until a later
 successful synchronous resume on both failed-save branches.
 
-Landed in 96d0a72. These tests pass in the tagged full suite, and route-checked
+Landed in a8e7715. These tests pass in the tagged full suite, and route-checked
 mutations of the handoff are killed by TestUnitCRecoveryHandoff (5),
 TestUnitCRecoveryNonLandingCertificate (1) and TestUnitCDisposalDisplacedRecovery
 (1). Consults 46/48's accepted residual remains; this does not close

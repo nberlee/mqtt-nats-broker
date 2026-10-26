@@ -212,7 +212,7 @@ var mqttProtectedMapMutators = map[string]struct{}{
 // membership, custody, retirement membership, deletion-attempt count, staged-release
 // length, candidate classification — never through a downstream guard that could mask it.
 var mqttCensusManifest = []mqttCensusRow{
-	// ---- LANDED at 77c2168: gated, but every gate currently reduces to "the shape is
+	// ---- LANDED at ae30b56: gated, but every gate currently reduces to "the shape is
 	// supported" because `publish` is the only state. Each acquires a real per-state arm
 	// with the admission half, so each needs its mutation RE-RUN against the enlarged
 	// state set — which is why they are rows here and not assumed done.

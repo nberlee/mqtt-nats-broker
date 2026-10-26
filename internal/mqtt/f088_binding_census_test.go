@@ -82,7 +82,7 @@ type f088BindingSite struct {
 
 // f088FrozenBindingSites is the FROZEN census of every binding removal (by the proof argument
 // passed) and every direct write to sess.abandonedAcks, by enclosing function. Frozen against the
-// F-097/F-088 working tree of 2026-10-08 (base HEAD 7dd2c3e plus the uncommitted WP2/WP3 edits).
+// F-097/F-088 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted WP2/WP3 edits).
 var f088FrozenBindingSites = map[f088BindingSite]struct {
 	n      int
 	reason f088BindingReason

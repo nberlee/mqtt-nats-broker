@@ -11,7 +11,7 @@ This dossier records the design audit the roadmap asked for: what a reclaimer of
 records would have to prove, and why nothing in the current protocol can prove it. It does
 not claim reclamation is impossible under every protocol. It claims that the visibility a
 sound reclaimer needs does not exist today, per class, and names what would have to exist.
-Source locations are under `internal/mqtt/` and were read at `4601485`.
+Source locations are under `internal/mqtt/` and were read at `29c00b4`.
 
 ## The records
 

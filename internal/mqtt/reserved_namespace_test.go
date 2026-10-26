@@ -739,7 +739,7 @@ func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 		},
 		{
 			// NO GENERATION — the record shape that actually existed. The namespace deny
-			// (3610eb3) predates generation-scoped naming, so a broker old enough to have
+			// (d222539) predates generation-scoped naming, so a broker old enough to have
 			// written a reserved membership wrote no `gen` either. This row pins the
 			// reserved check sitting BEFORE the generation check: with the order reversed
 			// the only realistic record gets the generation refusal instead, and the

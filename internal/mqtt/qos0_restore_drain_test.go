@@ -93,7 +93,7 @@ func testQoS0OverLiveConsRecord(t *testing.T, s *Server, o *Options, clientID, f
 	}
 	dur = cc0.Durable
 
-	// Step 2: the downgrade converts rather than destroys (d554f13).
+	// Step 2: the downgrade converts rather than destroys (6515a7b).
 	testMQTTSub(t, 2, conn.c, conn.r, []*mqttFilter{{filter: filter, qos: 0}}, []byte{0})
 	testMQTTFlush(t, conn.c, nil, conn.r)
 	sess.mu.Lock()

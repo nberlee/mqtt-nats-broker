@@ -79,7 +79,7 @@ var f088CancelledBacking = map[f088CancelledDisposition][]string{
 
 // f088FrozenCancelledReaders is the FROZEN census: every production function reading `.Cancelled`
 // (outside an assignment's left-hand side), the number of reads, its disposition, and why. Frozen
-// against the F-097/F-088 working tree of 2026-10-08 (base HEAD 7dd2c3e plus the uncommitted
+// against the F-097/F-088 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted
 // WP2/WP3 edits).
 var f088FrozenCancelledReaders = map[string]struct {
 	n    int

@@ -48,7 +48,7 @@ The remaining unit C follow-ups are **NONBLOCKING**:
   intent, materialization, live-token, source-ACK and unreadable-outcome cuts.
 
 - [x] [F-111: Give every recovered reservation a lifecycle
-  owner](findings/recovery-reservation-lifecycle.md). At 7de0a61, raw and
+  owner](findings/recovery-reservation-lifecycle.md). At 28b9a5f, raw and
   marker-opaque PUBLISH reservations and recovered PUBREL placeholders could
   outlive their durable evidence on a reused session; terminal and cancellation
   successors could leave a scheduling owner behind; live PUBREL bookkeeping could
@@ -981,7 +981,7 @@ base](findings/ha-arbitration.md#f-029).
   normalized set MEASURED against a real create rather than listed. A `Cons` entry carrying
   a `DeliverGroup` was refused at all five ingresses **that existed then**; the count
   later rose to six, the sixth being the shared last-holder scan's own refusal, and fell
-  back to five when F-105's shared-group lifecycle transfer (`e078092`) deleted that scan.
+  back to five when F-105's shared-group lifecycle transfer (`9530f86`) deleted that scan.
   It also fixed a latent defect in a shared helper: `lookupConsumersMulti` encoded an
   authoritative not-found and a successful nil `ConsumerInfo` identically, so the
   in-flight source cache was concluding a terminal `Lost` from a reply that proved
@@ -1004,7 +1004,7 @@ base](findings/ha-arbitration.md#f-029).
 
   - [x] [F-077: Arbitrate
   ownership after any shared group durable create](findings/shared-qos2.md#f-077).
-  **Alpha blocker — DONE.** The CONNECT half landed in `5cc8081`; the box stayed open on
+  **Alpha blocker — DONE.** The CONNECT half landed in `3bf8285`; the box stayed open on
   F-078, which has now landed and closes it. Split out of
   F-076 by a scope consult, and **a defect on `main` rather than one F-076 introduced**: no
   route that restores shared group interest revalidated that this broker still owns the
@@ -1211,7 +1211,7 @@ base](findings/ha-arbitration.md#f-029).
   this bullet closes is now enforced by F-105 code, so the closure is conditional on
   F-105's integrated gate. What replaced the mechanism its passages describe:
   `sharedDurablesHeldByOthers` and `holdAll` were deleted by the shared-group lifecycle
-  transfer (`e078092`, 2026-09-22). A group consumer's fate is the group record's
+  transfer (`9530f86`, 2026-09-22). A group consumer's fate is the group record's
   arbitrated holder count on `$MQTT_shared`, executed from release verdicts, and names are
   incarnation-qualified, so a late delete cannot reach a successor; the
   leaver-versus-joiner race is the transfer's to state (F-105's "The SHARED transfer
@@ -1293,7 +1293,7 @@ base](findings/ha-arbitration.md#f-029).
   **Coverage:** nine unit cases, a production-route case whose two arming confirmations
   are
   load-bearing, and one row (**C7**) added to the last-holder scan's own table for the
-  **indeterminate-walk arm, which predated `b659236` and was pinned by nothing at either
+  **indeterminate-walk arm, which predated `74a8546` and was pinned by nothing at either
   layer**. Sixteen mutations were run and each kills a named test. `docs/CONFORMANCE.md`
   residual 3 of the unreadable-record entry is now closed; items 1 and 2 there are unchanged.
 
@@ -1819,7 +1819,7 @@ base](findings/ha-arbitration.md#f-029).
 
   - [x] [F-036: Revalidate quiet resident-session
   ownership](findings/ha-arbitration.md#f-036). **DONE 2026-09-03, in two units. Unit 1
-  landed 2026-09-02 (the incarnation completion lease, `901ee8f`); unit 2 — the
+  landed 2026-09-02 (the incarnation completion lease, `226e5f8`); unit 2 — the
   two-dimensional PUBREL classifier and sites 1 and 3 — closes the box.**
 
   **UNIT 2, 2026-09-03.** Six plan-review rounds (blocking findings 8 → 4 → *no output* →
@@ -2211,7 +2211,7 @@ base](findings/ha-arbitration.md#f-029).
   a nonterminal claim created after the verification scan.
   **SECOND ATTEMPT, 2026-09-01: the ordered pre-plan investigation RAN and the item
   STOPPED AGAIN**, after five consults and four plan-review rounds, with **no
-  implementation code written**. F-066's enforcement landed (`1205d32`), so OPEN 1 is
+  implementation code written**. F-066's enforcement landed (`cfda77d`), so OPEN 1 is
   dissolved and the prerequisite was met. **Gate-relevant outcome only; the dossier is
   canonical for the mechanism, the evidence and the refuted designs.**
 
@@ -3302,7 +3302,7 @@ never licenses changing a test assertion.
 
 - [x] **Drain retirement does not prove disposal before releasing the sid.** Filed
   2026-09-05 by F-094's plan-review rounds 2 and 3. **Closed 2026-09-06** after 8
-  plan-review rounds (4 against `d75bdb1`, 4 after revalidation against `67864e7`), a
+  plan-review rounds (4 against `7572f12`, 4 after revalidation against `4b5870e`), a
   Codex scope consult, and 12 mutations each confirmed to fail its paired test.
 
   **What landed.** `retireDrainLocked` releases the sid and closes the delivery path
@@ -4299,11 +4299,11 @@ never licenses changing a test assertion.
   liveness check is the same refuted design.
 
   **Ticked in the W3 candidate; NOT accepted as closed until the integrated branch review
-  passes.** WP-F, the last remaining work, is delivered in that candidate (W1 `868990c`,
-  W2 `522d25d`, W3 this change; see "Delivered in the W3 candidate" below). The history
+  passes.** WP-F, the last remaining work, is delivered in that candidate (W1 `00761d7`,
+  W2 `53c9d51`, W3 this change; see "Delivered in the W3 candidate" below). The history
   follows. The design converged after four plan-review rounds and
   eight Codex consults in the PLAN lane, with the conversion lane's own numbered
-  separately. The first substrate landed as commit `2992f9c`, which is a CHECKPOINT
+  separately. The first substrate landed as commit `1bd707a`, which is a CHECKPOINT
   and explicitly not a delivery.
 
   **Cutover checkpoint state (row 3, the completion flip).** All three acknowledgement
@@ -4314,7 +4314,7 @@ never licenses changing a test assertion.
   advancing the exchange in the same batch that re-phases its slot (`opAdvanceExchangeAck`,
   reached through `advanceExchangeAck` from the terminal arm in
   `attemptTerminalRegisterRelease` and from `intendPubRelSlot`). The durable core landed at
-  WIP checkpoint `a759d23`, the PUBACK/refused-PUBREC wiring at `0bce8ed`; the
+  WIP checkpoint `3db596e`, the PUBACK/refused-PUBREC wiring at `6c0e5e8`; the
   successful-PUBREC arrow (in-line bounded re-attempt, Confirmed on an acknowledged batch)
   is the increment on top of it. One class gate (`ackExchangeFor`) serves every arrow:
   affine slots are slot-only (shared ones were too, until 7a made them ordinary), an
@@ -4751,7 +4751,7 @@ never licenses changing a test assertion.
   filed on 2026-09-21: "F-110 QUALIFIES EVERY mutation-checked CLAIM BELOW, and does not
   withdraw any of them. Those checks were real and are preserved; what they did not
   establish is the admission contract F-110 names, which did not exist as a question when
-  they were run. F-105's committed checkpoints `2992f9c`, `d5eced3` and `86b9b25` write
+  they were run. F-105's committed checkpoints `1bd707a`, `682f3a3` and `55b2e43` write
   `expect: 0` members — the admission batch's register, unsent marker and exchange
   (`outbound_admit_publish.go:189-191`), and the resources, duties, recovery roots,
   exchanges and directory shards enumerated in F-110's census — so the existing substrate
@@ -4797,7 +4797,7 @@ never licenses changing a test assertion.
   it. The parts of both documents that still described the state before any route
   admitted are rewritten by WP-F W3 (this change; step 6 below).
 
-  **The shared-durable enrolment landed (d5eced3) and the RECOVERY PASS now landed on top
+  **The shared-durable enrolment landed (682f3a3) and the RECOVERY PASS now landed on top
   of
   it.** A closing transition allocates a REACHABLE RECOVERY ROOT in the same atomic batch
   that
@@ -4981,8 +4981,8 @@ never licenses changing a test assertion.
   F-108 and F-109 affect is retired by the 2026-09-22 ruling above. Partial adoption is
   still worse than none: a path that ignored the authority could create work after
   closure. **WP-F** (the cutover plan's verification, mutations and documents) is ONE
-  acceptance unit with ordered steps, delivered by W1 (`868990c`), W2 (`522d25d`, which
-  needed F-113's fix `c374099`) and W3 (this change). Each step's evidence follows; none
+  acceptance unit with ordered steps, delivered by W1 (`00761d7`), W2 (`53c9d51`, which
+  needed F-113's fix `166c5ad`) and W3 (this change). Each step's evidence follows; none
   of it is the gate's result, which this tree does not record:
 
   1. **The output boundary, restated.** The five actionless emitters (CONNACK, the server
@@ -4992,7 +4992,7 @@ never licenses changing a test assertion.
      `mqttEnqueuePreparedPublishMsgTo`, with their per-site counts, and tests show that
      supported QoS 1/2 traffic never leaves through them. Their remaining raw affine
      output is chapter P's; the plan's empty-set requirement is restated, never claimed
-     met, and B2 is re-run against the restricted set. *Delivered by W1 (`868990c`):* the
+     met, and B2 is re-run against the restricted set. *Delivered by W1 (`00761d7`):* the
      five moved onto `writeActionlessFrameBy`, with
      `TestF105OutputBypassSetIsTheTwoMixedSites` and
      `TestF105SupportedObligationsNeverLeaveThroughAMixedSite`.
@@ -5000,7 +5000,7 @@ never licenses changing a test assertion.
      experimental affine caller (consult 80); the custody ledger, not the exclusion lift,
      is the allocator's gate (`liftIdentifierExclusionLocked` still lifts on absence;
      witness `TestF105CustodyAllocatorSkipsALedgerHeldIdentifier`); 8c's certificate
-     clearance replaces the deleted discharge oracle. *Delivered by W1 (`868990c`):*
+     clearance replaces the deleted discharge oracle. *Delivered by W1 (`00761d7`):*
      recorded, with the restricted bypass set, in the cutover plan the gate judges
      against; W3 adds Amendment 9 (consult 133, step 6 below).
   3. **An obligation-to-evidence crosswalk** over the plan's structural properties as
@@ -5017,7 +5017,7 @@ never licenses changing a test assertion.
      mutation, the effective mutation, fixture and assertion, tree and recorded result — or
      run now (C1-C9, A1, B1, B2, D2b, D2c, D3b and D4b appeared in no unit's ledger); a
      retired mechanism names the invariant that supersedes it; C9 and D2c keep their direct
-     boundary submissions. *Delivered by W2 (`522d25d`):* the crosswalk is the lane file
+     boundary submissions. *Delivered by W2 (`53c9d51`):* the crosswalk is the lane file
      `crosswalk-wpf.md` (outside the tree; its path goes to the gate), every mutant run on
      one frozen candidate tree and recorded as observed (consult 130's contract); the three
      inflight tests are renamed to what they assert (scheduling-entry removal for a
@@ -5037,8 +5037,8 @@ never licenses changing a test assertion.
      session expiry, that closes and discards the predecessor (consults 128, 129) - is ended
      only under that discarding closure.
      `TestF105ObligationSurvivesRetirementAndCompletes` builds the transitions directly and
-     satisfies neither. The clean-start arm was unreachable until F-113's fix (`c374099`).
-     *Delivered by W2 (`522d25d`):* `outbound_peer_witness_e2e_test.go` -
+     satisfies neither. The clean-start arm was unreachable until F-113's fix (`166c5ad`).
+     *Delivered by W2 (`53c9d51`):* `outbound_peer_witness_e2e_test.go` -
      `TestF105PreservedObligationCompletesOnThePeer`,
      `TestF105DiscardedObligationEndsUnderTheDiscardingClosure` (clean start),
      `TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure` (expiry),
@@ -5085,8 +5085,8 @@ never licenses changing a test assertion.
      derivation, `mqttLineageForWrite`, with two agreement refusals (the replacement
      composer's, and `opAdmitPublish`'s for a create).
 
-  **The integrated gate.** One `adversarial-review --scope branch --base 9310151` — the
-  parent of the first checkpoint, `2992f9c`; the span also carries the F-108, F-109 and
+  **The integrated gate.** One `adversarial-review --scope branch --base 0e0714e` — the
+  parent of the first checkpoint, `1bd707a`; the span also carries the F-108, F-109 and
   F-110 filings, the nats-server 2.15.0 pin and F-111, which the review is told about and
   does not rework — over the complete candidate tree, judged against the cutover plan's
   coherence property and its nine stopping invariants as amended in step 2. It passes when
@@ -5096,7 +5096,7 @@ never licenses changing a test assertion.
   F-105 and F-106 are ticked together in the W3 candidate, provisionally; they are
   accepted as closed only when this gate passes, and a required change reopens them.
 
-  **Gate round 1 (on `672a6a3`): one required change, made in the following commit.** The
+  **Gate round 1 (on `c07eea6`): one required change, made in the following commit.** The
   frame guard kept one entry per executed or abandoned acquisition in a per-connection map
   that nothing deleted, so a long-lived subscriber's memory grew with every transmission.
   The consume-once record moved onto each acquisition's holder (`mqttExecCell`, shared by
@@ -5107,7 +5107,7 @@ never licenses changing a test assertion.
   refused by the client's Maximum Packet Size; that open finding is widened, not fixed
   here (consult 134).
 
-  **Gate round 2 (on `31e2537`): round 1's fix accepted, one further required change, made
+  **Gate round 2 (on `ce97c1a`): round 1's fix accepted, one further required change, made
   in the following commit.** The identifier-exclusivity walk every admission runs read one
   stream-info page of the generation's exchange subjects and refused when the server
   reported more, and nothing deletes an exchange record, so a generation stopped admitting
@@ -5257,7 +5257,7 @@ and its evidence is preserved intact at
 - [x] [F-097: Terminal-completion evidence and reconciliation across allocation
   replacement](findings/ha-arbitration.md#f-097-terminal-completion-evidence-and-reconciliation-across-allocation-replacement).
   **Alpha blocker, filed 2026-09-09. CLOSED 2026-10-11 with F-088.** The joint change
-  landed as `a4a01a1` (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20,
+  landed as `87fe5ed` (lane `~/.claude/lanes/f-097-after-f105/`, plan revision 20,
   consults C1 to C10; holistic round 6 approved tree `4737156d` with its residuals and
   coverage gaps disclosed). The close-out (lane `~/.claude/lanes/f-097-f088-close/`)
   witnessed the open evidence on production schedules, which reached two F-088 contract
@@ -5354,7 +5354,7 @@ and its evidence is preserved intact at
 
   **What closed the box (2026-10-11).**
   - The holistic review of the whole change ran (round 6 approved `4737156d`, committed
-    as `a4a01a1`).
+    as `87fe5ed`).
   - `TestF105CustodyExhaustionRequestsObservation` passes: it was re-expressed under the
     implementation ruling R-impl-2, with the fault held through the window, the exhausted
     allocator's request starting the observing pass, and every release assertion kept.
@@ -5572,7 +5572,7 @@ proof together with continuous custody; no obligation was dropped in the move.
 
   **What landed.** `releaseDowngradedConsumersLocked` runs at the packet's final-update
   boundary, one step after `convertDowngradeCandidatesLocked` and inside the same `sess.mu`
-  section that applies the membership — the asymmetry `d554f13` closed for the converted arm
+  section that applies the membership — the asymmetry `6515a7b` closed for the converted arm
   and left open for the destructive one. It does **not** require `dd.convert`, because a
   stream inactivity limit stops a descriptor from ever reaching the conversion and that is
   the route that can hold started exchanges. The `inLock` hook reports the release, so a
@@ -5606,7 +5606,7 @@ proof together with continuous custody; no obligation was dropped in the move.
 
 - [x] **A quarantined packet identifier has no live-session release.** Filed 2026-08-30 by
   F-087's plan-review loop. **CLOSED 2026-10-11 by census: the mechanism no longer exists,
-  so there is nothing to release.** F-105 7b (`e35961d`) deleted `quarantineForeignInflight`,
+  so there is nothing to release.** F-105 7b (`f6e7feb`) deleted `quarantineForeignInflight`,
   the Shared claim contest, its source-keyed decline and the five Quarantine tests
   (`TestMQTTInflightQuarantineHoldsUntilResume` among them) for EVERY class, the
   experimental one included — not narrowed to it. Today a live same-delivery occupant is
@@ -5714,7 +5714,7 @@ retransmission](findings/release-investigations.md#f-072).
 
 - [x] [F-088: A transmitted delivery's cancellation must not free its packet
   identifier](findings/ha-arbitration.md#f-088-a-transmitted-deliverys-cancellation-must-not-free-its-packet-identifier).
-  **Alpha blocker. CLOSED 2026-10-11 with F-097.** The joint change landed as `a4a01a1`
+  **Alpha blocker. CLOSED 2026-10-11 with F-097.** The joint change landed as `87fe5ed`
   (lane `~/.claude/lanes/f-097-after-f105/`). The close-out (lane
   `~/.claude/lanes/f-097-f088-close/`) witnessed PS-1, PS-2, W5c and W6a on production
   schedules. That reached two contract failures, both fixed in the same change ("The
@@ -5774,7 +5774,7 @@ retransmission](findings/release-investigations.md#f-072).
   witnesses fence disposal and preservation per route; row 17 is F-119's schedule. T15
   witnesses every door entrance: marker standing ends then deletes, marker absent always
   preserves. **W6b** reached a D4 defect and its fix landed (see F-097). PS-1, PS-2, W5c
-  and W6a were open at `a4a01a1`. Their dispositions are below.
+  and W6a were open at `87fe5ed`. Their dispositions are below.
 
   **The close-out (2026-10-11).** Two brokers on one JetStream with real clients
   (`f088_cross_tenure_witness_e2e_test.go`). Each ordering is forced by an existing seam:
@@ -6375,7 +6375,7 @@ write](findings/runtime-correctness.md#f-035).
   is **not** durable deduplication. Retention is in memory, so a restart, its capacity
   bound and a never-returning account still lose the Will. Deadline correctness is not
   delivery promptness: the interval between the close and the consumption is unbounded, and
-  `c10f049`'s write deadline does not cover it. The sibling `:3903` is **untouched** and
+  `6364a37`'s write deadline does not cover it. The sibling `:3903` is **untouched** and
   anchoring does not fix it — a Will held behind that barrier still publishes late, it
   merely no longer has its delay restarted. Residuals in `docs/CONFORMANCE.md` under
   residual 8; mechanism in `docs/ARCHITECTURE.md` under "Why dated".
@@ -6558,8 +6558,8 @@ override](findings/session-and-will.md#f-041).
 
   **Shape:** 10 plan-review rounds across two runs (blocking 3, 5, 2, 1, 1, 0, 2, 2, 2,
   0),
-  zero relaunched, plus two scope consults. Rounds 1-6 were planned against `a8635fe` and
-  never approved; the re-anchoring to `2231651` cost rounds 7-10 and one deletion.
+  zero relaunched, plus two scope consults. Rounds 1-6 were planned against `355e5ef` and
+  never approved; the re-anchoring to `af86e29` cost rounds 7-10 and one deletion.
 
 - [x] [F-039: Restore shared membership during SUBSCRIBE
 rollback](findings/runtime-correctness.md#f-039).
@@ -6992,7 +6992,7 @@ publisher](findings/runtime-correctness.md#f-060).
   affine QoS 2 consumer — any ordinary QoS 2 subscriber — is refused before CONNACK
   ("refusing to prepare an unsupported handoff ... an affine target carries a malformed
   affine generation", naming the empty one) and the client sees the connection close.
-  Found during F-105 7c and verified at HEAD `0af6118` on an exported copy. Reproduction:
+  Found during F-105 7c and verified at HEAD `74955c5` on an exported copy. Reproduction:
   v5, Session Expiry 60, SUBSCRIBE at QoS 2, one ordinary QoS 2 delivery, close, CONNECT
   with Clean Start. **The producer is wrong, not the validator:** the clean-start path
   (`internal/mqtt/mqtt.go`, the `mqttCleanStartRetireTargets` built in the
@@ -7034,7 +7034,7 @@ publisher](findings/runtime-correctness.md#f-060).
   costs — before any is converted; they are not interchangeable retry policies (consult
   104).
 - [x] **F-115: a QoS 2 PUBLISH is redelivered after the client's PUBREC.** Filed
-  2026-10-02 by F-105 7c-lc, measured on `d5913f7` (the change's baseline, before any
+  2026-10-02 by F-105 7c-lc, measured on `6c51983` (the change's baseline, before any
   7c-lc edit): `TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe` fails 6 of 8 standalone
   runs. With `AckWait` 250 ms, a client that answers PUBREC for an outstanding QoS 2
   delivery receives that delivery's PUBLISH again (DUP set) once the source's AckWait
@@ -7068,7 +7068,7 @@ publisher](findings/runtime-correctness.md#f-060).
   Mutations M1, M2, M5, M6 and M7 each killed by their paired tests.
 - [x] **F-116: a PUBREL attempt prevented from writing keeps its PUBCOMP debt, so its
   identifier stays reserved for ever.** Filed 2026-10-02 by F-105 7d (consult 114), measured
-  on `a6ba9ee` (7d's baseline) and on the 7d tree alike. `beginPubRelSendLocked`
+  on `1f9501f` (7d's baseline) and on the 7d tree alike. `beginPubRelSendLocked`
   (`inflight_register.go`) increments the send hold's `pubCompOwed` when a PUBREL
   transmission opens; the callback then re-checks the entry at write entry
   (`pubRelWriteKindLocked`) and returns WITHOUT writing when the client's PUBCOMP for an
@@ -7088,8 +7088,8 @@ publisher](findings/runtime-correctness.md#f-060).
   client's Maximum Packet Size refusal inside `mqttWriteAuthorizedPubRel` (`mqtt.go`),
   which returns AFTER write entry and before any byte, from both current callers - the
   delivery callback `mqttDeliverPubRelCb` and the retained route's
-  `emitRetainedPubRelOnce`. The refusal already leaked the debt at the gate base `9310151`
-  (`mqttEnqueuePubResponse` -> `mqttEnqueueFittingProto`; `eea8531` moved it into the
+  `emitRetainedPubRelOnce`. The refusal already leaked the debt at the gate base `0e0714e`
+  (`mqttEnqueuePubResponse` -> `mqttEnqueueFittingProto`; `f79bb93` moved it into the
   authorized writer); `emitRetainedPubRelOnce` is new in the F-105 span, so its route is
   not covered by any baseline exemption. Measured by the gate fix's long-lived test: each
   such refusal followed by one successful PUBREL and its single PUBCOMP leaves a send hold
@@ -7131,7 +7131,7 @@ publisher](findings/runtime-correctness.md#f-060).
   inventory learned the new names (`endPubRelSend`, `endSendCore`,
   `retireReleasedDeliveryLocked`).
   **Not closed by this:** `TestMQTTDrainBarrierFailsClosed`'s "still reserved by a send
-  hold". Interleaved at `85024d9`, 16 runs per arm under `-race`: baseline 11 of 16 red,
+  hold". Interleaved at `6ae7e82`, 16 runs per arm under `-race`: baseline 11 of 16 red,
   F-116 tree 12 of 16, and on both trees the failing hold carries no PUBCOMP debt but an
   identifier exclusion (`slotOwed`) left by an action drain that did not complete the
   exchange. Moved to the
@@ -7282,8 +7282,8 @@ publisher](findings/runtime-correctness.md#f-060).
   consumer-not-found follows. It gets no credit for in-session disposal after the
   failure, and is re-expressed when F-124 lands. The baseline arm deletes the consumer
   in-session. **Provenance:** the mechanism is in code the close-out leaves unchanged
-  against `48a9003`; observed with the close-out applied, not separately reproduced on
-  `48a9003`. **Not fixed here:** refusing a zero at marking needs a demonstrated owner
+  against `d784cdb`; observed with the close-out applied, not separately reproduced on
+  `d784cdb`. **Not fixed here:** refusing a zero at marking needs a demonstrated owner
   that re-marks and disposes, and carrying the entitlement across retries and tenure
   changes needs an ownership design that keeps disposal authority distinct from MQTT ACK
   authority. Disclosed in `docs/CONFORMANCE.md` ("A drain whose completion is retried
@@ -7294,7 +7294,7 @@ publisher](findings/runtime-correctness.md#f-060).
 
 - [x] **F-127: credentials in the NATS URL replace every passthrough client's own.**
   Filed 2026-10-25 by the user's decision, from holistic round H8 of the section 5
-  manifest item (3ccaba8). Security, so a §0.3 box under the filing rule above. When
+  manifest item (114263c). Security, so a §0.3 box under the filing rule above. When
   `-nats` / `MQTTNB_NATS_URLS` carries userinfo (`nats://user:pass@host`, or a token
   `nats://token@host`), auth passthrough authenticates every MQTT client as THAT identity:
   - `Backend.DialClient` (`internal/backend/backend.go:257`) dials each per-client
@@ -7310,8 +7310,8 @@ publisher](findings/runtime-correctness.md#f-060).
   authorization is bypassed silently, with no error. **Evidence so far:** source reading
   of both functions at the pin. A real-server witness is owed: a client whose own
   credentials are denied must not be admitted when the URL carries a permitted identity.
-  **Provenance:** present at 45f61e2 and earlier. The example deployment's test now
-  refuses an `@` in any literal env value (3ccaba8), which guards the example only, not
+  **Provenance:** present at b2dac79 and earlier. The example deployment's test now
+  refuses an `@` in any literal env value (114263c), which guards the example only, not
   the binary. **Closure:** the binary refuses userinfo in every configured NATS URL at
   startup, an unsupported shape refused rather than reinterpreted. The service identity
   comes from `-nats-user`/`-nats-pass` or `-nats-creds`. Close it with that witness and a
@@ -7359,7 +7359,7 @@ confirmed finding's disposition, and never waive green CI.
 
 - [x] [F-040: Reproduce reconnect versus DISCONNECT
 expiry-zero](findings/session-and-will.md#f-040).
-  **REPRODUCED and FIXED (2026-10-14).** Deterministic at `903bee1`, 3/3: hold the old
+  **REPRODUCED and FIXED (2026-10-14).** Deterministic at `54999b0`, 3/3: hold the old
   connection's close at the teardown seam (after the DISCONNECT recorded its Session Expiry
   Interval 0 override, before the close contends for the gate), then CONNECT with Clean
   Start 0; the takeover resumed the session and reported Session Present 1, because the
@@ -7375,7 +7375,7 @@ expiry-zero](findings/session-and-will.md#f-040).
   override recorded after the takeover's sample is a displaced connection's and does
   nothing; across brokers the record arbitrates; a definite failure of the ending write
   keeps F-041's residual. Its verification met four unrecorded pre-existing reds (equal at
-  clean `903bee1`, interleaved); they are in the verification ledger.
+  clean `54999b0`, interleaved); they are in the verification ledger.
 
 - [x] [F-042: Identify the unexplained full-suite
 failure](findings/release-investigations.md#f-042).
@@ -7412,7 +7412,7 @@ real](findings/release-investigations.md#f-044).
   PUBREC and PUBREL receives the message, which now includes the publisher's own
   No Local filter created there (new behavior from this fix, characterized by
   `TestF117PubRelWindowSelfEchoResidual`; the pre-existing window is the defect). Its
-  verification met three unrecorded pre-existing reds (equal at clean `28e5516`,
+  verification met three unrecorded pre-existing reds (equal at clean `860a25a`,
   interleaved); they are in the verification ledger.
 
 - [x] **F-118: `TestMQTTRedeliveryAckWait` fails intermittently, pre-existing, mechanism
@@ -7424,7 +7424,7 @@ real](findings/release-investigations.md#f-044).
   action ... could not be drained; its packet identifier stays reserved"
   (`inflight_register.go` ~7431). It is red in the F-105 8a, 8b, 8c and WP-F W2 chains
   and absent from the W1 and F-113 chains. Measured interleaved A/B, prebuilt `-race`
-  binaries run from one directory: base `c374099` failed 7 of 10, the W2 candidate 3 of
+  binaries run from one directory: base `166c5ad` failed 7 of 10, the W2 candidate 3 of
   10, so W2 did not cause it. The mechanism is not traced; a QoS 1 action drain that never
   lands and keeps the identifier (F-116's neighbourhood) is a candidate only, not a
   finding. Never loosen the assertion; treat it as pre-existing when comparing suites.
@@ -7435,7 +7435,7 @@ real](findings/release-investigations.md#f-044).
   below is the ledger entry's required work. Filed 2026-10-11 by the F-097/F-088 close-out
   (consult C-W4). The test (`outbound_custody_driver_test.go`) fails with "the item and
   the gate request took 4 iterations under continuous hints, want <= 3". Measured: 1 of 10
-  at clean `48a9003` in a throwaway worktree (`-count=10`, tagged build), and 1 of 5 with
+  at clean `d784cdb` in a throwaway worktree (`-count=10`, tagged build), and 1 of 5 with
   the close-out's fix applied, which does not touch the dispatcher. That establishes the
   failure predates the fix; it does not establish whether the dispatcher or the
   measurement is wrong. The boundary to investigate first: the test samples `base` before
@@ -7494,10 +7494,10 @@ real](findings/release-investigations.md#f-044).
   (`sess_origin_interval_cluster_test.go:207`). When a retry produces a THIRD establish
   attempt, two rejections out of three is the CORRECT outcome — one winner, two losers —
   and the assertion fails a passing broker. Measured in isolation with `-count=8` on
-  2026-08-14: **2/8 at `81a8b9f`, 3/8 with the acceptance-fact change**, so it is
+  2026-08-14: **2/8 at `f36404f`, 3/8 with the acceptance-fact change**, so it is
   pre-existing and the rates are within noise of each other; it is not the concurrent-suite
   starvation the other flakes are. Re-measured 2026-08-15 during the F-030 work at
-  **2/12 on a clean checkout of `4db3764` and 2/12 on the working tree** — identical, and
+  **2/12 on a clean checkout of `c0c1d23` and 2/12 on the working tree** — identical, and
   confirming both the diagnosis and that it is unrelated to whatever change is in flight.
   At roughly one failure in six on an ungated CI job, this is worth doing. The fix is to
   assert the INVARIANT — exactly one
@@ -7516,7 +7516,7 @@ real](findings/release-investigations.md#f-044).
   fact-read failure on the first, and assert the pass issued exactly ONE read — the
   point being that an outage costs one timeout per PASS, not one per record. Under
   load the assertion intermittently sees 2.
-  **What was measured, at exact-test granularity.** A paired soak against `eadb22d`
+  **What was measured, at exact-test granularity.** A paired soak against `e3c5cd0`
   (the commit before the pre-CONNACK-signal work), selector
   `TestQ2Aff|TestMQTTQ2Aff|TestWill|TestMQTTWill`, 450 tests per run, **20 runs per
   arm POOLED FROM TWO INVOCATIONS of `make soak` (8 then 12)** with the same selector,
@@ -7558,7 +7558,7 @@ real](findings/release-investigations.md#f-044).
   `TestQ2AffOnBehalfRestorationIsNotChargedToTmaxack`
   (`qos2_shared_affine_lifecycle_test.go:5521`).
   **MEASURED as pre-existing and symmetric**: it fired once in each arm of the
-  paired soak above — the baseline arm at `eadb22d` and the candidate arm alike —
+  paired soak above — the baseline arm at `e3c5cd0` and the candidate arm alike —
   so it is neither introduced nor fixed by the pre-CONNACK-signal work. It is
   recorded because a panic is worse than a flake: it truncates the run, which is
   what put the coverage caveat on that soak. A nil check that keeps polling until
@@ -7638,7 +7638,7 @@ real](findings/release-investigations.md#f-044).
   (`server/client.go:5638-5652`, v2.15.1), without consulting the MQTT ACL. alice joined
   at ~3s, when the backoff had reached seconds per offer, so the 15s window held about
   three offers, each going to the denied bob with probability one half: a miss about one
-  run in eight. Measured at `9bf3a4d` with a diagnostic copy of the fixture, isolated and
+  run in eight. Measured at `e317d0e` with a diagnostic copy of the fixture, isolated and
   unloaded: 2 of 24 runs missed the window, and both were LATE, not lost (alice received
   at 25.5s on delivery 9 and at 81.1s on delivery 11). The shared consumer showed one
   ack-pending message with ack floor 0 throughout, and every arrival in all 24 runs fell
@@ -7671,7 +7671,7 @@ real](findings/release-investigations.md#f-044).
 
   **The original record.** Observed 2026-09-06 while verifying the delivery-readiness
   change, under `-tags mqttport_fulltests`. **On the working tree:** pass, pass, fail.
-  **On a clean `d75bdb1` worktree carrying none of that change:** pass, pass, pass,
+  **On a clean `7572f12` worktree carrying none of that change:** pass, pass, pass,
   fail. Failing runs took ~18.2 s each.
 
   **What that does and does not establish.** It establishes that the failure occurs
@@ -7753,13 +7753,13 @@ real](findings/release-investigations.md#f-044).
   carried in the verification ledger since 2026-10-12, not by this bullet.
   **ATTRIBUTED (2026-10-15); one broker mechanism FIXED, one residual ACCEPTED.** Closure
   here means attribution and disposition per member, not a green family run. Measured at
-  `b334415` on a prebuilt tagged `-race` binary: the four named members failed 0 of 19
+  `8e13e6a` on a prebuilt tagged `-race` binary: the four named members failed 0 of 19
   family runs (11 at `-parallel 8`, 8 CPU-starved at `GOMAXPROCS=2`). There is no shared
   server fixture, and no process-global interference was identified (every family test
   installing a `setMQTTTest*` hook is serial, under
   `TestParallelTestsTouchNoProcessGlobalState`). The "family-level" reading does not hold;
   per member: `TerminalAckParksWhileASendIsInFlight` — an immediate read of an asynchronous
-  delete, already fixed by 9a16434 four days after the filing;
+  delete, already fixed by a2f31c4 four days after the filing;
   `PubAckParksThroughTheAckPath` — the same premise, unconverted (a first terminal attempt
   that cannot confirm hands off to the retry by design), now observed at the designed
   completion; `OrphanReconcile` — F-069, now CLOSED: the test owns its sightings (its own
@@ -7835,7 +7835,7 @@ real](findings/release-investigations.md#f-044).
   **Measured on a local rig, not a CI runner**, because this sandbox cannot reach a Docker
   daemon. The rig is nats-server v2.15.1 built from the pinned module, with ci.yml's paho
   job configuration (`test/conformance/nats.conf`, auth passthrough, `-keepalive-max 60`).
-  - The two-test sequence fails deterministically at `76d8c28` and passed 5 of 5 on the fix.
+  - The two-test sequence fails deterministically at `c0b383e` and passed 5 of 5 on the fix.
   - Same-ID CONNACK, CONNECT sent the instant the DISCONNECT is read: 0.94 s at HEAD, 0.25
     to 0.28 s on the fix. When it is sent 0.25 s later: 0.76 s at HEAD, about 0.05 s on
     the fix.
@@ -7862,8 +7862,8 @@ real](findings/release-investigations.md#f-044).
   some of the retained messages or none until the attempts paused. The copies stayed in the
   store: one probe run received its backlog late. The late acknowledgement of a retained
   ABANDONMENT reached the same owner by a second site.
-  - Bisect, with both endpoints verified on the rig: `3bb3b45` passes 2 of 2, and the first
-    bad commit is `d5913f7` ("F-105 7c: retained QoS 1/2 through the manifest").
+  - Bisect, with both endpoints verified on the rig: `c053c83` passes 2 of 2, and the first
+    bad commit is `6c51983` ("F-105 7c: retained QoS 1/2 through the manifest").
   - Two earlier leads were wrong. Auth passthrough is NOT the distinguishing configuration:
     a probe reproduces it with `-auth-passthrough=false`. The logged `Permissions Violation
     for Publish to "$JS.API.CONSUMER.INFO.$MQTT_msgs."` is the server refusing a publish to
@@ -7881,7 +7881,7 @@ real](findings/release-investigations.md#f-044).
     through the manifest (F-105 7c)" and CONFORMANCE "Retained replay after acknowledged
     retained QoS 1". No residual.
   - Measured on the same rig. A probe of repeated `+/+` SUBSCRIBEs on one session delivered
-    3, 3, 3, 1, 0, ... retained frames at `210c33e`, and 3 of 3 in 8 of 8 rounds on the fix.
+    3, 3, 3, 1, 0, ... retained frames at `5dd0231`, and 3 of 3 in 8 of 8 rounds on the fix.
     The test alone passed 5 of 5 on the fix (0 of 3 at HEAD).
   - The cascade was this defect too. The next tests' setup CONNECT (`test_unsubscribe`,
     `test_user_properties`) timed out at 0.3 s behind the stuck attempts. The earlier
@@ -7906,12 +7906,12 @@ real](findings/release-investigations.md#f-044).
     before the PUBACK had been processed. It now waits for the exchange's ending first.
 
   Full `SUITES=paho` on the fix: 27 tests; the only failure was the baselined
-  `test_subscribe_identifiers` (`run.sh`: no regressions). At `76d8c28`: `test_keepalive`,
+  `test_subscribe_identifiers` (`run.sh`: no regressions). At `c0b383e`: `test_keepalive`,
   `test_subscribe_identifiers` and `test_subscribe_options`.
 
 - [x] **MOVED to the verification ledger (2026-10-12 convergence triage)** as a
   deterministic fixture-reach failure.
-  **A displaced-writer wire test fails deterministically at `c1b37b0`, pre-existing:**
+  **A displaced-writer wire test fails deterministically at `db63905`, pre-existing:**
   `TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate`, its
   `a_displaced_fresh_allocation_create` arm. Filed 2026-10-12 by F-119's verification, not
   investigated there (3 of 3 runs on a clean HEAD worktree fail identically): no allocation
@@ -7920,19 +7920,19 @@ real](findings/release-investigations.md#f-044).
   which ordinary admission no longer takes since F-105 converted it to the authority batch,
   so the first question is whether the fixture still reaches its route.
 
-- [x] **Three more deterministic pre-existing failures at `c1b37b0`**, filed by F-119's
+- [x] **Three more deterministic pre-existing failures at `db63905`**, filed by F-119's
   verification. **Split 2026-10-12 (convergence triage):** the nil-map teardown panic, the
   `mqttRetainedCacheTTL` harness data race with its leaked goroutine, and the isolated
   `TestMQTTShutdownV5SendsDisconnect` failure moved to the verification ledger.
-  **CLASSIFIED 2026-10-16, all six remaining assertion failures**, each measured at `b5ec59b`
+  **CLASSIFIED 2026-10-16, all six remaining assertion failures**, each measured at `f075bdf`
   (tagged, isolated) and traced to a mechanism:
   - `TestMQTTRestoreAmbiguousSettlesOnTheResidentObject` (3 of 3): a STALE FIXTURE, bisected
-    to `cd731a1` (F-105 cutover). The accepting CONNECT's save no longer reaches the
+    to `500269a` (F-105 cutover). The accepting CONNECT's save no longer reaches the
     store-result seam, so the boundary save the fixture loses is write 1, not 2; its sibling
     T8 had been retargeted at the cutover and T8b was missed. Retargeted, and it now proves
     the lost write is the boundary's (the restore's drain is staged when it is lost).
   - `TestMQTTReconcileForeignWriteDuringPhase` (3 of 3): a STALE ROUTE, bisected to
-    `00b35a4` (F-105's ownership-gated sweep; listed then as owing an "assembled-tree
+    `ebbb7fb` (F-105's ownership-gated sweep; listed then as owing an "assembled-tree
     reconcile" that never happened). A 10071-disposed repair phase leaves its replacement
     LIVE and undecided, so the orphan sweep correctly withholds it; the next ACCEPTED
     tenure's settlement decides it `tenure-superseded` and the owner retires and deletes
@@ -7962,7 +7962,7 @@ real](findings/release-investigations.md#f-044).
     pins the writer count and each writer's single-flight launch guard. Both tests 30 of 30;
     the looped reproduction 0 of 40. A loop of F-114's unspaced bounded re-attempt family,
     classified and converted (the §2 item).
-  - `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`: NOT REPRODUCED at `b5ec59b`
+  - `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`: NOT REPRODUCED at `f075bdf`
     (0 of 18), which is not "resolved"; moved to the verification ledger with its original
     observation.
 
@@ -7970,7 +7970,7 @@ real](findings/release-investigations.md#f-044).
   verification ledger's red-test pass; FIXED 2026-10-16). None lost or duplicated an
   application message. Each mechanism was traced with timestamps under `-race` before
   anything was planned, and the original witnesses were measured interleaved against
-  `c247593`, ten runs per arm under `-race` (HEAD -> fix): `TestMQTTQoS2RetriesPublish`
+  `874bfb0`, ten runs per arm under `-race` (HEAD -> fix): `TestMQTTQoS2RetriesPublish`
   9/10 -> 0/10, `TestMQTTDrainBarrierFailsClosed` 5/10 -> 0/10,
   `TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange` 9/10 -> 0/10, and the
   re-measured `TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere` 2/10 -> 0/10 (it
@@ -7991,7 +7991,7 @@ real](findings/release-investigations.md#f-044).
     action (a redelivery that acquired before the conversion), it marks that action
     answered before releasing the reservation, so its bind and write entry refuse it
     (holistic review round 1). This reverses F-105's "AckWait can re-admit the PUBREL
-    after an unrecorded PUBCOMP" clause (`30eb5bc`); the three completion-worker tests
+    after an unrecorded PUBCOMP" clause (`cc6a561`); the three completion-worker tests
     that pinned it were rewritten to the new contract by consult (`docs/ARCHITECTURE.md`,
     "A PUBREL exchange decided complete is not admitted again"). A PUBREL whose write had
     already entered still reaches the wire (`docs/CONFORMANCE.md`).
@@ -8101,7 +8101,7 @@ they do not impose a promise that later alpha work preserve that implementation 
 ### Fallout from F-092's admission half, filed here by the supported-scope rule
 
 F-092's sixth attempt (closed 2026-09-04) left **two experimental affine failures**, measured
-against HEAD `77c2168` in a separate worktree rather than remembered: HEAD's baseline is four
+against HEAD `ae30b56` in a separate worktree rather than remembered: HEAD's baseline is four
 failures in `make experimental-shared-qos2-tests` and the tree's is six. The two new
 ones are affine-only, so by the 2026-09-02 supported-scope rule they are appended
 here rather than widening that item.
@@ -8130,7 +8130,7 @@ supported paths, not of an affine defect newly introduced. Neither is an alpha b
 ### Fallout from F-098's resident-reaper authority enforcement, filed here by the same rule
 
 F-098's attempt 3 (2026-09-13) leaves **twelve new experimental affine failures**, measured
-against a clean HEAD `00f2ab8` built in a separate `git worktree` rather than remembered.
+against a clean HEAD `3544918` built in a separate `git worktree` rather than remembered.
 Both arms ran the same prebuilt test binary, the same `TestOrphanSweep` filter and the same
 `-test.parallel 2`; the tree's twelve reproduce identically at `-test.parallel 1`, so they
 are not a parallelism artefact.
@@ -8434,7 +8434,7 @@ v2.15.0 and every witness still reproduces, so none closed with that bump.
   (`internal/mqtt/point_read_absence_*_test.go`, its manifests, and the dossier
   `docs/findings/point-read-absence-census.md`) mapped broker decisions onto an upstream
   answer this broker no longer compensates for, and it is no longer maintained: red at
-  `34c50ef` and not updated for F-105 7b's reads (the record and counts are in
+  `3e937fd` and not updated for F-105 7b's reads (the record and counts are in
   `docs/known-upstream-issues.md`, F-109). Scope: review each check for one that states an
   independently applicable broker contract and keep that one on its own, then delete the
   census tests, manifests and dossier and reconcile every reference to them. This is not a
@@ -8804,7 +8804,7 @@ reads](findings/resolved.md#f-054).
   This item owns the remedy — a budget above the writer count, spacing, or stronger
   arbitration such as one outstanding background attempt per session (a draft of the
   latter threads a release through about twelve admission-hook sites). **One loop of the
-  family classified and converted (2026-10-16, the `c1b37b0` classification item):**
+  family classified and converted (2026-10-16, the `db63905` classification item):**
   `acquirePublishAction`'s ordinary-slot acquisition (`inflight_register.go`) is a
   FOREGROUND authority transition whose exhaustion stalled a live delivery until AckWait
   (`TestMQTTv5RetainHandling`, `TestMQTTReconcileChargeAccounting`). It now announces
@@ -8911,7 +8911,7 @@ reads](findings/resolved.md#f-054).
   deleted and a single attempt, route B's exhaustion re-read deleted, and the retained
   driver's retry disabled. Met on the way and carried by the verification ledger, not
   here: `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` (pre-existing,
-  5 of 5 at `7ed23d8`, re-measured in its existing entry).
+  5 of 5 at `5a313ff`, re-measured in its existing entry).
 
 - [x] Page the shared `$MQTT_out` consumer enumeration (moved from §0.4 on 2026-10-12).
   `consumerList` walks the whole `$MQTT_out` population on every orphan-sweep pass, and
@@ -9216,9 +9216,9 @@ reads](findings/resolved.md#f-054).
   release claimed by the issuer dropped at abort, and a queued job's ownership. Verified
   with `make test`, the tagged suite under `-race` and `make cluster-failover-tests`; reds
   met: `TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` and
-  `TestF105RecoveryKickIsBoundedAndFair` (recorded, both reproduced at clean `4839059`:
+  `TestF105RecoveryKickIsBoundedAndFair` (recorded, both reproduced at clean `87d1682`:
   3/3 and 3/20); `TestRetainedResetCreateResponseLostReconciles` (recorded intermittent;
-  0/20 at clean `4839059` this time); and
+  0/20 at clean `87d1682` this time); and
   `TestF105RetainedCloseLocatesTheRegisterByItsAdmission`, once, in the final chain (not
   reproduced in isolation on either tree, 0/10 each; its rig's only inbound packet is one
   acknowledged publish on the direct path), carried as unattributed in the verification
@@ -10099,13 +10099,13 @@ reads](findings/resolved.md#f-054).
 
 ### Before the first push
 
-- [ ] Nothing is pushed to the GitHub remote until commit signing is set up and the
-  branches are cleaned up. Added 2026-10-26 at the owner's request, when the
-  `nberlee/mqtt-nats-broker` repository was created empty. Until this box is checked no
-  branch, tag or wiki page is pushed, so every CI path that needs a pushed commit (the
-  workflows, the release jobs, wiki publication) stays unexercised on GitHub. Done when
-  the commits that will be pushed are signed, the branch set to publish is decided and
-  the others are deleted or kept local, and the owner has made the first push.
+- [x] Nothing is pushed to the GitHub remote until commit signing is set up and the
+  branches are cleaned up. **Done 2026-10-26.** The repository moved to
+  `mqtt-nats-broker` with one branch, `main`; the development branches and worktrees stay
+  in the old local checkout. Every commit is SSH-signed, history rewritten with trees,
+  authors and dates unchanged; WIP and checkpoint subjects were reworded to say what
+  each commit holds, and the commit hashes the docs and messages quote were repointed to
+  the signed history. The first push of `main` follows this commit, without tags.
 
 ## Alpha release gate
 
@@ -10327,7 +10327,7 @@ than
   production call sites** — five in `orphan_qos2_sweep.go`, eleven in
   `qos2_shared_affine.go`, and **one in `mqtt.go`'s PUBREL/PUBCOMP discharge path that the
   enumeration never listed at all** — against a stated twelve, and the cited line numbers
-  do not resolve (`qos2_shared_affine.go:1727` is blank at `4afa533`). Course E removed
+  do not resolve (`qos2_shared_affine.go:1727` is blank at `3c4730a`). Course E removed
   one reap site and one transition site and recorded only that MECHANICAL delta, marking the
   totals stale rather than restating them.
   *How to close it:* enumerate from the tree, disposition every site, and prefer a check

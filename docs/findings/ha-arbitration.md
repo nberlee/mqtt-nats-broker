@@ -719,7 +719,7 @@ them. Measured against the current tree: the reap class has **17 direct producti
 sites** (five in `orphan_qos2_sweep.go`, eleven in `qos2_shared_affine.go`, and **one in
 `mqtt.go` that this enumeration never listed at all**, in the PUBREL/PUBCOMP discharge
 path), excluding `reapQ2AffClaim`'s own delegation to `reapQ2AffClaimChecked`. The cited
-line numbers are stale too, verified with `git show` against HEAD `4afa533`:
+line numbers are stale too, verified with `git show` against HEAD `3c4730a`:
 `qos2_shared_affine.go:1727` is a blank line there. Course E's own contribution is the
 MECHANICAL fact stated above — one reap site and one transition site removed — and nothing
 here should be read as a verified inventory until the class is re-censused. That re-census
@@ -959,7 +959,7 @@ its implementation. The affine history below remains evidence about rejected mec
 not an active acceptance requirement.
 
 - Status: **CLOSED 2026-09-03**, in two units — unit 1 on 2026-09-02 (the incarnation
-  completion lease, `901ee8f`) and unit 2 on 2026-09-03 (the two-dimensional PUBREL
+  completion lease, `226e5f8`) and unit 2 on 2026-09-03 (the two-dimensional PUBREL
   classifier and sites 1 and 3). The section "F-036's seventh attempt (2026-09-03)" is
   canonical for unit 2 and states what it closed and what it deliberately did not; the
   residuals are in `docs/CONFORMANCE.md`. The history below is retained unchanged, because
@@ -1017,7 +1017,7 @@ not an active acceptance requirement.
 
   **SECOND ATTEMPT, 2026-09-01, STOPPED UNRESOLVED** after five consults and four
   plan-review rounds, with **no implementation code written**. F-066's enforcement had
-  landed (`1205d32`), dissolving OPEN 1, so the ordered pre-plan investigation ran. This
+  landed (`cfda77d`), dissolving OPEN 1, so the ordered pre-plan investigation ran. This
   section is canonical for what it established; `docs/ROADMAP.md` carries only the gating
   summary. Working lane `~/.claude/lanes/f-036-preplan/`.
 
@@ -1316,7 +1316,7 @@ that `sess.mu` is held**, cannot distinguish a not-yet-reachable object, and fir
 invariant rather than refusing at the transition boundary. The source guard bounds
 direct assignment, not synchronization.
 
-**The audited five-route ownership table**, by function extent at `cb26fa6`:
+**The audited five-route ownership table**, by function extent at `3978c01`:
 
 | Route | Extent in `mqtt.go` | Ownership refusal |
 |---|---|---|
@@ -1609,7 +1609,7 @@ publish afterwards.
 
 **STOPPED UNRESOLVED for the fifth time, with no implementation code and no design**,
 in the premise phase of a gate pre-registered before any design existed. HEAD
-`8e3c3db`, tree clean throughout. Working lane
+`7756ff2`, tree clean throughout. Working lane
 `~/.claude/lanes/f-036-completion-ownership/`, which holds the gate (`gate.md`), the
 premise audit (`premise-audit.md`), the ledger and the decisions. **The `advisor` tool
 was available for the gate consult and went unavailable before the audit challenge**,
@@ -1725,7 +1725,7 @@ manifestation stand exactly as the fourth attempt left them.
 
 **STOPPED UNRESOLVED for the fourth time, with no implementation code**, after one
 design pass and one consolidated adversarial challenge, under a gate pre-registered
-before the design existed. HEAD `ea04a0b`, tree clean throughout. Working lane
+before the design existed. HEAD `a6864dc`, tree clean throughout. Working lane
 `~/.claude/lanes/f-036-quiescence/`, which holds the design (`design.md`), the ledger
 and the decisions; the selection consult that set the gate is in
 `~/.claude/lanes/selection-20260902/`. **The `advisor` tool was unavailable for this
@@ -2011,7 +2011,7 @@ future claim creation." The proof-to-ack interval is **F-063's stated residual**
 cross-referenced rather than restated as a second residual.
 
 **It is PRE-EXISTING and path-independent, and course E neither introduced nor widened it.**
-`sess_teardown.go` is unchanged from HEAD `4afa533`, and the scan-then-delete sequence lives
+`sess_teardown.go` is unchanged from HEAD `3c4730a`, and the scan-then-delete sequence lives
 inside `deleteTeardownTargets`, reached identically by ordinary teardown (`mqtt.go:10876`,
 `:10930`) and by the sweep's adoption (`sess_teardown.go:1124`). Removing only the sweep's
 route would change which driver reaches the window without closing it, while permanently
@@ -4434,7 +4434,7 @@ machinery, and both are members of C-II's proof family — so an F-098 attempt t
 implements C-II repairs them, and they are filed separately because F-098 may not be
 attempted soon.
 
-**Both have now been taken on their own**: F-099 at `e7ca4b7`, F-100 after it. Neither
+**Both have now been taken on their own**: F-099 at `1eb3ee6`, F-100 after it. Neither
 needed any F-098 machinery, which is the prediction above holding. What F-100 did NOT
 establish is the part that was always F-098's: its gate reads local cached state, so it
 narrows what one broker releases without establishing what a peer consumed. F-100's own

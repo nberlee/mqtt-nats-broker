@@ -883,7 +883,7 @@ differ.
 
 - **The baseline exhausts.** Screen `screen1` (seed 20261022, 30 randomized balanced blocks,
   one test binary per arm, ledger and logs under the lane's gate directory): the code before
-  the benchmark item (bbc762c plus inert measurement seams) exhausted in 4 of 30 trials, after
+  the benchmark item (97ffa57 plus inert measurement seams) exhausted in 4 of 30 trials, after
   6, 7, 8 and 8 PUBACKs with 2 PUBCOMPs each; an intermediate version of the item's changes
   in 6 of 30. Nothing else failed in either arm. No difference was established at this sample
   size, a substantial increase remains compatible with the data, and non-inferiority was not

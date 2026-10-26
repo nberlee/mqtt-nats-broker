@@ -376,7 +376,7 @@ func TestMQTTQoS0DowngradeRestoreOnlyFillsAnAbsentSid(t *testing.T) {
 //
 // The tempting fix for this item was a positive-QoS predicate in
 // buildPersistedSessionLocked. It is wrong, and this is the counterexample. A filter sitting
-// at QoS 0 with a drain that still owes a started QoS 1 exchange -- an ordinary d554f13
+// at QoS 0 with a drain that still owes a started QoS 1 exchange -- an ordinary 6515a7b
 // result -- is upgraded back to QoS 1 in a packet that also carries a shared filter.
 // Adoption moves the durable out of BOTH drain maps and into sess.cons at once, while
 // sess.subs still says QoS 0 until the final update; the shared filter's early persist then
@@ -425,7 +425,7 @@ func TestMQTTAdoptedDrainIsNamedInAMidPacketRecord(t *testing.T) {
 		t.Fatal("fixture: the subscriber never received the QoS 1 delivery, so no started exchange exists")
 	}
 
-	// The downgrade converts, which is d554f13's guarantee and this fixture's premise.
+	// The downgrade converts, which is 6515a7b's guarantee and this fixture's premise.
 	if codes := testMQTTSubV5(t, c, r, 2, []mqttV5SubFilter{{topic: topic, opts: 0}}); len(codes) != 1 || codes[0] != 0 {
 		t.Fatalf("SUBACK for the downgrade: %v", codes)
 	}

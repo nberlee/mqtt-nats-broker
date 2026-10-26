@@ -67,8 +67,8 @@ stands.
   loads where the loop-top `willClaimStopCh` check should have stopped the scan
   after the first record ("scan performed 2 marker loads"). 30/30 standalone
   passes on the same tree, nine prior full-suite passes, and the Will-cancel
-  machinery is untouched by the register-claims change (last touched b70e9d9 /
-  3a25be2), so this is either a scheduling-sensitive test assumption or a real
+  machinery is untouched by the register-claims change (last touched fd9119e /
+  05c1b05), so this is either a scheduling-sensitive test assumption or a real
   ordering gap between `closeWillDispatch` and the scan loop's stop check.
   Needs the same treatment as the expiry-race bullet above: a deterministic
   reproduction before any fix.
@@ -113,7 +113,7 @@ after the seed under load, and `mqttSessionExpirySweepIntervalNS` is a PACKAGE-L
 value that other parallel tests shorten — `TestOrphanSweepRunsFromTheAccountSweepLoop`
 sets 100 ms — so the ticker can fire inside the window as well. Observed once in a `make
 test` run during F-034's verification; **0/8 isolated**, and **0/4** on a clean baseline
-worktree at `ba97fee`. Neither figure is evidence about the cause, because the mechanism
+worktree at `2b91dfd`. Neither figure is evidence about the cause, because the mechanism
 above is not statistical — they only say the window is narrow.
 
 ### What a fix must not do
@@ -184,7 +184,7 @@ and refuses the restoration. Those warnings are the designed behaviour, not this
 | Arm | Failures / runs | Rate |
 |---|---|---|
 | the F-034 change | 6 / 60 | 10% |
-| clean baseline worktree at `ba97fee` | **16 / 60** | **27%** |
+| clean baseline worktree at `2b91dfd` | **16 / 60** | **27%** |
 
 The first isolated batch read **1/10 on the change and 0/10 on the baseline**, which looks
 like a regression and is not one — the baseline is nearly three times worse at 60 runs per
@@ -676,7 +676,7 @@ from keep their full history.
 
 - **`TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect` hangs.** Met 2026-10-16 by
   the §0.4 ledger-red defects' verification. DETERMINISTIC and pre-existing: 4 of 4 at
-  `c247593` and 4 of 4 on that item's tree, each run in isolation under `-race` and
+  `874bfb0` and 4 of 4 on that item's tree, each run in isolation under `-race` and
   stopped by a 400 s test timeout. The test publishes 600 QoS 1 messages one at a time to
   a continuously connected subscriber and PUBACKs each; the goroutine dump shows the test
   blocked reading a delivery that never arrives (`testF112Deliver` ->
@@ -687,7 +687,7 @@ from keep their full history.
   are the first candidates), and file a §0.3 finding only if it shows loss.
 - **`TestF105RetainedAbandonedArrowRefusedAfterDiscard/discard-in-presend`: "the fixture's
   Discard did not land".** Met 2026-10-17 by the §0.4 ledger-red defects' verification.
-  Pre-existing: 1 of 40 at `c247593`, 4 of 40 on that item's tree, isolated and
+  Pre-existing: 1 of 40 at `874bfb0`, 4 of 40 on that item's tree, isolated and
   interleaved under `-race` (not a significant difference at these counts). Mechanism, by
   elimination: a Discard that ran either lands or reports "the discarding close", and
   neither happened, so the presend hook never fired: the fixture's hand-composed advance
@@ -700,7 +700,7 @@ from keep their full history.
 - **Two unmatched singles under full-package load (2026-10-17).**
   `TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands` ("identifier 1 is still
   held", once in an untagged `make test`; 0 of 15 isolated and 0 of 30 at `-cpu 2` on both
-  `c247593` and the §0.4 tree) and `TestF105RecoveryKickIsBoundedAndFair` ("257 roots,
+  `874bfb0` and the §0.4 tree) and `TestF105RecoveryKickIsBoundedAndFair` ("257 roots,
   want the cap 256", once in a tagged shard; 0 of 10 isolated on both arms). Mechanism:
   unattributed. **Disposition: accepted as nonblocking** on present evidence; reopen
   either if it recurs.
@@ -711,13 +711,13 @@ from keep their full history.
   Reproduce: the tagged full suite. **Disposition: accepted as nonblocking** on present
   evidence; reopen with a deterministic reproduction if it recurs.
 - **F-118, `TestMQTTRedeliveryAckWait`.** Intermittent, "Maps should be empty, got 1, 1",
-  with a log of a durable PUBLISH action that could not be drained. Base `c374099` 7 of 10
+  with a log of a durable PUBLISH action that could not be drained. Base `166c5ad` 7 of 10
   interleaved `-race` runs. Mechanism: untraced; an unresolved drain/reservation liveness
   observation, not a proven fixture flake (F-116's neighbourhood is a candidate only).
   Reproduce: `-run TestMQTTRedeliveryAckWait -count=10`. **Disposition: open**; owed: trace
   the mechanism, and file a §0.3 finding only if it shows loss.
 - **F-123, `TestF097DispatcherIsFairUnderContinuousHints`.** Intermittent, "took 4
-  iterations under continuous hints, want <= 3"; 1 of 10 at `48a9003`. **Disposition:
+  iterations under continuous hints, want <= 3"; 1 of 10 at `d784cdb`. **Disposition:
   CLOSED 2026-10-16, a measurement defect; the dispatcher meets its bound.** Traced over 40
   runs with each iteration's units recorded: the failure sampled `base` before the item
   existed and an iteration started in between, so it counted an iteration that was not the
@@ -732,11 +732,11 @@ from keep their full history.
   owed withdrawals fails it (no completion), and taking one pass target per iteration
   fails it (the gate request takes 5).
 - **`TestF097DispatcherCostBound`** ("fixture: an incomplete reconstruction must keep
-  wanting the census"). Intermittent under `-race`, 2 of 40 isolated at `c14482a`; found
+  wanting the census"). Intermittent under `-race`, 2 of 40 isolated at `3a0bc6f`; found
   2026-10-16 by the ledger red-test pass, not seen in that pass's sharded `-race` run.
   Mechanism: unclassified. **Disposition: open**; owed: classify the mechanism.
 - **`TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`, `one_failed_save`** (F-124's
-  characterization). Under `-race` 5 of 5 at `b5ec59b` and 4 of 5 at `c14482a` ("F-124
+  characterization). Under `-race` 5 of 5 at `f075bdf` and 4 of 5 at `3a0bc6f` ("F-124
   characterization: the consumer was deleted in-session"). **Disposition: CLOSED
   2026-10-16, an unpinned fixture.** The drain holds two claims, and the consumer is decided
   by whichever finalize removes the LAST one. Traced: when message 1's failed finalize is
@@ -750,14 +750,14 @@ from keep their full history.
   connectionless retry an entitlement (a stand-in for F-124's fix) fails it.
 - **`TestWillClaimantAbortsThePassOnATransientFactOutage` and
   `TestWillPendingArmAbortsThePassOnATransientFactOutage`.** Intermittent under load, the
-  read count is 2 where 1 is asserted. Paired soak at `eadb22d`: Claimant 2/20 candidate
+  read count is 2 where 1 is asserted. Paired soak at `e3c5cd0`: Claimant 2/20 candidate
   and 0/20 baseline, Pending 2/20 baseline and 0/20 candidate; the candidate-only half is
   suspect, not dismissed. Mechanism: inferred, not settled, that concurrent passes inflate
   the count. Reproduce: `make soak` with the selector in the roadmap bullet.
   **Disposition: open**; owed: count reads for this pass only, or run each half alone under
   injected concurrency.
 - **`TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate`,
-  `a_displaced_fresh_allocation_create`.** Deterministic, 3 of 3 at `c1b37b0`: no allocation
+  `a_displaced_fresh_allocation_create`.** Deterministic, 3 of 3 at `db63905`: no allocation
   observed within 5 s at the fixture-reach check. **Disposition: CLOSED 2026-10-16, a stale
   fixture; no loss.** The observation seam (`testInflightStore`) watched a standalone
   register CAS that admission no longer takes since F-105; it now observes the admission's
@@ -768,7 +768,7 @@ from keep their full history.
   identifier, and nothing after it, which is the licence's claim (never two exchanges under
   one identifier). 3 of 3.
 - **The custody dispatcher's exit panics the tagged binary.** Deterministic at
-  `c1b37b0`: `exitCustodyDispatcher` calls `scheduleWillTimer` on a rig server whose timer
+  `db63905`: `exitCustodyDispatcher` calls `scheduleWillTimer` on a rig server whose timer
   map is nil ("assignment to entry in nil map"), taking every later test with it; triggered
   by `TestRetiredDrainMustNotTransmitAPastPubRecSource` and
   `TestRetiredDrainBarrierMustBeAtomicWithTheMapDrop`. **Disposition: CLOSED 2026-10-16, a
@@ -782,11 +782,11 @@ from keep their full history.
   themselves). Both triggers pass 3 of 3, and the tagged whole-package run completes
   without a panic.
 - **`TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority`.** Deterministic, 3 of 3
-  at clean `e280b83`, both subtests ("the fence must be disposed of by its provenance, got
+  at clean `4104789`, both subtests ("the fence must be disposed of by its provenance, got
   0"; "expected 0 register(s) for this incarnation, got 1"). Found 2026-10-12 by the
   subs-barrier item's verification, identical on its tree, and not investigated there.
   **Disposition: CLOSED 2026-10-15, a stale test premise; no loss.** Bisected: green at
-  `c1b37b0`, red from `5847952` (F-119), which made a pending fence disposable only
+  `db63905`, red from `9f5a702` (F-119), which made a pending fence disposable only
   behind a confirmed authority advance and only once no admission ladder of its nonce is
   live. The
   test's hook runs inside that ladder's own commit, so both its in-ladder disposal and the
@@ -805,11 +805,11 @@ from keep their full history.
   **Disposition: open**; owed: stop the leak or stop mutating the global. Blocks a green
   `-race` run.
 - **`TestMQTTDrainBarrierFailsClosed`, "packet identifier 1 is still reserved by a send
-  hold".** Filed under F-116, which was measured as its mechanism at `a6ba9ee`; 11 of 16 on
-  both arms at `85024d9` under `-race`. The failing hold has no token, no PUBCOMP debt, no
+  hold".** Filed under F-116, which was measured as its mechanism at `1f9501f`; 11 of 16 on
+  both arms at `6ae7e82` under `-race`. The failing hold has no token, no PUBCOMP debt, no
   action and no retained term, only an identifier exclusion (`slotOwed`) installed when a
   PUBREL action drain retired without completing the exchange (`retireActionLocked_`).
-  **Measured 2026-10-16 at `c14482a`, not a test budget:** with the check given 60 s
+  **Measured 2026-10-16 at `3a0bc6f`, not a test budget:** with the check given 60 s
   instead of 10 s, 3 of 8 runs freed the identifier after about 2.2 s and the other 5 still
   held it after 60 s. An exclusion that outlives its completed exchange that long is a
   broker liveness defect (the identifier, and under a small Receive Maximum the session's
@@ -818,10 +818,10 @@ from keep their full history.
   after the client's PUBCOMP acquired the slot again and drew a second PUBCOMP; the retained
   terminal cleanup owner, enrolled from the first PUBCOMP's reference, carried the
   pre-acquisition counter and was refused by the gated reap on every attempt. The redelivery
-  is now withheld and terminal cleanup adopts the counter it observes; 5/10 at `c247593` vs
+  is now withheld and terminal cleanup adopts the counter it observes; 5/10 at `874bfb0` vs
   0/10, interleaved under `-race`.
 - **Per-exchange slowdown on one long-lived connection.** Measured by F-116's verification
-  at `85024d9` with the F-105 long-lived schedules: per-iteration time grows roughly
+  at `6ae7e82` with the F-105 long-lived schedules: per-iteration time grows roughly
   linearly with the exchanges already carried (S1-S5/S7 under `-race`: 1.9 s to 4.1 s over
   25 iterations; without `-race` all eight schedules 0.7 s to 1.7 s), while the in-memory
   census stays flat. Not attributed. **Disposition: open**; owed: find which store-side
@@ -833,7 +833,7 @@ from keep their full history.
   complete it (PUBACK; PUBREC, PUBREL, PUBCOMP), then read the live delivery that waited
   behind it, and intermittently time out on that read ("Error reading data: ... i/o
   timeout"). Interleaved prebuilt `-race` binaries, 11 runs per arm in one four-test
-  combination: the first failed 3 of 11 on both `85024d9` and the F-116 tree, the second
+  combination: the first failed 3 of 11 on both `6ae7e82` and the F-116 tree, the second
   4 of 11 and 3 of 11; each passes alone. Not caused by F-116. Mechanism: untraced;
   whether the withheld delivery waits for an AckWait re-offer rather than a prompt redrive
   once the slot frees is what to establish first. **Disposition: open**; owed: trace which
@@ -856,7 +856,7 @@ from keep their full history.
   nonblocking**; an answered section still holds PUBREL admission until it drains
   (latency only), which F-115 deliberately does not change.
 - **`TestExchangeQoSWireMatchesPreservedRecord`.** Deterministic, 3 of 3 at clean
-  `1a15a49` ("the occupant was never injected, so the replacement arm was not reached"), in
+  `2bb9260` ("the occupant was never injected, so the replacement arm was not reached"), in
   the tagged suite. **Disposition: CLOSED 2026-10-16, a stale fixture; no loss.** It wrote
   its QoS 2 occupant through the standalone register CAS seam, which admission no longer
   takes since F-105. The occupant is now ADMITTED through the production authority batch
@@ -865,8 +865,8 @@ from keep their full history.
   arm. The wire QoS and the register QoS agree on the occupant's 2 for a delivery the
   caller computed at 1, 3 of 3.
 - **`TestRetainedResetCreateResponseLostReconciles`.** Intermittent ("want exactly one
-  observer consumer, got 0"), in the default `-race` suite: 2 of 2 at clean `1a15a49`, 2
-  of 10 at `7551cb6`. **Disposition: CLOSED 2026-10-16, a test read; no loss.** On every
+  observer consumer, got 0"), in the default `-race` suite: 2 of 2 at clean `2bb9260`, 2
+  of 10 at `90b8b91`. **Disposition: CLOSED 2026-10-16, a test read; no loss.** On every
   failing run the observer existed (a lookup by name found it), indexing worked, and the
   listing reported it within 500 ms: a clustered CONSUMER.LIST read right after the create
   had not reported the new consumer yet (it is reported as missing until it does). The test
@@ -874,7 +874,7 @@ from keep their full history.
   reads the listing until it reports exactly one. 15 of 15 under `-race`.
 - **`TestMQTTQoS0DowngradeAmbiguousLandedSaveLeavesTheDurableToTheSweep`** (renamed
   `...LeavesTheDurableToTheNextTenure`). Intermittent, "the durable must survive a CONNECT
-  that reconciled from the record": 2 of 5 at clean `1a15a49`, 6 of 20 at `7551cb6`.
+  that reconciled from the record": 2 of 5 at clean `2bb9260`, 6 of 20 at `90b8b91`.
   **Disposition: CLOSED 2026-10-16, a stale test; no loss.** It pinned the pre-F-105
   residual ("the orphan sweep is the only convergence") and required the durable to survive
   both reconnects. The documented convergence (`docs/CONFORMANCE.md`, "On an AMBIGUOUS
@@ -883,7 +883,7 @@ from keep their full history.
   `tenure-superseded` and the owner retires and deletes it, racing the old assertion. The
   test now asserts that convergence (decision, RETIRED name, durable gone, no teardown) and
   keeps the record-restore check. 20 of 20.
-- **`TestMQTTFlappingSession`.** Deterministic, 3 of 3 at clean `903bee1` under `-race`
+- **`TestMQTTFlappingSession`.** Deterministic, 3 of 3 at clean `54999b0` under `-race`
   ("Did not find the client ID in the flappers map"). **Disposition: CLOSED 2026-10-16, a
   fixture timing defect; the jail works.** Measured under `-race`: the takeover alone takes
   200-330 ms, and the jail entry exists from the takeover's CONNACK until the 350 ms cleanup
@@ -891,7 +891,7 @@ from keep their full history.
   reconnect and its read finished. The jail is now 1 s and the cleanup 1.2 s (still longer
   than the jail, as the final absence check requires). 5 of 5 under both builds.
 - **`TestMQTTQoS2RetriesPublish`.** Deterministic under `-race` (3 of 3 at clean
-  `903bee1`, 6 of 6 at `c14482a`): "Expected nothing, got [98 2 0 1]", a PUBREL after the
+  `54999b0`, 6 of 6 at `3a0bc6f`): "Expected nothing, got [98 2 0 1]", a PUBREL after the
   client's PUBCOMP. **Classified 2026-10-16, a broker defect:** with `AckWait` at 100 ms,
   after the client's PUBCOMP the broker kept resending PUBREL at about every `AckWait` for
   up to 3 s (2 to 29 resends across 4 runs; the client answered the first with a second
@@ -901,19 +901,19 @@ from keep their full history.
   **Disposition: FIXED 2026-10-16** (`docs/ROADMAP.md` §0.4). Traced: the second reading —
   a redelivery in the window between the PUBCOMP's in-memory conversion and its durable
   advance was admitted on the still-`pubrel_ready` slot and written; it is now withheld
-  before admission. 9/10 at `c247593` vs 0/10;
+  before admission. 9/10 at `874bfb0` vs 0/10;
   `TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere` 2/10 vs 0/10 (isolated),
   interleaved under `-race`.
 - **`TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased`.** 3 of 3 at clean
-  `903bee1` and 2 of 3 on F-040's tree, interleaved under `-race` ("fixture: F-100's reap
+  `54999b0` and 2 of 3 on F-040's tree, interleaved under `-race` ("fixture: F-100's reap
   must have released the entry"). Found 2026-10-14 by F-040's verification. Mechanism: the
   fixture does not reach its route; what stops the reap is unclassified. **Disposition:
-  open**; owed: make the fixture reach F-100's reap. Re-measured 2026-10-15 at `b334415`
+  open**; owed: make the fixture reach F-100's reap. Re-measured 2026-10-15 at `8e13e6a`
   by the `TestMQTTInflight*` family attribution: 11 of 11 family runs, and it is now the
   only member that keeps the family run red; still carried here, not by that bullet.
-  Re-measured 2026-10-20 by the §2 follow-up to F-114 (`5c155a9`), whose sharded tagged
-  `-race` suite met it: in isolation, tagged, `-race -p 1`, 5 of 5 at `7ed23d8` and 4 of 5
-  at `5c155a9`; that change does not touch the path. Observed: after the same-object
+  Re-measured 2026-10-20 by the §2 follow-up to F-114 (`a85e194`), whose sharded tagged
+  `-race` suite met it: in isolation, tagged, `-race -p 1`, 5 of 5 at `5a313ff` and 4 of 5
+  at `a85e194`; that change does not touch the path. Observed: after the same-object
   resume whose fixture attempts to delete the source message at `before-connack`, the
   resident PUBLISH entry and its `cpending` mapping are still present when the resume
   redelivery pass completes. Not established: that the source was actually absent when the
@@ -924,7 +924,7 @@ from keep their full history.
   classify the broker behavior.
 - **`TestMQTTInflightLandedButUnconfirmedAckLeavesNothing`, historical intermittent.** One
   of the four members the 2026-09-01 family bullet named; the bullet never recorded which
-  assertion failed, and it reproduced 0 of 19 family runs at `b334415` (11 at
+  assertion failed, and it reproduced 0 of 19 family runs at `8e13e6a` (11 at
   `-parallel 8`, 8 at `GOMAXPROCS=2`). Mechanism: **unattributed**. A candidate was found
   and removed: its hook modelled "the acknowledgement landed, its confirmation was lost"
   with a fire-and-forget ack, so "landed" was not established when
@@ -938,7 +938,7 @@ from keep their full history.
   ("the register must be marked retired before the restart, got `<nil>`": the register is
   already gone, not merely unmarked). Interleaved at `GOMAXPROCS=2 -parallel 8`, the
   `^TestMQTTInflight` family on a prebuilt tagged `-race` binary: 4 of 18 at clean
-  `b334415` and 4 of 18 on the family-attribution tree (2026-10-15, two batches of 8 and
+  `8e13e6a` and 4 of 18 on the family-attribution tree (2026-10-15, two batches of 8 and
   10 per arm); 0 of 19 in the unstarved runs. Pre-existing; the counts establish
   provenance, not improvement or cause, and it is not attributed to the QoS 1 re-offer
   residual (this is QoS 2).
@@ -948,7 +948,7 @@ from keep their full history.
 - **`TestMQTTInflightRecoveryPubRelKeepsOwnerWhenSourceComplete`. UNMATCHED.** Once in
   CPU-starved `^TestMQTTInflight` family runs on the family-attribution tree (2026-10-15):
   the owner slot read back `pubrel_intended` where `pubrel_ready` is asserted. 1 of 28
-  starved family runs on the change against 0 of 18 at clean `b334415` (10 of each
+  starved family runs on the change against 0 of 18 at clean `8e13e6a` (10 of each
   interleaved); 0 of 200 per arm in isolation (`GOMAXPROCS=2`, 50 concurrent instances,
   four alternating batches each). Neither pre-existence nor causation is established. The
   change adds no call on its path (the prompt handoff is called only from send sections,
@@ -958,7 +958,7 @@ from keep their full history.
   owed: a reproduction on either arm, then classify.
 - **`TestMQTTInflightQoS2IdentifierSurvivesRestartBeforePubRec`. UNMATCHED.** Once in 10
   interleaved CPU-starved family runs on the family-attribution tree, 0 of 10 at clean
-  `b334415` (2026-10-15): "Expected ping response got 60" at the warm-up loop's flush
+  `8e13e6a` (2026-10-15): "Expected ping response got 60" at the warm-up loop's flush
   after PUBCOMP — a PUBREL where the flush expected PINGRESP, the shape of a PUBREL
   retransmitted at its 1 s AckWait before the PUBCOMP was processed. The change does not
   touch the PUBREL/PUBCOMP path (only PUBACK and failed-PUBREC completions), which again
@@ -967,11 +967,11 @@ from keep their full history.
   does not expect.
 - **`TestMQTTDrainClusterDefiniteIntentFailureResumesElsewhere`.** Intermittent, under suite
   load only ("Expected PUBLISH (30), got 60"): once in a sharded tagged `-race` run on
-  F-040's tree and once at `c14482a`; 6 of 6 green standalone under `-race`. A PUBREL
+  F-040's tree and once at `3a0bc6f`; 6 of 6 green standalone under `-race`. A PUBREL
   arrives on broker B before the re-offered PUBLISH; the exchanges before it were completed
   with PUBCOMP, so it matches the PUBREL-after-PUBCOMP defect above. **Disposition: open**;
   filed with that defect in `docs/ROADMAP.md` §0.4, to be re-measured once it is fixed.
-- **`TestMQTTAckWaitConfigChange`.** Deterministic, 3 of 3 at clean `28e5516` under
+- **`TestMQTTAckWaitConfigChange`.** Deterministic, 3 of 3 at clean `860a25a` under
   `-race` ("Expected topic "bar", got "foo""). **Disposition: CLOSED 2026-10-16, two fixture
   timing defects; the AckWait handling is correct.** `msg1` on `foo` was never
   acknowledged, so its preserved 250 ms AckWait redelivered it ahead of the `bar` delivery
@@ -980,7 +980,7 @@ from keep their full history.
   it is now 150 ms, which still separates the new 10 ms from the preserved 250 ms. 8 of 8
   under both builds.
 - **`TestMQTTDrainRestoredClaimRedeliveredAfterRestart`.** Intermittent, 4 of 6 at clean
-  `28e5516` and 3 of 6 on F-117's tree, interleaved under `-race` ("Expected payload
+  `860a25a` and 3 of 6 on F-117's tree, interleaved under `-race` ("Expected payload
   "payload", got "burn""). Found 2026-10-14 by F-117's verification. Mechanism:
   unclassified; a different message arrives where a restored drain's claimed sequence is
   expected, so whether the claimed message is lost or only reordered is what to establish
@@ -988,14 +988,14 @@ from keep their full history.
   if it shows loss.
 - **`TestMQTTv5SharedSubscription`.** Intermittent, once in a sharded tagged `-race` run on
   F-117's tree ("message 10 not delivered to any group member"), and 6 of 6 green
-  standalone on that tree and 6 of 6 on clean `28e5516`, interleaved. Found 2026-10-14 by
+  standalone on that tree and 6 of 6 on clean `860a25a`, interleaved. Found 2026-10-14 by
   F-117's verification; F-117 changes nothing on the shared route (a shared subscription
   carries no No Local filter key, so its No Local decision is unchanged). Mechanism:
   unattributed, under suite load only. **Disposition: open**; owed: a reproduction under
   load, then classify.
-- **`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`.** 1 of 6 at `5847952`;
-  0 of 18 non-race at `b5ec59b`, which this ledger first recorded as "not reproduced". It
-  REPRODUCES under `-race`: 10 of 12 isolated at `c14482a`, "the PUBACK must release the
+- **`TestMQTTRestoreQoS0OverLiveConsumerCompletesQoS1Exchange`.** 1 of 6 at `9f5a702`;
+  0 of 18 non-race at `f075bdf`, which this ledger first recorded as "not reproduced". It
+  REPRODUCES under `-race`: 10 of 12 isolated at `3a0bc6f`, "the PUBACK must release the
   drain's claim, still 1". **Classified 2026-10-16:** with the check given 30 s, the claim
   was released every time, at 2.1-2.2 s, which is the 2 s action-reconcile delay: under
   `-race` the PUBACK's own release does not land and the reconcile pass releases the claim
@@ -1003,26 +1003,26 @@ from keep their full history.
   **Disposition: FIXED 2026-10-16** (`docs/ROADMAP.md` §0.4). Traced: the PUBACK's prompt
   release made one acknowledgement advance and lost its authority CAS to the reclaimer's
   `op-dispose-tenure-superseded` step; it now re-attempts the whole attempt within its
-  foreground budget. 9/10 at `c247593` vs 0/10, interleaved under `-race`.
+  foreground budget. 9/10 at `874bfb0` vs 0/10, interleaved under `-race`.
 - **`TestF105RetainedCloseLocatesTheRegisterByItsAdmission/ended-control-closes`.**
   Intermittent, once in a sharded tagged `-race` run on the inbound acknowledgement
-  pipeline's tree (`2b56445`, tree `ff0efe12`; shard 3 of the final verification chain):
+  pipeline's tree (`7c453ce`, tree `ff0efe12`; shard 3 of the final verification chain):
   "the ended exchange's copy did not close: wrong last sequence: 58 (10071)". That
   establishes a sequence conflict returned by the test's `reclaimRetainedPayloadStep`,
   nothing more: the close transition (`mqttCloseManifestTransition`) guards both the
   authority sequence and the manifest sequence, so which record conflicted, and which
   writer moved it, are not identified. Not reproduced in isolation: 0 of 10 at clean
-  `4839059` and 0 of 10 at `2b56445`, tagged, `-race -p 1`. Found 2026-10-22 by that
+  `87d1682` and 0 of 10 at `7c453ce`, tagged, `-race -p 1`. Found 2026-10-22 by that
   item's verification. Observed about the rig: its only inbound packet is one retained QoS
   1 PUBLISH whose PUBACK the client waits for, so it takes the pipeline's direct path; the
   failing step runs after the test releases its reclamation hold. A race with the
   background reclaimer is a hypothesis, not a finding. Mechanism: unattributed, under
   suite load only. **Disposition: open**; owed: a reproduction under load on both
-  `4839059` and `2b56445`, trace which guarded sequence moved and by whom, then classify.
+  `87d1682` and `7c453ce`, trace which guarded sequence moved and by whom, then classify.
 - **`TestWillClaimantAbortsThePassOnATransientFactOutage`.** Intermittent, once in a
   sharded tagged `-race` run on the JetStream path benchmark's tree (shard 6 of its
   verification chain): "2 fact reads were issued, want 1". Pre-existing and unrelated to
-  that change (which touches no Will path): 4 of 30 on its baseline arm (`bbc762c` plus the
+  that change (which touches no Will path): 4 of 30 on its baseline arm (`97ffa57` plus the
   benchmark's inert seams) against 4 of 30 on the change, interleaved, tagged, `-race`.
   Found 2026-10-22. Hypothesis, not a finding: the fixture installs its fact-load hook on
   an account manager whose claim loop keeps scanning in the background (the test binary
@@ -1033,16 +1033,16 @@ from keep their full history.
   tagged `-race` run on the JetStream path benchmark's final tree (shard 1 of its
   verification chain): "the refused CONNECT must be certified at its refusal, got []", the
   CONNECT refused as "outbound ownership not established (the proposal this step names no
-  longer stands)". Pre-existing: 1 of 15 on its baseline arm (`bbc762c` plus the
+  longer stands)". Pre-existing: 1 of 15 on its baseline arm (`97ffa57` plus the
   benchmark's inert seams), the same assertion, against 0 of 15 on the change, interleaved,
   tagged, `-race`. Found 2026-10-22. Mechanism: unattributed. **Disposition: open**; owed:
   which proposal moved before the step, and whether the certificate is missing or late.
 - **`TestF105RetainedIndeterminateVerdictIsOwed`, `stays-indeterminate-closes`.**
   Intermittent, once in a sharded tagged `-race` run on the JetStream path benchmark's final
-  tree (`32d6998`, shard 1 of its verification chain): "expected 0 clients, got 1" at
+  tree (`875fdcb`, shard 1 of its verification chain): "expected 0 clients, got 1" at
   `outbound_retained_abandon_test.go:771`, the fixture's `checkClientsCount` waiting 2 s for
   the closed connection to leave the server before the resume. Not reproduced: 15 of 15
-  passing on that tree and on its baseline arm (`bbc762c` plus the benchmark's inert seams),
+  passing on that tree and on its baseline arm (`97ffa57` plus the benchmark's inert seams),
   interleaved, tagged, `-race`, and 10 of 10 each again on one CPU. Found 2026-10-23.
   Hypothesis, not a finding: the server-side teardown of the first connection outlasts the
   2 s wait under suite load. Mechanism: unattributed. **Disposition: open**; owed: a
@@ -1055,7 +1055,7 @@ from keep their full history.
   That is `intendPubRelSlot` losing all `mqttPubRecAdvanceAttempts` (8) attempts, every
   failed one a CAS conflict won by the same session's admissions and acquisitions. First
   seen 2026-10-22 by that item's holistic review on its larger change only (5 of 32 against
-  0 of 28 baseline runs); a later randomized screen reproduced it on the baseline (`bbc762c`
+  0 of 28 baseline runs); a later randomized screen reproduced it on the baseline (`97ffa57`
   plus inert seams: 4 of 30, against 6 of 30 on an intermediate version of the change), so
   it is not the change's. Whether the change alters its frequency is unresolved; no further
   comparative study is owed. **Disposition: classified**: F-126, dossier in

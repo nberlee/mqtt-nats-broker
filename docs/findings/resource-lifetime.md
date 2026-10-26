@@ -13,7 +13,7 @@ This dossier is the evidence index the census left behind. A row says what owns 
 what creates it, what ends it on every exit (normal, failure, refusal, takeover, shutdown),
 whether shutdown joins it, and the verdict. Rows were produced by six read-only slices
 (goroutines, timers, channels and NATS subscriptions, server and account containers, session
-and connection state, the process boundary) and read against the code at `9d440ae`. A row
+and connection state, the process boundary) and read against the code at `1a0dabd`. A row
 marked **verified** was re-read by the planner or confirmed by a plan-review round; a row
 marked **carried** is the slice's reading, checked by the plan-review rounds only where they
 cited it. The soak in "Acceptance" is the dynamic half: a census row claims an exit, the soak

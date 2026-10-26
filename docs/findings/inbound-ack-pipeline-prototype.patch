@@ -2,7 +2,7 @@ Inbound acknowledgement pipeline: EXPERIMENTAL PROTOTYPE, kept as a research art
 Never compiled by any target; it is the exact code the evaluation measured.
 See docs/findings/nats-platform.md, "Inbound ack pipelining: evaluation".
 
-Base: commit 496d3ef plus this change's committed benchmark and probes
+Base: commit d22e245 plus this change's committed benchmark and probes
 (internal/mqtt/inbound_ack_throughput_test.go, internal/mqtt/inbound_ack_order_test.go).
 Apply on a scratch worktree of that tree:  git apply docs/findings/inbound-ack-pipeline-prototype.patch
 Then: make bench-inbound, and the kill tests:

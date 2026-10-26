@@ -136,7 +136,7 @@ classified the rejection, is UNCHANGED and is what keeps F-038 open.
 
 ### Outcome (2026-10-14)
 
-Reproduced deterministically at `903bee1` (3/3) by holding the old connection's close at
+Reproduced deterministically at `54999b0` (3/3) by holding the old connection's close at
 the teardown seam after the DISCONNECT recorded its override and before the close contends
 for the gate, then sending CONNECT with Clean Start 0: Session Present 1. The mechanism is
 the one recorded below, and it was not load-only: the takeover's resume decision never read
@@ -158,7 +158,7 @@ the residuals in `docs/CONFORMANCE.md` ("A reconnect racing its own DISCONNECT")
   Evidence so far: 3 failures, all on a loaded machine (one in a full-suite
   run concurrent with a `-race` suite, two in a probe window confounded by
   compilation); 0 in 120 further targeted runs on the same tree and 0 in 100
-  runs at `ac49002` under controlled identical load, so neither "introduced
+  runs at `a546be9` under controlled identical load, so neither "introduced
   by the register-claims change" (whose code provably does not execute in
   this shape) nor "pre-existing" is EVIDENCED yet — the mechanism analysis
   above says pre-existing, the counts say only "rare and load-sensitive".

@@ -136,7 +136,7 @@ filing needs the user's approval). What the broker does with the revived registe
 `RESURRECTED seq=3` after dropping `index.db`, and its clean-shutdown control stays clean.
 The harness witness no longer runs at the current tree, because the broker's own write
 boundary now refuses its fixture shape before anything is stored, so it was run at the
-commit it was recorded on (`28c2920`), first on v2.15.0 and then with only the pin moved to
+commit it was recorded on (`1b2a49a`), first on v2.15.0 and then with only the pin moved to
 v2.15.1: on both, in both the plain-CAS and atomic-batch modes, the limit-evicted first
 version revives after a clean restart. None of the 2.15.1 compaction or recovery changes
 (#8623, #8629, #8710) touches the per-subject limit, the tombstones or the index rebuild.
@@ -190,7 +190,7 @@ of their replies exists, and no direct-get route exists. The record below is why
 already not a completeness gate.
 
 **The census was historical, not a current completeness gate** (decided with F-105 7b,
-2026-09-30). Its tests were already failing before 7b (122 diagnostics at `34c50ef`,
+2026-09-30). Its tests were already failing before 7b (122 diagnostics at `3e937fd`,
 including unaccounted edges and stale evidence fingerprints in functions 7b does not
 touch), and 7b's reads are not entered in it (186 diagnostics on the 7b tree; three more
 of its tests fail: `TestPointReadCensusDestinationsResolve`,

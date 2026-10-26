@@ -268,7 +268,7 @@ after UNSUBSCRIBE
   session ends.
 
   Closed by two halves: the plain drain here, and session-affine shared QoS 2 in
-  `ee80a5c`. Shared QoS 1 redistribution to another member remains permitted and
+  `4bfe88d`. Shared QoS 1 redistribution to another member remains permitted and
   documented rather than changed, and the QoS 1/2 to QoS 0 re-SUBSCRIBE downgrade
   (`execDeferredConsumerDelete`) stays out of scope: it replaces a subscription
   rather than removing one.
@@ -993,7 +993,7 @@ list from what…
   carry correctness), `Sources` on `$MQTT_rmsgs` (supported cross-account
   retained topology), and `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`
   (the drain and shared/affine RUNTIME refusals remain the authority — that
-  prerequisite was already delivered by `ab683d9`, and the acceptance test now
+  prerequisite was already delivered by `f169209`, and the acceptance test now
   pins it as a non-startup-failure). The `$MQTT_qos2in` list was re-derived for
   the `<idHash>.<gen>.<PI>` + `.rel` layout: fields unchanged, two stale
   rationales corrected (the purge `DenyPurge` protects is `purgeQoS2Hold`'s
@@ -2161,8 +2161,8 @@ the operator to stop the account's brokers and recreate the bridge-owned `$MQTT_
 streams. No CONNACK is sent, matching the malformed-generation refusal below it.
 
 Ordering ahead of the generation check is load-bearing, and it is a correction the
-holistic review forced: the namespace deny (3610eb3, 2026-07-27) PREDATES
-generation-scoped naming (`mqttSessGenFromRecord`, ab683d9, 2026-07-30), so a broker old
+holistic review forced: the namespace deny (d222539, 2026-07-27) PREDATES
+generation-scoped naming (`mqttSessGenFromRecord`, f169209, 2026-07-30), so a broker old
 enough to have written a reserved membership wrote no `gen` either. With the checks in
 the other order every record that can really exist got the generation refusal and the
 key-naming diagnostic was unreachable. Both refusals are read-only and both prescribe
@@ -2899,7 +2899,7 @@ unchanged. `Options` and `MQTTOpts` now hold only what the broker reads.
 
 ### Resolution
 
-Resolved as five independent commits (a13b1f9, 80306fe, 2219a91, 0f08887, and the
+Resolved as five independent commits (291c775, 694a6c5, 39512db, 10f5fad, and the
 commit that moved this record):
 
 1. Move setter functions and test-only convenience methods into appropriately

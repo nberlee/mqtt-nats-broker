@@ -183,7 +183,7 @@ func TestMQTTInstallGateRefusesAnEmptyLineage(t *testing.T) {
 // uncertainty's RESOLUTION drives the projection. Resolved LIVE, the projection is present with
 // its source mapping, and the source's redelivery returns the ORIGINAL identifier (a new one would
 // admit a second exchange for one source: a duplicate, and an exchange nothing ends). Resolved
-// ENDED, the projection is gone and the identifier free. Measured at 34c50ef: the restart form
+// ENDED, the projection is gone and the identifier free. Measured at 3e937fd: the restart form
 // restored the delivery and the redelivery returned identifier 1.
 func TestMQTTRecoveryUncertainExchangeKeepsItsDelivery(t *testing.T) {
 	t.Parallel()

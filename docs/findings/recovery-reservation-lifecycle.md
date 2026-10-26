@@ -9,12 +9,12 @@ before a successful CONNECT commits it; exclusion is installed before removal.
 A local exact read cannot complete the custody census or register apply.
 
 Raw ordinary recovery, marker reservations, and known recovered PUBREL
-placeholders already exist at 7de0a61. Their general lifecycle repair belongs
+placeholders already exist at 28b9a5f. Their general lifecycle repair belongs
 to F-111. C5 preserves their constructors and marker replacement rule.
 L1 and L2 have both old and C5-created cases; L3 is widened by C5; L4's
 conflicting-resident attribution is introduced by C5.
 
-C5 landed in 96d0a72. The F-111 lifecycle change landed after it, under its
+C5 landed in a8e7715. The F-111 lifecycle change landed after it, under its
 own holistic review, full suite and route-checked mutation run, including the
 unconfirmed-marker successor regression below.
 

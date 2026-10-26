@@ -417,7 +417,7 @@ act, because a partial view must never be reported as a complete one: the orphan
 held** rather than skipping, which withholds the group-consumer deletion.
 
 *Superseded in part (2026-10-06 note).* The shared last-holder scan was deleted by the
-shared-group lifecycle transfer (2026-09-22, `e078092`), so it is no longer an ingress;
+shared-group lifecycle transfer (2026-09-22, `9530f86`), so it is no longer an ingress;
 `mqttSharedConsInRecord` refuses the shape at five: the CONNECT restore prologue,
 record-driven expiry, the session-expiry sweep, the orphan-consumer sweep and the orphan
 QoS 2 sweep. A group consumer's fate is now its group record's: the orphan sweep deletes
@@ -946,7 +946,7 @@ replicated case is visible when it lands.
 **Title:** Release a failed shared filter's own state independently of the last-holder answer
 
 - Status: **Closed.** Alpha blocker, filed by `docs/ROADMAP.md` §0.2 and split out of the
-  last-holder fail-closed change (`b659236`) by its plan review.
+  last-holder fail-closed change (`74a8546`) by its plan review.
 
 ### The finding, in four parts
 
@@ -963,7 +963,7 @@ by
 interest-retained, which is other members' business. The resident `cons` entry, the
 deliver-subject subscription, the pending deliveries with their reserved packet identifiers
 and the `MaxAckPending` charge are this session's own, and are owed whatever the answer.
-Since `b659236` the scan also reports held for an indeterminate walk and for a record it
+Since `74a8546` the scan also reports held for an indeterminate walk and for a record it
 cannot interpret, so one unreadable record anywhere in the account suppressed this session's
 cleanup indefinitely. The other four callers of the scan withhold only the delete.
 
@@ -1018,7 +1018,7 @@ membership-removal write.
 
 *Superseded mechanism (2026-10-06 note).* The scan, its three fail-closed arms,
 `mqttSharedGroupNamesForKey`, `mqttSharedKeyOwnsDurable` and the scan-based delete were
-replaced by the shared-group lifecycle transfer (2026-09-22, `e078092`). The disposition
+replaced by the shared-group lifecycle transfer (2026-09-22, `9530f86`). The disposition
 is two-way: own-held (decided by `targetsOwed` over surviving memberships) does nothing;
 otherwise this session's state is discharged and the consumer goes to the group record's
 verdict execution. The derivation is `mqttSharedGroupNamesFor`, keyed on the membership's
@@ -1152,7 +1152,7 @@ and the readLoop's resolver then settles it. Both of its arming confirmations ar
 without them it passes for the wrong reason when the filter fails BEFORE its first join, or
 when the rollback save fails definitely and registers nothing.
 
-The scan-table row is **C7, the indeterminate walk**, which predates `b659236` and was pinned
+The scan-table row is **C7, the indeterminate walk**, which predates `74a8546` and was pinned
 by nothing at either layer — the three existing fixtures using that seam drive the PUBREL
 barrier scan and the in-flight walks. Its paired mutation is the first thing that has ever
 made

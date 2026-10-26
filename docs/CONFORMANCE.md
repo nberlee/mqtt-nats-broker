@@ -301,7 +301,7 @@ the scan never visited; and a source message that is present but unreadable can 
 authoritatively gone. `docs/known-upstream-issues.md` carries the F-108 evidence, the
 affected sites found so far, and — because a prose list of sites has no natural end — a
 **frozen census** of every load path and every response classifier in `internal/mqtt`,
-bounded and counted at `1c143fc`. That census is a **preserved record of which broker
+bounded and counted at `6c85279`. That census is a **preserved record of which broker
 decisions rest on the server's answer**, not a repair audit: by the boundary ruling no
 broker-side compensation is planned, and the record closes when the upstream correction
 lands. The named sites are its output to date, **not a closed set**, and
@@ -3117,8 +3117,8 @@ Residuals:
   session continues. Characterized by the injected arm of
   `TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`, which gets no credit for
   in-session disposal after the failure. The mechanism is in code the F-097/F-088
-  close-out leaves unchanged against `48a9003`; it was observed with that change applied
-  and not separately reproduced on `48a9003`. Filed as F-124 in `docs/ROADMAP.md` §0.3
+  close-out leaves unchanged against `d784cdb`; it was observed with that change applied
+  and not separately reproduced on `d784cdb`. Filed as F-124 in `docs/ROADMAP.md` §0.3
   and accepted there as this residual on 2026-10-12: it needs a failed last-claim removal
   save.
 - **A live SUBSCRIBE reclaims a drain that cannot deliver.** A resume can leave a

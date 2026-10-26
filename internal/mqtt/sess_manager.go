@@ -2140,7 +2140,7 @@ RESTORE:
 	// ever deriving a name from such a record or migrating it in place.
 	//
 	// It also precedes the GENERATION check below, which is what makes the diagnostic
-	// reach the record shape that actually exists: the namespace deny (3610eb3)
+	// reach the record shape that actually exists: the namespace deny (d222539)
 	// predates generation-scoped naming, so a broker old enough to have written a
 	// reserved membership wrote no `gen` either, and the generation refusal would
 	// otherwise answer every real case with the less specific message. Both refusals

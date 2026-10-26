@@ -26,7 +26,7 @@ differs from its source. Attribution text is in [NOTICE](../NOTICE).
 ## Upstream revision
 
 The import commit was not recorded. The baseline is **inferred**: the repository's first
-commit (`60c9f20`, 2026-07-24) is closest to the `mqtt5-shared-subs` head
+commit (`9c282fb`, 2026-07-24) is closest to the `mqtt5-shared-subs` head
 `00b5ca83341691967c44fe46b39591029ba6bf35` (2026-07-06, "mqtt: implement MQTT 5.0 Shared
 Subscriptions"). Its `internal/mqtt/mqtt.go` shares 241 of its 249 top-level functions
 with that head's `server/mqtt.go`, and a whitespace-insensitive line diff against it is

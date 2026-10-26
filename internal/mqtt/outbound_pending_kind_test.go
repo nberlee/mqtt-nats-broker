@@ -98,7 +98,7 @@ func testCompleteRemotely(t *testing.T, e *testInflightEnv, ref mqttInflightSlot
 // entry is the scan's LINEAGE-LESS placeholder is delivered; the acquired action must become an
 // Ordinary entry carrying the ACTION's evidence, and when the exchange completes elsewhere and the
 // ending is observed here, that entry, its mapping, its identifier and its Receive Maximum charge
-// must all go. At e35961d the entry kept an empty lineage and survived the release.
+// must all go. At f6e7feb the entry kept an empty lineage and survived the release.
 //
 // Mutations M2 (the callback's in-place attach restored) and M2b (the promotion takes the
 // resident's evidence): the "Ordinary with the record's lineage" assertion.

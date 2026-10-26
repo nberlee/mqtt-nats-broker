@@ -257,7 +257,7 @@ several repeated reads below are distinct validation moments, so removing one ne
 consistency argument as well as a number. What landed with it is the closure of
 `docs/CONFORMANCE.md` Residual 13 and the stream-count correction (ten broker-owned
 streams, not nine). Request counts below are STATIC estimates from reading the code at
-`e3f8e16`; the benchmark's first need is a request-counting seam that confirms them.
+`eb8e8a9`; the benchmark's first need is a request-counting seam that confirms them.
 
 ### The primitives
 
@@ -512,7 +512,7 @@ both QoS levels built only to be measured, and this record. No production code c
   (8, W=256); QoS 2 likewise. Three repetitions per arm, baseline and prototype interleaved
   (B, P, B, P, B, P), one `go test` at a time. Medians of throughput and of per-repetition
   p99 (PUBACK for QoS 1, PUBCOMP for QoS 2).
-- **Environment**: baseline `496d3ef` plus the benchmark; prototype = the same plus
+- **Environment**: baseline `d22e245` plus the benchmark; prototype = the same plus
   `inbound-ack-pipeline-prototype.patch` (this directory). Go 1.26.8, nats-server v2.15.1,
   nats.go v1.54.0, linux/arm64, 8 cores (Cortex-A55 + Cortex-A76, heterogeneous), 8 GB.
   Resource figures are whole-process (client, broker and nats-servers share the test
@@ -683,7 +683,7 @@ kill against its own decision boundaries; the prototype's kill evidence does not
 `internal/mqtt/inbound_pipeline.go` (docs/ARCHITECTURE.md, "The inbound acknowledgement
 pipeline"): a connection with nothing outstanding and nothing more buffered runs each
 PUBLISH or PUBREL inline, on the same steps the pipeline runs. Measured under the frozen
-W=1 rule against `4839059` plus this benchmark's two new 64-connection W=1 rows: candidate
+W=1 rule against `87d1682` plus this benchmark's two new 64-connection W=1 rows: candidate
 1 failed one of eight cases (r3, QoS 1, 64 connections, pooled throughput 0.894; an A/A
 control read 0.998); with the direct path's per-exchange allocations removed, candidate 2
 passed all eight (throughput ratios 0.980-1.003, p99 0.984-1.022). At W=256, descriptive,
@@ -735,7 +735,7 @@ the reduced one.
   2 PUBRELs owed, warm and after a broker restart; sweep tick: 50 offline sessions;
   startup: 3 restarts of a provisioned account). Two rigs: standalone (one embedded
   server, R1) and r3 (three in-process nodes, R3 streams).
-- **Arms**: baseline = `bbc762c` plus only the measurement seams, census and bench;
+- **Arms**: baseline = `97ffa57` plus only the measurement seams, census and bench;
   change = the full tree. Pinned (`taskset -c 4-7`, `GOMAXPROCS=4`), arms interleaved run
   by run (B C C B for the full matrix, then B C C B B C for the publish, window and
   reconnect loads). Go 1.26.8, nats-server v2.15.1, nats.go v1.54.0, linux/arm64.
@@ -860,7 +860,7 @@ because their trees and instrumentation differ:
   3, 5: 2, 6: 2} plus 2 unresolved runs of 8. The 0 of 28 is a true observation; read as
   an exhaustion-free baseline, it was wrong.
 - Screen `screen1` (30 randomized balanced blocks, seed 20261022, one test binary per arm,
-  a durable ledger, every trial classified): the baseline (`bbc762c` plus inert seams)
+  a durable ledger, every trial classified): the baseline (`97ffa57` plus inert seams)
   exhausted in 4 of 30 trials, an intermediate version of the change (Q2 to Q4 already
   removed) in 6 of 30, nothing else failed. No difference was established at this sample
   size, a substantial increase remains compatible with the data (two-sided 90% interval

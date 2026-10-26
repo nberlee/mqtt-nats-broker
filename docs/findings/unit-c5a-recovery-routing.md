@@ -37,6 +37,6 @@ durable pair. Terminal/rejected snapshots use the real ACK advance. PUBREL
 successor snapshots isolate recovery routing and do not replace action/ACK
 boundary tests. Local reconciliation has a separate incompleteness assertion.
 
-Validation status: landed in 96d0a72. The routing tests pass in the tagged full
+Validation status: landed in a8e7715. The routing tests pass in the tagged full
 suite, and 12 route-checked mutations of this routing are killed by
 TestUnitCRecoveryRouting.
