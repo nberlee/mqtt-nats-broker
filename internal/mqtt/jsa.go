@@ -1213,7 +1213,7 @@ func isJSErrCausedBy(err error, id ErrorIdentifier, cause error) bool {
 //
 // Upstream's comment here said the opposite ("can run from various go
 // routines"), which is true where MQTT rides nats-server internals and false in
-// this standalone port. It is corrected rather than kept because it describes
+// this standalone broker. It is corrected rather than kept because it describes
 // the one execution model this function is NOT safe under.
 //
 // Splitting the wildcard into per-kind subscriptions -- floated in

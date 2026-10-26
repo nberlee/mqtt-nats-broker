@@ -2573,7 +2573,7 @@ func (sess *mqttSession) advanceFinishedSlotToTerminal(c *client, ref *mqttInfli
 // the invariant above.
 //
 // It is NOT "the slot must already say pubrel_ready". That formulation looked equivalent
-// and is not, and the difference cost the ported suite: the store is what makes a record
+// and is not, and the difference cost the fulltests suite: the store is what makes a record
 // deliverable, and JetStream delivers it to this callback BEFORE storeMsg returns to the
 // PUBREC handler. So the handler's `publish -> pubrel_ready` CAS cannot be made to precede
 // the first delivery by any ordering — the race is against the store itself. Requiring

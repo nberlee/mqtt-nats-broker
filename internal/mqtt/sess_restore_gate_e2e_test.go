@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // End-to-end proofs that the success CONNACK follows a COMPLETE restoration, or
 // the CONNECT is refused (F-050, sess_restore_gate.go).

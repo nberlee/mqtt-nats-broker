@@ -26,7 +26,7 @@ make build       # host binary
 them separately). `make lint-go` runs golangci-lint four times with one
 configuration: production only (`--tests=false`, the only pass that reports a
 declaration nothing but tests still reaches), the default tests, and both tagged
-builds (`mqttport_fulltests`, and with `mqttport_experimental_shared_qos2`); each
+builds (`mqtt_fulltests`, and with `mqtt_experimental_shared_qos2`); each
 must be clean. Markdown rules live in `.markdownlint.jsonc`; vendored
 third-party docs are excluded via `.markdownlintignore`, since their style is
 upstream's decision. CI runs the same linter and configuration: it installs the
@@ -39,7 +39,7 @@ cmd/mqtt-nats-broker   entrypoint: config, backend connect, health, shutdown
 internal/config        flags/env configuration
 internal/backend       NATS/JetStream service conn + per-client auth-passthrough dial
 internal/conn          (planned) TCP/TLS accept + per-connection read/write loop
-internal/mqtt          MQTT protocol core (ported from NATS-server; see below)
+internal/mqtt          MQTT protocol core (derived from NATS-server; see below)
 test/conformance       compose env + conformance runner + baselines
 ```
 
@@ -65,13 +65,16 @@ Call out any proposed exception explicitly, including who needs compatibility,
 which released artifact or persisted format establishes the contract, and how
 the compatibility path will be tested.
 
-## The ported MQTT core
+## The MQTT core and its upstream origin
 
-`internal/mqtt` is a port of NATS-server's `server/mqtt.go`. It builds and serves
-in the default tree; the behavioral shims that replace NATS-server's runtime live
-in `shim_*.go` and the vendored helpers in `compat_*.go`.
+`internal/mqtt` derives from NATS-server's MQTT implementation (`server/mqtt.go`, as
+extended for MQTT 5.0); [docs/PROVENANCE.md](docs/PROVENANCE.md) records the source
+revision, the license and the intentional divergence. It builds and serves in the
+default tree; the behavioral shims that replace NATS-server's runtime live in
+`shim_*.go` and the vendored helpers in `compat_*.go` ("The shim surface" in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 
-- The ported core is `mqtt.go` plus the files split from it along this broker's
+- The core is `mqtt.go` plus the files split from it along this broker's
   responsibilities (protocol codec and properties, connection lifecycle,
   sessions, QoS tracking, publish, subscribe, retained messages, the JetStream
   request layer); `internal/mqtt/doc.go` lists them. The layout follows this
@@ -80,28 +83,72 @@ in `shim_*.go` and the vendored helpers in `compat_*.go`.
 - No file is excluded from lint. A deliberately retained declaration that only
   tests reach gets a `//nolint:unused` directive stating its invariant, on its own
   line, never a path rule.
-- The upstream regression/conformance suite (`mqtt_test.go`, `mqtt_v5_test.go`,
-  `mqtt_ex_*`) is retained behind the `mqttport_fulltests` tag until its NATS
-  test-server harness is ported:
 
-  ```sh
-  make full-suite   # go test -tags mqttport_fulltests ./internal/mqtt/
-  ```
+### Test suites and build tags
 
-- The delayed-Will outbox also has **real replicated-JetStream** tests behind the
-  same tag. They launch **three embedded nats-server processes** joined into one
-  cluster so `$MQTT_willq` is genuinely `R3`. The cheap R3 smoke test
-  (`TestMQTTWillOutboxReplicatedStream`) runs in the normal `make full-suite`; the
-  slow failure-injection tests self-skip unless `MQTTNB_CLUSTER_FAILOVER_TESTS=1` and
-  cover both **stream-leader node loss** (`…ReplicatedLeaderFailover`) and
-  **stale-replica restart/catch-up** (`…ReplicatedNodeCatchup`):
+| Build tag | What it selects | How it runs |
+|---|---|---|
+| none | the default tree: transport, session, end-to-end, auth and unit tests | `make test`, CI `build-test` |
+| `mqtt_fulltests` | the upstream regression suite (`mqtt_test.go`, `mqtt_v5_test.go`) and the broker's own tests that need its harness | `make full-suite`, CI `fulltests` |
+| `mqtt_fulltests mqtt_experimental_shared_qos2` | the parked shared-subscription QoS 2 suite, in place of its disabled twins | `make experimental-shared-qos2-tests`, CI non-gating |
+| `mqtt_cluster_reference` | upstream cluster, leafnode and internal-API tests, kept unbuilt as reference | never built |
+| `mqtt_tls_reference` | upstream TLS configuration tests, kept unbuilt as reference | never built |
 
-  ```sh
-  make cluster-failover-tests   # MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqttport_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
-  ```
+The upstream suite assumes the MQTT server embeds a nats-server (see
+`testMQTTRunServer`). `fulltests_harness_test.go` supplies that: an embedded
+nats-server provides NATS and JetStream, and upstream's assertion helpers and
+`*Server` accessors are mapped onto the shim. The suite runs with no skips. Its
+inherited cases were adapted where this broker deliberately differs; the
+adaptations and their reasons are in [docs/PROVENANCE.md](docs/PROVENANCE.md).
 
-- The port mapping and remaining work are documented in
-  [docs/PORTING.md](docs/PORTING.md).
+```sh
+make full-suite   # go test -tags mqtt_fulltests ./internal/mqtt/
+```
+
+The two reference tags park what cannot run against a standalone broker:
+
+- `mqtt_cluster_reference` (`mqtt_cluster_ref_test.go`, `mqtt_v5_cluster_ref_test.go`,
+  `mqtt_ex_test_test.go`, `mqtt_ex_bench_test.go`): tests that need upstream's
+  clustered test harness (`createJetStreamCluster*`), config reload, leafnodes, or
+  upstream's **unexported** JetStream and client APIs (`Account.lookupStream`,
+  `Account.addStream`, `stream.lookupConsumer`, the internal leafnode parser), which
+  are inaccessible from this package whatever the architecture; and tests whose
+  defense boundary is `Options.Users[].Permissions`, which the shim does not enforce
+  because authorization is delegated to NATS through auth passthrough
+  (`docs/AUTHENTICATION.md`).
+- `mqtt_tls_reference` (`mqtt_tls_ref_test.go`): TLS configuration tests needing
+  upstream's cert fixtures (`../test/configs/certs/...`), which are not in this
+  repository. TLS is covered by the native suite instead.
+
+Coverage for the parked areas comes from tests that drive real MQTT clients against
+the standalone broker over TCP and in-process JetStream, mining the same upstream
+scenarios: `protocol_test.go` (MQTT 3.1.1 via paho.mqtt.golang: QoS 1 and 2,
+wildcards, unsubscribe, fan-out, retained replay, the offline persistent-session
+queue), `will_test.go` (ungraceful-disconnect Will), `ha_test.go` (cross-instance
+session takeover), `v5_test.go`, `shared_test.go` and `expiry_test.go` (MQTT 5.0 via
+paho.golang), and `shim_*_test.go` (transport, session-manager bring-up, auth
+passthrough, end to end). Config-based authentication has no harness equivalent:
+it would need `Options.Users` translated into embedded-server accounts plus a
+per-client dialer, and the production auth-passthrough path is covered by
+`shim_auth_test.go` instead.
+
+The delayed-Will outbox, takeover arbitration and shared groups also have **real
+replicated-JetStream** tests behind `mqtt_fulltests`. They launch **three embedded
+nats-server processes** joined into one cluster so the streams are genuinely `R3`.
+The cheap R3 smoke test (`TestMQTTWillOutboxReplicatedStream`) runs in the normal
+`make full-suite`; the slow failure-injection tests self-skip unless
+`MQTTNB_CLUSTER_FAILOVER_TESTS=1`:
+
+```sh
+make cluster-failover-tests   # MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqtt_fulltests -race -run '^TestMQTTWillOutboxReplicated' ./internal/mqtt/
+```
+
+One canary sits outside all of these, because its subject is the dependency rather
+than the broker: `test/depproof/` (`make depproof`) runs `package server` fixtures
+inside isolated nats-server checkouts, which needs upstream's unexported cluster
+helpers and Raft internals, the same boundary that parks `mqtt_cluster_reference`.
+Its broker-side counterparts are the broker sentinels it runs with
+`./test/depproof/run.sh --broker`; see `test/depproof/README.md`.
 
 ### Syncing with upstream NATS
 
@@ -130,6 +177,7 @@ baseline worktree, alternating the two arms, and compares failure rates:
 make soak                                    # 20 runs per arm of TestQoS2Move
 SOAK_RUNS=40 SOAK_RUN='TestQoS2Move' make soak
 SOAK_BASE=HEAD~1 make soak                   # compare against the previous commit
+SOAK_BASE_TAGS=<tag> make soak               # baseline built with other tags (before a tag rename)
 ```
 
 It exists because a single red run proves nothing on its own, and the tempting

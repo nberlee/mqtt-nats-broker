@@ -2,7 +2,7 @@
 // configuration structs (`Options`/`MQTTOpts`) the MQTT core reads. These
 // replace NATS-server's internal runtime with a standalone engine backed by the
 // nats.go client and a plain net.Conn (routing, connection I/O, and auth
-// passthrough). See docs/PORTING.md.
+// passthrough). See "The shim surface" in docs/ARCHITECTURE.md.
 
 package mqtt
 
@@ -308,7 +308,7 @@ type Server struct {
 	owedRetainedMu sync.Mutex
 	owedRetained   map[*mqttRetainedCleanup]*mqttSession
 
-	// nodeName identifies this bridge instance (see NodeName). It is not a NATS
+	// nodeName identifies this broker instance (see NodeName). It is not a NATS
 	// cluster name and must never be presented as one.
 	nodeName string
 
@@ -359,7 +359,7 @@ func (s *Server) startGoRoutine(f func()) bool {
 }
 
 // NodeName returns this instance's unique id, used as the JSA reply-routing
-// token. It must be non-empty and unique per bridge instance; if unset, a stable
+// token. It must be non-empty and unique per broker instance; if unset, a stable
 // id is generated lazily so JSA subjects are always valid.
 func (s *Server) NodeName() string {
 	s.mu.Lock()
@@ -1142,7 +1142,7 @@ func (c *client) doTLSServerHandshake(kind string, cfg *tls.Config, timeout floa
 }
 
 // mqttWriteDeadline bounds EVERY MQTT application write. It restores a bound
-// this port dropped rather than inventing a policy: upstream nats-server
+// this broker dropped rather than inventing a policy: upstream nats-server
 // installs opts.WriteDeadline on every flush (server/client.go:1842), CLEARS it
 // afterwards (:1844), and closes a client that misses it as
 // SlowConsumerWriteDeadline (:1962). The shim replaced upstream's writeLoop and
@@ -1219,7 +1219,7 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 // double socket close is harmless. This error path is also the slow-consumer
 // disconnect: a client that cannot absorb a write within mqttWriteDeadline loses
 // its socket here, which is upstream's SlowConsumerWriteDeadline behaviour
-// reached through the port's existing close path rather than a new one.
+// reached through the broker's existing close path rather than a new one.
 //
 // It takes no cap. The one writer that needs an earlier bound, the shutdown
 // drain's DISCONNECT, passes it to writeActionlessFrameBy, which hands it to

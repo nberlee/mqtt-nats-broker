@@ -1220,7 +1220,7 @@ func TestMQTTResolveUncertainNowReportsDischargeReArm(t *testing.T) {
 // pins is the ORDINARY save's credit, which is the mechanism a reconnect's accept save uses;
 // the CONNECT-specific choreography — a real reconnect whose accept save is the first landed
 // write after a close that could persist nothing — is pinned end to end by
-// TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict in the ported suite.
+// TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict in the fulltests suite.
 //
 // Mutation MU15: drop the marshal-rev credit in saveWithDetail's success arm.
 func TestMQTTLandedSaveCreditsInheritedVerdicts(t *testing.T) {

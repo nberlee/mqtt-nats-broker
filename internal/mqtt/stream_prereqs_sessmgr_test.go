@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // End-to-end complements to stream_prereqs_test.go: the pure tests prove each
 // validator's own logic; these prove the validators are actually wired into

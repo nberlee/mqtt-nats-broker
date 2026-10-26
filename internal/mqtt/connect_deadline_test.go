@@ -11,7 +11,7 @@ import (
 
 // These tests are deliberately untagged: the CONNECT deadline is race-shaped
 // (an AfterFunc goroutine against the readLoop), so it belongs in the default
-// tree that `make test` runs under -race, not in the ported suite that does not.
+// tree that `make test` runs under -race, not in the tagged suite that does not.
 
 // startConnectDeadlineBroker brings up a broker whose Options the caller tunes.
 // The window is per server rather than a package-level var, which is what keeps
@@ -49,8 +49,8 @@ func dialSilent(t testing.TB, addr string) net.Conn {
 }
 
 // testConnectPacket builds a minimal MQTT 3.1.1 CONNECT (clean session, no
-// credentials, no Will). Hand-built rather than borrowed from the ported suite's
-// helpers, which live behind the mqttport_fulltests tag.
+// credentials, no Will). Hand-built rather than borrowed from the upstream suite's
+// helpers, which live behind the mqtt_fulltests tag.
 func testConnectPacket(clientID string, keepAlive uint16) []byte {
 	body := newMQTTWriter(0)
 	body.WriteBytes(mqttProtoName)

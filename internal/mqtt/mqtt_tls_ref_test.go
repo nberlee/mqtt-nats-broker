@@ -1,4 +1,4 @@
-//go:build mqttport_tlstests
+//go:build mqtt_tls_reference
 
 // Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,7 @@
 // Upstream TLS tests kept as an unbuilt reference; they need TLSConfigOpts /
 // GenTLSConfig / cert-file-backed config (o.Accounts, o.MQTT.TLSMap) that the
 // standalone shim does not implement, and the referenced cert fixtures
-// (../test/configs/certs/...) do not exist in this repo. See docs/PORTING.md.
+// (../test/configs/certs/...) do not exist in this repo. See CONTRIBUTING.md.
 
 package mqtt
 

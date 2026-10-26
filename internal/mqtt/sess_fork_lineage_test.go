@@ -10,7 +10,7 @@ import (
 // The unconditional store below is NOT a simulation of a Raft window any more. It IS the
 // route: a write carrying no per-subject expectation is excluded by nothing, and the
 // same-base boundary in docs/CONFORMANCE.md closes the cross-term alternative for two
-// bridge-authored CONDITIONAL writes. Nothing validates provenance at restore, and the
+// broker-authored CONDITIONAL writes. Nothing validates provenance at restore, and the
 // reserved-namespace guards deny $MQTT.> to MQTT clients rather than to permitted NATS
 // publication, so a valid-shaped body claiming our parent can simply be published onto
 // the subject. What the broker has to act on is that durable outcome — two records

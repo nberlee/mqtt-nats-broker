@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // End-to-end tests for the 3.1.1 forced leave's EXIT DISPOSITION: which save outcome refuses
 // the CONNECT and which one lets it live.

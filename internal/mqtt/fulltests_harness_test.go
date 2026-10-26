@@ -1,10 +1,10 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
-// Harness shims that let the ported upstream MQTT test suite run against the
+// Harness shims that let the upstream MQTT test suite run against the
 // standalone broker: an embedded nats-server provides NATS+JetStream (the
 // upstream suite assumes the MQTT server embeds one), and the upstream
-// Server/assertion helpers are mapped onto the shim Server. See docs/PORTING.md
-// ("Testing strategy").
+// Server/assertion helpers are mapped onto the shim Server. See CONTRIBUTING.md
+// ("Test suites and build tags").
 
 package mqtt
 
@@ -26,7 +26,7 @@ import (
 )
 
 // MAX_PAYLOAD_SIZE mirrors the upstream nats-server default max payload used
-// throughout the ported suite.
+// throughout the upstream suite.
 const MAX_PAYLOAD_SIZE = 1024 * 1024
 
 // globalAccountName is the name of the default/global NATS account, matching
@@ -39,7 +39,7 @@ const globalAccountName = "$G"
 const JetStreamStoreDir = "jetstream"
 
 // DummyLogger mirrors upstream server.DummyLogger closely enough for the
-// ported suite's embedding and log-capture assertions.
+// upstream suite's embedding and log-capture assertions.
 type DummyLogger struct {
 	sync.Mutex
 	Msg     string
@@ -321,11 +321,11 @@ func testMQTTWaitRetained(t testing.TB, s *Server, subject string) {
 // so concurrent tests touch disjoint keys.
 //
 // byDir tracks the live embedded nats-server (if any) for a given StoreDir. The
-// ported suite's restart idiom is
+// upstream suite's restart idiom is
 // s.Shutdown(); testSetStoreDir(o, <same dir>); s = testMQTTRunServer(t, o) —
 // s.Shutdown() only stops the shim's MQTT listener (Server.Shutdown,
 // shim_public.go), not the paired embedded nats-server (by design: in production
-// the bridge restarts against an external, never-restarted NATS/JetStream
+// the broker restarts against an external, never-restarted NATS/JetStream
 // deployment). Without it, testMQTTRunServer would start a SECOND embedded
 // nats-server pointed at the same on-disk store while the first is still
 // running — a file-store conflict that corrupts JetStream state (observed as
@@ -491,7 +491,7 @@ func TestEmbeddedRegistryReclaimsARestartedShim(t *testing.T) {
 
 // reapLocked drops references held by shims that are no longer running.
 //
-// The restart idiom the ported suite uses is a raw s.Shutdown() followed by
+// The restart idiom the upstream suite uses is a raw s.Shutdown() followed by
 // another testMQTTRunServer against the same StoreDir — deliberately NOT
 // testMQTTShutdownServer, because the embedded server has to stay up across the
 // restart. That shim never releases its reference, so counting alone would keep
@@ -552,7 +552,7 @@ func (r *testEmbeddedRegistry) releaseEntry(e *embeddedServer) {
 	close(e.closing)
 }
 
-// mqttTestLogger is the upstream server.Logger method set that the ported
+// mqttTestLogger is the upstream server.Logger method set that the upstream
 // suite's capture loggers (DummyLogger and the captureX loggers) implement.
 type mqttTestLogger interface {
 	Noticef(format string, v ...any)
@@ -565,7 +565,7 @@ type mqttTestLogger interface {
 
 // slogToTestLogger is an slog.Handler that forwards records to a typed test
 // logger, mapping slog levels back to the upstream Logger methods so the
-// ported suite's log-capture assertions work. The shim's Server.Fatalf and
+// upstream suite's log-capture assertions work. The shim's Server.Fatalf and
 // Server.Errorf both emit at slog.Error (shim_engine.go), so an Error record is
 // fanned out to BOTH Errorf and Fatalf; each captureX logger wires exactly one
 // of them to a channel and no-ops the rest (via embedded DummyLogger), so only
@@ -711,7 +711,7 @@ func (s *Server) ClientURL() string {
 }
 
 // JetStreamConfigShim is a minimal stand-in for upstream's JetStreamConfig,
-// exposing only the field the ported suite reads.
+// exposing only the field the upstream suite reads.
 type JetStreamConfigShim struct {
 	StoreDir string
 }
@@ -869,7 +869,7 @@ func TestFulltestsHarnessStoreInputs(t *testing.T) {
 }
 
 // DefaultOptions mirrors upstream's server.DefaultOptions() for the fields the
-// ported suite relies on.
+// upstream suite relies on.
 func DefaultOptions() *Options {
 	return &Options{MaxPayload: MAX_PAYLOAD_SIZE}
 }

@@ -1,6 +1,6 @@
 // Small behavioral shims that replace NATS-server internal types the MQTT core
 // depends on. These are re-implemented (not aliased) because the core uses their
-// unexported members. See docs/PORTING.md.
+// unexported members. See "The shim surface" in docs/ARCHITECTURE.md.
 
 package mqtt
 
@@ -30,7 +30,7 @@ type subscription struct {
 }
 
 // Account identifies the NATS account the broker operates within. The standalone
-// broker uses a single account (see docs/PORTING.md), so this is a thin holder.
+// broker uses a single account (see docs/PROVENANCE.md), so this is a thin holder.
 type Account struct {
 	name string
 }

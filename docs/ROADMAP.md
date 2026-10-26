@@ -8056,7 +8056,7 @@ does **not** make them a compatibility or regression gate:
 fails;
 - the default build and supported test suites must remain sound, but the experimental
 suite
-  is quarantined behind `mqttport_experimental_shared_qos2` and its CI job is non-gating;
+  is quarantined behind `mqtt_experimental_shared_qos2` and its CI job is non-gating;
 - do not repair an affine-only regression opportunistically. Append it to the single
   completion item below, with the responsible general change and failing test recorded.
 
@@ -8214,7 +8214,7 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
   - [F-071](findings/release-investigations.md#f-071), affine same-topic ordering;
   - the parked F-033 transition/reap census. **`TestSharedDenyDoesNotConsumeForAllowedMembers`
     was REMOVED from this inventory on 2026-09-20: it is not affine.**
-    `internal/mqtt/authz_affine_test.go` carries `//go:build mqttport_fulltests` alone, its
+    `internal/mqtt/authz_affine_test.go` carries `//go:build mqtt_fulltests` alone, its
     members subscribe at QoS 1 (`:438`) and its publisher publishes at QoS 1 (`:456`) — the
     FILENAME was the only affine thing about it. Its investigation was CLOSED in §0.4 on
     2026-10-14 as a fixture premise (late delivery behind random queue selection, nothing
@@ -9883,17 +9883,37 @@ reads](findings/resolved.md#f-054).
 
 ### Remove porting-era terminology
 
-- [ ] Rename the `mqttport_fulltests`, `mqttport_clustertests`, and
+- [x] Rename the `mqttport_fulltests`, `mqttport_clustertests`, and
   `mqttport_tlstests` build tags and CI references. (`mqttport_wstests` no longer
-  exists: §3 "WebSocket" retired the parked file it selected.)
+  exists: §3 "WebSocket" retired the parked file it selected.) **Done 2026-10-25**, with
+  `mqttport_experimental_shared_qos2` too: every `//go:build` line (plain, negated and
+  combined), `Makefile`, CI, `test/soak.sh`, `test/depproof/run.sh`, the experimental
+  skip message, `CLAUDE.md`, the contributor docs and the open roadmap text. The proof is
+  file-set equality, not a green run: for the default build and the six tagged selections,
+  `go list` (selected and ignored files) under the new tags equals HEAD's under the old,
+  and the old tags now select exactly the default build. A mistyped constraint and an old
+  name left in a negated combined constraint each fail that comparison.
 
-- [ ] Preferred replacements are `mqtt_upstream_suite`,
-  `mqtt_cluster_reference`, and `mqtt_tls_reference`.
+- [x] Preferred replacements are `mqtt_upstream_suite`,
+  `mqtt_cluster_reference`, and `mqtt_tls_reference`. **Taken for the two reference tags;
+  the main tag is `mqtt_fulltests` instead**, because only two of the 236 files it selects
+  are the upstream suite and the rest are this broker's tests that need its harness. The
+  experimental tag is `mqtt_experimental_shared_qos2`. The `fulltests_harness_test.go` and
+  `*_fulltests_test.go` file names stay: they carry no porting identity and match the tag.
+  There are no aliases. `CONTRIBUTING.md`, "Test suites and build tags", says what each
+  tag selects and how it runs.
 
-- [ ] Remove `port`, `ported`, and `porting` as project-identity language from
-  the README, CI, lint configuration, comments, and documentation.
+- [x] Remove `port`, `ported`, and `porting` as project-identity language from
+  the README, CI, lint configuration, comments, and documentation. The core is "derived
+  from" nats-server; "the ported suite" became the upstream suite or the fulltests suite,
+  whichever was meant; "this port dropped" became "this broker". Kept: "forward-port" as
+  the verb for syncing a fix, the three `mqtt_test.go` cases marked "Ported from upstream
+  nats-server (#8692)", which record one specific forward-port, and every networking
+  sense. Two stale claims went with the wording: the upstream suite is not waiting for its
+  harness to be ported (it runs), and the `mqtt_ex_*` files are parked under
+  `mqtt_cluster_reference`, not run under the main tag (`docs/CONFORMANCE.md`).
 
-- [ ] Remove "bridge" as project-identity language left after the section 1
+- [x] Remove "bridge" as project-identity language left after the section 1
   rename to `mqtt-nats-broker`: Go comments, operator-visible diagnostics (for
   example "recreate the bridge-owned JetStream state" in `internal/mqtt/sess_manager.go`,
   `orphan_qos2_sweep.go` and `shared_group_verify.go`), test-fixture prose, and an
@@ -9901,17 +9921,40 @@ reads](findings/resolved.md#f-054).
   `bridge_test`/`bridge_run` identifiers. Keep "bridge" as a verb and as MQTT
   broker-bridging terminology. The census as of the rename is
   `git grep -n -i -w bridge`, excluding `docs/findings/`, `CHANGELOG.md` and
-  `docs/PORTING.md`; finished roadmap narrative stays as written.
+  `docs/PORTING.md`; finished roadmap narrative stays as written. **Done.** The
+  diagnostic now says "broker-owned" at all eight sites; two are pinned by tests
+  (`reserved_namespace_test.go` and the experimental record-refusal test), the other six
+  only by the census. The depproof flag is `--broker` with `broker_*` identifiers and a
+  "broker sentinel" label, with no alias. Test node names are `broker-<nuid>`. What the
+  census still lists is deliberate: four verb uses (`inflight_slot_state.go`,
+  `outbound_ack_advance.go`, `js_domain_test.go`, `docs/ARCHITECTURE.md`) and the memory
+  path in `CLAUDE.md`, which names the checkout directory; renaming that directory and the
+  GitHub repository is the owner's step from section 1.
 
-- [ ] Keep technically necessary networking terms such as listener port,
-  `containerPort`, and port numbers.
+- [x] Keep technically necessary networking terms such as listener port,
+  `containerPort`, and port numbers. Kept: the networking senses were excluded by reading
+  the census line by line, not by pattern.
 
-- [ ] Replace `docs/PORTING.md` before alpha with concise provenance
+- [x] Replace `docs/PORTING.md` before alpha with concise provenance
   documentation covering the MQTT 3.1.1 source, upstream revision, license,
-  modifications, and intentional divergence.
+  modifications, and intentional divergence. **`docs/PROVENANCE.md`.** The source is not
+  a nats-server release, which has no MQTT 5.0 code: it is the `mqtt5-shared-subs` branch
+  of `nberlee/nats-server`, proposed and declined upstream in nats-io/nats-server
+  discussion #8362. The import commit was never recorded, so the revision is stated as
+  inferred, with the measurement behind it (the branch head `00b5ca8` is far closer to
+  the first commit's `mqtt.go` than its parent is); the first commit's v2.14.3 pin is
+  named as the dependency, not the source. What was still current moved rather than
+  vanished: the testing strategy and why the reference files are parked to
+  `CONTRIBUTING.md`, the per-(Topic, QoS) ordering property `docs/CONFORMANCE.md` and a
+  test cite to its own section there, the shim surface to `docs/ARCHITECTURE.md`, and every
+  live pointer to the place now holding what it cited. The porting diary (wiring
+  milestones, the bugs found getting the suite to run) is history in git and
+  `CHANGELOG.md`; no redirect stub is kept. Finished roadmap narrative, `CHANGELOG.md` and
+  `docs/findings/` keep their pointers to it as written.
 
-- [ ] Keep attribution in NOTICE and the README after removing the porting
-  narrative.
+- [x] Keep attribution in NOTICE and the README after removing the porting
+  narrative. NOTICE is unchanged; the README's attribution also links
+  `docs/PROVENANCE.md`.
 
 ### Release documentation
 

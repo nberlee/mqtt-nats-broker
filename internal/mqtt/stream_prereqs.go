@@ -297,7 +297,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleE
 // (the observer's pre-create delete and the rollback's, see ephemeral_identity.go)
 // are CONSUMER.DELETE requests, which no stream setting here can refuse.
 // The durable deletion authority is the empty-body tombstone plus
-// MaxMsgsPer:1 replacement (docs/PORTING.md), and BOTH the store-time eviction
+// MaxMsgsPer:1 replacement ("Stream prerequisites" in docs/ARCHITECTURE.md), and BOTH the store-time eviction
 // that replacement performs and TTL expiry are reaped by the store engine
 // itself, which DenyDelete does not gate. Denying deletes therefore costs
 // nothing here.

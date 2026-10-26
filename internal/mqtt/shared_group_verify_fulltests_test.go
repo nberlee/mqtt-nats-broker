@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // End-to-end coverage for F-076: a resume must PROVE its shared group durable exists and
 // is usable before it restores the membership into it.

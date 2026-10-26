@@ -1,12 +1,12 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
-// The bridge-level sentinel for the accepted-CONNECT atomic-batch write path, over a
+// The broker-level sentinel for the accepted-CONNECT atomic-batch write path, over a
 // genuine 3-node embedded JetStream cluster and the production accept path.
 //
 // It is an INTEGRATION SENTINEL, not sole proof: the deterministic dependency canary
 // for the server's apply-layer contract -- a committed batch prefix with no commit
 // entry stores nothing -- lives in test/depproof, inside an isolated nats-server
-// checkout. What this test adds is that the BRIDGE's accepted CONNECT really goes
+// checkout. What this test adds is that the BROKER's accepted CONNECT really goes
 // through that contract: one batch, both messages, and at the moment the commit is
 // acknowledged the acceptance fact and the session record are both on the stream with
 // the attempt's own bytes.
@@ -21,7 +21,7 @@
 // else can write the subject. The accept transaction the CONNECT holds is what keeps
 // the window closed to a local successor.
 //
-// The paired mutation is m-accept-split-write (test/depproof/run.sh --bridge): the one
+// The paired mutation is m-accept-split-write (test/depproof/run.sh --broker): the one
 // batch becomes two independent conditional writes, and the second is suppressed
 // through the counterfactual phase below while the caller is still handed an
 // acknowledgement it cannot tell from a real commit. That must make the assertion here

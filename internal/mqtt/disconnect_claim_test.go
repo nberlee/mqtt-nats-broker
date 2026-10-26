@@ -188,7 +188,7 @@ func TestMQTTPersistDisplacementHonorsTheConnAckGate(t *testing.T) {
 }
 
 // The CONNECT-takeover route's gate test needs real sockets and the real
-// mqttProcessConnect, whose harness lives behind the mqttport_fulltests tag:
+// mqttProcessConnect, whose harness lives behind the mqtt_fulltests tag:
 // TestMQTTv5TakeoverBeforeConnAckIsSilent, in mqtt_v5_test.go, beside the CONNACKed twin
 // it must suppress.
 

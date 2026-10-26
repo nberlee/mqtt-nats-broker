@@ -686,7 +686,7 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 // The corrected invariant is: NO SLOT-BACKED PUBREL BYTES ARE TRANSMITTED WITHOUT FIRST
 // ATOMICALLY ACQUIRING `pubrel_sending` (a live retained exchange has no slot, R6, and is
 // authorized by its live in-memory owner instead). The weaker version was wrong and cost
-// the ported suite —
+// the fulltests suite —
 // the store makes a record deliverable and JetStream delivers it before the PUBREC
 // handler's own phase CAS can run, so requiring `pubrel_ready` refused the very PUBREL the
 // PUBREC had just created and every exchange waited out AckWait.

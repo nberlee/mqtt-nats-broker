@@ -1,5 +1,5 @@
 // Copyright 2025 The mqtt-nats-broker Authors
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 package mqtt
 

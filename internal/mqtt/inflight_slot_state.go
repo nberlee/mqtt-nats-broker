@@ -464,7 +464,7 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	// the lineage would silently acquire one equal to its allocation's nonce, which is the
 	// value a FRESH exchange gets — so an inherited obligation would be read as a new one,
 	// and completion evidence recorded against the real lineage would name nothing. The
-	// bridge is pre-release and its `$MQTT_*` schemas carry no compatibility contract
+	// broker is pre-release and its `$MQTT_*` schemas carry no compatibility contract
 	// (docs/ARCHITECTURE.md, "Compatibility boundary"): such a record means the development
 	// store predates this design and must be recreated.
 	if !mqttValidInflightNonce(r.Lin) {

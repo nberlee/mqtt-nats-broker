@@ -251,7 +251,7 @@ func testAssertSettlesToUnsettled(t *testing.T, e *testRejectionEnv) {
 // The retention evidence is TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill, which
 // lands a valid-shaped record with an UNCONDITIONAL store and drives the live connection
 // through this classifier to 0x89 with the Will published. See the same-base boundary in
-// docs/CONFORMANCE.md: two bridge-authored CONDITIONAL writes off one base cannot both
+// docs/CONFORMANCE.md: two broker-authored CONDITIONAL writes off one base cannot both
 // apply, and a write carrying no expectation is excluded by nothing.
 //
 // What this test is for: the concessions above cannot be satisfied by a classifier that

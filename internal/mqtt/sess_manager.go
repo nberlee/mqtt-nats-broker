@@ -2004,7 +2004,7 @@ func (as *mqttAccountSessionManager) removeSessionIfCurrent(sess *mqttSession) b
 // the session holds), so the record's schema is UNSUPPORTED and restoration
 // fails closed before any name is derived from it — no migration, no
 // half-honored record. CONTRIBUTING.md forbids migration code before the first
-// release; the operator recreates the bridge-owned state instead.
+// release; the operator recreates the broker-owned state instead.
 //
 // Such a record is almost certainly also generationless, since the deny predates
 // generation-scoped naming — which is why the caller runs this check BEFORE the
@@ -2111,7 +2111,7 @@ RESTORE:
 			return nil, false, fmt.Errorf("creating session %q: the delayed-teardown "+
 				"watermark for this client is unreadable, so a teardown of this session "+
 				"could never record its retirement; stop this account's brokers and "+
-				"recreate the bridge-owned JetStream state (the $MQTT_* streams)", clientID)
+				"recreate the broker-owned JetStream state (the $MQTT_* streams)", clientID)
 		}
 		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
@@ -2149,7 +2149,7 @@ RESTORE:
 		return nil, false, fmt.Errorf("restoring session %q: the record contains a "+
 			"subscription in the reserved %q namespace (%q), written by a pre-release "+
 			"development broker; this format is not supported: stop this account's "+
-			"brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+			"brokers and recreate the broker-owned JetStream state (the $MQTT_* "+
 			"streams)", clientID, mqttPrefix, key)
 	}
 
@@ -2196,7 +2196,7 @@ RESTORE:
 	if aerr := mqttValidateRecordAffinePair(ps, hash); aerr != nil {
 		return nil, false, fmt.Errorf("restoring session %q: %w; this record was written by "+
 			"a pre-release development broker and its format is not supported: stop this "+
-			"account's brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+			"account's brokers and recreate the broker-owned JetStream state (the $MQTT_* "+
 			"streams)", clientID, aerr)
 	}
 
@@ -2245,7 +2245,7 @@ RESTORE:
 	case mqttRetirementCorrupt:
 		return nil, false, fmt.Errorf("restoring session %q: its durable retirement watermark is malformed, "+
 			"so whether this generation was torn down cannot be decided: stop this account's brokers and "+
-			"recreate the bridge-owned JetStream state (the $MQTT_* streams)", clientID)
+			"recreate the broker-owned JetStream state (the $MQTT_* streams)", clientID)
 	case mqttRetirementIndeterminate:
 		return nil, false, fmt.Errorf("restoring session %q: unable to read its durable retirement watermark", clientID)
 	}

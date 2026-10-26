@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests && mqttport_experimental_shared_qos2
+//go:build mqtt_fulltests && mqtt_experimental_shared_qos2
 
 // Replicated-JetStream (R3) tests for session-affine ownership of a started
 // shared-subscription QoS 2 delivery, against a genuine 3-node embedded cluster

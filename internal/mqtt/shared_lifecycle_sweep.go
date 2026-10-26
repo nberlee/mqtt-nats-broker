@@ -115,7 +115,7 @@ func (as *mqttAccountSessionManager) sweepSharedConsumers(s *Server, names []str
 	if refused > 0 {
 		s.Warnf("MQTT orphaned consumer sweep: %d shared consumer(s) carry a name with no incarnation, a "+
 			"format this broker no longer writes; they are retained, not deleted. Stop this account's "+
-			"brokers and recreate the bridge-owned JetStream state (the $MQTT_* streams); this is not a "+
+			"brokers and recreate the broker-owned JetStream state (the $MQTT_* streams); this is not a "+
 			"rolling upgrade", refused)
 	}
 }

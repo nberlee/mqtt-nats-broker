@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Cross-replica tests for the delayed-Will durable outbox (Layer 2). Two broker
 // instances share one embedded NATS/JetStream (same StoreDir), modelling two

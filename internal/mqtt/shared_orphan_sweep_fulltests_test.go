@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 package mqtt
 
@@ -27,8 +27,8 @@ import (
 // sweep over $MQTT_msgs end to end: its grace window, the live consumers it spares, the
 // consumer that is not MQTT's, the pass a restart runs, and the exact set it leaves.
 //
-// It ports TestMQTTv5SharedSubscriptionOrphanSweep, which no target ran (its harness was the
-// unported cluster one), onto the rules the sweep now enforces. Nothing is deleted for being
+// It ports TestMQTTv5SharedSubscriptionOrphanSweep, which no target ran (its harness was
+// upstream's cluster harness, which this repository does not have), onto the rules the sweep now enforces. Nothing is deleted for being
 // unreferenced any more; each class is deleted only under the record that owns its name:
 //
 //   - a SHARED group consumer under its GROUP RECORD: an incarnation the record allocated that

@@ -47,7 +47,7 @@ accounts {
 }
 `
 
-// authzConfTwoAccounts gives "mallory" credentials in an account the bridge's
+// authzConfTwoAccounts gives "mallory" credentials in an account the broker's
 // streams do not live in - F-080's whole subject.
 const authzConfTwoAccounts = `
 port: -1
@@ -1614,7 +1614,7 @@ func TestNoDerivedSparkplugEffectAfterInvalidation(t *testing.T) {
 // by a live check. Nothing failed if the capture was replaced by the constant TRUE:
 // a census plus a mutation run confirmed that `c.willAuthorized = true` survived the
 // entire suite, tagged and untagged. The one denied-Will fixture in the tree is an
-// upstream-ported cluster test on a broker with no client dialer, so mqttAuthzApplies
+// upstream cluster reference test on a broker with no client dialer, so mqttAuthzApplies
 // is false there and it never reaches this decision at all.
 //
 // Both arms run on ONE broker and are triggered the same way, so the control is not

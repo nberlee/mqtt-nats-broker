@@ -1800,7 +1800,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			// owes a PUBREL, so its in-flight register is now the owner SLOT and owns the
 			// exchange for its whole life (§10.5). Releasing it here — as this path did
 			// before — leaves the recreated PUBREL naming a slot admission can no longer
-			// find, which fail-closes forever: the exact stranding the two ported drain
+			// find, which fail-closes forever: the exact stranding the two upstream drain
 			// tests reproduce. The slot is released once, at PUBCOMP terminal cleanup,
 			// addressed through the identifier the record persists.
 			pastPubRec = cur.intent

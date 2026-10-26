@@ -1192,7 +1192,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 // caller that kept its mutation may have moved memory on since. It is also what
 // makes the re-send an ARBITRATION: same CAS base, so at most one of the original and
 // this can commit. That exclusion used to be qualified as holding only within a leader
-// term; it is now unqualified for two BRIDGE-AUTHORED CONDITIONAL writes — see the
+// term; it is now unqualified for two BROKER-AUTHORED CONDITIONAL writes — see the
 // same-base boundary in docs/CONFORMANCE.md, and the retired argument in
 // sess_uncertain.go for why identical bytes and MaxMsgsPer:1 are kept for their own
 // reasons rather than as that exclusion's safety net.

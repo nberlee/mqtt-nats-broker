@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // End-to-end coverage for the orphan QoS 2 sweep, against real JetStream state
 // produced by real MQTT exchanges rather than hand-written records.

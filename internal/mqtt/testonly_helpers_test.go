@@ -257,14 +257,14 @@ const (
 	// different value, so equality would refuse a heterogeneous but working deployment.
 	// BOUNDED rather than ignored: the bound is what stops "variable" meaning "anything".
 	sharedGroupMemberVariable
-	// sharedGroupServerOwned: the server populates it with content this bridge cannot
-	// predict across versions, and which carries no behavior the bridge depends on.
+	// sharedGroupServerOwned: the server populates it with content this broker cannot
+	// predict across versions, and which carries no behavior the broker depends on.
 	//
 	// Deliberately distinct from sharedGroupServerNormalized, and the distinction is the
 	// one a review already forced on MaxDeliver: a normalized field has ONE expected value
 	// and gets compared against it, because accepting whatever the consumer reports makes a
 	// behaviour-bearing field unconstrained. This kind is for a field where no such value
-	// exists — but it is still not a free pass. What is checked is the part the bridge
+	// exists — but it is still not a free pass. What is checked is the part the broker
 	// could have written: see sharedGroupMetadataIsServerOnly.
 	sharedGroupServerOwned
 )
@@ -293,7 +293,7 @@ var sharedGroupConfigRules = map[string]struct {
 	"ReplayPolicy":      {sharedGroupPinned, "instant; a replay pacing this broker never sets"},
 	"MaxDeliver":        {sharedGroupServerNormalized, "the request leaves it zero and nats-server normalizes that to -1 (unlimited). A positive value would DISCARD a group delivery after that many attempts, so it is compared against the expected normalized value rather than accepted from the live consumer"},
 	"InactiveThreshold": {sharedGroupPinned, "must be zero: a non-zero one gives the group durable a delete timer and reaps it while every member is offline, which is the shape the join path refuses to create"},
-	"HeadersOnly":       {sharedGroupPinned, "the bridge needs bodies"},
+	"HeadersOnly":       {sharedGroupPinned, "the broker needs bodies"},
 	"FlowControl":       {sharedGroupPinned, "not used; a flow-control consumer sends frames the delivery callback does not expect"},
 	"Heartbeat":         {sharedGroupPinned, "not used, for the same reason as FlowControl"},
 	"RateLimit":         {sharedGroupPinned, "not used; pacing the group is not this broker's contract"},
@@ -326,9 +326,9 @@ var sharedGroupConfigRules = map[string]struct {
 	// Descriptive and server-informational.
 	"Description":    {sharedGroupPinned, "unset; cosmetic, but a whole-struct comparison is only closed if every field has a verdict"},
 	"FilterSubjects": {sharedGroupPinned, "unset: this broker uses the single FilterSubject form, and a multi-filter group would consume a different subject space"},
-	"Metadata":       {sharedGroupServerOwned, "nats-server populates it with its own version and API-level keys, whose values move with the dependency, so no single expected value exists. This bridge writes NO consumer metadata, and sharedGroupMetadataIsServerOnly re-checks exactly that: anything beyond the three server keys was written by something else"},
+	"Metadata":       {sharedGroupServerOwned, "nats-server populates it with its own version and API-level keys, whose values move with the dependency, so no single expected value exists. This broker writes NO consumer metadata, and sharedGroupMetadataIsServerOnly re-checks exactly that: anything beyond the three server keys was written by something else"},
 	"Replicas":       {sharedGroupPinned, "unset in the request; the group durable inherits the stream's replication rather than asking for its own"},
-	"Direct":         {sharedGroupPinned, "server-set for direct-get consumers; this bridge reads through the JS API"},
+	"Direct":         {sharedGroupPinned, "server-set for direct-get consumers; this broker reads through the JS API"},
 	"Sourcing":       {sharedGroupPinned, "server-set marker for a sourcing consumer; a group durable is never one"},
 }
 

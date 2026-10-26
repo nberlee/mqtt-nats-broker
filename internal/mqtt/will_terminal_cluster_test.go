@@ -1,13 +1,13 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
-// The bridge-level sentinel for F-030's terminal Will state, over a genuine 3-node
+// The broker-level sentinel for F-030's terminal Will state, over a genuine 3-node
 // embedded JetStream cluster and the production CAS helpers.
 //
 // It is an INTEGRATION SENTINEL, not sole proof that the internal window was reached:
 // the deterministic dependency canary for the supported server's refusal of a write
 // whose per-subject expectation read a base a committed `done` has replaced lives in
 // test/depproof, inside an isolated nats-server checkout. What this test adds is that
-// the bridge's own writes go through that contract - both of them conditional - and
+// the broker's own writes go through that contract - both of them conditional - and
 // that a refused reclaim leaves the terminal record standing and the Will unpublished.
 //
 // The paired mutation is named in the test: replacing the conditional reclaim with the
@@ -102,7 +102,7 @@ func TestMQTTWillOutboxReplicatedTerminalDoneStands(t *testing.T) {
 	// says must never take the record back to publishing. It goes through the same
 	// production CAS helper the claim protocol uses.
 	//
-	// MUTATION (`test/depproof/run.sh --bridge`): the reclaim is replaced by the
+	// MUTATION (`test/depproof/run.sh --broker`): the reclaim is replaced by the
 	// unconditional store the negative pins use, and the publication assertion below
 	// must then fail with a SECOND publication of a Will already published once. That
 	// is what makes this test evidence about the server's contract rather than about

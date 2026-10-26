@@ -783,14 +783,14 @@ type mqttPersistedSession struct {
 	// subjects). It is mandatory. A record without one predates generations and is
 	// REFUSED rather than interpreted under the hash-only names it was written with
 	// (F-057): nothing reclaims such a record, so the recovery is recreating the
-	// bridge-owned streams. See sess_incarnation.go.
+	// broker-owned streams. See sess_incarnation.go.
 	Gen string `json:"gen,omitempty"`
 	// WID is this record write's own identity, minted once per write; PWID is the
 	// WID of the record the write was derived from (empty only for a first create).
 	// The pair is a PARENT POINTER.
 	//
 	// It used to exist because two writes derived from one base could both apply
-	// across a leader transition. That is retired for two BRIDGE-AUTHORED CONDITIONAL
+	// across a leader transition. That is retired for two BROKER-AUTHORED CONDITIONAL
 	// writes — see the same-base boundary in docs/CONFORMANCE.md. What the pointer
 	// answers now is the route that boundary leaves open: an UNCONDITIONAL foreign
 	// write puts a body in the single slot that a CAS cannot exclude, and sequence and

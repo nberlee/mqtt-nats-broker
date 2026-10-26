@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Tests for what is owed to a connection's Will when its close races a new
 // connection for the same client ID.

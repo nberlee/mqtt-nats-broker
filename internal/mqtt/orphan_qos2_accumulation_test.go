@@ -1,4 +1,4 @@
-//go:build mqttport_experimental_shared_qos2
+//go:build mqtt_experimental_shared_qos2
 
 // Fixtures for F-064's accumulation half: settled affine QoS 2 state that nothing
 // reaped while the owning session's record was live.

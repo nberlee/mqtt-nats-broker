@@ -79,7 +79,7 @@ const (
 	// structuredBlob: a []byte with an interpretable structure; decoder names what
 	// reads it.
 	structuredBlob
-	// opaquePayload: a []byte the bridge never interprets. Deliberately distinct
+	// opaquePayload: a []byte the broker never interprets. Deliberately distinct
 	// from structuredBlob — demanding a decoder for application bytes would invite
 	// a fictional one.
 	opaquePayload
@@ -175,7 +175,7 @@ type censusDisposition struct {
 	// not whoever minted it.
 	//
 	// Review of the first implementation found the model could not express
-	// ConsumerConfig.Durable: the bridge MINTS the name before the create, so no stream
+	// ConsumerConfig.Durable: the broker MINTS the name before the create, so no stream
 	// issues it — but the consumer it names lives on a stream, and recreating that
 	// stream strands the name. Calling it identityLocal contradicted identityLocal's own
 	// definition, and the F-066 oracle accepted it anyway because it only checked
@@ -515,11 +515,11 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Durable": {kind: identityLocal, lifecycle: "the stream the consumer is created on", encoding: encJSON,
 			reason: "the durable name. MINTED LOCALLY — randomly for a plain consumer, deterministically " +
 				"for a shared group — BEFORE the consumer create, so JetStream holds the consumer under a " +
-				"name this bridge authored rather than issuing it. Named by F-066's table wherever a record " +
+				"name this broker authored rather than issuing it. Named by F-066's table wherever a record " +
 				"persists it: recreating the stream the consumer lives on strands the name"},
 		"Name": {kind: identityLocal, lifecycle: "the stream the consumer is created on", encoding: encJSON, reason: "the consumer's name as the server reports it; for a durable it equals Durable, scoped to the same stream lifecycle"},
 		"DeliverSubject": {kind: identityLocal, encoding: encJSON,
-			reason: "the delivery subject this bridge minted; a repair of a SESSION durable must mint a " +
+			reason: "the delivery subject this broker minted; a repair of a SESSION durable must mint a " +
 				"FRESH one rather than reuse a recorded one, because the recorded $JS.ACK/NAK subjects " +
 				"embed the name with per-instance counters (sess_resume_reconcile.go). The two " +
 				"per-broker EPHEMERAL consumers are the deliberate exception: their subject is derived " +
@@ -540,13 +540,13 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"ReplayPolicy":    {kind: notAnIdentity, encoding: encJSON, reason: "delivery pacing"},
 		"RateLimit":       {kind: notAnIdentity, encoding: encJSON, reason: "delivery pacing"},
 		"SampleFrequency": {kind: notAnIdentity, encoding: encJSON, reason: "ack sampling for monitoring"},
-		"MaxWaiting":      {kind: notAnIdentity, encoding: encJSON, reason: "pull-consumer bound; this bridge uses push consumers"},
+		"MaxWaiting":      {kind: notAnIdentity, encoding: encJSON, reason: "pull-consumer bound; this broker uses push consumers"},
 		"MaxAckPending": {kind: notAnIdentity, encoding: encJSON,
 			reason: "the in-flight cap. Load-bearing for Receive Maximum accounting, and a stream-forced " +
 				"value below the broker's effective cap is fatal at validation — but it is a limit, not a " +
 				"reference to anything"},
 		"FlowControl":        {kind: notAnIdentity, encoding: encJSON, reason: "push-consumer flow control"},
-		"HeadersOnly":        {kind: notAnIdentity, encoding: encJSON, reason: "delivery shape; this bridge needs bodies"},
+		"HeadersOnly":        {kind: notAnIdentity, encoding: encJSON, reason: "delivery shape; this broker needs bodies"},
 		"MaxRequestBatch":    {kind: notAnIdentity, encoding: encJSON, reason: "pull-consumer bound"},
 		"MaxRequestExpires":  {kind: notAnIdentity, encoding: encJSON, reason: "pull-consumer bound"},
 		"MaxRequestMaxBytes": {kind: notAnIdentity, encoding: encJSON, reason: "pull-consumer bound"},
@@ -557,14 +557,14 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"but a duration is not an identity"},
 		"Replicas":       {kind: notAnIdentity, encoding: encJSON, reason: "consumer replica count"},
 		"MemoryStorage":  {kind: notAnIdentity, encoding: encJSON, reason: "consumer storage mode"},
-		"Direct":         {kind: notAnIdentity, encoding: encJSON, reason: "server-set for direct-get consumers; this bridge reads via the JS API"},
+		"Direct":         {kind: notAnIdentity, encoding: encJSON, reason: "server-set for direct-get consumers; this broker reads via the JS API"},
 		"Sourcing":       {kind: notAnIdentity, encoding: encJSON, reason: "server-set marker for a sourcing consumer"},
 		"Description":    {kind: notAnIdentity, encoding: encJSON, reason: "cosmetic"},
 		"Metadata":       {kind: container, keys: "metadata keys", elems: "metadata values", encoding: encJSON, reason: "arbitrary key/value metadata. The census records it as a CARRIER because $MQTT_teardown's epoch coupling is carried in STREAM metadata. Consumer metadata is no longer unused: the two per-broker ephemeral consumers stamp owner/purpose/run/schema, and the SERVER compares it as part of the ActionCreate equality check, which is what makes a colliding run's consumer unequal. No broker code reads it back (ephemeral_identity.go)"},
-		"PauseUntil":     {kind: notAnIdentity, encoding: encJSON, reason: "a pause deadline; unused by this bridge"},
-		"PriorityGroups": {kind: container, elems: "priority group names", encoding: encJSON, reason: "priority-group names; unused by this bridge"},
-		"PriorityPolicy": {kind: notAnIdentity, encoding: encJSON, reason: "priority policy; unused by this bridge"},
-		"PinnedTTL":      {kind: notAnIdentity, encoding: encJSON, reason: "priority pinning timeout; unused by this bridge"},
+		"PauseUntil":     {kind: notAnIdentity, encoding: encJSON, reason: "a pause deadline; unused by this broker"},
+		"PriorityGroups": {kind: container, elems: "priority group names", encoding: encJSON, reason: "priority-group names; unused by this broker"},
+		"PriorityPolicy": {kind: notAnIdentity, encoding: encJSON, reason: "priority policy; unused by this broker"},
+		"PinnedTTL":      {kind: notAnIdentity, encoding: encJSON, reason: "priority pinning timeout; unused by this broker"},
 	}
 
 	// mqttQ2AffClaim was MISSING from an earlier draft of this manifest entirely, and
@@ -596,7 +596,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"ClientIDHash": {kind: notAnIdentity, encoding: encJSON, reason: "the client hash, which the subject also carries; the subject is what addresses the record"},
 		"ClientID":     {kind: notAnIdentity, encoding: encJSON, reason: "the plaintext client ID, carried for the publish-time authorization check and diagnostics"},
 		"Topic":        {kind: notAnIdentity, encoding: encJSON, reason: "the Will's MQTT topic"},
-		"Msg":          {kind: opaquePayload, encoding: encJSON, reason: "the Will payload: arbitrary application bytes the bridge never interprets"},
+		"Msg":          {kind: opaquePayload, encoding: encJSON, reason: "the Will payload: arbitrary application bytes the broker never interprets"},
 		"QoS":          {kind: notAnIdentity, encoding: encJSON, reason: "MQTT delivery metadata"},
 		"Retain":       {kind: notAnIdentity, encoding: encJSON, reason: "MQTT delivery metadata"},
 		"Props":        {kind: structuredBlob, decoder: "mqttValidateForwardProps", encoding: encJSON, reason: "the MQTT 5 properties block, validated before being forwarded into an outbound PUBLISH"},
@@ -713,7 +713,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 
 	m["mqttPersistedWill"] = map[string]censusDisposition{
 		"Topic":  {kind: notAnIdentity, encoding: encJSON, reason: "the Will's MQTT topic"},
-		"Msg":    {kind: opaquePayload, encoding: encJSON, reason: "the Will payload: arbitrary application bytes the bridge never interprets"},
+		"Msg":    {kind: opaquePayload, encoding: encJSON, reason: "the Will payload: arbitrary application bytes the broker never interprets"},
 		"QoS":    {kind: notAnIdentity, encoding: encJSON, reason: "MQTT delivery metadata"},
 		"Retain": {kind: notAnIdentity, encoding: encJSON, reason: "MQTT delivery metadata"},
 		"Props":  {kind: structuredBlob, decoder: "mqttValidateForwardProps", encoding: encJSON, reason: "the MQTT 5 properties block, forwarded verbatim into outbound PUBLISH packets and therefore validated before use"},
@@ -736,7 +736,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 	}
 
 	m["StreamConfig"] = map[string]censusDisposition{
-		"Name":     {kind: identityLocal, encoding: encJSON, reason: "the stream's own name, which the bridge authors and every $MQTT_* constant fixes"},
+		"Name":     {kind: identityLocal, encoding: encJSON, reason: "the stream's own name, which the broker authors and every $MQTT_* constant fixes"},
 		"Subjects": {kind: container, elems: "the stream's subject space", encoding: encJSON, reason: "the subject SPACE is the identity space every record on this stream is addressed in; three of the ten carry the JS domain token and seven do not, and the validators compare the set order-independently"},
 		"Metadata": {kind: container, keys: "metadata keys", elems: "metadata values", elemIssuer: mqttSessStreamName, encoding: encJSON,
 			reason: "the carrier of $MQTT_teardown's adopted incarnation EPOCH — one of F-066's three couplings, and the one no body walk can see. Recorded as cross-stream through its elements for that reason"},
@@ -835,7 +835,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 
 	m["ConsumerInfo"] = map[string]censusDisposition{
 		"Stream": {kind: identityCrossStream, issuer: "the stream the consumer is on", encoding: encJSON, reason: "names the stream this consumer belongs to"},
-		"Name":   {kind: identityLocal, encoding: encJSON, reason: "the consumer name, which the bridge minted before the create"},
+		"Name":   {kind: identityLocal, encoding: encJSON, reason: "the consumer name, which the broker minted before the create"},
 		"Config": {kind: embeddedType, embeds: "ConsumerConfig", encoding: encJSON, reason: "the persisted configuration, dispositioned once under its own type"},
 		"Created": {kind: identityLocal, encoding: encJSON,
 			reason: "the JetStream-issued consumer INSTANCE fingerprint. The orphan sweep's PUBREL class " +
@@ -848,14 +848,14 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"AckFloor":       {kind: embeddedType, embeds: "SequenceInfo", encoding: encJSON, reason: "the ack floor: the consumer state confirmAck waits for"},
 		"NumAckPending":  local("in-flight count; the accounting Receive Maximum interacts with"),
 		"NumRedelivered": local("redelivery count, which a delivery callback interprets"),
-		"NumWaiting":     local("pull-request count; this bridge uses push consumers"),
+		"NumWaiting":     local("pull-request count; this broker uses push consumers"),
 		"NumPending":     local("undelivered count"),
 		"Cluster":        {kind: embeddedType, embeds: "ClusterInfo", encoding: encJSON, reason: "transient Raft placement, declared out of scope; naming it here keeps the exclusion visible at the site rather than only in the walker"},
 		"PushBound":      local("whether a push consumer has a bound subscription"),
-		"Paused":         local("pause state; this bridge never pauses a consumer"),
+		"Paused":         local("pause state; this broker never pauses a consumer"),
 		"PauseRemaining": local("remaining pause duration"),
 		"TimeStamp":      local("the read's own timestamp, not a property of the consumer"),
-		"PriorityGroups": {kind: container, elems: "priority group state", encoding: encJSON, reason: "per-group state; this bridge sets no priority groups, which the ConsumerConfig row records"},
+		"PriorityGroups": {kind: container, elems: "priority group state", encoding: encJSON, reason: "per-group state; this broker sets no priority groups, which the ConsumerConfig row records"},
 	}
 
 	// StreamState is the stream's own durable accounting, and the orphan sweep consumes
@@ -898,10 +898,10 @@ func censusManifest() map[string]map[string]censusDisposition {
 
 	// PriorityGroupState likewise: excluded as transient, but it is reachable from a root
 	// and this census records a verdict for everything reachable rather than a filtered
-	// subset. The verdict happens to be that this bridge sets no priority groups.
+	// subset. The verdict happens to be that this broker sets no priority groups.
 	m["PriorityGroupState"] = map[string]censusDisposition{
-		"Group":          {kind: identityLocal, encoding: encJSON, reason: "the group name; this bridge sets no priority groups, which the ConsumerConfig row records"},
-		"PinnedClientID": {kind: identityLocal, encoding: encJSON, reason: "the pinned consumer instance; unused by this bridge"},
+		"Group":          {kind: identityLocal, encoding: encJSON, reason: "the group name; this broker sets no priority groups, which the ConsumerConfig row records"},
+		"PinnedClientID": {kind: identityLocal, encoding: encJSON, reason: "the pinned consumer instance; unused by this broker"},
 		"PinnedTS":       local("when the pin was taken"),
 	}
 
@@ -1023,7 +1023,7 @@ func censusWalkFields(t reflect.Type) []censusField {
 	return out
 }
 
-// censusRoots are the artifacts this bridge PERSISTS or reads back as configuration and
+// censusRoots are the artifacts this broker PERSISTS or reads back as configuration and
 // state. The audited type universe is everything reachable from them
 // (censusReachableTypes), not this list — so a nested type is covered without anybody
 // remembering to add it.

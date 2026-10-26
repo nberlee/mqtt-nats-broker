@@ -497,7 +497,7 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		// members who ARE allowed it -- turning one member's deny into data loss for
 		// the whole group. Hand it back instead, paced, so the group can offer it to
 		// someone else; upstream NATS gets the same outcome by filtering denied
-		// queue members before selection, which this port cannot do because the
+		// queue members before selection, which this broker cannot do because the
 		// selection happens on the service connection.
 		//
 		// Whether it is acked away or handed back, this session is not going to

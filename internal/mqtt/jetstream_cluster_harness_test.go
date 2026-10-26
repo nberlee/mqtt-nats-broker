@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Real replicated-JetStream cluster harness for the delayed-Will outbox tests.
 //
@@ -395,14 +395,14 @@ func (c *testJetStreamCluster) cleanup() {
 	}
 }
 
-// testClusterBroker is a standalone MQTT bridge connected to the cluster.
+// testClusterBroker is a standalone MQTT broker connected to the cluster.
 type testClusterBroker struct {
 	s    *Server
 	nc   *nats.Conn
 	opts *Options
 }
 
-// startBroker starts an MQTT bridge whose NATS connection prefers the given node
+// startBroker starts an MQTT broker whose NATS connection prefers the given node
 // index (deterministic initial placement). The willq and other MQTT streams are
 // created R3 (MQTT.StreamReplicas=3), which requires the cluster to be formed
 // first. Cleanup is completion-aware and never touches the shared cluster.
@@ -418,7 +418,7 @@ func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int, tweaks .
 		t.Fatalf("broker NATS connect: %v", err)
 	}
 
-	node := "bridge-" + nuid.Next()
+	node := "broker-" + nuid.Next()
 	// Build on the v5 helper so cluster tests share the exact protocol config the
 	// other v5 tests use, then set replicas and override the listener.
 	opts := testMQTTDefaultOptionsV5()

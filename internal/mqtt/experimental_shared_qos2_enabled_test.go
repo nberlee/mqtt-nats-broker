@@ -1,4 +1,4 @@
-//go:build mqttport_experimental_shared_qos2
+//go:build mqtt_experimental_shared_qos2
 
 package mqtt
 

@@ -2,7 +2,7 @@
 // path (mqtt-nats-broker, docs/ROADMAP.md §0.2).
 //
 // Every accepted CONNECT commits the acceptance fact and the session record as ONE
-// AllowAtomicPublish batch on $MQTT_sess (mqttJSA.storeAcceptBatch). The bridge reads
+// AllowAtomicPublish batch on $MQTT_sess (mqttJSA.storeAcceptBatch). The broker reads
 // an acknowledgement of that batch as "the record committed WITH the fact", and the
 // roadmap finding this fixture answers argued the opposite from four Raft-layer facts:
 // ProposeMulti pushes entries individually, runAsLeader pops whatever prefix exists,
@@ -24,7 +24,7 @@
 // exact shape -- R3, a hand-encoded uncommitted 10-member prefix through ProposeMulti,
 // a per-server batchApply.count barrier, a real StepDown, and a per-server CLFS wait --
 // but asserts only the CLFS accounting. It never looks at the target subject. This
-// fixture reuses that construction and adds the assertion the bridge's claim rests on.
+// fixture reuses that construction and adds the assertion the broker's claim rests on.
 //
 // The paired mutation is m-batch-apply-eager: applying each member as it is committed
 // instead of buffering it must make the store assertions below fail.
@@ -62,7 +62,7 @@ const (
 	acceptBatchPrefixBufferedMarker = "ACCEPT-BATCH-PREFIX-BUFFERED"
 
 	// A member of an uncommitted prefix reached the STORE. This is the failure the
-	// mutation must produce, and the one the bridge's indivisibility claim forbids.
+	// mutation must produce, and the one the broker's indivisibility claim forbids.
 	acceptBatchPrefixStoredMarker = "ACCEPT-BATCH-PREFIX-STORED"
 )
 

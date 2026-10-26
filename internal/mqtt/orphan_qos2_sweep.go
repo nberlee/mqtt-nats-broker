@@ -84,7 +84,7 @@
 // four groups, and a single stream spans several clocks across a leadership change.
 // Subtracting one from another says nothing about elapsed time. Comparing either
 // against this process's time.Now() is worse, and for the reason the release claim's
-// self-reported At was rejected: the bridge is an external client on its own host.
+// self-reported At was rejected: the broker is an external client on its own host.
 //
 // So the grace is not an age. It is a STABLE-OBSERVATION requirement, measured on
 // the one clock this process can trust — its own monotonic one. A candidate becomes
@@ -163,7 +163,7 @@ var mqttOrphanSweepRuns atomic.Int64
 // errMQTTSessRecordUninterpretable marks a reference-walk failure caused by a
 // RECORD rather than by the transport. The distinction is operator-facing: a record
 // this broker cannot interpret is permanent and its recovery is recreating the
-// bridge-owned streams, whereas a scan that failed on a timeout, a leader change or
+// broker-owned streams, whereas a scan that failed on a timeout, a leader change or
 // a shutdown resolves itself on a later pass. Prescribing the destructive recovery
 // for the second class would be actively harmful.
 var errMQTTSessRecordUninterpretable = errors.New("session record cannot be interpreted")
@@ -253,7 +253,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		if errors.Is(rerr, errMQTTSessRecordUninterpretable) {
 			s.Warnf("MQTT orphaned QoS 2 sweep ABORTED and nothing was reclaimed: %v; "+
 				"this will not clear on its own — stop this account's brokers and recreate the "+
-				"bridge-owned JetStream state (the $MQTT_* streams)", rerr)
+				"broker-owned JetStream state (the $MQTT_* streams)", rerr)
 		} else {
 			s.Debugf("MQTT orphaned QoS 2 sweep ended: %v", rerr)
 		}
@@ -299,7 +299,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 		s.Warnf("MQTT orphaned QoS 2 sweep: skipping affine reconciliation because a session record's "+
 			"affine pair cannot be interpreted, so nothing proves which affine generations are still "+
 			"referenced: %v; this will not clear on its own — stop this account's brokers and recreate "+
-			"the bridge-owned JetStream state (the $MQTT_* streams). Every other class is unaffected "+
+			"the broker-owned JetStream state (the $MQTT_* streams). Every other class is unaffected "+
 			"and keeps being reclaimed", affRefsBad)
 	}
 	budget := mqttQ2AffSweepMutationBudget
@@ -381,7 +381,7 @@ func (as *mqttAccountSessionManager) qos2SweepRecordLimit() int {
 // leader's timestamp minus a slow leader's says nothing about elapsed time, and the
 // difference can exceed the grace while no time has passed at all. Comparing either
 // against this process's time.Now() is worse still, for the reason the release
-// claim's self-reported `At` was rejected: the bridge is an external client on its
+// claim's self-reported `At` was rejected: the broker is an external client on its
 // own host.
 //
 // What this process CAN measure honestly is a duration on its own monotonic clock.

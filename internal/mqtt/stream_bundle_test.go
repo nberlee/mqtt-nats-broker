@@ -3,7 +3,7 @@
 //
 // Untagged on purpose: the ten streams are one recreation unit (F-066), so
 // every fixture that hand-builds broker-owned streams now needs these helpers,
-// and several of those fixtures live outside the mqttport_fulltests build.
+// and several of those fixtures live outside the mqtt_fulltests build.
 
 package mqtt
 

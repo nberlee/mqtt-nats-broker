@@ -123,10 +123,10 @@ var mqttServerOwnedConsumerMetaKeys = []string{
 // sharedGroupMetadataIsServerOnly reports whether a live group durable's metadata contains
 // nothing but the server's own keys.
 //
-// This bridge sets no consumer metadata. That is an assertion, not an absence of interest:
+// This broker sets no consumer metadata. That is an assertion, not an absence of interest:
 // consumer metadata is a CARRIER — it is how $MQTT_teardown's epoch coupling is expressed
 // at the stream level — so "nobody writes it here" is a fact worth re-checking rather than
-// assuming. A group durable carrying a key this bridge did not write was provisioned by
+// assuming. A group durable carrying a key this broker did not write was provisioned by
 // something else, and the whole-struct comparison is what makes that observable.
 func sharedGroupMetadataIsServerOnly(md map[string]string) error {
 	for k := range md {
@@ -182,7 +182,7 @@ func sharedGroupExpectedConfig(group, subject string, inc uint64, live *Consumer
 	want.MaxDeliver = -1
 	// Server-OWNED, not normalized: its content moves with the dependency, so it is taken
 	// from the live consumer — but only after sharedGroupMetadataIsServerOnly has proved it
-	// holds nothing this bridge could have written. That check is the constraint; this
+	// holds nothing this broker could have written. That check is the constraint; this
 	// assignment only keeps the whole-struct comparison from failing on the server's own
 	// version keys.
 	want.Metadata = live.Metadata
@@ -294,7 +294,7 @@ func mqttSharedConsInRecord(ps *mqttPersistedSession) (string, bool) {
 func mqttSharedConsRecordErr(clientID, sid string) error {
 	return fmt.Errorf("the record of %q carries a shared group consumer configuration for %q in Cons, "+
 		"a format this broker never writes: shared membership is held in SharedSubs alone. Stop this "+
-		"account's brokers and recreate the bridge-owned JetStream state (the $MQTT_* streams); this is "+
+		"account's brokers and recreate the broker-owned JetStream state (the $MQTT_* streams); this is "+
 		"not a rolling upgrade", clientID, sid)
 }
 

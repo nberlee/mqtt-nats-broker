@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Replicated-JetStream (R3) tests for outbound in-flight identifier continuity,
 // running against a genuine 3-node embedded cluster (see

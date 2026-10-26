@@ -175,7 +175,7 @@ func TestSessGenContinuity(t *testing.T) {
 	// so its inbound QoS 2 release could not be arbitrated against a discard and the
 	// discard would fall back to a blind hash-wide purge — destroying a held payload
 	// whose releaser claimed it and then died. Refusing the record is the alternative
-	// to that silent loss; the bridge is pre-release, so the store is recreated.
+	// to that silent loss; the broker is pre-release, so the store is recreated.
 	const noGenID = "no-generation"
 	ps := mqttPersistedSession{ID: noGenID, Subs: map[string]byte{"foo": 1}}
 	b, err := json.Marshal(&ps)

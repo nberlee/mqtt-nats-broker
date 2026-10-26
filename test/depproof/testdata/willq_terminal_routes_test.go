@@ -1,7 +1,7 @@
 // Repository-owned dependency regressions for mqtt-nats-broker finding F-030.
 //
 // These run inside an isolated nats-server checkout (package `server`), driven by
-// test/depproof/run.sh in the bridge repository. They exist because the bridge's
+// test/depproof/run.sh in the broker repository. They exist because the broker's
 // terminal Will-outbox state (`done` on $MQTT_willq) is only non-regressible if the
 // JetStream server refuses a write whose per-subject expectation read a base that a
 // committed `done` has already replaced. Two routes can carry such a write to a Raft
@@ -112,16 +112,16 @@ func willqBody(t *testing.T, state, tag string) []byte {
 	return b
 }
 
-// willqExpect builds the per-subject expectation header the bridge's
+// willqExpect builds the per-subject expectation header the broker's
 // storeWillOutboxCAS always sets. Every $MQTT_willq write is conditional, base 0
 // included, so a fixture that stored unconditionally would not be testing the
-// bridge's protocol at all.
+// broker's protocol at all.
 func willqExpect(seq uint64) nats.Header {
 	return nats.Header{JSExpectedLastSubjSeq: []string{strconv.FormatUint(seq, 10)}}
 }
 
 // willqFixtureCluster starts a three-node cluster carrying one stream configured
-// exactly as the bridge configures $MQTT_willq (file storage, limits retention,
+// exactly as the broker configures $MQTT_willq (file storage, limits retention,
 // one message per subject, R3), and seeds the record the routes then race against.
 func willqFixtureCluster(t *testing.T) (*cluster, *nats.Conn, nats.JetStreamContext, uint64) {
 	t.Helper()
@@ -597,7 +597,7 @@ func TestJetStreamWillqNewLeaderRefusesTheSupersededBase(t *testing.T) {
 	})
 	require_NoError(t, err)
 
-	// A real transition, through the same public stepdown the bridge sentinel uses.
+	// A real transition, through the same public stepdown the broker sentinel uses.
 	// This is the boundary the finding is about: it clears the in-process per-subject
 	// state and zeroes the clustered sequence, so the new leader has to reconstruct
 	// what the subject currently holds from its own applied state.

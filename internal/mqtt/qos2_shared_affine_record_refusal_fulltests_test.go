@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests && mqttport_experimental_shared_qos2
+//go:build mqtt_fulltests && mqtt_experimental_shared_qos2
 
 // Copyright 2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -108,7 +108,7 @@ func TestQ2AffOrphanedSharedQoS2RecordRefusesRestore(t *testing.T) {
 			// instructing the opposite.
 			want := fmt.Sprintf("restoring session %q: %s; this record was written by a "+
 				"pre-release development broker and its format is not supported: stop this "+
-				"account's brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+				"account's brokers and recreate the broker-owned JetStream state (the $MQTT_* "+
 				"streams)", cid, tc.wantErr)
 			if err == nil || err.Error() != want {
 				t.Fatalf("createOrRestoreSession error:\n got: %v\nwant: %s", err, want)

@@ -534,7 +534,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 // classifies WHAT is there — never by whom, which no record can say (F-084).
 //
 // This comment used to argue that the original attempt and this re-attempt — two
-// BRIDGE-AUTHORED CONDITIONAL writes off one base — could both commit across a leader
+// BROKER-AUTHORED CONDITIONAL writes off one base — could both commit across a leader
 // transition, and that identical bytes plus MaxMsgsPer:1 made that harmless. **That
 // argument is RETIRED**, not re-pointed at another producer: the same-base boundary in
 // docs/CONFORMANCE.md closes it for exactly this pair. An external unconditional replay
@@ -561,7 +561,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 // is recorded in the stream's in-flight state and our expected-sequence re-attempt is
 // REFUSED (and once it has applied, the moved subject sequence refuses us too). What is
 // reachable is the other order: our re-attempt is admitted, and the foreign body lands
-// afterwards and replaces it. For two bridge-authored CONDITIONAL writes neither ordering
+// afterwards and replaces it. For two broker-authored CONDITIONAL writes neither ordering
 // arises — the same-base boundary excludes the second. That is the external-write route
 // in docs/CONFORMANCE.md, not a reattempt-specific residual, and it is not narrowed by
 // anything this arm could do.
@@ -587,7 +587,7 @@ func (sess *mqttSession) reattemptUncertainWrite(tok recordTx, pw *mqttPendingWr
 		// The re-attempt's own outcome is unknown. The identity stays EXACTLY as it
 		// was — same base, same digest, same bytes — because it names whichever of the
 		// two proposals lands. (The both-land case is retired for these two writes: they
-		// are bridge-authored conditional writes off one base — see the same-base
+		// are broker-authored conditional writes off one base — see the same-base
 		// boundary in docs/CONFORMANCE.md.)
 		return mqttUncertainUnresolved,
 			fmt.Errorf("the re-attempted record write of session %q is itself unresolved: %w", sess.id, err)

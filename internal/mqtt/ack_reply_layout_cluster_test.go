@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // The JetStream acknowledgement layout a v2.16 server emits by default, met for real.
 //
@@ -116,7 +116,7 @@ func (c *testJetStreamCluster) startAckLayoutBroker(t *testing.T, preferred int,
 	opts.StreamReplicas = 3
 	opts.MQTT.JsDomain = ackLayoutDomain
 	opts.MQTT.AckWait = ackWait
-	s := NewServer(nc, opts, "bridge-"+nuid.Next())
+	s := NewServer(nc, opts, "broker-"+nuid.Next())
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(urls, nats.UserInfo(user, pass), nats.DontRandomize())
 	})

@@ -1,7 +1,7 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // The re-drive transitions that need a REAL CONNECT. mqttProcessConnect can only be
-// driven end to end through the ported harness (mqtt_test.go), which is this build tag,
+// driven end to end through the fulltests harness (mqtt_test.go), which is this build tag,
 // so these live here and run under `make full-suite`. The budget and record-level halves
 // are in the default build; see sess_takeover_arbitration_test.go.
 

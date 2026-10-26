@@ -3,7 +3,7 @@
 // nats-io/nats-server#8370 closed, so that the supported generation's refusal is a
 // difference in the mechanism and not an artefact of the fixture.
 //
-// This generation is NOT supported by the bridge. run.sh only ever selects it for the
+// This generation is NOT supported by the broker. run.sh only ever selects it for the
 // control run against an older checkout.
 package server
 

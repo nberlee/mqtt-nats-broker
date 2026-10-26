@@ -179,7 +179,7 @@ type mqttSubPacketFacts struct {
 // local failure stored nothing and moved nothing, and an ambiguity is this connection's own
 // bytes maybe-landing, which if they landed landed under its own CAS. Treating either as
 // evidence converted an ordinary per-filter failure into a connection-level refusal and
-// broke 1352 tests in the ported suite — a contract the affine paths own, not this one.
+// broke 1352 tests in the fulltests suite — a contract the affine paths own, not this one.
 //
 // AN AMBIGUITY DOES NOT BLOCK THE QUIET BRANCH EITHER, and a review round read that as a
 // defect. The reasoning and the residual are at the quiet branch in mqttProcessSubs: a quiet

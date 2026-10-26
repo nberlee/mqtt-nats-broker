@@ -1,5 +1,5 @@
 # Default owners for everything in the repo.
 *       @nberlee
 
-# The ported MQTT core needs upstream-sync awareness.
+# The MQTT core derived from nats-server needs upstream-sync awareness.
 /internal/mqtt/ @nberlee

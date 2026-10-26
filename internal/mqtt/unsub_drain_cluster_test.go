@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Replicated-JetStream (R3) tests for the UNSUBSCRIBE drain, running against a
 // genuine 3-node embedded cluster with TWO independent brokers (see

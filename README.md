@@ -12,8 +12,8 @@ retained messages, QoS1/2 persistence, and message routing.
 > end-to-end — CONNECT, SUBSCRIBE, PUBLISH (QoS0), retained/sessions via
 > JetStream, and auth passthrough with per-client NATS authorization — verified
 > with a real MQTT client in CI. The upstream regression suite runs in CI against the
-> standalone broker (behind the `mqttport_fulltests` tag). See
-> [docs/PORTING.md](docs/PORTING.md).
+> standalone broker (behind the `mqtt_fulltests` tag). See
+> [CONTRIBUTING.md](CONTRIBUTING.md#test-suites-and-build-tags).
 
 ## Why
 
@@ -243,7 +243,7 @@ The authoritative pre-alpha release checklist is maintained in
 ```sh
 make test          # unit + end-to-end tests (real MQTT client over JetStream)
 make vet lint      # static analysis
-make full-suite    # ported upstream MQTT suite (tag mqttport_fulltests)
+make full-suite    # upstream MQTT suite + harness-based tests (tag mqtt_fulltests)
 make docker        # build the container image
 make image-smoke-external  # build it and run it as a pod would (needs Docker)
 make image-smoke-embedded  # the same for the embedded-NATS image, including a 3-node cluster
@@ -255,4 +255,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Apache-2.0. Substantial portions are derived from
 [nats-io/nats-server](https://github.com/nats-io/nats-server) (Apache-2.0); see
-[NOTICE](NOTICE).
+[NOTICE](NOTICE) and, for the source revision and what changed,
+[docs/PROVENANCE.md](docs/PROVENANCE.md).

@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Replicated-JetStream (R3) tests for the delayed-Will outbox, running against a
 // genuine 3-node embedded cluster (see jetstream_cluster_harness_test.go) rather
@@ -173,7 +173,7 @@ func TestMQTTWillOutboxReplicatedLeaderFailover(t *testing.T) {
 	t.Logf("new $MQTT_willq stream-leader node %q", newLeader.name)
 	c.waitStreamCurrent(t, testGlobalAccount, mqttWillQStreamName)
 
-	// Bridge B must remain operational or reconnect (its node may or may not have
+	// Broker B must remain operational or reconnect (its node may or may not have
 	// been the one stopped) — do NOT assert a specific reconnect.
 	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
 		if !bB.nc.IsConnected() {
@@ -217,13 +217,13 @@ func TestMQTTWillOutboxReplicatedNodeCatchup(t *testing.T) {
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
 
-	// Subscriber and Will client both through the single bridge.
+	// Subscriber and Will client both through the single broker.
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "cusub", cleanStart: true}, b.opts.MQTT.Host, b.opts.MQTT.Port)
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/catchup", opts: 0}})
 
-	will := &mqttWill{topic: []byte("will/catchup"), message: []byte("from-bridge"), qos: 0}
+	will := &mqttWill{topic: []byte("will/catchup"), message: []byte("from-broker"), qos: 0}
 	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "cupub", cleanStart: true, will: will,
 		willProps: mqttV5WillDelayProps(10), props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
 	testMQTTReadConnAckV5(t, rw)
@@ -244,25 +244,25 @@ func TestMQTTWillOutboxReplicatedNodeCatchup(t *testing.T) {
 	c.waitStreamCurrent(t, testGlobalAccount, mqttWillQStreamName)
 
 	// Pick a victim FOLLOWER: neither the stream leader nor the node serving the
-	// bridge's NATS connection, so its restart cannot trigger an election or a bridge
+	// broker's NATS connection, so its restart cannot trigger an election or a broker
 	// reconnect and the test isolates pure replica catch-up.
 	leader := c.waitStreamLeader(t, testGlobalAccount, mqttWillQStreamName)
-	bridgeNode := b.nc.ConnectedServerName()
+	brokerNode := b.nc.ConnectedServerName()
 	var victim *testJSClusterNode
 	for _, n := range c.nodes {
-		if n.running && n.name != leader.name && n.name != bridgeNode {
+		if n.running && n.name != leader.name && n.name != brokerNode {
 			victim = n
 			break
 		}
 	}
 	if victim == nil {
-		t.Fatalf("no eligible follower: leader=%q bridge=%q\n%s", leader.name, bridgeNode, c.describe())
+		t.Fatalf("no eligible follower: leader=%q broker=%q\n%s", leader.name, brokerNode, c.describe())
 	}
-	t.Logf("stopping follower %q (leader=%q bridge=%q)", victim.name, leader.name, bridgeNode)
+	t.Logf("stopping follower %q (leader=%q broker=%q)", victim.name, leader.name, brokerNode)
 	c.stopNode(victim) // its local store keeps the pending record
 
 	// The surviving quorum (leader + other follower) claims, publishes and deletes.
-	testMQTTReadPublishV5(t, rs, "will/catchup", []byte("from-bridge"))
+	testMQTTReadPublishV5(t, rs, "will/catchup", []byte("from-broker"))
 	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
 		if n := testMQTTCountWillRecords(t, asm); n != 0 {
 			return fmt.Errorf("outbox record not removed after publish, got %d\n%s", n, c.describe())
@@ -340,7 +340,7 @@ func testAcceptFactsFor(t *testing.T, asm *mqttAccountSessionManager, cidHash st
 
 // TestMQTTWillOutboxReplicatedAcceptFacts is T17's always-run half: $MQTT_sess is
 // created R3 and current on every node, it carries ALL FOUR subject spaces, and a real
-// CONNECT through the bridge leaves a permanent acceptance fact that is replicated
+// CONNECT through the broker leaves a permanent acceptance fact that is replicated
 // and reads back valid.
 //
 // SMOKE COVERAGE ONLY. It runs against a real cluster, but no mutation is paired

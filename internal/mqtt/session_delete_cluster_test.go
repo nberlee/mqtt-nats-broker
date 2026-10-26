@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Replicated coverage for the "session record already deleted" classification in
 // mqttSession.clear. On a cluster the record can vanish underneath the broker

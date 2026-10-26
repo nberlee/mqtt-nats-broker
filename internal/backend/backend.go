@@ -5,7 +5,7 @@
 // It exposes:
 //   - a long-lived *service connection* used for JetStream asset management
 //     (stream/consumer create, message store/load) — the transport that the
-//     ported mqttJSA layer plugs into;
+//     MQTT core's mqttJSA layer plugs into;
 //   - a per-MQTT-client dial (Auth passthrough) so that NATS enforces
 //     authorization for each MQTT client's subscriptions, and so the MQTT layer
 //     can discover that client's account and permissions and police the routes

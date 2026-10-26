@@ -14,7 +14,7 @@ import (
 )
 
 // runNATSAuth starts an in-process JetStream server that requires credentials,
-// with a service user (for the bridge) and an application user (for MQTT auth
+// with a service user (for the broker) and an application user (for MQTT auth
 // passthrough). Returns the client URL.
 func runNATSAuth(t *testing.T) string {
 	t.Helper()

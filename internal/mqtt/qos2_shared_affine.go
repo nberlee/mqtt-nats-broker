@@ -1216,7 +1216,7 @@ func (as *mqttAccountSessionManager) storeQ2AffCopy(subject string, hdrLen int, 
 // installed, so the constructor's signature carries no test-only parameter.
 // Stored and cleared by the test directly, with no setter beside it. The other
 // hooks in this package have one because they are installed from untagged tests;
-// this one is reachable only from the mqttport_fulltests suite, so a setter would
+// this one is reachable only from the mqtt_fulltests suite, so a setter would
 // be dead code in every build the linter sees.
 var mqttTestQ2AffineConfigBuiltHookV atomic.Pointer[func(caller string)]
 

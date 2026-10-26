@@ -8,7 +8,7 @@
 // has no dry-out criterion, so a fourth round can always add snapshotting or
 // pause/unpause.
 //
-// So closure is anchored to the BRIDGE'S INTERPRETATION SURFACE instead: a transition
+// So closure is anchored to the BROKER'S INTERPRETATION SURFACE instead: a transition
 // is in scope if and only if it can change the outcome of an enumerated interpretation
 // site. Delivery and redelivery then enter through the reads and callbacks that OBSERVE
 // them rather than as classes of their own — which is also how deduplication already
@@ -37,7 +37,7 @@ import (
 )
 
 // censusIngressMethods are the mqttJSA methods through which every JetStream
-// observation and mutation reaches the bridge. The unit of the census is the semantic
+// observation and mutation reaches the broker. The unit of the census is the semantic
 // interpretation SITE rather than the transport wrapper — one generic loadMsg feeds
 // several materially different interpretations — so this set is the ingress, and the
 // manifest below is what assigns each call site its interpretation.
@@ -69,7 +69,7 @@ var censusIngressMethods = map[string]string{
 	"consumerList":         "list a stream's consumers",
 
 	// Writes, whose RESPONSE is itself interpreted: success, error, the returned
-	// sequence, and duplicate status all change bridge behaviour.
+	// sequence, and duplicate status all change broker behaviour.
 	"storeMsg":        "store a message and interpret its ack",
 	"submitStoreMsg":  "submit a store without awaiting it (the inbound pipeline's ordered issuance); the request leaves in submission order and its ack is interpreted by await",
 	"await":           "await a submitted store's ack and classify it",
@@ -83,7 +83,7 @@ var censusIngressMethods = map[string]string{
 	"deleteConsumer": "delete a consumer by name",
 
 	// Consumer creation, which for an existing durable is an UPDATE, so its response
-	// carries configuration and state the bridge interprets.
+	// carries configuration and state the broker interprets.
 	"createEphemeralConsumer": "create an ephemeral consumer; with ActionCreate its response partitions into CONFIRMED, adopted-because-identical, and refused",
 	"createDurableConsumer":   "create or update a durable consumer",
 	"createStream":            "create a stream",

@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 package mqtt
 
@@ -23,7 +23,7 @@ import (
 // testE2ELandSibling stores a record CLAIMING the SAME parent as the bound session's
 // acknowledged one, unconditionally — no per-subject expectation, so nothing excludes it.
 // This is the retention route itself, not a stand-in for a leader transition: that
-// alternative is closed for two bridge-authored conditional writes (the same-base
+// alternative is closed for two broker-authored conditional writes (the same-base
 // boundary, docs/CONFORMANCE.md). See sess_fork_lineage_test.go.
 func testE2ELandSibling(t *testing.T, sess *mqttSession) {
 	t.Helper()

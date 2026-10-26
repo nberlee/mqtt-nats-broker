@@ -1,7 +1,7 @@
 // Copyright 2025 The mqtt-nats-broker Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 package mqtt
 

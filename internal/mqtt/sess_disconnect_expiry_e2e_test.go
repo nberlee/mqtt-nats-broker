@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Copyright 2024 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");

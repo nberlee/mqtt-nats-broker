@@ -1,4 +1,4 @@
-//go:build mqttport_clustertests
+//go:build mqtt_cluster_reference
 
 // Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 // Upstream cluster-harness tests kept as an unbuilt reference; they require
 // the nats-server clustered test harness (cluster, createJetStreamCluster*),
-// which is not ported. See docs/PORTING.md.
+// which this repository does not have. See CONTRIBUTING.md, "Test suites and build tags".
 
 package mqtt
 
@@ -1286,7 +1286,7 @@ func TestMQTTDecodeRetainedMessage(t *testing.T) {
 	// JSON-encoded body here to exercise the legacy reader; this broker accepts
 	// only the header format (F-056 removed the JSON fallback), so the reference
 	// injects the current format instead. Reference-only: this file is build
-	// tagged mqttport_clustertests and never runs — see docs/PORTING.md.
+	// tagged mqtt_cluster_reference and never runs — see CONTRIBUTING.md.
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
 
@@ -2743,7 +2743,7 @@ func TestMQTTWillRetainPermViolation(t *testing.T) {
 
 // The following tests exercise multi-account authorization (Options.Accounts,
 // User.Account) that the standalone single-account broker does not implement
-// (see docs/PORTING.md); User.Account is *server.Account (the User type is
+// (see docs/PROVENANCE.md); User.Account is *server.Account (the User type is
 // aliased from nats-server), which is not assignable from this package's
 // single-account Account type, so these also do not type-check as written.
 func TestMQTTRequiresJSEnabled(t *testing.T) {
@@ -2876,7 +2876,7 @@ func TestMQTTDontSetPinger(t *testing.T) {
 // TestMQTTSubQoS2Restart inspects acc.sl (Account.sl), upstream's internal
 // in-process sublist, to count routed subscriptions. The shim's Account has no
 // such field: subscriptions are real nats.go subscriptions over the wire, not
-// an in-process routing table. See docs/PORTING.md.
+// an in-process routing table. See "The shim surface" in docs/ARCHITECTURE.md.
 func TestMQTTSubQoS2Restart(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -2972,7 +2972,7 @@ func TestMQTTSubQoS2Restart(t *testing.T) {
 // TestMQTTPublishSubjectLeafNodeParserFailures drives upstream's internal
 // leafnode client parser directly (dummyClient, LEAF, leaf, client.parse),
 // none of which exist in the shim's client type (a different struct built for
-// the standalone broker, with no leafnode concept). See docs/PORTING.md.
+// the standalone broker, with no leafnode concept). See CONTRIBUTING.md.
 func TestMQTTPublishSubjectLeafNodeParserFailures(t *testing.T) {
 	const (
 		hdrLen           = 25
@@ -3098,7 +3098,7 @@ func TestMQTTPublishSubjectLeafNodeParserFailures(t *testing.T) {
 
 // TestMQTTSubRetainedRace and its two helpers poll s.lookupAccount(...).
 // lookupStream(...).state(), upstream's UNEXPORTED internal JetStream stream
-// API (package server), inaccessible from this package. See docs/PORTING.md.
+// API (package server), inaccessible from this package. See CONTRIBUTING.md.
 func testMQTTNewSubRetainedRace(t *testing.T, s *Server, o *Options, subTopic, pubTopic string, QOS byte) {
 	expectedFlags := (QOS << 1) | mqttPubFlagRetain
 	payload := []byte("testmsg")
@@ -3226,7 +3226,8 @@ func TestMQTTSubRetainedRace(t *testing.T) {
 
 // TestMQTTSubWithNATSStream uses Account.addStream (upstream's unexported
 // internal JetStream API). TestMQTTPublishRetainPermViolation uses
-// Server.ReloadOptions (unported config-reload machinery). See docs/PORTING.md.
+// Server.ReloadOptions (config-reload machinery this broker does not have). See
+// CONTRIBUTING.md.
 func TestMQTTSubWithNATSStream(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)

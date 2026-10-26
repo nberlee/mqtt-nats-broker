@@ -90,7 +90,7 @@ the protocol core (`mqtt.go` and the files split from it, listed in
 A test that passes against deliberately broken code proves nothing. For
 anything cluster- or race-shaped, name the mutations up front, apply each one,
 confirm the paired test fails, and revert it. Report which mutations were run.
-`mqttport_clustertests` passing is not evidence for a clustered claim; a test
+`mqtt_cluster_reference` passing is not evidence for a clustered claim; a test
 that fails under mutation is.
 
 ## Verification
@@ -99,7 +99,7 @@ that fails under mutation is.
 make test
 make vet
 make lint          # Go and Markdown; markdownlint covers **/*.md
-make full-suite    # ported upstream MQTT suite against the standalone broker
+make full-suite    # mqtt_fulltests: upstream MQTT suite + harness-based broker tests
 ```
 
 For anything touching sessions, QoS 2, Wills, or cluster handoff, also:

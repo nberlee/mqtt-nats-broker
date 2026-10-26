@@ -250,7 +250,7 @@ func TestMQTTDeferredDischargePersistsTheStampForAnElapsedFiniteOverride(t *test
 // helper: it arms ONE ambiguous write inside clear()'s pre-fence window so the
 // discard refuses with errMQTTClearRefusedUnresolved and deletes nothing.
 //
-// Separate from the e2e one because that lives behind the mqttport_fulltests
+// Separate from the e2e one because that lives behind the mqtt_fulltests
 // tag and takes *testing.T from a client-level fixture. The reporter is a
 // closure over an atomic because the hook runs on whatever goroutine drives the
 // discharge while the reporter is read from the test goroutine.

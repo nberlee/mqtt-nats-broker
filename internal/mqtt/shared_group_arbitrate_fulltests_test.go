@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // End-to-end coverage for F-077 on the CONNECT/resume path.
 //

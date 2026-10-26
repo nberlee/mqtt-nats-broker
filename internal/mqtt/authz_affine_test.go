@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // The affine shared-QoS-2 authorization fixture. It lives behind the fulltests
 // tag because the raw MQTT 5 helpers it needs do, and it needs them: the

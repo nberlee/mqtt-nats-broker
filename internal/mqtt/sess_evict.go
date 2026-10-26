@@ -321,7 +321,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 // proves a successor. F-084.
 //
 // Two corrections to what this comment used to say. It is NOT the leader-transition
-// fork: that route is closed for two bridge-authored conditional writes (the same-base
+// fork: that route is closed for two broker-authored conditional writes (the same-base
 // boundary, docs/CONFORMANCE.md), and what remains reachable is an unconditional foreign
 // write. And THIS path cancels no delayed Will on either verdict — see the block below,
 // where that was deliberately removed in favour of the claimant deciding against the

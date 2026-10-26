@@ -10,8 +10,8 @@ import (
 // These tests drive real MQTT 3.1.1 clients against the standalone broker over
 // TCP + in-process JetStream, covering the core protocol behaviors mined from
 // NATS-server's upstream MQTT suite (retained, QoS1/2, sessions, will,
-// wildcards, unsubscribe). See docs/PORTING.md for why the upstream suite is not
-// ported wholesale (it assumes an embedded NATS server started from config
+// wildcards, unsubscribe). See CONTRIBUTING.md for why the upstream suite does not
+// cover these on its own (it assumes an embedded NATS server started from config
 // files).
 
 // recvChan subscribes and returns a channel of received payloads.

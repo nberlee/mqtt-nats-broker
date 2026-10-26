@@ -24,6 +24,11 @@
 #   make soak                                   # defaults below
 #   SOAK_RUNS=40 SOAK_RUN='TestQoS2Move' make soak
 #   SOAK_BASE=origin/main make soak
+#   SOAK_BASE_TAGS=<old tag> make soak            # a baseline from before a tag rename
+#
+# Each arm is built with its own tags: SOAK_TAGS for the working tree, SOAK_BASE_TAGS
+# (default: SOAK_TAGS) for the baseline. A baseline that predates a build-tag rename
+# names its suite by the old tag, and the shared default would select nothing there.
 #
 # The baseline worktree is created from SOAK_BASE, which must be a committed
 # ref: uncommitted work in the working tree is precisely what is under test, and
@@ -36,6 +41,8 @@ RUNS="${SOAK_RUNS:-20}"
 SELECTOR="${SOAK_RUN:-TestQoS2Move}"
 BASE_REF="${SOAK_BASE:-HEAD}"
 DIR="${SOAK_DIR:-/tmp/mqtt-nats-broker-soak}"
+CAND_TAGS="${SOAK_TAGS:-mqtt_fulltests}"
+BASE_TAGS="${SOAK_BASE_TAGS:-$CAND_TAGS}"
 
 REPO="$(git rev-parse --show-toplevel)"
 CAND="$REPO"
@@ -45,7 +52,8 @@ SUMMARY="$DIR/summary.txt"
 
 # The gated cluster tests self-skip without this; see CONTRIBUTING.md.
 export MQTTNB_CLUSTER_FAILOVER_TESTS=1
-TEST_CMD=(go test -count=1 -v -tags mqttport_fulltests -race -run "$SELECTOR" ./internal/mqtt/)
+# arm_tags names the build tags one arm's directory is built with.
+arm_tags() { [ "$1" = "$BASE" ] && echo "$BASE_TAGS" || echo "$CAND_TAGS"; }
 
 echo "soak: $RUNS runs per arm, selector '$SELECTOR', baseline '$BASE_REF'"
 echo "soak: artifacts in $DIR"
@@ -61,8 +69,9 @@ trap 'git -C "$REPO" worktree remove --force "$BASE" >/dev/null 2>&1; git -C "$R
 
 # A selector that names tests which exist in only one arm is not a comparison.
 for arm_dir in "$BASE" "$CAND"; do
-  if ! (cd "$arm_dir" && go vet -tags mqttport_fulltests ./internal/mqtt/ >/dev/null 2>&1); then
-    echo "soak: $arm_dir does not build with the fulltests tag" >&2
+  tags=$(arm_tags "$arm_dir")
+  if ! (cd "$arm_dir" && go vet -tags "$tags" ./internal/mqtt/ >/dev/null 2>&1); then
+    echo "soak: $arm_dir does not build with tags '$tags'" >&2
     exit 1
   fi
 done
@@ -73,7 +82,7 @@ for i in $(seq 1 "$RUNS"); do
     [ "$arm" = base ] && d="$BASE" || d="$CAND"
     log="$LOGS/$arm.$i.log"
     start=$(date +%s)
-    (cd "$d" && "${TEST_CMD[@]}") >"$log" 2>&1
+    (cd "$d" && go test -count=1 -v -tags "$(arm_tags "$d")" -race -run "$SELECTOR" ./internal/mqtt/) >"$log" 2>&1
     rc=$?
     secs=$(( $(date +%s) - start ))
     ran=$(grep -c '^=== RUN' "$log")
@@ -81,6 +90,7 @@ for i in $(seq 1 "$RUNS"); do
 
     if [ "$ran" -eq 0 ]; then
       echo "soak: ABORT — $arm run $i executed no tests at all; '0 failures' would be meaningless." >&2
+      echo "soak: its tags were '$(arm_tags "$d")'; a baseline from before a tag rename needs SOAK_BASE_TAGS." >&2
       echo "soak: see $log" >&2
       exit 1
     fi

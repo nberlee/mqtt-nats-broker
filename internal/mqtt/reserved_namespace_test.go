@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 package mqtt
 
@@ -588,7 +588,7 @@ func testReservedRefusedConnect(t *testing.T, o *Options, cid string, cleanStart
 // the reserved "$MQTT.>" namespace can only have been written by a development
 // broker predating the namespace deny, and there is no released persisted-state
 // contract to migrate from (CONTRIBUTING.md), so the CONNECT is REFUSED and the
-// operator recreates the bridge-owned state.
+// operator recreates the broker-owned state.
 //
 // Every row asserts the three facts a migration, a discard, or a skip-only
 // regression would each break: the CONNECT gets no CONNACK, the record is
@@ -890,7 +890,7 @@ func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 			want := fmt.Sprintf("restoring session %q: the record contains a "+
 				"subscription in the reserved %q namespace (%q), written by a pre-release "+
 				"development broker; this format is not supported: stop this account's "+
-				"brokers and recreate the bridge-owned JetStream state (the $MQTT_* "+
+				"brokers and recreate the broker-owned JetStream state (the $MQTT_* "+
 				"streams)", cid, mqttPrefix, tc.key)
 			if err == nil || err.Error() != want {
 				t.Fatalf("createOrRestoreSession error:\n got: %v\nwant: %s", err, want)

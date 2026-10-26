@@ -24,7 +24,7 @@ NATS/JetStream cluster as its backend.
 
 ## Source layout of the protocol core
 
-The core ported from nats-server's `server/mqtt.go` is split along this broker's
+The core derived from nats-server's `server/mqtt.go` is split along this broker's
 responsibilities, not upstream's layout (`docs/ROADMAP.md` §2). The split moved
 whole declarations verbatim; it changed no behavior. Every file keeps the NATS
 Authors' Apache-2.0 header, and the per-feature protocol files (`qos2_move.go`,
@@ -996,7 +996,7 @@ transition, so a recovered duplicate is possible. It is not unconditional no-los
 QoS 0 is best-effort, a sustained JetStream outage can defeat the immediate-publish
 fallback, and a forced process kill can interrupt persistence before the record is
 acknowledged. Both mechanisms are
-regression-tested under the `mqttport_fulltests` tag — the shared-store simulation
+regression-tested under the `mqtt_fulltests` tag — the shared-store simulation
 in `will_outbox_test.go` and the real 3-node cluster in
 `jetstream_cluster_harness_test.go` (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
 
@@ -14096,7 +14096,7 @@ are not what anyone typed. Ordinary non-ASCII is accepted, so a legitimate
 Unicode domain the server would take is not refused here. Invalid values fail at
 startup rather than surfacing later as unroutable requests.
 
-## Backend seams (see docs/PORTING.md)
+## Backend seams
 
 | Concern            | Mechanism                                             |
 |--------------------|-------------------------------------------------------|
@@ -14116,6 +14116,41 @@ That probe is the only check that runs before the MQTT listener opens, and it re
 under the reserved `$MQTT.inbox.` prefix: the service connection is configured with that
 custom inbox (`internal/backend`), because the default `_INBOX.` is reachable by an MQTT
 `#` subscriber in the same account (Residual 13 in `docs/CONFORMANCE.md`, now closed).
+
+### The shim surface
+
+The core still speaks in nats-server's internal types. Upstream, an MQTT connection
+*is* a nats-server `*client`, and persistence and routing ride server internals; here
+those types are re-implemented against the public `nats.go` client, so the core runs
+against an external NATS/JetStream cluster. The compiler is the authority on the exact
+members the core reaches; this is what each stands for.
+
+- **Aliases** (`shim_natsalias.go`): exported nats-server symbols (wire types, enums,
+  JS API request and response structs, error identifiers) aliased to
+  `github.com/nats-io/nats-server/v2/server`. The core touches only their exported
+  fields.
+- **Vendored helpers** (`compat_helpers.go`, `compat_proto.go`): self-contained
+  utilities copied verbatim or lightly adapted (hashing, header parsing, subject
+  tokenisation, varints, ack-reply parsing, constants), with no runtime coupling.
+- **`client`** (`shim_engine.go`): the per-connection engine. `readLoop` feeds the MQTT
+  parser; `processSub`/`processUnsub` attach `nats.go` subscriptions on the client's
+  routing connection (its own per-client connection under auth passthrough) and reframe
+  each NATS message for the core's callbacks; `processInboundClientMsg` publishes on that
+  connection. Writes are synchronous under `wmu` in `writeSocket`, bounded by
+  `mqttWriteDeadline`, and `writeLoop` is a no-op (see "Every MQTT application write is deadline-bounded").
+- **`Server`** (`shim_engine.go`, `shim_public.go`): the listener and accept loop, the
+  client registry, shutdown and drain, the per-client dialer behind
+  `isClientAuthorized`, and the node name used for JS API reply routing. `NewServer`,
+  `Start`, `Addr` and `Shutdown` are the public surface the command uses.
+- **`Account`, `subscription`, `ipQueue`** (`shim_small.go`): a named single account
+  with no subject mappings, a thin wrapper of a `*nats.Subscription` carrying the MQTT
+  delivery metadata, and a generic queue with a drain channel.
+- **`Options`/`MQTTOpts`** (`shim_engine.go`): the option structs the core reads,
+  validated once by `ValidateOptions` (see "Configuration validation").
+
+The persistence seams in the table above are where those types meet JetStream:
+`mqttJSA` speaks the JS API over request/reply on the service connection, QoS 0 rides
+core subscriptions, and QoS 1 and 2 ride JetStream consumers.
 
 ## Configuration validation
 
@@ -14699,7 +14734,7 @@ a fixed delay is not a retry but an unbounded loop against `MaxDeliver` of -1 -
 measured at 59 re-offers in three seconds at 50ms, and 10788 with no delay at all.
 The delay comes from JetStream's own delivery count, so no per-message state is
 kept. Upstream NATS reaches the same outcome by filtering denied queue members
-before selection; this port cannot, because the selection happens on the service
+before selection; this broker cannot, because the selection happens on the service
 connection. So the backoff is NOT a fast retry when an allowed member is present:
 each re-offer goes to a member nats-server picks at random, a denied one refuses it
 again at the next, longer delay, and the offers until an allowed member is picked
@@ -15116,7 +15151,7 @@ open. `MaxConn` remains the absolute cap and `admitConnSetup` the shutdown gate.
 A fixed header claims a Remaining Length of up to 268,435,455 bytes, and the read loop
 keeps a partial packet until that many bytes arrive. So the claim is judged when the
 fixed header is read, before any of the body is buffered (`mqttReader.readPacketLen`,
-`protocol_codec.go`; F-120, a port of nats-io/nats-server#8692 into this broker's copy):
+`protocol_codec.go`; F-120, nats-io/nats-server#8692 forward-ported into this broker):
 
 1. **Against the connection's bound** (`mqttInboundPacketBound`). Before CONNECT it is
    max_payload. A connected MQTT 5.0 client is held to the Maximum Packet Size its
@@ -15159,13 +15194,13 @@ an in-progress write rather than to write. So every PUBLISH, every acknowledgeme
 every CONNACK, every server DISCONNECT and every courtesy write is bounded by the
 same deadline value, with **no per-site machinery** beyond those two writers.
 
-This restores a bound the port dropped rather than introducing a policy. Upstream
+This restores a bound this broker had dropped rather than introducing a policy. Upstream
 nats-server sets `c.out.wdl` from `opts.WriteDeadline`, installs it on every flush,
 clears it afterwards, and closes a client that misses it as
 `SlowConsumerWriteDeadline`; `DEFAULT_FLUSH_DEADLINE` is 10s, which is the value
 used here. The shim replaced upstream's `writeLoop` and outbound buffer with a
 synchronous write under `wmu` and a no-op `writeLoop`, and the deadline went with
-them. See `docs/PORTING.md`.
+them. See `docs/PROVENANCE.md`.
 
 **The optional cap.** `writeActionlessFrameBy` (and `writeSocket` beneath it) takes
 an ABSOLUTE earlier bound, and only the shutdown drain supplies one: its shared

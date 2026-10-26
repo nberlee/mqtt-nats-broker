@@ -225,7 +225,7 @@ const (
 	// retention). A teardown that has WON its claim records the retirement here
 	// before it deletes anything, so the fact survives the one thing the session
 	// record cannot: an unconditional foreign write evicting the marker off the
-	// record's own subject. (Two bridge-authored CONDITIONAL writes off one base
+	// record's own subject. (Two broker-authored CONDITIONAL writes off one base
 	// cannot both apply — see the same-base boundary in docs/CONFORMANCE.md — but a
 	// write carrying no expectation is not excluded by any CAS.) Nothing ever reaps a
 	// watermark. See sess_teardown.go.

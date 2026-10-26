@@ -115,7 +115,7 @@ func TestSharedGroupServerNormalization(t *testing.T) {
 		}
 	}
 
-	// The bridge writes no consumer metadata, and a freshly created durable is the cleanest
+	// The broker writes no consumer metadata, and a freshly created durable is the cleanest
 	// place to assert it: whatever is there came from the server.
 	if err := sharedGroupMetadataIsServerOnly(ci.Config.Metadata); err != nil {
 		t.Errorf("a freshly created group durable already carries non-server metadata: %v", err)

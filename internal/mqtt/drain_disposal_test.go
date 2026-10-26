@@ -39,7 +39,7 @@ import (
 // and stated in docs/CONFORMANCE.md.
 
 // drainDisposalWaitFor polls fn until it stops returning an error, then fails. Local to this
-// file because the shared checkFor lives behind the mqttport_fulltests build tag and these
+// file because the shared checkFor lives behind the mqtt_fulltests build tag and these
 // tests are part of the default suite.
 func drainDisposalWaitFor(t *testing.T, total, step time.Duration, fn func() error) {
 	t.Helper()

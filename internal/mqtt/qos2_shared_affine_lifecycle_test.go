@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests && mqttport_experimental_shared_qos2
+//go:build mqtt_fulltests && mqtt_experimental_shared_qos2
 
 // Conformance and invariant tests for session-affine ownership of a STARTED
 // shared-subscription QoS 2 delivery (qos2_shared_affine.go).
@@ -1517,7 +1517,7 @@ func TestQ2AffinePerFilterFailureLeavesNoProvisioning(t *testing.T) {
 		"a SUBSCRIBE whose only shared QoS 2 filter failed left affine provisioning behind")
 }
 
-// Per-(Topic, QoS) ordering is a preserved invariant (docs/PORTING.md); shared
+// Per-(Topic, QoS) ordering is a preserved invariant (docs/CONFORMANCE.md); shared
 // subscriptions do not waive it. Two same-topic QoS 2 messages claimed in source
 // order must reach the owning client in that order, because they are stored in
 // order onto one generation-scoped subject and consumed in stream order by one

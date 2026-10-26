@@ -611,7 +611,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// admission it installs the canonical PUBREL tuple and leaves admission on the
 			// ordinary `pubrel_ready -> pubrel_sending` arrow; if delivery wins first, the
 			// direct arrow installs that tuple together with the action and this CAS safely
-			// loses. Either way no exchange stalls on AckWait, which is what the ported
+			// loses. Either way no exchange stalls on AckWait, which is what the upstream
 			// suite's timeouts were before the direct arrow existed.
 			//
 			// A crash or failed handoff after the store leaves "record stored, slot still

@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 package mqtt
 

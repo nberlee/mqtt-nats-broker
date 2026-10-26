@@ -83,7 +83,7 @@ func TestUncertainLateProposalIsNotForeign(t *testing.T) {
 	// The proposal that was in process upstream commits NOW. It CAS's against the
 	// same base the resolver just re-attempted at, so the exclusion holds and this one
 	// loses — the re-attempt already landed. That exclusion is now unqualified for two
-	// bridge-authored conditional writes (the same-base boundary, docs/CONFORMANCE.md);
+	// broker-authored conditional writes (the same-base boundary, docs/CONFORMANCE.md);
 	// TestUncertainDuplicateCommitCollapses covers the both-landed outcome as a generic
 	// MaxMsgsPer:1 property — NOT as coverage of the unconditional route, which supplies
 	// no acknowledgement for this broker to adopt.
@@ -452,7 +452,7 @@ func TestUncertainReattemptSendsTheAttemptsOwnBytes(t *testing.T) {
 // TestUncertainDuplicateCommitCollapses pins what makes the ours-landed invariant hold
 // WITHOUT relying on "only one of the two proposals can commit".
 //
-// For two BRIDGE-AUTHORED CONDITIONAL writes that exclusion is now a guarantee — see the
+// For two BROKER-AUTHORED CONDITIONAL writes that exclusion is now a guarantee — see the
 // same-base boundary in docs/CONFORMANCE.md — so this test no longer pins a reachable
 // interleaving of the original and its re-attempt.
 //

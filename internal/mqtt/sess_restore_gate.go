@@ -62,7 +62,7 @@ import (
 // continuation produces.
 var mqttTestRestoreOpenHookV atomic.Pointer[func()]
 
-// Its setter lives beside its ONE caller, in the mqttport_fulltests test file that
+// Its setter lives beside its ONE caller, in the mqtt_fulltests test file that
 // installs it, rather than here. The variable stays because openRestoreGate reads it;
 // the setter is test-only, and a test-only helper in a production file that no
 // default build can reach is exactly what `unused` is for. Moving it is the fix

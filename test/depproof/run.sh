@@ -14,7 +14,7 @@
 #   ./run.sh --run <regexp> --require <marker> --forbid <marker> --mutation <name> ...
 #   ./run.sh --run <regexp> --fixture acceptbatch_partial_test.go
 #   ./run.sh --matrix           # every row of the evidence table in README.md
-#   ./run.sh --bridge           # the bridge sentinels and their own mutations
+#   ./run.sh --broker           # the broker sentinels and their own mutations
 #
 # A mutation run is EXPECTED TO FAIL: that is what makes the paired assertion
 # evidence rather than decoration. --matrix asserts the direction of every row and
@@ -335,7 +335,7 @@ one_run() {
 }
 
 # ---------------------------------------------------------------------------
-# The bridge sentinel's own mutation.
+# The broker sentinel's own mutation.
 #
 # It lives here rather than in the broker's suites because it is the same kind of
 # evidence and needs the same scoring: a mutation is only evidence if it fails, and a
@@ -343,11 +343,11 @@ one_run() {
 #
 # The copy is of the working tree (tracked plus untracked, ignored files excluded)
 # rather than a worktree of HEAD, so a dependency-canary change exercises the exact
-# bridge code and documentation tree being reviewed rather than the previous commit.
+# broker code and documentation tree being reviewed rather than the previous commit.
 # ---------------------------------------------------------------------------
 
-bridge_test='^TestMQTTWillOutboxReplicatedTerminalDoneStands$'
-bridge_file=internal/mqtt/will_terminal_cluster_test.go
+broker_test='^TestMQTTWillOutboxReplicatedTerminalDoneStands$'
+broker_file=internal/mqtt/will_terminal_cluster_test.go
 
 accept_test='^TestMQTTAcceptBatchReplicatedIndivisible$'
 accept_file=internal/mqtt/accept_batch_cluster_test.go
@@ -363,28 +363,28 @@ copy_working_tree() {
     || die "could not copy the working tree"
 }
 
-# bridge_run copies the working tree, optionally applies the unconditional-store
+# broker_run copies the working tree, optionally applies the unconditional-store
 # mutation, runs the sentinel and prints one scored line.
-bridge_run() {
-  local mutate=$1 dest="$work/bridge" log outcome
+broker_run() {
+  local mutate=$1 dest="$work/broker" log outcome
   copy_working_tree "$dest"
 
   if [ "$mutate" = mutate ]; then
     # Exactly the substitution the sentinel's own comment names: the conditional
     # reclaim becomes the unconditional store the negative tests use.
-    edit "$dest/$bridge_file" 1 \
+    edit "$dest/$broker_file" 1 \
       'reclaim := licensed' \
       'reclaim := licensed
 	{
 		body, _ := json.Marshal(&reclaim)
 		_, _ = asm.jsa.storeMsg(subject, -1, body)
 	}'
-    edit "$dest/$bridge_file" 1 '	"fmt"' '	"encoding/json"
+    edit "$dest/$broker_file" 1 '	"fmt"' '	"encoding/json"
 	"fmt"'
   fi
 
-  log="$work/log-bridge-${mutate}.txt"
-  ( cd "$dest" && go test -tags mqttport_fulltests -count=1 -run "$bridge_test" \
+  log="$work/log-broker-${mutate}.txt"
+  ( cd "$dest" && go test -tags mqtt_fulltests -count=1 -run "$broker_test" \
       ./internal/mqtt/ -v ) > "$log" 2>&1 && outcome=PASS || outcome=FAIL
 
   if [ "$outcome" = FAIL ]; then
@@ -403,20 +403,20 @@ bridge_run() {
     outcome=BROKEN
   fi
   rm -rf "$dest"
-  echo "$outcome bridge-sentinel ${mutate} -> $log"
+  echo "$outcome broker-sentinel ${mutate} -> $log"
 }
 
-# bridge_matrix asserts both directions when the bridge sentinel is run on its own.
+# broker_matrix asserts both directions when the broker sentinel is run on its own.
 # Printing two outcomes and exiting zero would let callers mistake a broken mutation
-# for evidence, so this is shared by --bridge and the full matrix.
-bridge_matrix() {
+# for evidence, so this is shared by --broker and the full matrix.
+broker_matrix() {
   local failures=0 line want mode row
   for row in "PASS clean" "FAIL mutate"; do
     # shellcheck disable=SC2086
     set -- $row
     want=$1
     mode=$2
-    line=$(bridge_run "$mode") || exit 2
+    line=$(broker_run "$mode") || exit 2
     echo "$line"
     case $line in
       "$want "*) ;;
@@ -424,14 +424,14 @@ bridge_matrix() {
     esac
   done
   [ "$failures" -eq 0 ] || return 1
-  echo "depproof: both bridge-sentinel rows matched the evidence table"
+  echo "depproof: both broker-sentinel rows matched the evidence table"
 }
 
 # ---------------------------------------------------------------------------
 # The accepted-CONNECT batch sentinel and its own mutation.
 #
 # m-accept-split-write replaces the one atomic batch with the independent conditional
-# writes the bridge claims it does NOT make. The accepted CONNECT's batch is now the
+# writes the broker claims it does NOT make. The accepted CONNECT's batch is now the
 # outbound-ownership metadata commit's THREE members — the acceptance fact, the proposal's
 # COMMITTED receipt and the session record — so the mutation acknowledges the fact on its
 # own and then suppresses the record (and the receipt with it) through the sentinel's
@@ -511,7 +511,7 @@ accept_run() {
   fi
 
   log="$work/log-accept-${mutate}.txt"
-  ( cd "$dest" && go test -tags mqttport_fulltests -count=1 -run "$accept_test" \
+  ( cd "$dest" && go test -tags mqtt_fulltests -count=1 -run "$accept_test" \
       ./internal/mqtt/ -v ) > "$log" 2>&1 && outcome=PASS || outcome=FAIL
 
   if [ "$outcome" = FAIL ]; then
@@ -594,8 +594,8 @@ matrix() {
     esac
   done
 
-  # The bridge sentinels and their own mutations, scored the same way.
-  bridge_matrix || failures=$((failures + 1))
+  # The broker sentinels and their own mutations, scored the same way.
+  broker_matrix || failures=$((failures + 1))
   accept_matrix || failures=$((failures + 1))
   if [ "$failures" -gt 0 ]; then
     echo "depproof: $failures row(s) did not match the evidence table" >&2
@@ -612,7 +612,7 @@ mutations=()
 while [ $# -gt 0 ]; do
   case $1 in
     --matrix) matrix; exit $? ;;
-    --bridge) rc=0; bridge_matrix || rc=1; accept_matrix || rc=1; exit $rc ;;
+    --broker) rc=0; broker_matrix || rc=1; accept_matrix || rc=1; exit $rc ;;
     --version) version=${2:?}; shift 2 ;;
     --mutation) mutations+=("${2:?}"); shift 2 ;;
     --require) mutations+=("@${2:?}"); shift 2 ;;

@@ -5,7 +5,7 @@
 // aggregation, and the invocation-scoped charge refund. The end-to-end properties
 // — nothing precedes the CONNACK, the refusal preserves the session, the Will is
 // not published — need a real connection and live in
-// sess_restore_gate_e2e_test.go under the mqttport_fulltests tag.
+// sess_restore_gate_e2e_test.go under the mqtt_fulltests tag.
 
 package mqtt
 

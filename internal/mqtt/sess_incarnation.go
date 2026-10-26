@@ -32,7 +32,7 @@
 // own PUBRELs, QoS 2 holds and Will.
 //
 // EVERY session carries one. A record without a generation is rejected rather
-// than accommodated (mqttSessGenFromRecord), because the bridge is pre-release and
+// than accommodated (mqttSessGenFromRecord), because the broker is pre-release and
 // its `$MQTT_*` schemas carry no compatibility contract yet — see "Compatibility
 // boundary" in docs/ARCHITECTURE.md, which says designs must not carry legacy-format
 // machinery. That is not merely tidiness here: a hash-only session would have no
@@ -280,7 +280,7 @@ func mqttInflightWalkFilter(idHash, gen string) string {
 // would fall back to a blind hash-wide purge — which destroys a held payload whose
 // releaser claimed it and then died. That is silent loss, strictly worse than the
 // ordering deviation the claim exists to fix, so the path is rejected rather than
-// half-supported. The bridge is pre-release and its `$MQTT_*` schemas carry no
+// half-supported. The broker is pre-release and its `$MQTT_*` schemas carry no
 // compatibility contract (docs/ARCHITECTURE.md, "Compatibility boundary"): such a
 // record means the development store predates this design and must be recreated.
 func mqttSessGenFromRecord(gen string) (string, error) {

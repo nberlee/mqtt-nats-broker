@@ -241,9 +241,9 @@ unblocked the suite.
 ## nats-io/mqtt-test
 
 Not run here — the module was not fetchable in the build environment. It is also
-exercised by the ported upstream external tests (`mqtt_ex_*`, tag
-`mqttport_fulltests`) when the `mqtt-test` / HiveMQ `mqtt-cli` binaries are on
-`$PATH`.
+targeted by the upstream external tests (`mqtt_ex_*`), which need the `mqtt-test` /
+HiveMQ `mqtt-cli` binaries on `$PATH` and upstream's clustered test harness; they are parked,
+unbuilt, under `mqtt_cluster_reference` and do not run here.
 
 ## Client-ID handling
 
@@ -1730,7 +1730,7 @@ unacknowledged and keeps being offered. Once the denied members have left and an
 allowed member remains, the next offer goes to an allowed member, but a refusal delay
 already scheduled still runs first, so that offer can itself be up to the cap away.
 Upstream NATS avoids this by filtering denied queue members before selection, which
-this port cannot do because the selection happens on the service connection.
+this broker cannot do because the selection happens on the service connection.
 
 **Residual 13 - a starting broker's JetStream account-info reply was observable on
 `_INBOX`. CLOSED 2026-10-20.** The `AccountInfo` probe `internal/backend` makes at
@@ -2148,6 +2148,20 @@ its own parked ordering defect (below) is unrelated. See
 [F-072](findings/release-investigations.md#f-072). **This does not license a release: F-088
 remains an unconditional alpha blocker.**
 
+### Per-(Topic, QoS) delivery order: an intended implementation property
+
+MQTT orders delivery only per (Topic, QoS): an *Ordered Topic* server sends PUBLISHes
+"for the same Topic and QoS in the order that they were received" (MQTT 5.0 §4.6, whose
+normative statements end at MQTT-4.6.0-6). It does **not** order across topics or across
+QoS levels. This broker **intends** that per-(Topic, QoS) order on every path: each
+topic-filter+QoS stream rides a single ordered carrier (one core-NATS subscription for
+QoS 0, one JetStream push consumer for QoS 1 and 2) on a single dispatch goroutine. It holds
+on the non-affine paths, and it is what justified rewriting three inherited upstream tests
+that asserted order across topics or QoS levels (`docs/PROVENANCE.md`): two
+Subscription-Identifier cases accept either arrival order of their topic/property pairs,
+and `TestMQTTv5OutboundTopicAliasMixedQoS` lets whichever QoS path arrives first bind the
+alias. The affine shared-subscription QoS 2 path violates it (next section).
+
 ### Same-topic ordering on the affine QoS 2 path — PARKED EXPERIMENTAL DEFECT
 
 **This remains a demonstrated defect, not a residual or a fixed item.** It is retained as
@@ -2160,11 +2174,11 @@ Same-topic QoS 2 messages delivered to a member of a Shared Subscription through
 path can reach the client **out of publication order**. This is **not** a bare MQTT
 violation: MQTT-4.6.0-5 is conditional on an *Ordered Topic*, MQTT-4.6.0-6 requires ordered
 treatment only for **Non-shared** Subscriptions, and §4.8.2 does not extend it to Shared
-Subscriptions. Nor does this file promise ordering globally — its only
-ordering statement is scoped to the Receive Maximum prompt-release path. What exists is an
-**INTENDED implementation property** in `docs/PORTING.md`, stated for EVERY path: each
-topic-filter+QoS stream is meant to ride "a single ordered carrier ... on a single dispatch
-goroutine". It sits under *Testing strategy*, justifying why three upstream ordering tests
+Subscriptions. Nor does this file promise ordering globally as a conformance claim — its
+only conformance-level ordering statement is scoped to the Receive Maximum prompt-release
+path. What exists is the **INTENDED implementation property** of the previous section,
+stated for EVERY path: each topic-filter+QoS stream is meant to ride "a single ordered
+carrier ... on a single dispatch goroutine". It justifies why three upstream ordering tests
 were rewritten, so it is load-bearing for those. The affine path adds a SECOND carrier —
 copies through a `$MQTT_Q2AFF_*` consumer on `$MQTT_out` — and so **violates the intention
 rather than being excluded from it.** Its parked status is a product-scope decision, not a
@@ -6088,7 +6102,7 @@ for the mechanism. What that does and does not guarantee:
 - **A sourced `$MQTT_rmsgs` topology is untested (accepted coverage gap, 2026-10-12).**
   `docs/ARCHITECTURE.md` supports a cross-account sourced retained stream, but no
   executing native test stands one up: the only test of it is in the unbuilt
-  `mqttport_clustertests` reference file. A record arriving through a source with a
+  `mqtt_cluster_reference` reference file. A record arriving through a source with a
   subject transform, its TTL expiry, and delete-marker propagation through the source are
   therefore not exercised. Arbitration and resume use destination sequences and apply
   unchanged there, but neither can recover an update lost before ingestion into the
@@ -6186,7 +6200,7 @@ the edges:
 Every MQTT application write is bounded by `mqttWriteDeadline` (10s, no operator knob),
 installed and cleared in `writeSocket`; see `docs/ARCHITECTURE.md`, "Every MQTT application
 write is deadline-bounded". This restores upstream nats-server's per-flush deadline and its
-`SlowConsumerWriteDeadline` close, which this port dropped when it replaced upstream's
+`SlowConsumerWriteDeadline` close, which this broker had dropped when it replaced upstream's
 `writeLoop` and outbound buffer. Before it, a client whose socket send buffer stayed full
 blocked its writer — and any lock that writer held — for as long as the connection lasted.
 

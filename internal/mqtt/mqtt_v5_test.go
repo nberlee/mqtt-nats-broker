@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Copyright 2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -437,7 +437,7 @@ func testMQTTReadPubAck(t testing.TB, r *mqttReader, expPI uint16) {
 // ---- Tests ----
 
 // testMQTTDefaultOptionsV5 returns the default MQTT options. Every broker accepts
-// 5.0; the helper is kept for the ported call sites.
+// 5.0; the helper is kept for the upstream call sites.
 func testMQTTDefaultOptionsV5() *Options {
 	return testMQTTDefaultOptions()
 }
@@ -446,7 +446,7 @@ func testMQTTDefaultOptionsV5() *Options {
 // until explicitly enabled) is intentionally omitted from this fork: MQTT 5.0
 // is always enabled here (the experimental opt-in gate was removed), so the
 // test asserts behavior this broker does not — and will not — have. See
-// docs/PORTING.md.
+// docs/PROVENANCE.md.
 
 func TestMQTTv5ConnectAndCapabilities(t *testing.T) {
 	t.Parallel()

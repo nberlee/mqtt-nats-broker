@@ -13,7 +13,7 @@ import (
 // transport: createSubscription -> processSub, the sendJSAPIrequests send loop
 // -> processInboundClientMsg, and jsa.createStream request/reply -> NATS ->
 // processJSAPIReplies. Success means the MQTT streams actually exist in
-// JetStream, created by the ported code over nats.go.
+// JetStream, created by the MQTT core over nats.go.
 func TestSessionManagerBringUp(t *testing.T) {
 	t.Parallel()
 	_, nc := runNATS(t)

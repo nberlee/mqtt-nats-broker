@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Tests for graceful connection draining on shutdown (Layer 1): the server
 // sends connected v5 clients a DISCONNECT 0x8B "server shutting down" and closes

@@ -33,10 +33,11 @@ jobs:
   fulltests:
     name: test (upstream suite)
     runs-on: ubuntu-latest
-    # Ported upstream nats-server MQTT regression suite, run against the
-    # standalone broker via an embedded nats-server test harness
-    # (fulltests_harness_test.go). Split from build-test since it's a large,
-    # separate suite; see docs/PORTING.md ("Testing strategy").
+    # The mqtt_fulltests build: the upstream nats-server MQTT regression suite
+    # and the broker's own tests that need its harness, run against the
+    # standalone broker via an embedded nats-server (fulltests_harness_test.go).
+    # Split from build-test since it's a large, separate suite; see
+    # CONTRIBUTING.md ("Test suites and build tags").
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -44,9 +45,9 @@ jobs:
           go-version: '1.26'
           cache: true
       - name: go vet
-        run: go vet -tags mqttport_fulltests ./...
+        run: go vet -tags mqtt_fulltests ./...
       - name: test
-        run: go test -tags mqttport_fulltests -race -count=1 ./internal/mqtt/
+        run: go test -tags mqtt_fulltests -race -count=1 ./internal/mqtt/
 
   experimental-shared-qos2:
     name: test (experimental shared QoS 2; non-gating)
@@ -60,7 +61,7 @@ jobs:
           go-version: '1.26'
           cache: true
       - name: test
-        run: go test -tags 'mqttport_fulltests mqttport_experimental_shared_qos2' -race -count=1 ./internal/mqtt/
+        run: go test -tags 'mqtt_fulltests mqtt_experimental_shared_qos2' -race -count=1 ./internal/mqtt/
 
   cluster-failover:
     name: test (cluster Will failover)
@@ -84,7 +85,7 @@ jobs:
       - name: test
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
-        run: go test -tags mqttport_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
+        run: go test -tags mqtt_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
       - name: test (embedded-NATS cluster)
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'

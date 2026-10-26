@@ -1,4 +1,4 @@
-//go:build mqttport_fulltests
+//go:build mqtt_fulltests
 
 // Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -603,7 +603,7 @@ func testMQTTDefaultOptions() *Options {
 	o.MQTT.Host = "127.0.0.1"
 	o.MQTT.Port = -1
 	// The required suites use the production boundary. The separate
-	// mqttport_experimental_shared_qos2 build tag opts the parked suite into the
+	// mqtt_experimental_shared_qos2 build tag opts the parked suite into the
 	// preserved affine implementation.
 	o.MQTT.ExperimentalSharedQoS2 = mqttTestExperimentalSharedQoS2
 	return o

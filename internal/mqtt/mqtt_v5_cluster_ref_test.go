@@ -1,4 +1,4 @@
-//go:build mqttport_clustertests
+//go:build mqtt_cluster_reference
 
 // Copyright 2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 // Upstream cluster-harness tests kept as an unbuilt reference; they require
 // the nats-server clustered test harness (cluster, createJetStreamCluster*),
-// which is not ported. See docs/PORTING.md.
+// which this repository does not have. See CONTRIBUTING.md, "Test suites and build tags".
 
 package mqtt
 
@@ -341,7 +341,7 @@ func TestMQTTv5WillDelayPermViolation(t *testing.T) {
 // unexported in the server package and therefore inaccessible from this
 // package regardless of how the value is obtained — there is no thin mapping
 // possible, only the public nats.go JetStream client (which the shim's own
-// production code uses). See docs/PORTING.md.
+// production code uses). See CONTRIBUTING.md.
 func TestMQTTv5SharedSubscriptionLastHolder(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
