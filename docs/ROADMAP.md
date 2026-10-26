@@ -10018,6 +10018,60 @@ reads](findings/resolved.md#f-054).
   authentication and authorization, migration, operations, troubleshooting,
   conformance, and provenance pages.
 
+- [ ] Every `F-###` finding is a GitHub issue, and every reference to one points at its
+  issue. Once the repository has its GitHub remote, each finding record in
+  `docs/findings/` is uploaded as one issue, a suffixed record such as F-029a or F-029b
+  included even where it shares a dossier with its base: the record's text, its ID kept
+  in the title so commit messages stay resolvable, open findings open and resolved ones
+  closed with the resolving commit. Then every `F-###` reference in the repository is
+  replaced by its issue reference: Go comments and test commentary, `docs/ROADMAP.md`,
+  `docs/ARCHITECTURE.md`, `docs/CONFORMANCE.md`, `docs/known-upstream-issues.md`,
+  `docs/PROVENANCE.md`, `README.md`, `CLAUDE.md`, CI, the `Makefile`, lint
+  configuration, `test/depproof/` and the `test/conformance/` scripts and configuration.
+  Every test file named for a finding is renamed for what it contains: the `f088_*`,
+  `f115_*`, `f116_*`, `f117_*` and `f119_*` files, `outbound_row2_f105helpers_test.go`,
+  and `outbound_tenure_close_8b_e2e_test.go` and
+  `outbound_tenure_close_8b_fulltests_test.go` (the 8b unit of the outbound cutover).
+  The audits in `docs/findings/` that carry no finding ID become issues too. Every link
+  to a `docs/findings/` path is repointed at its issue, from the docs and from Go
+  comments alike, and the `CLAUDE.md` instructions that send upstream reports and their
+  references to `docs/findings/` name the issues instead. Only then is `docs/findings/`
+  deleted, so there is no second index to keep in step; this replaces the former check
+  that every dossier appears exactly once in the active or resolved index. The issue
+  titles are the only `F-###` to issue mapping; no mapping file is kept. Creating the
+  issues is outward-facing, so the issue text and the mapping get the owner's approval
+  before anything is posted. Closing the item rewrites this bullet as a completion
+  record that names no finding ID and no findings path, and then three checks are empty:
+  `git grep -E 'F-[0-9]{3}'` (contents), `git grep 'findings[/]'` (stale paths and
+  relative links), and `git ls-files` filtered for a finding number or unit label in a
+  file name. The census on 2026-10-26 was 129 finding identifiers (127 three-digit IDs
+  plus the separately tracked suffixed records F-029a and F-029b), about 2,900
+  references in Go and 1,600 in the docs outside `docs/findings/`.
+
+- [ ] Cut the dead text from `docs/ROADMAP.md`, `docs/CONFORMANCE.md`,
+  `docs/ARCHITECTURE.md` and `docs/known-upstream-issues.md`, once the findings are
+  GitHub issues (the item above). All four stay versioned documents that change in the
+  same commit as the code: `docs/ARCHITECTURE.md` states the mechanism the tagged source
+  runs, `docs/CONFORMANCE.md` its gaps, `docs/known-upstream-issues.md` the upstream
+  defects it is exposed to, and `docs/ROADMAP.md` the work still to do. What goes is
+  text that no longer describes the broker or the work. In `docs/ROADMAP.md`, a checked
+  item shrinks to one line, what was done, its date and its issue link; the roadmap's
+  opening paragraph, which keeps finished narrative verbatim and sends evidence to the
+  findings dossiers, and the `CLAUDE.md` line saying bullets carry the prior analysis
+  are rewritten so the issue is where that analysis lives. In `docs/CONFORMANCE.md`, a
+  section about a closed or accepted finding keeps only the residual that is current,
+  stated as behavior and linked to its issue. In `docs/ARCHITECTURE.md`, descriptions of
+  deleted or superseded mechanisms, review-round and attempt narrative, and the analysis
+  behind a design choice once it is restated as the rule it established. In
+  `docs/known-upstream-issues.md`, each defect keeps what it is, the pinned version it
+  affects, the upstream issue and this repository's issue. The analysis, rounds and
+  dispositions move to the matching issue's text rather than being lost; text with no
+  issue to go to stays in git history. Done when every remaining section describes the
+  current broker or open work, and every residual, design rule and open item still has
+  its statement (check by section against the pre-cut tree, not by length). The census
+  on 2026-10-26: about 9,500 of `docs/ROADMAP.md`'s 10,400 lines sat under checked
+  items; `docs/ARCHITECTURE.md` is 16,000 lines and `docs/CONFORMANCE.md` 7,100.
+
 ## Alpha release gate
 
 The first alpha may be tagged only when:
@@ -10034,9 +10088,9 @@ The first alpha may be tagged only when:
 - [ ] Every post-alpha candidate has an explicit disposition; an unchecked
   post-alpha item does not by itself block the alpha.
 
-- [ ] A repository documentation check proves every canonical `F-###` dossier
-  appears exactly once in the active or resolved finding index and that the
-  roadmap's closed total matches the index.
+- [ ] Every finding is a GitHub issue and the repository holds no finding ID, no
+  findings-directory path and no test file named for a finding (section 7, "Release
+  documentation").
 
 - [ ] The full test, race, lint, conformance, Paho, container, and deployment
   gates pass with no unexplained failures or skips.
