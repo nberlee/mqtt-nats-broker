@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -58,10 +59,9 @@ const mqttUserInfoSubject = "$SYS.REQ.USER.INFO"
 // enforced.
 const mqttUserInfoInboxPrefix = mqttPrefix + "uinfo."
 
-// mqttUserInfoTimeout bounds the identity request. It sits on the CONNECT path,
-// which the CONNECT deadline already bounds, so it must be comfortably shorter
-// than that: a request that outlives the deadline turns a refusable CONNECT into
-// a closed socket with no CONNACK.
+// mqttUserInfoTimeout bounds the identity request. It runs after admission has
+// stopped the CONNECT deadline, so this is the bound on that wait; a request it
+// cuts off is refused as server-unavailable (errMQTTIdentityUnavailable).
 const mqttUserInfoTimeout = 2 * time.Second
 
 // mqttIdentity is one connection's authenticated identity, taken once and never
@@ -106,10 +106,30 @@ type mqttUserInfoResponse struct {
 	Error *ApiError        `json:"error"`
 }
 
+// errMQTTIdentityUnavailable marks an identity request that got no answer: no
+// connection to ask on, or the request or its reply could not travel. It is the one
+// distinction a refused CONNECT reports (F-061): without it the broker could not tell
+// the client "the server is unavailable" from "you are not authorized", and every other
+// mqttFetchIdentity failure is an ANSWER the broker refuses.
+var errMQTTIdentityUnavailable = errors.New("identity request unanswered")
+
+// mqttIdentityUnavailableError classifies err as errMQTTIdentityUnavailable without
+// changing its text: the refusal's log line is an operator surface, and the class is
+// for the CONNACK alone.
+type mqttIdentityUnavailableError struct{ err error }
+
+func (e mqttIdentityUnavailableError) Error() string { return e.err.Error() }
+func (e mqttIdentityUnavailableError) Unwrap() []error {
+	return []error{errMQTTIdentityUnavailable, e.err}
+}
+
+func mqttIdentityUnavailable(err error) error { return mqttIdentityUnavailableError{err: err} }
+
 // mqttFetchIdentity asks nc who it is and returns a validated snapshot.
 //
 // Every failure is an error, never a permissive default. The caller refuses the
-// CONNECT on any of them.
+// CONNECT on any of them. A failure to obtain an answer wraps
+// errMQTTIdentityUnavailable; a refused answer does not.
 //
 // replyOn is the connection the ANSWER is received on, and it is deliberately not
 // nc. The server decides whose identity to report from who PUBLISHED the request,
@@ -126,21 +146,21 @@ type mqttUserInfoResponse struct {
 // wildcard subscriptions anyway ([MQTT-4.7.2-1]).
 func mqttFetchIdentity(nc, replyOn *nats.Conn) (*mqttIdentity, error) {
 	if nc == nil || replyOn == nil {
-		return nil, fmt.Errorf("no NATS connection to identify")
+		return nil, mqttIdentityUnavailable(fmt.Errorf("no NATS connection to identify"))
 	}
 	inbox := mqttUserInfoInboxPrefix + nuid.Next()
 	sub, err := replyOn.SubscribeSync(inbox)
 	if err != nil {
-		return nil, fmt.Errorf("subscribing to the identity reply inbox: %w", err)
+		return nil, mqttIdentityUnavailable(fmt.Errorf("subscribing to the identity reply inbox: %w", err))
 	}
 	defer sub.Unsubscribe() //nolint:errcheck // best effort; the subscription is short-lived
 	// The interest must exist before the request, or a fast reply is lost and the
 	// CONNECT is refused for a reason that is not the client's.
 	if ferr := replyOn.Flush(); ferr != nil {
-		return nil, fmt.Errorf("registering the identity reply inbox: %w", ferr)
+		return nil, mqttIdentityUnavailable(fmt.Errorf("registering the identity reply inbox: %w", ferr))
 	}
 	if perr := nc.PublishRequest(mqttUserInfoSubject, inbox, nil); perr != nil {
-		return nil, fmt.Errorf("%s: %w", mqttUserInfoSubject, perr)
+		return nil, mqttIdentityUnavailable(fmt.Errorf("%s: %w", mqttUserInfoSubject, perr))
 	}
 	msg, err := sub.NextMsg(mqttUserInfoTimeout)
 	if err != nil {
@@ -148,9 +168,9 @@ func mqttFetchIdentity(nc, replyOn *nats.Conn) (*mqttIdentity, error) {
 		// violation in LastError, so naming both is what lets the refusal say
 		// which of the two it was.
 		if le := nc.LastError(); le != nil {
-			return nil, fmt.Errorf("%s: %w (connection reported: %v)", mqttUserInfoSubject, err, le)
+			return nil, mqttIdentityUnavailable(fmt.Errorf("%s: %w (connection reported: %v)", mqttUserInfoSubject, err, le))
 		}
-		return nil, fmt.Errorf("%s: %w", mqttUserInfoSubject, err)
+		return nil, mqttIdentityUnavailable(fmt.Errorf("%s: %w", mqttUserInfoSubject, err))
 	}
 	body := msg.Data
 	// The seam substitutes the RAW RESPONSE, not the parsed identity, so every

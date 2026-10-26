@@ -160,6 +160,8 @@ func (jsa *mqttJSA) publishDurableCloseCert(c *mqttDurableCloseCert) error {
 // connection acquired under, captured when it FIRST attempted an acquisition and never derived
 // later from a session object a reconnect may have rebound.
 type mqttCertPersistCtx struct {
+	// srv is the server whose shutdown joins this write; nil in unit fixtures.
+	srv   *Server
 	jsa   *mqttJSA
 	id    string
 	epoch string
@@ -172,12 +174,24 @@ type mqttCertPersistCtx struct {
 // and on a torn writer's delivery goroutine — the last under the session's delivery lock — and
 // none of them may wait a store round trip, or take a lock, to state a fact the process already
 // established. The goroutine holds no lock and uses only the captured context.
-func mqttPersistCloseCert(ctx *mqttCertPersistCtx, run, conn string) {
-	if ctx == nil || ctx.jsa == nil {
+//
+// joined is the shutdown join's token, taken by claimPersistLocked; it is released when this
+// attempt ends, however it ends.
+func mqttPersistCloseCert(ctx *mqttCertPersistCtx, joined bool, run, conn string) {
+	if ctx == nil {
+		return
+	}
+	if ctx.jsa == nil {
+		if joined {
+			ctx.srv.closeCertWriteDone()
+		}
 		return
 	}
 	cert := &mqttDurableCloseCert{ID: ctx.id, Epoch: ctx.epoch, Gen: ctx.gen, Run: run, Conn: conn}
 	go func() {
+		if joined {
+			defer ctx.srv.closeCertWriteDone()
+		}
 		if h := mqttTestCloseCertPersistV.Load(); h != nil && !(*h)(cert) {
 			return
 		}
@@ -192,7 +206,11 @@ func mqttPersistCloseCert(ctx *mqttCertPersistCtx, run, conn string) {
 // assistant is taken WITHOUT a deadline: the certificate is written after whatever bounded
 // operation registered it has ended.
 func (jsa *mqttJSA) newCertPersistCtx(id, epoch, gen string) *mqttCertPersistCtx {
-	return &mqttCertPersistCtx{jsa: jsa.withDeadline(time.Time{}), id: id, epoch: epoch, gen: gen}
+	var srv *Server
+	if jsa.c != nil {
+		srv = jsa.c.srv
+	}
+	return &mqttCertPersistCtx{srv: srv, jsa: jsa.withDeadline(time.Time{}), id: id, epoch: epoch, gen: gen}
 }
 
 // ---------------------------------------------------------------------------

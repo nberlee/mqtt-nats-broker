@@ -329,7 +329,8 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		// notification cannot read the gate in between (see
 		// mqttRecordConnAckWrittenLocked).
 		sent, werr := c.mqttEnqueueConnAck(rc, sessp, reasonStr)
-		if sent && trace {
+		// Traced only when it reached the socket: a write that failed sent nothing.
+		if sent && werr == nil && trace {
 			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", sessp, rc)))
 		}
 		// The write error is part of the verdict: "a success CONNACK was written"
@@ -344,10 +345,14 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	admitted := c.mqttAdmitConnectLocked()
 	c.mu.Unlock()
 	if !admitted {
-		// The CONNECT deadline already won: this connection is condemned and its
-		// socket is closed. Refuse BEFORE isClientAuthorized, so a connection that
-		// lost the race dials no per-client NATS connection and binds no session
-		// state -- there is nothing to unwind.
+		// The CONNECT deadline already won, by its callback or by the clock: this
+		// connection is condemned. The socket is closed HERE because a clock refusal
+		// runs before the callback, which will now find the connection expired and close
+		// nothing; when the callback won, this is a second, harmless close. Refuse BEFORE
+		// authorizeClient, so a connection that lost the race dials no per-client NATS
+		// connection and binds no session state -- there is nothing to unwind -- and
+		// silently: it never authenticated, so it is owed no CONNACK.
+		c.closeTransport()
 		return errMQTTConnectDeadlineExpired
 	}
 	// The ownership budget is anchored HERE, at the moment F-051's deadline stopped
@@ -396,15 +401,17 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 			}
 		}
 	}()
-	if !s.isClientAuthorized(c) {
-		// The CONNACK is enqueued inside authViolation; trace it only if sent.
-		sent := c.authViolation()
-		if sent && trace {
-			c.traceOutOp("CONNACK", []byte(fmt.Sprintf("sp=%v rc=%v", false, mqttConnAckRCNotAuthorized)))
+	if refusal, ok := s.authorizeClient(c); !ok {
+		// Tell the client which refusal it was before the close (F-061): 3.1.1 [3.1.4] says
+		// the Server SHOULD, 5.0 [3.1.4] that it MAY. sendConnAck traces it only if written.
+		if h := mqttTestRefusalBeforeConnAckV.Load(); h != nil {
+			(*h)(c)
 		}
+		sendConnAck(refusal.code(c.mqtt.proto), false, refusal.reasonStr)
+		c.closeConnection(WriteError)
 		return ErrAuthentication
 	}
-	// Authenticated AND account-bound: isClientAuthorized refused the CONNECT
+	// Authenticated AND account-bound: authorizeClient refused the CONNECT
 	// unless the identity's own NATS account is the service account, which is the
 	// v1 same-account constraint docs/ARCHITECTURE.md states. F-080.
 	//

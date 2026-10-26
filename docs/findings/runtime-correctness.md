@@ -387,10 +387,10 @@ publisher's connection".
 
 **Title:** An unauthorized CONNECT is closed with no CONNACK
 
-- Status: Open
+- Status: Closed 2026-10-26
 - Classification: Confirmed conformance gap (a SHOULD)
 - Release treatment: Pre-alpha, `docs/ROADMAP.md` §0.5 (moved from the post-alpha
-  candidates by the user on 2026-10-26)
+  candidates by the user on 2026-10-26), satisfied
 
 ### Evidence
 
@@ -431,6 +431,23 @@ applies on the success path, whose write error is part of its verdict. Then the
 call site's trace stops claiming a packet that was not sent. A connection whose
 CONNECT lost the race to the connect deadline is a different case and must stay
 silent: its socket is already closed, and it was never authenticated.
+
+### Resolution
+
+Closed 2026-10-26 (`docs/ROADMAP.md` §0.5). `authViolation` is deleted.
+`authorizeClient` (formerly `isClientAuthorized`) returns the refusal it decided, an
+`mqttConnectRefusal` carrying a 3.1.1 return code and a 5.0 reason code, and the CONNECT
+writes it through `sendConnAck` before the close at both versions: 0x05 / 0x86 for a
+credential the server refused, 0x05 / 0x87 for a refused default credential (no user name)
+or an identity answer the broker will not admit, 0x03 / 0x88 when admission could not be
+completed (`errMQTTIdentityUnavailable` marks an unanswered identity request). The 5.0
+wording was verified: the CONNACK is a MAY there, with non-normative text suggesting
+silence; sending it was decided in the item's consult (the user's bullet asked for it, and
+the broker already writes refusal CONNACKs elsewhere). The unadopted per-client connection's
+handlers are disarmed before it is closed, because its closed handler closed the MQTT socket
+under the CONNACK. The trace now requires a successful write. Witnesses:
+`TestRefusedConnectIsToldWhy`, `TestRefusalDisarmsTheUnadoptedConnectionsHandlers`,
+`TestAuthorizationRefusalClassification` (`internal/mqtt/connect_refusal_test.go`).
 
 ## F-067
 
@@ -540,7 +557,7 @@ the mistake F-034's own review cycle rejected twice.
 
 **Title:** The CONNECT deadline refuses only after its timer has fired
 
-- Status: Open
+- Status: Closed 2026-10-26
 - Classification: Confirmed gap in the broker's own contract (`-connect-timeout`); not
   an MQTT violation
 - Release treatment: Pre-alpha, `docs/ROADMAP.md` §0.5. The ID was allocated
@@ -586,6 +603,16 @@ callback before it acquires `c.mu`, or replace the timer or clock.
 
 Raising a fixture's sleep is not a fix: it makes the symptom rarer and leaves the bound
 unenforced.
+
+### Resolution
+
+Closed 2026-10-26 (`docs/ROADMAP.md` §0.5). `armConnectDeadline` records the armed instant
+(`connectDeadline`), and `mqttAdmitConnectLocked` refuses a pending connection once it has
+passed, making the expiry transition itself so the late callback finds it expired and
+closes nothing; the refusing CONNECT path closes the socket. The witness parks the callback
+before it takes `c.mu`, through a server-scoped seam installed before the dial
+(`TestMQTTConnectRefusedOnceTheWindowElapsedBeforeTheCallbackRan`, with an inside-window
+control), and fails when the clock comparison is removed.
 
 ## F-079
 

@@ -413,7 +413,20 @@ func (c *client) mqttParse(buf []byte) error {
 			if trace && cp != nil {
 				c.traceInOp("CONNECT", errOrTrace(err, c.mqttConnectTrace(cp)))
 			}
-			if rc != 0 {
+			// A CONNECT the parser refuses still lost to the CONNECT deadline if it
+			// arrived after the window, and is then owed no refusal CONNACK either:
+			// the deadline is arbitrated before ANY response (F-074). The accepted
+			// path arbitrates in mqttProcessConnect, which also admits.
+			late := false
+			if rc != 0 || err != nil {
+				c.mu.Lock()
+				late = c.mqttConnectExpiredLocked()
+				c.mu.Unlock()
+			}
+			if late {
+				c.closeTransport()
+				err = errMQTTConnectDeadlineExpired
+			} else if rc != 0 {
 				var rs string
 				if err != nil {
 					rs = err.Error()

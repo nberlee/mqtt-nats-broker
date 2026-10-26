@@ -431,12 +431,12 @@ and a bounded clearance attempt. A listing the server truncates is not complete,
 resume then clears nothing (the tokens stand until a later resume or acquisition meets
 them). A PUBREL slot whose token stands is met again only by the next resume: a stored
 PUBREL's admission refuses a standing token before its acquisition runs, so a mid-session
-PUBREL redelivery does not clear one. At a GRACEFUL shutdown the loss is systematic rather
-than occasional: the connections Phase 1 closes write their certificates on goroutines
-shutdown does not join, and Phase 4 stops the JetStream request path under them, so those
-writes usually fail and their tokens stand for the next start's resume, which is the same
-outcome as a crash. Joining those writes before Phase 4 is owed before the alpha
-(`docs/ROADMAP.md` §0.5).
+PUBREL redelivery does not clear one. A GRACEFUL shutdown joins every
+certificate write claimed before the last step of its Phase 3b, so the connections Phase 1
+closes have their certificates written while JetStream still answers rather than failing
+under Phase 4. A certificate first claimed after that join is still attempted, unjoined,
+and is then usually lost as it would be at a crash; the one-attempt rule above is
+otherwise unchanged (a failed write is logged and not retried).
 
 **The discard boundary's settlement can fail; a clean start then refuses, and any other
 discard's release waits for an adopter.** Every discard settles a standing ownership proposal
@@ -1510,13 +1510,17 @@ per-client identity, so no per-client enforcement exists: every client acts as
 the service identity. The mode assumes that credential is trusted and suitably
 privileged.
 
-**Residual 5 - a refused CONNECT is a bare socket close.** Every refusal above
-routes through `authViolation`, which closes the connection and sends no CONNACK.
-So a client refused for a cross-account credential, an unidentifiable identity or
-an expired one learns only that the socket closed, and cannot tell that from a
-network failure. That is [F-061](findings/runtime-correctness.md#f-061), which
-owns that path and is owed before the alpha (`docs/ROADMAP.md` §0.5); it is recorded
-here so the closure above is not read as claiming more than it delivers.
+**Not a residual since F-061: a refused CONNECT is told which refusal it was.** Every
+refusal above writes a CONNACK before the close, at both protocol versions: 0x05 / 0x86
+for a credential the server refused, 0x05 / 0x87 for an identity the broker will not admit
+(or a refused default credential when the client sent no user name), and 0x03 / 0x88 when
+admission could not be completed (`docs/ARCHITECTURE.md`, "A refused CONNECT is told which
+refusal it was"). This discloses the failure stage to a peer that has not authenticated,
+which 5.0's non-normative text advises against and both versions permit; it is chosen. Two
+limits remain. A per-client connection that dropped during discovery may close the socket
+before the CONNACK is written, and the client then sees a bare close. And a client denied
+publish on `$SYS.REQ.USER.INFO` gets no answer to its identity request, so a deployment that
+denies it is refused as server-unavailable, not as not-authorized.
 
 **Residual 6 - a denied QoS 2 PUBLISH costs one JetStream read.** MQTT transfers
 ownership of a message at PUBREC, so a later PUBLISH on the same packet
@@ -6298,36 +6302,25 @@ restarted per byte received, and the bound is fail-closed — a value of `0` or
 below is refused at startup rather than read as "unlimited". See
 `docs/ARCHITECTURE.md`, "Connection liveness bounds".
 
-**If the expiry callback transitions the state before admission**, the racing CONNECT is
-refused before any authentication is attempted, so a connection the deadline closed never
-dials a per-client NATS connection and never binds session state. That conditional is
-load-bearing: the other order is reachable and is described below. CONNECT authentication
-itself is unchanged either way: credentials are still adjudicated by the configured client
-dialer.
+**A CONNECT arriving after the window is refused before any authentication is attempted**,
+whether the expiry callback already ran or is late: admission compares the recorded
+deadline itself (F-074). So a connection the deadline condemned never dials a per-client
+NATS connection, never binds session state and gets no CONNACK, not even the refusal
+CONNACK the parser would send a malformed or unsupported CONNECT. CONNECT authentication
+itself is unchanged: credentials are still adjudicated by the configured client dialer.
 
-**What "closed after `-connect-timeout`" does and does not promise, since the two are easy
-to read as one.** The bound makes a silent connection's LIFETIME finite: the timer callback
-closes the socket whenever it is scheduled, so no such connection is held indefinitely, and
-that is the resource guarantee. It does **not** guarantee that a CONNECT arriving after the
-configured window is refused. The arbitration is a race between two facts under `c.mu` —
-the CONNECT arrived, or the deadline expired — and admission tests only whether the callback
-has ALREADY transitioned the state, never whether the window has elapsed. So a CONNECT that
-takes the mutex before a delayed callback does is admitted and served, and the effective
-admissibility bound is the configured value plus however late that callback is scheduled.
+**What "closed after `-connect-timeout`" promises, both halves.** The bound makes a silent
+connection's LIFETIME finite: the timer callback closes the socket whenever it is scheduled,
+so no such connection is held indefinitely, and that is the resource guarantee. And a
+CONNECT arriving after the configured window is refused, measured at admission (after the
+CONNECT was parsed) against the instant the deadline was armed for, not against whether the
+callback has run. Until F-074 only the first half held: admission tested the callback's
+state alone, so a late callback let a late CONNECT through. Nor is the timeout a strict
+pre-authentication admission bound, which is the reading to guard against: once admitted,
+authentication runs on its own bound.
 
-**This is a known gap and it is NOT accepted**: an operator setting `-connect-timeout`
-reasonably expects the second promise as well as the first, and the fix is for admission to
-consult the elapsed window rather than the callback's state. Nor is the timeout a strict
-pre-authentication admission bound, which is the reading to guard against.
-
-On [3.1.4]: it is a SHOULD, and the timer generally implements it — a connection that
-stays silent is closed. **What is not claimed is that the late-admission case honours
-the configured window**: there the callback finds the CONNECT already admitted, does
-nothing, and the connection proceeds under the keep-alive rules instead — which are
-themselves no bound at all when the client negotiates Keep Alive 0, as the next residual
-states. So nothing closed it for exceeding the window. The fix is
-[F-074](findings/runtime-correctness.md#f-074), owed before the alpha (`docs/ROADMAP.md`
-§0.5).
+On [3.1.4]: it is a SHOULD, and the timer implements it — a connection that stays silent is
+closed, and one whose CONNECT arrives too late is refused and closed.
 
 **The residual is on the other side of CONNECT**, and it is pre-existing rather
 than introduced here: a client that completes CONNECT with **Keep Alive 0** is
@@ -6425,8 +6418,10 @@ bound):
   auth-passthrough dial is what the server refuses. The broker's CONNECT deadline has
   already stopped by then (it bounds the wait for a CONNECT, not its authentication), so
   for those seconds the attempt holds a goroutine, the pipe pair and a connection slot
-  counted against `-max-conns`. It is still refused, as a bare close, the same as over
-  TCP (Residual 5 under "Authorization of the authenticated identity").
+  counted against `-max-conns`. It is still refused, but with the server-unavailable
+  CONNACK (0x03 / 0x88) rather than the bad-credential one: nats.go reports a closed pipe,
+  not the refusal, and the broker reports what the dependency told it ("Authorization of
+  the authenticated identity").
 - **A wrong service credential fails startup about 10 s late,** with the pipe error
   rather than "Authorization Violation", before the JetStream wait (whose cancellation
   does not interrupt the handshake).

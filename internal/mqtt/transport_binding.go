@@ -187,20 +187,31 @@ func completeCertification(b *mqttConnBinding, reason string) *mqttCloseCert {
 		close(b.established)
 	}
 	cert := b.cert
-	ctx := b.claimPersistLocked()
+	ctx, joined := b.claimPersistLocked()
 	b.mu.Unlock()
-	mqttPersistCloseCert(ctx, b.run, b.conn)
+	if ctx != nil {
+		if h := mqttTestCertClaimedV.Load(); h != nil {
+			(*h)(b)
+		}
+	}
+	mqttPersistCloseCert(ctx, joined, b.run, b.conn)
 	return cert
 }
 
 // claimPersistLocked returns the persistence context exactly once, and only once both the
 // certificate and the context stand. b.mu held.
-func (b *mqttConnBinding) claimPersistLocked() *mqttCertPersistCtx {
+//
+// The shutdown join's token is taken HERE, in the same critical section that marks the
+// attempt launched, and not where its goroutine starts: a certifier that claimed the attempt
+// and paused before launching it would otherwise hold a write no join can see, and every
+// other certifier finds the attempt already claimed. joined reports whether the token was
+// taken; it is not once the join has closed, and the attempt then runs unjoined.
+func (b *mqttConnBinding) claimPersistLocked() (ctx *mqttCertPersistCtx, joined bool) {
 	if b.cert == nil || b.persist == nil || b.persistLaunched {
-		return nil
+		return nil, false
 	}
 	b.persistLaunched = true
-	return b.persist
+	return b.persist, b.persist.srv.admitCloseCertWrite()
 }
 
 // registerAcquisition records, BEFORE an acquisition's batch is sent, where this connection's
@@ -225,9 +236,9 @@ func (b *mqttConnBinding) registerAcquisition(ctx *mqttCertPersistCtx) error {
 	if b.persist == nil {
 		b.persist = ctx
 	}
-	launch := b.claimPersistLocked()
+	launch, joined := b.claimPersistLocked()
 	b.mu.Unlock()
-	mqttPersistCloseCert(launch, b.run, b.conn)
+	mqttPersistCloseCert(launch, joined, b.run, b.conn)
 	return nil
 }
 

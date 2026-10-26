@@ -186,6 +186,8 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 //	  timers and claim loops) so no publisher worker Add can race Phase 3's Wait.
 //	Phase 3 waits for active publisher workers (willWorkerWG) to complete; each
 //	  publish is bounded by the JSA request timeout, well under the claim lease.
+//	Phase 3b closes the PUBLISH send barrier, makes the last attempts at owed work, and
+//	  joins the closure-certificate writes, all while JetStream still answers.
 //	Phase 4 finally stops the JSA/account infrastructure (quitCh) and the
 //	  remaining background goroutines (grWG).
 //	Phase 5 hands the caller's service connection back: the account managers'
@@ -264,6 +266,10 @@ func (s *Server) runShutdown() {
 	// drains are what clear them.
 	s.finishOwedTerminals()
 	s.finishOwedRetainedCleanups()
+	// Every closure certificate claimed so far is written before Phase 4 stops the request
+	// path under it; otherwise the tokens of a connection Phase 1 closed stand for the next
+	// start's resume exactly as after a crash. Last in 3b, so nothing above launches behind it.
+	s.joinCloseCertWrites()
 
 	// Anything still held for a service account that never came back. Reported
 	// rather than published: the destination is still unestablished, and the whole
@@ -367,6 +373,46 @@ func (s *Server) closePublishSendBarrier() {
 	s.publishSendClosed = true
 	s.publishSendMu.Unlock()
 	s.publishSendWG.Wait()
+}
+
+// admitCloseCertWrite takes the shutdown join's token for one closure-certificate write. It
+// returns false once joinCloseCertWrites has closed the gate; that write then runs unjoined,
+// which is the one-attempt residual docs/CONFORMANCE.md states, narrowed to a certificate
+// first claimed after Phase 3b. A nil server (unit fixtures) has nothing to join.
+func (s *Server) admitCloseCertWrite() bool {
+	if s == nil {
+		return false
+	}
+	s.closeCertMu.Lock()
+	defer s.closeCertMu.Unlock()
+	if s.closeCertClosed {
+		return false
+	}
+	s.closeCertWG.Add(1)
+	s.closeCertInFlight++
+	return true
+}
+
+// closeCertWriteDone releases a token admitCloseCertWrite returned.
+func (s *Server) closeCertWriteDone() {
+	s.closeCertMu.Lock()
+	s.closeCertInFlight--
+	s.closeCertMu.Unlock()
+	s.closeCertWG.Done()
+}
+
+// joinCloseCertWrites closes the gate and returns once every admitted certificate write has
+// ended. Called in Phase 3b, while JetStream requests still work, so the certificates of the
+// connections Phase 1 closed are written rather than failing under Phase 4. Each write is one
+// store and at most one read-back, each bounded by the request timeout.
+func (s *Server) joinCloseCertWrites() {
+	s.closeCertMu.Lock()
+	s.closeCertClosed = true
+	s.closeCertMu.Unlock()
+	if h := mqttTestShutdownCertJoinV.Load(); h != nil {
+		(*h)(s)
+	}
+	s.closeCertWG.Wait()
 }
 
 // noteOwedDrain records a drain that did not resolve, so shutdown can make one last

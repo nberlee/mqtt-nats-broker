@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -449,6 +450,52 @@ func TestMQTTConnectAdmissionArbitration(t *testing.T) {
 		}
 	})
 
+	// The clock arms (F-074). A deadline that was never armed has nothing to compare, so a
+	// bare fixture is admitted; a recorded deadline already passed refuses even though no
+	// callback ran, and makes the expiry transition itself; one still ahead admits.
+	t.Run("never armed is admitted", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newPipedClient(t)
+		c.mu.Lock()
+		admitted := c.mqttAdmitConnectLocked()
+		c.mu.Unlock()
+		if !admitted {
+			t.Fatal("a connection whose deadline was never armed was refused: a zero deadline is not a passed one")
+		}
+	})
+
+	t.Run("window elapsed by the clock, callback not run", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newPipedClient(t)
+		c.mu.Lock()
+		c.connectDeadline = time.Now().Add(-time.Millisecond)
+		admitted := c.mqttAdmitConnectLocked()
+		adm := c.connectAdmission
+		expiredAgain := c.mqttExpireConnectLocked()
+		c.mu.Unlock()
+		if admitted {
+			t.Fatal("a CONNECT was admitted after the window had elapsed, because the callback had not run")
+		}
+		if adm != mqttConnectExpired {
+			t.Fatalf("a clock refusal must make the expiry transition itself, got admission %d", adm)
+		}
+		if expiredAgain {
+			t.Fatal("the late callback would expire the connection a second time")
+		}
+	})
+
+	t.Run("window still open by the clock", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newPipedClient(t)
+		c.mu.Lock()
+		c.connectDeadline = time.Now().Add(time.Hour)
+		admitted := c.mqttAdmitConnectLocked()
+		c.mu.Unlock()
+		if !admitted {
+			t.Fatal("a CONNECT inside the window was refused")
+		}
+	})
+
 	t.Run("CONNECT first, then deadline", func(t *testing.T) {
 		t.Parallel()
 		c, peer := newPipedClient(t)
@@ -462,6 +509,180 @@ func TestMQTTConnectAdmissionArbitration(t *testing.T) {
 		if pipeClosed(peer) {
 			t.Fatal("a late deadline callback closed a connection whose CONNECT had been admitted")
 		}
+	})
+}
+
+// testConnectPacketWithCredentials is testConnectPacket with a user name and password:
+// the CONNECT a client under auth passthrough sends.
+func testConnectPacketWithCredentials(clientID, user, pass string) []byte {
+	body := newMQTTWriter(0)
+	body.WriteBytes(mqttProtoName)
+	body.WriteByte(mqttProtoLevel)
+	body.WriteByte(mqttConnFlagCleanSession | mqttConnFlagUsernameFlag | mqttConnFlagPasswordFlag)
+	body.WriteUint16(30)
+	body.WriteString(clientID)
+	body.WriteString(user)
+	body.WriteBytes([]byte(pass))
+
+	pkt := newMQTTWriter(0)
+	pkt.WriteByte(mqttPacketConnect)
+	pkt.WriteVarInt(body.Len())
+	pkt.Write(body.Bytes())
+	return pkt.Bytes()
+}
+
+// parkDeadlineCallbacks installs a hook on s that parks every CONNECT deadline callback
+// BEFORE it takes c.mu, which is how a late callback looks to the CONNECT path. Installed
+// before the test dials, so no timer can fire ahead of it. entered receives each parked
+// client; closing the returned release lets them all go, and the cleanup closes it too, so
+// no callback outlives the test.
+func parkDeadlineCallbacks(t *testing.T, s *Server) (entered <-chan *client, release func()) {
+	t.Helper()
+	ch := make(chan *client, 4)
+	gate := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+	hook := func(c *client) {
+		ch <- c
+		<-gate
+	}
+	s.testConnectDeadlineBeforeLock.Store(&hook)
+	t.Cleanup(func() { s.testConnectDeadlineBeforeLock.Store(nil) })
+	return ch, release
+}
+
+// expectClosedWithoutBytes requires the broker to close c without sending anything: EOF
+// or a reset, never a read timeout, and never a byte first (a CONNACK would be one).
+func expectClosedWithoutBytes(t testing.TB, c net.Conn, what string) {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var buf [16]byte
+	n, err := c.Read(buf[:])
+	if n > 0 {
+		t.Fatalf("%s: the broker sent % x before closing; nothing was owed", what, buf[:n])
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatalf("%s: the connection is still open", what)
+	}
+	if err == nil {
+		t.Fatalf("%s: empty read without an error", what)
+	}
+}
+
+// awaitNoClients waits until s has no registered connection: the ordered teardown ran.
+func awaitNoClients(t testing.TB, s *Server) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		n := len(s.clients)
+		s.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connection(s) still registered: the refused connection was not torn down", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestMQTTConnectRefusedOnceTheWindowElapsedBeforeTheCallbackRan is F-074's witness: the
+// deadline's callback is LATE -- parked before it takes c.mu, so the CONNECT path cannot
+// know -- and a CONNECT arriving after the window must still be refused. Before the fix
+// admission only asked whether the callback had already run, so this CONNECT was served.
+//
+// The refused connection gets no CONNACK (it lost to the deadline before authenticating),
+// dials no per-client NATS connection, is closed, and is torn down. The control, on a
+// second broker with a 5 s window, parks its callback the same way, fired early by
+// Timer.Reset so the recorded deadline is still ahead: that CONNECT is admitted and the
+// connection keeps working after the callback is released.
+func TestMQTTConnectRefusedOnceTheWindowElapsedBeforeTheCallbackRan(t *testing.T) {
+	t.Parallel()
+
+	// Every CONNECT after the window is owed nothing, including the ones the parser itself
+	// would refuse with a CONNACK: an unsupported protocol level (3.1.1 return code 0x01)
+	// and a malformed 5.0 CONNECT (reserved flag set, which 5.0 answers with a reason code).
+	badLevel := testConnectPacket("late-level", 30)
+	badLevel[2+2+len(mqttProtoName)] = 9 // fixed header (2), name length (2), name, level
+	malformedV5 := testConnectPacketV5WithCredentials("late-v5", "alice", "pw")
+	malformedV5[2+2+len(mqttProtoName)+1] |= 0x01 // the reserved CONNECT flag
+	for _, late := range []struct {
+		name   string
+		packet []byte
+	}{
+		{"a valid CONNECT", testConnectPacketWithCredentials("late", "alice", "pw")},
+		{"a CONNECT the parser refuses with a return code", badLevel},
+		{"a malformed 5.0 CONNECT", malformedV5},
+	} {
+		t.Run("after the window: "+late.name, func(t *testing.T) {
+			t.Parallel()
+			var dials atomic.Int64
+			s, addr := startAuthBrokerTuned(t, func(o *Options) { o.MQTT.AuthTimeout = 0.1 }, &dials)
+			entered, release := parkDeadlineCallbacks(t, s)
+
+			conn := dialSilent(t, addr)
+			var parked *client
+			select {
+			case parked = <-entered:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the deadline callback never fired")
+			}
+			parked.mu.Lock()
+			deadline := parked.connectDeadline
+			parked.mu.Unlock()
+			if deadline.IsZero() {
+				t.Fatal("the armed deadline was not recorded")
+			}
+			if wait := time.Until(deadline); wait > 0 {
+				time.Sleep(wait)
+			}
+			time.Sleep(10 * time.Millisecond)
+
+			if _, err := conn.Write(late.packet); err != nil {
+				t.Fatalf("writing CONNECT: %v", err)
+			}
+			expectClosedWithoutBytes(t, conn, "a CONNECT after the window, with the callback late")
+			awaitNoClients(t, s)
+			parked.mu.Lock()
+			adm := parked.connectAdmission
+			parked.mu.Unlock()
+			if adm != mqttConnectExpired {
+				t.Fatalf("admission state %d, want expired", adm)
+			}
+			if n := dials.Load(); n != 0 {
+				t.Fatalf("the late CONNECT dialed %d per-client NATS connection(s); it must be refused first", n)
+			}
+			release()
+		})
+	}
+
+	t.Run("inside the window, callback parked (control)", func(t *testing.T) {
+		t.Parallel()
+		s, addr := startAuthBrokerTuned(t, func(o *Options) { o.MQTT.AuthTimeout = 5 }, nil)
+		entered, release := parkDeadlineCallbacks(t, s)
+
+		conn := dialSilent(t, addr)
+		hc := awaitClients(t, s, 1)[0]
+		hc.mu.Lock()
+		hc.connectTimer.Reset(time.Millisecond)
+		hc.mu.Unlock()
+		select {
+		case <-entered:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the deadline callback never reached the hook")
+		}
+		if _, err := conn.Write(testConnectPacketWithCredentials("early", "alice", "pw")); err != nil {
+			t.Fatalf("writing CONNECT: %v", err)
+		}
+		expectConnAckAccepted(t, conn)
+		release()
+		if _, err := conn.Write(testPublishQoS1Packet("control/topic", 1, "x")); err != nil {
+			t.Fatalf("writing PUBLISH: %v", err)
+		}
+		expectPacket(t, conn, mqttPacketPubAck)
 	})
 }
 

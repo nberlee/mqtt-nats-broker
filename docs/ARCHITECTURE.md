@@ -13255,6 +13255,20 @@ no certifier waits a store round trip or takes a lock to state a fact it already
 established (the torn writer certifies under the delivery's lock). One attempt, no loop; a
 failure is logged and leaves the in-process certificate valid.
 
+**A graceful shutdown joins those writes.** Phase 1 certifies every connection it closes,
+and each certificate is written on its own goroutine; Phase 4 then stops the JetStream
+request path, under which a write still running failed and left its tokens standing for
+the next start's resume, the outcome of a crash. Every write is therefore admitted to a
+join (`admitCloseCertWrite`, the `admitPublishSend` shape: a mutex, a closed flag and a
+WaitGroup, so no `Add` races the `Wait`), and `joinCloseCertWrites` is the last step of
+Phase 3b. The token is taken where the attempt is CLAIMED (`claimPersistLocked`, in the
+same `b.mu` section that marks it launched), not where its goroutine starts: a certifier
+paused between the two — a torn writer, say — would otherwise hold a write no join could
+see, while every other certifier finds the attempt already claimed. `closeCertMu` is a
+leaf lock, released before the wait. Each write is one store and at most one read-back,
+each bounded by the request timeout. A certificate first claimed after the join closed is
+still attempted, unjoined: today's one-attempt residual, narrowed to that window.
+
 **The clearance, and its licence.** `clearCertifiedActionToken` ends one register's token
 when, and only when, all of these are proven from durable state: the register is ordinary
 (a slot-only register has no action record) and carries a token; the action record at the
@@ -14140,7 +14154,7 @@ members the core reaches; this is what each stands for.
   `mqttWriteDeadline`, and `writeLoop` is a no-op (see "Every MQTT application write is deadline-bounded").
 - **`Server`** (`shim_engine.go`, `shim_public.go`): the listener and accept loop, the
   client registry, shutdown and drain, the per-client dialer behind
-  `isClientAuthorized`, and the node name used for JS API reply routing. `NewServer`,
+  `authorizeClient`, and the node name used for JS API reply routing. `NewServer`,
   `Start`, `Addr` and `Shutdown` are the public surface the command uses.
 - **`Account`, `subscription`, `ipQueue`** (`shim_small.go`): a named single account
   with no subject mappings, a thin wrapper of a `*nats.Subscription` carrying the MQTT
@@ -14195,7 +14209,7 @@ and a subscribe deny stopped at SUBSCRIBE admission.
 The request is made twice: once on the service connection at startup, **before
 the MQTT listener opens**, to learn the account the broker's own streams live
 in; and once per CONNECT on the client's connection, inside
-`isClientAuthorized`, before the CONNECT is accepted.
+`authorizeClient`, before the CONNECT is accepted.
 
 ### The identity snapshot
 
@@ -14220,15 +14234,49 @@ A permissions object that is **absent entirely** is the shape a server with no
 ACLs configured emits, and it means unrestricted. That is the default
 deployment, so reading it the other way would refuse every publish everywhere.
 
+### A refused CONNECT is told which refusal it was
+
+MQTT 3.1.1 [3.1.4] says a Server whose authentication or authorization check fails
+SHOULD send a CONNACK with a non-zero return code before it MUST close; 5.0 [3.1.4]
+says it MAY send one with a reason code of 0x80 or greater. The broker sends it at both
+versions (F-061; the 5.0 non-normative suggestion to stay silent was weighed and not
+taken, consistent with every other refusal CONNACK this broker writes). Each refusal
+branch of `authorizeClient` returns its own `mqttConnectRefusal`, carrying both codes,
+because the versions do not map one to one: a credential the server does not accept is
+0x86 in 5.0, while 3.1.1's 0x04 is defined as MALFORMED credentials, so a well-formed
+wrong password is 0x05 there.
+
+| Refusal | 3.1.1 | 5.0 |
+|---|---|---|
+| the dial was refused with `nats.ErrAuthorization`, `ErrAuthExpired` or `ErrAuthRevoked`, and the client sent a user name | 0x05 | 0x86 |
+| the same with no user name: the credential refused is the deployment's default, not the client's | 0x05 | 0x87 |
+| the identity answer is one the broker refuses: another account, no identity, user or account, a malformed permissions object or filter, an elapsed lifetime, an error reply, an undecodable body | 0x05 | 0x87 |
+| admission could not be completed: the service account is not established, the per-client connection is down before or during discovery, the identity request went unanswered (`errMQTTIdentityUnavailable`), or the dial failed for any other reason | 0x03 | 0x88 |
+
+The Reason Strings are fixed and generic; the identity's user and account go to the log,
+never to a peer that has not authenticated. The CONNACK goes through the CONNECT's own
+`sendConnAck`, whose verdict and trace both require the write to have succeeded, and the
+connection is then closed. A CONNECT that lost to the CONNECT deadline is refused before
+`authorizeClient` and stays silent: it never authenticated.
+
+**The refused connection's handlers are disarmed before it is closed.** The handlers
+below exist to tear the MQTT connection down when an ADOPTED per-client connection goes
+away. A refusal never adopts its connection, and closing it with them armed fired the
+closed handler, which closed the MQTT socket asynchronously under the refusal CONNACK.
+nats.go reads both handlers under the connection's lock when it closes, so clearing them
+first means the close dispatches neither. A handler that had already fired (the
+connection dropped during discovery) can still close the socket first; the CONNACK
+write then fails and is reported as not written.
+
 ### The snapshot's validity is the connection's validity
 
 A per-client connection reconnects indefinitely and re-authenticates each time,
 potentially under changed permissions, so a snapshot outliving its connection
 would authorize service-owned stores on behalf of an identity that no longer
 holds. The broker therefore installs a disconnect and a closed handler on the
-connection it dialled, and either firing **closes that MQTT connection's
-socket** - `c.rawConn.Close()` only, leaving the ordered teardown to `readLoop`,
-exactly as the CONNECT deadline does.
+connection it dialled (removed again before closing a connection it refuses, above),
+and either firing **closes that MQTT connection's socket** - `c.rawConn.Close()` only,
+leaving the ordered teardown to `readLoop`, exactly as the CONNECT deadline does.
 
 The cost is that an MQTT connection does not survive a transient NATS outage.
 That is the fail-closed direction, and it is more truthful than what preceded
@@ -15097,13 +15145,15 @@ and a writeLoop goroutine for as long as the peer kept the TCP connection open.
 MQTT 3.1.1 / 5.0 [3.1.4] says the Server SHOULD close a Network Connection that
 does not deliver a CONNECT in reasonable time.
 
-**Two promises, and only the first is enforced.** The bound makes a silent connection's
-LIFETIME finite — the callback closes the socket whenever it runs, which is the resource
-argument. It does NOT enforce refusal of a CONNECT that arrives after the window: admission
-tests whether the callback has already transitioned the state, never whether the window has
-elapsed, so the effective admissibility bound is the configured value plus the callback's
-scheduling delay. `docs/CONFORMANCE.md` states that gap and marks it not accepted; the
-paragraphs below describe the mechanism as built.
+**Two promises, both enforced.** The bound makes a silent connection's LIFETIME finite —
+the callback closes the socket whenever it runs, which is the resource argument. And it
+bounds ADMISSION: `armConnectDeadline` records the instant it arms the timer for
+(`connectDeadline`, on the same monotonic clock), and admission compares it, so a CONNECT
+that arrives after the window is refused even when the callback is late or has not run
+(F-074). Before that, admission only tested whether the callback had already transitioned
+the state, and the effective admissibility bound was the configured value plus the
+callback's scheduling delay. The compared instant is admission time, after the CONNECT was
+parsed.
 
 **Unconditional and fail-closed.** It is armed for every accepted connection,
 not only when an authentication mechanism is configured: the resources a silent
@@ -15116,14 +15166,23 @@ connection immediately. `-connect-timeout` is the operator surface; `Validate`
 refuses `<= 0`, so "disabled" is not expressible.
 
 **The arbitration is a state under `c.mu`, not `Timer.Stop()`.** Exactly one of
-two racing facts wins for a connection: the CONNECT arrived
+two racing facts wins for a connection: the CONNECT arrived inside the window
 (`mqttAdmitConnectLocked`), or the deadline expired (`mqttExpireConnectLocked`).
 `Stop` reports that the timer had already fired; it cannot order itself against a
-callback that is about to decide, so it is not an arbitration. The loser does
-nothing: a late callback that finds the CONNECT admitted leaves the socket alone,
-and a CONNECT that finds the deadline expired is refused with
-`errMQTTConnectDeadlineExpired` **before** `isClientAuthorized` — so a connection
-that lost dials no per-client NATS connection and binds no session state.
+callback that is about to decide, so it is not an arbitration. The deadline wins
+either way it can: its callback already ran, or admission finds the recorded window
+elapsed and makes the expiry transition itself — so one transition still happens, and
+the late callback finds the connection expired and closes nothing. A connection whose
+deadline was never armed has nothing to compare. The loser does nothing: a late
+callback that finds the CONNECT admitted leaves the socket alone, and a CONNECT that
+finds the deadline expired is refused with `errMQTTConnectDeadlineExpired` **before**
+`authorizeClient` — so a connection that lost dials no per-client NATS connection,
+binds no session state and gets no CONNACK. That refusal closes the socket itself
+(`closeTransport`, a second harmless close when the callback won), since after a clock
+refusal no callback will. A CONNECT the parser itself refuses (an unsupported protocol
+level, a rejected client identifier, a malformed 5.0 CONNECT) is arbitrated the same way
+before its refusal CONNACK, through `mqttConnectExpiredLocked`, which expires by the clock
+but admits nothing: after the window no CONNECT is answered at all.
 
 **The callback closes `c.rawConn` only**, never `closeConnection`. The ordered
 teardown belongs to `readLoop`'s `disconnect()`, which runs
@@ -15339,8 +15398,9 @@ removals as the same `delete:cpending` sinks the builtin was.
 
 **Shutdown hands the service connection back (Phase 5).** The phases are: Phase 1 drains
 clients while JetStream answers; Phase 2 closes Will dispatch; Phase 3 waits for publisher
-workers; Phase 3b closes the PUBLISH send barrier and makes the last attempts at owed drains,
-actions, intents, disposals, terminals and retained cleanups; Phase 4 closes `quitCh` and
+workers; Phase 3b closes the PUBLISH send barrier, makes the last attempts at owed drains,
+actions, intents, disposals, terminals and retained cleanups, and joins the closure-certificate
+writes; Phase 4 closes `quitCh` and
 waits for the background goroutines. Phase 5 then unsubscribes every subscription the account
 managers' internal clients hold on the service connection (JSA replies, retained observer,
 session-record watch) and restores the disconnect and reconnect handlers the service
@@ -15714,7 +15774,9 @@ wrong password, an account connection limit) is not refused promptly: nats.go's
 handshake write deadline is replaced by its 1-minute `FlusherTimeout` and nats-server
 writes its `-ERR` on the unbuffered pipe, so both sides block until nats-server's write
 deadline (10 s by default) closes it, and the client reports `io: read/write on closed
-pipe` instead of the server's error. Recorded in `docs/known-upstream-issues.md`
+pipe` instead of the server's error. So a wrong MQTT credential in embedded mode is
+answered, about 10 s late, with the server-unavailable CONNACK (0x03 / 0x88) rather than
+the bad-credential one: the broker reports what the dependency told it. Recorded in `docs/known-upstream-issues.md`
 (INPROCESS-REFUSAL) and stated in `docs/CONFORMANCE.md`; the broker does not work around
 it.
 

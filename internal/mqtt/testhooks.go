@@ -266,6 +266,12 @@ var (
 	// (F-105 8c), before the write; returning false suppresses the write. Process-wide because
 	// the persister runs in its own goroutine with no account in reach.
 	mqttTestCloseCertPersistV atomic.Pointer[func(cert *mqttDurableCloseCert) bool]
+	// mqttTestCertClaimedV runs in completeCertification after a persistence attempt was
+	// claimed and before it is launched, so a test can park a certifier in that gap.
+	mqttTestCertClaimedV atomic.Pointer[func(*mqttConnBinding)]
+	// mqttTestShutdownCertJoinV runs in joinCloseCertWrites after the gate is closed and
+	// before the wait, so a test can see that shutdown reached the join.
+	mqttTestShutdownCertJoinV atomic.Pointer[func(*Server)]
 )
 
 // mqttTestExpiryNowV, when set, is the clock mqttForwardExpiry reads instead of time.Now.

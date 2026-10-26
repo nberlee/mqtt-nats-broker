@@ -122,7 +122,7 @@ func TestMQTTAuthRejectionIsNotTheConnectDeadline(t *testing.T) {
 
 // TestMQTTExpiredConnectDialsNoNATSConnection pins the ORDERING the refusal
 // depends on: a CONNECT that lost the race to the deadline is refused before
-// isClientAuthorized, so it dials no per-client NATS connection, looks up no
+// authorizeClient, so it dials no per-client NATS connection, looks up no
 // account session manager and binds no session state -- there is nothing to
 // unwind.
 //
@@ -131,7 +131,7 @@ func TestMQTTAuthRejectionIsNotTheConnectDeadline(t *testing.T) {
 // exited, so the CONNECT never reaches mqttProcessConnect at all and "no dial"
 // would hold just as well against a refusal placed after the dial.
 //
-// The credentials are valid on purpose: a refusal moved after isClientAuthorized
+// The credentials are valid on purpose: a refusal moved after authorizeClient
 // would dial successfully and move the counter. Invalid credentials would fail the
 // dial for an unrelated reason and would not distinguish the two placements. c.acc
 // is wired for the same reason -- past the dial, execution reaches
@@ -162,7 +162,7 @@ func TestMQTTExpiredConnectDialsNoNATSConnection(t *testing.T) {
 		t.Fatalf("expected %v, got %v", errMQTTConnectDeadlineExpired, err)
 	}
 	if n := dials.Load(); n != 0 {
-		t.Fatalf("a CONNECT that lost the race to the deadline dialed %d per-client NATS connection(s); the refusal must precede isClientAuthorized", n)
+		t.Fatalf("a CONNECT that lost the race to the deadline dialed %d per-client NATS connection(s); the refusal must precede authorizeClient", n)
 	}
 }
 

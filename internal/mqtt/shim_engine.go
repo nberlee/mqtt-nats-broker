@@ -47,7 +47,7 @@ func (rf readCacheFlag) isSet(c readCacheFlag) bool { return rf&c != 0 }
 // ---------------------------------------------------------------------------
 // Permissions. Delivery and persistence ride the full-rights SERVICE connection,
 // so NATS cannot police them and the broker does it here, from the identity
-// snapshot isClientAuthorized takes at CONNECT (authz_identity.go). NATS still
+// snapshot authorizeClient takes at CONNECT (authz_identity.go). NATS still
 // enforces the client's own connection: SUBSCRIBE admission, and QoS 0 on a user
 // topic. F-079, F-080, F-081.
 // ---------------------------------------------------------------------------
@@ -282,6 +282,23 @@ type Server struct {
 	publishSendMu     sync.Mutex
 	publishSendClosed bool
 	publishSendWG     sync.WaitGroup
+	// closeCert* join the closure-certificate writes (outbound_close_cert.go) the same way.
+	// Phase 1 certifies every connection it closes, and each certificate is persisted on its
+	// own goroutine; joined before Phase 4, so the writes run while JetStream still answers
+	// instead of failing under the closed request path and leaving their tokens standing for
+	// the next start. The token is taken where the attempt is CLAIMED (claimPersistLocked),
+	// not where its goroutine starts, so a certifier paused between the two is still joined.
+	// closeCertInFlight counts the admitted, unfinished writes; closeCertMu is a leaf lock.
+	closeCertMu       sync.Mutex
+	closeCertClosed   bool
+	closeCertInFlight int
+	closeCertWG       sync.WaitGroup
+	// testConnectDeadlineBeforeLock, when set, runs in every one of this server's CONNECT
+	// deadline callbacks BEFORE the callback takes c.mu, so a test can make the callback late
+	// while the CONNECT path knows nothing of it (F-074). Installed before the test dials, so
+	// it is in place before any timer is armed; atomic because it is read outside every lock.
+	// Nil in production.
+	testConnectDeadlineBeforeLock atomic.Pointer[func(*client)]
 	// owedDrains holds PUBLISH-action drains that did NOT resolve, keyed by the exchange
 	// subject and the exact action token, with the captured identity needed to re-attempt
 	// them. It is deliberately independent of the entry maps and of the retry timers: an
@@ -375,7 +392,7 @@ func (s *Server) NodeName() string {
 // config/replicas rather than an embedded server.
 func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas > 1 }
 
-// isClientAuthorized implements auth passthrough: it dials a per-client NATS
+// authorizeClient implements auth passthrough: it dials a per-client NATS
 // connection using the CONNECT credentials, then asks that connection WHO IT IS.
 //
 // The dial alone only proves the credentials authenticated. It says nothing about
@@ -390,10 +407,11 @@ func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas
 // closeConnection, which drains the connection dialled just above, so a refused
 // CONNECT leaks nothing.
 //
-// F-079, F-080, F-081. Note what this does NOT do: the refusal is a bare socket
-// close, because authViolation sends no CONNACK. That is F-061's, owed before the
-// alpha (docs/ROADMAP.md §0.5); nothing here makes it worse or better.
-func (s *Server) isClientAuthorized(c *client) bool {
+// F-079, F-080, F-081. A refusal reports WHICH refusal it is, as the CONNACK the caller
+// writes before the close (F-061): a credential the server refused, an identity the broker
+// will not admit, or an admission that could not be completed (mqttConnectRefusal). Every
+// branch below chooses its own; there is no default.
+func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
 	if s.dialClient == nil {
 		// No per-client identity exists in this mode, so there is nothing to
 		// enforce and nothing to snapshot: the client IS the service credential.
@@ -401,7 +419,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		if c.nrc == nil {
 			c.nrc = s.nrc
 		}
-		return true
+		return mqttConnectRefusal{}, true
 	}
 	// The service account must be known before any client can be compared against
 	// it, and it must be known to be CURRENT -- a service connection that is down
@@ -409,7 +427,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	svcAccount, svcOK := s.serviceAccount()
 	if !svcOK {
 		s.Warnf("MQTT: refusing CONNECT: the service connection's account is not currently established")
-		return false
+		return mqttRefusalServerUnavailable, false
 	}
 	var user, pass string
 	var cid string
@@ -423,7 +441,7 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	nc, err := s.dialClient(cid, user, pass)
 	if err != nil {
 		s.Debugf("MQTT auth passthrough rejected client %q: %v", cid, err)
-		return false
+		return mqttDialRefusal(user, err), false
 	}
 	// Owned by THIS function until it is installed on the client, and closed on
 	// every path that does not install it. Ordinary teardown only drains a
@@ -431,9 +449,21 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	// used to leak one -- and DialClient sets MaxReconnects(-1), so each leaked
 	// connection reconnects forever. An authenticated client that cannot be
 	// identified could accumulate them remotely, one per CONNECT attempt.
+	//
+	// The handlers armed below are DISARMED before that close. They exist to tear the MQTT
+	// connection down when an ADOPTED per-client connection goes away; on a refusal the
+	// connection was never adopted, and its closed handler would close the MQTT socket
+	// asynchronously, racing the refusal CONNACK the caller is about to write. A handler
+	// that already fired (the connection dropped during discovery) still closes it, and the
+	// caller's CONNACK write then reports that it was not written, which is the truth.
 	adopted := false
 	defer func() {
 		if !adopted {
+			nc.SetDisconnectErrHandler(nil)
+			nc.SetClosedHandler(nil)
+			if h := mqttTestRefusalCloseV.Load(); h != nil {
+				(*h)(nc)
+			}
 			nc.Close()
 		}
 	}()
@@ -443,13 +473,16 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	c.armIdentityInvalidation(nc)
 	if !nc.IsConnected() {
 		s.Debugf("MQTT: per-client NATS connection for %q was already down when identity was requested", cid)
-		return false
+		return mqttRefusalServerUnavailable, false
 	}
 
 	id, ierr := mqttFetchIdentity(nc, s.nrc)
 	if ierr != nil {
 		s.Warnf("MQTT: refusing CONNECT for client %q: %v", cid, ierr)
-		return false
+		if errors.Is(ierr, errMQTTIdentityUnavailable) {
+			return mqttRefusalServerUnavailable, false
+		}
+		return mqttRefusalNotAuthorized, false
 	}
 	if id.account != svcAccount {
 		// The v1 same-account constraint docs/ARCHITECTURE.md states. Until now
@@ -458,14 +491,14 @@ func (s *Server) isClientAuthorized(c *client) bool {
 		// streams. F-080.
 		s.Warnf("MQTT: refusing CONNECT for client %q: identity %q is bound to account %q, not the service account %q",
 			cid, id.user, id.account, svcAccount)
-		return false
+		return mqttRefusalNotAuthorized, false
 	}
 	// The window the handler could not cover: a drop between arming and here is
 	// reported by neither setter, so the connection is asked directly. After this
 	// point the handler owns invalidation.
 	if !nc.IsConnected() {
 		s.Debugf("MQTT: per-client NATS connection for %q dropped during identity discovery", cid)
-		return false
+		return mqttRefusalServerUnavailable, false
 	}
 
 	c.mu.Lock()
@@ -477,7 +510,31 @@ func (s *Server) isClientAuthorized(c *client) bool {
 	c.mu.Unlock()
 	adopted = true // the client owns it now, and its teardown drains it
 	c.armIdentityExpiry(id.expires)
-	return true
+	return mqttConnectRefusal{}, true
+}
+
+// mqttDialRefusal classifies a failed per-client dial. Only the server's own answer that
+// the credential is not accepted (nats.go maps the -ERR to these sentinels, and its
+// protocol error matches them under errors.Is) is a credential refusal; every other
+// failure is an admission that could not be completed.
+//
+// A client that sent no user name connects under the configured default credential
+// (backend.DialClient), which is the deployment's and not the client's, so its refusal is
+// reported as not authorized rather than as a bad user name or password.
+//
+// In embedded mode nats.go reports a refused in-process connect as a closed pipe after
+// the server's write deadline instead of the refusal (docs/known-upstream-issues.md,
+// INPROCESS-REFUSAL), so that case lands in server-unavailable. The broker reports what the
+// dependency told it; it does not infer a bad credential from the timing.
+func mqttDialRefusal(user string, err error) mqttConnectRefusal {
+	if errors.Is(err, nats.ErrAuthorization) || errors.Is(err, nats.ErrAuthExpired) ||
+		errors.Is(err, nats.ErrAuthRevoked) {
+		if user == _EMPTY_ {
+			return mqttRefusalNotAuthorized
+		}
+		return mqttRefusalBadCredentials
+	}
+	return mqttRefusalServerUnavailable
 }
 
 // armIdentityInvalidation ties the snapshot's life to the connection's.
@@ -686,7 +743,7 @@ type client struct {
 	in    struct{ flags readCacheFlag }
 	pa    pubArg
 	// perms and mperms are the authenticated identity's compiled publish and
-	// subscribe permissions, written once under c.mu by isClientAuthorized and
+	// subscribe permissions, written once under c.mu by authorizeClient and
 	// read under c.mu by the publication gate and the delivery guards. A nil
 	// value means "no permissions configured", i.e. unrestricted -- see
 	// mqttSubjectPermissions.
@@ -724,6 +781,11 @@ type client struct {
 	// than race-free by the field never being written.
 	connectTimer     *time.Timer
 	connectAdmission mqttConnectAdmission
+	// connectDeadline is the instant the CONNECT deadline was armed for, on the same
+	// monotonic clock as connectTimer. Admission compares it, so a CONNECT arriving after
+	// the window is refused even when the timer's callback has not run yet (F-074). Zero
+	// on a connection whose deadline was never armed. Written and read under c.mu.
+	connectDeadline time.Time
 	// testConnectDeadlinePause, when non-nil, is invoked by THIS connection's
 	// deadline callback with c.mu HELD and before the arbitration, so a test can
 	// park the callback exactly where it contends with closeConnection's timer
@@ -847,7 +909,7 @@ func (c *client) mqttAuthzApplies() bool {
 //
 // The flag alone is not enough, for the same reason it was not enough on the
 // service side: the disconnect callback is asynchronous, so it can fire DURING
-// isClientAuthorized -- clearing the flag and closing the socket -- and the
+// authorizeClient -- clearing the flag and closing the socket -- and the
 // installation that follows would then write `valid = true` back over it,
 // resurrecting a snapshot whose connection is already gone. Consulting the live
 // connection makes that ordering irrelevant: a dead connection is never usable,
@@ -995,7 +1057,7 @@ func (c *client) registerWithAccount(a *Account) { c.mu.Lock(); c.acc = a; c.mu.
 
 // initClient finishes wiring an accepted MQTT client: assigns a unique id and
 // mints its output identity. The NATS routing connection
-// is attached at CONNECT time by isClientAuthorized (auth passthrough dials a
+// is attached at CONNECT time by authorizeClient (auth passthrough dials a
 // per-client connection); the service connection is a pre-CONNECT fallback.
 func (c *client) initClient() {
 	if c.srv != nil {
@@ -1096,7 +1158,6 @@ func (c *client) maxPayloadViolation(sz int, max int32) {
 	c.Warnf("MQTT maximum payload exceeded: %d > %d", sz, max)
 	c.closeConnection(WriteError)
 }
-func (c *client) authViolation() bool { c.closeConnection(WriteError); return true }
 
 // doTLSServerHandshake upgrades the client socket to TLS (nats-server:
 // server.go). It is called from createMQTTClient before the readLoop goroutine

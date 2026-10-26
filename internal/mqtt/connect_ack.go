@@ -18,7 +18,10 @@ package mqtt
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // mqttConnAckReasonFromRC maps a 3.1.1 CONNACK return code to the equivalent
@@ -299,3 +302,58 @@ func mqttConnAckReasonFromConnectErr(err error) byte {
 	}
 	return mqttReasonMalformedPacket
 }
+
+// mqttConnectRefusal is what an authentication or authorization refusal of a CONNECT tells
+// the client before the close (F-061): MQTT 3.1.1 [3.1.4] says the Server SHOULD send a
+// failure CONNACK, 5.0 [3.1.4] that it MAY. Both codes are carried because the two
+// versions do not map one to one: a credential the server does not accept is 0x86 in 5.0
+// ([3.2.2.2]), while 3.1.1's nearest code, 0x04, is defined as MALFORMED credentials, so a
+// well-formed wrong password is 0x05 there. mqttConnAckReasonFromRC cannot express that
+// pairing, and changing its 0x05 mapping would misreport every other authorization refusal.
+//
+// The Reason Strings are fixed and generic: the identity's user and account go to the log,
+// never to a peer that has not authenticated.
+type mqttConnectRefusal struct {
+	rc311     byte
+	reason5   byte
+	reasonStr string
+}
+
+var (
+	// The credential the client supplied was refused by the NATS server.
+	mqttRefusalBadCredentials = mqttConnectRefusal{
+		rc311: mqttConnAckRCNotAuthorized, reason5: mqttReasonBadUserOrPassword,
+		reasonStr: "bad user name or password",
+	}
+	// The broker refuses to admit this client: the default credential a client without a
+	// user name connects under was refused, or the identity the server reported is one the
+	// broker will not act on. Not a claim that the client's credential was wrong.
+	mqttRefusalNotAuthorized = mqttConnectRefusal{
+		rc311: mqttConnAckRCNotAuthorized, reason5: mqttReasonNotAuthorized,
+		reasonStr: "not authorized",
+	}
+	// Admission could not be completed: the service account is not established, the
+	// per-client connection is down, or the identity request went unanswered.
+	mqttRefusalServerUnavailable = mqttConnectRefusal{
+		rc311: mqttConnAckRCServerUnavailable, reason5: mqttReasonServerUnavailable,
+		reasonStr: "server unavailable",
+	}
+)
+
+// code is the CONNACK code for the connection's negotiated protocol version.
+func (r mqttConnectRefusal) code(proto byte) byte {
+	if proto == mqttProtoLevel5 {
+		return r.reason5
+	}
+	return r.rc311
+}
+
+// mqttTestRefusalCloseV runs on authorizeClient's refusal path immediately before the
+// unadopted per-client connection is closed, after its handlers were disarmed, so a test can
+// see that closing it can no longer close the MQTT socket under the refusal CONNACK. Nil in
+// production.
+var mqttTestRefusalCloseV atomic.Pointer[func(*nats.Conn)]
+
+// mqttTestRefusalBeforeConnAckV runs after authorizeClient refused and before the refusal
+// CONNACK is written, so a test can make that write fail. Nil in production.
+var mqttTestRefusalBeforeConnAckV atomic.Pointer[func(*client)]

@@ -2467,10 +2467,11 @@ never licenses changing a test assertion.
   would discover an account change after the effects had already landed in it. Costs, all
   stated in `docs/CONFORMANCE.md`: an MQTT connection no longer survives a transient NATS
   outage, and the refusal is a bare socket close because `authViolation` sends no CONNACK
-  (that is F-061's, untouched here). **The end-to-end cross-account fixture does not
-  prove the comparison** — such a client cannot even be identified, so it is refused by
-  timeout, and a mutation run showed the fixture passing with the comparison deleted;
-  a seam-driven test isolates it.
+  (that is F-061's, untouched here; since closed in §0.5, which writes the refusal
+  CONNACK). **The end-to-end cross-account fixture does not prove the comparison** —
+  such a client cannot even be identified, so it is refused by timeout, and a mutation
+  run showed the fixture passing with the comparison deleted; a seam-driven test
+  isolates it.
 
 - [x] [F-081: A subscribe deny overlapped by a wildcard is not enforced on
   delivery](findings/runtime-correctness.md#f-081). **Alpha blocker — done.** `mperms`
@@ -8018,39 +8019,32 @@ small to close and should not ship in the alpha. One item, because each is a con
 change to a refusal or shutdown path and none needs a new mechanism. It is an alpha
 blocker: the gate's "every unconditional alpha blocker" box covers it.
 
-- [ ] **Close three small stated gaps before alpha: the CONNECT deadline by the clock
+- [x] **Close three small stated gaps before alpha: the CONNECT deadline by the clock
   (F-074), a CONNACK on a refused CONNECT (F-061), and closure certificates at graceful
-  shutdown.**
-  - *[F-074](findings/runtime-correctness.md#f-074): admission refuses a CONNECT only
-    after the deadline timer has fired.* `mqttAdmitConnectLocked`
-    (`connect_deadline.go`) tests whether the `time.AfterFunc` callback has already set
-    `mqttConnectExpired`; nothing on the CONNECT path compares a clock. A callback
-    scheduled late lets a CONNECT that arrives after `-connect-timeout` be admitted and
-    served. `docs/CONFORMANCE.md` states this as a known gap that is **not accepted**.
-    Fix direction: record the deadline when `armConnectDeadline` arms it and refuse in
-    `mqttAdmitConnectLocked` once it has passed, through the existing refusal path. The
-    paired test must make the callback late without the CONNECT path knowing (a hook
-    before the callback takes `c.mu`, or an injectable clock): the existing
-    `testConnectDeadlinePause` runs inside `c.mu`, after the race is decided, so a broken
-    fix would still pass it. Watch the 50 ms window in `TestMQTTAuthTimeout` for new
-    flakiness under load.
-  - *[F-061](findings/runtime-correctness.md#f-061): a refused CONNECT gets no CONNACK.*
-    `authViolation` (`shim_engine.go`) only closes the socket, while
-    `mqttProcessConnect` (`connect_process.go`) traces a CONNACK as sent. MQTT 3.1.1
-    [3.1.4] makes the CONNACK a SHOULD; verify the 5.0 wording and reason codes when
-    planning. The work is the reason code: `isClientAuthorized` returns only a bool, and
-    bad credentials, a cross-account identity and an identity request timeout want
-    different codes. The returned value must report whether the CONNACK was written. A
-    CONNECT that lost the race to the deadline stays silent. Moved here from section 8.
-  - *Closure certificates written during a graceful shutdown are usually lost.*
-    `mqttPersistCloseCert` (`outbound_close_cert.go`) writes each certificate on a
-    goroutine nothing joins, and shutdown's Phase 4 stops the JetStream request path under
-    them, so the connections Phase 1 closes leave their tokens standing for the next
-    start's resume, the same outcome as a crash (`docs/CONFORMANCE.md`, "A durable closure
-    certificate is one attempt"). Fix direction: track those writes and wait for them in
-    Phase 3b of `runShutdown`, which runs while JetStream still answers. The payoff is
-    narrower than the paragraph suggests: shutdown already finishes this process's own
-    owed work, so the certificate matters only for holders whose drain did not finish.
+  shutdown.** Done 2026-10-26; plan reviewed in three Codex rounds, one consult decided the
+  F-061 codes.
+  - *[F-074](findings/runtime-correctness.md#f-074): admission compares the clock.*
+    `armConnectDeadline` records the armed instant, and `mqttAdmitConnectLocked` refuses a
+    pending connection once it has passed, making the expiry transition itself so a late
+    callback closes nothing; the refusing CONNECT closes the socket and stays silent. The
+    witness parks the callback before it takes `c.mu` through a server-scoped seam installed
+    before the dial; `TestMQTTAuthTimeout`'s late case is now decided by the clock.
+  - *[F-061](findings/runtime-correctness.md#f-061): a refused CONNECT is told why.*
+    `authViolation` is deleted; `authorizeClient` returns its refusal with both protocols'
+    codes and the CONNECT writes it before the close: 0x05 / 0x86 refused credential,
+    0x05 / 0x87 refused default credential or identity answer, 0x03 / 0x88 admission not
+    completed. MQTT 5.0 makes the CONNACK a MAY with non-normative text suggesting silence;
+    the consult kept the user's decision to send it. The refused per-client connection's
+    handlers are disarmed before its close, which otherwise closed the socket under the
+    CONNACK. Limits in `docs/CONFORMANCE.md`: a drop during discovery can still close the
+    socket first, a deployment denying `$SYS.REQ.USER.INFO` is answered server-unavailable,
+    and embedded mode answers a wrong credential server-unavailable about 10 s late
+    (INPROCESS-REFUSAL, upstream).
+  - *Closure certificates are joined at graceful shutdown.* Each write takes a join token
+    where its attempt is claimed (`claimPersistLocked`), and `joinCloseCertWrites` is the
+    last step of Phase 3b, so Phase 1's certificates are written while JetStream answers.
+    A certificate first claimed after the join is still attempted unjoined, the one-attempt
+    residual narrowed to that window.
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
