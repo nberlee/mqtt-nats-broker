@@ -2,7 +2,7 @@
 
 # ---- build stage ----
 # Cross-compiles for the target platform selected by buildx (linux/amd64, linux/arm64).
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 
 ARG TARGETOS
 ARG TARGETARCH
