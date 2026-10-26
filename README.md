@@ -31,22 +31,9 @@ sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Quickstart
 
-**Requires nats-server 2.15.1 or newer.** Earlier releases are explicitly
-unsupported — not degraded, not fallback-handled. The broker's durability
-guarantees rest on specific JetStream behaviors (per-subject CAS, interest
-retention, deduplication, per-message TTL, double ack); those are asserted against
-the supported line and their stream prerequisites are validated at startup rather
-than worked around. The external cluster's version is an operator prerequisite:
-every JetStream peer must meet the floor, and a mixed-version cluster is unsupported.
-One server **option** is a prerequisite too: configure
-`jetstream { limits { default_max_consumers: -1 } }` on every peer, or give the account
-tier an explicit positive `max_consumers` above your working set. From 2.15.0 the server
-otherwise caps each stream at 1000 consumers, and asking for unlimited arms that cap
-rather than opting out of it — the broker cannot detect the setting and cannot refuse
-early (F-095).
-`go.mod` pins the exact version tested. See "JetStream behaviors this design depends on" in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the list a version bump has to
-re-verify.
+The broker needs nats-server 2.15.1 or newer with one server option set; the
+prerequisites, the binary and both container images are in
+[docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 Run a broker + NATS locally:
 
@@ -61,123 +48,20 @@ go build ./cmd/mqtt-nats-broker
 ./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -port 1883
 ```
 
-Container image (multi-arch amd64/arm64), for an external NATS/JetStream deployment. It is
-`FROM scratch` (the binary and the system CA bundle only), runs as the numeric user
-`65532:65532`, and supports a read-only root filesystem:
+## Documentation
 
-```sh
-docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
-  -e MQTTNB_NATS_URLS=nats://nats:4222 \
-  ghcr.io/nberlee/mqtt-nats-broker:latest
-```
+- [Installation](docs/INSTALLATION.md): prerequisites, the binary, the container images
+- [Configuration](docs/CONFIGURATION.md): every flag and environment variable
+- [TLS](docs/TLS.md): TLS, mTLS, certificate rollover, secure WebSocket
+- [Kubernetes](docs/KUBERNETES.md): the Helm chart, example manifests, HA sizing
+- [Authentication and authorization](docs/AUTHENTICATION.md)
+- [Migration](docs/MIGRATION.md) from nats-server's own MQTT listener
+- [Operations](docs/OPERATIONS.md) and [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Architecture](docs/ARCHITECTURE.md), [Conformance](docs/CONFORMANCE.md) and
+  [Provenance](docs/PROVENANCE.md)
 
-A `tls://` NATS URL is verified against the image's CA bundle. For a NATS server under a
-private CA, mount the CA and name it with `SSL_CERT_FILE` (for example
-`-e SSL_CERT_FILE=/etc/nats-ca/ca.crt`). The image sets no `HOME`, so `-nats-creds` takes
-an absolute path. Log timestamps are UTC
-([details](docs/ARCHITECTURE.md#the-runtime-image)).
-
-The embedded-NATS image (tags suffixed `-embedded`) runs its own JetStream in-process, so
-no NATS deployment is needed. Its baked configuration takes the credentials from four
-variables and refuses to start without them; MQTT clients without credentials connect
-as the default user, which is kept out of the broker's reserved namespace and the
-JetStream API:
-
-```sh
-docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
-  -v mqtt-data:/data \
-  -e MQTTNB_NATS_USER=service -e MQTTNB_NATS_PASS=change-me \
-  -e MQTTNB_DEFAULT_USER=mqtt -e MQTTNB_DEFAULT_PASS=change-me-too \
-  ghcr.io/nberlee/mqtt-nats-broker:latest-embedded
-```
-
-Mount your own nats-server configuration and point `MQTTNB_NATS_EMBEDDED_CONFIG` at it
-for other accounts, TLS, or a cluster of broker pods (`embedded/nats-cluster.conf` is
-an example) ([details](docs/ARCHITECTURE.md#embedded-nats)).
-
-## Configuration
-
-Every flag has an `MQTTNB_`-prefixed environment variable equivalent; flags win.
-
-| Flag | Env | Default | Description |
-|------|-----|---------|-------------|
-| `-nats` | `MQTTNB_NATS_URLS` | `nats://127.0.0.1:4222` | Comma-separated NATS URLs, without credentials (refused: give them with `-nats-user`/`-nats-pass` or `-nats-creds`) |
-| `-nats-embedded-config` | `MQTTNB_NATS_EMBEDDED_CONFIG` | | Run an embedded nats-server from this native configuration file instead of connecting to `-nats` ([details](docs/ARCHITECTURE.md#embedded-nats)) |
-| `-nats-creds` | `MQTTNB_NATS_CREDS` | | NATS `.creds` file (service conn) |
-| `-nats-user` / `-nats-pass` | `MQTTNB_NATS_USER` / `_PASS` | | NATS user/password (service conn); keep URL credential-less under auth passthrough |
-| `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-broker` | Connection name |
-| `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain; a single subject token. Baked into session subjects, so changing it later orphans existing sessions ([details](docs/ARCHITECTURE.md#jetstream-domain)) |
-| `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | `0` (auto) | JetStream stream replicas |
-| `-host` | `MQTTNB_HOST` | `0.0.0.0` | MQTT listen host |
-| `-port` | `MQTTNB_PORT` | `1883` | MQTT listen port |
-| `-max-conns` | `MQTTNB_MAX_CONNS` | `0` (∞) | Max concurrent clients |
-| `-connect-timeout` | `MQTTNB_CONNECT_TIMEOUT` | `5s` | How long an accepted connection may send no CONNECT before it is closed. Must be `> 0`: the bound is fail-closed and cannot be disabled ([details](docs/ARCHITECTURE.md#connection-liveness-bounds)) |
-| `-auth-passthrough` | `MQTTNB_AUTH_PASSTHROUGH` | `true` | Dial per-client NATS conn from MQTT creds |
-| `-default-user` / `-default-pass` | `MQTTNB_DEFAULT_USER` / `_PASS` | | NATS creds for anonymous MQTT clients |
-| `-keepalive-max` | `MQTTNB_KEEPALIVE_MAX` | `0` (no override) | MQTT 5.0 Server Keep Alive cap (seconds) |
-| `-response-info` | `MQTTNB_RESPONSE_INFO` | | MQTT 5.0 Response Information base topic |
-| `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS (set `-port 8883`) |
-| `-plain-port` | `MQTTNB_PLAIN_PORT` | `0` (off) | Additional plaintext MQTT listener beside the TLS `-port` (requires `-tls-cert`/`-tls-key`). Credentials and payloads cross it in clear, and no client certificate is checked on it |
-| `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS (requires cert+key) |
-| `-tls-reload-interval` | `MQTTNB_TLS_RELOAD_INTERVAL` | `10s` | How often the TLS files are re-read for a renewal. Must be `> 0` |
-| `-ws-port` | `MQTTNB_WS_PORT` | `0` (off) | MQTT over WebSocket listen port; the other `-ws-*` flags require it |
-| `-ws-host` | `MQTTNB_WS_HOST` | the `-host` value | MQTT over WebSocket listen host |
-| `-ws-path` | `MQTTNB_WS_PATH` | `/mqtt` | Request path served, exact and as escaped on the wire |
-| `-ws-handshake-timeout` | `MQTTNB_WS_HANDSHAKE_TIMEOUT` | `5s` | Bound on the WebSocket opening handshake. Must be `> 0` |
-| `-ws-no-tls` | `MQTTNB_WS_NO_TLS` | `false` | Plaintext WebSocket although TLS is configured, for a TLS-terminating ingress |
-| `-ws-allowed-origins` | `MQTTNB_WS_ALLOWED_ORIGINS` | (same-origin) | Comma-separated browser origins, `scheme://host[:port]`, replacing the same-origin default |
-| `-log-level` | `MQTTNB_LOG_LEVEL` | `info` | `debug`\|`info`\|`warn`\|`error` |
-| `-http-addr` | `MQTTNB_HTTP_ADDR` | `:8080` | Health/readiness (`/healthz`, `/readyz`) |
-
-### Go memory limit
-
-At startup the broker sets the Go soft memory limit to 90 percent of the container's
-memory limit (cgroup v1 or v2), so the GC tightens before the kernel's OOM killer acts.
-`GOMEMLIMIT` in the environment overrides this entirely; `AUTOMEMLIMIT=<ratio>` changes
-the fraction and `AUTOMEMLIMIT=off` disables it. With no container limit the Go limit is
-unlimited. A failure to read the limit is logged and does not stop startup
-([details](docs/ARCHITECTURE.md#the-go-memory-limit-follows-the-container-limit)).
-
-### TLS
-
-Setting `-tls-cert` and `-tls-key` turns the MQTT listener into a TLS listener;
-adding `-tls-ca` additionally requires and verifies client certificates (mTLS).
-`-port` selects the MQTT-over-TCP listener in either mode, and there is no implicit
-port change when the TLS flags are set: TLS deployments should pass `-port 8883` (the
-conventional MQTT-over-TLS port). To serve plaintext 1883 and TLS 8883 at once, while
-clients move to TLS, add `-plain-port 1883` beside TLS. Credentials and payloads cross
-that port in clear, and no client certificate is checked on it
-([details](docs/ARCHITECTURE.md#plaintext-mqtt-beside-tls)).
-
-TLS configuration fails closed: an unreadable or invalid certificate, key, or
-client CA aborts startup before anything is bound, so a broken TLS setup can
-never fall back to a plaintext listener. A certificate outside its validity
-window counts as invalid.
-
-Certificates roll over without a restart. The broker re-reads the three files
-every `-tls-reload-interval` and applies a complete, valid replacement to new
-handshakes. Existing MQTT connections stay connected on the material they were
-admitted under. Mount the files from a Kubernetes Secret, for example one
-cert-manager renews, as a volume: the kubelet updates it in place, so no
-Stakater Reloader or other rollout controller is needed. A `subPath` mount never
-receives updates. An update that is incomplete, malformed, expired, or whose key
-does not match its certificate is refused and logged, and the last valid
-configuration stays active
-([details](docs/ARCHITECTURE.md#tls-material-reload)).
-
-### MQTT over WebSocket
-
-`-ws-port` opens a second listener for MQTT over WebSocket, at `-ws-path`
-(default `/mqtt`); clients must offer the `mqtt` subprotocol. It shares
-`-max-conns`, sessions and takeover with the MQTT listener, and its TLS: with
-`-tls-cert`/`-tls-key` set it serves secure WebSocket (`wss://`) from the same
-material, reloaded with it, unless `-ws-no-tls` is set for an ingress that
-terminates TLS (WebSocket clients then get neither encryption nor client-certificate
-verification from the broker). Browser pages are admitted only from the
-listener's own origin unless `-ws-allowed-origins` lists them; behind an ingress
-that terminates TLS, list the page origins. Forwarding headers and the PROXY
-protocol are not consumed, and no WebSocket extension (compression) is
-negotiated ([details](docs/ARCHITECTURE.md#mqtt-over-websocket)).
+The same documents are published as the project's GitHub Wiki at each release
+([docs/WIKI.md](docs/WIKI.md)).
 
 ## Authentication
 

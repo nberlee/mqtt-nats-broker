@@ -966,7 +966,11 @@ recorded in `docs/CONFORMANCE.md`.
   to any instance; **session takeover** works across instances because it is
   mediated by a NATS-message mechanism, not in-memory state.
 - HA/durability guarantees come from JetStream **replicas** (`R3`/`R5`). Size the
-  NATS cluster, not the broker.
+  NATS cluster, not the broker, and set `-stream-replicas` to it: the broker cannot see
+  the cluster's size, and `0` creates new streams with one replica and leaves an existing
+  stream's count unchecked (`mqttDetermineReplicas` reads only `Options.Routes`, which
+  this binary never sets). A nonzero count is enforced on every existing stream at
+  startup.
 - `-stream-replicas` is the only replica setting. Durable MQTT consumers leave
   `Replicas` at 0 and inherit their stream's count: they all live on the
   interest-retention `$MQTT_msgs` and `$MQTT_out`, where JetStream refuses any
@@ -15000,7 +15004,7 @@ so a failed bind closes those already bound and Start fails with every port free
 **In clear.** On the plaintext listener MQTT credentials (auth passthrough's user and
 password) and payloads cross the network unencrypted, and no client certificate is
 checked, even with `-tls-ca`. That is the operator's choice in enabling it, stated
-here and in the README, not a conformance residual.
+here and in `docs/TLS.md`, not a conformance residual.
 
 ## MQTT over WebSocket
 
@@ -15531,7 +15535,10 @@ as a mounted file named by `SSL_CERT_FILE` (which replaces the bundle as the roo
 
 **Nothing on the exercised paths writes to the filesystem**, so the image supports a
 read-only root filesystem (`readOnlyRootFilesystem: true`) with no `emptyDir`. Logs go to
-stdout. The image cannot enforce read-only; the pod does.
+stdout, one stream of JSON records at `-log-level`: `serveMQTT` hands the command's logger
+to the MQTT core through `Options.Logger`, so the core's records are the broker's and not
+Go's default text logger on stderr, which carried them before. Only a startup failure
+(`fatal: ...`) is written to stderr. The image cannot enforce read-only; the pod does.
 
 **What the static binary takes from the platform, not the image.** The pure-Go resolver
 reads `/etc/resolv.conf` and `/etc/hosts`, which the runtime mounts; with no
@@ -15940,6 +15947,101 @@ runner, with the image tags metadata-action derives from a synthetic tag, the re
 `release-version`, and a push without the login's credential refused. The GHCR push
 itself, its `GITHUB_TOKEN` login and the jobs' ordering on a real tag are exercised first
 by the first release.
+
+## The wiki is generated from docs/
+
+The project's GitHub Wiki is a published copy of the documentation in this repository,
+never edited as such. `cmd/wikigen` renders it and `internal/wiki` holds the mechanism.
+
+**The manifest.** `docs/WIKI.md` is the wiki's Home page, and its `## Pages` list decides
+what the wiki is: each entry is exactly one link to a tracked Markdown file, in sidebar
+order, its link text the page title. Nothing else is published. One source lives outside
+`docs/`: the Helm chart's `charts/mqtt-nats-broker/README.md`, which `helm package` ships
+as the chart's own README, so it stays beside the chart and the manifest names it.
+
+**Pages and the budget.** A page's final output, after link rewriting and generated
+navigation, is at most 400,000 bytes. GitHub documents no per-page limit (only 5,000 wiki
+files); a third-party measurement puts it at 484,044 characters, and the budget stays
+under that pending a live rendering check. A document within budget is one page. One
+over it is split at its sections: the text before the first subsection, with a generated
+list of the subsections, becomes the document's page, each subsection its own page named
+`<title>: <heading>`, and a subsection still over budget descends a level the same way.
+Splitting is decided on the rendered size and repeated until no page is over, so a
+section that only exceeds once its links are expanded is split too. A section with no
+subsection that is still over budget fails the render, naming it.
+
+**The published subset, and who decides it.** A CommonMark/GFM parse (goldmark, a
+documentation-tooling dependency the broker binary does not link) is the authority on
+what a document holds; a pattern scanner is not. Outside code, a link may come only from
+an inline link or image (including an image inside a link's label) or an autolink
+(angle-bracketed, or a bare URL or email address as GFM extends them), and every
+destination is written literally, without escapes or entities. Everything else GitHub
+would turn into a link is refused wherever it sits, in blockquotes and list items too:
+link reference definitions, and so every reference-style use; footnotes, which GitHub
+renders in a repository and not in a wiki; raw HTML of any form, comments included;
+and the wiki's own `[[...]]` syntax. A heading is plain text and code spans only, and
+its only non-ASCII characters are four decorations github-slugger strips (`§`, `—`,
+`→`, `✅`), so its anchor depends on no Unicode table or casing rule. These are
+restrictions on authors, measured against the documentation of 2026-10-26, not a
+general Markdown model.
+
+**Anchors and links.** A heading's anchor is GitHub's: the heading's text slugged by
+github-slugger v2.0.0's rule, with its collision counter, checked against that
+package's fixtures (captured from GitHub's renderer) in `internal/wiki/testdata`.
+Anchors are counted per page, because a split page renders only its own headings. The
+rewriting is done by a line scanner that knows byte offsets, and every source must read
+the same through it and through the parse: the same link destinations and the same
+headings in order. A construct the scanner bounds differently (a code span across a
+block that ends the paragraph, a heading in a blockquote, a setext heading) fails the
+render instead of being rewritten wrongly. A link to a published document becomes
+`Page-Name#anchor` on the page that holds the heading; a link to any other tracked file
+or directory becomes a `blob` or `tree` URL pinned to the rendered commit. An anchor on
+such a link must be a heading's anchor in a Markdown file that is itself inside the
+published subset, counted over the whole file; a link to any other file or to a
+directory carries none, and line anchors are not supported. An autolink into this
+repository is refused, since it cannot be pinned; external URLs are unchanged. Anything
+else, a missing file, an anchor no heading produces, a path outside the repository,
+fails the render.
+
+**Verification.** After rendering, `Verify` parses every output page with the same GFM
+parse, without the renderer's scanner or map: every page within budget and inside the
+published subset, every wiki link naming an existing page with no `.md` and no
+directory, every anchor present on its page, and every link into this repository,
+however its host and owner are cased and including autolinks, either naming no file
+(an issue, a pull request, Actions) or a blob or tree pinned to the commit, naming a
+tracked path, and carrying only an anchor that file renders; raw and blame views are
+refused. `TestRepositoryDocsRenderAsWiki` renders this repository's documentation in
+the default test run, so a documentation change that breaks a link or an anchor, steps
+outside the subset, or grows a section past the budget, fails CI.
+`make wiki` renders a local preview into a new temporary directory; an output directory
+it is given must be absent or empty and outside the checkout, and nothing is deleted.
+
+**Publication.** Only a release publishes, from the `wiki` job in
+`.github/workflows/release.yml`: the tag's commit is rendered with that tag and SHA,
+then `wikigen publish` replaces the wiki repository's tree with the output (every old
+file removed first, so a page the documentation no longer has is deleted) and pushes it
+with the job's `GITHUB_TOKEN`. The wiki therefore mirrors the newest published release;
+between releases the repository's documentation moves ahead of it. The output carries
+`.wiki-publication`, two lines naming its tag and commit, written only by a render
+given a tag, and that record is the publication's only identity: `publish` takes no tag
+of its own. The wiki's copy of the record is the guard. A candidate older by SemVer
+precedence than the wiki's record stops without pushing; the same tag at another commit
+is refused (a moved tag); the same tag and commit republishes, which changes nothing
+unless the wiki was edited. The record is not a page, so a web edit adds commits without
+changing it and does not let an older release back in.
+
+**Concurrent publications** are arbitrated by the wiki repository's branch, not by an
+Actions concurrency group, which keeps one pending job and can cancel the newest
+release's. A rejected push means the wiki moved; `publish` fetches, resets to it, and
+judges the new state from the start, guard included, up to five attempts. Whichever
+publication lands first is the one the other re-reads: an older one behind a newer one
+stops, a newer one behind an older one publishes.
+
+**Prerequisites and limits.** The wiki repository exists only once its first page has
+been created in GitHub's web UI. Web edits are overwritten by the next release, and
+restricting wiki editing to collaborators is a repository setting. The publication and
+GitHub's rendering of the pages are unverified until the first release; the tests run
+the publication against local repositories.
 
 ## C5 recovery reservation ownership
 

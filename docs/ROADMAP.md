@@ -10010,13 +10010,38 @@ reads](findings/resolved.md#f-054).
 - [x] Replace the README's duplicate roadmap with a short link to this file.
 
 - [ ] Make version-controlled files under `docs/` the source of truth for a
-  GitHub Wiki.
+  GitHub Wiki. **Implemented 2026-10-26; open until the first publication is verified.**
+  `docs/WIKI.md` is the Home page and its `## Pages` list is the manifest; `cmd/wikigen`
+  renders the listed documents, splitting one over the 400,000-byte page budget at its
+  sections, rewriting links to pages, anchors and commit-pinned repository URLs, and
+  `TestRepositoryDocsRenderAsWiki` fails `make test` on a broken link, a missing anchor,
+  Markdown outside the published subset (judged by a GFM parse: no raw HTML,
+  reference-style links or footnotes, plain headings) or an oversized section
+  (`docs/ARCHITECTURE.md`, "The wiki is generated from docs/").
 
-- [ ] Publish the wiki from CI so it cannot drift from repository docs.
+- [ ] Publish the wiki from CI so it cannot drift from repository docs. **Implemented
+  2026-10-26; open until the first publication is verified.** The release workflow's
+  `wiki` job renders each release tag and `wikigen publish` pushes it, guarded by the
+  wiki's `.wiki-publication` record so an older release or a moved tag never replaces
+  newer pages; a rejected push is re-judged against what landed. The wiki mirrors the
+  newest release, so `docs/` runs ahead of it between releases, and web edits are
+  overwritten at the next one. Not verifiable before a release: the push with
+  `GITHUB_TOKEN` and GitHub's rendering of the pages, which waits on "Before the first
+  push" below and the alpha tag. Before that release the wiki repository must exist: its
+  first page is created in GitHub's web UI, which had not happened on 2026-10-26.
 
 - [ ] Include installation, configuration, architecture, TLS, Helm/Kubernetes,
   authentication and authorization, migration, operations, troubleshooting,
-  conformance, and provenance pages.
+  conformance, and provenance pages. **Implemented 2026-10-26; open with the two items
+  above.** New `docs/INSTALLATION.md`, `CONFIGURATION.md`, `TLS.md`, `KUBERNETES.md`,
+  `OPERATIONS.md` and `TROUBLESHOOTING.md` take the README's installation, flag table,
+  TLS and WebSocket sections (the README keeps a short quickstart and links); the chart
+  README and the two deploy READMEs are published as they are. Writing the operations
+  pages found two defects: the MQTT core logged through Go's default logger, text on
+  stderr ignoring `-log-level`, now wired to the broker's JSON logger; and
+  `-stream-replicas 0` was documented as automatic while it creates one-replica streams,
+  now stated as such everywhere, with a `docs/CONFORMANCE.md` limitation and a section 8
+  decision.
 
 - [ ] Every `F-###` finding is a GitHub issue, and every reference to one points at its
   issue. Once the repository has its GitHub remote, each finding record in
@@ -10071,6 +10096,16 @@ reads](findings/resolved.md#f-054).
   its statement (check by section against the pre-cut tree, not by length). The census
   on 2026-10-26: about 9,500 of `docs/ROADMAP.md`'s 10,400 lines sat under checked
   items; `docs/ARCHITECTURE.md` is 16,000 lines and `docs/CONFORMANCE.md` 7,100.
+
+### Before the first push
+
+- [ ] Nothing is pushed to the GitHub remote until commit signing is set up and the
+  branches are cleaned up. Added 2026-10-26 at the owner's request, when the
+  `nberlee/mqtt-nats-broker` repository was created empty. Until this box is checked no
+  branch, tag or wiki page is pushed, so every CI path that needs a pushed commit (the
+  workflows, the release jobs, wiki publication) stays unexercised on GitHub. Done when
+  the commits that will be pushed are signed, the branch set to publish is decided and
+  the others are deleted or kept local, and the owner has made the first push.
 
 ## Alpha release gate
 
@@ -10399,6 +10434,16 @@ claims](findings/shared-qos2.md#f-049).
   Either remove the parameter and fix its callers, or state in the comment why it is kept.
   Scoped out of the F-090 disposition deliberately: that change was docs and comments only,
   and a signature change touching every caller belongs with the suite run it deserves.
+
+- [ ] Decide what `-stream-replicas 0` means. Filed 2026-10-26 by the wiki item, which
+  corrected the documentation: `0` creates new streams with one replica and checks no
+  existing stream's count, because the broker cannot see the JetStream cluster's size
+  (`mqttDetermineReplicas` reads `Options.Routes`, which the command never sets). On a
+  clustered NATS left at the default, the broker state has no replication. Options: keep
+  `0` as documented; discover the cluster's capacity (the service identity has no `$SYS`
+  access, so this needs a JetStream API answer that carries it); or refuse `0` when the
+  JetStream is clustered. Not an alpha blocker: the setting works when given, and
+  `docs/CONFORMANCE.md` states the limitation.
 
 - [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
   A schedule may publish only into its own stream, so the ADR must preserve F-031's

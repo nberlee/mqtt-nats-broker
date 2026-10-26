@@ -349,11 +349,11 @@ func ValidateOptions(o *Options) error {
 	if o.MaxConn < 0 {
 		return fmt.Errorf("mqtt max_conn must be >= 0 (0 = unlimited), got %d", o.MaxConn)
 	}
-	// A negative value is read as automatic when the replica count is chosen and as an explicit
+	// A negative value is read as "choose" when the replica count is chosen and as an explicit
 	// requirement when the streams are checked, so it has no single meaning. The upper bound is the
 	// server's, which refuses it loudly.
 	if mo.StreamReplicas < 0 {
-		return fmt.Errorf("mqtt stream_replicas must be >= 0 (0 = automatic), got %d", mo.StreamReplicas)
+		return fmt.Errorf("mqtt stream_replicas must be >= 0 (0 = the replica count mqttDetermineReplicas chooses), got %d", mo.StreamReplicas)
 	}
 	for _, t := range []struct {
 		name string

@@ -30,9 +30,11 @@ func setNATSAuthExampleEnv(t *testing.T) {
 	t.Setenv("OUTSIDER_PASSWORD", "outsiderpass")
 }
 
-// recordBrokerLog sends the broker's own log (the default logger) to a recorder for the
-// rest of the test. It swaps a process-wide logger, so a test that calls it must not run
-// in parallel with another that does.
+// recordBrokerLog sends the broker's own log to a recorder for the rest of the test:
+// startExampleBroker gives the broker the default logger, as the command gives it its
+// own, so the MQTT core's records reach the recorder through Options.Logger. It swaps a
+// process-wide logger, so a test that calls it must not run in parallel with another
+// that does, and must call it before startExampleBroker.
 func recordBrokerLog(t *testing.T) *recordingHandler {
 	t.Helper()
 	h := &recordingHandler{}
@@ -47,7 +49,7 @@ func recordBrokerLog(t *testing.T) *recordingHandler {
 func startExampleBroker(t *testing.T, srv *server.Server, cfg *config.Config) string {
 	t.Helper()
 	cfg.NATSURLs = srv.ClientURL()
-	log := slog.New(slog.DiscardHandler)
+	log := slog.Default()
 	be, err := backend.Connect(context.Background(), cfg, nil, log)
 	if err != nil {
 		t.Fatalf("Connect: %v", err)

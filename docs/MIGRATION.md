@@ -56,7 +56,7 @@ Present 0 for a client that had a session.
 ## Configuration
 
 Every key the `mqtt {}` block accepts, and what replaces it. Broker flags each have
-an `MQTTNB_` environment variable; see the [README](../README.md#configuration).
+an `MQTTNB_` environment variable; see [Configuration](CONFIGURATION.md).
 
 | `mqtt {}` key (aliases) | Broker | Notes |
 |---|---|---|
@@ -80,8 +80,8 @@ Check these while the embedded listener still serves; each one found late extend
 the outage.
 
 - **nats-server 2.15.1 or newer on every peer**, and
-  `jetstream { limits { default_max_consumers: -1 } }` on every peer (see the
-  [README](../README.md#quickstart)).
+  `jetstream { limits { default_max_consumers: -1 } }` on every peer (see
+  [Installation](INSTALLATION.md#prerequisites)).
 - **Every MQTT identity works as a standard NATS client, in the service's
   account.** The broker connects to NATS with each client's user name and password
   as an ordinary client connection, then asks the server who it is. Check each

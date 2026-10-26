@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -186,6 +186,16 @@ helm-smoke: helm-check ## Install the chart in a kind cluster, every topology, w
 docker-multiarch: ## Build (and optionally push) the multi-arch image
 	docker buildx build --platform linux/amd64,linux/arm64 \
 		--build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .
+
+# Where `make wiki` renders a local preview: a new temporary directory unless WIKI_OUT
+# names one, which must be absent or empty and outside the checkout, so neither
+# markdownlint nor git sees generated pages. Nothing is deleted: wikigen refuses an
+# output it could misplace. The release job renders and publishes on its own.
+WIKI_OUT ?= $(shell mktemp -d)
+
+wiki: ## Render the GitHub Wiki from docs/ for a local preview (WIKI_OUT=<absent or empty dir>; docs/WIKI.md lists the pages)
+	go run ./cmd/wikigen render -out '$(WIKI_OUT)'
+
 
 conformance: ## Run the MQTT conformance suites against a running broker+NATS
 	./test/conformance/run.sh

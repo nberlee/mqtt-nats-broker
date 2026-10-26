@@ -96,7 +96,7 @@ func run(args []string) error {
 	// instance before its connections are drained.
 	var ready atomic.Bool
 
-	// Health/metrics endpoint (readiness = ready flag AND NATS connected).
+	// Health endpoint (readiness = ready flag AND NATS connected). There is no metrics endpoint.
 	var httpSrv *http.Server
 	if cfg.HTTPAddr != "" {
 		httpSrv = startHTTP(cfg.HTTPAddr, be, &ready, log)

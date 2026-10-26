@@ -31,6 +31,10 @@ behind separately configured TLS termination.
 
 - **NATS with JetStream**, reachable as `nats://nats:4222` from the broker's namespace.
   Change `MQTTNB_NATS_URLS` otherwise.
+- **The stream replicas.** The Deployment does not set `MQTTNB_STREAM_REPLICAS`, so the
+  broker creates one-replica streams. Against a JetStream cluster, add it with the
+  cluster size (normally `3`) before the first start; existing streams keep the count
+  they were created with. See `docs/CONFIGURATION.md`, "Stream replicas".
 - **The client ACL.** Every MQTT identity must be denied `$MQTT.>`, `$JS.>`, `$KV.>` and
   `$O.>` in both directions, and allowed to publish `$SYS.REQ.USER.INFO`. See
   `docs/ARCHITECTURE.md`, "What a deployment must allow".

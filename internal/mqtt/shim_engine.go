@@ -96,6 +96,11 @@ type Options struct {
 	StreamReplicas int
 	Routes         []*url.URL
 
+	// Logger receives every record the MQTT core writes. The broker's command sets
+	// it to its own logger, so the core follows -log-level and writes to the same
+	// JSON stream; nil leaves the core on slog.Default().
+	Logger *slog.Logger
+
 	MQTT MQTTOpts
 }
 
@@ -176,9 +181,10 @@ type Server struct {
 	mu   sync.Mutex
 	opts *Options
 	info Info
-	// log is nil (→ slog.Default()) in production; it is atomic so the test
-	// harness's SetLogger can install a capture logger on an already-running
-	// server without racing the log reads on server goroutines.
+	// log is Options.Logger, installed by NewServer, or nil (→ slog.Default()) when
+	// the caller supplied none. It is atomic so the test harness's SetLogger can
+	// replace it on an already-running server without racing the log reads on
+	// server goroutines.
 	log atomic.Pointer[slog.Logger]
 
 	// bundleSettleBudget is how long account-manager initialization keeps rescanning a
@@ -388,8 +394,10 @@ func (s *Server) NodeName() string {
 }
 
 // JetStreamIsClustered: the standalone broker always runs against external
-// JetStream; clustering is a property of that cluster, exposed via
-// config/replicas rather than an embedded server.
+// JetStream and cannot see that cluster's size; "clustered" here means only that
+// the operator asked for more than one stream replica. With StreamReplicas 0 it
+// is false, so mqttDetermineReplicas creates new streams with one replica: 0 is
+// not a discovery of the cluster size (docs/CONFIGURATION.md, -stream-replicas).
 func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas > 1 }
 
 // authorizeClient implements auth passthrough: it dials a per-client NATS

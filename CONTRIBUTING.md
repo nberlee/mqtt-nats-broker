@@ -32,6 +32,12 @@ third-party docs are excluded via `.markdownlintignore`, since their style is
 upstream's decision. CI runs the same linter and configuration: it installs the
 pinned golangci-lint and runs `make lint-go`.
 
+The documents `docs/WIKI.md` lists are also published as the GitHub Wiki, and
+`make test` renders them: a broken link or anchor fails it, and so does Markdown outside
+the subset the wiki publishes (no raw HTML, reference-style links or footnotes;
+headings of plain text and code spans). `make wiki` renders a local preview. The rules
+are in `docs/ARCHITECTURE.md`, "The wiki is generated from docs/".
+
 ## Code layout
 
 ```text

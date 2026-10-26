@@ -59,9 +59,10 @@ broker:
     #     the embedded topology, whose configurations reference them
     secretName: mqtt-nats-broker-nats
 
-  # JetStream replicas of the broker's streams; 0 is automatic. The embedded cluster
-  # always uses its replica count. With a clustered optional dependency, set it to the
-  # NATS cluster size.
+  # JetStream replicas of the broker's streams. 0 creates new streams with ONE replica
+  # and leaves an existing stream's count unchecked; it does not discover the NATS
+  # cluster size. The embedded cluster always uses its replica count. Against a
+  # clustered NATS (the optional dependency or your own), set the cluster size.
   streamReplicas: 0
 
   logLevel: info

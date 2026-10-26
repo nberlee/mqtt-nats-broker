@@ -26,7 +26,7 @@ type Config struct {
 	NATSName   string        // connection name reported to NATS
 	JSDomain   string        // optional JetStream domain; a single subject token (see validateJSDomain)
 	JSTimeout  time.Duration // JetStream API request timeout
-	StreamReps int           // JetStream stream replicas (0 = auto)
+	StreamReps int           // JetStream stream replicas (0 = new streams R1, existing streams unchecked)
 	// NATSEmbeddedConfig, when set, is a native nats-server configuration file: the
 	// broker runs that server in-process and reaches it without a URL, so NATSURLs does
 	// not apply and an explicit one is refused.
@@ -99,7 +99,7 @@ type Config struct {
 
 	// Observability.
 	LogLevel string // debug|info|warn|error
-	HTTPAddr string // health/metrics bind address (empty = disabled)
+	HTTPAddr string // health endpoint bind address (empty = disabled)
 }
 
 // Default returns a Config populated with sensible defaults.
@@ -279,7 +279,7 @@ func registerFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.NATSPass, "nats-pass", c.NATSPass, "NATS password for the service connection")
 	fs.StringVar(&c.NATSName, "nats-name", c.NATSName, "NATS connection name")
 	fs.StringVar(&c.JSDomain, "js-domain", c.JSDomain, "JetStream domain, a single subject token (optional; empty=the connected server's domain)")
-	fs.IntVar(&c.StreamReps, "stream-replicas", c.StreamReps, "JetStream stream replicas (0=auto)")
+	fs.IntVar(&c.StreamReps, "stream-replicas", c.StreamReps, "JetStream replicas of the broker's streams; set the JetStream cluster size for HA (0=create new streams with one replica and leave existing streams' count unchecked; it does not discover the cluster size)")
 	fs.StringVar(&c.MQTTHost, "host", c.MQTTHost, "MQTT listen host")
 	fs.IntVar(&c.MQTTPort, "port", c.MQTTPort, "MQTT listen port")
 	fs.IntVar(&c.PlainPort, "plain-port", c.PlainPort, "additional plaintext MQTT listen port beside the TLS -port (0=disabled; requires -tls-cert/-tls-key)")
@@ -300,7 +300,7 @@ func registerFlags(fs *flag.FlagSet, c *Config) {
 	fs.BoolVar(&c.WSNoTLS, "ws-no-tls", c.WSNoTLS, "serve plaintext WebSocket although TLS is configured (TLS terminated by an ingress; drops client-certificate verification for WebSocket clients)")
 	fs.StringVar(&c.WSAllowedOrigins, "ws-allowed-origins", c.WSAllowedOrigins, "comma-separated browser origins allowed on the WebSocket listener, scheme://host[:port] (empty=same-origin only)")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug|info|warn|error")
-	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health/metrics bind address (empty=disabled)")
+	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health endpoint bind address, /healthz and /readyz (empty=disabled)")
 	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
 	fs.DurationVar(&c.ConnectTimeout, "connect-timeout", c.ConnectTimeout, "how long an accepted connection may send no CONNECT before it is closed (must be > 0)")
 

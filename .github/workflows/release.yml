@@ -163,3 +163,31 @@ jobs:
           make helm-publish TAG="$GITHUB_REF_NAME" \
             CHART_REGISTRY="oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" \
             HELM_REGISTRY_USER="$GITHUB_ACTOR"
+
+  wiki:
+    name: publish the wiki
+    # The wiki mirrors the newest published release: the pages are rendered from this
+    # tag's docs/, every repository link pinned to the tag's commit, and `wikigen publish`
+    # pushes them unless the wiki already shows a newer release. No concurrency group: a
+    # group keeps one pending job and can cancel the newest release's; publish arbitrates
+    # by retrying a rejected push against what landed instead. The wiki repository exists
+    # only once its first page has been created in the web UI.
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+      # Rendered before the wiki is checked out, so the wiki's clone is not among the files
+      # the render sees in this checkout.
+      - name: render
+        run: |
+          go run ./cmd/wikigen render -tag "$GITHUB_REF_NAME" -sha "$(git rev-parse HEAD)" \
+            -repo "$GITHUB_REPOSITORY" -out "$RUNNER_TEMP/wiki"
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki-repo
+      - name: publish
+        run: go run ./cmd/wikigen publish -wiki wiki-repo -out "$RUNNER_TEMP/wiki"

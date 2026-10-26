@@ -91,6 +91,9 @@ func serveMQTT(cfg *config.Config, be *backend.Backend, opts *mqtt.Options, log 
 		nodeName = cfg.NATSName
 	}
 
+	// The core writes through the broker's logger, so one JSON stream at -log-level
+	// carries every record the process writes after startup.
+	opts.Logger = log
 	s := mqtt.NewServer(be.Conn(), opts, nodeName)
 	if cfg.AuthPassthrough {
 		s.SetClientDialer(be.DialClient)

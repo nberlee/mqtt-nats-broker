@@ -46,6 +46,9 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 		// account-manager init and the accept loop reach it concurrently.
 		gacc: &Account{name: "$G"},
 	}
+	if opts.Logger != nil {
+		s.log.Store(opts.Logger)
+	}
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
 	s.running.Store(true)
 	return s

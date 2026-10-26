@@ -6379,6 +6379,27 @@ before. What this states for MQTT 3.1.1, which has no Maximum Packet Size:
    maximum (about 256 MiB) leaves that maximum as the effective bound, for either
    protocol level.
 
+### `-stream-replicas 0` creates one-replica streams and checks no count
+
+Not an MQTT conformance item; an operational limit of the replica setting in
+`docs/ARCHITECTURE.md` "High availability" and `docs/CONFIGURATION.md` "Stream replicas".
+
+- The broker cannot see the size of the JetStream cluster it runs against. With the
+  default `-stream-replicas 0` it creates every missing broker-owned stream with one
+  replica, on a clustered NATS as on a single server, and logs the count it used
+  (`Creating MQTT streams/consumers with replicas 1 ...`). A one-replica stream lives on
+  one server: its sessions, retained messages and in-flight QoS state are unavailable
+  while that server is down and lost with its storage.
+- With `0` the replica count of streams that already exist is not checked, so a bundle
+  created at another count is served as it is. A nonzero setting is enforced on every
+  existing stream at startup, and a mismatch refuses the start.
+- Changing the setting does not change existing streams; recreating the ten streams,
+  which discards the broker state, is the supported way to move a deployment to another
+  count. The Helm chart's external topology and the example manifests leave the setting
+  at `0`; their documentation says to set the cluster size.
+- Whether `0` should stay the default, discover the cluster's capacity, or be refused
+  against a clustered JetStream is a post-alpha roadmap decision.
+
 ### The Go memory limit is a GC target, not an OOM guarantee
 
 Not an MQTT conformance item; an operational limit of the startup derivation in

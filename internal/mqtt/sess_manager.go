@@ -1367,6 +1367,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	return as, nil
 }
 
+// mqttDetermineReplicas chooses the count for new streams when -stream-replicas is 0.
+// cmd/mqtt-nats-broker never sets Options.Routes and its StreamReplicas 0 makes
+// JetStreamIsClustered false, so for this binary the answer is always 1; the route
+// count below applies only to a caller that sets both.
 func (s *Server) mqttDetermineReplicas() int {
 	// If not clustered, then replica will be 1.
 	if !s.JetStreamIsClustered() {

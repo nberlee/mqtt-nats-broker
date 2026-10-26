@@ -535,11 +535,15 @@ func TestEmbeddedJetStreamWaitFailsOnPermanentErrors(t *testing.T) {
 type brokerProcess struct {
 	cmd      *exec.Cmd
 	httpAddr string
+	mqttAddr string
 	mu       sync.Mutex
 	lines    []map[string]any
-	stderr   strings.Builder
-	exited   chan struct{}
-	exitErr  error
+	// nonJSON holds every stdout line that is not a JSON object: the broker's log is
+	// one JSON stream, so a test may require it to stay empty.
+	nonJSON []string
+	stderr  strings.Builder
+	exited  chan struct{}
+	exitErr error
 }
 
 func startBrokerProcess(t *testing.T, env []string, args ...string) *brokerProcess {
@@ -548,8 +552,8 @@ func startBrokerProcess(t *testing.T, env []string, args ...string) *brokerProce
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &brokerProcess{httpAddr: reservedAddr(t), exited: make(chan struct{})}
-	p.cmd = exec.Command(exe, append([]string{"-http-addr", p.httpAddr, "-port", portOf(t, reservedAddr(t))}, args...)...)
+	p := &brokerProcess{httpAddr: reservedAddr(t), mqttAddr: reservedAddr(t), exited: make(chan struct{})}
+	p.cmd = exec.Command(exe, append([]string{"-http-addr", p.httpAddr, "-port", portOf(t, p.mqttAddr)}, args...)...)
 	p.cmd.Env = append(append(os.Environ(), "MQTTNB_TEST_RUN_BROKER=1"), env...)
 	stdout, err := p.cmd.StdoutPipe()
 	if err != nil {
@@ -570,11 +574,13 @@ func startBrokerProcess(t *testing.T, env []string, args ...string) *brokerProce
 		sc := bufio.NewScanner(stdout)
 		for sc.Scan() {
 			var m map[string]any
+			p.mu.Lock()
 			if json.Unmarshal(sc.Bytes(), &m) == nil {
-				p.mu.Lock()
 				p.lines = append(p.lines, m)
-				p.mu.Unlock()
+			} else {
+				p.nonJSON = append(p.nonJSON, sc.Text())
 			}
+			p.mu.Unlock()
 		}
 		p.exitErr = p.cmd.Wait()
 		close(p.exited)
