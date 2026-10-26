@@ -389,8 +389,8 @@ publisher's connection".
 
 - Status: Open
 - Classification: Confirmed conformance gap (a SHOULD)
-- Release treatment: Post-alpha candidate; promote if a conformance suite or an
-  operator report contradicts the evidence below
+- Release treatment: Pre-alpha, `docs/ROADMAP.md` §0.5 (moved from the post-alpha
+  candidates by the user on 2026-10-26)
 
 ### Evidence
 
@@ -418,8 +418,9 @@ F-051 deliberately left the false comment and the trace untouched, because this
 finding owns that path and that change does not enter it.
 
 Both conformance suites pass today — vibesrc/mqttconformance 124/124, Paho 106/106
-— which is the evidence for the post-alpha treatment: no suite currently exercises
-a rejected CONNECT against a broker that authenticates.
+— because no suite exercises a rejected CONNECT against a broker that authenticates.
+That was the original case for a post-alpha treatment; it was superseded on
+2026-10-26, when the user moved F-061 before the alpha (`docs/ROADMAP.md` §0.5).
 
 ### Fix direction
 
@@ -534,6 +535,57 @@ enqueue fence that revalidates binding and holder under the lock that owns them 
 write. Deliberately **not** durable arbitration: there is no second party contending for
 anything here, and inflating an in-process ordering problem into a durable protocol is
 the mistake F-034's own review cycle rejected twice.
+
+## F-074
+
+**Title:** The CONNECT deadline refuses only after its timer has fired
+
+- Status: Open
+- Classification: Confirmed gap in the broker's own contract (`-connect-timeout`); not
+  an MQTT violation
+- Release treatment: Pre-alpha, `docs/ROADMAP.md` §0.5. The ID was allocated
+  2026-08-22, when F-034's verification found it; this dossier was written 2026-10-26.
+
+### Evidence
+
+`mqttAdmitConnectLocked` (`internal/mqtt/connect_deadline.go`) refuses a CONNECT only
+when the deadline callback has already set `connectAdmission = mqttConnectExpired`.
+Nothing on the CONNECT path compares a clock: the deadline exists only as the
+`time.AfterFunc` that `armConnectDeadline` arms. So the effective bound is the
+configured window plus however late that callback is scheduled, and a CONNECT that
+takes `c.mu` before a late callback is admitted and served.
+
+Two guarantees are easy to read as one, and only one holds. A silent connection's
+lifetime is finite: a late callback still closes the socket, which is the resource
+guarantee. The refusal of a CONNECT arriving after the window is not enforced.
+`docs/CONFORMANCE.md` states this as a known gap that is not accepted.
+
+MQTT 3.1.1 [3.1.4] says only that the Server SHOULD close a connection that sends no
+CONNECT within a reasonable time, and the broker does. The broken contract is the
+broker's own: `-connect-timeout` / `MQTTNB_CONNECT_TIMEOUT` does not bound what its
+name says, and `Validate` refuses values `<= 0` precisely because the bound is meant
+to fail closed.
+
+Observed once, as a CONNACK about 100 ms after a 50 ms deadline, by
+`TestMQTTAuthTimeout/use_mqtt_auth_timeout`; 0 failures in 20 isolated runs, so the
+rate is not characterised.
+
+### Fix direction
+
+The property: admission refuses once the configured window has elapsed, even when the
+expiry transition has not run. Recording the deadline when it is armed and comparing
+it in `mqttAdmitConnectLocked` is the obvious representation; an injected clock is
+another.
+
+A deterministic test in which the window has elapsed and the transition has not run is
+part of the fix. `testConnectDeadlinePause` is not a seam for it: it runs inside the
+callback after the callback has taken `c.mu`, which `mqttAdmitConnectLocked` also
+needs, so while it is held the CONNECT cannot be admitted, and releasing it lets the
+callback win. A defective implementation passes such a test. The seam must delay the
+callback before it acquires `c.mu`, or replace the timer or clock.
+
+Raising a fixture's sleep is not a fix: it makes the symptom rarer and leaves the bound
+unenforced.
 
 ## F-079
 

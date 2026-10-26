@@ -435,7 +435,8 @@ PUBREL redelivery does not clear one. At a GRACEFUL shutdown the loss is systema
 than occasional: the connections Phase 1 closes write their certificates on goroutines
 shutdown does not join, and Phase 4 stops the JetStream request path under them, so those
 writes usually fail and their tokens stand for the next start's resume, which is the same
-outcome as a crash.
+outcome as a crash. Joining those writes before Phase 4 is owed before the alpha
+(`docs/ROADMAP.md` §0.5).
 
 **The discard boundary's settlement can fail; a clean start then refuses, and any other
 discard's release waits for an adopter.** Every discard settles a standing ownership proposal
@@ -1514,8 +1515,8 @@ routes through `authViolation`, which closes the connection and sends no CONNACK
 So a client refused for a cross-account credential, an unidentifiable identity or
 an expired one learns only that the socket closed, and cannot tell that from a
 network failure. That is [F-061](findings/runtime-correctness.md#f-061), which
-owns that path and is a post-alpha candidate; it is recorded here so the closure
-above is not read as claiming more than it delivers.
+owns that path and is owed before the alpha (`docs/ROADMAP.md` §0.5); it is recorded
+here so the closure above is not read as claiming more than it delivers.
 
 **Residual 6 - a denied QoS 2 PUBLISH costs one JetStream read.** MQTT transfers
 ownership of a message at PUBREC, so a later PUBLISH on the same packet
@@ -6324,8 +6325,9 @@ stays silent is closed. **What is not claimed is that the late-admission case ho
 the configured window**: there the callback finds the CONNECT already admitted, does
 nothing, and the connection proceeds under the keep-alive rules instead — which are
 themselves no bound at all when the client negotiates Keep Alive 0, as the next residual
-states. So nothing closed it for exceeding the window. The finding specifying the fix is
-filed separately from the change that added this paragraph.
+states. So nothing closed it for exceeding the window. The fix is
+[F-074](findings/runtime-correctness.md#f-074), owed before the alpha (`docs/ROADMAP.md`
+§0.5).
 
 **The residual is on the other side of CONNECT**, and it is pre-existing rather
 than introduced here: a client that completes CONNECT with **Keep Alive 0** is

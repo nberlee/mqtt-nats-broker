@@ -323,9 +323,13 @@ broker does not compensate for it. See `docs/known-upstream-issues.md`.
   stated in `docs/CONFORMANCE.md`.
   Details: [F-060](runtime-correctness.md#f-060).
 - Send a CONNACK before closing an unauthorized CONNECT.
-  Status: Open. Release treatment: Post-alpha candidate; promote if a conformance
-  suite or an operator report shows the missing CONNACK in practice.
+  Status: Open. Release treatment: Pre-alpha, ROADMAP §0.5 (moved from the post-alpha
+  candidates 2026-10-26).
   Details: [F-061](runtime-correctness.md#f-061).
+- Refuse a CONNECT once the connect deadline has elapsed, not only once its timer has
+  fired.
+  Status: Open. Release treatment: Pre-alpha, ROADMAP §0.5.
+  Details: [F-074](runtime-correctness.md#f-074).
 - A server-side default caps consumers per stream, and asking for unlimited arms it
   rather than opting out.
   Status: Decided 2026-10-12: a deployment prerequisite (option (a)); the limitation

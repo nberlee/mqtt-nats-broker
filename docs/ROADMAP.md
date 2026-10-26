@@ -8011,6 +8011,47 @@ real](findings/release-investigations.md#f-044).
     advanced twice) up to `mqttForegroundAcquireAttempts`, spaced by the contention wait;
     exhaustion by writers outside the handshake still falls back to the continuation.
 
+### 0.5 Small pre-alpha fixes
+
+Added 2026-10-26 at the user's request: three gaps `docs/CONFORMANCE.md` states that are
+small to close and should not ship in the alpha. One item, because each is a contained
+change to a refusal or shutdown path and none needs a new mechanism. It is an alpha
+blocker: the gate's "every unconditional alpha blocker" box covers it.
+
+- [ ] **Close three small stated gaps before alpha: the CONNECT deadline by the clock
+  (F-074), a CONNACK on a refused CONNECT (F-061), and closure certificates at graceful
+  shutdown.**
+  - *[F-074](findings/runtime-correctness.md#f-074): admission refuses a CONNECT only
+    after the deadline timer has fired.* `mqttAdmitConnectLocked`
+    (`connect_deadline.go`) tests whether the `time.AfterFunc` callback has already set
+    `mqttConnectExpired`; nothing on the CONNECT path compares a clock. A callback
+    scheduled late lets a CONNECT that arrives after `-connect-timeout` be admitted and
+    served. `docs/CONFORMANCE.md` states this as a known gap that is **not accepted**.
+    Fix direction: record the deadline when `armConnectDeadline` arms it and refuse in
+    `mqttAdmitConnectLocked` once it has passed, through the existing refusal path. The
+    paired test must make the callback late without the CONNECT path knowing (a hook
+    before the callback takes `c.mu`, or an injectable clock): the existing
+    `testConnectDeadlinePause` runs inside `c.mu`, after the race is decided, so a broken
+    fix would still pass it. Watch the 50 ms window in `TestMQTTAuthTimeout` for new
+    flakiness under load.
+  - *[F-061](findings/runtime-correctness.md#f-061): a refused CONNECT gets no CONNACK.*
+    `authViolation` (`shim_engine.go`) only closes the socket, while
+    `mqttProcessConnect` (`connect_process.go`) traces a CONNACK as sent. MQTT 3.1.1
+    [3.1.4] makes the CONNACK a SHOULD; verify the 5.0 wording and reason codes when
+    planning. The work is the reason code: `isClientAuthorized` returns only a bool, and
+    bad credentials, a cross-account identity and an identity request timeout want
+    different codes. The returned value must report whether the CONNACK was written. A
+    CONNECT that lost the race to the deadline stays silent. Moved here from section 8.
+  - *Closure certificates written during a graceful shutdown are usually lost.*
+    `mqttPersistCloseCert` (`outbound_close_cert.go`) writes each certificate on a
+    goroutine nothing joins, and shutdown's Phase 4 stops the JetStream request path under
+    them, so the connections Phase 1 closes leave their tokens standing for the next
+    start's resume, the same outcome as a crash (`docs/CONFORMANCE.md`, "A durable closure
+    certificate is one attempt"). Fix direction: track those writes and wait for them in
+    Phase 3b of `runShutdown`, which runs while JetStream still answers. The payoff is
+    narrower than the paragraph suggests: shutdown already finishes this process's own
+    owed work, so the certificate matters only for holders whose drain did not finish.
+
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription
@@ -10212,17 +10253,10 @@ follow-ups](findings/inflight-followups.md#f-046).
   alpha-time part, deciding the compatibility-sensitive schema names, is in §1 ("In-flight
   verdict schema names").
 
-- [ ] [F-061: Send a CONNACK before closing an unauthorized
-CONNECT](findings/runtime-correctness.md#f-061).
-  **Small.** The shim's `authViolation` only closes the socket, so a client whose
-  per-client NATS dial is refused never receives CONNACK 0x05 / 0x87 — while
-  `mqttProcessConnect` (`connect_process.go`) comments that the CONNACK is enqueued there
-  and traces one as sent.
-  MQTT 3.1.1 [3.1.4] makes the close a MUST (met) and the CONNACK a SHOULD (not
-  met); verify the v5 wording when planning it. Found while reading this path for
-  F-051, not caused by it. Both conformance suites pass today (124/124, 106/106),
-  which is why it is a post-alpha candidate rather than a blocker; promote it if a
-  suite or an operator report contradicts that.
+- [x] [F-061: Send a CONNACK before closing an unauthorized
+  CONNECT](findings/runtime-correctness.md#f-061). **Moved to §0.5 on 2026-10-26** (user
+  decision), as part of one pre-alpha item with F-074 and the shutdown closure
+  certificates.
 
 - [ ] F-085: Carry the authorizing NATS account through the transport. **Codex's
   wording, taken verbatim from the consult that closed F-079/F-080/F-081, because

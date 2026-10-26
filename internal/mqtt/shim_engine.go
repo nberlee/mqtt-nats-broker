@@ -391,8 +391,8 @@ func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas
 // CONNECT leaks nothing.
 //
 // F-079, F-080, F-081. Note what this does NOT do: the refusal is a bare socket
-// close, because authViolation sends no CONNACK. That is F-061's, filed and
-// deliberately post-alpha; nothing here makes it worse or better.
+// close, because authViolation sends no CONNACK. That is F-061's, owed before the
+// alpha (docs/ROADMAP.md §0.5); nothing here makes it worse or better.
 func (s *Server) isClientAuthorized(c *client) bool {
 	if s.dialClient == nil {
 		// No per-client identity exists in this mode, so there is nothing to
