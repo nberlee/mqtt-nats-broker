@@ -26,10 +26,10 @@ func TestExternalWithNATSDependency(t *testing.T) {
 	ns := namespace(t)
 	install(t, ns, "ext", chartDir, chartValues("optional-nats-values.yaml"))
 	svc := "svc/ext-mqtt-nats-broker"
-	addr := portForward(t, ns, svc, 1883)
-	eventually(t, time.Minute, "round trip", func() error { return roundTripOnce(addr, "ext-rt", nil) })
+	fwd := portForward(t, ns, svc, 1883)
+	eventually(t, time.Minute, "round trip", func() error { return roundTripOnce(fwd.Addr(), "ext-rt", nil) })
 
-	cl, err := dial(addr, "ext-retain", "smoke/retained", nil)
+	cl, err := dial(fwd.Addr(), "ext-retain", "smoke/retained", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,9 +41,9 @@ func TestExternalWithNATSDependency(t *testing.T) {
 		kubectl(t, "-n", ns, "delete", "pod", pod, "--wait=true")
 	}
 	kubectl(t, "-n", ns, "rollout", "status", "deployment/ext-mqtt-nats-broker", "--timeout", installTimeout.String())
-	addr = portForward(t, ns, svc, 1883)
+	fwd = portForward(t, ns, svc, 1883)
 	eventually(t, time.Minute, "retained after every broker pod was replaced", func() error {
-		return awaitRetained(addr, "ext-retain-2", "smoke/retained", "kept")
+		return awaitRetained(fwd.Addr(), "ext-retain-2", "smoke/retained", "kept")
 	})
 }
 
@@ -52,9 +52,9 @@ func TestExternalWithNATSDependency(t *testing.T) {
 func TestExternalWithNATSDependencyCluster(t *testing.T) {
 	ns := namespace(t)
 	install(t, ns, "extc", chartDir, chartValues("optional-nats-cluster-values.yaml"))
-	addr := portForward(t, ns, "svc/extc-mqtt-nats-broker", 1883)
-	eventually(t, 2*time.Minute, "round trip", func() error { return roundTripOnce(addr, "extc-rt", nil) })
-	if err := routeRefused(portForward(t, ns, "pod/extc-nats-0", 6222)); err != nil {
+	fwd := portForward(t, ns, "svc/extc-mqtt-nats-broker", 1883)
+	eventually(t, 2*time.Minute, "round trip", func() error { return roundTripOnce(fwd.Addr(), "extc-rt", nil) })
+	if err := routeRefused(portForward(t, ns, "pod/extc-nats-0", 6222).Addr()); err != nil {
 		t.Errorf("route port: %v", err)
 	}
 }
@@ -75,9 +75,9 @@ func TestExternalTLS(t *testing.T) {
 	key, _ := testcerts.Write(dir, "tls.key", keyPEM)
 	kubectl(t, "-n", ns, "create", "secret", "tls", "mqtt-nats-broker-tls", "--cert", cert, "--key", key)
 	install(t, ns, "tls", chartDir, writeValues(t, "topology: external\nnats:\n  enabled: true\nmqtt:\n  tls:\n    enabled: true\n    secretName: mqtt-nats-broker-tls\n"))
-	addr := portForward(t, ns, "svc/tls-mqtt-nats-broker", 8883)
+	fwd := portForward(t, ns, "svc/tls-mqtt-nats-broker", 8883)
 	cfg := &tls.Config{RootCAs: ca.Pool(), ServerName: "mqtt-nats-broker", MinVersion: tls.VersionTLS12}
-	eventually(t, time.Minute, "TLS round trip", func() error { return roundTripOnce(addr, "tls-rt", cfg) })
+	eventually(t, time.Minute, "TLS round trip", func() error { return roundTripOnce(fwd.Addr(), "tls-rt", cfg) })
 }
 
 // TestEmbedded installs the embedded topology, one server and a three-peer cluster. The
@@ -95,19 +95,19 @@ func TestEmbedded(t *testing.T) {
 			release := "emb" + tc.name[:1] + randSuffix()[:4]
 			install(t, ns, release, chartDir, chartValues(tc.values))
 			svc := "svc/" + release + "-mqtt-nats-broker"
-			addr := portForward(t, ns, svc, 1883)
-			eventually(t, 2*time.Minute, "round trip", func() error { return roundTripOnce(addr, release+"-rt", nil) })
+			fwd := portForward(t, ns, svc, 1883)
+			eventually(t, 2*time.Minute, "round trip", func() error { return roundTripOnce(fwd.Addr(), release+"-rt", nil) })
 			if !tc.clustered {
 				return
 			}
-			if err := routeRefused(portForward(t, ns, "pod/"+release+"-mqtt-nats-broker-0", 6222)); err != nil {
+			if err := routeRefused(portForward(t, ns, "pod/"+release+"-mqtt-nats-broker-0", 6222).Addr()); err != nil {
 				t.Errorf("route port: %v", err)
 			}
 			kubectl(t, "-n", ns, "delete", "pod", release+"-mqtt-nats-broker-0", "--wait=false")
 			// Through a peer that stays up.
-			addr = portForward(t, ns, "pod/"+release+"-mqtt-nats-broker-1", 1883)
+			fwd = portForward(t, ns, "pod/"+release+"-mqtt-nats-broker-1", 1883)
 			eventually(t, 2*time.Minute, "round trip with a peer gone", func() error {
-				return roundTripOnce(addr, release+"-rt2", nil)
+				return roundTripOnce(fwd.Addr(), release+"-rt2", nil)
 			})
 			kubectl(t, "-n", ns, "rollout", "status", "statefulset/"+release+"-mqtt-nats-broker", "--timeout", installTimeout.String())
 		})
@@ -177,8 +177,8 @@ func TestUpgradeAndRollback(t *testing.T) {
 		}
 		return nil
 	})
-	addr := portForward(t, ns, "svc/"+dep, 1883)
-	eventually(t, time.Minute, "round trip after the rollback", func() error { return roundTripOnce(addr, "upg-rt", nil) })
+	fwd := portForward(t, ns, "svc/"+dep, 1883)
+	eventually(t, time.Minute, "round trip after the rollback", func() error { return roundTripOnce(fwd.Addr(), "upg-rt", nil) })
 }
 
 // TestNATSDependencyReload changes the dependency's configuration with helm upgrade: its
@@ -213,9 +213,9 @@ nats:
 	if after := restarts(); after != before {
 		t.Errorf("the nats container restarted (%s -> %s); the reloader should have applied the change", before, after)
 	}
-	addr := portForward(t, ns, "pod/"+pod, 4222)
+	fwd := portForward(t, ns, "pod/"+pod, 4222)
 	eventually(t, time.Minute, "the added user", func() error {
-		nc, err := nats.Connect("nats://"+addr, nats.UserInfo("extra", "extra-password"), nats.Timeout(5*time.Second))
+		nc, err := nats.Connect("nats://"+fwd.Addr(), nats.UserInfo("extra", "extra-password"), nats.Timeout(5*time.Second))
 		if err != nil {
 			return err
 		}
@@ -291,11 +291,11 @@ func TestSharedPodShutdownOrder(t *testing.T) {
 
 			// The NATS chart's fullname: the release name, suffixed -nats unless it contains it.
 			pod := release + "-nats-0"
-			addr := portForward(t, ns, "pod/"+pod, 1883)
+			fwd := portForward(t, ns, "pod/"+pod, 1883)
 			var cl *client
 			eventually(t, 2*time.Minute, "connect", func() error {
 				var err error
-				cl, err = dial(addr, "shared-drain", "smoke/shared-drain", nil)
+				cl, err = dial(fwd.Addr(), "shared-drain", "smoke/shared-drain", nil)
 				if err != nil {
 					return err
 				}
@@ -303,7 +303,7 @@ func TestSharedPodShutdownOrder(t *testing.T) {
 			})
 			defer cl.close()
 			if len(tc.files) > 1 {
-				if err := routeRefused(portForward(t, ns, "pod/"+pod, 6222)); err != nil {
+				if err := routeRefused(portForward(t, ns, "pod/"+pod, 6222).Addr()); err != nil {
 					t.Errorf("route port: %v", err)
 				}
 			}

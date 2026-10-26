@@ -9350,6 +9350,30 @@ reads](findings/resolved.md#f-054).
   entirely outside broker code. Each fix has a focused test paired with a mutation that was
   run and fails it.
 
+- [ ] **Delivery to a QoS 1 subscriber caps at about 5 messages per second.** Filed
+  2026-10-26 from an operator's measurement (3-pod R3 on NFS: 4-8 msg/s, 120-250 ms per
+  message, slower as the backlog grows, the same for MQTT 3.1.1 and 5.0), reproduced
+  locally on one broker with embedded JetStream on local disk, R1: 200 QoS 1 messages to a
+  QoS 1 subscriber took 39.9 s (5.0 msg/s, median gap 203 ms), 60 took 10 s (6.0 msg/s,
+  121 ms); the same 200 to a QoS 0 subscriber took 49 ms, and accepting the QoS 1
+  publishes took 88 ms. So the slowdown is in outbound QoS 1 delivery and reproduces
+  without NFS or replication; how much the storage adds on top, and whether QoS 2 delivery
+  has the same ceiling, is not measured. At this rate a burst to a QoS 1 subscriber, such
+  as Home Assistant or Node-RED resubscribing after a restart, would take minutes. What
+  is known: the JetStream path benchmark above measured about 105 requests per QoS 1
+  delivery, about 98 of them message GETs on `$MQTT_inflight` (the outbound obligation
+  records), at 48-65 ms against an in-process server; it also found that almost every
+  delivery's first admission attempt loses its CAS on the source consumer's resource
+  record to the previous delivery's hold release and is retried. The observed gap is two
+  to four times that request cost, and deliveries to one subscriber appear to run one at
+  a time. Not yet known: where the time goes per delivery (serial admission, the CAS
+  retry, waits between attempts, the read count), and what ordering or durability
+  property each serial step protects. Deliverable: a throughput benchmark of sustained
+  QoS 1 and QoS 2 delivery to one subscriber (and to several), the profile of one
+  delivery, and a change that raises the rate without giving up an invariant
+  `docs/ARCHITECTURE.md` states, or a stated residual in `docs/CONFORMANCE.md` with the
+  measured ceiling if the cost is the design's.
+
 ### NATS platform follow-ups
 
 - [x] Enable `js_ack_fc_v2` in clustered CI and prove the broker's dual-layout ACK

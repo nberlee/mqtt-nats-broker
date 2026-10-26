@@ -4100,11 +4100,11 @@ of 6 arrive within about 150 ms. The 30 s is the observed delay, not a proven bo
 The mechanism is untraced. A plausible one is that the publish is delivered to the old
 connection while its teardown runs, and the resume does not count it as unacknowledged.
 It is not F-118, which is a packet identifier held by an undrained durable PUBLISH
-action. The 3.1.1 persistent-session tests never showed it because paho 3.1.1's
-`Disconnect(100)` waits before closing, so the window is never hit.
-`TestWSPahoV5Session` waits for the old connection's deregistration before publishing,
-because "published while offline" means after the broker processed the DISCONNECT, so
-it deliberately does not cover this window.
+action. paho 3.1.1's `Disconnect(100)` waits before closing, which narrows the window
+without closing it: `TestWSPahoV311` met it in CI on 2026-10-26. `TestWSPahoV311` and
+`TestWSPahoV5Session` both wait for the old connection's deregistration before
+publishing, because "published while offline" means after the broker processed the
+DISCONNECT, so they deliberately do not cover this window.
 
 ### No Local is decided when the message is owned
 

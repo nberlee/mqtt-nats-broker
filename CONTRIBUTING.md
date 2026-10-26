@@ -95,8 +95,8 @@ default tree; the behavioral shims that replace NATS-server's runtime live in
 | Build tag | What it selects | How it runs |
 |---|---|---|
 | none | the default tree: transport, session, end-to-end, auth and unit tests | `make test`, CI `build-test` |
-| `mqtt_fulltests` | the upstream regression suite (`mqtt_test.go`, `mqtt_v5_test.go`) and the broker's own tests that need its harness | `make full-suite`, CI `fulltests` |
-| `mqtt_fulltests mqtt_experimental_shared_qos2` | the parked shared-subscription QoS 2 suite, in place of its disabled twins | `make experimental-shared-qos2-tests`, CI non-gating |
+| `mqtt_fulltests` | the upstream regression suite (`mqtt_test.go`, `mqtt_v5_test.go`) and the broker's own tests that need its harness | `make full-suite`; CI `fulltests` runs it under `-race` in eight `make test-shard` jobs |
+| `mqtt_fulltests mqtt_experimental_shared_qos2` | the parked shared-subscription QoS 2 suite, in place of its disabled twins | `make experimental-shared-qos2-tests`; CI non-gating, eight `make test-shard` jobs |
 | `mqtt_cluster_reference` | upstream cluster, leafnode and internal-API tests, kept unbuilt as reference | never built |
 | `mqtt_tls_reference` | upstream TLS configuration tests, kept unbuilt as reference | never built |
 

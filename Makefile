@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance wiki tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -57,6 +57,22 @@ lint-md: ## Run markdownlint over the project's own Markdown
 
 full-suite: ## Run the mqtt_fulltests build: the upstream MQTT suite and the harness-based broker tests.
 	go test -tags mqtt_fulltests -timeout 60m ./internal/mqtt/
+
+# One shard of a tagged ./internal/mqtt/ suite under -race, as CI runs it: the tests
+# `go test -list` names, every SHARDS-th one starting at SHARD (0-based), so the shards
+# together run each test exactly once and a new test joins a shard with no list to edit.
+# The whole tagged suite in one -race process outlasts any reasonable timeout.
+TEST_TAGS ?= mqtt_fulltests
+SHARD     ?= 0
+SHARDS    ?= 1
+SHARD_TIMEOUT ?= 45m
+
+test-shard: ## Run shard SHARD of SHARDS of the tagged suite (TEST_TAGS) under -race
+	@tests=$$(go test -tags '$(TEST_TAGS)' -list '^Test' ./internal/mqtt/ | grep '^Test' \
+		| awk -v s=$(SHARD) -v n=$(SHARDS) 'NR % n == s' | paste -sd'|'); \
+	test -n "$$tests" || { echo "shard $(SHARD) of $(SHARDS) holds no test"; exit 1; }; \
+	echo "shard $(SHARD) of $(SHARDS): $$(echo "$$tests" | tr '|' '\n' | wc -l) tests"; \
+	go test -tags '$(TEST_TAGS)' -race -count=1 -timeout $(SHARD_TIMEOUT) -run "^($$tests)\$$" ./internal/mqtt/
 
 experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
 	go test -tags 'mqtt_fulltests mqtt_experimental_shared_qos2' ./internal/mqtt/

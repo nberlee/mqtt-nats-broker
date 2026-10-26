@@ -264,7 +264,7 @@ func wsPahoClient(t *testing.T, broker, id string, clean bool, h pmqtt.MessageHa
 // session resumed over WebSocket.
 func TestWSPahoV311(t *testing.T) {
 	t.Parallel()
-	_, wsAddr, _ := startWSBroker(t, nil)
+	_, wsAddr, s := startWSBroker(t, nil)
 	ws := "ws://" + wsAddr + "/mqtt"
 
 	sub := wsPahoClient(t, ws, "ws-sub", true, nil)
@@ -284,6 +284,15 @@ func TestWSPahoV311(t *testing.T) {
 		t.Fatal(tok.Error())
 	}
 	ps.Disconnect(100)
+	// As in TestWSPahoV5Session: "published while offline" is after the broker has
+	// processed the DISCONNECT. paho's quiesce does not guarantee that under load (CI met
+	// it), and a publish racing the teardown is the residual docs/CONFORMANCE.md states
+	// ("A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait").
+	for start := time.Now(); wsHasClient(s, "ws-persist"); time.Sleep(10 * time.Millisecond) {
+		if time.Since(start) > 10*time.Second {
+			t.Fatal("the disconnected session's connection is still registered")
+		}
+	}
 	mustPublish(t, pub, "ws/persist", 1, false, "while-offline")
 	got := make(chan string, 1)
 	wsPahoClient(t, ws, "ws-persist", false, func(_ pmqtt.Client, m pmqtt.Message) { got <- string(m.Payload()) })

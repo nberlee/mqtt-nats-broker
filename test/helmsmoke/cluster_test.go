@@ -199,14 +199,36 @@ func namespace(t *testing.T) string {
 }
 
 // install installs the chart (or the NATS chart archive) as a fresh release and waits
-// for every workload to be ready.
+// for every workload to be ready. The wait is the test's, not Helm's: Helm 4's watcher
+// reports a release failed as soon as a pod is in CrashLoopBackOff, and a broker container
+// crash-loops until its NATS is up (docs/CONFORMANCE.md, "Shared-pod startup is not
+// ordered"), while its legacy waiter also waits for LoadBalancer addresses kind never
+// assigns. Readiness of every replica, not the first restart, is what an install reaches.
 func install(t *testing.T, ns, release, chart string, values ...string) {
 	t.Helper()
-	args := []string{"install", release, chart, "-n", ns, "--wait", "--timeout", installTimeout.String()}
+	args := []string{"install", release, chart, "-n", ns}
 	for _, v := range values {
 		args = append(args, "-f", v)
 	}
 	helm(t, args...)
+	waitReady(t, ns)
+}
+
+// waitReady waits until every Deployment and StatefulSet in ns has observed its spec and
+// has all its replicas updated and ready.
+func waitReady(t *testing.T, ns string) {
+	t.Helper()
+	eventually(t, installTimeout, "every workload ready", func() error {
+		out := kubectl(t, "-n", ns, "get", "deployments,statefulsets", "-o",
+			`jsonpath={range .items[*]}{.kind}/{.metadata.name} {.metadata.generation} {.status.observedGeneration} {.spec.replicas} {.status.updatedReplicas} {.status.readyReplicas}{"\n"}{end}`)
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) != 6 || f[1] != f[2] || f[3] != f[4] || f[3] != f[5] {
+				return fmt.Errorf("not ready (name generation observed replicas updated ready): %s", line)
+			}
+		}
+		return nil
+	})
 }
 
 func natsChartArchive(t *testing.T) string {
@@ -229,11 +251,43 @@ func writeValues(t *testing.T, body string) string {
 	return file
 }
 
-// portForward forwards a local port to target's port and returns the local address.
-func portForward(t *testing.T, ns, target string, port int) string {
+// forward is a kubectl port-forward that reopens when it has ended. kubectl exits when
+// the connection to its pod breaks, and a broker container restarts while its NATS
+// starts (docs/CONFORMANCE.md, "Shared-pod startup is not ordered"), so a retry through
+// a forward opened before such a restart would reach nothing. Each retry asks Addr.
+type forward struct {
+	t      *testing.T
+	ns     string
+	target string
+	port   int
+	addr   string
+	ended  chan struct{}
+}
+
+// portForward forwards a local port to target's port.
+func portForward(t *testing.T, ns, target string, port int) *forward {
+	t.Helper()
+	f := &forward{t: t, ns: ns, target: target, port: port}
+	f.open()
+	return f
+}
+
+// Addr is the local address of a live forward, reopening it if kubectl has exited.
+func (f *forward) Addr() string {
+	f.t.Helper()
+	select {
+	case <-f.ended:
+		f.open()
+	default:
+	}
+	return f.addr
+}
+
+func (f *forward) open() {
+	t := f.t
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, env.kubectl, "-n", ns, "port-forward", "--address", "127.0.0.1", target, fmt.Sprintf(":%d", port))
+	cmd := exec.CommandContext(ctx, env.kubectl, "-n", f.ns, "port-forward", "--address", "127.0.0.1", f.target, fmt.Sprintf(":%d", f.port))
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+env.kubeconfig)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -244,8 +298,8 @@ func portForward(t *testing.T, ns, target string, port int) string {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cancel(); _ = cmd.Wait() })
 	addr := make(chan string, 1)
+	ended := make(chan struct{})
 	go func() {
 		re := regexp.MustCompile(`Forwarding from (127\.0\.0\.1:\d+)`)
 		sc := bufio.NewScanner(out)
@@ -258,13 +312,15 @@ func portForward(t *testing.T, ns, target string, port int) string {
 		if sc.Err() == nil {
 			_, _ = io.Copy(io.Discard, out)
 		}
+		_ = cmd.Wait()
+		close(ended)
 	}()
+	t.Cleanup(func() { cancel(); <-ended })
 	select {
 	case a := <-addr:
-		return a
+		f.addr, f.ended = a, ended
 	case <-time.After(30 * time.Second):
-		t.Fatalf("port-forward %s %d: %s", target, port, stderr.String())
-		return ""
+		t.Fatalf("port-forward %s %d: %s", f.target, f.port, stderr.String())
 	}
 }
 

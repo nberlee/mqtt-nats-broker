@@ -31,13 +31,21 @@ jobs:
         run: go test -race -count=1 ./...
 
   fulltests:
-    name: test (upstream suite)
+    name: test (upstream suite, shard ${{ matrix.shard }} of 8)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     # The mqtt_fulltests build: the upstream nats-server MQTT regression suite
     # and the broker's own tests that need its harness, run against the
     # standalone broker via an embedded nats-server (fulltests_harness_test.go).
     # Split from build-test since it's a large, separate suite; see
-    # CONTRIBUTING.md ("Test suites and build tags").
+    # CONTRIBUTING.md ("Test suites and build tags"). Under -race the whole suite in
+    # one process outlasts any reasonable timeout, so `make test-shard` runs every
+    # eighth listed test per job: the shards cover the list exactly once, and a new
+    # test lands in a shard with nothing to edit here.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -45,15 +53,20 @@ jobs:
           go-version: '1.26'
           cache: true
       - name: go vet
+        if: matrix.shard == 0
         run: go vet -tags mqtt_fulltests ./...
       - name: test
-        run: go test -tags mqtt_fulltests -race -count=1 ./internal/mqtt/
+        run: make test-shard TEST_TAGS=mqtt_fulltests SHARD=${{ matrix.shard }} SHARDS=8
 
   experimental-shared-qos2:
-    name: test (experimental shared QoS 2; non-gating)
+    name: test (experimental shared QoS 2, shard ${{ matrix.shard }} of 8; non-gating)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -61,7 +74,7 @@ jobs:
           go-version: '1.26'
           cache: true
       - name: test
-        run: go test -tags 'mqtt_fulltests mqtt_experimental_shared_qos2' -race -count=1 ./internal/mqtt/
+        run: make test-shard TEST_TAGS='mqtt_fulltests mqtt_experimental_shared_qos2' SHARD=${{ matrix.shard }} SHARDS=8
 
   cluster-failover:
     name: test (cluster Will failover)
@@ -406,7 +419,8 @@ jobs:
     # The two images publish to one repository; the embedded variant's tags carry a
     # suffix, including its `latest`. A flavor that dropped onlatest would let the
     # embedded job overwrite the external image's `latest`, so both tag sets are rendered
-    # for a sample release ref and compared.
+    # for a sample release ref and compared. latest=false: the sample lists `latest`
+    # itself, and on the default branch the action would add its automatic one beside it.
     runs-on: ubuntu-latest
     steps:
       - id: external
@@ -414,6 +428,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           context: workflow
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},value=v1.2.3
             type=semver,pattern={{major}}.{{minor}},value=v1.2.3
@@ -425,6 +441,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           context: workflow
           flavor: |
+            latest=false
             suffix=-embedded,onlatest=true
           tags: |
             type=semver,pattern={{version}},value=v1.2.3
