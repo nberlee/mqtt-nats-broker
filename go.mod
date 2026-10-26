@@ -3,7 +3,7 @@ module github.com/nberlee/mqtt-nats-broker
 go 1.26.5
 
 require (
-	github.com/KimMachineGun/automemlimit v1.0.0
+	github.com/KimMachineGun/automemlimit v1.0.1
 	github.com/eclipse/paho.golang v0.23.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/nats-io/jwt/v2 v2.8.2
