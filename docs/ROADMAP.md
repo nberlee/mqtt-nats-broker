@@ -9993,10 +9993,19 @@ reads](findings/resolved.md#f-054).
 
 ### Release documentation
 
-- [ ] Remove the pre-release changelog before the first alpha.
+- [x] Remove the pre-release changelog before the first alpha. **Done 2026-10-26.** The
+  development-only `CHANGELOG.md`, one `[Unreleased]` section covering every pre-release
+  change, is deleted with no redirect stub; git keeps its history. Nothing in the tree read
+  it. Finished roadmap narrative and `docs/findings/` keep their mentions of it as written.
 
 - [ ] Start a changelog with the first published alpha, or generate release
-  notes from Git history and pull requests.
+  notes from Git history and pull requests. **Decided 2026-10-26: a hand-written
+  changelog.** `CHANGELOG.md` in Keep a Changelog format starts again with a versioned,
+  dated entry for the first published alpha, committed before the alpha tag so the tagged
+  source carries it. The GitHub release body is that entry, copied at release time:
+  `.github/workflows/release.yml` sets no body and generates none. Generated release notes
+  are not adopted, because GitHub builds them from merged pull requests and this
+  repository's history is direct commits. Open until the alpha is published.
 
 - [x] Replace the README's duplicate roadmap with a short link to this file.
 
