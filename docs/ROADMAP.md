@@ -9405,21 +9405,42 @@ reads](findings/resolved.md#f-054).
   the tree before it: the CI failure was not reproduced) and left the Paho baseline. 26
   mutations each fail their paired test.
 
-- [ ] **Raise the per-subscriber delivery ceiling: change the delivery protocol, not its
+- [x] **Raise the per-subscriber delivery ceiling: change the delivery protocol, not its
   tuning.** Filed 2026-10-26 by the item above, whose residual it is, at the user's
-  direction. After that item a QoS 1 subscriber still receives a backlog at about 6-8
-  msg/s against several hundred for stock nats-server's MQTT listener on the same
-  storage: every delivery is admitted through the outbound obligation authority one at a
-  time per subscription, each admission reads about 50 records, writes three atomic
-  batches and re-reads at the write boundary, and every admission CASes the client's one
-  authority record, which the previous delivery's acknowledgement also rewrites, so
-  nearly every first attempt loses and waits 10-25 ms; duty reads still grow through a
-  burst because the floor yields to deliveries. Deliverable: a design that admits
-  several deliveries per subscription concurrently (or several in one batch) and drops
-  the re-reads the write boundary does not need, keeping every invariant
-  docs/ARCHITECTURE.md states for the authority, measured with `make bench-outbound`
-  against the rows in [the
-  record](findings/nats-platform.md#outbound-delivery-throughput-2026-10-26).
+  direction. After that item a QoS 1 subscriber still received a backlog at about 6-8
+  msg/s: every admission CASed the client's one authority record, which the previous
+  delivery's acknowledgement also rewrote, and the source consumer's resource record, from
+  which that acknowledgement released its hold, so nearly every first attempt lost and
+  waited 10-25 ms; and every admission read every duty of its generation's unreclaimed
+  span. Deliverable, as revised by consult 2 (2026-10-27) after measured spikes: the
+  protocol-local changes that remove the per-delivery losses and the O(span) walk, with
+  about 2x sustained backlog throughput as the acceptance gate; concurrent or batched
+  admission per subscription is the next bullet, because it changes the ordering carrier.
+  Done 2026-10-27: a completion writes no authority record (one exception, the retained
+  abandoned-origin PUBREC arrow, keeps the fence its closure read needs); an
+  acknowledgement ending leaves its holds release-owed, recorded durably by its still
+  pending delivery duty and released by an authority-free `release-holds` batch (the
+  session's releaser, the floor, the executors, or the retirement waiting on them); and
+  the identifier walk caches each duty position's validated identity, never its state (a
+  stated contract change: a corrupted cached duty is not re-detected by that walk).
+  Measured with `make bench-outbound`: QoS 1 burst of 500 at 17.6 / 18.6 msg/s standalone
+  / R3 (from 6.2 / 8.0), QoS 2 at 10.3 / 13.6 (from 5.5 / 7.4), four subscribers 43.0 /
+  101.3 in aggregate (from 30.6 / 45.4), at rest 20.9 / 29.3 (from 11.0 / 12.8). Record:
+  [Outbound delivery
+  protocol](findings/nats-platform.md#outbound-delivery-protocol-2026-10-27), residual in
+  `docs/CONFORMANCE.md`.
+- [ ] **Admit several deliveries per subscription in one batch.** Filed 2026-10-27 by the
+  item above (consult 2's L3), whose residual it is. One subscriber still receives a backlog
+  at 10-30 msg/s because a subscription's deliveries are admitted one at a time, each
+  admission a full atomic batch with its own reads and boundary re-checks, and a QoS 2
+  delivery still loses about two attempts to its PUBREL acquisition's authority CAS.
+  Deliverable (consult 1's conditions): a bounded offer queue per subscription with one
+  ordered admission batch in flight, a bounded flush delay, and Receive Maximum,
+  identifier, memory and batch limits; per-(Topic, QoS) order carried through allocation,
+  acquisition and socket dispatch across batches; a stale-only failure keeps the whole
+  batch's place under the contention extension; ambiguous attempts settled before a retry
+  or a split; every per-obligation check kept, intra-batch conflicts included. Measured
+  against the rows above.
 
 ### NATS platform follow-ups
 

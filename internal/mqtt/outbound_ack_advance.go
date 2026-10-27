@@ -20,7 +20,7 @@ import (
 )
 
 // The acknowledgement-driven advance (F-105 row 3): one CLIENT ACKNOWLEDGEMENT moves the
-// exchange's phase AND re-phases the durable in-flight slot, in ONE atomic authority batch.
+// exchange's phase AND re-phases the durable in-flight slot, in ONE atomic batch.
 //
 // # Two records, one fact, one batch
 //
@@ -45,7 +45,9 @@ import (
 // An acknowledgement observes output that was already authorised, so this records no new work
 // and needs no current entitlement — and a CLOSED generation's obligation must still reach its
 // end under whoever serves now (TestF105ClosedGenerationsObligationStillEnds). That is why the
-// op contends on the STANDING authority and why the register-member generation may lag the
+// op reads the STANDING authority only for the ownership its receipt records, and writes none
+// (mqttAttemptAuthorityFree: its members are fenced by their own CAS; the one exception is
+// mqttFenceAdvanceOnAuthority's), and why the register-member generation may lag the
 // transition's own, exactly as the exchange member's may.
 
 // mqttAdvanceExchangeAckRequest names one acknowledgement's advance of an obligation.
@@ -371,6 +373,12 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 			}
 			retainedExtra = append(retainedExtra, mqttTransitionMember{
 				subj: mqttManifestSubject(idHash, r.Manifest.Gen, r.Manifest.Payload), expect: r.ManifestSeq, body: mb})
+		} else {
+			// THE ABANDONED-ORIGIN ARROW HAS NO MATERIAL TO FENCE ON. The boundary refuses it in a
+			// Discarded generation by reading the closure, and only the authority CAS makes that
+			// read atomic with the batch: a Discard moves the authority, so one landing after the
+			// read fails this batch (consult 103 2c). The one advance that is not authority-free.
+			mqttFenceAdvanceOnAuthority(tr, prev, prevSeq)
 		}
 	}
 	if verr := mqttValidateInflightShape(&next); verr != nil {
@@ -425,8 +433,12 @@ func (jsa *mqttJSA) opAdvanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (mqtt
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}
-	if herr := jsa.appendHoldReleases(tr, cur, r.To); herr != nil {
-		return mqttOpOutcome{}, herr
+	// AN ACKNOWLEDGEMENT ENDING LEAVES ITS HOLDS RELEASE-OWED (outbound_release_holds.go), except
+	// an abandoned delivery's, whose duty no longer stands pending to carry the debt.
+	if mqttCompletionReleasesInBatch(cur) {
+		if herr := jsa.appendHoldReleases(tr, cur, r.To); herr != nil {
+			return mqttOpOutcome{}, herr
+		}
 	}
 	return jsa.commitOp(tr)
 }
@@ -497,8 +509,8 @@ func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (m
 	// Whatever the advance's outcome — landed, lost, refused — the exchange MAY have ended, so
 	// its custody is observed. The hint never releases; the exchange's own phase does.
 	defer sess.hintCustody(r.Gen, r.Nonce)
-	// An ending releases its holds in its own batch, which is what a disposed consumer's
-	// retirement waits for: a hint, each step re-reads (F-105 7c-lc).
+	// An abandoned delivery's ending releases its holds in its own batch, which is what a
+	// disposed consumer's retirement waits for: a hint, each step re-reads (F-105 7c-lc).
 	defer sess.wakeSourceRetirements()
 	write := func() (mqttOpOutcome, error) { return sess.jsa.opAdvanceExchangeAck(r) }
 	if as := sess.asm; as != nil {
@@ -506,10 +518,22 @@ func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (m
 		hook := as.testAckAdvance
 		as.mu.RUnlock()
 		if hook != nil {
-			return hook(r, write)
+			return sess.noteAckEnding(r.Gen, r.Nonce, r.To)(hook(r, write))
 		}
 	}
-	return write()
+	return sess.noteAckEnding(r.Gen, r.Nonce, r.To)(write())
+}
+
+// noteAckEnding passes an acknowledgement advance's result through, noting a landed ending for
+// the session's releaser (outbound_release_holds.go). A landing hidden behind a lost response is
+// not noted: its pending duty carries the release to the floor and the executors.
+func (sess *mqttSession) noteAckEnding(gen, nonce string, to mqttExchangePhase) func(mqttOpOutcome, error) (mqttOpOutcome, error) {
+	return func(out mqttOpOutcome, err error) (mqttOpOutcome, error) {
+		if err == nil && mqttExchangeReleasesHolds(to) {
+			sess.noteReleaseOwed(gen, nonce)
+		}
+		return out, err
+	}
 }
 
 // mqttCompleteExchangeDrainRequest names one PUBREL holder's drain of a pending-drain
@@ -609,8 +633,11 @@ func (jsa *mqttJSA) opCompleteExchangeDrain(r *mqttCompleteExchangeDrainRequest)
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}
-	if herr := jsa.appendHoldReleases(tr, cur, mqttExchangeTerminal); herr != nil {
-		return mqttOpOutcome{}, herr
+	// Release-owed, as the acknowledgement's ending (opAdvanceExchangeAck).
+	if mqttCompletionReleasesInBatch(cur) {
+		if herr := jsa.appendHoldReleases(tr, cur, mqttExchangeTerminal); herr != nil {
+			return mqttOpOutcome{}, herr
+		}
 	}
 	return jsa.commitOp(tr)
 }
@@ -630,8 +657,8 @@ func (sess *mqttSession) completeExchangeDrain(r *mqttCompleteExchangeDrainReque
 		hook := as.testDrainComplete
 		as.mu.RUnlock()
 		if hook != nil {
-			return hook(r, write)
+			return sess.noteAckEnding(r.Gen, r.Nonce, mqttExchangeTerminal)(hook(r, write))
 		}
 	}
-	return write()
+	return sess.noteAckEnding(r.Gen, r.Nonce, mqttExchangeTerminal)(write())
 }

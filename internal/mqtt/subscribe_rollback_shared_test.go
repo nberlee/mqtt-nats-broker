@@ -534,7 +534,11 @@ func TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership(t *testing.T
 	var sharedAtRelease, uncertainAtRelease, sampled atomic.Bool
 
 	restoreRelease := setMQTTTestRecordTxReleaseHook(func(hs *mqttSession) {
-		if hs != sess || !sampled.CompareAndSwap(false, true) {
+		// THE ROLLBACK'S OWN TRANSACTION, by the save ordinal (as T6 gates on its own): any
+		// earlier record transaction of this session — the eager membership write's, or one a
+		// loaded run schedules ahead of it — releases with no uncertainty armed, and sampling it
+		// reported the definite arm (intermittent under shard load).
+		if hs != sess || saves.Load() < 3 || !sampled.CompareAndSwap(false, true) {
 			return
 		}
 		_, ok := hs.sharedSubs[sharedKey]

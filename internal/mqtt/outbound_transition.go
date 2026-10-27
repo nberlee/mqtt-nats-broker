@@ -215,6 +215,11 @@ func (jsa *mqttJSA) classifyAgainstOutcome(a *mqttTransitionAttempt, wantDigest 
 	if wantDigest != o.Digest {
 		return mqttTransitionUnresolved
 	}
+	// AN AUTHORITY-FREE ATTEMPT installed no ownership, so nothing about it can have been
+	// superseded: a committed receipt whose digest matches is final.
+	if mqttAttemptAuthorityFree(a.Kind, a.Rev) {
+		return mqttTransitionLanded
+	}
 	al := jsa.loadOutboundAuthority(a.ID, a.Epoch)
 	if al.status != mqttOutboundValid {
 		return mqttTransitionUnresolved
@@ -321,25 +326,35 @@ type mqttAuthorityTransition struct {
 // needing one loads that subject authoritatively, exactly as the pair writer does for its
 // marker.
 func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint64, error) {
-	if t == nil || t.Auth == nil || t.Attempt == nil {
-		return 0, fmt.Errorf("unreachable: an authority transition with no attempt or authority")
+	if t == nil || t.Attempt == nil {
+		return 0, fmt.Errorf("unreachable: an authority transition with no attempt")
 	}
 	a := t.Attempt
 	if verr := mqttValidateTransitionAttempt(a); verr != nil {
 		return 0, fmt.Errorf("refusing to commit an unsupported transition attempt: %w", verr)
 	}
 	idHash := getHash(a.ID)
+	// AN AUTHORITY-FREE ATTEMPT writes no authority, names no predecessor and proposes no
+	// revision; every other attempt writes the authority. Each shape is refused for the other.
+	free := mqttAttemptAuthorityFree(a.Kind, a.Rev)
+	if free != (t.Auth == nil) || (free && (t.Prev != nil || t.PrevSeq != 0 || t.Closure != nil)) {
+		return 0, fmt.Errorf("transition %q of kind %q carries an authority %v and a predecessor %v: an "+
+			"authority-free attempt carries neither, and every other attempt carries its authority",
+			a.Txn, a.Kind, t.Auth != nil, t.Prev != nil)
+	}
 
 	// THE WRITE BOUNDARY VALIDATES. Every transition funnels through here, so this is the
 	// only place the claim "no unsupported shape is ever written" can be true.
-	if verr := mqttValidateOutboundAuthority(t.Auth, a.ID, a.Epoch); verr != nil {
-		return 0, fmt.Errorf("refusing to commit a transition with an unsupported authority: %w", verr)
+	if !free {
+		if verr := mqttValidateOutboundAuthority(t.Auth, a.ID, a.Epoch); verr != nil {
+			return 0, fmt.Errorf("refusing to commit a transition with an unsupported authority: %w", verr)
+		}
 	}
 
 	// The authority this transition installs must be the ownership its attempt described,
 	// or the permanent receipt would describe a mutation that never happened.
-	if t.Auth.Rev != a.Rev || t.Auth.Gen != a.Gen || t.Auth.Tenure != a.Tenure ||
-		t.Auth.OwnerTxn != a.OwnerTxn || t.Auth.Txn != a.Txn {
+	if !free && (t.Auth.Rev != a.Rev || t.Auth.Gen != a.Gen || t.Auth.Tenure != a.Tenure ||
+		t.Auth.OwnerTxn != a.OwnerTxn || t.Auth.Txn != a.Txn) {
 		return 0, fmt.Errorf("transition %q installs %d/%q/%q/%q but its attempt proposed %d/%q/%q/%q",
 			a.Txn, t.Auth.Rev, t.Auth.Gen, t.Auth.Tenure, t.Auth.OwnerTxn, a.Rev, a.Gen, a.Tenure, a.OwnerTxn)
 	}
@@ -369,8 +384,10 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	// a storage expectation proves nothing about what it displaced: the sequence moves for
 	// completions that change no ownership, so without this a transition could install any
 	// revision over any predecessor.
-	switch a.Rev {
-	case 1:
+	switch {
+	case free:
+		// No predecessor: nothing about the authority is displaced or fenced.
+	case a.Rev == 1:
 		if t.Prev != nil || t.PrevSeq != 0 {
 			return 0, fmt.Errorf("a first admission of %q names a predecessor", a.ID)
 		}
@@ -417,7 +434,10 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	if derr != nil {
 		return 0, derr
 	}
-	authBody, _ := json.Marshal(t.Auth)
+	var authBody []byte
+	if !free {
+		authBody, _ = json.Marshal(t.Auth)
+	}
 
 	var closureBody []byte
 	if t.Closure != nil {
@@ -605,8 +625,11 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 
 		// Member 1 is the outcome, create-only. Then the closure, also create-only. Then what
 		// the transition authorizes. The authority is last and carries the commit flag, so the
-		// PubAck names it.
+		// PubAck names it; an authority-free batch has no authority, and its last member commits.
 		total := 2 + len(t.Extra)
+		if free {
+			total--
+		}
 		if closureBody != nil {
 			total++
 		}
@@ -621,10 +644,17 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if closureBody != nil {
 			add(mqttGenClosureSubject(idHash, t.Closure.Gen), 0, closureBody, false)
 		}
-		for _, e := range t.Extra {
-			add(e.subj, e.expect, e.body, false)
+		if free {
+			// The last member commits the batch: there is no authority to carry the commit.
+			for i, e := range t.Extra {
+				add(e.subj, e.expect, e.body, i == len(t.Extra)-1)
+			}
+		} else {
+			for _, e := range t.Extra {
+				add(e.subj, e.expect, e.body, false)
+			}
+			add(authSubject, t.PrevSeq, authBody, true)
 		}
-		add(authSubject, t.PrevSeq, authBody, true)
 
 		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
 		if err != nil {
@@ -930,6 +960,23 @@ func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransit
 	return nil
 }
 
+// mqttKindMayOmitAuthority reports the kinds that may run AUTHORITY-FREE: a completion of an
+// exchange already admitted, which a client's answer drives across tenures and which every
+// member it writes fences by its own CAS. Every other kind writes the authority.
+//
+// May, not must: a completion whose batch needs the authority CAS as a fence carries it
+// (mqttFenceAdvanceOnAuthority). Which shape an attempt has is its revision: zero proposes none
+// (mqttAttemptAuthorityFree).
+func mqttKindMayOmitAuthority(k mqttTransitionKind) bool {
+	return k == mqttTransitionAdvanceExchange || k == mqttTransitionReleaseHolds
+}
+
+// mqttAttemptAuthorityFree reports an attempt that writes no authority record, proposes no
+// revision and displaces no predecessor.
+func mqttAttemptAuthorityFree(k mqttTransitionKind, rev uint64) bool {
+	return rev == 0 && mqttKindMayOmitAuthority(k)
+}
+
 // mqttKindCarriesMembers reports whether a transition kind may carry obligation members at all.
 //
 // A CLOSED SET, stated once, because five kinds enumerated what they may carry and five said
@@ -948,7 +995,7 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 		mqttTransitionProvisionResource, mqttTransitionDisposeResource,
 		mqttTransitionMaterializePayload, mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery,
 		mqttTransitionTombstoneRegister, mqttTransitionRebindCanonical, mqttTransitionDiscardExchange,
-		mqttTransitionAdvanceFloor:
+		mqttTransitionAdvanceFloor, mqttTransitionReleaseHolds:
 		return true
 	}
 	return false
@@ -959,10 +1006,11 @@ func mqttKindCarriesMembers(k mqttTransitionKind) bool {
 // changes nothing on the authority but its revision — not its state, not its ownership, not
 // either pending proposal, and it writes no closure.
 //
-// One statement for the kinds that share it (advance-exchange, withdraw-unsent), because a kind
-// exempt from the serving requirement that could move ownership or state would be a route for
-// taking over a generation under a closed authority, and two copies of the rule are how one of
-// them loses a clause.
+// One statement for the kinds that share it (withdraw-unsent and the other endings;
+// advance-exchange is authority-free and writes no authority at all), because a kind exempt from
+// the serving requirement that could move ownership or state would be a route for taking over a
+// generation under a closed authority, and two copies of the rule are how one of them loses a
+// clause.
 func mqttCheckEndingPreservesAuthority(t *mqttAuthorityTransition, what string) error {
 	if t.Prev == nil {
 		return fmt.Errorf("%s transition requires a predecessor", what)
@@ -1237,12 +1285,16 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 
 	case mqttTransitionAdvanceExchange:
-		// Permitted under ANY predecessor state, including CLOSED, because an obligation of
-		// a closed generation must still be able to end. Like dispose-resource it preserves
-		// ownership, state and both pending proposals exactly; unlike it, what it carries is
-		// exchanges rather than resources, and it carries at least one.
-		if err := mqttCheckEndingPreservesAuthority(t, "an advance-exchange"); err != nil {
-			return err
+		// Permitted under ANY authority state, including CLOSED, because an obligation of a
+		// closed generation must still be able to end. Normally AUTHORITY-FREE
+		// (mqttAttemptAuthorityFree): it writes no authority at all, so it can neither move
+		// ownership nor rewrite a pending proposal. Fenced on the authority
+		// (mqttFenceAdvanceOnAuthority), it preserves ownership, state and both pending proposals
+		// exactly, as every ending does. It carries at least one exchange.
+		if t.Auth != nil {
+			if err := mqttCheckEndingPreservesAuthority(t, "an advance-exchange"); err != nil {
+				return err
+			}
 		}
 		if len(t.Extra) == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange")
@@ -1294,6 +1346,31 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 		if exchanges == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange to advance")
+		}
+
+	case mqttTransitionReleaseHolds:
+		// AUTHORITY-FREE, ALWAYS, and ONLY EDGE REMOVALS AND DUTY RESOLUTIONS. It releases what
+		// endings already earned: each resource member is confined by checkResourceOverwrites to
+		// removing hold edges of obligations the store shows ended, and each duty member by
+		// checkDutyEndingIsEarned. It creates nothing, so no member is create-only.
+		if t.Auth != nil || t.Prev != nil {
+			return fmt.Errorf("a release-holds transition carries an authority: it writes none")
+		}
+		if len(t.Extra) == 0 {
+			return fmt.Errorf("a release-holds transition carries nothing to release or resolve")
+		}
+		for _, e := range t.Extra {
+			if e.expect == 0 {
+				return fmt.Errorf("a release-holds transition carries member %q create-only: it creates nothing", e.subj)
+			}
+			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+				continue
+			}
+			if mqttIsDutySubject(e.subj) {
+				continue
+			}
+			return fmt.Errorf("a release-holds transition carries member %q, which is neither a resource "+
+				"whose released holds it removes nor a duty it resolves", e.subj)
 		}
 
 	case mqttTransitionDiscardExchange:
@@ -1747,12 +1824,16 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 // a batch member, and omitting it made a transition with a closure and one without produce
 // the same digest.
 func mqttTransitionMutationDigest(t *mqttAuthorityTransition) (string, error) {
-	if t == nil || t.Attempt == nil || t.Auth == nil {
-		return _EMPTY_, fmt.Errorf("unreachable: digesting a transition with no attempt or authority")
+	if t == nil || t.Attempt == nil || (t.Auth == nil) != mqttAttemptAuthorityFree(t.Attempt.Kind, t.Attempt.Rev) {
+		return _EMPTY_, fmt.Errorf("unreachable: digesting a transition with no attempt, or with an authority its kind does not carry")
 	}
-	authBody, err := json.Marshal(t.Auth)
-	if err != nil {
-		return _EMPTY_, err
+	var authBody []byte
+	if t.Auth != nil {
+		b, err := json.Marshal(t.Auth)
+		if err != nil {
+			return _EMPTY_, err
+		}
+		authBody = b
 	}
 	members := make([]mqttTransitionMember, 0, len(t.Extra)+1)
 	if t.Closure != nil {
@@ -1973,9 +2054,9 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 // its own name. That is what stops a transition installing a well-named obligation whose
 // contents belong to something else.
 // mqttKindEndsEarlierGeneration reports whether a kind may carry a register or exchange member of
-// a generation other than the attempt's: the two kinds that END an existing obligation, because a
-// G1 obligation must reach its end while G2 serves and only the current authority's CAS can
-// succeed. Each is bound by its own member rules — the advance by checkAckPhaseAdvanceMembers,
+// a generation other than the attempt's: the kinds that END an existing obligation, because a
+// G1 obligation must reach its end while G2 serves (an advance writes no authority at all,
+// mqttAttemptAuthorityFree; the others CAS only the current one). Each is bound by its own member rules — the advance by checkAckPhaseAdvanceMembers,
 // the withdrawal by its kind arm (one register and one exchange of ONE obligation, same
 // generation) and by the boundary's withdrawal rule — so no arbitrary earlier-generation member
 // rides on the exemption.
@@ -2071,7 +2152,10 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls
 		// AND AN ENDING KIND'S HOLD RELEASE names its obligation's own generation, which is an
 		// earlier one when a G1 obligation ends while G2 serves (F-105 7c-lc, P-4); what such a
 		// member may change is confined by checkResourceOverwrites.
-		if a.Kind != mqttTransitionDisposeResource && !mqttKindEndsEarlierGeneration(a.Kind) &&
+		// And a release-holds batch, which releases finished history of any generation as
+		// dispose-resource disposes it (confined by checkResourceOverwrites to ended holds).
+		if a.Kind != mqttTransitionDisposeResource && a.Kind != mqttTransitionReleaseHolds &&
+			!mqttKindEndsEarlierGeneration(a.Kind) &&
 			toks[2] != a.Gen && !(closureGen != _EMPTY_ && toks[2] == closureGen) {
 			return fmt.Errorf("transition %q carries resource %q, which names generation %q rather than %q",
 				a.Txn, e.subj, toks[2], a.Gen)
@@ -3187,6 +3271,12 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		// A HOLD-RELEASING move: an ending, or the generation's discard (F-105 7d), which releases
 		// holds without being an identifier ending.
 		if prev, known := xchPred[e.subj]; known && !mqttExchangeReleasesHolds(prev) && mqttExchangeReleasesHolds(x.Phase) {
+			// AN ACKNOWLEDGEMENT ENDING LEAVES ITS HOLDS RELEASE-OWED (mqttCompletionReleasesInBatch):
+			// their release is a later release-holds batch's, so it is not in endedHere, and a
+			// release of them in this batch is refused like any release without its ending.
+			if a.Kind == mqttTransitionAdvanceExchange && !mqttCompletionReleasesInBatch(x) {
+				continue
+			}
 			endedHere[toks[2]+"."+toks[3]] = x
 		}
 	}
@@ -3388,7 +3478,27 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		retained := func(r *mqttOutboundResource, nonce string) error {
 			return jsa.retainedMaterialNoLongerNeeded(a, r, nonce)
 		}
-		if err := mqttCheckResourceStep(a, cur, next, createdHere, endedHere, terminal, sealable, ownedLive, retained); err != nil {
+		// A RELEASE-HOLDS BATCH releases what STORED endings earned: the obligations whose hold
+		// edges it removes are read here, and only one standing at a hold-releasing phase is
+		// released for. An ending is absorbing, so a read that says ended still says ended at the
+		// commit; a removal whose obligation does not read ended is left out of the map and
+		// refused by the step.
+		releasable := endedHere
+		if a.Kind == mqttTransitionReleaseHolds {
+			releasable = map[string]*mqttOutboundExchange{}
+			_, removedR, _ := mqttResourceEdgeChanges(cur, next)
+			for _, ed := range removedR {
+				if !mqttHoldRole(ed.Role) || !mqttResourceLogicalUseKind(cur.Kind) {
+					return fmt.Errorf("transition %q of kind %q removes %s from resource %q: a release-holds "+
+						"batch releases hold edges and nothing else", a.Txn, a.Kind, ed, cur.Inc)
+				}
+				if x, _, xerr := jsa.loadOutboundExchange(a.ID, a.Epoch, gen, ed.Nonce); xerr == nil && x != nil &&
+					mqttExchangeReleasesHolds(x.Phase) {
+					releasable[gen+"."+ed.Nonce] = x
+				}
+			}
+		}
+		if err := mqttCheckResourceStep(a, cur, next, createdHere, releasable, terminal, sealable, ownedLive, retained); err != nil {
 			return err
 		}
 		if cur.State == mqttResourceDeleteAuthorized && next.State == mqttResourceCleanupComplete {
@@ -3427,7 +3537,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 					"dependents: outside a dispose-resource transition a resource member is an edge change",
 					a.Txn, a.Kind, cur.Inc)
 			}
-			if mqttKindEndsEarlierGeneration(a.Kind) && len(addedE) != 0 {
+			if (mqttKindEndsEarlierGeneration(a.Kind) || a.Kind == mqttTransitionReleaseHolds) && len(addedE) != 0 {
 				return fmt.Errorf("transition %q of kind %q mutates resource %q other than by releasing "+
 					"the holds of an obligation it ends", a.Txn, a.Kind, cur.Inc)
 			}
@@ -3449,9 +3559,12 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 				a.Txn, nonce, x.Holds, addedHolds[nonce])
 		}
 	}
-	// AND EVERY OBLIGATION THIS BATCH ENDS RELEASES EVERY HOLD IT HAS, IN THIS BATCH. The ending and
-	// the release are one fact: committed apart, a crash between them leaves an ended obligation
-	// pinning a consumer no later act is entitled to free (no stored-ended release is admitted).
+	// AND EVERY OBLIGATION THIS BATCH ENDS RELEASES EVERY HOLD IT HAS, IN THIS BATCH — except an
+	// acknowledgement ending, which leaves them RELEASE-OWED (never in endedHere): its
+	// delivery duty stays pending until a release-holds batch has released them, so the release
+	// is a durable, discoverable debt rather than a crash window (outbound_release_holds.go). An
+	// ending committed apart from its release with no such duty would pin a consumer no later
+	// act is entitled to free, which is why every other ending still releases here.
 	for key, x := range endedHere {
 		for _, h := range x.Holds {
 			if !releasedHolds[key][h] {
@@ -3561,12 +3674,15 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 			a.Txn, cur.Inc, derr)
 	}
 	// A HOLD RELEASE IS ITS EXCHANGE'S ENDING'S, AND ONLY THAT (F-105 7c-lc). The source-replay and
-	// canonical-PUBREL edges of a name-owned consumer are released IN THE BATCH that moves their
-	// exchange into an ending — never later against a stored ending, never earlier. So these
-	// removals are judged against endedHere, the endings THIS batch makes (S-xor-Delta: the batch
-	// is atomic, and the stored exchange is the state before it), and several may leave one record
-	// in one act: each is its own obligation's ending, proven separately. Every other role keeps
-	// the single-edge rule and its own evidence below.
+	// canonical-PUBREL edges of a name-owned consumer are released either IN THE BATCH that moves
+	// their exchange into an ending that releases there, or by a release-holds batch once the
+	// store shows the exchange ended (an acknowledgement ending leaves them release-owed,
+	// outbound_release_holds.go) — never earlier. The caller passes, as endedHere, exactly the
+	// endings that license a release in this batch: the endings THIS batch makes (S-xor-Delta: the
+	// batch is atomic, and the stored exchange is the state before it), or for release-holds the
+	// stored endings it read. Several may leave one record in one act: each is its own
+	// obligation's ending, proven separately. Every other role keeps the single-edge rule and its
+	// own evidence below.
 	var holdRemoved, otherRemoved []mqttResourceEdge
 	for _, e := range removedAll {
 		if mqttHoldRole(e.Role) && mqttResourceLogicalUseKind(cur.Kind) {
@@ -3591,8 +3707,9 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		x := endedHere[cur.Gen+"."+h.Nonce]
 		if x == nil {
 			return fmt.Errorf("transition %q releases %s from resource %q, but this batch does not "+
-				"move that obligation into an ending: a source or canonical-PUBREL edge is released "+
-				"by its exchange's ending, in the same batch, and by nothing else", a.Txn, h, cur.Inc)
+				"move that obligation into an ending that releases in its own batch, and it is not a "+
+				"release-holds batch over a stored ending: a source or canonical-PUBREL edge is "+
+				"released by nothing else", a.Txn, h, cur.Inc)
 		}
 		held := false
 		for _, xh := range x.Holds {

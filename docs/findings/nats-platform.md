@@ -1192,3 +1192,121 @@ failed-confirmation retention, the set's keying and both bounds, the decline's
 dependence on the record, the hand-back; the claim's attempts, its ownership re-read,
 its abort, its entitlement rule; the extension, its qualification, its connection check
 and the classifier). The decline's explicit drain exclusion has no discriminating test.
+
+## Outbound delivery protocol (2026-10-27)
+
+The section 2 roadmap item "Raise the per-subscriber delivery ceiling" is recorded here,
+measured against the rows above (21eca60). Scope came from two consults on measured
+spikes in a throwaway worktree: on the burst of 500, dropping the acknowledgement's
+authority member and moving its hold release out of its batch raised 6.4 to 7.8 msg/s
+(19.7 against 11.1 on a burst of 60, every admission loss gone), and adding a cache of the
+identifier walk's validated duty identities raised it to 15.0 msg/s, with duty reads per
+delivery falling from about 530 to 32. Concurrent or batched admission per subscription
+changes the ordering carrier and is the next roadmap bullet.
+
+### Where the losses came from
+
+At a small span, per delivery: three authority transitions (admission, acquisition,
+acknowledgement), and each admission lost its first attempt. By record, those losses were
+mostly on the SOURCE RESOURCE (32 of 59; the acknowledgement released its hold edge on the
+record the next admission adds its edge to), then a store CAS (26), and the authority
+record itself only once: the authority was not the main contended record, the resource was.
+
+### What changed
+
+Each in docs/ARCHITECTURE.md:
+
+- **A completion writes no authority record.** The acknowledgement advance and the drain
+  completion are authority-free: no authority member, revision 0, a receipt that resolves
+  LANDED and final. Implementation finding: the retained abandoned-origin PUBREC arrow
+  creates a canonical PUBREL with no material to CAS, and its refusal in a Discarded
+  generation is a closure read made atomic only by the authority CAS (consult 103); it
+  keeps the authority, reinstalled exactly, and the boundary refuses it without. An audit
+  of every other read the boundary makes for an advance found each fenced by a member's own
+  CAS.
+- **An acknowledgement ending leaves its holds release-owed.** The release is an
+  authority-free `release-holds` batch over the stored ending; the debt is durable because
+  the delivery duty may not be written terminal while a hold of its ended exchange is
+  listed. The session's releaser runs at 16 owed or 200 ms; the floor, the recovery and
+  discard executors and the source retirement release through the same composer.
+- **The identifier walk caches validated duty identities, never state**, scoped by client,
+  epoch, generation and ordinal, bounded, pruned below the floor and version-guarded. Stated
+  contract change: a corrupted cached duty is not re-detected by the walk.
+
+### Measured, stage by stage
+
+`make bench-outbound`, the burst cases (standalone / R3, msg/s; contention waits per run
+standalone in brackets):
+
+| Stage | QoS 1, one subscriber, 500 | QoS 2, one subscriber, 200 |
+|---|---|---|
+| 21eca60 | 6.2 / 8.0 [498] | 5.5 / 7.4 [-] |
+| completion authority-free | 6.4 / 8.9 [498] | 7.6 / 10.8 [659] |
+| and release-owed holds | 10.4 / 13.9 [6] | 9.3 / 9.2 [558] |
+| and the identity cache | 17.6 / 18.6 [13] | 10.3 / 13.6 [509] |
+
+The completion alone moved the QoS 1 case little: its admissions then lost to the resource
+record instead. The release-owed holds removed that, and the cache removed the walk's
+growth (requests per delivery on the 500 burst: 744, 376, 105). QoS 2 still loses about two
+attempts per delivery to its PUBREL acquisition, which CASes the authority the next
+admission CASes.
+
+Full run with all three (every row held its oracle; no duplicate):
+
+| Case | Standalone | R3 | Requests per delivery (standalone) |
+|---|---|---|---|
+| QoS 1, one subscriber, 500 | 17.6 msg/s (21-26 to 13 per 50) | 18.6 msg/s | 105 |
+| QoS 2, one subscriber, 200 | 10.3 msg/s | 13.6 msg/s | 185 |
+| QoS 1, four subscribers, 200 each | 43.0 msg/s aggregate | 101.3 msg/s aggregate | 140 |
+| QoS 1, 20 at rest after 300 | 20.9 msg/s | 29.3 msg/s | 114 |
+
+Mutations, each run and each failing its paired test: 17 (the completion written with the
+authority again; its receipt classified against the authority's revision; the abandoned
+arrow's fence dropped by the composer and its boundary guard removed; the completion
+releasing in its batch again; the releaser idle; a release accepted without a stored
+ending; the inventory's resolution kept on the authority path; the duty judged on stored
+resources only, on the batch's resources only, and without its holds; the retirement
+waiting instead of releasing; the boundary accepting a completion's in-batch release; the
+walk's highest-seen shortcut, a cached exchange, no prune, and an unguarded fill). The
+highest-seen shortcut is caught as an uncertain position (the walk refuses), not as a
+missed holder.
+
+Plan tests not written, stated rather than implied: the retained QoS 2 PUBREC against
+cleanup and takeover with a lost commit response (the retained arrows' existing suites ran
+green instead), and the audit that every caller of an advance's returned sequence re-reads
+the register's (done by reading every caller, not by a test). Written beyond the plan: the
+abandoned arrow's fence (both halves), racing releasers, a lost release response, a pending
+drain's release refused, and a release owed in a generation that is then discarded.
+
+Found by the full suite on the change: the recovery kick set's requeue of a root its
+worker held bypassed the set's cap, so kicks landing during the worker's turn could grow
+it to the cap plus one (`TestF105RecoveryKickIsBoundedAndFair`, 3 of 8 runs under `-race`
+on the change, 0 of 8 on 21eca60, where only the timing differed). The requeue now drops
+the root to the periodic pass when the set is full, as a kick does (12 of 12).
+
+Found by the final suite on the reviewed tree:
+`TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect` failed intermittently under
+`-race` (the floor short of its deadline after 600 deliveries). A diagnostic run showed
+the hold releaser starved for the whole burst (546 completions owed at its end) and the
+floor then clearing the backlog too slowly. Two causes: the release composed its resource
+CAS after reading every exchange it released for, so an admission adding its edge to the
+same source resource defeated it nearly every time; and the floor unit, which waits for
+foreground admission, blocked the session's shared custody dispatcher for the whole burst,
+the releaser behind it (pre-existing in the floor, made consequential by the releaser).
+Fixed: the release recomposes only its resource half on a stale expectation; the floor
+yields without waiting; the floor hands its exchange reads to the release; the first owed
+completion starts the dispatcher. After the fix, four `-race` runs of the scenario passed
+with at most 4 completions owed, and 600 deliveries took about 92 s against 3m42s before.
+Mutations, each killed: the floor waiting again, no recomposition, and the first owed
+completion not starting the dispatcher.
+
+Two pre-existing intermittent test failures the final suite also hit, fixed at the user's
+direction rather than baselined, both fixture races with no broker change:
+`TestWillClaimantAbortsThePassOnATransientFactOutage` (5 of 20 runs on 21eca60) counted the
+fact reads of the account's own claim loop, which the package runs every 50 ms beside the
+test's direct pass; it and its pending-arm sibling now pin the loop's interval long and wait
+for its initial pass (30 of 30 each). `TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership`
+sampled the first record-transaction release of the session, which under shard load could
+be an earlier transaction's; it now samples the rollback's own, by the save ordinal, as its
+sibling T6 does (20 of 20). Both still fail against the mutations they exist for (the
+recovery arm's pass abort removed; F-039's M3).

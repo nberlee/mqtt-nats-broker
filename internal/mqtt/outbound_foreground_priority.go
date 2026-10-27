@@ -17,8 +17,11 @@ import "sync"
 
 // FOREGROUND PRIORITY over this broker's retained background writers (F-105 7c, consult 105).
 //
-// Every outbound authority transition of a session CASes the one authority record, so this
-// broker's own writers serialize on it by construction. The retained driver (materialization,
+// Every outbound authority transition of a session but the authority-free completions
+// (mqttAttemptAuthorityFree) CASes the one authority record, so this broker's own writers
+// serialize on it by construction. A completion contends only on the records it writes
+// (exchange, register, resources), which the same background writers may also write, so it stays
+// announced. The retained driver (materialization,
 // admission, acquisition, withdrawal, abandonment) and the reclaimer (one transition per
 // reclamation step) produce BURSTS of such writes right after a SUBSCRIBE and after every retained
 // acknowledgement, withdrawal and abandonment; a foreground operation whose bounded re-attempts all
@@ -118,6 +121,37 @@ func (sess *mqttSession) announceForegroundAuthority() (release func()) {
 			}
 		})
 	}
+}
+
+// tryAdmitBackgroundAuthority admits ONE background authority-transition attempt only if no
+// foreground operation is announced now, and never waits. It is the admission of a unit that runs
+// on the session's shared custody dispatcher: waiting there would hold every other custody unit
+// (hints, owed withdrawals, the hold releaser) behind the foreground for as long as it lasts. A
+// refused unit backs off and is retried by the dispatcher instead. False also on server shutdown.
+//
+// No lock held on entry; the caller holds no session, client, account or worker lock.
+func (sess *mqttSession) tryAdmitBackgroundAuthority() bool {
+	if s := sess.serverFor(nil); s != nil {
+		select {
+		case <-s.quitCh:
+			return false
+		default:
+		}
+	}
+	f := &sess.foreground
+	f.mu.Lock()
+	idle := f.n == 0
+	f.mu.Unlock()
+	if !idle {
+		if h := sess.testBackgroundWait.Load(); h != nil {
+			(*h)()
+		}
+		return false
+	}
+	if h := sess.testBackgroundAdmit.Load(); h != nil {
+		(*h)()
+	}
+	return true
 }
 
 // admitBackgroundAuthority admits ONE background authority-transition attempt, waiting while any

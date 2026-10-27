@@ -24,8 +24,8 @@ import (
 	"testing"
 )
 
-// fgCensusAdmissions maps every production function that references admitBackgroundAuthority
-// to the counted writers that reach it. One function may serve several: transmitRetained is the
+// fgCensusAdmissions maps every production function that references admitBackgroundAuthority (or
+// tryAdmitBackgroundAuthority) to the counted writers that reach it. One function may serve several: transmitRetained is the
 // retained driver's and the continuations' send, and the foreground resume path calls it WITHOUT
 // the admission.
 var fgCensusAdmissions = map[string]string{
@@ -309,12 +309,16 @@ func TestForegroundCensusCountsTheWriters(t *testing.T) {
 	}
 }
 
-// TestForegroundCensusEveryAdmissionIsAWriters: every reference to admitBackgroundAuthority is in a
+// TestForegroundCensusEveryAdmissionIsAWriters: every reference to admitBackgroundAuthority or
+// its non-waiting form tryAdmitBackgroundAuthority (the dispatcher units' admission) is in a
 // function the census attributes to a counted writer, and every attributed function still has one.
 func TestForegroundCensusEveryAdmissionIsAWriters(t *testing.T) {
 	t.Parallel()
 	sc := censusScanPackage(t)
 	got := sc.FunctionsReferencing("admitBackgroundAuthority")
+	for k, v := range sc.FunctionsReferencing("tryAdmitBackgroundAuthority") {
+		got[k] = v
+	}
 	var unclassified, stale []string
 	for k := range got {
 		if _, ok := fgCensusAdmissions[k.String()]; !ok {

@@ -399,7 +399,8 @@ func TestF105AckAndDiscardRaceOnOneExchange(t *testing.T) {
 		if x.Phase != mqttExchangeTerminal {
 			t.Fatalf("the exchange stands at %d, want the answer's Terminal", x.Phase)
 		}
-		testRequireHolds(t, &e.asm.jsa, x, false)
+		// The answer's ending leaves the holds release-owed (outbound_release_holds.go).
+		testRequireHolds(t, &e.asm.jsa, x, true)
 		e.asm.jsa.testTransitionPresend.Store(nil)
 		if _, err := e.asm.jsa.opDiscardExchange(e.id, e.epoch, "txn-discard-2", testF105Gen, nonce); !errors.Is(err, errMQTTExchangeAlreadyReleased) {
 			t.Fatalf("the re-attempted discard returned %v, want the ending preserved", err)

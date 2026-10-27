@@ -102,9 +102,7 @@ func TestExchangeAdvancedOnlyWithItsSlot(t *testing.T) {
 		if terr != nil {
 			t.Fatalf("composing the acknowledgement: %v", terr)
 		}
-		if herr := jsa.appendHoldReleases(tr, cur, mqttExchangeTerminal); herr != nil {
-			t.Fatalf("composing the hold releases: %v", herr)
-		}
+		// No hold release: an acknowledgement ending leaves its holds release-owed.
 		return tr
 	}
 	full := compose()

@@ -677,6 +677,13 @@ type mqttSession struct {
 	floorDueAt   time.Time
 	floorDelay   time.Duration
 	floorHorizon *mqttFloorHorizon
+	// The releaser's state (outbound_release_holds.go), protected by mu and replaced with the
+	// generation: releaseOwed is the generation's acknowledgement endings whose holds a
+	// release-holds batch is still to release (a pacing hint; the pending duty is the record),
+	// releaseDueAt when the next batch is due and releaseDelay its failure backoff.
+	releaseOwed  map[string]struct{}
+	releaseDueAt time.Time
+	releaseDelay time.Duration
 	// testCustodyDriver instruments the dispatcher (F-097 T2*); nil in production, read under mu.
 	testCustodyDriver *mqttCustodyDriverSeams
 	// resumeLineage carries, across the bounded re-runs of ONE recoverInflightRegisters
@@ -985,6 +992,7 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	sess.custodyRetry, sess.custodyPassQueue, sess.custodyRR = nil, nil, 0
 	sess.custodyTickAt, sess.custodyTickKey = time.Time{}, _EMPTY_ // custodyTickArm keeps increasing
 	sess.floorWanted, sess.floorDueAt, sess.floorDelay, sess.floorHorizon = false, time.Time{}, 0, nil
+	sess.releaseOwed, sess.releaseDueAt, sess.releaseDelay = nil, time.Time{}, 0
 	// Owed withdrawals name the retiring generation's obligations; its successor's recovery
 	// reconstructs any it still owes (F-088).
 	sess.withdrawOwed = nil

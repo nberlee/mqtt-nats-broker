@@ -121,7 +121,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	}
 
 	// (4) ADVANCE, one step at a time, each reading the exchange as it stands. The terminal
-	// advance is the ending, and it releases the hold in its own batch (F-105 7c-lc).
+	// advance is the ending, and it leaves the hold release-owed (F-105 7c-lc).
 	for _, to := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
@@ -130,10 +130,14 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		}
 	}
 
-	// (5) THE ENDING RELEASED THE HOLD, so nothing names the resource; and no later release door
-	// exists for it. Then (6) AUTHORIZE, (7) COMPLETE.
+	// (5) THE RELEASE-HOLDS BATCH RELEASES THE OWED HOLD, so nothing names the resource; and no
+	// other release door exists for it. Then (6) AUTHORIZE, (7) COMPLETE.
+	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src"); res == nil || len(res.Deps) != 1 {
+		t.Fatalf("the terminal advance did not leave its hold owed: %+v", res)
+	}
+	testReleaseOwed(t, e, reg.Lin)
 	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src"); res == nil || len(res.Deps) != 0 {
-		t.Fatalf("the terminal advance did not release its hold: %+v", res)
+		t.Fatalf("the release did not release the owed hold: %+v", res)
 	}
 	if _, err := jsa.opReleaseDependency(e.id, e.epoch, "txn-rel", "op-rel",
 		testF105Gen, "inc-src", mqttResourceEdge{

@@ -142,7 +142,7 @@ func (as *mqttAccountSessionManager) runRecoveryKick(s *Server) {
 
 		if h := mqttTestRecoveryKickHookV.Load(); h != nil && !(*h)(k.id, k.gen) {
 			rk.mu.Lock()
-			rk.queue = append([]mqttRecoveryKickKey{k}, rk.queue...)
+			rk.requeueLocked(k, true)
 			rk.running = false
 			rk.mu.Unlock()
 			return
@@ -164,9 +164,26 @@ func (as *mqttAccountSessionManager) runRecoveryKick(s *Server) {
 		if concluded || rk.visits[k] >= mqttRecoveryKickMaxVisits {
 			delete(rk.visits, k)
 		} else {
-			rk.queue = append(rk.queue, k)
+			rk.requeueLocked(k, false)
 		}
 		rk.mu.Unlock()
+	}
+}
+
+// requeueLocked puts back a root this worker took, in front or behind. THE CAP HOLDS HERE TOO:
+// kicks landing while the worker held the root may have filled the set meanwhile, and a full set
+// drops the root to the periodic pass exactly as a kick into a full set does.
+//
+// Lock held on entry.
+func (rk *mqttRecoveryKick) requeueLocked(k mqttRecoveryKickKey, front bool) {
+	if len(rk.queue) >= mqttRecoveryKickCap {
+		delete(rk.visits, k)
+		return
+	}
+	if front {
+		rk.queue = append([]mqttRecoveryKickKey{k}, rk.queue...)
+	} else {
+		rk.queue = append(rk.queue, k)
 	}
 }
 

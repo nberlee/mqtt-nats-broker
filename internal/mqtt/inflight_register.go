@@ -2750,8 +2750,9 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 	defer release()
 
 	// A CONTENDED ADVANCE IS RE-ATTEMPTED, AS A WHOLE ATTEMPT. The advance is conditioned on the
-	// authority sequence its read captured, so a background writer committing in between refuses
-	// it although nothing contradicted it; with no re-attempt the release waited out the
+	// sequences its read captured (exchange, register, resources; it is authority-free), so a
+	// writer committing one of them in between refuses it although nothing contradicted it; with
+	// no re-attempt the release waited out the
 	// continuation's delay (a restored drain's claim stood ~2 s after its PUBACK). Each re-attempt
 	// re-runs EVERYTHING — the deferral, generation, epoch and ACK-owner checks, the fresh read and
 	// every premise on it — so a batch that landed behind a lost response is adopted through the
@@ -2883,8 +2884,8 @@ func (sess *mqttSession) attemptTerminalRegisterReleaseOnce(c *client, pi uint16
 				return false
 			}
 			// The slot is now publish_terminal; complete its cleanup at the register sequence the
-			// atomic batch left it (mqttOpOutcome.Seq is the AUTHORITY sequence, not the
-			// register's), so re-read.
+			// atomic batch left it (mqttOpOutcome.Seq is the commit member's sequence, not
+			// the register's), so re-read.
 			cur2, smsg2, lerr := sess.asm.loadInflightRecord(ref.name.subject)
 			if lerr != nil || smsg2 == nil || cur2 == nil {
 				return false

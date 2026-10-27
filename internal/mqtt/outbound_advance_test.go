@@ -310,13 +310,15 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 			testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, cur.Nonce)
 		}
 		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, to)
-		// The ending releases G1's source hold in the same batch, under G2's authority: the
-		// resource member names the obligation's own, earlier, generation (F-105 7c-lc, P-4).
+		// The acknowledgement ending leaves G1's source hold release-owed (F-105 7c-lc).
 		adv = testF105WithHoldReleases(t, e, adv, cur, to)
 		if _, ccerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); ccerr != nil {
 			t.Fatalf("a closed generation's obligation could not advance to %d: %v", to, ccerr)
 		}
 	}
+	// A release-holds batch over the stored ending releases G1's hold while G2 serves: the
+	// resource member names the obligation's own, earlier, generation (P-4).
+	testReleaseOwed(t, e, adm.Exchange.Nonce)
 	testF105RequireDeps(t, e, "inc-src")
 	end, _ := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
 	if end.Phase != mqttExchangeTerminal {
@@ -338,6 +340,28 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 	}
 }
 
+// testForgeAdvanceAuthority turns a composed advance into the FENCED shape
+// (mqttFenceAdvanceOnAuthority): the authority as read, one revision on, under the advance's own
+// transition id, then mutated. A fenced advance must preserve the authority exactly, as every
+// ending does, so each mutation is refused by that rule.
+func testForgeAdvanceAuthority(tr *mqttAuthorityTransition, prev *mqttOutboundAuthority, prevSeq uint64,
+	mutate func(*mqttTransitionAttempt, *mqttOutboundAuthority)) {
+	next := *prev
+	next.Rev, next.Txn = prev.Rev+1, tr.Attempt.Txn
+	attempt := *tr.Attempt
+	attempt.Rev, attempt.PrevTxn = next.Rev, prev.OwnerTxn
+	mutate(&attempt, &next)
+	tr.Attempt, tr.Prev, tr.PrevSeq, tr.Auth = &attempt, prev, prevSeq, &next
+}
+
+// testRefusedForgedAdvance commits a forged advance and requires a refusal.
+func testRefusedForgedAdvance(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, what string) {
+	t.Helper()
+	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr)); err == nil {
+		t.Fatalf("an advance-exchange transition %s was accepted", what)
+	}
+}
+
 // TestF105AdvanceIsNotAnOwnershipEvent pins that the transition exempt from the serving
 // requirement cannot touch the authority itself.
 //
@@ -347,11 +371,12 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 // one that could move the generation, the tenure or the ownership token would be a takeover
 // executed by a completion handler.
 //
-// EACH MUTATION IS STATED CONSISTENTLY IN BOTH THE ATTEMPT AND THE AUTHORITY. Stating it in
-// the authority alone is caught by the generic agreement check between them, which ties the
-// installed record to the attempt that describes it — a different fact from the one here,
-// which ties the installed record to its PREDECESSOR. An oracle that left them disagreeing
-// would be testing the generic check and reporting it as this one.
+// An advance is normally authority-free and installs nothing; fenced on the authority it must
+// reinstall it exactly. EACH MUTATION IS STATED CONSISTENTLY IN BOTH THE ATTEMPT AND THE
+// AUTHORITY (testForgeAdvanceAuthority). Stating it in the authority alone is caught by the
+// generic agreement check between them, which ties the installed record to the attempt that
+// describes it — a different fact from the one here, which ties the installed record to its
+// PREDECESSOR.
 func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-advance-ownership")
 	defer done()
@@ -387,12 +412,8 @@ func TestF105AdvanceIsNotAnOwnershipEvent(t *testing.T) {
 			t.Fatalf("assembling the advance for %q failed: %v", name, aerr)
 		}
 		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
-		attempt, auth := *adv.Attempt, *adv.Auth
-		mutate(&attempt, &auth)
-		adv.Attempt, adv.Auth = &attempt, &auth
-		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr == nil {
-			t.Fatalf("an advance-exchange transition %s was accepted", name)
-		}
+		testForgeAdvanceAuthority(adv, al.rec, al.seq, mutate)
+		testRefusedForgedAdvance(t, e, adv, name)
 	}
 
 	// The authority is where it was: none of the refusals above left a partial write.
@@ -465,12 +486,10 @@ func TestF105AdvanceCannotReopenAClosedGeneration(t *testing.T) {
 		t.Fatalf("assembling the advance failed: %v", rerr)
 	}
 	reopen = testWithSlotMember(t, &e.asm.jsa, reopen, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
-	mutated := *reopen.Auth
-	mutated.State = mqttAuthorityServing
-	reopen.Auth = &mutated
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reopen)); err == nil {
-		t.Fatalf("an advance-exchange transition reopened a permanently closed generation")
-	}
+	testForgeAdvanceAuthority(reopen, al.rec, al.seq, func(_ *mqttTransitionAttempt, o *mqttOutboundAuthority) {
+		o.State = mqttAuthorityServing
+	})
+	testRefusedForgedAdvance(t, e, reopen, "reopening a closed generation")
 	if back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); back.rec.State != mqttAuthorityClosed {
 		t.Fatalf("the authority is at state %d after the refused reopen, want closed", back.rec.State)
 	}
@@ -561,12 +580,10 @@ func TestF105AdvancePreservesAPendingProposal(t *testing.T) {
 		t.Fatalf("assembling the advance failed: %v", serr)
 	}
 	swapped = testWithSlotMember(t, &e.asm.jsa, swapped, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
-	mutated := *swapped.Auth
-	mutated.Intent = mkIntent("intent-9", "tenure-usurper")
-	swapped.Auth = &mutated
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, swapped)); err == nil {
-		t.Fatalf("an advance-exchange transition replaced the pending handoff intent")
-	}
+	testForgeAdvanceAuthority(swapped, al.rec, al.seq, func(_ *mqttTransitionAttempt, o *mqttOutboundAuthority) {
+		o.Intent = mkIntent("intent-9", "tenure-usurper")
+	})
+	testRefusedForgedAdvance(t, e, swapped, "replacing the pending handoff intent")
 
 	// The well-formed advance commits and carries the standing proposal through untouched.
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)

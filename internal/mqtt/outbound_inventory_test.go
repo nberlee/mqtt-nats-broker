@@ -595,8 +595,10 @@ func TestF105SealingForbidsAllocationAndIsNotRevocable(t *testing.T) {
 	}
 
 	// AND COMPLETION STILL RUNS. This is the point of the whole design: the seal fixes the
-	// inventory's SHAPE, and the states of its entries keep moving.
+	// inventory's SHAPE, and the states of its entries keep moving — the release the ending left
+	// owed included.
 	testF105FinishExchange(t, e, nonce)
+	testReleaseOwed(t, e, nonce)
 	d, dseq := testF105LoadDuty(t, e, 1)
 	ended := *d
 	ended.State, ended.Outcome = mqttDutyTerminal, "completed"
@@ -649,6 +651,12 @@ func TestF105DutyContinuationsPreserveIdentityAndTerminality(t *testing.T) {
 	d, dseq = testF105LoadDuty(t, e, 1)
 	ended := *d
 	ended.State, ended.Outcome = mqttDutyTerminal, "completed"
+	// Not while the ending's holds are still owed (outbound_release_holds.go).
+	if err := testF105SubmitInventory(t, e, "txn-end-owed",
+		testF105DutyMember(t, e, dseq, &ended)); err == nil || !strings.Contains(err.Error(), "still lists") {
+		t.Fatalf("a duty ended beside its obligation's owed hold: %v", err)
+	}
+	testReleaseOwed(t, e, nonce)
 	if err := testF105SubmitInventory(t, e, "txn-end",
 		testF105DutyMember(t, e, dseq, &ended)); err != nil {
 		t.Fatalf("a duty could not reach its ending: %v", err)
@@ -1040,6 +1048,7 @@ func TestF105ADutyEndingMustBeEarned(t *testing.T) {
 	if _, aerr := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); aerr != nil {
 		t.Fatalf("ending the obligation: %v", aerr)
 	}
+	testReleaseOwed(t, e, nonce)
 	d, dseq = testF105LoadDuty(t, e, 1)
 	ended = *d
 	ended.State, ended.Outcome = mqttDutyTerminal, "completed"

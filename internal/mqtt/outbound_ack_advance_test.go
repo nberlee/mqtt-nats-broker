@@ -204,16 +204,22 @@ func testWithSlotMember(t *testing.T, jsa *mqttJSA, tr *mqttAuthorityTransition,
 	if lerr != nil || reg == nil || smsg == nil {
 		t.Fatalf("reading the slot of exchange %q: %v", nonce, lerr)
 	}
+	// The advance is authority-free and carries no predecessor; the composer still reads the
+	// ownership it records in the attempt, so it gets the authority as it stands.
+	al := jsa.loadOutboundAuthority(id, epoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("reading the authority of %q: status %v", id, al.status)
+	}
 	var ack *mqttAuthorityTransition
 	var aerr error
 	if x.Phase == mqttExchangeTerminalPendingDrain && to == mqttExchangeTerminal {
 		// The drain's own arrow: the holder's token clearance (opCompleteExchangeDrain).
-		ack, aerr = mqttCompleteExchangeDrainTransition(tr.Prev, tr.PrevSeq, &mqttCompleteExchangeDrainRequest{
+		ack, aerr = mqttCompleteExchangeDrainTransition(al.rec, al.seq, &mqttCompleteExchangeDrainRequest{
 			ID: id, Epoch: epoch, Txn: tr.Attempt.Txn, Op: tr.Attempt.Op,
 			Gen: gen, Nonce: nonce, Token: reg.ActionToken, Register: reg, RegisterSeq: smsg.Sequence,
 		}, x, xSeq)
 	} else {
-		ack, aerr = mqttAdvanceExchangeAckTransition(tr.Prev, tr.PrevSeq, &mqttAdvanceExchangeAckRequest{
+		ack, aerr = mqttAdvanceExchangeAckTransition(al.rec, al.seq, &mqttAdvanceExchangeAckRequest{
 			ID: id, Epoch: epoch, Txn: tr.Attempt.Txn, Op: tr.Attempt.Op,
 			Gen: gen, Nonce: nonce, To: to, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
 		}, x, xSeq)

@@ -872,10 +872,11 @@ func mqttExchangePhaseSucceeds(qos byte, from, to mqttExchangePhase) error {
 // simply vanish, and no authority would have arbitrated any of it.
 //
 // It CASes the exchange at the sequence it was read, so two brokers observing the same
-// acknowledgement produce one advance, and it contends on the authority in the same batch, so
-// the advance is an act of the current owner even when the exchange belongs to an older
-// generation the owner has already closed.
-func mqttAdvanceExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
+// acknowledgement produce one advance. It does NOT contend on the authority: a completion is an
+// act of the client's answer, not of the current owner, and lands even when the exchange belongs
+// to an older generation the owner has already closed. prev supplies the ownership the attempt
+// records; its sequence is fenced only by mqttFenceAdvanceOnAuthority.
+func mqttAdvanceExchangeTransition(prev *mqttOutboundAuthority, _ uint64, txn, op string,
 	cur *mqttOutboundExchange, curSeq uint64, to mqttExchangePhase) (*mqttAuthorityTransition, error) {
 
 	if prev == nil {
@@ -907,20 +908,16 @@ func mqttAdvanceExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 		return nil, err
 	}
 
+	// AN AUTHORITY-FREE TRANSITION: a completion writes no authority record, proposes no revision
+	// and displaces no predecessor (mqttAttemptAuthorityFree). The attempt records the ownership it
+	// was composed under, for its outcome receipt; it neither CASes nor advances it.
+	// A client's answer crosses tenures, so nothing about the standing owner is its to fence, and
+	// its own members (exchange, register, resources) are each fenced by their CAS. What the
+	// authority CAS used to cost was every next admission's first attempt.
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
-			Kind: mqttTransitionAdvanceExchange, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op, Kind: mqttTransitionAdvanceExchange,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		// The authority is reinstalled exactly as it stood, pending proposals included: an
-		// advance is not an ownership event, and dropping a reservation or a preparation
-		// here would abandon a proposal nobody resolved.
-		Auth: &mqttOutboundAuthority{
-			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttExchangeSubject(getHash(prev.ID), cur.Gen, cur.Nonce),
@@ -928,6 +925,22 @@ func mqttAdvanceExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 			body:   body,
 		}},
 	}, nil
+}
+
+// mqttFenceAdvanceOnAuthority makes an authority-free advance carry the authority it was composed
+// under, reinstalled exactly at one revision on: its batch then also CASes the authority, so any
+// authority transition landing after its reads (a Discard, a takeover) defeats it atomically. For
+// the advance whose boundary judgement rests on a record only an authority transition writes; the
+// kind rule holds a fenced advance to preserving ownership, state and both proposals.
+func mqttFenceAdvanceOnAuthority(tr *mqttAuthorityTransition, prev *mqttOutboundAuthority, prevSeq uint64) {
+	a := tr.Attempt
+	a.PrevTxn, a.Rev = prev.OwnerTxn, prev.Rev+1
+	tr.Prev, tr.PrevSeq = prev, prevSeq
+	tr.Auth = &mqttOutboundAuthority{
+		ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
+		State: prev.State, Rev: prev.Rev + 1, Txn: a.Txn, OwnerTxn: prev.OwnerTxn,
+		Intent: prev.Intent, Creation: prev.Creation,
+	}
 }
 
 // mqttSourceAckReplyBinds reports whether reply is a JetStream acknowledgement subject for

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -417,6 +418,42 @@ func TestWillRenewalPersistsTheFloorWithItsIncarnation(t *testing.T) {
 // T7 / T16: what a failure to read the evidence costs
 // ---------------------------------------------------------------------------
 
+// testQuietWillClaimLoop keeps the account's own claim loop out of a test that calls
+// scanWillOutbox itself and counts what one PASS reads: the package drops the claim interval to
+// 50ms, so the loop's ticker would scan the same records concurrently and its reads would be
+// counted as the test's pass (a fixture race, pre-existing: 5 of 20 runs). It must be called
+// before the environment starts, and the returned wait blocks until the loop's initial pass on
+// asm has returned.
+func testQuietWillClaimLoop(t *testing.T) func(asm *mqttAccountSessionManager) {
+	t.Helper()
+	// As withLongWillScan (a tagged file's) does: the ticker starts with the account manager, so
+	// the interval is pinned before the environment exists, and the lease kept above it.
+	prevInterval, prevLease := mqttWillClaimInterval.Get(), mqttWillClaimLease.Get()
+	mqttWillClaimInterval.Set(30 * time.Second)
+	mqttWillClaimLease.Set(60 * time.Second)
+	t.Cleanup(func() {
+		mqttWillClaimInterval.Set(prevInterval)
+		mqttWillClaimLease.Set(prevLease)
+	})
+	var seen sync.Map
+	done := func(as *mqttAccountSessionManager) { seen.Store(as, true) }
+	mqttTestWillInitialScanDoneV.Store(&done)
+	t.Cleanup(func() { mqttTestWillInitialScanDoneV.Store(nil) })
+	return func(asm *mqttAccountSessionManager) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, ok := seen.Load(asm); ok {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("fixture: the claim loop's initial pass never returned")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+}
+
 // TestWillClaimantAbortsThePassOnATransientFactOutage is T7's transient half and T16.
 //
 // TWO expired records with the failure injected on the FIRST. A single-record test
@@ -425,7 +462,9 @@ func TestWillRenewalPersistsTheFloorWithItsIncarnation(t *testing.T) {
 // discarded return was the defect — an outage cost one JetStream timeout per expired
 // record instead of one per pass.
 func TestWillClaimantAbortsThePassOnATransientFactOutage(t *testing.T) {
+	quiet := testQuietWillClaimLoop(t)
 	a, _ := testNewTeardownEnv(t)
+	quiet(a.asm)
 	const cid = "abort-pass"
 	origin := testSessStreamFloor(t, a.asm)
 
@@ -474,7 +513,9 @@ func TestWillClaimantAbortsThePassOnATransientFactOutage(t *testing.T) {
 // test uses expired PUBLISHING records, so a mutation discarding the PENDING arm's result
 // survived it untouched. Two DUE PENDING records are what distinguish them.
 func TestWillPendingArmAbortsThePassOnATransientFactOutage(t *testing.T) {
+	quiet := testQuietWillClaimLoop(t)
 	a, _ := testNewTeardownEnv(t)
+	quiet(a.asm)
 	const cid = "abort-pending"
 	origin := testSessStreamFloor(t, a.asm)
 

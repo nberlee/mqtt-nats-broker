@@ -459,6 +459,13 @@ func TestUnitCAbandonedRegisterAdvancesOnlyUnderTheAckKind(t *testing.T) {
 			// Only the register member (the acknowledgement-shaped rewrite), under a foreign kind.
 			tr.Extra = tr.Extra[len(tr.Extra)-1:]
 			tr.Attempt.Kind = k
+			// The acknowledgement kind is authority-free; a foreign kind writes the authority, so
+			// the forged batch carries one, preserved exactly, or the authority-shape rule would
+			// refuse it before the rule under test is reached.
+			next := *auth
+			next.Rev, next.Txn = auth.Rev+1, tr.Attempt.Txn
+			tr.Prev, tr.PrevSeq, tr.Auth = auth, authSeq, &next
+			tr.Attempt.Rev, tr.Attempt.PrevTxn = next.Rev, auth.OwnerTxn
 			_, cerr := jsa.commitAuthorityTransition(tr)
 			if cerr == nil || !strings.Contains(cerr.Error(), "rewrites the abandoned register") {
 				t.Fatalf("a %s batch rewriting the abandoned register was answered %v", k, cerr)

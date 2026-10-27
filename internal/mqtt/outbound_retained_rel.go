@@ -114,7 +114,8 @@ func mqttCheckRetainedRelMember(a *mqttTransitionAttempt, idHash string, e mqttT
 // created by exactly such an arrow, agreeing on generation, exchange, identifier and identity. The
 // Publish-origin arrow additionally carries its copy's manifest (the fence closure arbitrates on);
 // the abandoned-origin arrow needs no material, and is fenced instead by the generation's closure —
-// a generation closed with Discard takes no new canonical (an unreadable closure refuses).
+// a generation closed with Discard takes no new canonical (an unreadable closure refuses) — read
+// under the authority CAS its batch carries.
 func (jsa *mqttJSA) checkRetainedRelMembers(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
 	idHash := getHash(a.ID)
 	rels := map[string]*mqttRetainedRel{}
@@ -170,6 +171,12 @@ func (jsa *mqttJSA) checkRetainedRelMembers(a *mqttTransitionAttempt, extra []mq
 					"copy's manifest", a.Txn, e.subj)
 			}
 		case mqttInflightDeliveryAbandoned:
+			// THE CLOSURE READ IS ATOMIC ONLY UNDER THE AUTHORITY CAS: a Discard landing after it
+			// moves the authority and so fails this batch (mqttFenceAdvanceOnAuthority).
+			if mqttAttemptAuthorityFree(a.Kind, a.Rev) {
+				return fmt.Errorf("transition %q advances abandoned retained slot %q without fencing on the "+
+					"authority: its closure read would not be atomic with the batch", a.Txn, e.subj)
+			}
 			closure, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, name.gen)
 			if cst != mqttOutboundValid && cst != mqttOutboundAbsent {
 				return fmt.Errorf("transition %q advances abandoned retained slot %q while generation %q's "+

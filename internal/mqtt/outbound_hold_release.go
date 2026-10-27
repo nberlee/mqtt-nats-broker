@@ -18,20 +18,23 @@ import (
 	"fmt"
 )
 
-// An ending releases its holds in its own batch (F-105 7c-lc).
+// An ending other than an acknowledgement's releases its holds in its own batch (F-105 7c-lc).
 //
 // An admitted obligation takes an edge on its source consumer (and, at QoS 2, on the canonical
 // PUBREL consumer), and that edge is what keeps the consumer from being retired while the
-// obligation may still need it. The edge is discharged by the obligation's ENDING — terminal,
-// rejected, superseded unsent, withdrawn unsent — and by nothing else, so the release rides the
-// batch that writes the ending. Committed apart, a crash between the two would leave an ended
-// obligation pinning a consumer that no later act is entitled to free; committed together, a lost
-// response leaves both or neither, and the caller resolves it by reading the exchange.
+// obligation may still need it. The edge is discharged by the obligation's ENDING — superseded
+// unsent, withdrawn unsent, discarded, and a completion of an abandoned delivery — and the release
+// rides the batch that writes the ending. Committed apart, a crash between the two would leave an
+// ended obligation pinning a consumer that no later act is entitled to free; committed together,
+// a lost response leaves both or neither, and the caller resolves it by reading the exchange.
+// The client's answer (terminal, rejected) is the exception: it leaves the release owed to a
+// release-holds batch, and its pending delivery duty is the durable record of that debt
+// (outbound_release_holds.go).
 //
 // The write boundary enforces it in both directions (checkResourceOverwrites): an ending without
-// its releases is refused, and a hold release without its ending is refused. A producer this file
-// is not called from is therefore refused rather than silently leaking, which is the point of
-// stating it as a property.
+// its releases is refused, and a hold release without its ending — or, for release-holds, without
+// a stored ending — is refused. A producer this file is not called from is therefore refused
+// rather than silently leaking, which is the point of stating it as a property.
 //
 // An abandonment is NOT an ending (mqttExchangePhaseEnded excludes it) and releases nothing; a
 // pending-drain phase releases nothing either — the drain completion that moves it to terminal

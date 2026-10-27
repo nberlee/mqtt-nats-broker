@@ -238,16 +238,21 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		t.Fatalf("a dependency was asserted for an obligation this transition does not admit")
 	}
 
-	// (4) FINISH ONE OBLIGATION, and only its edge goes — IN THE ENDING'S OWN BATCH (F-105 7c-lc):
-	// the terminal advance releases a's hold, and nothing else.
+	// (4) FINISH ONE OBLIGATION, and only its edge goes (F-105 7c-lc): the terminal advance leaves
+	// a's hold release-owed, and a release-holds batch over a's stored ending releases it and
+	// nothing else.
 	testF105FinishExchange(t, e, a)
 	if err := testF105ReleaseDependency(t, e, "inc-rel", b, "txn-wrong"); err == nil {
 		t.Fatalf("finishing one obligation released another obligation's dependency")
 	}
-	// NO LATER RELEASE DOOR. The ending already released a's edge; a standalone release of a
-	// hold edge is refused whatever the stored phase says.
+	// NO OTHER RELEASE DOOR. A standalone dependency release of a hold edge is refused whatever
+	// the stored phase says: only release-holds releases an acknowledgement ending's holds.
 	if err := testF105ReleaseDependency(t, e, "inc-rel", a, "txn-rel-a2"); err == nil {
-		t.Fatalf("a finished obligation's hold was released a second time, after its ending")
+		t.Fatalf("a finished obligation's hold was released by a dependency release, after its ending")
+	}
+	if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{a, b}, nil,
+		mqttNewInflightNonce(), nil); err != nil {
+		t.Fatalf("releasing the finished obligation's hold: %v", err)
 	}
 
 	// (5) The resource is still not authorizable: the second obligation stands.
@@ -261,9 +266,10 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		t.Fatalf("a deletion was authorized while an obligation still needs the resource")
 	}
 
-	// (6) Finish the second: its ending releases the last edge in its own batch (F-105 7c-lc),
-	// and only then does the authorization win.
+	// (6) Finish the second: its ending leaves the last edge release-owed, the release-holds batch
+	// releases it (F-105 7c-lc), and only then does the authorization win.
 	testF105FinishExchange(t, e, b)
+	testReleaseOwed(t, e, b)
 	last, curSeq := testF105LoadResource(t, e, "inc-rel")
 	if len(last.Deps) != 0 {
 		t.Fatalf("the second obligation's ending did not release the last edge: %v", last.Deps)

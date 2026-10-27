@@ -241,18 +241,19 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		t.Fatalf("assembling the drain completion failed: %v", derr)
 	}
 	drained = testWithSlotMember(t, &e.asm.jsa, drained, testF105Gen, cur.Nonce, mqttExchangeTerminal)
-	// The drain completion is the ending, so it releases both holds in its own batch (F-105 7c-lc).
-	drained = testF105WithHoldReleases(t, e, drained, cur, mqttExchangeTerminal)
+	// The drain completion is the ending; it leaves both holds release-owed, and a release-holds
+	// batch over the stored ending releases them under the CLOSED authority (F-105 7c-lc).
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, drained)); cerr != nil {
 		t.Fatalf("recording the completed drain was refused: %v", cerr)
 	}
+	testReleaseOwed(t, e, cur.Nonce)
 
 	authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	for _, inc := range []string{"inc-src", "inc-rel"} {
 		rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
 			mqttResourceSubject(getHash(e.id), testF105Gen, inc))
 		cleared, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
-		// The ending already released this obligation's hold: nothing depends on the resource.
+		// The release took this obligation's hold: nothing depends on the resource.
 		if len(cleared.Deps) != 0 {
 			t.Fatalf("resource %q is still needed by %v after its only obligation ended", inc, cleared.Deps)
 		}

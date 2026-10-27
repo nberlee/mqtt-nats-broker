@@ -199,8 +199,8 @@ func (c *client) outboundEntitlement() (mqttOutboundEntitlement, bool) {
 // What an operation returns
 // ---------------------------------------------------------------------------
 
-// mqttOpOutcome is what every operation returns: the authority sequence its batch landed at,
-// and a HANDLE for the attempt it sent.
+// mqttOpOutcome is what every operation returns: the sequence its batch's commit member landed
+// at (the authority's, except for an authority-free kind), and a HANDLE for the attempt it sent.
 //
 // The handle is why this is a struct rather than a sequence. An operation composes its
 // transition internally, so on a lost acknowledgement the caller holds neither that

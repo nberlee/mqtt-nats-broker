@@ -979,3 +979,64 @@ func TestF105RetainedSameSidReplacementInheritsTheReplay(t *testing.T) {
 		})
 	}
 }
+
+// THE ABANDONED-ORIGIN PUBREC ARROW IS THE ONE ADVANCE FENCED ON THE AUTHORITY: its closure read
+// is atomic with its batch only under that CAS (mqttFenceAdvanceOnAuthority). The composer fences
+// it, the boundary refuses it unfenced, and the fenced arrow lands while the generation serves.
+//
+// Mutations: the composer leaves it authority-free -> the composed arrow carries no authority;
+// the boundary guard removed -> the unfenced arrow lands.
+func TestF105RetainedAbandonedArrowFencesOnTheAuthority(t *testing.T) {
+	rig := testRetainedAbandonUp(t, "ret-ab-fenced", 2)
+	defer rig.done()
+	reg0, _ := rig.abandoned(t)
+	gen := rig.gen
+	jsa := &rig.asm.jsa
+	compose := func() *mqttAuthorityTransition {
+		t.Helper()
+		reg, smsg, err := rig.asm.loadInflightRecord(mqttInflightSubject(rig.idHash, gen, rig.pi))
+		if err != nil || smsg == nil || reg == nil || reg.State != mqttInflightDeliveryAbandoned || reg.Nonce != reg0.Nonce {
+			t.Fatalf("the fixture does not reach the arrow: the abandoned register is %+v (%v)", reg, err)
+		}
+		x, xSeq, xerr := jsa.loadOutboundExchange(rig.id, rig.epoch, gen, reg.Lin)
+		if xerr != nil || x == nil {
+			t.Fatalf("reading the exchange: %v", xerr)
+		}
+		prev, prevSeq, aerr := jsa.requireAuthority(rig.id, rig.epoch)
+		if aerr != nil || prev == nil {
+			t.Fatalf("no authority: %v", aerr)
+		}
+		txn := mqttNewInflightNonce()
+		tr, terr := mqttAdvanceExchangeAckTransition(prev, prevSeq, &mqttAdvanceExchangeAckRequest{
+			ID: rig.id, Epoch: rig.epoch, Txn: txn, Op: "op-" + txn, Gen: gen, Nonce: reg.Lin,
+			To: mqttExchangePubRecObserved, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
+			RelID: mqttNewInflightNonce()}, x, xSeq)
+		if terr != nil {
+			t.Fatalf("composing the abandoned PUBREC arrow: %v", terr)
+		}
+		return tr
+	}
+	fenced := compose()
+	if fenced.Auth == nil || fenced.Prev == nil || mqttAttemptAuthorityFree(fenced.Attempt.Kind, fenced.Attempt.Rev) {
+		t.Fatal("the abandoned retained PUBREC arrow was composed authority-free")
+	}
+	unfenced := compose()
+	unfenced.Auth, unfenced.Prev, unfenced.PrevSeq = nil, nil, 0
+	unfenced.Attempt.Rev, unfenced.Attempt.PrevTxn = 0, _EMPTY_
+	if _, err := jsa.commitAuthorityTransition(unfenced); err == nil ||
+		!strings.Contains(err.Error(), "without fencing on the authority") {
+		t.Fatalf("the unfenced abandoned arrow was answered %v, want the fence refusal", err)
+	}
+	// The control: the fenced arrow lands. Re-composed on a stale expectation, because the
+	// session's own background writers (the copy's reclamation) may still move the authority.
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		if _, err = jsa.commitAuthorityTransition(compose()); err == nil || !mqttIsStaleExpectation(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("the fenced abandoned arrow was refused: %v", err)
+	}
+}

@@ -34,7 +34,9 @@ import (
 // writers that may each hold one attempt admitted before the announcement. Five such commits, one
 // in each of its first five windows, exhausted it: the completion went to the 2 s worker with the
 // Receive Maximum unit, the terminal reservation and the canonical PUBREL's acknowledgement held.
-// Now the sixth attempt lands inline, and a writer admitted during the announcement is held.
+// Now the completion is authority-free (mqttAttemptAuthorityFree): a writer committing the authority
+// inside its window is no contender, and it lands on its FIRST attempt with no wait. Mutation
+// M-L1a (the advance writes the authority again): it loses that window and waits.
 func TestMQTTPubCompOutlastsThePreAdmittedWriters(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -45,12 +47,10 @@ func TestMQTTPubCompOutlastsThePreAdmittedWriters(t *testing.T) {
 	waits := testCountContentionWaits(t, sess)
 	w := testNewAuthorityContender(t, sess)
 	w.preAdmit(mqttBackgroundAuthorityWriters)
-	var windows, held atomic.Int32
+	var windows atomic.Int32
 	testPresendFor(t, sess, "op-ack-advance", testF105SlotSubject(sess, pi), func(*mqttAuthorityTransition) {
 		windows.Add(1)
-		if !w.fire() && !w.live() {
-			held.Add(1)
-		}
+		w.fire()
 	})
 
 	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
@@ -61,15 +61,14 @@ func TestMQTTPubCompOutlastsThePreAdmittedWriters(t *testing.T) {
 			"the pre-admitted writers exhausted it", windows.Load(), w.commits.Load())
 	}
 	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-	if n := windows.Load(); int(n) != mqttBackgroundAuthorityWriters+1 {
-		t.Fatalf("the PUBCOMP made %d attempts, want %d: one lost to each pre-admitted writer, then one landed",
-			n, mqttBackgroundAuthorityWriters+1)
+	if n := windows.Load(); n != 1 {
+		t.Fatalf("the PUBCOMP made %d attempts, want 1: a pre-admitted authority writer is no contender", n)
 	}
-	if n := waits.Load(); int(n) != mqttBackgroundAuthorityWriters {
-		t.Fatalf("%d contention waits before %d re-attempts", n, mqttBackgroundAuthorityWriters)
+	if c := w.commits.Load(); c != 1 {
+		t.Fatalf("%d authority writers committed inside the PUBCOMP's window, want 1: nothing contended", c)
 	}
-	if held.Load() != 1 {
-		t.Fatalf("the writer admitted during the announcement was not held (held %d)", held.Load())
+	if n := waits.Load(); n != 0 {
+		t.Fatalf("%d contention waits for a completion nothing contends with", n)
 	}
 	testF105SlotGone(t, sess, pi, time.Second)
 }
@@ -277,6 +276,9 @@ type testFgArm struct {
 	op      string // the operation its batches carry
 	subject string // the register member its batches carry
 	run     func() bool
+	// completion: the loop's batches are authority-free completions (mqttAttemptAuthorityFree), so
+	// a background AUTHORITY writer committing in their windows is no contender at all.
+	completion bool
 	// refuseUncommitted makes every attempt fail BEFORE its batch reaches the commit (no handle),
 	// and counts the attempts.
 	refuseUncommitted func(t *testing.T) *atomic.Int32
@@ -328,7 +330,7 @@ func testFgArms() []testFgArmCase {
 		{"recovered PUBREC", func(t *testing.T) *testFgArm {
 			e, pi, subject, lin := testAdmittedPublishWorld(t, "fgarm-routeb", testRealPubRelSrcSeq)
 			testStoreCanonical(t, e, pi, e.nonceOf(pi), testRealPubRelSrcSeq)
-			return &testFgArm{sess: e.sess, op: "op-ack-advance", subject: subject,
+			return &testFgArm{sess: e.sess, op: "op-ack-advance", subject: subject, completion: true,
 				run: func() bool {
 					if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
 						t.Fatalf("recoverInflightRegisters: %v", err)
@@ -380,7 +382,7 @@ func testFgArms() []testFgArmCase {
 			s := testMQTTRunServer(t, o)
 			t.Cleanup(func() { testMQTTShutdownServer(s) })
 			_, _, sess, c, _, nonce, ref := testF105PubRelReady(t, o, s, "fgarm-pubcomp")
-			return &testFgArm{sess: sess, op: "op-ack-advance", subject: ref.name.subject,
+			return &testFgArm{sess: sess, op: "op-ack-advance", subject: ref.name.subject, completion: true,
 				run: func() bool { return sess.mqttTerminalizeOnPubComp(c, ref).recorded },
 				refuseUncommitted: func(t *testing.T) *atomic.Int32 {
 					var n atomic.Int32
@@ -464,7 +466,8 @@ func TestMQTTForegroundLoopsSpaceOnlyCommittedAttempts(t *testing.T) {
 // THE BOUND, WITH REAL COMMITS AND THE ANNOUNCEMENT: five writers admitted before the loop starts
 // each commit in one of its windows, which is the whole allowance the handshake concedes; a sixth,
 // admitted during the loop, is held until it returns, so the sixth attempt lands. An unannounced
-// loop admits the sixth and loses its last attempt too.
+// loop admits the sixth and loses its last attempt too. A completion loop writes no authority, so
+// the same commits never defeat it: it lands on its first attempt.
 func TestMQTTForegroundLoopsHoldWritersAdmittedDuringThem(t *testing.T) {
 	for _, arm := range testFgArms() {
 		t.Run(arm.name, func(t *testing.T) {
@@ -482,6 +485,14 @@ func TestMQTTForegroundLoopsHoldWritersAdmittedDuringThem(t *testing.T) {
 			if !a.run() {
 				t.Fatalf("the loop failed after %d attempts (%d contending commits, %d held)",
 					windows.Load(), w.commits.Load(), held.Load())
+			}
+			if a.completion {
+				// Mutation M-L1a (the advance writes the authority again): it loses the first window.
+				if n := windows.Load(); n != 1 || waits.Load() != 0 {
+					t.Fatalf("%d attempts and %d waits for a completion no authority writer contends with, "+
+						"want 1 and 0", n, waits.Load())
+				}
+				return
 			}
 			if n := windows.Load(); int(n) != mqttBackgroundAuthorityWriters+1 || int(waits.Load()) != mqttBackgroundAuthorityWriters {
 				t.Fatalf("%d attempts and %d waits, want %d and %d", n, waits.Load(),

@@ -316,10 +316,12 @@ func TestF105OwnershipPrepareRefusesAForeignPreparation(t *testing.T) {
 
 // C1: THE REPORTED RACE, end to end. A client holds an admitted QoS 2 obligation and resumes; the
 // resuming CONNECT's prepare is composed, and before it commits the obligation's real
-// successful-PUBREC advance lands, moving the standing authority. The first prepare is refused by
-// the real pre-submit check with its real plain error; the next is composed over the fresh
-// authority under the SAME proposal; the CONNECT is accepted. Mutation M-C1: return the error on
-// a never-landed attempt instead of re-attempting, and the CONNECT is refused.
+// successful-PUBREC advance lands. The advance is authority-free (mqttAttemptAuthorityFree), so it
+// no longer moves the standing authority: the race is closed by construction, and the prepare
+// lands on its FIRST attempt over the authority sequence it was composed against. Mutation
+// M-L1a (the advance writes the authority again): the first prepare is refused by the pre-submit
+// check and re-attempted. The re-attempt on a never-landed prepare (M-C1) is witnessed by the C4
+// allowance tests, whose refusals are staged at the seam.
 func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -368,6 +370,7 @@ func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 		mu       sync.Mutex
 		prepares []*mqttAuthorityTransition
 		firstErr error
+		advLin   string
 		inner    atomic.Bool
 	)
 	testArmTransitionSeam(t, &asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
@@ -383,8 +386,12 @@ func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 		}
 		// THE RACE: the old connection's successful-PUBREC advance lands between this prepare's
 		// read of the authority and its commit.
+		before := asm.jsa.loadOutboundAuthority(cid, asm.sessStreamEpoch)
 		inner.Store(true)
 		reg, smsg, lerr := asm.jsa.loadInflightRecord(subj)
+		if reg != nil {
+			advLin = reg.Lin
+		}
 		if lerr != nil || reg == nil || smsg == nil {
 			t.Errorf("reading the obligation's slot: %v", lerr)
 		} else if _, aerr := asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
@@ -393,6 +400,8 @@ func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 			Register: reg, RegisterSeq: smsg.Sequence,
 		}); aerr != nil {
 			t.Errorf("landing the PUBREC advance: %v", aerr)
+		} else if after := asm.jsa.loadOutboundAuthority(cid, asm.sessStreamEpoch); after.seq != before.seq {
+			t.Errorf("the PUBREC advance moved the authority from sequence %d to %d", before.seq, after.seq)
 		}
 		inner.Store(false)
 		seq, err := send()
@@ -408,18 +417,13 @@ func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(prepares) < 2 {
-		t.Fatalf("the refused prepare was not re-attempted: %d prepare(s)", len(prepares))
+	if len(prepares) != 1 || firstErr != nil {
+		t.Fatalf("the prepare met the PUBREC advance as a contender: %d prepare(s), first answered %v",
+			len(prepares), firstErr)
 	}
-	if firstErr == nil || !strings.Contains(firstErr.Error(), "is conditioned on the authority at sequence") {
-		t.Fatalf("the first prepare must meet the real pre-submit refusal, got %v", firstErr)
-	}
-	a, b := prepares[0], prepares[1]
-	if a.PrevSeq == b.PrevSeq {
-		t.Fatalf("the re-attempt reused the stale authority sequence %d", a.PrevSeq)
-	}
-	if a.Auth.Intent == nil || b.Auth.Intent == nil || a.Auth.Intent.ID != b.Auth.Intent.ID {
-		t.Fatal("the re-attempt must carry the SAME proposal as the refused attempt")
+	if x, _, xerr := asm.jsa.loadOutboundExchange(cid, asm.sessStreamEpoch, gen, advLin); xerr != nil || x == nil ||
+		x.Phase != mqttExchangePubRecObserved {
+		t.Fatalf("the PUBREC advance did not land: %+v (%v)", x, xerr)
 	}
 }
 

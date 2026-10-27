@@ -476,9 +476,10 @@ func TestF105RetiredPubRelSweptWithoutTheWatermark(t *testing.T) {
 	}
 }
 
-// T2b: an ending whose response is lost leaves BOTH writes or neither: the exchange ended and its
-// hold released, never one without the other.
-func TestF105EndingLostResponseLeavesNoStandingEdge(t *testing.T) {
+// T2b: an acknowledgement ending whose response is lost leaves the exchange ended and its hold
+// release-owed, with the pending duty that records the debt: never an ended obligation whose
+// release nothing durable remembers.
+func TestF105EndingLostResponseLeavesTheReleaseOwed(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-holds-lost")
 	defer done()
 	e.bootstrap(t, "txn-1")
@@ -502,6 +503,17 @@ func TestF105EndingLostResponseLeavesNoStandingEdge(t *testing.T) {
 	x, _ := testF105LoadExchange(t, e, testF105Gen, nonce)
 	if x.Phase != mqttExchangeTerminal {
 		t.Fatalf("fixture: the ending must have landed, phase %d", x.Phase)
+	}
+	// RELEASE-OWED, and durably so: the hold stands and the duty that records the debt is still
+	// pending, so the inventory's resolution releases it with no memory of the lost response.
+	testRequireHolds(t, &e.asm.jsa, x, true)
+	duty := testDutyNaming(t, e, nonce)
+	if testDutyTerminal(t, e, duty) {
+		t.Fatal("the duty of a release-owed obligation stands terminal")
+	}
+	if err := e.asm.jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}, duty,
+		mqttNewInflightNonce()); err != nil {
+		t.Fatalf("resolving the owed duty: %v", err)
 	}
 	testRequireHolds(t, &e.asm.jsa, x, false)
 }

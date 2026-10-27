@@ -636,8 +636,12 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 	})
 }
 
-// T11. PUBCOMP's batch losing the authority CAS to an unrelated authority writer re-attempts.
-func TestF105PubCompReattemptsAfterAnAuthorityWrite(t *testing.T) {
+// T11. An unrelated authority writer (a second delivery's admission, which also adds its edge to
+// the same source consumer) landing inside the PUBCOMP's window does not defeat it: the
+// completion is authority-free and leaves its hold release-owed, so it writes neither record.
+// Mutation M-L1a or M-L0a (the completion writes the authority, or releases its hold on the
+// source resource, again): the first PUBCOMP batch loses its CAS.
+func TestF105PubCompLandsOverAnAuthorityWrite(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-pubcomp-contention")
 	var calls atomic.Int32
@@ -668,8 +672,11 @@ func TestF105PubCompReattemptsAfterAnAuthorityWrite(t *testing.T) {
 	w.e.asm.jsa.testTransitionCommit.Store(&hook)
 	t.Cleanup(func() { w.e.asm.jsa.testTransitionCommit.Store(nil) })
 	w.e.c.mqttProcessPubComp(w.seed.pi)
-	if !firstRefused.Load() {
-		t.Fatal("the first PUBCOMP batch was not refused, so the contention was never exercised")
+	if calls.Load() < 1 {
+		t.Fatal("fixture: the PUBCOMP's batch never reached the commit, so nothing contended")
+	}
+	if firstRefused.Load() {
+		t.Fatal("the first PUBCOMP batch lost its CAS to an unrelated admission")
 	}
 	if got := testRealExchangePhase(t, w.e, w.seed); got != mqttExchangeTerminal {
 		t.Fatalf("the re-attempted PUBCOMP left the exchange at phase %d", got)

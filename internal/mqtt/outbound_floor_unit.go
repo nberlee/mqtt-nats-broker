@@ -127,9 +127,11 @@ func (sess *mqttSession) runFloorUnit(gen, epoch string) bool {
 	case led.Del < led.Lo:
 		// EVERY AUTHORITY ATTEMPT OF THE FLOOR IS BACKGROUND (outbound_foreground_priority.go): it
 		// yields to announced foreground operations, so the floor trails the traffic it reclaims
-		// rather than competing with it.
-		if !sess.admitBackgroundAuthority() {
-			return false
+		// rather than competing with it. It yields WITHOUT WAITING (tryAdmitBackgroundAuthority):
+		// the unit runs on the shared custody dispatcher, and a refused step backs off instead.
+		if !sess.tryAdmitBackgroundAuthority() {
+			more = true
+			break
 		}
 		_, derr := jsa.deleteRetiredPositionsUpTo(id, epoch, gen, mqttFloorUnitPositions)
 		progress, more = derr == nil, true
@@ -217,7 +219,7 @@ func (sess *mqttSession) floorHorizonStep(gen, epoch string, led *mqttGenLedger)
 				// horizon resumes at the first resolved position so it is classified resolved.
 				if x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, d.Ref); xerr == nil && x != nil &&
 					mqttExchangeDeliveryDutyEnded(x.Phase) {
-					resolve = append(resolve, mqttSweptDuty{Ord: ord, Entry: d})
+					resolve = append(resolve, mqttSweptDuty{Ord: ord, Entry: d, Exchange: x})
 					if len(resolve) == mqttFloorBatchCarry {
 						break
 					}
@@ -241,8 +243,9 @@ func (sess *mqttSession) floorHorizonStep(gen, epoch string, led *mqttGenLedger)
 			scanned = true
 		}
 		if len(resolve) > 0 {
-			if !sess.admitBackgroundAuthority() {
-				return scanned, false
+			if !sess.tryAdmitBackgroundAuthority() {
+				save(&h)
+				return scanned, true // yielded: back off and look again
 			}
 			root := &mqttRecoveryRoot{ID: id, Epoch: epoch, Gen: gen}
 			if rerr := jsa.opResolveDuties(root, resolve, mqttNewInflightNonce()); rerr != nil {
@@ -281,8 +284,8 @@ func (sess *mqttSession) floorHorizonStep(gen, epoch string, led *mqttGenLedger)
 		save(nil)
 		return false, true
 	}
-	if !sess.admitBackgroundAuthority() {
-		return false, false
+	if !sess.tryAdmitBackgroundAuthority() {
+		return false, true // yielded: back off and look again
 	}
 	if err := jsa.opAdvanceFloor(f, mqttNewInflightNonce()); err != nil {
 		// LOST THE LEDGER OR AN ENTRY CAS (an admission, a peer's advance, a continuation of a

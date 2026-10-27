@@ -647,6 +647,9 @@ type mqttSweptDuty struct {
 	// "nothing to do": a missing or unreadable entry is an INCONSISTENCY, never completed work,
 	// and it enters the accumulator exactly as an open duty does.
 	Entry *mqttDutyEntry
+	// Exchange, when set, is the exchange an exchange duty names as its reader already read it:
+	// a resolver may use it instead of reading it again (an ending is absorbing). Nil: read it.
+	Exchange *mqttOutboundExchange
 	// Why records what made this entry unresolved, for the operator who has to act on it. Empty
 	// for a resolved one.
 	Why string

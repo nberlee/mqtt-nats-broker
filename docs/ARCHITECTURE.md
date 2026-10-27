@@ -9447,13 +9447,13 @@ the client holds a message it declined, and would oblige a release nothing may e
 ending has a pending-drain form for the same reason the completion does: the evidence is
 durable at once, and the release still waits for the output to stop.
 
-The advance CASes the exchange at the sequence it was read, so two brokers observing the same
-acknowledgement produce one advance, and it contends on the authority in the same batch. Both
-the phase-only guarantee and the successor relation are enforced at the **write boundary**,
-against the exchange as it durably stands — not only in the helper that composes the
-transition. A guarantee that lived only in a builder would be a caller convention: every
-check a transition can make about itself still passes for a body substituted after it was
-built, and the CAS would succeed.
+The advance CASes the exchange at the sequence it was read, so two brokers observing the
+same acknowledgement produce one advance. It writes no authority record ("A completion
+writes no authority record", below). Both the phase-only guarantee and the successor
+relation are enforced at the **write boundary**, against the exchange as it durably stands
+— not only in the helper that composes the transition. A guarantee that lived only in a
+builder would be a caller convention: every check a transition can make about itself still
+passes for a body substituted after it was built, and the CAS would succeed.
 
 That boundary rule is keyed on the **member**, not the kind. An exchange member at a nonzero
 expectation IS an advance whichever transition carries it, so scoping the check to
@@ -9466,8 +9466,8 @@ counter rather than a replacement of the attempt that may still be executing.
 
 Like resource disposal it does **not** require a serving authority, for the same reason: a
 closed generation's obligation must still be able to END — its PUBCOMP arrives on the old
-connection while the successor serves, and only the current authority's CAS can succeed. A
-kind that
+connection while the successor serves, and it writes no authority, so the successor's tenure
+does not fence it. A kind that
 demanded SERVING would leave that generation permanently unfinished, its charge held and its
 identifier unreclaimable. It is confined to exactly that: it carries exchange members and
 nothing else, never create-only, and it preserves the authority's state, generation, tenure,
@@ -10093,11 +10093,14 @@ order JetStream offers them, and that serial callback is the whole of what keeps
 non-shared subscription's same-topic messages in publish order (MQTT-4.6.0-6). An
 admission that gives up abandons its offer, and JetStream's re-offer queues behind
 everything already pushed to the subscription, so the message reaches the client after
-messages published later. Every admission and every acknowledgement of a session CASes
-its one authority record, so under a backlog an admission could lose all
+messages published later. Every admission and (before 2026-10-27) every acknowledgement
+of a session CASed its one authority record, so under a backlog an admission could lose all
 `mqttForegroundAcquireAttempts` of its budget to the session's own acknowledgements and
 reorder the subscription (measured: 4 of 15 bursts of 500 on the tree before this
-change).
+change). Since 2026-10-27 an acknowledgement writes neither the authority ("A completion
+writes no authority record") nor the source resource (its holds are release-owed, 7c-lc),
+so an ordinary QoS 1 admission no longer loses to the previous delivery's answer; the
+extension below still covers every contention that remains.
 
 So the delivery entrance (`admitThroughAuthority`, ordinary and shared) extends the
 shared ladder past its budget (`runInflightAdmission`'s extension,
@@ -10172,6 +10175,37 @@ Terminal evidence observed while output is still outstanding yields
 `terminal_pending_drain`, not release: an action acquired earlier may still be executing,
 and
 releasing there would let a late first transmission escape after its own release boundary.
+
+### A completion writes no authority record
+
+`advance-exchange` — the PUBACK, PUBREC (refused or successful) and PUBCOMP advances and the
+drain completion — is AUTHORITY-FREE (`mqttAttemptAuthorityFree`): its batch carries the
+outcome receipt and its own members (exchange, register, the retained PUBREC's canonical
+PUBREL and manifest), with the last member committing, and no authority member. Its attempt
+proposes revision 0 and names no predecessor; it records the ownership it was composed
+under, for its receipt only. A completion is an act of the client's answer, not of the
+owner: it is tenure-agnostic and not serving-gated (above), double advance is fenced by the
+exchange CAS and the successor relation, the slot by its CAS. What the authority CAS bought
+it — that the completion was an act of the current owner — is given up on purpose: it was
+also what made every next admission lose its first attempt to the previous delivery's
+acknowledgement.
+
+Its outcome is decided by its receipt alone: a committed receipt whose digest matches is
+LANDED and final (nothing it installed can be SUPERSEDED, which is about an installed
+authority revision); an absent one is UNRESOLVED and settled by the abort, as for every
+kind; an aborted one is NEVER LANDED. The operation returns the commit member's sequence,
+not the slot's, and every caller re-reads the slot.
+
+**One advance keeps the fence.** The retained ABANDONED-origin PUBREC arrow creates a
+canonical PUBREL with no material to CAS, and its refusal in a Discarded generation is a
+boundary read of the closure; only an authority CAS makes that read atomic with the batch,
+because a Discard moves the authority (consult 103). That arrow carries the authority
+reinstalled exactly at one revision on (`mqttFenceAdvanceOnAuthority`), the kind rule holds
+a fenced advance to preserving ownership, state and both proposals, and
+`checkRetainedRelMembers` refuses that arrow unfenced. Every other read the boundary makes
+for an advance is of a record whose writers also move a member of the advance's own batch
+(the unsent marker is written only beside its register, the canonical PUBREL is deleted only
+after its register or exchange moved), so the member CAS fences it.
 
 ### The socket effect cannot be fenced, and is not pretended otherwise
 
@@ -11479,7 +11513,31 @@ Terminal duties included (an abandoned delivery keeps its identifier), and an un
 exchange behind it refuses. Before the duty carried the identifier, every admission read
 every exchange in the range, so its cost grew with the generation's unreclaimed history.
 Every exchange's duty is allocated in the batch that creates it, so the range covers
-every obligation the floor has not proven ended and reclaimed. The paged stream-info
+every obligation the floor has not proven ended and reclaimed.
+
+**The walk remembers a position's identity, never its state** (2026-10-27,
+`outbound_duty_identity_cache.go`). Reading every duty in the range made each admission
+cost one duty read per open position, O(span) during a burst. A position's identity — kind,
+the exchange or resource it names, an exchange duty's identifier — is written once at
+allocation and never re-identified (`checkDutyContinuation`, `checkFloorAdvance`; a
+relocation is a new ordinal), so the walk caches the identity of every position it read and
+validated, keyed by client, account recovery epoch, generation and ordinal, in the account
+assistant's shared core, and reads every position it does not hold (no highest-seen
+shortcut: a hole is read like any other position). The ledger is read fresh on every walk
+and its sequence is still what the admission's ledger CAS is held to, and the exchange of
+every duty naming a claimed identifier is read fresh; a duty's state, an exchange's phase,
+an absence or an availability is never cached. The cache prunes positions below the floor
+(pruning is not completion: a miss is a read), evicts a generation not walked for 10
+minutes and the least recently walked beyond 64, caches at most 65536 positions per
+generation, and stores a walk's fills only if the generation's version (bumped by a prune,
+removed by an eviction) is the one the walk began with. **Contract change, stated:** a
+cached position is not re-validated, so a later out-of-protocol rewrite or corruption of
+that duty record is not re-detected by this walk (the census still reads every position);
+and a restore of the stream under running brokers would invalidate the cache the same way,
+so a restore requires every broker stopped, which drops every cache. The census
+(`mqttTraverseGenerationInventory`) does not use the cache.
+
+The paged stream-info
 walk it replaced was sound only because no exchange subject was ever deleted — a
 deletion between pages shifts a live subject past the cursor — and
 `enumerateGenerationObligations` moved onto the traversal for the same reason (its
@@ -11553,7 +11611,11 @@ Hi]`: O(outstanding work plus what has not yet been reclaimed), not O(history). 
 reclaimed" is not small: the floor is a background writer that yields to every
 foreground delivery, so during a burst it does not advance and the span grows with the
 burst; at rest it retires history down to `mqttFloorSlack` (32, measured against 64 and
-256 with `make bench-outbound`). Every admission reads every duty in the span
+256 with `make bench-outbound`). It yields WITHOUT WAITING (`tryAdmitBackgroundAuthority`):
+the floor unit runs on the session's shared custody dispatcher, and an admission that
+waited there held every other custody unit — hints, owed withdrawals, the hold releaser —
+behind the foreground for the burst's whole length; a refused step backs off and is
+retried by the dispatcher instead. Every admission reads every duty in the span
 (overlapped through the multi-read) and, since the duty carries the identifier, only the
 exchanges that could collide. What stays permanent is stated in "Storage this mechanism
 accepts".
@@ -13013,28 +13075,67 @@ kind of fact as its beginning — arbitrated on the resource record, never infer
 session record or a timer. Four rules, each enforced at the write boundary rather than by
 its callers.
 
-**An ending releases its holds in its own batch.** An exchange carries `holds`, the
-reverse index of the source-replay and canonical-PUBREL edges its admission took (written
-once by the admitting batch, equal to exactly those edges in both directions, never
-rewritten). The batch that moves an exchange INTO an ending — terminal, rejected,
-superseded unsent, withdrawn unsent — must carry, for every hold, the resource member
-removing exactly that edge; and a hold edge is released by nothing else: no stored-ended
-release door exists, so a lost response leaves both or neither and the caller resolves it
-by reading the exchange. The boundary judges these removals against the ONE set of
-exchanges the batch ends (`endedHere`, S-xor-Delta), for these two roles only; the
-retained-material role keeps its own rules. An abandonment is not an ending and releases
-nothing; a pending-drain phase releases nothing until its drain completes. The ending
-kinds (advance, withdraw) may carry a resource member only as such a release, including
-for an earlier generation's resource when a G1 obligation ends under G2; and more
+**An ending releases its holds in its own batch — except the client's answer, which
+leaves them release-owed.** An exchange carries `holds`, the reverse index of the
+source-replay and canonical-PUBREL edges its admission took (written once by the admitting
+batch, equal to exactly those edges in both directions, never rewritten). The batch that
+moves an exchange INTO a superseded-unsent, withdrawn-unsent or discarded phase, and an
+acknowledgement ending of an ABANDONED delivery, must carry, for every hold, the resource
+member removing exactly that edge, judged against the ONE set of exchanges the batch ends
+(`endedHere`, S-xor-Delta), for these two roles only; the retained-material role keeps its
+own rules. An abandonment is not an ending and releases nothing; a pending-drain phase
+releases nothing until its drain completes.
+
+An acknowledgement ending (terminal, rejected, from the PUBACK, PUBCOMP, refused PUBREC or
+drain completion) of a delivery that was not abandoned releases NOTHING in its batch, and
+a release beside it is refused: the source resource is the record every next admission
+adds its edge to, so releasing there made each completion defeat the next admission's
+resource CAS. The obligation stands RELEASE-OWED (`outbound_release_holds.go`): its
+exchange is at an identifier ending and a resource still lists its edge, and its delivery
+duty stays PENDING, because a delivery duty at an identifier ending may be written
+terminal only when no hold of it is listed in the state the batch leaves
+(`checkDutyEndingIsEarned`, judged per hold on the batch's own resource member or the
+stored record; a stored absence is stable, since no batch adds an edge for an obligation
+it does not create). So the debt is durable and found by every traversal that resolves
+duties, in any generation, with no process memory. An abandoned delivery is the exception
+because its duty was already resolved by the abandonment, leaving no pending duty to carry
+the debt.
+
+The release is a `release-holds` transition: authority-free always, carrying ONE resource
+member per distinct resource (a CAS removing exact hold edges) and the delivery duties it
+earns, and nothing else (`mqttCheckTransitionKindRules`). Each removed edge's exchange is
+read in the store and must stand at a hold-releasing phase with that hold in its index (an
+ending is absorbing, so the read stays true at the commit); no edge is added and nothing
+else about the resource changes. It may name any generation of the client, as
+dispose-resource may. A partial release (another hold still listed) resolves nothing; a
+later batch whose result leaves every hold absent resolves the duty, with or without a
+removal of its own. Every resolver composes through `opReleaseHolds`: the session's releaser
+(a custody dispatcher unit, `runReleaseUnit`, armed by each landed acknowledgement ending,
+running at 16 owed or 200 ms after the first, not slack-gated and not yielding to foreground
+deliveries, so the dependents list stays near the in-flight count during a backlog; it
+releases only, the duties stay for the floor), the floor's bulk resolution and the recovery
+and discard executors (`opResolveDuty`/`opResolveDuties` route an exchange duty there,
+releasing and resolving in one batch), and a source retirement waiting on exactly those
+edges (it releases the ended holders it finds itself). The releaser's resource CAS competes
+with admissions' edge adds once per batch rather than once per delivery, and a lost CAS is
+recomposed at once inside the same call from a fresh resource read (the exchanges it
+releases for are read once: an ending is absorbing); composed over all its exchange reads,
+the release lost to an admission nearly every time and fell behind for a burst's length
+under `-race`. The first owed completion starts the dispatcher, so an idle one arms its tick
+at the release deadline and a below-threshold release runs on a quiescent session. A
+resolver that already read the exchanges (the floor's horizon) hands them over rather than
+having them read again.
+
+The ending and releasing kinds (advance, withdraw, discard, release-holds) may carry a
+resource member only as such a release, including for an earlier generation's resource when
+a G1 obligation ends under G2; and more
 generally, outside a dispose-resource transition every resource overwrite is an edge
 change and nothing else (holistic H-2/H-3, stated as one property): sealing, authorizing,
 completing and disposing are that kind's alone, so no separate resource change can ride an
 admission, a pair replacement or an ending; and a dispose batch overwrites at most one
 resource, so none can ride a disposal step either (consult 112). A pair
 supersession merges the predecessor's release into the member that adds the replacement's
-edge. Holds are released with the ending, not in a later continuation: every authority op
-already CASes the client's authority record, so the release adds no serialization point
-and removes the crash window a continuation would have had to bridge. Before 7c-lc no
+edge. Before 7c-lc no
 source or PUBREL edge was ever released, which made every such resource that admitted
 anything permanently unauthorizable — a prior-row omission this unit closes first.
 
@@ -13069,13 +13170,14 @@ source item, one bounded step per call: settle the claims of a failed provisioni
 (below); resolve the name's incarnation from its ownership (a missing or foreign owner
 WITHHOLDS the delete and drops the item — never a raw delete); write the disposal
 (idempotent: a lost response or another route's decision is found standing; an entitlement
-that moved on drops the item); wait while holds remain (an ending's commit wakes it; a
-hold whose exchange already ended is a contradiction this broker does not write, withheld
-and reported, never repaired); authorize (resource and name, one batch); delete and
-classify (removed, gone, or unresolved — which records nothing and repeats, safe because
-the name is RETIRED and never reused); record the cleanup outcome and resolve both duties.
-A restored subscription's consumer is never disposed of by a local failure: it is the
-persisted subscription's durable, and the CONNECT that cannot restore it refuses instead.
+that moved on drops the item); wait while holds remain (an ending's commit and the
+releaser wake it; a hold whose exchange already ended is release-owed, and the step
+releases it itself through `opReleaseHolds`); authorize (resource and name, one batch);
+delete and classify (removed, gone, or unresolved — which records nothing and repeats,
+safe because the name is RETIRED and never reused); record the cleanup outcome and resolve
+both duties. A restored subscription's consumer is never disposed of by a local failure:
+it is the persisted subscription's durable, and the CONNECT that cannot restore it refuses
+instead.
 
 **A failed provisioning is settled by arbitration, never by a read.** A SUBSCRIBE's claim
 (and the resume repair's) keeps the handle of every attempt it submitted. On exhaustion
@@ -13200,7 +13302,9 @@ successor (this closed row 6's "continuation 4").
 **The prompt drive is a caller, not a mechanism.** The teardown kicks the root as soon
 as its discarding closure stands — before, and independently of, the shared closing —
 and a worker visits it with the pass's own `visitRecoveryRoot`: at most 32 visits per
-kick, 8 per FIFO turn, a bounded set whose overflow is dropped. It judges no progress;
+kick, 8 per FIFO turn, a bounded set whose overflow is dropped — a root the worker puts
+back after its turn included, since kicks may have filled the set while it held the root
+(before 2026-10-27 that requeue bypassed the cap). It judges no progress;
 whatever it leaves is the periodic pass's, which promises eventual visitation and no
 latency bound.
 

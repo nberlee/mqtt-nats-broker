@@ -64,8 +64,10 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 		t.Fatalf("the refused exchange stands at phase %d, want rejected", end.Phase)
 	}
 
-	// AND IT IS AN ENDING: the resource it depends on was released by it, exactly as by a
-	// completion, because nothing further can be emitted for it (F-105 7c-lc: in its own batch).
+	// AND IT IS AN ENDING: the resource it depends on is released over it, exactly as over a
+	// completion, because nothing further can be emitted for it (F-105 7c-lc: release-owed,
+	// then released by a release-holds batch over the stored ending).
+	testReleaseOwed(t, e, nonce)
 	res, _ := testF105LoadResource(t, e, "inc-src")
 	if len(res.Deps) != 0 {
 		t.Fatalf("the resource still names %v after its only obligation was refused", res.Deps)

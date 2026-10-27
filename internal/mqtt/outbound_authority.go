@@ -285,6 +285,14 @@ const (
 	// of an exchange that already exists, and only along the protocol's own successor
 	// relation, so it can neither resurrect a terminal obligation nor skip the drain.
 	mqttTransitionAdvanceExchange mqttTransitionKind = "advance-exchange"
+	// mqttTransitionReleaseHolds releases the hold edges of obligations that already ENDED, and
+	// writes terminal the delivery duties that release earns (outbound_release_holds.go). It is
+	// AUTHORITY-FREE, always: it ends nothing, admits nothing and moves no ownership; each
+	// resource member is a CAS removing exact edges whose exchange the store shows ended, and
+	// each duty member is judged by checkDutyEndingIsEarned on the state the batch leaves. Like
+	// dispose-resource it may name any generation of the client: finished history needs no
+	// serving authority to be released.
+	mqttTransitionReleaseHolds mqttTransitionKind = "release-holds"
 	// mqttTransitionWithdrawUnsent ends ONE admitted PUBLISH obligation that was never
 	// transmitted: its register becomes a cancellation tombstone and its exchange moves
 	// Publish -> WithdrawnUnsent, in one batch.
@@ -355,7 +363,7 @@ func mqttValidTransitionKind(k mqttTransitionKind) bool {
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
 		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
 		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange, mqttTransitionFenceSharedRelease,
-		mqttTransitionFencePendingDisposal, mqttTransitionAdvanceFloor:
+		mqttTransitionFencePendingDisposal, mqttTransitionAdvanceFloor, mqttTransitionReleaseHolds:
 		return true
 	}
 	return false
@@ -426,7 +434,11 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 	if a.PrevTxn != _EMPTY_ && !mqttF105IdentTk(a.PrevTxn) {
 		return fmt.Errorf("transition attempt names a malformed predecessor transition %q", a.PrevTxn)
 	}
-	if a.Rev == 0 {
+	// AN AUTHORITY-FREE KIND proposes no revision and displaces no predecessor; every other kind
+	// proposes one.
+	if free := mqttAttemptAuthorityFree(a.Kind, a.Rev); free && a.PrevTxn != _EMPTY_ {
+		return fmt.Errorf("an authority-free %s attempt names predecessor %q: it displaces none", a.Kind, a.PrevTxn)
+	} else if !free && a.Rev == 0 {
 		return fmt.Errorf("transition attempt proposes no authority revision")
 	}
 	if !mqttValidSessGen(a.Gen) {
@@ -441,7 +453,7 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 	// A first admission is the only attempt with no predecessor, and it is exactly the
 	// attempt that installs revision 1. Any later revision displaces something, and an
 	// attempt that cannot name what it displaces could finalize against whatever it found.
-	if (a.PrevTxn == _EMPTY_) != (a.Rev == 1) {
+	if !mqttAttemptAuthorityFree(a.Kind, a.Rev) && (a.PrevTxn == _EMPTY_) != (a.Rev == 1) {
 		return fmt.Errorf("transition attempt at revision %d names predecessor %q: only a first admission has none",
 			a.Rev, a.PrevTxn)
 	}
@@ -844,6 +856,13 @@ var mqttOutcomeCommittedRequired = map[string]struct{}{
 	"rev": {}, "gen": {}, "tenure": {}, "owner_txn": {}, "digest": {},
 }
 
+// mqttOutcomeCommittedFreeRequired is the committed receipt of a kind that may run authority-free:
+// an authority-free attempt produced no revision, so it carries none (mqttAttemptAuthorityFree).
+var mqttOutcomeCommittedFreeRequired = map[string]struct{}{
+	"id": {}, "epoch": {}, "txn": {}, "op": {}, "kind": {}, "verdict": {},
+	"gen": {}, "tenure": {}, "owner_txn": {}, "digest": {},
+}
+
 // mqttJSONOptionalMembersNotNull refuses an explicitly null optional member.
 //
 // Optional means ABSENT OR A VALID SUPPORTED VALUE, never null. These writers use
@@ -969,6 +988,7 @@ func mqttDecodeTransitionOutcome(data []byte, wantID, wantEpoch, wantTxn string)
 	}
 	probe := struct {
 		Verdict mqttOutcomeVerdict `json:"verdict"`
+		Kind    mqttTransitionKind `json:"kind"`
 	}{}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, err
@@ -977,6 +997,9 @@ func mqttDecodeTransitionOutcome(data []byte, wantID, wantEpoch, wantTxn string)
 	switch probe.Verdict {
 	case mqttOutcomeCommitted:
 		members, required = mqttOutcomeCommittedMembers, mqttOutcomeCommittedRequired
+		if mqttKindMayOmitAuthority(probe.Kind) {
+			required = mqttOutcomeCommittedFreeRequired
+		}
 	case mqttOutcomeAborted:
 		members, required = mqttOutcomeCommonMembers, mqttOutcomeCommonRequired
 	default:
@@ -1315,7 +1338,11 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 	}
 	switch o.Verdict {
 	case mqttOutcomeCommitted:
-		if o.Rev == 0 {
+		// An authority-free kind produced no revision; every other kind produced exactly one.
+		if free := mqttAttemptAuthorityFree(o.Kind, o.Rev); free && o.PrevTxn != _EMPTY_ {
+			return fmt.Errorf("a committed authority-free %s outcome names predecessor %q: it displaced none",
+				o.Kind, o.PrevTxn)
+		} else if !free && o.Rev == 0 {
 			return fmt.Errorf("committed outcome carries no authority revision")
 		}
 		if !mqttValidSessGen(o.Gen) {
@@ -1330,7 +1357,7 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 		if o.Digest == _EMPTY_ {
 			return fmt.Errorf("committed outcome carries no mutation digest")
 		}
-		if (o.PrevTxn == _EMPTY_) != (o.Rev == 1) {
+		if !mqttAttemptAuthorityFree(o.Kind, o.Rev) && (o.PrevTxn == _EMPTY_) != (o.Rev == 1) {
 			return fmt.Errorf("committed outcome at revision %d names predecessor %q: only a first admission has none",
 				o.Rev, o.PrevTxn)
 		}

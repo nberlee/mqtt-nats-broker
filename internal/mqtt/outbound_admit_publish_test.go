@@ -562,10 +562,16 @@ func testF105FinishExchange(t *testing.T, e *testF105Env, nonce string) {
 }
 
 // testF105WithHoldReleases adds to a hand-composed ending the release of the exchange's holds,
-// through the production helper (F-105 7c-lc): an ending without them is refused at the boundary.
+// through the production helper (F-105 7c-lc), where the ending releases in its own batch: an
+// ending of that kind without them is refused at the boundary.
 func testF105WithHoldReleases(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition,
 	cur *mqttOutboundExchange, to mqttExchangePhase) *mqttAuthorityTransition {
 	t.Helper()
+	// AS THE PRODUCTION COMPOSERS DO: an acknowledgement ending leaves its holds release-owed
+	// (outbound_release_holds.go) unless the delivery was abandoned, so it carries no release.
+	if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionAdvanceExchange && !mqttCompletionReleasesInBatch(cur) {
+		return tr
+	}
 	if err := e.asm.jsa.appendHoldReleases(tr, cur, to); err != nil {
 		t.Fatalf("composing the hold releases of %q's ending: %v", cur.Nonce, err)
 	}

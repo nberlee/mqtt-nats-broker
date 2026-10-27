@@ -28,7 +28,9 @@ import (
 //
 //  1. the DISPOSAL decision stands on the resource, written under the entitlement the route
 //     decided with (opRequestDisposal; a decision is never re-made under a successor);
-//  2. every hold on it has been released — by its obligation's ending, in that ending's batch;
+//  2. every hold on it has been released — by its obligation's ending in that ending's batch, or,
+//     for an acknowledgement ending, by a release-holds batch (outbound_release_holds.go), which
+//     this step composes itself for the ended holders it finds;
 //  3. the deletion is AUTHORIZED, which retires the physical name in the same batch, so no
 //     obligation can depend on it again and no replacement can ever claim it;
 //  4. the delete is performed and its outcome CLASSIFIED, and recorded with the cleanup duty's
@@ -282,17 +284,27 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 			return mqttReclaimWithheld, fmt.Errorf("the disposal of %q is not visible yet", it.name)
 		}
 		if len(r.Deps) > 0 {
-			// HELD. Each hold goes with its obligation's ending; a hold whose obligation already
-			// ENDED is a contradiction this broker does not write, and is withheld, not repaired.
+			// HELD. A hold whose obligation already ENDED is RELEASE-OWED (an acknowledgement
+			// ending's, outbound_release_holds.go): the retirement waits on exactly those edges, so
+			// it releases them itself rather than waiting for a releaser that may not run here.
+			var owed []string
 			for _, d := range r.Deps {
+				if !mqttHoldRole(d.Role) || len(owed) == mqttHoldReleaseBatch {
+					continue
+				}
 				x, _, xerr := jsa.loadOutboundExchange(id, epoch, r.Gen, d.Nonce)
-				if xerr == nil && x != nil && mqttExchangeReleasesHolds(x.Phase) && mqttHoldRole(d.Role) {
-					if !it.warned && sess.jsa.c != nil {
-						it.warned = true
-						sess.jsa.c.Errorf("MQTT: consumer %q of %q is held by obligation %q, which already "+
-							"ended: a shape this broker does not write; its retirement is withheld", it.name, id, d.Nonce)
-					}
-					return mqttReclaimWithheld, fmt.Errorf("contradiction: ended obligation %q holds %q", d.Nonce, it.name)
+				if xerr == nil && x != nil && mqttExchangeReleasesHolds(x.Phase) {
+					owed = append(owed, d.Nonce)
+				}
+			}
+			if len(owed) > 0 {
+				out, rerr := jsa.opReleaseHolds(id, epoch, r.Gen, owed, nil, mqttNewInflightNonce(), nil)
+				if rerr != nil {
+					return mqttReclaimWithheld, fmt.Errorf("releasing %d ended obligation(s)' holds on %q: %w",
+						len(owed), it.name, rerr)
+				}
+				if len(out.cleared) > 0 {
+					return mqttReclaimProgress, nil
 				}
 			}
 			return mqttReclaimWithheld, fmt.Errorf("%d obligation(s) still hold %q", len(r.Deps), it.name)

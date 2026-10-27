@@ -452,6 +452,29 @@ func (jsa *mqttJSA) checkDutyEndingIsEarned(a *mqttTransitionAttempt, gen string
 				"phase %d: a duty ends when the thing it is about ends, and a pending-drain "+
 				"phase is not an ending", a.Txn, d.Ord, d.Ref, int(x.Phase))
 		}
+		// AND, AT AN IDENTIFIER ENDING, WHEN NO HOLD OF IT IS LISTED in the state this batch
+		// leaves (outbound_release_holds.go). An acknowledgement ending leaves its holds
+		// release-owed, and this pending duty is the durable record of that debt: written
+		// terminal beside a listed hold, the debt would be forgotten. Judged per hold on the
+		// resource as the batch leaves it — its own member, validated as a step by
+		// mqttCheckResourceStep, or the stored record — so the batch that removes the last edge
+		// may resolve, and one that leaves another hold listed may not. A stored absence is
+		// stable: no batch adds an edge for an obligation it does not create.
+		if mqttExchangeReleasesHolds(x.Phase) {
+			for _, h := range x.Holds {
+				r, rerr := jsa.resourceAsBatchLeavesIt(a, gen, h.Inc, extra)
+				if rerr != nil || r == nil {
+					return fmt.Errorf("transition %q ends duty %d, whose obligation %q holds resource "+
+						"%q, which this broker cannot read: the release it owes is not corroborated (%v)",
+						a.Txn, d.Ord, d.Ref, h.Inc, rerr)
+				}
+				if mqttHoldListed(r, d.Ref, h.Role) {
+					return fmt.Errorf("transition %q ends duty %d while resource %q still lists obligation "+
+						"%q's hold in role %q: an ended obligation's duty ends when its holds are released",
+						a.Txn, d.Ord, h.Inc, d.Ref, h.Role)
+				}
+			}
+		}
 
 	case mqttDutyProvision:
 		r, _, rerr := jsa.loadOutboundResource(a.ID, a.Epoch, gen, d.Ref)

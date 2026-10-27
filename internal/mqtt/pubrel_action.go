@@ -103,7 +103,8 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 	for attempt := 0; attempt < mqttPubRecAdvanceAttempts; attempt++ {
 		if attempt > 0 {
 			// SPACED, and BEFORE the fresh reads, never between a read and its batch: the
-			// contention this outlasts is a burst — the send's own token drain, a resuming
+			// contention this outlasts is a burst — the send's own token drain on the slot, an
+			// acquisition, and for the authority-fenced abandoned retained arrow a resuming
 			// CONNECT's successive authority writes — not a steady rate.
 			sess.authorityContentionWait()
 		}
@@ -141,9 +142,10 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 				Gen: ack.slot.name.gen, Nonce: cur.Lin, To: to, Acq: cur.Acq,
 				Register: cur, RegisterSeq: smsg.Sequence, RelID: relID,
 			}); aerr != nil {
-				// RE-ATTEMPTED, NOT CLASSIFIED. The authority is rewritten by every acknowledgement
-				// advance and acquisition on this session — and by a resuming CONNECT's ownership
-				// steps — and the slot by every acquisition, so losing a CAS is ordinary contention,
+				// RE-ATTEMPTED, NOT CLASSIFIED. The slot is rewritten by every acquisition and token
+				// drain, and the exchange by any completion racing this one (and the authority, for
+				// the one arrow fenced on it, by every authority transition), so losing a CAS is
+				// ordinary contention,
 				// while a "not recorded" here rolls the PUBREC back and closes the connection. Any
 				// error re-attempts; nothing here establishes that the batch was refused. The next
 				// iteration's read is the authoritative re-read: a batch that landed behind a lost
@@ -1255,8 +1257,8 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 			}); derr != nil {
 				continue // re-read: a landed batch behind a lost response shows the token gone
 			}
-			// ACKNOWLEDGED. The op returns the AUTHORITY sequence; finalize's freshness fence
-			// needs the slot's own, so read it back.
+			// ACKNOWLEDGED. The op returns the commit member's sequence, not the slot's;
+			// finalize's freshness fence needs the slot's own, so read it back.
 			cur2, smsg2, lerr := sess.asm.loadInflightRecord(ref.name.subject)
 			switch {
 			case lerr == nil && smsg2 == nil:
@@ -2091,8 +2093,8 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 				contended = out.Handle != nil
 				continue
 			}
-			// ACKNOWLEDGED: the completion is durable. The op returns the AUTHORITY sequence,
-			// so finalize needs the slot's own, read back.
+			// ACKNOWLEDGED: the completion is durable. The op returns the commit member's
+			// sequence, not the slot's, so finalize reads the slot's own back.
 			return sess.finalizeRecordedPubComp(c, ref)
 		case mqttInflightPubRelTerminal:
 			// A retried PUBCOMP, a lost response, or the drain finished it. Cleanup is

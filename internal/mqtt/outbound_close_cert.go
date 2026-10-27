@@ -329,7 +329,7 @@ func (sess *mqttSession) clearCertifiedActionToken(c *client, subject string, se
 		}
 		landed, werr = as.storeInflightCAS(subject, seq, &next)
 	}
-	// RE-READ ON EVERY OUTCOME. The terminal batch reports an authority sequence, not the
+	// RE-READ ON EVERY OUTCOME. The terminal batch reports its commit member's sequence, not the
 	// register's; and a write whose answer was lost may have landed. The register reading as
 	// EXACTLY the clearance's body is that landing, whoever wrote it — the holder's own drain
 	// writes the identical body — so adopting its sequence names the state either would reach.

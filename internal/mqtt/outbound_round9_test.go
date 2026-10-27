@@ -246,14 +246,16 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 		t.Fatalf("the committed operation's handle resolves %v, want LANDED", v)
 	}
 
-	// AND IT SURVIVES INTERVENING REVISIONS, which is the whole point: a caller that comes
-	// back after a restart is not asking whether the authority still stands where it left
-	// it, but whether ITS attempt landed.
+	// AND IT SURVIVES INTERVENING WRITES, which is the whole point: a caller that comes back
+	// after a restart is not asking whether the exchange still stands where it left it, but
+	// whether ITS attempt landed. An advance is authority-free: it installed no ownership, so
+	// nothing can supersede it, and a later advance leaves its answer LANDED (not SUPERSEDED,
+	// which is about an installed authority revision).
 	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("the second advance was refused: %v", err)
 	}
-	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionSuperseded {
-		t.Fatalf("after a later revision the handle resolves %v, want SUPERSEDED", v)
+	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
+		t.Fatalf("after a later advance the handle resolves %v, want LANDED", v)
 	}
 
 	// A REFUSED operation still yields its handle, and the handle says the attempt never

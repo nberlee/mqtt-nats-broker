@@ -627,19 +627,19 @@ func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager
 	// existed. The trigger is the floor CROSSING the observed position, never a bare sequence
 	// change, so admissions and watermark updates cause no restart; every restart is caused by a
 	// floor advance that retired a position, i.e. by real progress, and they are still bounded.
-	return mqttTraverseInventoryRestarting(jsa, as, id, epoch, gen, unreadable, nil)
+	return mqttTraverseInventoryRestarting(jsa, as, id, epoch, gen, unreadable, nil, false)
 }
 
 // mqttTraverseInventoryRestarting is the restart loop the census and the identifier walk share.
-// wanted, when non-nil, decides which exchange duties have their exchange read (see
-// mqttTraverseInventoryOnce).
+// wanted, when non-nil, decides which exchange duties have their exchange read, and identities
+// lets the walk use the duty identity cache (see mqttTraverseInventoryOnce).
 func mqttTraverseInventoryRestarting(jsa *mqttJSA, as *mqttAccountSessionManager,
 	id, epoch, gen string, unreadable func(subject string) bool,
-	wanted func(d *mqttDutyEntry) bool) (*mqttCustodyCensus, error) {
+	wanted func(d *mqttDutyEntry) bool, identities bool) (*mqttCustodyCensus, error) {
 
 	var last *mqttCustodyCensus
 	for attempt := 0; attempt <= mqttTraversalRestarts; attempt++ {
-		out, restart, err := mqttTraverseInventoryOnce(jsa, as, id, epoch, gen, unreadable, wanted)
+		out, restart, err := mqttTraverseInventoryOnce(jsa, as, id, epoch, gen, unreadable, wanted, identities)
 		if err != nil || !restart {
 			return out, err
 		}
@@ -677,7 +677,7 @@ func mqttTraverseInventoryForIdentifiers(jsa *mqttJSA, id, epoch, gen string,
 		func(d *mqttDutyEntry) bool {
 			_, ok := pis[d.PI]
 			return ok
-		})
+		}, true)
 	if census == nil {
 		return nil, err
 	}
@@ -693,9 +693,14 @@ func mqttTraverseInventoryForIdentifiers(jsa *mqttJSA, id, epoch, gen string,
 // validated (one that did not is uncertain whatever it names), Terminal duties included; an
 // exchange duty it rejects is recorded as named but its exchange is not read. Only the identifier
 // walk passes one, and its result is not a census.
+//
+// identities, for the identifier walk only, takes a position's validated identity from the duty
+// identity cache instead of reading it (outbound_duty_identity_cache.go), and offers back every
+// position it read and validated. A cached position is a standing duty of that identity; its
+// exchange, when wanted, is read fresh exactly as an uncached one's.
 func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 	id, epoch, gen string, unreadable func(subject string) bool,
-	wanted func(d *mqttDutyEntry) bool) (*mqttCustodyCensus, bool, error) {
+	wanted func(d *mqttDutyEntry) bool, identities bool) (*mqttCustodyCensus, bool, error) {
 
 	led, ledSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
 	if lerr != nil {
@@ -707,6 +712,11 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 		return out, false, nil
 	}
 	out.ledger, out.ledgerSeq = led, ledSeq
+	var known *mqttDutyIdentityWalk
+	if identities && jsa.mqttJSACore != nil {
+		known = jsa.dutyIdentities.begin(id, epoch, gen, led.Lo, led.Hi, time.Now())
+		defer jsa.dutyIdentities.finish(known)
+	}
 	// crossed re-reads the ledger and reports whether the floor has passed ordinal ord.
 	crossed := func(ord uint64) (bool, error) {
 		now, _, nerr := jsa.loadGenLedger(id, epoch, gen)
@@ -718,27 +728,46 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 	idHash := getHash(id)
 	for lo := led.Lo; lo <= led.Hi; lo += mqttInflightLoadBatch {
 		hi := min(led.Hi, lo+mqttInflightLoadBatch-1)
+		// EVERY POSITION THE CACHE DOES NOT HOLD IS READ: no highest-seen shortcut, so a hole
+		// below the cached range is read like any other position.
 		subjects := make([]string, 0, hi-lo+1)
+		ords := make([]uint64, 0, hi-lo+1)
 		for ord := lo; ord <= hi; ord++ {
+			if _, ok := known.lookup(ord); ok {
+				continue
+			}
 			subjects = append(subjects, mqttDutySubject(idHash, gen, ord))
+			ords = append(ords, ord)
 		}
 		var resps []*JSApiMsgGetResponse
 		var berr error
-		if as != nil {
+		switch {
+		case len(subjects) == 0:
+		case as != nil:
 			resps, berr = as.loadInflightRecordsMulti(subjects)
-		} else {
+		default:
 			resps, berr = jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
 		}
 		if berr != nil {
 			return out, false, fmt.Errorf("reading the duties of %q/%q: %w", id, gen, berr)
 		}
-		for i, subject := range subjects {
-			ord := lo + uint64(i)
-			var resp *JSApiMsgGetResponse
+		read := make(map[uint64]*JSApiMsgGetResponse, len(ords))
+		for i, ord := range ords {
 			if i < len(resps) {
-				resp = resps[i]
+				read[ord] = resps[i]
 			}
-			d := mqttDecodeDutyResponse(id, epoch, gen, ord, resp)
+		}
+		for ord := lo; ord <= hi; ord++ {
+			subject := mqttDutySubject(idHash, gen, ord)
+			var d *mqttDutyEntry
+			if c, ok := known.lookup(ord); ok {
+				d = &mqttDutyEntry{Ord: ord, Kind: c.kind, Ref: c.ref, PI: c.pi, State: mqttDutyPending}
+			} else {
+				d = mqttDecodeDutyResponse(id, epoch, gen, ord, read[ord])
+				if d != nil && d.State != mqttDutyRelocated {
+					known.offer(ord, d)
+				}
+			}
 			if d == nil || d.State == mqttDutyRelocated {
 				c, cerr := crossed(ord)
 				if cerr != nil {

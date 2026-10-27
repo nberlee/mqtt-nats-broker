@@ -77,6 +77,10 @@ type mqttJSACore struct {
 	// still being processed in this account. See mqttSubsBarrier.
 	subsBarrier mqttSubsBarrier
 
+	// dutyIdentities is the identifier walk's cache of validated duty identities
+	// (outbound_duty_identity_cache.go), shared by every view of this account's assistant.
+	dutyIdentities mqttDutyIdentityCache
+
 	// acceptObs is the accepted-CONNECT store observation seam. nil in production;
 	// a test arms it to observe the acceptance batch AT the store boundary, which is
 	// the only place the pair's indivisibility is a fact about this write rather than

@@ -21,7 +21,9 @@ import (
 	"testing"
 )
 
-// F-105 7c-lc: an ending releases its holds in its own batch, and nothing else releases them.
+// F-105 7c-lc: an ending other than an acknowledgement's releases its holds in its own batch; an
+// acknowledgement ending leaves them release-owed to a release-holds batch over its stored ending
+// (outbound_release_holds.go); nothing else releases them.
 
 // testRequireHolds asserts, for every hold x names, whether its resource still carries the edge.
 // An exchange with no holds proves nothing here, so it is refused as a fixture.
@@ -48,9 +50,10 @@ func testRequireHolds(t *testing.T, jsa *mqttJSA, x *mqttOutboundExchange, stand
 	}
 }
 
-// T1 at the operation surface: every ending releases exactly its holds, a non-ending releases
-// nothing, and the index names exactly what admission took.
-func TestF105EndingReleasesItsHolds(t *testing.T) {
+// T1 at the operation surface: an acknowledgement ending leaves exactly its holds standing,
+// release-owed, and a release-holds batch over it then releases exactly them; over a non-ending it
+// releases nothing. The index names exactly what admission took.
+func TestF105AckEndingLeavesItsHoldsOwed(t *testing.T) {
 	for name, tc := range map[string]struct {
 		qos   byte
 		incs  []string
@@ -91,13 +94,19 @@ func TestF105EndingReleasesItsHolds(t *testing.T) {
 			if !mqttHoldsEqual(end.Holds, want) {
 				t.Fatalf("the holds index changed across the protocol: %v", end.Holds)
 			}
+			testRequireHolds(t, &e.asm.jsa, end, true)
+			if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil,
+				mqttNewInflightNonce(), nil); err != nil {
+				t.Fatalf("the release-holds batch was refused: %v", err)
+			}
 			testRequireHolds(t, &e.asm.jsa, end, !tc.ended)
 		})
 	}
 }
 
-// T1, the acknowledgement arrow: a PUBACK releases the source hold in the batch that ends it.
-func TestF105AckEndingReleasesItsHold(t *testing.T) {
+// T1, the acknowledgement arrow: a PUBACK ends the obligation and leaves its source hold standing,
+// release-owed.
+func TestF105AckEndingLeavesItsHoldOwed(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-holds-ack")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
@@ -114,7 +123,7 @@ func TestF105AckEndingReleasesItsHold(t *testing.T) {
 	if end.Phase != mqttExchangeTerminal {
 		t.Fatalf("the exchange stands at %d, want terminal", end.Phase)
 	}
-	testRequireHolds(t, &e.asm.jsa, end, false)
+	testRequireHolds(t, &e.asm.jsa, end, true)
 }
 
 // T1, through a real session: a proven-unsent withdrawal releases the obligation's holds, and an
@@ -141,7 +150,8 @@ func TestF105WithdrawalReleasesAndAbandonmentKeepsTheHolds(t *testing.T) {
 }
 
 // testHoldsLegitEnding composes a legitimate terminal ending of a QoS 1 obligation holding
-// inc-src, with its release, and returns it uncommitted with the stored exchange.
+// inc-src — an acknowledgement's, so without a release — and returns it uncommitted with the
+// stored exchange.
 func testHoldsLegitEnding(t *testing.T, e *testF105Env, txn string) (*mqttAuthorityTransition, *mqttOutboundExchange) {
 	t.Helper()
 	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm-"+txn, 7, 1, "inc-src")
@@ -178,28 +188,30 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 		}
 	}
 
-	t.Run("an ending without its release", func(t *testing.T) {
+	t.Run("an acknowledgement ending without its release commits", func(t *testing.T) {
 		e, done := testF105NewEnv(t, "f105-holds-t2a")
 		defer done()
 		e.bootstrap(t, "txn-1")
 		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		tr, _ := testHoldsLegitEnding(t, e, "txn-bare")
-		_, err := e.asm.jsa.commitAuthorityTransition(tr)
-		refused(t, err, "without releasing its hold")
+		tr, cur := testHoldsLegitEnding(t, e, "txn-bare")
+		if _, err := e.asm.jsa.commitAuthorityTransition(tr); err != nil {
+			t.Fatalf("the acknowledgement ending was refused: %v", err)
+		}
+		end, _ := testF105LoadExchange(t, e, testF105Gen, cur.Nonce)
+		testRequireHolds(t, &e.asm.jsa, end, true)
 	})
 
-	t.Run("the same ending with its release commits", func(t *testing.T) {
+	t.Run("an acknowledgement ending with its release is refused", func(t *testing.T) {
 		e, done := testF105NewEnv(t, "f105-holds-t2b")
 		defer done()
 		e.bootstrap(t, "txn-1")
 		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		tr, cur := testHoldsLegitEnding(t, e, "txn-ok")
-		tr = testF105WithHoldReleases(t, e, tr, cur, mqttExchangeTerminal)
-		if _, err := e.asm.jsa.commitAuthorityTransition(tr); err != nil {
-			t.Fatalf("the ending with its release was refused: %v", err)
+		if err := e.asm.jsa.appendHoldReleases(tr, cur, mqttExchangeTerminal); err != nil {
+			t.Fatalf("composing the release: %v", err)
 		}
-		end, _ := testF105LoadExchange(t, e, testF105Gen, cur.Nonce)
-		testRequireHolds(t, &e.asm.jsa, end, false)
+		_, err := e.asm.jsa.commitAuthorityTransition(tr)
+		refused(t, err, "does not move that obligation into an ending")
 	})
 
 	t.Run("a release without an ending", func(t *testing.T) {
@@ -213,9 +225,8 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 	})
 
 	t.Run("a release against a stored ending", func(t *testing.T) {
-		// The contradiction the atomic release makes unwritable: an ended exchange whose hold
-		// still stands. Planted raw, and the standalone release is refused rather than offered
-		// as a repair door.
+		// An ended exchange whose hold still stands is release-owed, and only a release-holds
+		// batch releases it: the standalone dependency release of another kind is refused.
 		e, done := testF105NewEnv(t, "f105-holds-t2d")
 		defer done()
 		e.bootstrap(t, "txn-1")
@@ -233,7 +244,8 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 		refused(t, err, "does not move that obligation into an ending")
 	})
 
-	// UNDER AN ENDING KIND the resource member is a hold release and nothing else (P-4, M22).
+	// UNDER A RELEASING KIND the resource member is a hold release and nothing else (P-4, M22),
+	// here a release-holds batch over a stored acknowledgement ending.
 	for name, edit := range map[string]func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int){
 		"an added edge": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
 			var r mqttOutboundResource
@@ -292,26 +304,27 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 			tr.Extra[i].expect = seq
 		},
 	} {
-		t.Run("ending kind refuses "+name, func(t *testing.T) {
+		t.Run("release kind refuses "+name, func(t *testing.T) {
 			e, done := testF105NewEnv(t, "f105-holds-k-"+strings.ReplaceAll(name, " ", "-"))
 			defer done()
 			e.bootstrap(t, "txn-1")
 			testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-			tr, cur := testHoldsLegitEnding(t, e, "txn-k")
-			tr = testF105WithHoldReleases(t, e, tr, cur, mqttExchangeTerminal)
+			ending, cur := testHoldsLegitEnding(t, e, "txn-k")
+			if _, err := e.asm.jsa.commitAuthorityTransition(ending); err != nil {
+				t.Fatalf("fixture: the acknowledgement ending was refused: %v", err)
+			}
+			tr := testReleaseBatch(t, e, cur.Nonce, []string{"inc-src"})
 			i := testHoldsResourceMember(e, tr, "inc-src")
 			if i < 0 {
-				t.Fatal("fixture: the ending carries no release member")
+				t.Fatal("fixture: the release carries no resource member")
 			}
 			edit(t, e, tr, i)
 			if _, err := e.asm.jsa.commitAuthorityTransition(tr); err == nil {
-				t.Fatalf("an ending kind carried %s", name)
+				t.Fatalf("a release kind carried %s", name)
 			}
 			// AND NOTHING LANDED.
-			x, _ := testF105LoadExchange(t, e, testF105Gen, cur.Nonce)
-			if x.Phase != mqttExchangePublish {
-				t.Fatalf("a refused ending moved the exchange to %d", x.Phase)
-			}
+			end, _ := testF105LoadExchange(t, e, testF105Gen, cur.Nonce)
+			testRequireHolds(t, &e.asm.jsa, end, true)
 		})
 	}
 }

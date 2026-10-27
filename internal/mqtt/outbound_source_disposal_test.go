@@ -105,6 +105,11 @@ func TestF105DisposalRequestFencesAdmission(t *testing.T) {
 		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("ending the obligation was refused: %v", err)
 		}
+		// The acknowledgement ending leaves its hold release-owed: still held until released.
+		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-owed", "op-a", testF105Gen, "inc-src"); err == nil {
+			t.Fatal("a disposed consumer was authorized while an ended obligation's hold is still owed")
+		}
+		testReleaseOwed(t, e, nonce)
 		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testF105Gen, "inc-src"); err != nil {
 			t.Fatalf("authorizing the disposed, released consumer was refused: %v", err)
 		}

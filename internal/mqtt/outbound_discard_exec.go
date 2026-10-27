@@ -73,12 +73,13 @@ func (jsa *mqttJSA) classifyDiscardedExchangeDuty(id, epoch, gen string, d *mqtt
 	if st.relSeq != 0 || st.regSeq != 0 {
 		return mqttDutyVerdict{
 			Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDiscardCleanup,
-			Why: "the obligation released its holds, but its canonical PUBREL or its register still stands",
+			Why: "the obligation ended, but its canonical PUBREL or its register still stands",
 		}
 	}
 	return mqttDutyVerdict{
 		Disposition: mqttDutyMayResolve,
-		Why:         "the obligation released its holds and its records are gone",
+		Why: "the obligation ended and its records are gone; its resolution releases any hold " +
+			"still listed (an acknowledgement ending's, outbound_release_holds.go)",
 	}
 }
 

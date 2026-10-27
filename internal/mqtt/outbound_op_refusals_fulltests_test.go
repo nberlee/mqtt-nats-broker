@@ -68,8 +68,9 @@ func TestOpAdmitPublishSharedRefusalPrecedesResourceErrors(t *testing.T) {
 }
 
 // What a refused operation reads: the reads are serial and stop at the refusal, so an admission
-// under a moved generation has read only the authority, and an ending whose first held resource is
-// gone has read only that resource.
+// under a moved generation has read only the authority. An acknowledgement ending reads no held
+// resource at all (its holds are release-owed), so one whose first held resource is gone still
+// lands, and the release over the missing resource writes nothing and clears nothing.
 func TestOpRefusalCosts(t *testing.T) {
 	e, auth, o := testOpRefusalEnv(t, "op-refusal-costs")
 	idHash := getHash(e.id)
@@ -103,13 +104,17 @@ func TestOpRefusalCosts(t *testing.T) {
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
 		Gen: auth.Gen, Nonce: nonce, To: mqttExchangeRejected, Acq: reg.Acq,
 		Register: reg, RegisterSeq: seq,
-	}); err == nil {
-		t.Fatal("an ending over a held resource that does not stand must be refused")
+	}); err != nil {
+		t.Fatalf("an acknowledgement ending was refused over a resource it does not write: %v", err)
 	}
-	if n := o.sends(m2, testSubjectIs(first)); n != 1 {
-		t.Fatalf("the refused ending read its first held resource %d times, want once", n)
+	if n := o.sends(m2, testSubjectIs(first)) + o.sends(m2, testSubjectIs(second)); n != 0 {
+		t.Fatalf("the acknowledgement ending read its held resources %d times, want none", n)
 	}
-	if n := o.sends(m2, testSubjectIs(second)); n != 0 {
-		t.Fatalf("the refused ending still read its second held resource (%d): the refusal did not stop it", n)
+	out, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, auth.Gen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
+	if err != nil {
+		t.Fatalf("the release over a missing resource failed instead of writing what it can: %v", err)
+	}
+	if len(out.cleared) != 0 {
+		t.Fatalf("an obligation whose held resource does not stand was reported cleared: %v", out.cleared)
 	}
 }

@@ -439,10 +439,13 @@ func TestMQTTPubRecAdvanceLastAttemptIsResolvedNotAssumed(t *testing.T) {
 	}
 }
 
-// EVERY ATTEMPT READS FRESH. A real write lands between two attempts — during the wait — once on
-// the slot (a register CAS conflict) and once on the authority (the pre-submit conflict a
-// resuming CONNECT causes); the next attempt must reload and land on what now stands, not resend
-// the stale read. Mutation: hoist the slot read above the loop, and the slot case never lands.
+// EVERY ATTEMPT READS FRESH. A real write lands between two attempts — during the wait — on the
+// slot (a register CAS conflict); the next attempt must reload and land on what now stands, not
+// resend the stale read. Mutation: hoist the slot read above the loop, and the slot case never
+// lands. A completion of ANOTHER obligation landing inside the attempt is no conflict at all:
+// both are authority-free (mqttAttemptAuthorityFree), so the first attempt lands with no wait.
+// Mutation M-L1a (the advance writes the authority again): the authority case loses its first
+// attempt.
 func TestMQTTPubRecAdvanceReadsFreshAfterEachWait(t *testing.T) {
 	t.Parallel()
 	for _, what := range []string{"slot", "authority"} {
@@ -502,6 +505,13 @@ func TestMQTTPubRecAdvanceReadsFreshAfterEachWait(t *testing.T) {
 						ie.sess.jsa.testTransitionCommit.Store(&hook)
 						defer ie.sess.jsa.testTransitionCommit.Store(nil)
 					}
+					if what == "authority" {
+						seq, err := write()
+						if err != nil {
+							t.Errorf("the first attempt lost to another obligation's completion: %v", err)
+						}
+						return seq, err
+					}
 					if _, err := write(); err == nil {
 						t.Errorf("the first attempt committed over a write that moved its %s", what)
 					}
@@ -509,14 +519,18 @@ func TestMQTTPubRecAdvanceReadsFreshAfterEachWait(t *testing.T) {
 				}
 				return write()
 			}
+			want := 2
+			if what == "authority" {
+				want = 1
+			}
 			waits := testPubRecWaits(ie, nil)
 			if err := ie.c.mqttProcessPublishReceived(ie.pi, true, 0); err != nil {
 				t.Fatalf("the PUBREC must complete on a fresh read after a %s conflict, got %v", what, err)
 			}
-			if got := ie.fired.Load(); got != 2 {
-				t.Fatalf("the advance was attempted %d times, want 2", got)
+			if got := ie.fired.Load(); got != int64(want) {
+				t.Fatalf("the advance was attempted %d times, want %d", got, want)
 			}
-			testCheckPubRecWaits(t, *waits, 1)
+			testCheckPubRecWaits(t, *waits, want-1)
 			if !ie.pubRelStored(t) {
 				t.Fatal("the PUBREL record must have been stored")
 			}

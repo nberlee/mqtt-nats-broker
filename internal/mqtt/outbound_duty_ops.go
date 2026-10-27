@@ -64,6 +64,13 @@ func mqttResolvedDutyBody(cur *mqttDutyEntry, outcome string) ([]byte, error) {
 // about: a duty whose obligation has not ended is refused here whatever the caller believes, and a
 // terminal entry is immutable, so this cannot reopen one.
 func (jsa *mqttJSA) opResolveDuty(root *mqttRecoveryRoot, d mqttSweptDuty, txn string) error {
+	// AN EXCHANGE DUTY ENDS WITH ITS OBLIGATION'S RELEASED HOLDS, so it is resolved by the
+	// release composer, which releases what is still listed in the same batch.
+	if d.Entry != nil && d.Entry.Kind == mqttDutyExchange {
+		_, err := jsa.opReleaseHolds(root.ID, root.Epoch, root.Gen, nil, []mqttSweptDuty{d}, txn,
+			mqttSweptExchanges([]mqttSweptDuty{d}))
+		return err
+	}
 	auth, authSeq, err := jsa.requireAuthority(root.ID, root.Epoch)
 	if err != nil {
 		return err
@@ -111,12 +118,27 @@ func (jsa *mqttJSA) opResolveDuty(root *mqttRecoveryRoot, d mqttSweptDuty, txn s
 }
 
 // opResolveDuties continues several duty entries to terminal in ONE batch (F-112: the floor unit
-// resolves a live generation's ended exchange duties in bulk, so its authority writes stay a
-// small fraction of the deliveries it trails). Each member is judged by the same boundary as
-// opResolveDuty's single one; one unearned ending refuses the whole batch.
+// resolves a live generation's ended exchange duties in bulk, so its writes stay a small fraction
+// of the deliveries it trails). Each member is judged by the same boundary as opResolveDuty's
+// single one; one unearned ending refuses the whole batch, and the release composer leaves out
+// what it cannot earn rather than sending it.
 func (jsa *mqttJSA) opResolveDuties(root *mqttRecoveryRoot, ds []mqttSweptDuty, txn string) error {
 	if len(ds) == 0 {
 		return nil
+	}
+	// EXCHANGE DUTIES ARE RESOLVED BESIDE THEIR HOLD RELEASES (opResolveDuty), all in one
+	// authority-free batch; a mixed set keeps the authority-written path, which refuses an
+	// exchange duty whose holds are still listed.
+	exchanges := true
+	for _, d := range ds {
+		if d.Entry == nil || d.Entry.Kind != mqttDutyExchange {
+			exchanges = false
+			break
+		}
+	}
+	if exchanges {
+		_, err := jsa.opReleaseHolds(root.ID, root.Epoch, root.Gen, nil, ds, txn, mqttSweptExchanges(ds))
+		return err
 	}
 	auth, authSeq, err := jsa.requireAuthority(root.ID, root.Epoch)
 	if err != nil {
@@ -317,4 +339,19 @@ func (jsa *mqttJSA) cleanupDutyStandsFor(id, epoch, gen, inc string) (bool, erro
 		return false, err
 	}
 	return found, nil
+}
+
+// mqttSweptExchanges collects the exchanges a sweep already read beside its duties.
+func mqttSweptExchanges(ds []mqttSweptDuty) map[string]*mqttOutboundExchange {
+	var known map[string]*mqttOutboundExchange
+	for _, d := range ds {
+		if d.Exchange == nil {
+			continue
+		}
+		if known == nil {
+			known = make(map[string]*mqttOutboundExchange, len(ds))
+		}
+		known[d.Exchange.Nonce] = d.Exchange
+	}
+	return known
 }
