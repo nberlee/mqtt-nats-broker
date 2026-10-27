@@ -623,6 +623,30 @@ func TestF105RetainedCloseLocatesTheRegisterByItsAdmission(t *testing.T) {
 			if tc.wrongPI {
 				testRewriteRecordField(t, rig.asm, mqttExchangeSubject(rig.idHash, rig.gen, reg.Lin), "pi", wrong)
 			}
+			// THE TEST'S STEP IS THE ONLY ONE. The session's own reclaimer retries this copy
+			// while the owner read is held; released as is, it steps the copy concurrently with
+			// the call below and one of the two loses the manifest CAS (a fixture race:
+			// intermittent, 2 of 10 runs on the Go 1.27 toolchain). A foreground announcement
+			// parks it at its admission; it is released after the step.
+			rig.asm.mu.RLock()
+			sess := rig.asm.sessions[rig.id]
+			rig.asm.mu.RUnlock()
+			parked := make(chan struct{}, 1)
+			wait := func() {
+				select {
+				case parked <- struct{}{}:
+				default:
+				}
+			}
+			sess.testBackgroundWait.Store(&wait)
+			var raced atomic.Int32
+			stepped := func(mqttRetainedReclaimKey, mqttReclaimStep, error) { raced.Add(1) }
+			release := sess.announceForegroundAuthority()
+			select {
+			case <-parked:
+			case <-time.After(3 * time.Second): // nothing pending: no reclaimer to park
+			}
+			sess.testReclaimAfterStep.Store(&stepped)
 			hold.Store(false)
 			man, _, merr := rig.asm.jsa.loadRetainedManifest(rig.id, rig.epoch, rig.gen, reg.Payload)
 			if merr != nil {
@@ -633,6 +657,12 @@ func TestF105RetainedCloseLocatesTheRegisterByItsAdmission(t *testing.T) {
 			}
 			_, err := rig.asm.jsa.reclaimRetainedPayloadStep(rig.asm, rig.id, rig.epoch, rig.gen, man.Inc)
 			after, _, _ := rig.asm.jsa.loadRetainedManifest(rig.id, rig.epoch, rig.gen, reg.Payload)
+			sess.testReclaimAfterStep.Store(nil)
+			sess.testBackgroundWait.Store(nil)
+			release()
+			if n := raced.Load(); n != 0 {
+				t.Fatalf("fixture: the session's reclaimer stepped %d time(s) beside the test's step", n)
+			}
 			if !tc.wrongPI {
 				if err != nil || after == nil || after.State != mqttManifestClosed {
 					t.Fatalf("the ended exchange's copy did not close: %v, manifest %+v", err, after)

@@ -124,7 +124,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
       - name: build
         env:
           GOOS: ${{ matrix.goos }}
@@ -153,7 +153,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
       - name: package, push and check
         env:
           HELM_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
@@ -178,7 +178,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
       # Rendered before the wiki is checked out, so the wiki's clone is not among the files
       # the render sees in this checkout.
       - name: render

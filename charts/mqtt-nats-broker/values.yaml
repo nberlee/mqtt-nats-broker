@@ -318,10 +318,19 @@ nats:
                     - $KV.>
                     - $O.>
 
-  # The four variables the account block references, from the broker's credentials
+  # THE SERVER IMAGE AT THE 2.15.2 FLOOR. Chart 2.15.1 defaults to nats:2.15.1-alpine, below
+  # the floor, and neither a 2.15.2 chart nor a Docker Official nats:2.15.2 tag exists yet;
+  # synadia/nats-server is the upstream publisher's own build (nats-io/nats-docker) of the
+  # same alpine image, by tag as the chart pins its own. Drop it when the chart's default
+  # reaches the floor.
+  #
+  # And the four variables the account block references, from the broker's credentials
   # Secret. The name must equal broker.credentials.secretName; the chart refuses a
   # mismatch.
   container:
+    image:
+      repository: synadia/nats-server
+      tag: 2.15.2-alpine3.22
     env:
       MQTTNB_NATS_USER:
         valueFrom:

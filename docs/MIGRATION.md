@@ -79,7 +79,7 @@ an `MQTTNB_` environment variable; see [Configuration](CONFIGURATION.md).
 Check these while the embedded listener still serves; each one found late extends
 the outage.
 
-- **nats-server 2.15.1 or newer on every peer**, and
+- **nats-server 2.15.2 or newer on every peer**, and
   `jetstream { limits { default_max_consumers: -1 } }` on every peer (see
   [Installation](INSTALLATION.md#prerequisites)).
 - **Every MQTT identity works as a standard NATS client, in the service's

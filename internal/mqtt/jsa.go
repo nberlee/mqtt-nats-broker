@@ -837,7 +837,7 @@ func mqttConsumerListEntryName(ci *ConsumerInfo) string {
 // reported with its information, once each.
 //
 // The offset advances by the positions a page COVERED, which is neither the entries it
-// returned nor the server's limit. The pinned handlers differ (nats-server v2.15.1): the
+// returned nor the server's limit. The pinned handlers differ (nats-server v2.15.2): the
 // standalone one examines positions until it has returned 256 infos, listing an offline
 // consumer in Missing and silently skipping one closed under it; the clustered one selects
 // 256 assignments and reports each as answered, as a synthetic offline entry that is ALSO

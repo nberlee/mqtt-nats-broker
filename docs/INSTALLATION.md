@@ -6,7 +6,7 @@ setting is in [Configuration](CONFIGURATION.md).
 
 ## Prerequisites
 
-**nats-server 2.15.1 or newer, on every JetStream peer.** Earlier releases are
+**nats-server 2.15.2 or newer, on every JetStream peer.** Earlier releases are
 unsupported: not degraded, not fallback-handled. The broker's durability guarantees rest
 on specific JetStream behaviors (per-subject CAS, interest retention, deduplication,
 per-message TTL, double ack); those are asserted against the supported line, and the

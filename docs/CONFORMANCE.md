@@ -5892,7 +5892,7 @@ ones the `$MQTT_qos2in` precedent established:
   `jetstream { limits { default_max_consumers: -1 } }`, or the account tier must carry an
   explicit positive `max_consumers` above the deployment's working set — a deployment
   prerequisite beside the cluster-wide version floor, and unenforced. It is stated
-  unconditionally because the floor (2.15.1) is above 2.15.0: every supported peer has the
+  unconditionally because the floor (2.15.2) is above 2.15.0: every supported peer has the
   option.
   Tracked as F-095, whose decision (2026-10-12) is to keep this a deployment
   prerequisite: the policy choice is closed, the limitation is not, and the broker still
@@ -5901,14 +5901,15 @@ ones the `$MQTT_qos2in` precedent established:
 - **This project's own external conformance environments now meet both prerequisites,
   and assert them.** All three launches — the two CI conformance jobs
   (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` — run
-  `synadia/nats-server:2.15.1-scratch` *by digest*, at the floor, with
+  `synadia/nats-server:2.15.2-scratch` *by digest*, at the floor, with
   `default_max_consumers: -1`. The digest rather than a tag is deliberate and stays: a
   floating tag moves the backing server with no repository change and no paired
   configuration edit, which is how two environments come to disagree about the server they
   ran.
 
   **The image is the upstream publisher's, not the Docker Official Image.** When the floor
-  moved to 2.15.1 the Docker Official `nats` repository had no 2.15.1 tag, and GitHub's
+  moved to 2.15.1, and again to 2.15.2, the Docker Official `nats` repository had no tag
+  for it, and GitHub's
   container registry carries no public nats-server image. `synadia/nats-server` on Docker
   Hub is where nats-io/nats-docker publishes each release; its image configuration
   (entrypoint `/nats-server`, ports 4222/6222/8222) matches the official image's, and
@@ -6415,19 +6416,19 @@ never read, and an unset or ignored `-max-conns` means no cap at all.
 ### Programmatic AckWait near the duration limit
 
 `MQTT.AckWait` has no command-line flag or environment variable, and the standalone
-command leaves it at zero, selecting the broker's default. Programmatic callers can
-supply a positive duration, which the broker forwards unchanged to JetStream;
-`ValidateOptions` rejects negative values but imposes no upper bound. In the pinned
-nats-server v2.15.1 source, consumer validation accepts
-`time.Duration(math.MaxInt64)`, but `consumer.ackWait` adds a 1 ms timer delay
-without overflow checking. Source tracing shows that this can produce a negative
-pending-message timer interval and repeated immediate timer resets while a delivery
-remains unacknowledged. This is an upstream arithmetic defect, not corrected or
-bounded by this broker. It is accepted as a non-blocking residual for F-052 because
-the standalone command cannot configure the triggering value. A real-server
-reproduction, an upstream status check, and an upstream report remain owed under
-`CLAUDE.md`; the report wording must be presented for user approval at the commit
-gate before posting. Recording this residual does not close the upstream defect.
+command leaves it at zero, selecting the broker's default. Programmatic callers can supply
+a positive duration, which the broker forwards unchanged to JetStream; `ValidateOptions`
+rejects negative values but imposes no upper bound. In the pinned nats-server v2.15.2
+source (consumer validation is unchanged from v2.15.1), consumer validation accepts
+`time.Duration(math.MaxInt64)`, but `consumer.ackWait` adds a 1 ms timer delay without
+overflow checking. Source tracing shows that this can produce a negative pending-message
+timer interval and repeated immediate timer resets while a delivery remains
+unacknowledged. This is an upstream arithmetic defect, not corrected or bounded by this
+broker. It is accepted as a non-blocking residual for F-052 because the standalone command
+cannot configure the triggering value. A real-server reproduction, an upstream status
+check, and an upstream report remain owed under `CLAUDE.md`; the report wording must be
+presented for user approval at the commit gate before posting. Recording this residual
+does not close the upstream defect.
 
 ### A connected packet's claimed length is bounded at its fixed header
 

@@ -61,7 +61,7 @@ current `nats-server/v2` dependency in `go.mod` and exercised in CI. The broker
 does not maintain alternate code paths for older JetStream APIs or semantics.
 When the dependency advances, plans may adopt the new current behavior directly.
 
-The floor is **nats-server 2.15.1**. Older releases are unsupported outright: there
+The floor is **nats-server 2.15.2**. Older releases are unsupported outright: there
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
 is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
 but the broker cannot infer every peer's binary version from one client connection,
@@ -91,6 +91,14 @@ broker becomes conditional on the version, and no prerequisite is added or remov
 `default_max_consumers` default measures the same on the 2.15.1 binary. What moved under
 the rows this design depends on is recorded in the v2.15.0 → v2.15.1 audit below. The
 2.15.0 reasoning above is the provenance of the previous floor.
+
+**Raised from 2.15.1 to 2.15.2 on 2026-10-27**, together with the pin, as the same flat
+move: 2.15.2 is the latest release, nothing in this broker becomes conditional on the
+version, and no prerequisite is added or removed. It corrects one upstream defect this
+project recorded, CALLOUT-CONN-TYPES (`docs/known-upstream-issues.md`): an auth callout's
+issued user is now held to its `allowed_connection_types`. The broker relied on neither
+behavior, but the floor now names the release where a deployment's callout restriction is
+enforced (`docs/AUTHENTICATION.md`). What moved is in the v2.15.1 → v2.15.2 audit below.
 
 One server **option** is a deployment prerequisite for the same reason the version is:
 a peer defaults to at most 1000 consumers per stream, and no stream or account setting
@@ -204,12 +212,12 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
-The pinned dependency is **nats-server v2.15.1**, with `nats.go` 1.54.0. This is the
+The pinned dependency is **nats-server v2.15.2**, with `nats.go` 1.54.0. This is the
 *pin* — the version CI builds and tests against — and it is a different statement from the
-deployment floor above, which is **2.15.1** on every JetStream peer. **The two converged on
+deployment floor above, which is **2.15.2** on every JetStream peer. **The two converged on
 2026-09-20**, when the 2.15.0 GA shipped and the pin advanced from `v2.15.0-RC.1` to it;
 before that the pin deliberately sat below the floor. They moved together to 2.15.1 on
-2026-10-11. The pin moved to
+2026-10-11, and to 2.15.2 on 2026-10-27. The pin moved to
 the v2.15.0 line at `preview.1` for the fix to an upstream
 `CONSUMER.CREATE` versus `CONSUMER.LIST` data race
 ([`nats-io/nats-server#8478`](https://github.com/nats-io/nats-server/pull/8478)):
@@ -287,6 +295,34 @@ name. The real-server witnesses reproduce all
   `consumer.setCreatedTime` also persists `Created` to the consumer store, and
   `processConsumerRemoval` only carries over the assignment's group node; its
   `Created`-time guards are unchanged.
+
+#### The v2.15.1 → v2.15.2 audit
+
+Every non-test server file of the two trees was compared. Fourteen changed (`const.go`
+only in its version string), in five themes, and none of them is a JetStream file:
+`jetstream*.go`, `stream.go`, `consumer.go`, `raft.go`, `memstore.go` and `mqtt.go` are
+byte-identical, so every row of this list, every `make depproof` anchor and every symbol
+`internal/mqtt/shim_natsalias.go` aliases is unchanged.
+
+- **The store** (`filestore.go`): `readStreamState` gained bounds checks on the subject and
+  block counts and on each subject length in the index state file, refusing a malformed
+  file as `errCorruptState` (which rebuilds from the blocks) instead of overflowing. A
+  well-formed state file reads exactly as before. Every other function of the file is
+  byte-identical, including every store-level site F-108, F-109 and F-110 cite and the
+  recovery, tombstone and limit paths behind MAXMSGSPER-REVIVAL.
+- **Auth callout** (`auth_callout.go`): the callout's issued user is checked against its
+  `allowed_connection_types` (`connectionTypeAllowed`, after the scoped template is
+  applied). That corrects CALLOUT-CONN-TYPES; its witness fails on v2.15.1 and passes on
+  v2.15.2. The broker dials every client as a standard connection, so a callout that
+  restricts an issued user to `MQTT` alone now refuses it (`docs/AUTHENTICATION.md`).
+- **`$MQTT.` permissions** (`client.go`): the implicit allowance of `$MQTT.` subjects for
+  non-client connections now excludes leafnode connections. Not reached: this broker uses
+  no leafnodes (embedded mode refuses them, and the external mode documents none).
+- **Queue-group selection** (`client.go`, `sublist.go`, `accounts.go`, `events.go`,
+  `server.go`, `route.go`, `gateway.go`, `leafnode.go`, `util.go`): a remote queue
+  subscription that represents several members is picked in proportion to their number.
+  It changes only how a delivery is spread across remote queue members.
+- **OCSP** (`ocsp.go`, `ocsp_peer.go`) and the build files: not reached.
 
 #### The v2.15.0-RC.1 → v2.15.0 GA audit
 
@@ -611,7 +647,7 @@ to it (see the v2.15.0 → v2.15.1 audit above).
   and the account-name hash before the stream:
   `$JS.ACK.<domain>.<acchash>.<stream>.<consumer>.<dc>.<sseq>.<dseq>.<ts>.<pending>`. The
   server option `js_ack_fc_v2` selects which one a consumer EMITS (`consumer.ackReply`);
-  at the v2.15.1 pin it is off, and upstream's `main` states it becomes the default in
+  at the v2.15.2 pin it is off, and upstream's `main` states it becomes the default in
   2.16.0. Whatever it emits, the leader of an acknowledging consumer subscribes BOTH
   layouts (`consumer.go` `setLeader`), so either reply is accepted. The broker's
   obligation is only to read what arrives and to answer on it verbatim. It parses by
@@ -13595,7 +13631,12 @@ decision. An unresolved save decides nothing; whichever record lands, the next t
 settlement finds an unnamed predecessor. Both the repair's claim and a SUBSCRIBE's claim are
 now made under the CONNECTION's entitlement rather than the authority that happens to stand
 when they read it, so a connection displaced between its gate and its claim never labels a
-claim with its successor's tenure.
+claim with its successor's tenure. The repair's claim is re-attempted on a positively stale
+expectation, spaced and announced foreground, as the PUBREL claim is: it CASes the
+authority, which the session's background writers and a refused CONNECT's settlement also
+write, and a stale attempt wrote nothing, so losing one is contention rather than a reason
+to refuse the CONNECT (2026-10-27, found by the full suite on the Go 1.27 toolchain). Any
+other failure ends it at once, and every attempt's handle goes to arbitration.
 
 **Fork repair never reinstates a decided consumer.** A recognised fork's capsule is this
 broker's own erased branch, and a consumer it names may since have been decided by another
@@ -15688,8 +15729,8 @@ memory limit once at startup, before TLS is resolved or NATS is dialed
 (`applyGoMemoryLimit`, `cmd/mqtt-nats-broker/memlimit.go`), using
 `github.com/KimMachineGun/automemlimit` v1.0.0. Without it the garbage collector paces
 only by `GOGC`, so the heap can grow past the cgroup ceiling between collections and
-the kernel kills the pod where the runtime could have collected harder. Go 1.26 does
-not derive this itself (golang/go#75164 is an open proposal), and a Kubernetes
+the kernel kills the pod where the runtime could have collected harder. Go 1.27 does
+not derive this itself (golang/go#75164 is still an open proposal), and a Kubernetes
 `resourceFieldRef` cannot express a fraction of `limits.memory`, so the binary owns
 the derivation and the manifest only sets the limit.
 

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: go vet
         run: go vet ./...
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: go vet
         if: matrix.shard == 0
@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: test
         run: make test-shard TEST_TAGS='mqtt_fulltests mqtt_experimental_shared_qos2' SHARD=${{ matrix.shard }} SHARDS=8
@@ -96,7 +96,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: test
         env:
@@ -149,7 +149,7 @@ jobs:
       - uses: actions/setup-go@v7
         if: steps.gate.outputs.run == 'true'
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: route regressions and mutations
         if: steps.gate.outputs.run == 'true'
@@ -162,7 +162,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       # Pinned, not `latest`: the action resolves the binary, and .golangci.yml is
       # schema v2, which only a golangci-lint 2.x binary accepts. Action v6 mapped
@@ -171,9 +171,15 @@ jobs:
       #
       # The action only INSTALLS the binary; the passes are `make lint-go`'s, so CI runs exactly
       # the four passes a developer runs (production only, default tests, and both tagged builds).
+      #
+      # BUILT WITH THIS JOB'S GO (`goinstall`), not the release binary: golangci-lint's releases
+      # (v2.14.0 and v2.15.0 alike) are built with Go 1.27.0, whose importer cannot read the
+      # export data Go 1.27.3 writes ("export data version 5 is greater than maximum supported
+      # version 4"), so the release binary type-checks nothing on the go.mod toolchain.
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
+          install-mode: goinstall
           install-only: true
       - name: golangci-lint (four passes)
         run: make lint-go
@@ -213,7 +219,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: render and check
         run: make kubernetes-render
@@ -229,7 +235,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: lint, render and check
         run: make helm-check
@@ -252,7 +258,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - name: install and check
         run: make helm-smoke
@@ -271,7 +277,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - id: external
         uses: docker/metadata-action@v6
@@ -362,7 +368,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - uses: docker/setup-buildx-action@v4
       - name: build (load, no push)
@@ -398,7 +404,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: true
       - uses: docker/setup-buildx-action@v4
       - name: build (load, no push)
@@ -474,18 +480,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
-        with: { go-version: '1.26', cache: true }
+        with: { go-version: '1.27', cache: true }
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v7
         # run.sh's floor check decodes /varz with python3 rather than pattern-matching
         # it. This job runs no Python suite, but it does run that check.
         with: { python-version: '3.x' }
       - name: start NATS with JetStream
-        # Pinned by digest at the 2.15.1 floor, NOT `latest`: a floating tag would
+        # Pinned by digest at the 2.15.2 floor, NOT `latest`: a floating tag would
         # move the backing server with no repository change and no paired config
         # edit. The image is the upstream publisher's synadia/nats-server on Docker
         # Hub (built by nats-io/nats-docker), not the Docker Official `nats` image,
-        # which had no 2.15.1 tag when the floor moved. This job used to launch `-js` with no config file; it now needs one,
+        # which had no 2.15.1 or 2.15.2 tag when the floor moved. This job used to launch `-js` with no config file; it now needs one,
         # because `-js` alone leaves default_max_consumers at its 1000-per-stream
         # default and that ARMS the cap rather than opting out of it (F-095).
         # nats-plain.conf is this job's own, unauthenticated, and is NOT nats.conf:
@@ -493,7 +499,7 @@ jobs:
         run: |
           docker run -d --name nats -p 4222:4222 -p 8222:8222 \
             -v "$PWD/test/conformance/nats-plain.conf:/etc/nats/nats.conf:ro" \
-            synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2 -c /etc/nats/nats.conf
+            synadia/nats-server:2.15.2-scratch@sha256:4156d44c6d5f08767a8eaee26255280245ca0063ec64dfbdfcb1e58db7e45c99 -c /etc/nats/nats.conf
       - name: build broker
         run: go build -o mqtt-nats-broker ./cmd/mqtt-nats-broker
       - name: build mqtt-conformance
@@ -522,17 +528,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
-        with: { go-version: '1.26', cache: true }
+        with: { go-version: '1.27', cache: true }
       - uses: actions/setup-python@v7
         with: { python-version: '3.x' }
       - name: start NATS with JetStream + deny ACL
-        # Digest-pinned at the 2.15.1 floor, same image, for the same reason as the job above;
+        # Digest-pinned at the 2.15.2 floor, same image, for the same reason as the job above;
         # see docs/CONFORMANCE.md. Port 8222 is the monitoring endpoint run.sh
         # reads to assert the version and the effective consumer limit.
         run: |
           docker run -d --name nats -p 4222:4222 -p 8222:8222 \
             -v "$PWD/test/conformance/nats.conf:/etc/nats/nats.conf:ro" \
-            synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2 -c /etc/nats/nats.conf
+            synadia/nats-server:2.15.2-scratch@sha256:4156d44c6d5f08767a8eaee26255280245ca0063ec64dfbdfcb1e58db7e45c99 -c /etc/nats/nats.conf
       - name: build broker
         run: go build -o mqtt-nats-broker ./cmd/mqtt-nats-broker
       - name: run broker (auth passthrough + deny)

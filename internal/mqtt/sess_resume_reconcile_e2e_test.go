@@ -4024,3 +4024,55 @@ func TestMQTTReconcileRefusedParkRestoresTheWill(t *testing.T) {
 		t.Fatal("an action was parked on a session that was never unresolved")
 	}
 }
+
+// A RESUME REPAIR'S NAME CLAIM SURVIVES CONTENTION. The repair claims its replacement consumer's
+// name through an authority batch; a concurrent authority write landing between the claim's read
+// and its commit makes that attempt positively stale, and the claim re-attempts from a fresh read
+// instead of refusing the CONNECT. The contending write here rewrites the authority record
+// unchanged, which moves its sequence exactly as a background writer's commit does.
+//
+// Mutation: the claim makes one attempt -> the CONNECT is refused.
+func TestMQTTReconcileRepairClaimSurvivesContention(t *testing.T) {
+	t.Parallel()
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const cid, topic, sid = "repair-contended", "repair/contended", "repair.contended"
+	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
+	oldDur := testReconcileConsDur(t, s, cid, sid)
+	c.Close()
+	asm := testMQTTGetGlobalASM(t, s)
+	testReconcileDeleteConsumer(t, asm, oldDur)
+
+	var attempts, contended atomic.Int32
+	testArmTransitionSeam(t, &asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if tr.Attempt.ID != cid || tr.Attempt.Kind != mqttTransitionProvisionResource {
+			return send()
+		}
+		if attempts.Add(1) == 1 {
+			subj := mqttOutboundAuthoritySubject(getHash(cid))
+			smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+			if err != nil || smsg == nil {
+				t.Errorf("reading the authority to contend on: %v", err)
+				return send()
+			}
+			if _, err := asm.jsa.storeMsg(subj, -1, smsg.Data); err != nil {
+				t.Errorf("contending on the authority: %v", err)
+				return send()
+			}
+			contended.Store(1)
+		}
+		return send()
+	})
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	if contended.Load() != 1 || attempts.Load() < 2 {
+		t.Fatalf("fixture: %d claim attempt(s), contended %v: the contention never cost an attempt",
+			attempts.Load(), contended.Load() == 1)
+	}
+	testReconcileQoS1Publish(t, o, topic, []byte("repaired"))
+	testReconcileExpectQoS1(t, c2, r2, topic, []byte("repaired"))
+}

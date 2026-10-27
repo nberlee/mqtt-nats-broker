@@ -123,8 +123,10 @@ func runWithCluster(m *testing.M, external, embedded string) (int, error) {
 	return m.Run(), nil
 }
 
-// thirdPartyImages are the official NATS chart 2.15.1's default images.
-var thirdPartyImages = []string{"nats:2.15.1-alpine", "natsio/nats-server-config-reloader:0.24.0"}
+// thirdPartyImages are the images the NATS chart runs here: the server at the 2.15.2 floor
+// (chart 2.15.1's default nats:2.15.1-alpine is below it, so the values override it) and
+// chart 2.15.1's config reloader.
+var thirdPartyImages = []string{"synadia/nats-server:2.15.2-alpine3.22", "natsio/nats-server-config-reloader:0.24.0"}
 
 func randSuffix() string {
 	b := make([]byte, 4)

@@ -1310,3 +1310,47 @@ sampled the first record-transaction release of the session, which under shard l
 be an earlier transaction's; it now samples the rollback's own, by the save ordinal, as its
 sibling T6 does (20 of 20). Both still fail against the mutations they exist for (the
 recovery arm's pass abort removed; F-039's M3).
+
+## nats-server 2.15.2 and Go 1.27 (2026-10-27)
+
+The pin and the floor moved from nats-server 2.15.1 to 2.15.2, and the toolchain from Go
+1.26 to 1.27.3, at the user's direction.
+
+**The upstream delta** (`docs/ARCHITECTURE.md`, "The v2.15.1 → v2.15.2 audit"): fourteen
+server files changed and no JetStream file did. `make depproof` matched every row of its
+evidence table on v2.15.2. The one store change, `readStreamState`'s bounds checks, only
+refuses a malformed index state file, so the store paths behind F-108, F-109, F-110 and
+MAXMSGSPER-REVIVAL are unchanged and none of them closes. CALLOUT-CONN-TYPES does: the
+callout's issued user is now checked with `connectionTypeAllowed`, and its witness fails on
+v2.15.1 and passes on v2.15.2.
+
+**Images.** `synadia/nats-server:2.15.2-scratch` by digest for the conformance jobs, Compose
+and the image smoke test (the Docker Official `nats` repository had no 2.15.2 tag). Neither
+a 2.15.2 NATS chart nor `nats:2.15.2-alpine` exists, so the chart's optional NATS and the
+shared-pod example override chart 2.15.1's `nats:2.15.1-alpine` with
+`synadia/nats-server:2.15.2-alpine3.22`. The first version of that override was silently
+discarded: both values files already had a `container:` key, and YAML keeps the last; the
+render check caught it, and the image now merges into the existing block.
+
+**Go 1.27.** No gofmt or vet change in the tree. golangci-lint's release binaries (v2.14.0
+and v2.15.0 alike) are built with Go 1.27.0 and cannot read the export data Go 1.27.3
+writes ("export data version 5 is greater than maximum supported version 4"), so every
+import fails to type-check; CI now builds the pinned v2.14.0 with the job's own Go
+(`install-mode: goinstall`), and `CONTRIBUTING.md` says how locally. The claim that the
+runtime does not derive `GOMEMLIMIT` from the cgroup still holds on 1.27 (golang/go#75164
+is open).
+
+**One intermittent fixture race surfaced on the new toolchain**, fixed rather than
+baselined: `TestF105RetainedCloseLocatesTheRegisterByItsAdmission/ended-control-closes` (2
+of 10 runs under `-race` on the bump, 0 of 10 on `main`) called the reclaim step directly
+while the session's own reclaimer, released from the same held read, stepped the same
+copy, and one of the two lost the manifest CAS. The test now parks the reclaimer with a
+foreground announcement before it releases the hold and fails if a reclaimer step lands
+beside its own (20 of 20). No broker change.
+
+**And one broker defect it exposed**, fixed: `TestMQTTReconcileChargeAccounting`'s reconnect
+after a refused CONNECT was itself refused, intermittently, because the resume repair
+claimed its replacement consumer's name in ONE attempt and that attempt lost the authority
+CAS ("wrong last sequence") to concurrent authority writes. The claim now re-attempts on a
+positively stale expectation like the PUBREL name claim; the witness
+`TestMQTTReconcileRepairClaimSurvivesContention` fails when the claim gets one attempt.

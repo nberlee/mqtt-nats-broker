@@ -22,15 +22,18 @@ make vet lint    # static analysis: go vet, golangci-lint, markdownlint
 make build       # host binary
 ```
 
-`make lint` covers Markdown as well as Go (`make lint-go` / `make lint-md` run
-them separately). `make lint-go` runs golangci-lint four times with one
-configuration: production only (`--tests=false`, the only pass that reports a
-declaration nothing but tests still reaches), the default tests, and both tagged
-builds (`mqtt_fulltests`, and with `mqtt_experimental_shared_qos2`); each
-must be clean. Markdown rules live in `.markdownlint.jsonc`; vendored
-third-party docs are excluded via `.markdownlintignore`, since their style is
-upstream's decision. CI runs the same linter and configuration: it installs the
-pinned golangci-lint and runs `make lint-go`.
+`make lint` covers Markdown as well as Go (`make lint-go` / `make lint-md` run them
+separately). `make lint-go` runs golangci-lint four times with one configuration:
+production only (`--tests=false`, the only pass that reports a declaration nothing but
+tests still reaches), the default tests, and both tagged builds (`mqtt_fulltests`, and
+with `mqtt_experimental_shared_qos2`); each must be clean. Markdown rules live in
+`.markdownlint.jsonc`; vendored third-party docs are excluded via `.markdownlintignore`,
+since their style is upstream's decision. CI runs the same linter and configuration: it
+builds the pinned golangci-lint with the module's Go and runs `make lint-go`. Build it the
+same way locally (`GOTOOLCHAIN=go1.27.3 go install
+github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`): the release binaries are
+built with Go 1.27.0 and cannot read the export data Go 1.27.3 writes, so they report
+every import as a typecheck error.
 
 The documents `docs/WIKI.md` lists are also published as the GitHub Wiki, and
 `make test` renders them: a broken link or anchor fails it, and so does Markdown outside

@@ -159,16 +159,20 @@ a kind cluster (`make helm-smoke`). What a customization adds is yours: a `merge
 
 Everything under `nats:` is the official NATS chart's own values
 (<https://github.com/nats-io/k8s>, `helm/charts/nats`, version 2.15.1), passed through
-untranslated. The chart's defaults there enable JetStream with the consumer limit the
-broker needs, create the broker's account with the deny ACL for anonymous clients, take
-the four credential variables from `broker.credentials.secretName`, disable NATS Box,
-and run the server Restricted. For a JetStream cluster, start from
-`ci/optional-nats-cluster-values.yaml`: the routes must be authenticated (the chart refuses
-a cluster without route authorization, route credentials or route TLS), and that file
-takes the route credentials from the Secret `mqtt-nats-broker-routes` (`user`,
-`password`, URL-safe) without putting them in the rendered configuration. Set
-`broker.streamReplicas` to the server count. No NetworkPolicy is rendered for the
-dependency's route port; add one with `extraResources` where the network is shared.
+untranslated, except one default: that chart's server image, `nats:2.15.1-alpine`, is
+below the broker's 2.15.2 floor, so `nats.container.image` defaults to
+`synadia/nats-server:2.15.2-alpine3.22`, the upstream publisher's own build of
+the same image, until the NATS chart ships one at the floor. The chart's defaults there
+enable JetStream with the consumer limit the broker needs, create the broker's account
+with the deny ACL for anonymous clients, take the four credential variables from
+`broker.credentials.secretName`, disable NATS Box, and run the server Restricted. For a
+JetStream cluster, start from `ci/optional-nats-cluster-values.yaml`: the routes must be
+authenticated (the chart refuses a cluster without route authorization, route credentials
+or route TLS), and that file takes the route credentials from the Secret
+`mqtt-nats-broker-routes` (`user`, `password`, URL-safe) without putting them in the
+rendered configuration. Set `broker.streamReplicas` to the server count. No NetworkPolicy
+is rendered for the dependency's route port; add one with `extraResources` where the
+network is shared.
 
 `docs/ARCHITECTURE.md`, "The Helm chart", has the mechanism, and `docs/CONFORMANCE.md`
 what it does not cover.

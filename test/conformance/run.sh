@@ -12,7 +12,7 @@
 #   BROKER_PORT        (default 1883)
 #   SUITES             (default "conformance") space-separated subset of: conformance natstest paho
 #   NATS_MONITOR_URL   (default http://127.0.0.1:8222) NATS monitoring endpoint
-#   NATS_VERSION_FLOOR (default 2.15.1) minimum backing nats-server version
+#   NATS_VERSION_FLOOR (default 2.15.2) minimum backing nats-server version
 #
 # Every run first asserts the backing NATS server against the deployment floor and
 # the consumer-cap prerequisite; see check_nats_floor. There is deliberately no
@@ -48,7 +48,7 @@ warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*"; }
 # `default_max_consumers: -1` reports -1.
 # That is what makes this assertion discriminating rather than decorative.
 check_nats_floor() {
-  local url="${NATS_MONITOR_URL:-http://127.0.0.1:8222}" floor="${NATS_VERSION_FLOOR:-2.15.1}"
+  local url="${NATS_MONITOR_URL:-http://127.0.0.1:8222}" floor="${NATS_VERSION_FLOOR:-2.15.2}"
   command -v curl >/dev/null 2>&1 || { echo "curl is required to verify the NATS floor" >&2; exit 1; }
 
   # Bound the individual request AND the whole retry window. An endpoint that accepts

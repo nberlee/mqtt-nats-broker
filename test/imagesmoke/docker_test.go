@@ -30,7 +30,7 @@ import (
 
 const (
 	// natsImage is the server the conformance jobs pin, at the documented floor.
-	natsImage = "synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2"
+	natsImage = "synadia/nats-server:2.15.2-scratch@sha256:4156d44c6d5f08767a8eaee26255280245ca0063ec64dfbdfcb1e58db7e45c99"
 	// helperImage populates volumes; it needs a shell and tar, which neither the
 	// image under test nor the NATS image has. Digest-pinned like natsImage.
 	helperImage = "busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"

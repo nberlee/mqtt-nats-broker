@@ -4,12 +4,12 @@ name: mqtt-nats-conformance
 
 services:
   nats:
-    # Digest-pinned at the documented 2.15.1 floor, from the upstream publisher's
+    # Digest-pinned at the documented 2.15.2 floor, from the upstream publisher's
     # synadia/nats-server repository (Docker Hub, not the Docker Official `nats`
     # image). Keep it a digest, not a floating
     # tag: `latest` would move the backing server with no repository change and no
     # paired default_max_consumers edit. See docs/CONFORMANCE.md.
-    image: synadia/nats-server:2.15.1-scratch@sha256:57e8640c67acb4f40fd453cde5518baa601759ed242a476b705bbfb573cf01f2
+    image: synadia/nats-server:2.15.2-scratch@sha256:4156d44c6d5f08767a8eaee26255280245ca0063ec64dfbdfcb1e58db7e45c99
     command: ["-c", "/etc/nats/nats.conf", "-sd", "/data"]
     volumes:
       - nats-data:/data

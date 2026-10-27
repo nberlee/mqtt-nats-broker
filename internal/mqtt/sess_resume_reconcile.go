@@ -774,15 +774,34 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 				err: fmt.Errorf("this connection holds no accepted entitlement, so the replacement consumer "+
 					"name %q for filter %q cannot be claimed", durName, e.sid)}
 		}
+		//
+		// RE-ATTEMPTED ON A STALE EXPECTATION, as the PUBREL name claim is (claimPubRelName): the
+		// claim CASes the authority, which this session's own background writers and a refused
+		// CONNECT's settlement also write, and a positively stale attempt wrote nothing, so losing
+		// one is contention, not a reason to refuse the client. Any other failure ends the claim at
+		// once. Every attempt's handle goes to arbitration on failure.
 		repairInc := mqttNewInflightNonce()
 		repairClaim := &mqttSourceClaim{gen: repairEnt.Gen, name: durName, inc: repairInc, ent: repairEnt}
-		if out, perr := sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
-			mqttNewInflightNonce(), "op-provision-source", repairEnt.Gen, repairEnt.Tenure,
-			repairInc, durName, mqttResourceSourceConsumer); perr != nil {
-			// The claim may have landed: its handle goes to arbitration (F-105 7c-lc).
-			if out.Handle != nil {
-				repairClaim.handles = []*mqttTransitionHandle{out.Handle}
+		var perr error
+		releaseFG := sess.announceForegroundAuthority()
+		for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
+			if attempt > 0 {
+				sess.authorityContentionWait()
 			}
+			var out mqttOpOutcome
+			out, perr = sess.jsa.opProvisionResource(sess.id, sess.asm.sessStreamEpoch,
+				mqttNewInflightNonce(), "op-provision-source", repairEnt.Gen, repairEnt.Tenure,
+				repairInc, durName, mqttResourceSourceConsumer)
+			if out.Handle != nil {
+				repairClaim.handles = append(repairClaim.handles, out.Handle)
+			}
+			if perr == nil || !mqttIsStaleExpectation(perr) {
+				break
+			}
+		}
+		releaseFG()
+		if perr != nil {
+			// The claim may have landed: its handles go to arbitration (F-105 7c-lc).
 			sess.custodyFailedClaim(repairClaim)
 			undo()
 			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,

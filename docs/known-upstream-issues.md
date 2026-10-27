@@ -27,22 +27,26 @@ chapters P and U by name) and none is an alpha blocker. The alpha gate owes only
 the dependency floor: when a correction ships, the pin and the documented floor
 move onto it and the item is ticked.
 
-Pin: `nats-server v2.15.1` (latest release), moved from v2.15.0 on 2026-10-11. Every
-issue below was re-reproduced on v2.15.1 that day with its real-server witness, and the
+Pin: `nats-server v2.15.2` (latest release), moved from v2.15.1 on 2026-10-27. Every issue
+below was re-reproduced on v2.15.1 on 2026-10-11 with its real-server witness, and the
 store functions each one cites are byte-identical between v2.15.0 and v2.15.1
-(`docs/ARCHITECTURE.md`, "The v2.15.0 → v2.15.1 audit"). The earlier check against
-`main` (`v2.16.0-dev`) dates from each issue's own section and was not repeated.
+(`docs/ARCHITECTURE.md`, "The v2.15.0 → v2.15.1 audit") and again between v2.15.1 and
+v2.15.2 ("The v2.15.1 → v2.15.2 audit": the one store change, `readStreamState`'s bounds
+checks, touches only a malformed index state file). Their witnesses were not re-run on
+v2.15.2. CALLOUT-CONN-TYPES is corrected in v2.15.2, and its witness was re-run on both.
+The earlier check against `main` (`v2.16.0-dev`) dates from each issue's own section and
+was not repeated.
 
 ## Index
 
 | ID | One line | Upstream | Blocks | Status |
 |---|---|---|---|---|
-| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since F-105 the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1 |
-| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed; reproduces on v2.15.1 |
-| F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1 |
-| F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1 |
+| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since F-105 the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
-| CALLOUT-CONN-TYPES | A user an auth callout issues is admitted on any connection type, whatever its `allowed_connection_types` | Not filed; no existing report found (searched 2026-10-25; [#5786](https://github.com/nats-io/nats-server/issues/5786) is the scoped-signing-key case, without a callout) | nothing the broker relies on; an operator following the callout pattern in `docs/AUTHENTICATION.md` who restricts connection types | Witness ready, not yet filed; reproduces on v2.15.1; the callout path is unchanged on `main` at `f8f6db89` (2026-10-20) |
+| CALLOUT-CONN-TYPES | A user an auth callout issues is admitted on any connection type, whatever its `allowed_connection_types` | Not filed; no existing report found (searched 2026-10-25; [#5786](https://github.com/nats-io/nats-server/issues/5786) is the scoped-signing-key case, without a callout) | nothing the broker relies on; an operator following the callout pattern in `docs/AUTHENTICATION.md` who restricts connection types | **Fixed in v2.15.2** (the callout reply now calls `connectionTypeAllowed`); the witness fails on v2.15.1 and passes on v2.15.2 (2026-10-27); closed by the 2.15.2 pin and floor, never filed |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -261,7 +265,7 @@ post-alpha roadmap item (section 8); the user writes the reports personally.
 same restriction on a configuration-file user, or on a user JWT the client presents
 itself, is enforced.
 
-**Where (pinned nats-server v2.15.1).** The configuration-user and direct-JWT paths
+**Where (nats-server v2.15.1).** The configuration-user and direct-JWT paths
 call `connectionTypeAllowed` (`auth.go:929`, `943`, `958`, `1008`, `1095`). The
 callout's reply handler in `processClientOrLeafCallout` converts the claim
 (`getExpirationAndAllowedConnections`, `auth_callout.go:197`, called at `286`) and
@@ -274,10 +278,14 @@ lines.
 nats.go only: an operator, an `AUTH` account with a callout, a `default_sentinel`, and
 a responder that issues every user into `APP`, restricting `mqtt-only` to `MQTT`. The
 control connects; `mqtt-only` connecting as a standard client must be refused, and is
-admitted at the pin.
+admitted on v2.15.1.
 
-**Here.** Nothing in the broker depends on it: auth passthrough always dials a
+**Fixed in v2.15.2.** The callout's reply handler now checks the issued user with
+`connectionTypeAllowed`, after the scoped template is applied (`auth_callout.go`). Re-run
+on 2026-10-27, the witness fails on v2.15.1 and passes on v2.15.2, and the pin and the
+floor moved to v2.15.2 that day. Nothing to file.
+
+**Here.** Nothing in the broker depended on the defect: auth passthrough always dials a
 standard connection, and the broker reads the issued user's account and permissions
-itself. `docs/AUTHENTICATION.md` tells operators not to rely on the restriction in a
-callout. The broker does not work around it, and no test in this repository asserts
-the defect. The user writes and posts the report.
+itself. At the 2.15.2 floor a callout that restricts its issued users to `MQTT` alone
+refuses them on that standard connection, which `docs/AUTHENTICATION.md` now says.

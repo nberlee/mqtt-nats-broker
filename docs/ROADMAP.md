@@ -8428,7 +8428,8 @@ upstream references and the unblock conditions, is `docs/known-upstream-issues.m
 boundary ruling itself is restated there. Each closes when upstream ships a correction and
 the pin moves onto it under the ordinary reviewed-bump procedure; none is an alpha blocker.
 At the v2.15.1 pin (2026-10-11) the store functions all four cite are byte-identical to
-v2.15.0 and every witness still reproduces, so none closed with that bump.
+v2.15.0 and every witness still reproduces, so none closed with that bump; at the v2.15.2
+pin (2026-10-27) they are byte-identical again, so none closed with that one either.
 
 - [x] **Retire the F-109 point-read absence census (repository housekeeping).** The census
   (`internal/mqtt/point_read_absence_*_test.go`, its manifests, and the dossier
@@ -9444,6 +9445,19 @@ reads](findings/resolved.md#f-054).
 
 ### NATS platform follow-ups
 
+- [x] **Move the pin and the floor to nats-server 2.15.2, and the toolchain to Go 1.27.**
+  Done 2026-10-27 at the user's direction. `go.mod` requires nats-server v2.15.2 and
+  `go 1.27.3`; the Dockerfile builder, CI and release run Go 1.27; the conformance jobs,
+  Compose and the image smoke test run `synadia/nats-server:2.15.2-scratch` by digest;
+  every "2.15.1 or newer" statement says 2.15.2. Neither a 2.15.2 NATS chart nor a Docker
+  Official `nats:2.15.2` tag exists yet, so this chart's optional NATS dependency and the
+  shared-pod example override the chart's default server image to
+  `synadia/nats-server:2.15.2-alpine3.22`. The upstream delta and what it reaches
+  are in `docs/ARCHITECTURE.md`, "The v2.15.1 → v2.15.2 audit": no JetStream file changed,
+  and it corrects CALLOUT-CONN-TYPES (witness fails on 2.15.1, passes on 2.15.2), which
+  makes a callout that restricts its users to `MQTT` alone refuse them
+  (`docs/AUTHENTICATION.md`).
+
 - [x] Enable `js_ack_fc_v2` in clustered CI and prove the broker's dual-layout ACK
   parser and ACLs accept the domain/account-aware subjects. This is a compatibility test,
   not a production feature toggle. The flag is off at the v2.15.1 pin; upstream's `main`
@@ -9991,8 +10005,9 @@ reads](findings/resolved.md#f-054).
   mode: the service with `-nats-creds`, MQTT clients through an account auth callout
   reached via `default_sentinel`, built in-process by `TestOperatorModeAuthCallout`.
   That witness found nats-server 2.15.1 does not apply `allowed_connection_types` to a
-  callout-issued user (CALLOUT-CONN-TYPES in `docs/known-upstream-issues.md`, not yet
-  filed; nothing in the broker relies on it). It also met an unread
+  callout-issued user (CALLOUT-CONN-TYPES in `docs/known-upstream-issues.md`; nothing in
+  the broker relies on it). Fixed in v2.15.2, and closed when the pin and floor moved
+  there on 2026-10-27. It also met an unread
   `-consumer-replicas`, filed under section 2.
 
 - [x] Document MQTT-topic to NATS-subject mapping and denial of the internal

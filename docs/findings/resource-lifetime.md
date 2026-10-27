@@ -70,7 +70,7 @@ fails if the exit does not happen.
 | reconcile retries (PUBLISH drain, PUBREL action, owed materialization, terminal reservation, rematerialization, PUBCOMP owed, intent resolution, terminal release, drain finalize, disposal, retained terminal cleanup) | resolution, generation change, map membership, shutdown gate | verified for the PUBLISH drain (D2) and the disposal; carried for the rest; on a removed object, D1 |
 | exclusion reclaim | non-residency, empty set, shutdown | carried |
 | request-scoped `NewTimer`s (JSA waits, ack gate, phase and operation gates, incarnation drain ceilings) | `defer Stop` | carried |
-| `time.After` in loops | GC-eligible since Go 1.23 (the module is Go 1.26) | carried |
+| `time.After` in loops | GC-eligible since Go 1.23 (the module is Go 1.27) | carried |
 
 ### Channels (37 sites) and the JSA reply table
 

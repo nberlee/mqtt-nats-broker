@@ -171,12 +171,13 @@ subscribe, that an anonymous client gets the default identity through the callou
 that a user the callout places in another account is refused, and that a JWT sent as
 the password reaches the callout as a password.
 
-**Connection types in issued users.** nats-server 2.15.1 does not apply
-`allowed_connection_types` to a user an auth callout issues: such a user limited to
-`MQTT` is still admitted on a standard connection. Do not rely on that restriction in
-a callout; see
+**Connection types in issued users.** From nats-server 2.15.2, the floor, a user an auth
+callout issues is held to its `allowed_connection_types`, as configuration-file users and
+directly presented JWTs already were: such a user limited to `MQTT` is refused on a
+standard connection. The broker dials every client as a standard connection, so a
+callout must not restrict the users it issues to `MQTT` alone. nats-server 2.15.1 did
+not apply the restriction to callout-issued users; see
 [CALLOUT-CONN-TYPES](known-upstream-issues.md#callout-conn-types-an-auth-callout-issued-users-connection-types-are-not-applied).
-Configuration-file users and directly presented JWTs are checked.
 
 ## Kubernetes
 
