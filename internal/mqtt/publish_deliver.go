@@ -728,6 +728,31 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Unlock()
 		return // a test-staged pre-tracking refusal; AckWait re-offers the sequence
 	}
+	// A RE-OFFER OF A SOURCE THIS SESSION ALREADY ACKNOWLEDGED is not a delivery the client is
+	// owed. The session submits a positive source acknowledgement only once it has decided that
+	// source's fate, and JetStream never dispatches an acknowledged sequence again; this offer
+	// exists because it was dispatched before JetStream processed the acknowledgement (a
+	// dispatched redelivery is not recalled), or because the acknowledgement was lost. Under a
+	// backlog queued longer than AckWait that is every message whose first offer waited past it,
+	// and each would otherwise go out a second time under a fresh identifier with DUP=0.
+	//
+	// Declined here, after every guard above and before anything is allocated, and the
+	// acknowledgement is re-submitted on this offer's reply through the same gate (idempotent at
+	// the server), so a lost one cannot leave the sequence re-offered forever. Only a re-offer
+	// (delivered count above 1), and never a drain-managed durable: the drain owns its re-offers.
+	// The record is this session's own SUBMISSION: a sequence it never acknowledged — one whose
+	// message expired under an unfinished exchange, one another session acknowledged — is not in
+	// it and is admitted exactly as before.
+	if sess.drainByDur[sub.mqtt.jsDur] == nil && sess.ackedSources.has(sub.mqtt.jsDur, sseq) {
+		if _, _, delivered, _, _ := ackReplyInfo(reply); delivered > 1 {
+			sess.submitSourceAckLocked(reply, nil)
+			sess.mu.Unlock()
+			if h := mqttTestAckedReofferDeclinedHook.Get(); h != nil {
+				h(sub.mqtt.jsDur, sseq)
+			}
+			return
+		}
+	}
 	pi, isNew := sess.trackPublish(sub.mqtt.jsDur, reply)
 	// The allocation's nonce, read under the same lock that allocated it: it is the
 	// identity every later reservation touch is guarded by, and reading it later would

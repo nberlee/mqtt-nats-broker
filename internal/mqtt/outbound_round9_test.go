@@ -1806,19 +1806,26 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 		t.Fatalf("the registered admission was refused for another reason than the standing obligation: %v", err)
 	}
 
-	// AND AN UNREADABLE OBLIGATION REFUSES. A record this broker cannot interpret may be the
-	// one holding the identifier, so treating it as absent is the inference the whole
-	// mechanism exists to remove — and it is the only reading under which a free-looking
-	// identifier is not free. The enumeration is the generation's INVENTORY (F-112): every
-	// exchange is admitted with its duty in the same batch, so the obligation made unreadable
-	// here is one the inventory names — the registerless one standing on identifier 11.
+	// AND AN UNREADABLE OBLIGATION REFUSES THE IDENTIFIER ITS DUTY NAMES. A record this broker
+	// cannot interpret may be the one holding the identifier, so treating it as absent is the
+	// inference the whole mechanism exists to remove. The enumeration is the generation's
+	// INVENTORY (F-112): every exchange is admitted with its duty in the same batch, and that
+	// duty names the identifier the exchange holds, bound at admission and never moved — so the
+	// obligation made unreadable here is one the inventory names as standing on identifier 11.
 	corrupt := mqttExchangeSubject(getHash(e.id), testF105Gen, standing)
 	if _, err := jsa.storeMsg(corrupt, -1, []byte(`{"id":"nonsense"`)); err != nil {
 		t.Fatalf("planting the unreadable obligation failed: %v", err)
 	}
-	if _, err := admit("txn-e", 9); err == nil {
-		t.Fatalf("an identifier was claimed while an obligation nobody can read stands in " +
-			"the same generation")
+	if _, err := admit("txn-e", 11); err == nil {
+		t.Fatalf("identifier 11 was claimed while the obligation whose duty names it cannot be read")
+	} else if !strings.Contains(err.Error(), "unreadable position") {
+		t.Fatalf("the claim on 11 was refused for another reason than the unreadable obligation: %v", err)
+	}
+	// AND ONLY THAT IDENTIFIER. Its duty names 11, and an exchange's identifier never moves, so
+	// it cannot be the obligation holding 9: exclusivity does not read it for 9, which is what
+	// keeps an admission from paying for every exchange the inventory still names.
+	if _, err := admit("txn-f", 9); err != nil {
+		t.Fatalf("identifier 9 was refused because of an unreadable obligation whose duty names 11: %v", err)
 	}
 }
 

@@ -47,15 +47,20 @@ func testLadderCountWaits(t *testing.T, rig *testAcquireRig) *atomic.Int32 {
 }
 
 // testLadderLoseAtCommit refuses the first lose admission commits of the rig's client with the
-// production CAS rejection, and counts every admission commit.
-func testLadderLoseAtCommit(t *testing.T, rig *testAcquireRig, lose int) *atomic.Int32 {
+// production CAS rejection, and counts every admission commit. lastNot, when set, refuses the last
+// of them with it instead: a loss at the commit that is not contention.
+func testLadderLoseAtCommit(t *testing.T, rig *testAcquireRig, lose int, lastNot error) *atomic.Int32 {
 	t.Helper()
 	var attempts atomic.Int32
 	commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		if at.Attempt == nil || at.Attempt.ID != rig.id || at.Attempt.Op != "op-admit-publish" {
 			return send()
 		}
-		if int(attempts.Add(1)) <= lose {
+		n := int(attempts.Add(1))
+		if n == lose && lastNot != nil {
+			return 0, lastNot
+		}
+		if n <= lose {
 			return 0, ApiErrors[JSStreamWrongLastSequenceErrF]
 		}
 		return send()
@@ -67,21 +72,30 @@ func testLadderLoseAtCommit(t *testing.T, rig *testAcquireRig, lose int) *atomic
 
 // TestMQTTAdmissionLadderOutlastsTheBackgroundWriters: the admission survives one lost attempt per
 // counted background writer and transmits on the first offer, each re-attempt preceded by one
-// contention wait; one loss more than that exhausts the first offer, and the source's prompt re-offer
-// transmits.
+// contention wait. One CONTENTION loss more than that spends the budget and is extended past it —
+// exactly once, which is what pins the budget — still on the first offer
+// (outbound_admission_contention.go). One loss more whose last is not contention exhausts the first
+// offer, and the source's prompt re-offer transmits.
 func TestMQTTAdmissionLadderOutlastsTheBackgroundWriters(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		lose  int
-		inBud bool
+		name    string
+		lose    int
+		lastNot error
+		inBud   bool
+		extends int32
 	}{
 		{name: "one loss per background writer", lose: mqttBackgroundAuthorityWriters, inBud: true},
-		{name: "one loss more", lose: mqttBackgroundAuthorityWriters + 1, inBud: false},
+		{name: "one contention loss more", lose: mqttBackgroundAuthorityWriters + 1, inBud: true, extends: 1},
+		{name: "one loss more, the last not contention", lose: mqttBackgroundAuthorityWriters + 1,
+			lastNot: errors.New("test: refused at the commit, not contended")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rig := testAcquireRigUp(t, "ladder-bud", 2*time.Second)
-			attempts := testLadderLoseAtCommit(t, rig, tc.lose)
+			attempts := testLadderLoseAtCommit(t, rig, tc.lose, tc.lastNot)
 			waits := testLadderCountWaits(t, rig)
+			var extends atomic.Int32
+			mqttTestAdmissionExtendedHook.Set(func(*mqttSession, int) { extends.Add(1) })
+			t.Cleanup(func() { mqttTestAdmissionExtendedHook.Set(nil) })
 
 			start := time.Now()
 			testMQTTPubV5Props(t, rig.cp, rig.rp, 1, false, 1, rig.topic, []byte("live"), nil)
@@ -97,7 +111,13 @@ func TestMQTTAdmissionLadderOutlastsTheBackgroundWriters(t *testing.T) {
 				if w := waits.Load(); int(w) != tc.lose {
 					t.Fatalf("%d contention waits before %d re-attempts", w, tc.lose)
 				}
+				if x := extends.Load(); x != tc.extends {
+					t.Fatalf("the admission was extended past its budget %d time(s), want %d", x, tc.extends)
+				}
 				return
+			}
+			if x := extends.Load(); x != 0 {
+				t.Fatalf("an admission whose last loss was not contention was extended %d time(s)", x)
 			}
 			// EXHAUSTED, the source is deferred and NAKed when the admission's custody reservation is
 			// released, so the re-offer follows at once rather than at AckWait. What separates the
@@ -136,7 +156,7 @@ func TestMQTTAdmissionLadderSpacesOnlyCommittedAttempts(t *testing.T) {
 			waits := testLadderCountWaits(t, rig)
 			var writes atomic.Int32
 			if tc.atCommit {
-				testLadderLoseAtCommit(t, rig, refused)
+				testLadderLoseAtCommit(t, rig, refused, nil)
 			} else {
 				rig.asm.mu.Lock()
 				rig.asm.testAdmitWrite = func(sess *mqttSession, _ bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {

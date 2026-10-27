@@ -203,56 +203,24 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 	// provision would be refused. Provision only on the FIRST claim (ownership absent); a name
 	// that stands LIVE for this generation is already provisioned; a RETIRED or foreign-owned
 	// name is refused, because a spent name is never reused.
-	pubRelAuth, _, praerr := sess.servingAuthority()
-	if praerr != nil {
-		return fmt.Errorf("client %q: its outbound authority is not serving, so its PUBREL consumer "+
-			"name %q cannot be claimed: %w", id, pubRelDurable, praerr)
+	ent, _ := c.outboundEntitlement()
+	if err := sess.claimPubRelName(ent, pubRelGen, pubRelDurable); err != nil {
+		return err
 	}
-	// THE NAME AND ITS OWNER ARE ONE GENERATION (F-105 7c-lc). The name is derived from the
-	// session's generation and its ownership compared with the serving authority's; admission
-	// derives the same name from the authority's. If the two ever differ, the claim below would
-	// bind one generation's name to another's ownership, and a same-owner rematerialization — the
-	// sanctioned reuse of this stable name — would no longer be same-owner.
-	if pubRelGen != pubRelAuth.Gen {
-		return fmt.Errorf("client %q: its PUBREL consumer name %q belongs to generation %q but the serving "+
-			"authority is %q, so it cannot be claimed or rematerialized", id, pubRelDurable, pubRelGen, pubRelAuth.Gen)
-	}
-	pubRelOwn, _, pubRelOwnErr := sess.jsa.loadNameOwnershipPhysical(sess.asm.sessStreamEpoch,
-		mqttOwnedStreamOut, pubRelDurable)
-	if pubRelOwnErr != nil {
-		return fmt.Errorf("client %q: reading the ownership of PUBREL consumer name %q: %w",
-			id, pubRelDurable, pubRelOwnErr)
-	}
-	switch {
-	case pubRelOwn == nil:
-		if _, perr := sess.jsa.opProvisionResource(id, sess.asm.sessStreamEpoch, mqttNewInflightNonce(),
-			"op-provision-pubrel", pubRelAuth.Gen, pubRelAuth.Tenure, mqttNewInflightNonce(), pubRelDurable,
-			mqttResourcePubRelConsumer); perr != nil {
-			return fmt.Errorf("client %q: claiming PUBREL consumer name %q: %w", id, pubRelDurable, perr)
-		}
-	case pubRelOwn.State != mqttNameOwnLive || pubRelOwn.OwnerGen != pubRelAuth.Gen:
-		return fmt.Errorf("client %q: PUBREL consumer name %q stands in ownership state %d owned by "+
-			"generation %q, not this generation's LIVE own: a spent or foreign name is never reused",
-			id, pubRelDurable, pubRelOwn.State, pubRelOwn.OwnerGen)
-	default:
-		// A LIVE NAME IS NOT A SERVING RESOURCE (F-105 7f). The same-owner rematerialization is
-		// sanctioned for the resource the name's owner names, and only while that resource is
-		// LIVE without a disposal decision: recreating a decided or retiring consumer would
-		// resurrect what its retirement is about to delete.
-		r, _, rerr := sess.jsa.loadOutboundResource(id, sess.asm.sessStreamEpoch, pubRelAuth.Gen, pubRelOwn.OwnerInc)
-		if rerr != nil {
-			return fmt.Errorf("client %q: reading the resource of PUBREL consumer name %q: %w", id, pubRelDurable, rerr)
-		}
-		if r == nil || r.Kind != mqttResourcePubRelConsumer || r.State != mqttResourceLive || r.Disposal != nil {
-			return fmt.Errorf("client %q: PUBREL consumer name %q names a resource that is not a LIVE, undecided "+
-				"PUBREL consumer, so it is not rematerialized", id, pubRelDurable)
-		}
+	// AND AGAIN IMMEDIATELY BEFORE THE CREATE: a takeover between the claim and here displaced
+	// this connection's tenure, and a create now would materialize the consumer for a tenure that
+	// no longer serves. The create itself stays unfenced, as every consumer create here is.
+	if err := sess.pubRelClaimEntitled(ent, pubRelGen); err != nil {
+		return fmt.Errorf("client %q: PUBREL consumer name %q: %w", id, pubRelDurable, err)
 	}
 	if _, err := sess.jsa.createDurableConsumer(ccr); err != nil {
 		c.Errorf("Unable to add JetStream consumer for PUBREL for client %q: err=%v", id, err)
 		return err
 	}
 	pubRelConsumer = &ccr.Config
+	if err := sess.pubRelClaimEntitled(ent, pubRelGen); err != nil {
+		return fmt.Errorf("client %q: PUBREL consumer name %q: %w", id, pubRelDurable, err)
+	}
 
 	sess.mu.Lock()
 	sess.pubRelConsumer = pubRelConsumer
@@ -274,6 +242,153 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 //
 // Session lock is acquired and released as needed. Session is in the locked
 // map.
+
+// pubRelClaimEntitled is THE entitlement rule of the PUBREL name claim, checked at every point the
+// claim may act: before each attempt, before adopting a standing name, and before the create and
+// its installation. The serving authority must be the connection's own accepted generation AND
+// tenure, and the name's generation that generation: a takeover moves the tenure within one
+// generation, and the name, being generation-scoped, cannot tell the two tenures apart.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) pubRelClaimEntitled(ent mqttOutboundEntitlement, nameGen string) error {
+	if ent.isZero() {
+		return fmt.Errorf("this connection holds no accepted entitlement, so the name cannot be claimed")
+	}
+	auth, _, err := sess.servingAuthority()
+	if err != nil {
+		return fmt.Errorf("its outbound authority is not serving, so the name cannot be claimed: %w", err)
+	}
+	if auth.Gen != ent.Gen || auth.Tenure != ent.Tenure || nameGen != ent.Gen {
+		return fmt.Errorf("the name belongs to generation %q and this connection was accepted as %q/%q, "+
+			"but the serving authority is %q/%q: a displaced tenure claims nothing", nameGen,
+			ent.Gen, ent.Tenure, auth.Gen, auth.Tenure)
+	}
+	return nil
+}
+
+// claimPubRelName claims the generation-scoped PUBREL consumer name, or adopts it where it already
+// stands LIVE for this generation (F-105 §5.1, Codex consult 11 step 2: the name is stable across
+// recreates within a generation, so its ownership is claimed once and a recreate re-materializes
+// the consumer under the standing ownership).
+//
+// RE-ATTEMPTED, SPACED, under the connection's pinned entitlement, the way claimSourceConsumerName
+// is. Every transition of the client CASes its one authority record, so a CONNECT reusing a client
+// identifier moments after the previous connection closed lost the single attempt to that
+// connection's still-running closing work, and the QoS 2 SUBSCRIBE was refused. Each attempt
+// RE-READS the ownership: an earlier attempt that landed behind a lost response has made the name
+// LIVE for this generation, and the adoption arm takes it, still under the entitlement rule.
+//
+// EXHAUSTION SETTLES EVERY SUBMITTED ATTEMPT BY PERMANENT ARBITRATION (as retireSourceStep does):
+// a landed or superseded verdict is adopted after one more ownership read; an unresolved one is
+// aborted, so it can never land; one whose abort fails stays open and refuses the claim. An open
+// attempt that lands later leaves exactly what a crash between a claim and its create leaves: a
+// LIVE name and resource with their provision and cleanup duties in this generation's inventory,
+// which the next claim adopts and the generation's closing retires. Unlike a source name nothing
+// is disposed: the PUBREL name is stable per generation and adoption is its sanctioned reuse.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) claimPubRelName(ent mqttOutboundEntitlement, nameGen, name string) error {
+	release := sess.announceForegroundAuthority()
+	defer release()
+	var handles []*mqttTransitionHandle
+	var lastErr error
+	for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
+		if attempt > 0 {
+			sess.authorityContentionWait()
+		}
+		done, h, err := sess.claimPubRelNameOnce(ent, nameGen, name)
+		if h != nil {
+			handles = append(handles, h)
+		}
+		if done {
+			return err
+		}
+		lastErr = err
+	}
+	landed, aborted, open := false, 0, 0
+	for _, h := range handles {
+		switch sess.jsa.resolveTransitionHandle(h) {
+		case mqttTransitionLanded, mqttTransitionSuperseded:
+			landed = true
+		case mqttTransitionNeverLanded:
+		default:
+			if aerr := sess.jsa.abortTransition(&h.attempt); aerr != nil {
+				open++
+			} else {
+				aborted++
+			}
+		}
+	}
+	if h := mqttTestPubRelClaimSettledHook.Get(); h != nil {
+		h(len(handles), landed, aborted, open)
+	}
+	if landed {
+		if _, _, err := sess.claimPubRelNameOnce(ent, nameGen, name); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return fmt.Errorf("client %q: claiming PUBREL consumer name %q (%d attempt(s) unsettled): %w",
+		sess.id, name, open, lastErr)
+}
+
+// claimPubRelNameOnce is one attempt. done reports a decided outcome — claimed, adopted, or refused
+// for a reason another attempt cannot change — and a nil err with done is success; an undecided
+// attempt returns the handle of any provisioning it submitted.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) claimPubRelNameOnce(ent mqttOutboundEntitlement, nameGen, name string) (
+	done bool, h *mqttTransitionHandle, err error) {
+
+	id := sess.id
+	if err := sess.pubRelClaimEntitled(ent, nameGen); err != nil {
+		return true, nil, fmt.Errorf("client %q: PUBREL consumer name %q: %w", id, name, err)
+	}
+	own, _, oerr := sess.jsa.loadNameOwnershipPhysical(sess.asm.sessStreamEpoch, mqttOwnedStreamOut, name)
+	if oerr != nil {
+		return false, nil, fmt.Errorf("client %q: reading the ownership of PUBREL consumer name %q: %w",
+			id, name, oerr)
+	}
+	switch {
+	case own == nil:
+		out, perr := sess.jsa.opProvisionResource(id, sess.asm.sessStreamEpoch, mqttNewInflightNonce(),
+			"op-provision-pubrel", ent.Gen, ent.Tenure, mqttNewInflightNonce(), name,
+			mqttResourcePubRelConsumer)
+		if perr != nil {
+			return false, out.Handle, fmt.Errorf("client %q: claiming PUBREL consumer name %q: %w", id, name, perr)
+		}
+		return true, nil, nil
+	case own.State != mqttNameOwnLive || own.OwnerGen != ent.Gen:
+		return true, nil, fmt.Errorf("client %q: PUBREL consumer name %q stands in ownership state %d owned by "+
+			"generation %q, not this generation's LIVE own: a spent or foreign name is never reused",
+			id, name, own.State, own.OwnerGen)
+	}
+	// A LIVE NAME IS NOT A SERVING RESOURCE (F-105 7f). The same-owner rematerialization is
+	// sanctioned for the resource the name's owner names, and only while that resource is LIVE
+	// without a disposal decision: recreating a decided or retiring consumer would resurrect what
+	// its retirement is about to delete.
+	r, _, rerr := sess.jsa.loadOutboundResource(id, sess.asm.sessStreamEpoch, ent.Gen, own.OwnerInc)
+	if rerr != nil {
+		return false, nil, fmt.Errorf("client %q: reading the resource of PUBREL consumer name %q: %w", id, name, rerr)
+	}
+	if r == nil || r.Kind != mqttResourcePubRelConsumer || r.State != mqttResourceLive || r.Disposal != nil {
+		return true, nil, fmt.Errorf("client %q: PUBREL consumer name %q names a resource that is not a LIVE, "+
+			"undecided PUBREL consumer, so it is not rematerialized", id, name)
+	}
+	if h := mqttTestPubRelClaimAdoptedHook.Get(); h != nil {
+		h()
+	}
+	return true, nil, nil
+}
+
+// Test seams of the PUBREL name claim. Nil (false) in production.
+var (
+	// mqttTestPubRelClaimAdoptedHook observes an attempt adopting a standing LIVE name.
+	mqttTestPubRelClaimAdoptedHook = new(mqttKnob[func()])
+	// mqttTestPubRelClaimSettledHook observes exhaustion's settlement of the submitted attempts.
+	mqttTestPubRelClaimSettledHook = new(mqttKnob[func(submitted int, landed bool, aborted, open int)])
+)
 
 // claimSourceConsumerName claims a fresh source consumer name's LIVE ownership, its resource
 // incarnation and its duties, under the entitlement pinned at its first read. It is ANNOUNCED as a

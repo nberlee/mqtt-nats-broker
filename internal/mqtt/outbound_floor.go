@@ -67,8 +67,13 @@ const (
 	// are at most half the reclaimed positions and a prefix of long-lived duties is never
 	// rewritten for nothing.
 	mqttFloorMinReclaim = 32
-	// mqttFloorSlack is the span below which a generation's floor is not worth advancing.
-	mqttFloorSlack = 256
+	// mqttFloorSlack is the span below which a generation's floor is not worth advancing. Every
+	// admission reads the duty of every position in the span, so the slack is what a quiescent
+	// session pays per delivery; it equals the amortization minimum, below which an advance would
+	// not qualify anyway. Measured (make bench-outbound, the idle row): 256 left about 500 duty reads
+	// per delivery at rest, 64 about 125, 32 about 62, for about one more floor batch member per
+	// delivery.
+	mqttFloorSlack = 32
 )
 
 // mqttFloorClass is what a floor advance may do with one position.
@@ -238,7 +243,7 @@ func mqttComposeFloorMembers(f *mqttFloorAdvance) ([]mqttTransitionMember, error
 			}
 			marker := mqttDutyEntry{
 				ID: f.ID, Epoch: f.Epoch, Gen: f.Gen, Ord: p.Ord, Kind: p.Entry.Kind, Ref: p.Entry.Ref,
-				State: mqttDutyRelocated, To: next.Hi,
+				PI: p.Entry.PI, State: mqttDutyRelocated, To: next.Hi,
 			}
 			if verr := mqttValidateDutyEntry(&marker, f.ID, f.Epoch, f.Gen, p.Ord); verr != nil {
 				return nil, fmt.Errorf("refusing to compose an unsupported relocation marker: %w", verr)
@@ -514,7 +519,7 @@ func (jsa *mqttJSA) checkFloorAdvance(a *mqttTransitionAttempt, extra []mqttTran
 					"representative there: a retired position's duty has exactly one representative",
 					a.Txn, ord, mk.next.To)
 			}
-			if mk.next.Kind != standing.Kind || mk.next.Ref != standing.Ref {
+			if mk.next.Kind != standing.Kind || mk.next.Ref != standing.Ref || mk.next.PI != standing.PI {
 				return fmt.Errorf("transition %q re-identifies position %d in its relocation marker", a.Txn, ord)
 			}
 			want := *standing

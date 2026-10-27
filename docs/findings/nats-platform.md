@@ -1081,3 +1081,114 @@ broker parser accepts both token layouts. Enabling the flag in clustered CI was 
 compatibility check for parsing **and ACLs**, not a production behavior change; it is
 done, with `TestMQTTAckReplyLayoutV2Replicated` as the witness (see
 `docs/ARCHITECTURE.md` "JetStream behaviors this design depends on").
+
+## Outbound delivery throughput (2026-10-26)
+
+The section 2 roadmap item "Delivery to a QoS 1 subscriber caps at about 5 messages per
+second" is recorded here. Scope (two consults, recorded in the item's lane): remove the
+avoidable history-dependent reads, suppress re-offers of sources the session already
+acknowledged, keep contention from reordering a subscription, fix the PUBREL name
+claim's single attempt, and state the remaining ceiling as a residual. The delivery
+protocol itself (serial admission per subscription, its fixed reads) is the next item.
+
+### What was measured before the change
+
+A reproduction on one broker with embedded JetStream on local disk (R1): a burst
+published to a persistent QoS 1 subscriber before it reads, then read and acknowledged
+as fast as possible.
+
+| Burst | Rate | Median gap | Message GETs per delivery |
+|---|---|---|---|
+| 20 | 11.1 msg/s | 91 ms | 98 |
+| 200 | 3.7 msg/s | 274 ms | 464 |
+| 500 | 1.7 msg/s (8.6 falling to 1.0 per 50) | 588 ms | - |
+
+Wall-clock stack sampling put about 78% of the delivery path in waits for JetStream
+replies, nearly half of it in `checkIdentifierExclusivity`'s inventory walk. Split by
+record class, the duty and exchange reads grew with the burst (23 and 27 per delivery at
+20, 203 and 207 at 200) while the rest stayed near 50. Four mechanisms:
+
+1. **The identifier walk was O(span).** Every admission read every exchange in its generation's
+   `[Lo, Hi]`, ended ones included, serially.
+2. **The span was not bounded during a burst.** The floor only works above a slack of
+   256 and is a background writer that yields to deliveries: after 120 messages all 120
+   duties stood Pending at `Lo = 1` indefinitely; after 300, `Lo` moved only about 80 s
+   later.
+3. **Every first admission attempt lost its CAS** (199 contention waits for 200
+   deliveries): the previous delivery's acknowledgement rewrites the client's authority
+   record between the next admission's reads and its batch. The walk was therefore paid
+   twice per delivery.
+4. **Backlog redelivery.** The source consumer pushes up to MaxAckPending offers at
+   once, and an offer queued longer than AckWait is re-offered while its first offer is
+   still queued: a burst of 150 re-delivered 15 acknowledged messages with fresh
+   identifiers and DUP=0, a burst of 300 re-delivered 115 (the consumer reported 164
+   deliveries for 150 messages). Each duplicate cost a full delivery.
+
+Found along the way, both pre-existing: an admission that lost all 6 of its attempts was
+abandoned and its re-offer queued behind the backlog, so the subscription received one
+message after the next (4 of 15 bursts of 500 on the tree before the change); and a
+clean-session client reusing its identifier within about 200 ms had its QoS 2 SUBSCRIBE
+refused, because the PUBREL name claim made one attempt and lost it to the previous
+connection's closing.
+
+### What changed
+
+Each in docs/ARCHITECTURE.md:
+
+- **The exchange duty names its identifier**, bound to its exchange by the boundary and
+  carried unchanged by continuation and relocation; identifier exclusivity reads only
+  the exchanges whose duties name a claimed identifier (the duty reads stay O(span),
+  overlapped).
+- **The floor slack is 32**, chosen by measurement (the idle row below at 256, 64 and
+  32: 6.1, 9.7 and 11.3 msg/s; 613, 241 and 178 requests per delivery, 499, 125 and 62
+  of them duty reads; 15.9, 18.4 and 18.9 batch members per delivery).
+- **A re-offer of a source this session acknowledged is declined** before allocation and
+  re-acknowledged on its own reply. The proof is the session's own submission through
+  the one acknowledgement gate; two other proofs were refuted in plan review (an exact
+  read finding the message absent also covers expiry; the consumer's acknowledgement
+  floor also advances when a pending message disappears, nats-server v2.15.1
+  `consumer.go` 6150).
+- **An admission defeated only by stale expectations is re-attempted** for its
+  connection's life instead of abandoned, at the delivery entrance only.
+- **The PUBREL name claim is re-attempted** under the connection's pinned entitlement,
+  adopting a landed attempt and settling every attempt on exhaustion.
+
+### Measured after the change
+
+`make bench-outbound`, one run per rig, the burst published and acknowledged before the
+subscribers read; every row held its oracle (all delivered, first deliveries in publish
+order, every QoS 2 exchange completed, every consumer settled). No row delivered a message
+under a new identifier twice; one of four standalone QoS 2 runs retransmitted one PUBLISH
+under its own identifier with DUP set, which QoS 2 permits. (The first run of this
+benchmark let the subscribers read while the burst was being published and timed the
+publishing too; holistic review round 1 caught it, and every row here is from the
+corrected workload.)
+
+| Case | Standalone | R3 | Requests per delivery (standalone) |
+|---|---|---|---|
+| QoS 1, one subscriber, 500 | 6.2 msg/s (13.0 to 4.7 per 50) | 8.0 msg/s | 665 |
+| QoS 2, one subscriber, 200 | 5.5 msg/s | 7.4 msg/s | 606 |
+| QoS 1, four subscribers, 200 each | 30.6 msg/s aggregate | 45.4 msg/s aggregate | 360 |
+| QoS 1, 20 at rest after 300 | 11.0 msg/s | 12.8 msg/s | 182 |
+
+The burst rows' request count is dominated by duty reads (about 530 per delivery at
+500), which are overlapped; the exchange reads fell to about 20 per delivery. Mechanism
+4's duplicates are gone in these rows (the 500 burst was re-offered 339 times in a
+reproduction run and delivered nothing twice), and so are mechanism 3's reorders (0 of
+15 capped bursts, no admission exhausted). What remains — about 50 fixed reads and three
+batches per delivery, one delivery at a time per subscription, the CAS loss on every
+first attempt, and duty reads that grow through a burst — is the design's and is stated
+in docs/CONFORMANCE.md with these numbers.
+
+The Paho interoperability test `test_flow_control2`, which failed once in CI on
+2026-10-26 and was baselined pending this item, passed 5 of 5 runs locally against the
+change, and 5 of 5 against the tree before it: the CI failure was not reproduced here,
+so its cause is not confirmed. Its baseline entry is removed, so a recurrence fails CI.
+
+Mutations, each run and each failing its paired test: 26 (the identifier's shape,
+binding, continuation, marker and representative; the walk's filter both ways; the
+slack; the decline, its re-acknowledgement, both recording points, the
+failed-confirmation retention, the set's keying and both bounds, the decline's
+dependence on the record, the hand-back; the claim's attempts, its ownership re-read,
+its abort, its entitlement rule; the extension, its qualification, its connection check
+and the classifier). The decline's explicit drain exclusion has no discriminating test.

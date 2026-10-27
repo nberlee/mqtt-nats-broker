@@ -328,6 +328,9 @@ func TestF105PubRelGenerationMismatchRefused(t *testing.T) {
 	e := testNewInflightEnv(t, "pubrel-gen")
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
 	testConnIdentity(t, e, e.c)
+	// Accepted under the serving authority, so the claim reaches the generation rule rather than
+	// refusing a connection with no entitlement at all.
+	testStampAcceptedConnection(t, e)
 	e.sess.mu.Lock()
 	e.sess.c = e.c
 	e.sess.gen = mqttNewSessGen()

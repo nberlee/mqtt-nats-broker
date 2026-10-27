@@ -246,7 +246,7 @@ func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransiti
 	// when the thing it concerns is admitted" a rule with one meaning rather than two.
 	inv, ierr := mqttAllocateInventoryMembers(a.Auth.ID, a.Auth.Epoch, a.Auth.Gen,
 		a.Ledger, a.LedgerSeq, []mqttDutyDeclaration{
-			{Kind: mqttDutyExchange, Ref: a.Exchange.Nonce, State: mqttDutyPending},
+			{Kind: mqttDutyExchange, Ref: a.Exchange.Nonce, PI: a.Exchange.PI, State: mqttDutyPending},
 		})
 	if ierr != nil {
 		return nil, fmt.Errorf("admitting a publish: %w", ierr)

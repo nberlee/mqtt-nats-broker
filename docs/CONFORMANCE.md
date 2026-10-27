@@ -2103,27 +2103,39 @@ as this identifier's PUBLISH having been sent). This is honest per identifier an
 to a conforming receiver — §3.3.1.1 says DUP is not a receiver-side dedup signal, and
 QoS 2 is protected by the packet-identifier exchange regardless.
 
-**Residual: a QoS 1 re-offer dispatched before its acknowledgement landed (2026-10-15).**
-A QoS 1 source re-offer that JetStream dispatched before it processed the source's
-acknowledgement can reach admission after the terminal-source suppression has been
-released; it is then delivered again, after the client's PUBACK, with a fresh packet
-identifier and DUP=0 — the at-least-once duplicate a QoS 1 receiver must already tolerate.
-The broker no longer WIDENS this window: an acknowledgement's terminal release used to run
-on the delivery goroutine when the PUBACK landed on a still-open send section, which held
-every re-offer queued behind it until the suppression had lifted (deterministic once the
-release outlasted AckWait). It is now handed to the terminal-retry dispatcher, which
-removes THIS source of blocking and allows re-offers processed while the suppression is
-still held to meet it (docs/ARCHITECTURE.md, "An acknowledgement's release never runs on
-the delivery goroutine"; `TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed`). It
-does not guarantee timely admission: no ordering barrier is established between a delivery
-callback and the acknowledgement's confirmation, so a re-offer that came due before the
-acknowledgement was processed can still be admitted after settlement. That is reachable in
-practice whenever the release (first delivery to confirmed source acknowledgement)
-outlasts AckWait: observed 2026-10-15 under CPU starvation at a 500 ms AckWait, where the
-release took 590-680 ms and the re-offer was admitted 165-222 ms after the confirmation,
-which is why `TestMQTTInflightTransmittedRedeliversWithDup` budgets 2 s. At the 30 s
-default it needs a release slower than 30 s. QoS 2 is not affected: its retirement
-suppression carries the exchange past the source acknowledgement
+**Residual: a QoS 1 re-offer dispatched before its acknowledgement landed
+(2026-10-15).** A QoS 1 source re-offer that JetStream dispatched before it processed
+the source's acknowledgement can reach admission after the terminal-source suppression
+has been released; it is then delivered again, after the client's PUBACK, with a fresh
+packet identifier and DUP=0 — the at-least-once duplicate a QoS 1 receiver must already
+tolerate. The broker no longer WIDENS this window: an acknowledgement's terminal release
+used to run on the delivery goroutine when the PUBACK landed on a still-open send
+section, which held every re-offer queued behind it until the suppression had lifted
+(deterministic once the release outlasted AckWait). It is now handed to the
+terminal-retry dispatcher, which removes THIS source of blocking and allows re-offers
+processed while the suppression is still held to meet it (docs/ARCHITECTURE.md, "An
+acknowledgement's release never runs on the delivery goroutine";
+`TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed`). It does not guarantee
+timely admission: no ordering barrier is established between a delivery callback and the
+acknowledgement's confirmation, so a re-offer that came due before the acknowledgement
+was processed can still be admitted after settlement. That is reachable in practice
+whenever the release (first delivery to confirmed source acknowledgement) outlasts
+AckWait: observed 2026-10-15 under CPU starvation at a 500 ms AckWait, where the release
+took 590-680 ms and the re-offer was admitted 165-222 ms after the confirmation, which
+is why `TestMQTTInflightTransmittedRedeliversWithDup` budgets 2 s. **At the 30 s default
+it needs only a backlog**, not a slow release: JetStream pushes up to MaxAckPending
+(1024) offers to the delivery callback at once, and every offer that waits there longer
+than AckWait is re-offered while its first offer is still queued. Measured on 2026-10-26
+before the change: a burst of 150 to one QoS 1 subscriber re-delivered 15 acknowledged
+messages with fresh identifiers and DUP=0, a burst of 300 re-delivered 115. Since that
+change a re-offer of a source THIS SESSION acknowledged is declined at the allocation
+point and its reply re-acknowledged (docs/ARCHITECTURE.md, "An acknowledged PUBLISH is
+not sent again"); a burst of 500 then re-offered 339 times and delivered nothing twice.
+What remains of this residual: a re-offer of a source acknowledged by another session or
+broker (a takeover, another member of a shared group), or evicted from the session's
+bounded record (1024 sequences per durable, 64 durables), or one arriving after a
+restart (the record is in memory). QoS 2 is not affected: its retirement suppression
+carries the exchange past the source acknowledgement
 (`TestMQTTInflightQoS2SlowSourceAckLeavesNoDuplicate`).
 
 **Second residual: a pair whose register delete never lands is re-offered as unsent.**
@@ -2153,6 +2165,50 @@ its own parked ordering defect (below) is unrelated. See
 [F-072](findings/release-investigations.md#f-072). **This does not license a release: F-088
 remains an unconditional alpha blocker.**
 
+### Outbound QoS 1/2 delivery rate per subscriber: a measured ceiling
+
+**Residual, stated with its measurement.** Stored QoS 1 and QoS 2 messages reach one
+subscriber at single-digit messages per second, against several hundred for stock
+nats-server's MQTT listener on the same storage. The cost is the design's: each delivery
+is admitted through the outbound obligation authority (docs/ARCHITECTURE.md, "The
+outbound obligation authority"), which reads about 50 records, writes three atomic
+batches and re-reads at the write boundary, one delivery at a time per subscription, and
+every admission CASes the client's one authority record that the previous delivery's
+acknowledgement also rewrites, so nearly every first admission attempt loses and is
+spaced 10-25 ms and repeated. Every admission also reads every duty in its generation's
+unreclaimed span; the span grows with a burst (the floor yields to deliveries) and falls
+back to 32 at rest.
+
+Measured with `make bench-outbound` on 2026-10-26 (one machine, embedded JetStream on
+local disk; the burst published and acknowledged before the subscribers read; every
+message delivered, first deliveries in publish order, every QoS 2 exchange completed and
+every consumer settled, in every row):
+
+| Case | Standalone | Three nodes, R3 |
+|---|---|---|
+| QoS 1, one subscriber, 500 | 6.2 msg/s (13.0 falling to 4.7 per 50) | 8.0 msg/s (22.1 to 5.8) |
+| QoS 2, one subscriber, 200 | 5.5 msg/s | 7.4 msg/s |
+| QoS 1, four subscribers, 200 each | 30.6 msg/s in aggregate | 45.4 msg/s in aggregate |
+| QoS 1, one subscriber, 20 at rest after a burst of 300 | 11.0 msg/s | 12.8 msg/s |
+
+No row delivered a message twice under a new identifier; one of four standalone QoS 2 runs
+retransmitted one PUBLISH under its own identifier with DUP set, which QoS 2 permits.
+
+Before the 2026-10-26 change the same single-subscriber burst ran at 1.7 msg/s overall
+and 1.0 msg/s at its tail, re-delivered acknowledged messages and occasionally reordered
+(below). The rate falls through a burst because every admission reads the duty of every
+position the burst added; it scales with subscribers, since each subscription admits on
+its own callback. Raising the per-subscriber ceiling needs a different delivery protocol
+(concurrent admission per subscriber, fewer write-boundary re-reads), which is the next
+roadmap item, not a tuning.
+
+**And a subscription can stall.** An admission that loses only to stale expectations is
+re-attempted for its connection's life rather than abandoned, because an abandoned offer's
+re-offer arrives behind later messages (next section). A subscription whose admissions keep
+losing therefore stops delivering until they win or the connection closes, and the session's
+background authority writers stay yielded meanwhile. No such stall was observed in the measured
+runs.
+
 ### Per-(Topic, QoS) delivery order: an intended implementation property
 
 MQTT orders delivery only per (Topic, QoS): an *Ordered Topic* server sends PUBLISHes
@@ -2160,12 +2216,25 @@ MQTT orders delivery only per (Topic, QoS): an *Ordered Topic* server sends PUBL
 normative statements end at MQTT-4.6.0-6). It does **not** order across topics or across
 QoS levels. This broker **intends** that per-(Topic, QoS) order on every path: each
 topic-filter+QoS stream rides a single ordered carrier (one core-NATS subscription for
-QoS 0, one JetStream push consumer for QoS 1 and 2) on a single dispatch goroutine. It holds
-on the non-affine paths, and it is what justified rewriting three inherited upstream tests
-that asserted order across topics or QoS levels (`docs/PROVENANCE.md`): two
-Subscription-Identifier cases accept either arrival order of their topic/property pairs,
-and `TestMQTTv5OutboundTopicAliasMixedQoS` lets whichever QoS path arrives first bind the
-alias. The affine shared-subscription QoS 2 path violates it (next section).
+QoS 0, one JetStream push consumer for QoS 1 and 2) on a single dispatch goroutine. That
+carrier is ordered only while no delivery is abandoned and re-offered: a re-offer queues
+behind everything already pushed to the subscription, so the message it carries reaches
+the client after messages published later. Before the 2026-10-26 throughput item, an
+admission that lost every attempt of its contention budget to the session's own
+acknowledgements did exactly that on a plain QoS 1 subscription: observed in 4 of 15
+bursts of 500 on the tree before the change and 1 of 15 with only the item's other parts
+in place, one message overtaken by the next. An admission defeated only by stale
+expectations is now re-attempted for the connection's life instead of abandoned
+(docs/ARCHITECTURE.md, "An admission defeated only by contention keeps the
+subscription's order"; 0 of 15 bursts after it), which removes that route. It is not a
+universal ordering guarantee: an admission refused for any other reason (a dependency
+not ready, a withholding, a closing connection) still abandons its offer, and that
+re-offer still arrives late. The order is the intent on every path, and it is what
+justified rewriting three inherited upstream tests that asserted order across topics or
+QoS levels (`docs/PROVENANCE.md`): two Subscription-Identifier cases accept either
+arrival order of their topic/property pairs, and `TestMQTTv5OutboundTopicAliasMixedQoS`
+lets whichever QoS path arrives first bind the alias. The affine shared-subscription QoS
+2 path violates it (next section).
 
 ### Same-topic ordering on the affine QoS 2 path — PARKED EXPERIMENTAL DEFECT
 
@@ -2200,8 +2269,9 @@ An earlier version of this entry rested on a capture whose eight messages came f
 DIFFERENT publishing Clients, which §4.6 does not order. That claim did not follow from its
 evidence and was withdrawn; the single-publisher reproduction above replaced it.
 
-Scope, as far as it is established: the affine shared-subscription delivery path. Not
-observed on plain subscriptions, and no claim is made either way about them. Rate is
+Scope, as far as it is established: the affine shared-subscription delivery path. Plain
+subscriptions had their own reordering route through admission abandonment (previous section),
+a different mechanism; no other claim is made about them. Rate is
 load-sensitive — 1 in 240 attempts under concurrent `full-suite` load, 0 in 40 unloaded,
 which does not establish that load is necessary.
 

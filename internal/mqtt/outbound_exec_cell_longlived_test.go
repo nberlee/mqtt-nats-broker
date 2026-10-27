@@ -583,6 +583,14 @@ func testLongLivedRun(t *testing.T, clientID string, iterate func(*testLongLived
 	t.Logf("the census recorded %d paths after phase 1 and %d after phase 2", len(p1), len(p2))
 	var grew []string
 	for path, n2 := range p2 {
+		// A DELIBERATELY BOUNDED RECORD is held to its bound instead: it grows with transmissions
+		// until the bound, and that growth is its whole purpose (outbound_acked_sources.go).
+		if bound, ok := testLongLivedBoundedContainers[path]; ok {
+			if n2 > bound {
+				t.Errorf("%s holds %d after phase 2, past its bound of %d", path, n2, bound)
+			}
+			continue
+		}
 		n1, seen := p1[path]
 		if !seen || n2 > n1 {
 			grew = append(grew, path)
@@ -594,6 +602,17 @@ func testLongLivedRun(t *testing.T, clientID string, iterate func(*testLongLived
 		t.Errorf("%s grew from %d (present=%v) after phase 1 to %d after phase 2: the connection retains "+
 			"something per transmission", path, n1, seen, p2[path])
 	}
+}
+
+// testLongLivedBoundedContainers names the containers reachable from a connection that grow with
+// its transmissions BY DESIGN, up to a stated bound, and that bound. Each is checked against its
+// bound rather than against phase 1. Nothing belongs here that is not bounded in the code.
+var testLongLivedBoundedContainers = map[string]int{
+	// The sources this session acknowledged: per durable, then the durables themselves.
+	"c.mqtt.sess.ackedSources.durs[*].fifo": mqttAckedSourcesPerDurable,
+	"c.mqtt.sess.ackedSources.durs[*].seqs": mqttAckedSourcesPerDurable,
+	"c.mqtt.sess.ackedSources.durs":         mqttAckedSourcesDurables,
+	"c.mqtt.sess.ackedSources.order":        mqttAckedSourcesDurables,
 }
 
 // THE COMPLETION BARRIER. Every driven call has returned; what may still be running is an

@@ -421,6 +421,9 @@ type mqttSession struct {
 	// retireSourceLocked.
 	srcAckOwed      map[mqttDeferredKey]*mqttRetiredSource
 	terminalSources map[mqttTerminalSourceKey]*mqttTerminalSource
+	// ackedSources is every source this session submitted a positive acknowledgement for,
+	// bounded (outbound_acked_sources.go): a re-offer of one is declined at the allocation point.
+	ackedSources    mqttAckedSources
 	terminalRetries map[mqttTerminalRetryKey]*mqttTerminalRetry
 	// retainedCleanups owns every retained terminal slot's cleanup until it completes
 	// (retained_terminal_cleanup.go).

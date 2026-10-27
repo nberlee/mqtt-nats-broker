@@ -136,6 +136,13 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 	// it loses at most one attempt to each admitted background writer, and one more than that can
 	// land. Each attempt reports contended exactly when its operation reached commitOp (a frozen
 	// handle beside an error) — the only failure a same-session commit can have caused.
+	//
+	// AND PAST IT, while every attempt has lost only to a stale expectation: abandoning the offer
+	// would let its re-offer reach the client behind later messages (outbound_admission_contention.go).
+	ext := &mqttDeliveryContentionExtension{sess: sess, c: c}
+	if c != nil && c.mqtt != nil {
+		ext.closing = c.mqtt.tracker.closingSignal()
+	}
 	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, mqttForegroundAcquireAttempts,
 		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, bool, error) {
 			if regExpect == 0 && !registerOnly {
@@ -154,6 +161,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				// on the reservation for the reconciler.
 				sess.recordAdmissionAttempt(gen, nonce, lin, out, err)
 				if err != nil {
+					ext.noteWrite(err)
 					return 0, out.Handle != nil, err
 				}
 				seq, rerr := sess.landedRegisterSeq(subject, rec.Nonce)
@@ -205,11 +213,12 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 				sess.hintCustody(gen, cur.Lin)
 			}
 			if rerr != nil {
+				ext.noteWrite(rerr)
 				return 0, out.Handle != nil, rerr
 			}
 			seq, lerr := sess.landedRegisterSeq(subject, rec.Nonce)
 			return seq, false, lerr
-		})
+		}, ext.extend)
 }
 
 // errMQTTAdmittedRegisterUnread reports that an admission batch LANDED but its register could not

@@ -351,7 +351,15 @@ type mqttDutyEntry struct {
 	Ord  uint64       `json:"ord"`
 	Kind mqttDutyKind `json:"kind"`
 	// Ref is what the duty concerns: an exchange nonce, or a resource incarnation.
-	Ref   string        `json:"ref"`
+	Ref string `json:"ref"`
+	// PI is the packet identifier the exchange named by Ref holds, on an exchange duty and on
+	// nothing else. It is bound to that exchange by the boundary in the batch that creates both,
+	// and never moves afterwards — a continuation and a relocation carry it unchanged, and an
+	// exchange's own identifier never moves either — so a duty that names another identifier
+	// names an exchange that cannot hold this one. That is what lets identifier exclusivity read
+	// only the exchanges whose duties name the identifier it claims, instead of every exchange
+	// in the inventory.
+	PI    uint16        `json:"pi,omitempty"`
 	State mqttDutyState `json:"state"`
 	// Claim and LeaseUntil COORDINATE work and authorize nothing.
 	//
@@ -376,7 +384,7 @@ type mqttDutyEntry struct {
 }
 
 var mqttDutyMembers = map[string]struct{}{
-	"id": {}, "epoch": {}, "gen": {}, "ord": {}, "kind": {}, "ref": {}, "state": {},
+	"id": {}, "epoch": {}, "gen": {}, "ord": {}, "kind": {}, "ref": {}, "pi": {}, "state": {},
 	"claim": {}, "lease_until": {}, "outcome": {}, "to": {}, "from": {},
 }
 
@@ -385,7 +393,7 @@ var mqttDutyRequired = map[string]struct{}{
 }
 
 var mqttDutyOptional = map[string]struct{}{
-	"claim": {}, "lease_until": {}, "outcome": {}, "to": {}, "from": {},
+	"pi": {}, "claim": {}, "lease_until": {}, "outcome": {}, "to": {}, "from": {},
 }
 
 // mqttDecodeDutyEntry decodes and fully validates one duty body.
@@ -438,6 +446,14 @@ func mqttValidateDutyEntry(d *mqttDutyEntry, wantID, wantEpoch, wantGen string, 
 	}
 	if !mqttF105IdentTk(d.Ref) {
 		return fmt.Errorf("duty entry carries a malformed subject reference %q", d.Ref)
+	}
+	// AN EXCHANGE DUTY NAMES ITS IDENTIFIER, AND NOTHING ELSE DOES, in every state — the
+	// relocation marker included. An exchange duty without one is an unsupported shape and is
+	// refused, never read as "any identifier": exclusivity skips the exchanges whose duties name
+	// another identifier, so a duty that named none would hide its exchange from it.
+	if (d.Kind == mqttDutyExchange) != (d.PI != 0) {
+		return fmt.Errorf("duty entry %d of kind %q carries identifier %d: an exchange duty names "+
+			"the identifier its exchange holds, and no other kind names one", d.Ord, d.Kind, d.PI)
 	}
 	if !mqttValidDutyState(d.State) {
 		return fmt.Errorf("duty entry carries an unsupported state %d", d.State)
@@ -501,6 +517,8 @@ type mqttDutyDeclaration struct {
 	Kind mqttDutyKind
 	// Ref is what the duty concerns: an exchange nonce, or a resource incarnation.
 	Ref string
+	// PI is the identifier the exchange holds, on an exchange duty only.
+	PI uint16
 	// State is where the duty starts. A duty whose work cannot begin yet starts
 	// NOT_YET_ACTIONABLE, which is UNRESOLVED — the cursor must keep coming back for it.
 	State mqttDutyState
@@ -557,7 +575,7 @@ func mqttAllocateInventoryMembers(id, epoch, gen string, cur *mqttGenLedger, cur
 	for i, d := range decls {
 		ord := base + uint64(i) + 1
 		entry := &mqttDutyEntry{
-			ID: id, Epoch: epoch, Gen: gen, Ord: ord, Kind: d.Kind, Ref: d.Ref, State: d.State,
+			ID: id, Epoch: epoch, Gen: gen, Ord: ord, Kind: d.Kind, Ref: d.Ref, PI: d.PI, State: d.State,
 		}
 		// AN ALLOCATION NEVER STARTS TERMINAL. The thing a duty is predeclared for is being
 		// created in this same batch, so it cannot already have ended — and a duty allocated

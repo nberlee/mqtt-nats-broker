@@ -153,7 +153,53 @@ func (jsa *mqttJSA) checkInventoryMembers(a *mqttTransitionAttempt, extra []mqtt
 	if err := jsa.checkInventoryAllocation(a, ledger, allocated); err != nil {
 		return err
 	}
-	return mqttCheckInventoryCoverage(a, extra, allocated)
+	if err := mqttCheckInventoryCoverage(a, extra, allocated); err != nil {
+		return err
+	}
+	return mqttCheckExchangeDutyIdentifiers(a, extra, allocated)
+}
+
+// mqttCheckExchangeDutyIdentifiers binds every allocated exchange duty to the exchange it names:
+// that exchange is CREATED in this same batch, in the duty's generation, and holds exactly the
+// identifier the duty names.
+//
+// Coverage (below) requires the other direction — a created exchange owes a duty — and says
+// nothing about what the duty claims. The identifier is the part a reader now trusts without
+// reading the exchange: exclusivity skips every exchange whose duty names an identifier it does
+// not claim. A duty naming the wrong identifier, or naming an exchange this batch does not
+// create, would hide a live obligation from it, so the claim is checked where both are written.
+func mqttCheckExchangeDutyIdentifiers(a *mqttTransitionAttempt, extra []mqttTransitionMember,
+	allocated map[uint64]*mqttDutyEntry) error {
+
+	idHash := getHash(a.ID)
+	for ord, d := range allocated {
+		if d.Kind != mqttDutyExchange {
+			continue
+		}
+		subj := mqttExchangeSubject(idHash, d.Gen, d.Ref)
+		var created *mqttTransitionMember
+		for i := range extra {
+			if extra[i].subj == subj && extra[i].expect == 0 {
+				created = &extra[i]
+				break
+			}
+		}
+		if created == nil {
+			return fmt.Errorf("transition %q allocates exchange duty %d for %q, which this batch does "+
+				"not create: an exchange's duty is allocated in the batch that creates it, and only "+
+				"there can the identifier it names be bound to the exchange", a.Txn, ord, d.Ref)
+		}
+		x, xerr := mqttDecodeOutboundExchange(created.body, a.ID, a.Epoch, d.Gen, d.Ref)
+		if xerr != nil {
+			return fmt.Errorf("transition %q creates exchange %q whose body this broker cannot "+
+				"interpret, so the identifier its duty names cannot be checked: %w", a.Txn, d.Ref, xerr)
+		}
+		if x.PI != d.PI {
+			return fmt.Errorf("transition %q allocates exchange duty %d naming identifier %d for "+
+				"exchange %q, which holds %d", a.Txn, ord, d.PI, d.Ref, x.PI)
+		}
+	}
+	return nil
 }
 
 // mqttCheckInventoryCoverage is rule 3: a new exchange or resource cannot omit its inventory.
@@ -330,10 +376,12 @@ func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransi
 	// re-pointed it would let a batch repurpose an ordinal into a duty nothing reserved — which
 	// is the allocation rule evaded rather than obeyed. A representative's provenance is part
 	// of that identity (F-112).
-	if next.Kind != cur.Kind || next.Ref != cur.Ref || next.From != cur.From {
-		return fmt.Errorf("transition %q re-identifies duty %d from %s/%q to %s/%q: an entry is "+
-			"predeclared for one duty and continued as that duty",
-			a.Txn, ord, cur.Kind, cur.Ref, next.Kind, next.Ref)
+	// The identifier an exchange duty names is part of that identity: exclusivity skips the
+	// exchanges whose duties name another identifier, so re-pointing it would hide one.
+	if next.Kind != cur.Kind || next.Ref != cur.Ref || next.PI != cur.PI || next.From != cur.From {
+		return fmt.Errorf("transition %q re-identifies duty %d from %s/%q (identifier %d) to %s/%q "+
+			"(identifier %d): an entry is predeclared for one duty and continued as that duty",
+			a.Txn, ord, cur.Kind, cur.Ref, cur.PI, next.Kind, next.Ref, next.PI)
 	}
 
 	// A TERMINAL DUTY IS IMMUTABLE, and this is ONE rule rather than two.

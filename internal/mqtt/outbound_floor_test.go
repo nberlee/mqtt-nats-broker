@@ -628,10 +628,16 @@ func testF112PlantAdmittedDuty(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce
 	if led == nil {
 		led = &mqttGenLedger{ID: id, Epoch: epoch, Gen: gen, State: mqttGenLedgerOpen, Lo: 1, Del: 1}
 	}
+	// The duty names the identifier of the exchange it is planted beside, as the admission's
+	// boundary binds it; every caller plants the exchange first.
+	x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
+	if xerr != nil || x == nil {
+		t.Fatalf("planting the duty of exchange %q, which does not read: %v", nonce, xerr)
+	}
 	next := *led
 	next.Hi++
 	d := &mqttDutyEntry{ID: id, Epoch: epoch, Gen: gen, Ord: next.Hi, Kind: mqttDutyExchange, Ref: nonce,
-		State: mqttDutyPending}
+		PI: x.PI, State: mqttDutyPending}
 	dbody, _ := json.Marshal(d)
 	if _, err := jsa.storeMsg(mqttDutySubject(getHash(id), gen, next.Hi), -1, dbody); err != nil {
 		t.Fatalf("planting the duty: %v", err)

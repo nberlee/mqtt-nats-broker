@@ -5694,9 +5694,11 @@ func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) 
 // admitted background writers may take from it cannot all be lost to them; the classification and
 // cleanup arms below spend attempts too, and those are not covered by that bound.
 //
+// extend, when non-nil, may take the ladder past its budget (mqttAdmissionExtension).
+//
 // Session lock NOT held on entry.
-func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string,
-	budget int, write mqttInflightWrite) bool {
+func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, jsDur string, sseq uint64,
+	nonce, q2AffClaim, q2AffCopy string, budget int, write mqttInflightWrite, extend mqttAdmissionExtension) bool {
 	as := sess.asm
 	// Opportunistic, and free when nothing is pending: one of the convergence points that
 	// is guaranteed to come round again on a live session, so a void verdict whose save was
@@ -5800,7 +5802,19 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 	// The occupant the previous attempt loaded, carried forward so the replacement write can
 	// rewrite it; nil on the first attempt, whose write is always a create.
 	var lastCur *mqttInflightRecord
-	for attempt := 0; attempt < budget; attempt++ {
+	for attempt := 0; ; attempt++ {
+		if attempt >= budget {
+			// THE BUDGET IS SPENT. An extension takes one more attempt — the same allocation,
+			// custody reservation and settlement, nothing re-entered — or the ladder gives up as
+			// it always has.
+			if extend == nil {
+				break
+			}
+			if !extend(attempt, lastErr) {
+				break
+			}
+			budget = attempt + 1
+		}
 		// THE WRITE IS THE ONLY THING THAT DIFFERS between the standalone register/marker pair
 		// this ladder was born with and the F-105 admission that carries the authority, exchange
 		// and resource edges beside it. Everything below — the mode/lineage reset, the classifier
@@ -6324,6 +6338,12 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 // the commit never does. The standalone pair write reports false: its ladder is not spaced.
 type mqttInflightWrite func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (seq uint64, contended bool, err error)
 
+// mqttAdmissionExtension decides, when the ladder's budget is spent, whether it takes one more
+// attempt: attempts is how many it has taken, lastErr the failure of the last. It may wait before
+// answering, and is called with no lock held. Only the delivery entrance supplies one
+// (admitThroughAuthority); every other entrance's budget is exactly its budget.
+type mqttAdmissionExtension func(attempts int, lastErr error) bool
+
 // storeInflightRegister is the pre-F-105 admission: it makes a freshly allocated identifier
 // durable through the standalone register-and-marker write, with no authority, exchange or
 // resource edges beside it. It runs the shared ladder (runInflightAdmission) with the pair/CAS
@@ -6339,7 +6359,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			}
 			seq, err := sess.asm.storeInflightPair(subject, regExpect, markerExpect, rec)
 			return seq, false, err
-		})
+		}, nil)
 }
 
 // confirmInflightRegister stamps a confirmed register onto its pending entry and

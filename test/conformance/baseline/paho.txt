@@ -13,9 +13,3 @@
 # Deduplicating overlapping deliveries across independent JetStream consumers is
 # a substantial, race-prone change we deliberately do not make.
 test_subscribe_identifiers
-
-# Known defect, tracked: docs/ROADMAP.md section 2, "Delivery to a QoS 1 subscriber
-# caps at about 5 messages per second". Receive Maximum flow control with many QoS 1
-# and 2 messages; probably that delivery rate, not yet confirmed. It failed in CI from
-# 2026-10-26 after passing once. Remove this entry when that item lands.
-test_flow_control2

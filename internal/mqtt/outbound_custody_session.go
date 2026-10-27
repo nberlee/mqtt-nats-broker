@@ -627,9 +627,19 @@ func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager
 	// existed. The trigger is the floor CROSSING the observed position, never a bare sequence
 	// change, so admissions and watermark updates cause no restart; every restart is caused by a
 	// floor advance that retired a position, i.e. by real progress, and they are still bounded.
+	return mqttTraverseInventoryRestarting(jsa, as, id, epoch, gen, unreadable, nil)
+}
+
+// mqttTraverseInventoryRestarting is the restart loop the census and the identifier walk share.
+// wanted, when non-nil, decides which exchange duties have their exchange read (see
+// mqttTraverseInventoryOnce).
+func mqttTraverseInventoryRestarting(jsa *mqttJSA, as *mqttAccountSessionManager,
+	id, epoch, gen string, unreadable func(subject string) bool,
+	wanted func(d *mqttDutyEntry) bool) (*mqttCustodyCensus, error) {
+
 	var last *mqttCustodyCensus
 	for attempt := 0; attempt <= mqttTraversalRestarts; attempt++ {
-		out, restart, err := mqttTraverseInventoryOnce(jsa, as, id, epoch, gen, unreadable)
+		out, restart, err := mqttTraverseInventoryOnce(jsa, as, id, epoch, gen, unreadable, wanted)
 		if err != nil || !restart {
 			return out, err
 		}
@@ -643,11 +653,49 @@ func mqttTraverseGenerationInventory(jsa *mqttJSA, as *mqttAccountSessionManager
 // mqttTraversalRestarts bounds the restarts one traversal takes for a floor that crossed it.
 const mqttTraversalRestarts = 8
 
+// mqttIdentifierWalk is what identifier exclusivity reads from one generation's inventory: the
+// ledger sequence the walk read, the positions it could not read as standing, and the exchanges
+// whose duties name one of the identifiers asked about. It is deliberately NOT a census — it
+// carries no complete set of named or live exchanges — so it cannot stand in for one.
+type mqttIdentifierWalk struct {
+	ledgerSeq uint64
+	uncertain []string
+	holders   []*mqttOutboundExchange
+}
+
+// mqttTraverseInventoryForIdentifiers walks [Lo, Hi] exactly as the census does — every duty read
+// and validated, every position that will not read uncertain, the same restart on a floor that
+// crossed it — but reads only the exchanges whose duties name one of pis. A duty's identifier is
+// bound to its exchange where both are created and never moves afterwards, and neither does the
+// exchange's, so an exchange whose duty names another identifier cannot hold one of these.
+//
+// Session lock NOT held on entry.
+func mqttTraverseInventoryForIdentifiers(jsa *mqttJSA, id, epoch, gen string,
+	pis map[uint16]struct{}) (*mqttIdentifierWalk, error) {
+
+	census, err := mqttTraverseInventoryRestarting(jsa, nil, id, epoch, gen, nil,
+		func(d *mqttDutyEntry) bool {
+			_, ok := pis[d.PI]
+			return ok
+		})
+	if census == nil {
+		return nil, err
+	}
+	return &mqttIdentifierWalk{ledgerSeq: census.ledgerSeq, uncertain: census.uncertain,
+		holders: census.live}, err
+}
+
 // mqttTraverseInventoryOnce is one pass over [Lo, Hi]. It reports restart when the floor crossed
 // a position this pass could not read as standing. The census carries the ledger observation
 // even when the pass fails later, so a resident caller can arm deletion demand from it.
+//
+// wanted, when non-nil, is asked about each exchange duty only AFTER the duty has read and
+// validated (one that did not is uncertain whatever it names), Terminal duties included; an
+// exchange duty it rejects is recorded as named but its exchange is not read. Only the identifier
+// walk passes one, and its result is not a census.
 func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
-	id, epoch, gen string, unreadable func(subject string) bool) (*mqttCustodyCensus, bool, error) {
+	id, epoch, gen string, unreadable func(subject string) bool,
+	wanted func(d *mqttDutyEntry) bool) (*mqttCustodyCensus, bool, error) {
 
 	led, ledSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
 	if lerr != nil {
@@ -710,6 +758,9 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 				continue
 			}
 			out.named[d.Ref] = struct{}{}
+			if wanted != nil && !wanted(d) {
+				continue
+			}
 			xsubj := mqttExchangeSubject(idHash, gen, d.Ref)
 			if unreadable != nil && unreadable(xsubj) {
 				out.uncertain = append(out.uncertain, xsubj)

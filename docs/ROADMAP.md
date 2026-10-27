@@ -9350,33 +9350,10 @@ reads](findings/resolved.md#f-054).
   entirely outside broker code. Each fix has a focused test paired with a mutation that was
   run and fails it.
 
-- [ ] **Delivery to a QoS 1 subscriber caps at about 5 messages per second.** Filed
+- [x] **Delivery to a QoS 1 subscriber caps at about 5 messages per second.** Filed
   2026-10-26 from an operator's measurement (3-pod R3 on NFS: 4-8 msg/s, 120-250 ms per
-  message, slower as the backlog grows, the same for MQTT 3.1.1 and 5.0), reproduced
-  locally on one broker with embedded JetStream on local disk, R1: 200 QoS 1 messages to a
-  QoS 1 subscriber took 39.9 s (5.0 msg/s, median gap 203 ms), 60 took 10 s (6.0 msg/s,
-  121 ms); the same 200 to a QoS 0 subscriber took 49 ms, and accepting the QoS 1
-  publishes took 88 ms. So the slowdown is in outbound QoS 1 delivery and reproduces
-  without NFS or replication. At this rate a burst to a QoS 1 subscriber, such as Home
-  Assistant or Node-RED resubscribing after a restart, would take minutes. What is
-  known: the JetStream path benchmark above measured about 105 requests per QoS 1
-  delivery, about 98 of them message GETs on `$MQTT_inflight` (the outbound obligation
-  records), at 48-65 ms against an in-process server; it also found that almost every
-  delivery's first admission attempt loses its CAS on the source consumer's resource
-  record to the previous delivery's hold release and is retried. The observed gap is two
-  to four times that request cost, and deliveries to one subscriber appear to run one at
-  a time. Not yet known: where the time goes per delivery (serial admission, the CAS
-  retry, waits between attempts, the read count), and what ordering or durability
-  property each serial step protects. Deliverable: a throughput benchmark of sustained
-  QoS 1 and QoS 2 delivery to one subscriber (and to several), the profile of one
-  delivery, and a change that raises the rate without giving up an invariant
-  `docs/ARCHITECTURE.md` states, or a stated residual in `docs/CONFORMANCE.md` with the
-  measured ceiling if the cost is the design's. Possibly the same cause, unconfirmed:
-  the Paho interoperability suite's `test_flow_control2` (Receive Maximum with many QoS 1
-  and 2 messages) failed in CI on 2026-10-26 against its baseline, after passing in the
-  run before; check it against the benchmark before treating it separately. It is in
-  `test/conformance/baseline/paho.txt` so CI stays green meanwhile; landing this item
-  removes it.
+  message, slower as the backlog grows, the same for MQTT 3.1.1 and 5.0), reproduced locally
+  on one broker with embedded JetStream on local disk, R1.
 
   Measured against stock nats-server 2.15.1's own MQTT listener on the same 3-node
   cluster and NFS storage, both with their MQTT streams file-backed at R3 (checked with
@@ -9399,6 +9376,50 @@ reads](findings/resolved.md#f-054).
   refused when the client identifier was reused about a second after its previous
   connection closed (not with unique identifiers); a quick reconnect with the same
   identifier should not be refused.
+
+  **Done 2026-10-26.** Record: [Outbound delivery
+  throughput](findings/nats-platform.md#outbound-delivery-throughput-2026-10-26).
+  Measured cause: every admission's identifier-exclusivity walk read every exchange in
+  its generation's unreclaimed span (O(burst), and twice, because nearly every first
+  admission attempt loses its CAS to the previous delivery's acknowledgement); the floor
+  only worked above a span of 256; and a backlog queued longer than AckWait was
+  re-offered and re-delivered as fresh DUP=0 deliveries after the client had
+  acknowledged them (15 of a 150 burst, 115 of 300). Two pre-existing defects surfaced
+  and were fixed in the same change: contention exhaustion abandoned an admission whose
+  re-offer then reached the client behind later messages (plain QoS 1 reordering, 4 of
+  15 bursts), and the PUBREL name claim's single attempt refused a QoS 2 SUBSCRIBE from
+  a client reusing its identifier at once (the refusal in the operator's run). Changed
+  (docs/ARCHITECTURE.md): the exchange duty carries its packet identifier and
+  exclusivity reads only colliding exchanges; the floor slack is 32 (measured against 64
+  and 256); a re-offer of a source this session acknowledged is declined and
+  re-acknowledged; an admission defeated only by stale expectations is re-attempted for
+  its connection's life; the PUBREL name claim is re-attempted under the connection's
+  entitlement. `make bench-outbound` is the benchmark. Result (standalone / R3): one QoS
+  1 subscriber, burst of 500, 6.2 / 8.0 msg/s (1.7 before), QoS 2 5.5 / 7.4, four
+  subscribers 30.6 / 45.4 in aggregate, nothing delivered twice under a new identifier,
+  publish order held. Residual,
+  stated in docs/CONFORMANCE.md "Outbound QoS 1/2 delivery rate per subscriber": the
+  per-subscriber ceiling is the delivery protocol's (about 50 reads and three batches
+  per delivery, one delivery at a time per subscription), and a subscription can stall
+  while its admissions keep losing. `test_flow_control2` passed 5 of 5 locally (and on
+  the tree before it: the CI failure was not reproduced) and left the Paho baseline. 26
+  mutations each fail their paired test.
+
+- [ ] **Raise the per-subscriber delivery ceiling: change the delivery protocol, not its
+  tuning.** Filed 2026-10-26 by the item above, whose residual it is, at the user's
+  direction. After that item a QoS 1 subscriber still receives a backlog at about 6-8
+  msg/s against several hundred for stock nats-server's MQTT listener on the same
+  storage: every delivery is admitted through the outbound obligation authority one at a
+  time per subscription, each admission reads about 50 records, writes three atomic
+  batches and re-reads at the write boundary, and every admission CASes the client's one
+  authority record, which the previous delivery's acknowledgement also rewrites, so
+  nearly every first attempt loses and waits 10-25 ms; duty reads still grow through a
+  burst because the floor yields to deliveries. Deliverable: a design that admits
+  several deliveries per subscription concurrently (or several in one batch) and drops
+  the re-reads the write boundary does not need, keeping every invariant
+  docs/ARCHITECTURE.md states for the authority, measured with `make bench-outbound`
+  against the rows in [the
+  record](findings/nats-platform.md#outbound-delivery-throughput-2026-10-26).
 
 ### NATS platform follow-ups
 

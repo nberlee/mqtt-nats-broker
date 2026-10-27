@@ -166,6 +166,12 @@ func (sess *mqttSession) submitSourceAckLocked(reply string, owner mqttSourceAck
 		return sess.handBackLocked(reply)
 	}
 	mqttObserveSourceAck(reply, true)
+	// RECORDED AT THE SUBMISSION, before the send: the decision about this source's fate is what
+	// the record states, and a lost acknowledgement is what a declined re-offer re-submits.
+	sess.ackedSources.record(dur, seq)
+	if h := mqttTestSourceAckDropHook.Get(); h != nil && h(reply) {
+		return mqttSourceAckSubmitted
+	}
 	sess.jsa.sendAck(reply)
 	return mqttSourceAckSubmitted
 }
@@ -206,7 +212,12 @@ func (sess *mqttSession) submitSourceAck(reply string, confirm bool, owner mqttS
 		return r, errMQTTSourceHandedBack
 	}
 	mqttObserveSourceAck(reply, true)
-	p.enqueue()
+	// Recorded at the enqueue, and KEPT whatever the wait below reports: a failed confirmation
+	// leaves the acknowledgement possibly lost, which a declined re-offer re-submits.
+	sess.ackedSources.record(dur, seq)
+	if h := mqttTestSourceAckDropHook.Get(); h == nil || !h(reply) {
+		p.enqueue()
+	}
 	sess.mu.Unlock()
 	if hook := mqttTestSourceAckWaitHook.Get(); hook != nil {
 		hook(sess)
@@ -216,6 +227,11 @@ func (sess *mqttSession) submitSourceAck(reply string, confirm bool, owner mqttS
 	}
 	return mqttSourceAckConfirmed, nil
 }
+
+// mqttTestSourceAckDropHook, when it returns true for an acknowledgement's subject, drops the send
+// after the submission is recorded: an acknowledgement lost on the wire (a confirmed one then
+// waits out its confirmation and fails, as it would). Nil in production.
+var mqttTestSourceAckDropHook = new(mqttKnob[func(reply string) bool])
 
 // mqttTestSourceAckWaitHook observes a confirmed acknowledgement's wait, which runs with sess.mu
 // released. Nil in production.

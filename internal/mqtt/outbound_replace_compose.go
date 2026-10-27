@@ -275,7 +275,7 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 		// rather than obligations.
 		inv, ierr := mqttAllocateInventoryMembers(r.Auth.ID, r.Auth.Epoch, r.Auth.Gen,
 			r.Ledger, r.LedgerSeq, []mqttDutyDeclaration{
-				{Kind: mqttDutyExchange, Ref: r.Exchange.Nonce, State: mqttDutyPending},
+				{Kind: mqttDutyExchange, Ref: r.Exchange.Nonce, PI: r.Exchange.PI, State: mqttDutyPending},
 			})
 		if ierr != nil {
 			return nil, fmt.Errorf("replacing a register: %w", ierr)

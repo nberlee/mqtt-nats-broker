@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths depproof soak resource-soak run docker docker-multiarch conformance wiki tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -89,6 +89,9 @@ bench-inbound: ## Inbound QoS 1/2 acknowledgement throughput, standalone and R3 
 
 bench-jspaths: ## JetStream request cost per MQTT operation, standalone and R3 (MQTTNB_JS_PATH_BENCH_OUT=<csv> to record rows, MQTTNB_JS_PATH_BENCH_LOADS=<a,b> to select loads).
 	MQTTNB_JS_PATH_BENCH=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -v -timeout 90m -run '^TestMQTTJetStreamPathCosts$$' ./internal/mqtt/
+
+bench-outbound: ## Outbound QoS 1/2 delivery throughput to backlogged subscribers, standalone and R3 (MQTTNB_OUTBOUND_DELIVERY_BENCH_OUT=<csv> to record rows, MQTTNB_OUTBOUND_DELIVERY_BENCH_CASES=<a,b> to select cases).
+	MQTTNB_OUTBOUND_DELIVERY_BENCH=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -v -timeout 120m -run '^TestMQTTOutboundDeliveryThroughput$$' ./internal/mqtt/
 
 resource-soak: ## Resource-lifetime soak, run alone: churn, failover, TLS reloads, WebSocket churn and shutdown leave every broker-owned resource at its expected count (MQTTNB_RESOURCE_SOAK_DIR=<dir> keeps the per-block heap profiles).
 	MQTTNB_RESOURCE_SOAK=1 MQTTNB_CLUSTER_FAILOVER_TESTS=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -v -timeout 90m -run '^(TestResourceChurnSingleBroker|TestResourceChurnFailover|TestResourceDisplacedDisposalCollected|TestResourceShutdownComplete|TestResourceTLSReloadChurn|TestResourceWebSocketChurn)$$' ./internal/mqtt/

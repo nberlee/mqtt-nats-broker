@@ -40,6 +40,20 @@ func testF105Duty(e *testF105Env, ord uint64, kind mqttDutyKind, ref string,
 	if state == mqttDutyTerminal {
 		d.Outcome = "completed"
 	}
+	if kind == mqttDutyExchange {
+		// An exchange duty names its exchange's identifier. These fixtures plant no exchange
+		// whose identifier differs, so every one names the identifier the exchange fixtures use.
+		d.PI = testF105DutyPI
+	}
+	return d
+}
+
+// testF105DutyPI is the identifier the inventory fixtures' exchange duties name.
+const testF105DutyPI uint16 = 1
+
+// testF105DutyNaming is d naming identifier pi, for a fixture whose exchange holds another one.
+func testF105DutyNaming(d *mqttDutyEntry, pi uint16) *mqttDutyEntry {
+	d.PI = pi
 	return d
 }
 
@@ -327,38 +341,38 @@ func TestF105InventoryRecordsRefuseUnsupportedBodies(t *testing.T) {
 			"a predeclared cleanup":   {testF105Duty(e, 1, mqttDutyCleanup, "inc-1", mqttDutyNotYetActionable), true},
 			"a terminal provisioning": {testF105Duty(e, 1, mqttDutyProvision, "inc-1", mqttDutyTerminal), true},
 			"an unsupported kind":     {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1, Kind: "other", Ref: "x", State: mqttDutyPending}, false},
-			"an unsupported state":    {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1, Kind: mqttDutyExchange, Ref: "x", State: 9}, false},
-			"ordinal zero":            {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 0, Kind: mqttDutyExchange, Ref: "x", State: mqttDutyPending}, false},
-			"a malformed reference":   {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1, Kind: mqttDutyExchange, Ref: "not a token", State: mqttDutyPending}, false},
+			"an unsupported state":    {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1, Kind: mqttDutyExchange, Ref: "x", PI: testF105DutyPI, State: 9}, false},
+			"ordinal zero":            {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 0, Kind: mqttDutyExchange, Ref: "x", PI: testF105DutyPI, State: mqttDutyPending}, false},
+			"a malformed reference":   {&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1, Kind: mqttDutyExchange, Ref: "not a token", PI: testF105DutyPI, State: mqttDutyPending}, false},
 
 			// TERMINAL WITHOUT AN OUTCOME is an ending with nothing to say about itself, and
 			// "classified" is the word that makes a duty terminal at all.
 			"terminal with no outcome": {
 				&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
-					Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyTerminal}, false},
+					Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyTerminal}, false},
 			// AN OUTCOME BEFORE THE END describes a classified result for work still owed.
 			"pending with an outcome": {
 				&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
-					Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyPending,
+					Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyPending,
 					Outcome: "completed"}, false},
 			// A CLAIM COORDINATES WORK, so an ended duty holds none.
 			"terminal and still claimed": {
 				&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
-					Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyTerminal,
+					Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyTerminal,
 					Outcome: "completed", Claim: "broker-1", LeaseUntil: 5}, false},
 			// A LEASE WITHOUT A CLAIMANT NAMES NOBODY; a claimant without a lease never
 			// expires. Either alone is a record no reader can act on.
 			"a lease with no claimant": {
 				&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
-					Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyPending,
+					Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyPending,
 					LeaseUntil: 5}, false},
 			"a claimant with no lease": {
 				&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
-					Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyPending,
+					Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyPending,
 					Claim: "broker-1"}, false},
 			"a claim and a lease together": {
 				&mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
-					Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyPending,
+					Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyPending,
 					Claim: "broker-1", LeaseUntil: 5}, true},
 		} {
 			err := mqttValidateDutyEntry(tc.d, e.id, e.epoch, testF105Gen, tc.d.Ord)
@@ -404,7 +418,7 @@ func TestF105AllocationRequiresItsLedger(t *testing.T) {
 
 	// NO LEDGER MEMBER AT ALL.
 	err := testF105SubmitInventory(t, e, "txn-bare",
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)))
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)))
 	if err == nil {
 		t.Fatalf("a duty entry was allocated with no ledger member")
 	}
@@ -415,11 +429,11 @@ func TestF105AllocationRequiresItsLedger(t *testing.T) {
 	// THE POSITIVE CONTROL: the same entry, with the ledger CAS that allocates its ordinal.
 	if err := testF105SubmitInventory(t, e, "txn-first",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
 	); err != nil {
 		t.Fatalf("a properly ledgered allocation was refused: %v", err)
 	}
-	if d, _ := testF105LoadDuty(t, e, 1); d.Ref != "xch-a" {
+	if d, _ := testF105LoadDuty(t, e, 1); d.Ref != "inc-xa" {
 		t.Fatalf("the allocated duty did not land: %v", d)
 	}
 }
@@ -445,9 +459,9 @@ func TestF105AllocationIsExactlyTheDeclaredInterval(t *testing.T) {
 	// the duty at 4 is one no sweep will ever visit.
 	err := testF105SubmitInventory(t, e, "txn-gap",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 3)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyExchange, "xch-b", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyExchange, "xch-d", mqttDutyPending)))
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyProvision, "inc-xb", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyProvision, "inc-xd", mqttDutyPending)))
 	if err == nil {
 		t.Fatalf("an allocation left a hole in the inventory")
 	}
@@ -460,8 +474,8 @@ func TestF105AllocationIsExactlyTheDeclaredInterval(t *testing.T) {
 	// than one the other masks.
 	if err := testF105SubmitInventory(t, e, "txn-short",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 3)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyExchange, "xch-b", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyProvision, "inc-xb", mqttDutyPending)),
 	); err == nil {
 		t.Fatalf("fewer entries were allocated than the ledger's high-water declares")
 	}
@@ -469,8 +483,8 @@ func TestF105AllocationIsExactlyTheDeclaredInterval(t *testing.T) {
 	// MORE ENTRIES THAN THE LEDGER DECLARES.
 	if err := testF105SubmitInventory(t, e, "txn-over",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyExchange, "xch-b", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyProvision, "inc-xb", mqttDutyPending)),
 	); err == nil {
 		t.Fatalf("more entries were allocated than the ledger's high-water declares")
 	}
@@ -487,7 +501,7 @@ func TestF105AllocationIsExactlyTheDeclaredInterval(t *testing.T) {
 	// admission predeclaring a resource's provisioning and cleanup duties actually does.
 	if err := testF105SubmitInventory(t, e, "txn-three",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 3)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyProvision, "inc-1", mqttDutyPending)),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 3, mqttDutyCleanup, "inc-1", mqttDutyNotYetActionable)),
 	); err != nil {
@@ -498,7 +512,7 @@ func TestF105AllocationIsExactlyTheDeclaredInterval(t *testing.T) {
 	_, ledgerSeq := testF105LoadLedger(t, e)
 	if err := testF105SubmitInventory(t, e, "txn-next",
 		testF105LedgerMember(t, e, ledgerSeq, testF105Ledger(e, mqttGenLedgerOpen, 4)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyExchange, "xch-d", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyProvision, "inc-xd", mqttDutyPending)),
 	); err != nil {
 		t.Fatalf("the following allocation was refused: %v", err)
 	}
@@ -682,7 +696,7 @@ func TestF105DutyContinuationExpectationNamesTheInspectedEntry(t *testing.T) {
 
 	if err := testF105SubmitInventory(t, e, "txn-one",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
 	); err != nil {
 		t.Fatalf("the allocation was refused: %v", err)
 	}
@@ -709,7 +723,7 @@ func TestF105DutyContinuationExpectationNamesTheInspectedEntry(t *testing.T) {
 	// AN ENTRY THAT IS NOT THERE AT ALL. Ordinal 7 was never allocated, so a continuation over
 	// it would invent the duty it claims to advance — and inventing one is how an ordinal
 	// nothing reserved acquires an occupant.
-	ghost := testF105Duty(e, 7, mqttDutyExchange, "xch-z", mqttDutyPending)
+	ghost := testF105Duty(e, 7, mqttDutyProvision, "inc-xz", mqttDutyPending)
 	if err := e.asm.jsa.checkInventoryMembers(attempt,
 		[]mqttTransitionMember{testF105DutyMember(t, e, 5, ghost)}); err == nil {
 		t.Fatalf("a continuation validated over an entry that does not exist")
@@ -748,8 +762,18 @@ func testF105CoverExchanges(t *testing.T, e *testF105Env, gen string,
 		if len(toks) != 4 || toks[1] != idHash {
 			continue
 		}
+		// The duty names the identifier of the exchange it covers, as the admission's boundary
+		// binds it. Read leniently: some fixtures hand the boundary an exchange body that is
+		// malformed on purpose, and the rule they test is not this one.
+		var x struct {
+			PI uint16 `json:"pi"`
+		}
+		_ = json.Unmarshal(m.body, &x)
+		if x.PI == 0 {
+			x.PI = testF105DutyPI
+		}
 		decls = append(decls, mqttDutyDeclaration{
-			Kind: mqttDutyExchange, Ref: toks[3], State: mqttDutyPending,
+			Kind: mqttDutyExchange, Ref: toks[3], PI: x.PI, State: mqttDutyPending,
 		})
 	}
 	if len(decls) == 0 {
@@ -894,7 +918,7 @@ func TestF105CreationsOweTheirInventoryCoverage(t *testing.T) {
 	if err := testF105SubmitInventoryAs(t, e, mqttTransitionAdmitExchange, "txn-covered", withSlots("txn-covered",
 		xchMember("txn-covered"),
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, nonce, mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105DutyNaming(testF105Duty(e, 1, mqttDutyExchange, nonce, mqttDutyPending), 7)),
 	)...); err != nil {
 		t.Fatalf("a covered admission was refused: %v", err)
 	}
@@ -1033,7 +1057,7 @@ func TestF105ADutyEndingMustBeEarned(t *testing.T) {
 func TestF105ADutyIsNeverAllocatedTerminal(t *testing.T) {
 	_, err := mqttAllocateInventoryMembers(testF105ID, testF105Epoch, testF105Gen, nil, 0,
 		[]mqttDutyDeclaration{{
-			Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyTerminal,
+			Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyTerminal,
 		}})
 	if err == nil {
 		t.Fatalf("a duty was allocated already terminal")
@@ -1044,7 +1068,7 @@ func TestF105ADutyIsNeverAllocatedTerminal(t *testing.T) {
 	// THE POSITIVE CONTROL, so the rule is about the STATE and not about allocation failing.
 	if _, err := mqttAllocateInventoryMembers(testF105ID, testF105Epoch, testF105Gen, nil, 0,
 		[]mqttDutyDeclaration{{
-			Kind: mqttDutyExchange, Ref: "xch-a", State: mqttDutyPending,
+			Kind: mqttDutyExchange, Ref: "xch-a", PI: testF105DutyPI, State: mqttDutyPending,
 		}}); err != nil {
 		t.Fatalf("an ordinary allocation was refused: %v", err)
 	}
@@ -1087,7 +1111,7 @@ func TestF105CoverageMustNameTheGenerationItCovers(t *testing.T) {
 	}
 	duty := &mqttDutyEntry{
 		ID: e.id, Epoch: e.epoch, Gen: other, Ord: 1,
-		Kind: mqttDutyExchange, Ref: nonce, State: mqttDutyPending,
+		Kind: mqttDutyExchange, Ref: nonce, PI: x.PI, State: mqttDutyPending,
 	}
 	dbody, derr := json.Marshal(duty)
 	if derr != nil {
@@ -1129,7 +1153,7 @@ func TestF105AnAllocationNeverStartsTerminal(t *testing.T) {
 
 	err := testF105SubmitInventory(t, e, "txn-alloc-terminal",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyTerminal)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal)),
 	)
 	if err == nil {
 		t.Fatalf("a batch allocated a duty that had already ended")
@@ -1155,7 +1179,7 @@ func TestF105AnAllocationNeverStartsTerminal(t *testing.T) {
 	// statement about the STATE rather than about inventory members in general.
 	if oerr := testF105SubmitInventory(t, e, "txn-alloc-pending",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
 	); oerr != nil {
 		t.Fatalf("the same allocation with a live duty was refused: %v", oerr)
 	}

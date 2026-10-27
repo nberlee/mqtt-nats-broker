@@ -335,16 +335,16 @@ func TestF105SweepCountsMissingAndMalformedEntriesAsOutstanding(t *testing.T) {
 	// Four duties: 1 terminal, 2 missing, 3 malformed, 4 still pending.
 	if err := testF105SubmitInventory(t, e, "txn-alloc",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 4)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyExchange, "xch-b", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 3, mqttDutyExchange, "xch-c", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyExchange, "xch-d", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyProvision, "inc-xb", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 3, mqttDutyProvision, "inc-xc", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyProvision, "inc-xd", mqttDutyPending)),
 	); err != nil {
 		t.Fatalf("allocating four duties: %v", err)
 	}
 	// 1 REACHES terminal in the store rather than being allocated there: an allocation may never
 	// start terminal, and what this test is about is what the SWEEP does with the record.
-	testF105PlantDuty(t, e, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyTerminal))
+	testF105PlantDuty(t, e, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
 	// Remove 2 outright and corrupt 3, which is what a sweep must not read as done.
 	gone, gerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
 		mqttDutySubject(getHash(e.id), testF105Gen, 2))
@@ -555,14 +555,14 @@ func TestF105SweepNeverPassesANotYetActionableDuty(t *testing.T) {
 
 	if err := testF105SubmitInventory(t, e, "txn-alloc",
 		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 2)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyPending)),
+		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
 		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyCleanup, "inc-1",
 			mqttDutyNotYetActionable)),
 	); err != nil {
 		t.Fatalf("allocating the pair: %v", err)
 	}
 	// As above: 1 reaches terminal in the store, because an allocation may never start there.
-	testF105PlantDuty(t, e, testF105Duty(e, 1, mqttDutyExchange, "xch-a", mqttDutyTerminal))
+	testF105PlantDuty(t, e, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
 
 	root := testF105EnvRoot(e, 1, 1, 2, 0)
 	swept, out, err := e.asm.jsa.sweepOneBatch(root)

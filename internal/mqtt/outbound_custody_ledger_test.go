@@ -894,7 +894,7 @@ func TestF105CustodyCensusShapesStayConservative(t *testing.T) {
 	ord := led.Hi + 1
 	ghostLin := mqttNewInflightNonce()
 	d := &mqttDutyEntry{ID: e.sess.id, Epoch: e.asm.sessStreamEpoch, Gen: gen, Ord: ord,
-		Kind: mqttDutyExchange, Ref: ghostLin, State: mqttDutyPending}
+		Kind: mqttDutyExchange, Ref: ghostLin, PI: 1, State: mqttDutyPending}
 	body, _ := json.Marshal(d)
 	dutySubject := mqttDutySubject(e.sess.idHash, gen, ord)
 	if _, err := e.asm.jsa.storeMsg(dutySubject, -1, body); err != nil {

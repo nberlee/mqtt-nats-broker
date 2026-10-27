@@ -89,7 +89,9 @@ func TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect(t *testing.T) {
 
 	testF112Deliver(t, o, sub, "f112/t15", n)
 
-	deadline := time.Now().Add(30 * time.Second)
+	// One periodic re-arm of the floor fits inside the deadline: the floor yields to deliveries, so
+	// what is left at the burst's end is retired at rest, after at most one tick (+20% jitter).
+	deadline := time.Now().Add(mqttFloorTick*6/5 + 30*time.Second)
 	var led *mqttGenLedger
 	for time.Now().Before(deadline) {
 		led = testF112SessLedger(t, sub.sess)

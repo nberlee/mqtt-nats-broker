@@ -8457,6 +8457,28 @@ The source's acknowledgement always belongs to someone else — the PUBREC handl
 `trackPublish`), the drain, the intent resolver, or recovery. The slot-only (experimental
 affine) class is excluded by the source's own durable and keeps its existing order.
 
+**A re-offer of a source this session acknowledged is declined before allocation.**
+Under a backlog queued longer than AckWait, JetStream re-offers messages whose first
+offer is still queued on the delivery callback; the first offer is then delivered and
+acknowledged, and the re-offer arrives after both. Every positive source acknowledgement
+passes one gate (`submitSourceAckLocked` / `submitSourceAck`), which records the
+(durable, stream sequence) it SUBMITS — before the send, and kept whatever the
+confirmation reports — in a bounded per-session set (`mqttAckedSources`: 1024 sequences
+per durable, 64 durables, oldest evicted; a source durable's name is never reused). At
+the ordinary allocation point, after every earlier guard and only for an offer JetStream
+counts as delivered more than once on a durable with no drain state, a recorded source
+is declined: nothing is allocated or sent, and the acknowledgement is re-submitted on
+the re-offer's own reply through the same gate (positive acknowledgement is idempotent
+at the server), so a lost one cannot leave the sequence re-offered forever. The record
+is the session's decision about that source's fate — completed, finalized, withdrawn,
+disposed, or handed to another obligation — never the consumer's acknowledgement floor,
+which the server also advances when a pending message disappears without any
+acknowledgement. A hand-back records nothing. A sequence another session or broker
+acknowledged, or one evicted from the set, is not covered (`docs/CONFORMANCE.md`).
+
+These guards are scoped protections, not an end-to-end guarantee that an acknowledged
+PUBLISH is never sent again; what remains is stated in `docs/CONFORMANCE.md`.
+
 This is the live route's half of "one source delivery has at most one un-ended exchange"
 (see "An admission that may have landed keeps its source"); recovery's half is
 `installPubRelLocked`'s `reserveSource`. It lasts exactly as long as the entry: PUBCOMP
@@ -10064,6 +10086,62 @@ pins each row. Issuing these reads in rounds, and the composition reads of `opAd
 (`docs/findings/nats-platform.md`, "JetStream path benchmark"): every operation's reads are
 serial and stop at its refusal.
 
+### An admission defeated only by contention keeps the subscription's order
+
+A subscription's deliveries are admitted one at a time, on one delivery callback, in the
+order JetStream offers them, and that serial callback is the whole of what keeps a
+non-shared subscription's same-topic messages in publish order (MQTT-4.6.0-6). An
+admission that gives up abandons its offer, and JetStream's re-offer queues behind
+everything already pushed to the subscription, so the message reaches the client after
+messages published later. Every admission and every acknowledgement of a session CASes
+its one authority record, so under a backlog an admission could lose all
+`mqttForegroundAcquireAttempts` of its budget to the session's own acknowledgements and
+reorder the subscription (measured: 4 of 15 bursts of 500 on the tree before this
+change).
+
+So the delivery entrance (`admitThroughAuthority`, ordinary and shared) extends the
+shared ladder past its budget (`runInflightAdmission`'s extension,
+`outbound_admission_contention.go`) while every attempt so far has failed POSITIVELY on
+a stale expectation: the boundary's own stale-sequence refusals that an admission
+reaches (the authority predecessor, a resource, an exchange, a name ownership, the
+identifier walk's ledger fence), which wrap `errMQTTStaleExpectation`, or the store's
+expected-last-sequence CAS rejection (`mqttIsStaleExpectation`). The ladder's
+`contended` flag is not the test: it also covers boundary refusals and transport
+failures. Each extension attempt is an ordinary one — the same allocation, custody
+reservation and attempt settlement, the same spacing before its fresh reads — and its
+write compares the standing authority with the entitlement the connection was accepted
+under, so a moved tenure refuses and ends the extension. It ends too on any other
+failure, on the incarnation's closing signal, and when the connection closes or stops
+being the session's (`connectionServes`, checked before every further attempt); the
+ladder then abandons the offer exactly as before. No other entrance's budget changes.
+
+It is bounded by the connection's life, not by time: a periodic give-up while the
+connection lives would reorder exactly as before. A subscription can therefore stall for
+as long as its admissions keep losing, and the session's background authority writers
+stay yielded meanwhile (`docs/CONFORMANCE.md`). Making the losses rarer is the
+delivery-protocol redesign's business, not this extension's.
+
+### The PUBREL consumer's name is claimed under contention
+
+The PUBREL durable's name is generation-scoped and stable, so its ownership is claimed
+once, by the first QoS 2 SUBSCRIBE of a generation (`claimPubRelName`). That claim CASes
+the client's authority record like every transition of the client, and used to make a
+single attempt: a client reusing its identifier at once lost it to the previous
+connection's still-running closing work, and its QoS 2 SUBSCRIBE was refused. It is now
+re-attempted, spaced and announced foreground, under the connection's pinned
+entitlement: one rule (`pubRelClaimEntitled`: serving generation and tenure equal the
+connection's, and the name is that generation's) checked before every attempt, before
+adopting a standing name, and before the consumer is created and installed. Each attempt
+re-reads the ownership, so an attempt that landed behind a lost response is adopted
+through the existing same-owner rematerialization arm (a LIVE, undecided PUBREL
+resource). Exhaustion settles every submitted attempt by permanent arbitration, as
+source retirement does: landed or superseded is adopted after one more ownership read,
+an unresolved attempt is aborted so it can never land, and an attempt whose abort fails
+stays open and refuses the claim. An open attempt that lands later leaves what a crash
+between a claim and its create leaves: a LIVE name and resource whose provision and
+cleanup duties are in this generation's inventory, adopted by the next claim and retired
+by the generation's closing.
+
 ### An ambiguous transition is decided by a record that EXISTS
 
 The authority is a single-slot record, so a later transition overwrites the body an earlier
@@ -11256,6 +11334,18 @@ So a generation carries a **ledger** (lifecycle state and an inventory high-wate
 **duty entry** per obligation, provisioning operation and cleanup duty, at a stable ordinal
 carried in the SUBJECT — the record's sequence moves and its name does not.
 
+**An exchange duty names its exchange's packet identifier** (`pi`), and no other kind
+names one, in every state, the relocation marker included; an exchange duty without it
+is an unsupported shape and is refused, never read as "any identifier". The boundary
+binds it where it is written: every allocated exchange duty names an exchange CREATED in
+the same batch and generation, and its `pi` equals that exchange's
+(`mqttCheckExchangeDutyIdentifiers`); a continuation that changes it re-identifies the
+duty and is refused (`checkDutyContinuation`); a relocation carries it unchanged on the
+marker and the representative (`checkFloorAdvance`). An exchange's own identifier never
+moves either (`checkExchangeOverwrites`), so a duty naming one identifier names an
+exchange that cannot hold another. That is what identifier exclusivity relies on
+(below).
+
 Allocation is a CAS on the ledger inside the admission's own atomic batch, which is what makes
 ordinals contiguous: a batch that loses lands nothing, so no ordinal is consumed by a refused
 transition and there is no hole a cursor can mistake for the end.
@@ -11377,15 +11467,25 @@ Lo)`.
 
 **Identifier exclusivity reads the inventory, not a subject list.**
 `checkIdentifierExclusivity` traverses `[Lo, Hi]` of the ledger its own batch CASes and
-refuses unless the traversal read the ledger at exactly the sequence the batch expects: an
-admission or a floor advance landing after the read makes the batch lose. Every exchange's
-duty is allocated in the batch that creates it, so the range covers every obligation the
-floor has not proven ended and reclaimed. The paged stream-info walk it replaced was sound
-only because no exchange subject was ever deleted — a deletion between pages shifts a live
-subject past the cursor — and `enumerateGenerationObligations` moved onto the traversal
-for the same reason (its per-exchange action walk stays a subject walk: actions are never
-deleted). `streamSubjectsComplete` keeps its resource and certificate callers, whose
-records are never deleted.
+refuses unless the traversal read the ledger at exactly the sequence the batch expects:
+an admission or a floor advance landing after the read makes the batch lose. It reads
+every duty in the range and validates it, exactly as the census does (a duty that will
+not read is uncertain and refuses, whatever it names; restarts on a crossing floor are
+the census's), but it reads only the exchanges whose duties name an identifier the batch
+claims (`mqttTraverseInventoryForIdentifiers`, which shares the census's one pass and
+returns no census): an exchange whose duty names another identifier cannot hold this
+one. A duty naming the claimed identifier has its exchange read and judged as before,
+Terminal duties included (an abandoned delivery keeps its identifier), and an unreadable
+exchange behind it refuses. Before the duty carried the identifier, every admission read
+every exchange in the range, so its cost grew with the generation's unreclaimed history.
+Every exchange's duty is allocated in the batch that creates it, so the range covers
+every obligation the floor has not proven ended and reclaimed. The paged stream-info
+walk it replaced was sound only because no exchange subject was ever deleted — a
+deletion between pages shifts a live subject past the cursor — and
+`enumerateGenerationObligations` moved onto the traversal for the same reason (its
+per-exchange action walk stays a subject walk: actions are never deleted).
+`streamSubjectsComplete` keeps its resource and certificate callers, whose records are
+never deleted.
 
 **An absence is classified, not inferred** (`classifyExchangeAbsence`, the one
 definition): an exchange that reads absent is RECLAIMED — a positive, terminal ending —
@@ -11417,7 +11517,7 @@ floor; one inside the floor stays (a genuine hole).
 so it inherits its single start site, admission, incarnation lease, close-cycle stop,
 captured (generation, epoch, ledger) checks and its one tracked tick. Its demand is a
 latch armed by an accepted ending, by any resident ledger read that finds deletion owed or
-a span over `mqttFloorSlack` (256), and by its own periodic re-arm (`mqttFloorTick`, 30 s
+a span over `mqttFloorSlack` (32), and by its own periodic re-arm (`mqttFloorTick`, 30 s
 +/-20%) while the inventory holds a span over the slack or retired positions not yet
 deleted — which is what discovers a peer's completions and reclamations on a healthy,
 continuously connected session. It is cleared only by a run that found nothing to do,
@@ -11449,8 +11549,14 @@ the entries it had and goes quiescent. Memory is bounded by the ended lineages w
 register still stood, or that the object still projected, at the last floor run.
 
 **Cost.** A resume, a census, an exclusivity check and a shared release fence read `[Lo,
-Hi]`: O(outstanding work plus what has not yet been reclaimed), not O(history). What stays
-permanent is stated in "Storage this mechanism accepts".
+Hi]`: O(outstanding work plus what has not yet been reclaimed), not O(history). "Not yet
+reclaimed" is not small: the floor is a background writer that yields to every
+foreground delivery, so during a burst it does not advance and the span grows with the
+burst; at rest it retires history down to `mqttFloorSlack` (32, measured against 64 and
+256 with `make bench-outbound`). Every admission reads every duty in the span
+(overlapped through the multi-read) and, since the duty carries the identifier, only the
+exchanges that could collide. What stays permanent is stated in "Storage this mechanism
+accepts".
 
 ### Resume restores from the inventory, and ownership is the entitlement's (F-105 7b)
 
@@ -14039,6 +14145,17 @@ retained store and replay, session recovery (warm, and cold after a broker resta
 tick and a broker start, each on a fresh broker, against a standalone server and a three-node
 cluster. The record of what it measured, and what changed because of it, is in
 `docs/findings/nats-platform.md`, "JetStream path benchmark".
+
+What the request costs add up to at a subscriber is measured separately: `make
+bench-outbound` (`TestMQTTOutboundDeliveryThroughput`, opt-in) publishes a burst before
+the subscribers read, so the whole burst is backlog, and reports per case the unique and
+duplicate deliveries, the rate overall and per window of 50 first deliveries, the gaps,
+the contention waits and the requests per delivery by record class (QoS 1 and QoS 2, one
+and four subscribers, and delivery at rest after a burst; standalone and three-node). A
+row counts only when every subscriber received every message with its first deliveries
+in publish order (`TestMQTTOutboundDeliveryBenchOracleDiscriminates`); duplicates are
+counted, not failed. The record is in `docs/findings/nats-platform.md`, "Outbound
+delivery throughput".
 
 Three instruments, because no one of them can see everything:
 

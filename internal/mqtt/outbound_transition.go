@@ -2139,8 +2139,8 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 				a.Txn, nonce, lerr)
 		}
 		if smsg.Sequence != e.expect {
-			return nil, fmt.Errorf("transition %q advances exchange %q at sequence %d but it stands at %d",
-				a.Txn, nonce, e.expect, smsg.Sequence)
+			return nil, fmt.Errorf("transition %q advances exchange %q at sequence %d but it stands at %d: %w",
+				a.Txn, nonce, e.expect, smsg.Sequence, errMQTTStaleExpectation)
 		}
 		cur, derr := mqttDecodeOutboundExchange(smsg.Data, a.ID, a.Epoch, gen, nonce)
 		if derr != nil {
@@ -2668,14 +2668,16 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 // holding the identifier, and treating it as absent is the inference this whole mechanism
 // exists to remove. So does an INCOMPLETE enumeration, for the same reason one step further
 // out — an obligation the walk never returned is one this claim never saw. The walk is the
-// generation's inventory [Lo, Hi] (F-112), fenced by the ledger CAS this same batch carries.
+// generation's inventory [Lo, Hi] (F-112), fenced by the ledger CAS this same batch carries, and
+// it reads the exchange of every duty that names a claimed identifier and no other: a walk that
+// read every exchange made each admission cost as much as the generation's unreclaimed history.
 func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
 	resulting, rerr := jsa.batchExchangeState(a, extra)
 	if rerr != nil {
 		return rerr
 	}
 	claimed := map[string]string{}
-	gens := map[string]struct{}{}
+	gens := map[string]map[uint16]struct{}{}
 	for _, e := range extra {
 		cls, ok := mqttF105ObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk || e.expect != 0 {
@@ -2691,14 +2693,17 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 		}
 		slot := x.Gen + "." + strconv.FormatUint(uint64(x.PI), 10)
 		claimed[slot] = x.Nonce
-		gens[x.Gen] = struct{}{}
+		if gens[x.Gen] == nil {
+			gens[x.Gen] = map[uint16]struct{}{}
+		}
+		gens[x.Gen][x.PI] = struct{}{}
 	}
 	if len(claimed) == 0 {
 		return nil
 	}
 
 	idHash := getHash(a.ID)
-	for gen := range gens {
+	for gen, pis := range gens {
 		// THE ENUMERATION IS THE INVENTORY, read at the ledger sequence this batch CASes (F-112).
 		// Every exchange's duty is allocated in the batch that creates it, so [Lo, Hi] covers every
 		// obligation the floor has not proven ended and reclaimed; and because this batch's own
@@ -2720,7 +2725,11 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 			// fenced inventory to read for it.
 			continue
 		}
-		census, cerr := mqttTraverseGenerationInventory(jsa, nil, a.ID, a.Epoch, gen, nil)
+		// ONLY THE EXCHANGES WHOSE DUTIES NAME A CLAIMED IDENTIFIER are read: a duty's identifier
+		// is bound to its exchange where both are created (mqttCheckExchangeDutyIdentifiers) and
+		// never moves, so an exchange whose duty names another identifier cannot hold this one.
+		// Every duty is still read and validated, so an unreadable position still refuses.
+		census, cerr := mqttTraverseInventoryForIdentifiers(jsa, a.ID, a.Epoch, gen, pis)
 		if cerr != nil {
 			return fmt.Errorf("transition %q could not enumerate generation %q's obligations, "+
 				"so the identifier it claims cannot be shown to be free: %w", a.Txn, gen, cerr)
@@ -2728,7 +2737,7 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 		if census.ledgerSeq != ledgerExpect {
 			return fmt.Errorf("transition %q enumerated generation %q's obligations at ledger sequence "+
 				"%d but CASes %d: the identifier was shown free in an inventory this batch is not "+
-				"conditioned on", a.Txn, gen, census.ledgerSeq, ledgerExpect)
+				"conditioned on: %w", a.Txn, gen, census.ledgerSeq, ledgerExpect, errMQTTStaleExpectation)
 		}
 		if len(census.uncertain) != 0 {
 			// AN OBLIGATION THIS BROKER CANNOT READ may be the one holding the identifier.
@@ -2736,7 +2745,7 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 				"inventory (%s), which may hold the identifier it claims", a.Txn, len(census.uncertain),
 				gen, census.uncertain[0])
 		}
-		for _, x := range census.live {
+		for _, x := range census.holders {
 			// A member of THIS batch is the batch's own statement about that obligation, and
 			// the collision rules have already compared them with each other.
 			if _, mine := resulting[gen+"."+x.Nonce]; mine {
@@ -2906,7 +2915,8 @@ func (jsa *mqttJSA) checkNameOwnershipMembers(a *mqttTransitionAttempt, extra []
 		}
 		if e.expect != prevSeq {
 			return fmt.Errorf("transition %q writes ownership of %q at expectation %d, but it stands at %d: "+
-				"the claim must CAS the exact record it read", a.Txn, next.Name, e.expect, prevSeq)
+				"the claim must CAS the exact record it read: %w", a.Txn, next.Name, e.expect, prevSeq,
+				errMQTTStaleExpectation)
 		}
 		if terr := mqttNameOwnershipTransitionLegal(prev, next); terr != nil {
 			return fmt.Errorf("transition %q: %w", a.Txn, terr)
@@ -3111,10 +3121,11 @@ func (jsa *mqttJSA) checkPredecessorAgainstStore(a *mqttTransitionAttempt,
 		// check, so the transition's expected-last-sequence no longer holds and no batch is
 		// submitted. A frequent authority writer settles it the same way it settles the
 		// JetStream 10071 the batch CAS would have returned a moment later: a bounded re-attempt
-		// on ANY error after an authoritative re-read (the admission-ladder contract), which is
-		// why this needs no distinguishing type.
+		// on ANY error after an authoritative re-read (the admission-ladder contract). It is
+		// marked a stale expectation all the same, because the delivery entrance re-attempts PAST
+		// its bound only on that (outbound_admission_contention.go).
 		return fmt.Errorf("transition %q is conditioned on the authority at sequence %d but it "+
-			"stands at %d", a.Txn, prevSeq, smsg.Sequence)
+			"stands at %d: %w", a.Txn, prevSeq, smsg.Sequence, errMQTTStaleExpectation)
 	}
 	stored, derr := mqttDecodeOutboundAuthority(smsg.Data, a.ID, a.Epoch)
 	if derr != nil {
@@ -3361,8 +3372,8 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 				a.Txn, inc, lerr)
 		}
 		if smsg.Sequence != e.expect {
-			return fmt.Errorf("transition %q mutates resource %q at sequence %d but it stands at %d",
-				a.Txn, inc, e.expect, smsg.Sequence)
+			return fmt.Errorf("transition %q mutates resource %q at sequence %d but it stands at %d: %w",
+				a.Txn, inc, e.expect, smsg.Sequence, errMQTTStaleExpectation)
 		}
 		cur, derr := mqttDecodeOutboundResource(smsg.Data, a.ID, a.Epoch, gen, inc)
 		if derr != nil {

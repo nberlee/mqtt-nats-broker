@@ -15,6 +15,7 @@ type testTraversalFixture struct {
 	e          *testInflightEnv
 	gen, epoch string
 	exchanges  []string // the three exchange subjects, in admission order
+	pis        []uint16 // the identifiers they hold, in the same order
 }
 
 func testNewTraversalFixture(t *testing.T) *testTraversalFixture {
@@ -31,6 +32,7 @@ func testNewTraversalFixture(t *testing.T) *testTraversalFixture {
 		ent, _ := e.c.outboundEntitlement()
 		f.gen = ent.Gen
 		f.exchanges = append(f.exchanges, mqttExchangeSubject(e.sess.idHash, f.gen, rec.Lin))
+		f.pis = append(f.pis, pi)
 	}
 	testWaitCustodySettled(t, e.sess, 5*time.Second)
 	return f
@@ -68,8 +70,10 @@ func TestTraversalUnansweredExchangeIsUncertain(t *testing.T) {
 		t.Fatal("the pass must still complete: uncertainty is reported, not raised")
 	}
 
-	// Downstream: an admission of a fresh identifier on this generation is refused, because the
-	// unreadable position may hold it.
+	// Downstream: an admission claiming the identifier the unreadable exchange's duty names is
+	// refused, because that exchange may hold it. One claiming an identifier no duty names is not
+	// refused for it: the duty binds its exchange to its identifier, so the exchange cannot hold
+	// another (docs/ARCHITECTURE.md, "Identifier exclusivity reads the inventory").
 	ent, _ := f.e.c.outboundEntitlement()
 	dur := f.e.sess.idHash + "_" + nuid.Next()
 	f.e.admissionPrerequisites(t, dur, 1)
@@ -77,13 +81,19 @@ func TestTraversalUnansweredExchangeIsUncertain(t *testing.T) {
 	if !ok {
 		t.Fatal("fixture: the fresh dependency must be ready")
 	}
-	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 999, Dur: dur, Seq: 99, QoS: 1, Nonce: mqttNewInflightNonce()})
-	_, aerr := f.e.sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: f.e.sess.id, Epoch: f.epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
-		Gen: ent.Gen, Tenure: ent.Tenure, Register: rec, Deps: deps,
-	})
-	if aerr == nil || !strings.Contains(aerr.Error(), "unreadable position") {
-		t.Fatalf("an admission over an inventory with an unreadable exchange was not refused for it: %v", aerr)
+	admit := func(pi uint16, seq uint64) error {
+		rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: seq, QoS: 1, Nonce: mqttNewInflightNonce()})
+		_, aerr := f.e.sess.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
+			ID: f.e.sess.id, Epoch: f.epoch, Txn: mqttNewInflightNonce(), Op: "op-admit-publish",
+			Gen: ent.Gen, Tenure: ent.Tenure, Register: rec, Deps: deps,
+		})
+		return aerr
+	}
+	if aerr := admit(f.pis[1], 98); aerr == nil || !strings.Contains(aerr.Error(), "unreadable position") {
+		t.Fatalf("an admission claiming the identifier of an unreadable exchange was not refused for it: %v", aerr)
+	}
+	if aerr := admit(999, 99); aerr != nil && strings.Contains(aerr.Error(), "unreadable position") {
+		t.Fatalf("an admission claiming an identifier no duty names was refused for an unreadable exchange: %v", aerr)
 	}
 }
 
