@@ -28,7 +28,10 @@ jobs:
       - name: build (default tree)
         run: go build ./...
       - name: test
-        run: go test -race -count=1 ./...
+        # An explicit bound: the race-built internal/mqtt package runs close to go test's
+        # default 10m on a small machine (597s measured on 2026-10-28), so the default
+        # would turn a slow runner into a spurious failure.
+        run: go test -race -count=1 -timeout 30m ./...
 
   fulltests:
     name: test (upstream suite, shard ${{ matrix.shard }} of 8)
@@ -509,11 +512,23 @@ jobs:
           echo "/tmp/mc/target/release" >> "$GITHUB_PATH"
       - name: run broker
         run: |
-          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 -port 1883 -auth-passthrough=false -log-level warn &
+          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 -port 1883 -auth-passthrough=false -log-level warn \
+            > broker.log 2>&1 &
           echo $! > broker.pid
           for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
       - name: run conformance suites
         run: ./test/conformance/run.sh
+      # A failed suite keeps its per-test output and the broker's log: run.sh prints only
+      # the regression names, which is not enough to diagnose an intermittent failure.
+      - name: upload conformance results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-results
+          path: |
+            test/conformance/results/
+            broker.log
+          if-no-files-found: ignore
       - name: stop broker
         if: always()
         run: kill "$(cat broker.pid)" 2>/dev/null || true
@@ -546,11 +561,22 @@ jobs:
           ./mqtt-nats-broker -nats nats://127.0.0.1:4222 \
             -nats-user service -nats-pass service \
             -port 1883 -auth-passthrough -default-user mqtt -default-pass mqtt \
-            -keepalive-max 60 -log-level warn &
+            -keepalive-max 60 -log-level warn > broker.log 2>&1 &
           echo $! > broker.pid
           for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
       - name: run Paho interoperability suite
         run: SUITES=paho ./test/conformance/run.sh
+      # Same reason as the conformance job: an intermittent Paho regression (test_subscribe_failure
+      # and test_server_keep_alive on run 40584306314) left nothing to diagnose it with.
+      - name: upload Paho results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: paho-results
+          path: |
+            test/conformance/results/
+            broker.log
+          if-no-files-found: ignore
       - name: stop broker
         if: always()
         run: kill "$(cat broker.pid)" 2>/dev/null || true
