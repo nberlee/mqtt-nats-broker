@@ -1595,6 +1595,13 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 			return nil, mqttDisplacedRetained{}, err
 		}
 		sub.nsub = ns
+		sub.queued.Store(func() int {
+			n, _, perr := ns.Pending()
+			if perr != nil {
+				return 0
+			}
+			return n
+		})
 
 		// Interest propagation: QoS 1/2 and PUBREL deliveries ride an internal
 		// deliver subject ("$MQTT.sub.<nuid>") that a JetStream push consumer,

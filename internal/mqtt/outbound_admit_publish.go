@@ -37,11 +37,10 @@ import (
 // by a teardown that never knew an obligation depended on it, and the register survives to
 // prove nothing.
 //
-// NOT WIRED. mqttDeliverMsgCbQoS12 still calls storeInflightRegister directly; this exists so
-// the route can be converted against a mechanism that has already been exercised against a
-// real store. There is deliberately NO missing-authority fallback: a caller without an
-// authority is refused, because a fallback is how a path quietly keeps admitting work the
-// authority never authorized.
+// Every supported QoS 1/2 delivery is admitted through it (outbound_admit_orchestrate.go), one
+// obligation at a time or several of one subscription in one batch (outbound_admission_batch.go).
+// There is deliberately NO missing-authority fallback: a caller without an authority is refused,
+// because a fallback is how a path quietly keeps admitting work the authority never authorized.
 
 // mqttPublishAdmission is one outbound PUBLISH's admission, assembled by its caller.
 type mqttPublishAdmission struct {
@@ -118,18 +117,47 @@ func (d mqttResourceDependency) edgeFor(nonce string) mqttResourceEdge {
 	return mqttResourceEdge{Nonce: nonce, Role: d.Role}
 }
 
-// mqttAdmitPublishTransition assembles the whole admission.
+// mqttPublishAdmissionEntry is one obligation of a batched admission: its exchange, its register
+// and the subject it is created on, and the resources it depends on in their roles. Several entries
+// may name one resource; they must name it at one read sequence.
+type mqttPublishAdmissionEntry struct {
+	Exchange *mqttOutboundExchange
+	Register *mqttInflightRecord
+	RegSubj  string
+	Deps     []mqttResourceDependency
+}
+
+// mqttAdmitPublishTransition assembles the whole admission of one obligation: the batch form with
+// one entry, so one admission and a batch of them are composed by one definition.
+func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransition, error) {
+	if a == nil {
+		return nil, fmt.Errorf("admitting a publish requires the authority it is admitted under")
+	}
+	return mqttAdmitPublishesTransition(a, []mqttPublishAdmissionEntry{{
+		Exchange: a.Exchange, Register: a.Register, RegSubj: a.RegSubj, Deps: a.Deps,
+	}})
+}
+
+// mqttAdmitPublishesTransition assembles the admission of several obligations in ONE batch, under
+// one authority revision: every entry's register, unsent marker and exchange, ONE member per
+// resource carrying every edge the batch adds to it, and ONE ledger member allocating every
+// entry's exchange duty, in entry order. a supplies the authority, the attempt identity and the
+// ledger; its own Exchange, Register, RegSubj and Deps are not read.
 //
 // The register and marker are carried as ordinary members, so they land under exactly the
-// expectations storeInflightPair would have used: the register at its observed sequence, the
-// marker create-only. What changes is that they can no longer land without the authority and
-// the exchange landing too.
-func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransition, error) {
+// expectations storeInflightPair would have used: the register create-only, the marker
+// create-only. What changes is that they can no longer land without the authority and the
+// exchange landing too.
+func mqttAdmitPublishesTransition(a *mqttPublishAdmission, entries []mqttPublishAdmissionEntry) (*mqttAuthorityTransition, error) {
 	if a == nil || a.Auth == nil {
 		return nil, fmt.Errorf("admitting a publish requires the authority it is admitted under")
 	}
-	if a.Exchange == nil || a.Register == nil {
-		return nil, fmt.Errorf("admitting a publish requires both its exchange and its register")
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("admitting publishes requires at least one obligation")
+	}
+	if len(entries) > mqttAdmissionBatchMax {
+		return nil, fmt.Errorf("admitting %d publishes in one batch exceeds the bound of %d",
+			len(entries), mqttAdmissionBatchMax)
 	}
 	if a.AuthSeq == 0 {
 		return nil, fmt.Errorf("admitting a publish requires the sequence its authority was read at")
@@ -137,117 +165,145 @@ func mqttAdmitPublishTransition(a *mqttPublishAdmission) (*mqttAuthorityTransiti
 	if a.Auth.State != mqttAuthorityServing {
 		return nil, fmt.Errorf("an authority in state %d admits no new obligation", a.Auth.State)
 	}
-	// THE EXCHANGE IS ADMITTED INTO THE AUTHORITY'S OWN GENERATION. Without this an
-	// admission under a successor's authority could install an obligation in a generation
-	// that is already closed — an obligation admitted after closure, reached by naming the
-	// old generation rather than by racing the closure.
-	if a.Exchange.Gen != a.Auth.Gen {
-		return nil, fmt.Errorf("the exchange is admitted into generation %q but its authority serves %q",
-			a.Exchange.Gen, a.Auth.Gen)
-	}
-	if a.Exchange.Tenure != a.Auth.Tenure {
-		return nil, fmt.Errorf("the exchange names tenure %q but its authority carries %q",
-			a.Exchange.Tenure, a.Auth.Tenure)
-	}
-	if a.Exchange.AdmitTxn != a.Txn {
-		return nil, fmt.Errorf("the exchange names admitting transition %q, but this transition is %q",
-			a.Exchange.AdmitTxn, a.Txn)
-	}
-	// The exchange and the register describe ONE obligation, so the identifier and the QoS
-	// they carry must agree. They are two records because recovery and the send path already
-	// read the register; they are not two opinions.
-	if a.Exchange.PI != a.Register.PI {
-		return nil, fmt.Errorf("the exchange allocates identifier %d but its register carries %d",
-			a.Exchange.PI, a.Register.PI)
-	}
-	if a.Exchange.QoS != a.Register.QoS {
-		return nil, fmt.Errorf("the exchange is QoS %d but its register is QoS %d",
-			a.Exchange.QoS, a.Register.QoS)
-	}
-	// THE EXCHANGE NONCE IS THE REGISTER'S LINEAGE, not a second identity minted beside it.
-	//
-	// Lin is per-OBLIGATION where the register's own Nonce is per-ALLOCATION, so the
-	// exchange — which is the obligation — is identified by exactly that value. Minting E
-	// independently would give one obligation two identities that agree only by luck, and
-	// after an allocation replacement nothing could reconstruct which exchange a register
-	// belonged to: the identifier is reusable, so matching on it proves nothing.
-	if a.Exchange.Nonce != a.Register.Lin {
-		return nil, fmt.Errorf("the exchange is %q but its register's lineage is %q: the "+
-			"exchange nonce IS the obligation lineage", a.Exchange.Nonce, a.Register.Lin)
-	}
-	if a.RegSubj == _EMPTY_ {
-		return nil, fmt.Errorf("admitting a publish requires the register's subject")
-	}
-	if verr := mqttValidateInflightShape(a.Register); verr != nil {
-		return nil, fmt.Errorf("refusing to admit an unsupported register shape: %w", verr)
-	}
-
-	regBody, err := json.Marshal(a.Register)
-	if err != nil {
-		return nil, err
-	}
-	markerBody, merr := mqttBuildInflightMarker(a.Register.Nonce)
-	if merr != nil {
-		return nil, fmt.Errorf("refusing to admit a publish whose marker cannot be built: %w", merr)
-	}
-	// THE HOLDS INDEX IS DERIVED HERE, from the edges this batch adds, and from nothing the caller
-	// says: the ending that releases them reads it, and the write boundary refuses an admission
-	// whose index differs from its added edges in either direction (F-105 7c-lc).
-	a.Exchange.Holds = mqttHoldsForDeps(a.Deps)
-	xchBody, xerr := json.Marshal(a.Exchange)
-	if xerr != nil {
-		return nil, xerr
-	}
-
 	idHash := getHash(a.Auth.ID)
-	members := []mqttTransitionMember{
-		{subj: a.RegSubj, expect: 0, body: regBody},
-		{subj: a.RegSubj + "." + mqttInflightMarkerSuffix, expect: 0, body: markerBody},
-		{subj: mqttExchangeSubject(idHash, a.Exchange.Gen, a.Exchange.Nonce), expect: 0, body: xchBody},
+	members := make([]mqttTransitionMember, 0, 3*len(entries)+len(entries)+3)
+	decls := make([]mqttDutyDeclaration, 0, len(entries))
+	// THE RESOURCES, folded: one successor per incarnation, every edge the batch adds applied to it
+	// in entry order. Two members on one subject would carry two expectations of which only the
+	// first can hold, so the store would refuse the batch whole.
+	type foldedResource struct {
+		next *mqttOutboundResource
+		seq  uint64
 	}
+	var resOrder []string
+	folded := make(map[string]*foldedResource)
+	for i := range entries {
+		e := &entries[i]
+		if e.Exchange == nil || e.Register == nil {
+			return nil, fmt.Errorf("admitting a publish requires both its exchange and its register")
+		}
+		// THE EXCHANGE IS ADMITTED INTO THE AUTHORITY'S OWN GENERATION. Without this an
+		// admission under a successor's authority could install an obligation in a generation
+		// that is already closed — an obligation admitted after closure, reached by naming the
+		// old generation rather than by racing the closure.
+		if e.Exchange.Gen != a.Auth.Gen {
+			return nil, fmt.Errorf("the exchange is admitted into generation %q but its authority serves %q",
+				e.Exchange.Gen, a.Auth.Gen)
+		}
+		if e.Exchange.Tenure != a.Auth.Tenure {
+			return nil, fmt.Errorf("the exchange names tenure %q but its authority carries %q",
+				e.Exchange.Tenure, a.Auth.Tenure)
+		}
+		if e.Exchange.AdmitTxn != a.Txn {
+			return nil, fmt.Errorf("the exchange names admitting transition %q, but this transition is %q",
+				e.Exchange.AdmitTxn, a.Txn)
+		}
+		// The exchange and the register describe ONE obligation, so the identifier and the QoS
+		// they carry must agree. They are two records because recovery and the send path already
+		// read the register; they are not two opinions.
+		if e.Exchange.PI != e.Register.PI {
+			return nil, fmt.Errorf("the exchange allocates identifier %d but its register carries %d",
+				e.Exchange.PI, e.Register.PI)
+		}
+		if e.Exchange.QoS != e.Register.QoS {
+			return nil, fmt.Errorf("the exchange is QoS %d but its register is QoS %d",
+				e.Exchange.QoS, e.Register.QoS)
+		}
+		// THE EXCHANGE NONCE IS THE REGISTER'S LINEAGE, not a second identity minted beside it.
+		//
+		// Lin is per-OBLIGATION where the register's own Nonce is per-ALLOCATION, so the
+		// exchange — which is the obligation — is identified by exactly that value. Minting E
+		// independently would give one obligation two identities that agree only by luck, and
+		// after an allocation replacement nothing could reconstruct which exchange a register
+		// belonged to: the identifier is reusable, so matching on it proves nothing.
+		if e.Exchange.Nonce != e.Register.Lin {
+			return nil, fmt.Errorf("the exchange is %q but its register's lineage is %q: the "+
+				"exchange nonce IS the obligation lineage", e.Exchange.Nonce, e.Register.Lin)
+		}
+		if e.RegSubj == _EMPTY_ {
+			return nil, fmt.Errorf("admitting a publish requires the register's subject")
+		}
+		if verr := mqttValidateInflightShape(e.Register); verr != nil {
+			return nil, fmt.Errorf("refusing to admit an unsupported register shape: %w", verr)
+		}
 
-	// EVERY DEPENDENCY IS INCREMENTED IN THIS BATCH, at the sequence it was read. That is
-	// what makes it impossible for a deletion authorization to win on a count taken before
-	// this obligation existed: both write the resource record, so one of them loses.
-	for _, d := range a.Deps {
-		if d.Resource == nil {
-			return nil, fmt.Errorf("admitting a publish requires each named dependency")
+		regBody, err := json.Marshal(e.Register)
+		if err != nil {
+			return nil, err
 		}
-		if d.Seq == 0 {
-			return nil, fmt.Errorf("dependency %q carries no read sequence", d.Resource.Inc)
+		markerBody, merr := mqttBuildInflightMarker(e.Register.Nonce)
+		if merr != nil {
+			return nil, fmt.Errorf("refusing to admit a publish whose marker cannot be built: %w", merr)
 		}
-		if d.Resource.Gen != a.Exchange.Gen {
-			return nil, fmt.Errorf("dependency %q belongs to generation %q, not this exchange's %q",
-				d.Resource.Inc, d.Resource.Gen, a.Exchange.Gen)
+		// THE HOLDS INDEX IS DERIVED HERE, from the edges this entry adds, and from nothing the
+		// caller says: the ending that releases them reads it, and the write boundary refuses an
+		// admission whose index differs from its added edges in either direction (F-105 7c-lc).
+		e.Exchange.Holds = mqttHoldsForDeps(e.Deps)
+		xchBody, xerr := json.Marshal(e.Exchange)
+		if xerr != nil {
+			return nil, xerr
 		}
-		// NAMED BY THE OBLIGATION, not counted. The write boundary then requires this
-		// exchange to be created by this very batch, so the edge is derived from an
-		// admission rather than asserted by a caller.
-		next, derr := mqttResourceTakeDependency(d.Resource, d.edgeFor(a.Exchange.Nonce))
-		if derr != nil {
-			return nil, fmt.Errorf("admitting a publish: %w", derr)
+		members = append(members,
+			mqttTransitionMember{subj: e.RegSubj, expect: 0, body: regBody},
+			mqttTransitionMember{subj: e.RegSubj + "." + mqttInflightMarkerSuffix, expect: 0, body: markerBody},
+			mqttTransitionMember{subj: mqttExchangeSubject(idHash, e.Exchange.Gen, e.Exchange.Nonce), expect: 0, body: xchBody},
+		)
+
+		// EVERY DEPENDENCY IS INCREMENTED IN THIS BATCH, at the sequence it was read. That is
+		// what makes it impossible for a deletion authorization to win on a count taken before
+		// this obligation existed: both write the resource record, so one of them loses.
+		for _, d := range e.Deps {
+			if d.Resource == nil {
+				return nil, fmt.Errorf("admitting a publish requires each named dependency")
+			}
+			if d.Seq == 0 {
+				return nil, fmt.Errorf("dependency %q carries no read sequence", d.Resource.Inc)
+			}
+			if d.Resource.Gen != e.Exchange.Gen {
+				return nil, fmt.Errorf("dependency %q belongs to generation %q, not this exchange's %q",
+					d.Resource.Inc, d.Resource.Gen, e.Exchange.Gen)
+			}
+			f := folded[d.Resource.Inc]
+			if f == nil {
+				f = &foldedResource{next: d.Resource, seq: d.Seq}
+				folded[d.Resource.Inc] = f
+				resOrder = append(resOrder, d.Resource.Inc)
+			} else if f.seq != d.Seq {
+				return nil, fmt.Errorf("dependency %q is named at sequences %d and %d in one batch",
+					d.Resource.Inc, f.seq, d.Seq)
+			}
+			// NAMED BY THE OBLIGATION, not counted. The write boundary then requires this
+			// exchange to be created by this very batch, so the edge is derived from an
+			// admission rather than asserted by a caller.
+			next, derr := mqttResourceTakeDependency(f.next, d.edgeFor(e.Exchange.Nonce))
+			if derr != nil {
+				return nil, fmt.Errorf("admitting a publish: %w", derr)
+			}
+			f.next = next
 		}
-		body, berr := json.Marshal(next)
+		// THE OBLIGATION'S DUTY ORDINAL, allocated in this same batch: one entry, for the
+		// exchange. The resources it depends on already carry their own provisioning and cleanup
+		// entries, reserved by the transition that provisioned them — an admission never
+		// allocates for a resource, which is what keeps "every duty is allocated when the thing
+		// it concerns is admitted" a rule with one meaning rather than two.
+		decls = append(decls, mqttDutyDeclaration{
+			Kind: mqttDutyExchange, Ref: e.Exchange.Nonce, PI: e.Exchange.PI, State: mqttDutyPending,
+		})
+	}
+	for _, inc := range resOrder {
+		f := folded[inc]
+		body, berr := json.Marshal(f.next)
 		if berr != nil {
 			return nil, berr
 		}
 		members = append(members, mqttTransitionMember{
-			subj:   mqttResourceSubject(idHash, next.Gen, next.Inc),
-			expect: d.Seq,
+			subj:   mqttResourceSubject(idHash, f.next.Gen, f.next.Inc),
+			expect: f.seq,
 			body:   body,
 		})
 	}
 
-	// THE OBLIGATION'S DUTY ORDINAL, allocated in this same batch.
-	//
-	// One entry, for the exchange. The resources it depends on already carry their own
-	// provisioning and cleanup entries, reserved by the transition that provisioned them — an
-	// admission never allocates for a resource, which is what keeps "every duty is allocated
-	// when the thing it concerns is admitted" a rule with one meaning rather than two.
-	inv, ierr := mqttAllocateInventoryMembers(a.Auth.ID, a.Auth.Epoch, a.Auth.Gen,
-		a.Ledger, a.LedgerSeq, []mqttDutyDeclaration{
-			{Kind: mqttDutyExchange, Ref: a.Exchange.Nonce, PI: a.Exchange.PI, State: mqttDutyPending},
-		})
+	inv, ierr := mqttAllocateInventoryMembers(a.Auth.ID, a.Auth.Epoch, a.Auth.Gen, a.Ledger, a.LedgerSeq, decls)
 	if ierr != nil {
 		return nil, fmt.Errorf("admitting a publish: %w", ierr)
 	}

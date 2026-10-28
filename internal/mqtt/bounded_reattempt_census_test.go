@@ -106,8 +106,16 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "CHAPTER-P: the experimental affine route's standalone pair write, unreachable from the production command",
 		exhausted: "unspaced, three attempts; exhaustion re-offers at AckWait",
 		done:      "LEFT: chapter P is not alpha work"},
-	"outbound_admit_orchestrate.go:(mqttSession).admitThroughAuthority": {store: 0, fg: 1, fors: nil, budgets: nil,
-		class:     "FG-AUTHORITY: the ordinary and shared delivery admission, announced for the whole ladder",
+	"outbound_admission_batch.go:(mqttSession).attemptAdmissionBatch": {store: 0, fg: 1, fors: []string{"attempt := 0; ; attempt++", "i, it := range items", "k, it := range items"}, budgets: []string{"budget := mqttForegroundAcquireAttempts", "budget = attempt + 1"},
+		class:     "FG-AUTHORITY: a subscription's batched creates (opAdmitPublishes), announced for the whole batch by admitInflightPublishBatch; spaces only an attempt that reached its commit, before re-reading the batch's register subjects; the range headers build the attempt and locate an occupied slot, they bound nothing",
+		exhausted: "as admitThroughAuthority for the same writers; a batch whose every attempt lost to a stale expectation with every slot empty is EXTENDED while its connection serves (mqttDeliveryContentionExtension), an occupied slot splits it in order, any other refusal hands its head to the single ladder; exhaustion abandons every participant and re-offers at AckWait",
+		done:      "CONVERTED (mqttForegroundAcquireAttempts, the delivery entrance's extension)"},
+	"outbound_admit_orchestrate.go:(mqttSession).admitThroughAuthority": {store: 0, fg: 0, fors: nil, budgets: nil,
+		class:     "the delivery admission's custody reservation; the ladder runs in admitUnderReservation",
+		exhausted: "see admitUnderReservation",
+		done:      "CONVERTED (F-114), via admitUnderReservation"},
+	"outbound_admit_orchestrate.go:(mqttSession).admitUnderReservation": {store: 0, fg: 1, fors: nil, budgets: nil,
+		class:     "FG-AUTHORITY: the ordinary and shared delivery admission, announced for the whole ladder, under a reservation its caller holds (admitThroughAuthority, or a batch handing one delivery to the single ladder)",
 		exhausted: "the admitted background writers cannot exhaust an admission to an empty identifier; classification and cleanup attempts on an occupied one are not covered, nor are other brokers, recovery, unadmitted writes, foreground contention or store failures; an admission whose every attempt lost to a stale expectation is EXTENDED while its connection serves (mqttDeliveryContentionExtension), so a re-offer cannot overtake the subscription's order; any other exhaustion re-offers at AckWait",
 		done:      "CONVERTED (F-114)"},
 	"outbound_close_cert.go:(mqttSession).clearCertifiedRegister": {store: 1, fg: 0, fors: []string{"attempt := 0; attempt < mqttInflightStoreAttempts; attempt++"}, budgets: nil,
@@ -147,7 +155,7 @@ var reattemptCensus = map[string]reattemptRow{
 // reattemptEntranceBudgets pins the budget argument each entrance passes to the shared admission
 // ladder, which loops on that parameter and names neither budget itself.
 var reattemptEntranceBudgets = map[string]string{
-	"outbound_admit_orchestrate.go:(mqttSession).admitThroughAuthority": "mqttForegroundAcquireAttempts",
+	"outbound_admit_orchestrate.go:(mqttSession).admitUnderReservation": "mqttForegroundAcquireAttempts",
 	"inflight_register.go:(mqttSession).storeInflightRegister":          "mqttInflightStoreAttempts",
 }
 

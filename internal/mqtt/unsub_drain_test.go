@@ -893,14 +893,26 @@ func TestMQTTDrainLevelUpCoversBothConsumers(t *testing.T) {
 	testMQTTPublish(t, pc, pr, 1, false, false, "levelup/bar", 1, []byte("child"))
 	testMQTTPublish(t, pc, pr, 1, false, false, "levelup", 2, []byte("parent"))
 
-	// Both arrive unacknowledged; the order between two consumers is not fixed.
+	// Both arrive unacknowledged; the order between two consumers is not fixed. The 250 ms AckWait
+	// can bring one consumer's retransmission before the other's first delivery under load; a
+	// retransmission is the same delivery (DUP, its own identifier), so reading continues until each
+	// consumer's first delivery has been seen.
 	seen := map[string]uint16{}
-	for i := 0; i < 2; i++ {
-		_, pi, topic, payload := testMQTTReadPubPacket(t, r)
-		seen[string(payload)] = pi
+	for reads := 0; len(seen) < 2; reads++ {
+		if reads >= 20 {
+			t.Fatalf("expected one started delivery per consumer, got %v", seen)
+		}
+		flags, pi, topic, payload := testMQTTReadPubPacket(t, r)
 		if topic != "levelup/bar" && topic != "levelup" {
 			t.Fatalf("unexpected topic %q", topic)
 		}
+		if prev, ok := seen[string(payload)]; ok {
+			if flags&mqttPubFlagDup == 0 || pi != prev {
+				t.Fatalf("%q arrived again as flags %x identifier %d, want a retransmission under %d", payload, flags, pi, prev)
+			}
+			continue
+		}
+		seen[string(payload)] = pi
 	}
 	if len(seen) != 2 {
 		t.Fatalf("expected one started delivery per consumer, got %v", seen)

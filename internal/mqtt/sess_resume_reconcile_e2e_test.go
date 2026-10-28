@@ -711,6 +711,21 @@ func TestMQTTReconcileStreamForcedThresholdRefusesAdmission(t *testing.T) {
 	testMQTTExpectNothing(t, r)
 
 	var streamRefusals, consumerRefusals int
+	// The refusal is logged by the delivery's admission, which can trail the publish under load:
+	// wait for the first one, then take everything logged by then.
+	first := ""
+	deadline := time.After(10 * time.Second)
+	for first == "" {
+		select {
+		case w := <-l.warn:
+			if strings.Contains(w, "refusing to admit against") {
+				first = w
+			}
+		case <-deadline:
+			t.Fatal("no admission was refused within 10s")
+		}
+	}
+	l.warn <- first
 	for drained := false; !drained; {
 		select {
 		case w := <-l.warn:

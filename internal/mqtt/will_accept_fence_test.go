@@ -927,7 +927,11 @@ func TestWillUnconditionalWriteDivergesClaimants(t *testing.T) {
 // server refusing this write. `TestMQTTWillOutboxReplicatedTerminalDoneStands` is the
 // same shape against the real server, where the write IS refused.
 func TestWillUnconditionalWriteRefiresAPublishedWill(t *testing.T) {
+	// The fact reads counted below are the claimant's own: the account's claim loop scans the same
+	// record on its 50ms ticker and its reads would be counted too (1 of 10 under -race).
+	quiet := testQuietWillClaimLoop(t)
 	a, _ := testNewTeardownEnv(t)
+	quiet(a.asm)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "terminal-regression"
 	fireAt := testFarFuture()

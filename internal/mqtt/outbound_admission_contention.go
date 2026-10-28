@@ -44,15 +44,16 @@ func mqttIsStaleExpectation(err error) bool {
 
 // mqttDeliveryContentionExtension is the delivery entrance's extension of the admission ladder.
 //
-// A SUBSCRIPTION'S DELIVERIES ARE ADMITTED ONE AT A TIME, ON ONE CALLBACK, IN THE ORDER JETSTREAM
-// OFFERS THEM, and that is the whole of what keeps a non-shared subscription's same-topic messages
-// in order (MQTT-4.6.0-6). An admission that gives up abandons its offer, and JetStream's re-offer
-// queues behind everything already pushed to the subscription: the message reaches the client
-// after messages published later. Every admission and every acknowledgement of a session CASes its
-// one authority record, so under a backlog an admission can lose every attempt of its budget to
-// the session's own acknowledgements.
+// A SUBSCRIPTION'S OFFERS ARE PROCESSED ON ONE DISPATCH GOROUTINE, IN THE ORDER JETSTREAM OFFERS
+// THEM, their fresh deliveries admitted singly or several per batch and sent in that order, and
+// that is the whole of what keeps a non-shared subscription's same-topic messages in order
+// (MQTT-4.6.0-6). An admission that gives up abandons its offer, and JetStream's re-offer queues
+// behind everything already pushed to the subscription: the message reaches the client after
+// messages published later. Under a backlog an admission can lose attempt after attempt to
+// whatever else of the session writes the records it CASes.
 //
-// So an admission that has lost ONLY to stale expectations keeps its offer and attempts again,
+// So an admission (or a batch of them, attemptAdmissionBatch) that has lost ONLY to stale
+// expectations keeps its offer and attempts again,
 // with the same spacing before each attempt's fresh reads, for as long as this connection's
 // incarnation lives and its connection stays open. Each attempt is the ladder's ordinary one: the same allocation, custody
 // reservation and settlement, and the write compares the standing authority with the entitlement

@@ -5,6 +5,7 @@ package mqtt
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/nats-io/nuid"
@@ -412,6 +413,9 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			restored.mu.Lock()
 			_, restoredReserved := restored.pendingPublish[pi]
 			restoredCharge := restored.receiveMaxOccupancyLocked()
+			l := restored.custody
+			custodyState := fmt.Sprintf("exchanges %d, admissions %d, uncertain subjects %v",
+				len(l.heldExchanges), len(l.heldAdmissions), l.uncertainSubjects)
 			restored.mu.Unlock()
 			restoredReg, _ := e.loadRegister(t, pi)
 			if tc.markerSurvives {
@@ -424,7 +428,7 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 						"the PUBLISH never went out and its source can never be re-offered", pi)
 				}
 				if restoredCharge != 0 {
-					t.Fatalf("the released exchange still charges Receive Maximum, got %d", restoredCharge)
+					t.Fatalf("the released exchange still charges Receive Maximum, got %d (custody: %s)", restoredCharge, custodyState)
 				}
 				if restoredReg != nil {
 					t.Fatal("the durable register survived a release that freed its identifier")

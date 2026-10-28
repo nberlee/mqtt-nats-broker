@@ -3691,15 +3691,26 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 			otherRemoved = append(otherRemoved, e)
 		}
 	}
+	// SEVERAL ADMISSIONS MAY ADD THEIR EDGES IN ONE ACT, and only as HOLDS of a name-owned
+	// consumer: a batch admitting several deliveries of one subscription (one atomic batch, one
+	// member per resource) adds one source-replay or canonical-PUBREL edge per obligation it
+	// creates. Each is its own obligation's dependency, proven separately below exactly as a
+	// single one is. Every other role, and any resource that is not logical-use, keeps the
+	// single-edge rule.
 	if len(addedAll) > 1 {
-		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: more than "+
-			"one dependency admitted at once", a.Txn, cur.Inc)
+		for _, e := range addedAll {
+			if !mqttHoldRole(e.Role) || !mqttResourceLogicalUseKind(cur.Kind) {
+				return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: more "+
+					"than one dependency admitted at once, and %s is not a hold of a name-owned consumer",
+					a.Txn, cur.Inc, e)
+			}
+		}
 	}
 	if len(otherRemoved) > 1 {
 		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: more than "+
 			"one dependency released at once", a.Txn, cur.Inc)
 	}
-	if len(otherRemoved) == 1 && (len(addedAll) == 1 || len(holdRemoved) > 0) {
+	if len(otherRemoved) == 1 && (len(addedAll) > 0 || len(holdRemoved) > 0) {
 		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: one act "+
 			"both released %s and changed another dependency", a.Txn, cur.Inc, otherRemoved[0])
 	}
@@ -3723,10 +3734,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 				"holds index does not name", a.Txn, h, cur.Inc)
 		}
 	}
-	var added, removed *mqttResourceEdge
-	if len(addedAll) == 1 {
-		added = &addedAll[0]
-	}
+	var removed *mqttResourceEdge
 	if len(otherRemoved) == 1 {
 		removed = &otherRemoved[0]
 	}
@@ -3751,15 +3759,17 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 				a.Txn, cur.Inc, next.Disposal.Txn)
 		}
 	}
-	if added != nil && cur.Disposal != nil {
-		// A DISPOSED CONSUMER TAKES NO NEW DEPENDENT. The disposal and the admission both CAS this
-		// record, so whichever lands second meets the other: admission-first holds the retirement
-		// until its ending; disposal-first refuses the admission here.
-		return fmt.Errorf("transition %q makes resource %q depend on obligation %q, but the resource "+
-			"was disposed (%s): a consumer a route has ended admits no new obligation",
-			a.Txn, cur.Inc, added.Nonce, cur.Disposal.Reason)
-	}
-	if added != nil {
+	// EVERY ADDED EDGE IS JUDGED, each exactly as a single admission's is.
+	for i := range addedAll {
+		added := &addedAll[i]
+		if cur.Disposal != nil {
+			// A DISPOSED CONSUMER TAKES NO NEW DEPENDENT. The disposal and the admission both CAS this
+			// record, so whichever lands second meets the other: admission-first holds the retirement
+			// until its ending; disposal-first refuses the admission here.
+			return fmt.Errorf("transition %q makes resource %q depend on obligation %q, but the resource "+
+				"was disposed (%s): a consumer a route has ended admits no new obligation",
+				a.Txn, cur.Inc, added.Nonce, cur.Disposal.Reason)
+		}
 		if _, ok := createdHere[added.Nonce]; !ok {
 			return fmt.Errorf("transition %q makes resource %q depend on obligation %q, which "+
 				"this transition does not admit: a dependency is taken by the admission that "+

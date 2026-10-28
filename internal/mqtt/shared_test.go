@@ -58,9 +58,11 @@ func TestV5SharedSubscription(t *testing.T) {
 		}
 	}
 
+	// The window is a throughput bound, not a correctness one: under a loaded -race suite the group
+	// consumer was measured offering these about a second apart, every one exactly once.
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(60 * time.Second):
 		mu.Lock()
 		t.Fatalf("timed out: received %d/%d (A=%d B=%d)", received, total, countA, countB)
 	}

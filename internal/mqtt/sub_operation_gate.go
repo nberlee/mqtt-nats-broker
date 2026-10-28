@@ -332,6 +332,14 @@ func (sess *mqttSession) subGateFor(cc *client) *mqttSubGate {
 // QoS 0 does not call this — it has no redelivery, so parking a NATS delivery goroutine for
 // it would buy nothing; it consults transmissionBlocksQoS0 instead.
 func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerdict {
+	return sess.awaitTransmissionGatesThen(cc, nil)
+}
+
+// awaitTransmissionGatesThen is awaitTransmissionGates with beforeWait, when non-nil, run once,
+// outside any lock, at the first point the loop decides to WAIT rather than answer: the QoS 1/2
+// delivery callback flushes the deliveries it collected there, so they are not held behind this
+// offer's wait.
+func (sess *mqttSession) awaitTransmissionGatesThen(cc *client, beforeWait func()) mqttTransmissionVerdict {
 	deadline := time.Now().Add(mqttPhaseGateWaitFor(cc))
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
@@ -379,6 +387,11 @@ func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerd
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return mqttTransmissionTimedOut
+		}
+		if beforeWait != nil {
+			beforeWait()
+			beforeWait = nil
+			continue
 		}
 		if !timer.Stop() {
 			select {

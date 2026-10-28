@@ -495,7 +495,12 @@ func TestMQTTInflightUnprovenSourceAckSendsNoSecondPublish(t *testing.T) {
 func TestMQTTInflightRetiredSourceSurvivesRestart(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = time.Second
+	// Long enough that JetStream does not redeliver the source between PUBREC and the register
+	// read below even under suite load: a redelivery in that window reaches the retired-source
+	// settlement, which acknowledges it WITH confirmation and releases the register — correct,
+	// and the end of the state this test stages before the restart. 3 s still lost that race
+	// under a memory-starved -race shard.
+	o.MQTT.AckWait = 10 * time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

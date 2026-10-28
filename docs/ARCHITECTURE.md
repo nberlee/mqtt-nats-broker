@@ -10115,7 +10115,9 @@ single ownership read:
 | consumer unusable or with a threshold | 5 / 4 |
 
 No class reads more than it did, and a QoS 2 admission whose source dependency refuses reads
-nothing of the PUBREL dependency. A refused admission is re-offered on AckWait, so a persistent
+nothing of the PUBREL dependency. A batched admission ("A subscription's fresh deliveries
+are admitted in batches") pays these rows once per QoS present in the batch, not per
+delivery. A refused admission is re-offered on AckWait, so a persistent
 misconfiguration pays its row on every re-offer, as it always did. `TestReadinessRefusalCosts`
 pins each row. Issuing these reads in rounds, and the composition reads of `opAdmitPublish`,
 `opAcquireAction` and `opAdvanceExchangeAck` likewise, was measured and not adopted
@@ -10124,10 +10126,12 @@ serial and stop at its refusal.
 
 ### An admission defeated only by contention keeps the subscription's order
 
-A subscription's deliveries are admitted one at a time, on one delivery callback, in the
-order JetStream offers them, and that serial callback is the whole of what keeps a
-non-shared subscription's same-topic messages in publish order (MQTT-4.6.0-6). An
-admission that gives up abandons its offer, and JetStream's re-offer queues behind
+A subscription's offers are processed on one dispatch goroutine, in the order JetStream
+offers them, and that serial dispatch is the whole of what keeps a non-shared subscription's
+same-topic messages in publish order (MQTT-4.6.0-6). Since 2026-10-28 one callback may process
+several of them and admit their fresh deliveries in one batch (next section); they are
+still processed, admitted and sent in offer order. An admission that gives up abandons its
+offer, and JetStream's re-offer queues behind
 everything already pushed to the subscription, so the message reaches the client after
 messages published later. Every admission and (before 2026-10-27) every acknowledgement
 of a session CASed its one authority record, so under a backlog an admission could lose all
@@ -10138,27 +10142,131 @@ writes no authority record") nor the source resource (its holds are release-owed
 so an ordinary QoS 1 admission no longer loses to the previous delivery's answer; the
 extension below still covers every contention that remains.
 
-So the delivery entrance (`admitThroughAuthority`, ordinary and shared) extends the
-shared ladder past its budget (`runInflightAdmission`'s extension,
-`outbound_admission_contention.go`) while every attempt so far has failed POSITIVELY on
-a stale expectation: the boundary's own stale-sequence refusals that an admission
-reaches (the authority predecessor, a resource, an exchange, a name ownership, the
-identifier walk's ledger fence), which wrap `errMQTTStaleExpectation`, or the store's
-expected-last-sequence CAS rejection (`mqttIsStaleExpectation`). The ladder's
-`contended` flag is not the test: it also covers boundary refusals and transport
-failures. Each extension attempt is an ordinary one — the same allocation, custody
-reservation and attempt settlement, the same spacing before its fresh reads — and its
-write compares the standing authority with the entitlement the connection was accepted
-under, so a moved tenure refuses and ends the extension. It ends too on any other
-failure, on the incarnation's closing signal, and when the connection closes or stops
-being the session's (`connectionServes`, checked before every further attempt); the
-ladder then abandons the offer exactly as before. No other entrance's budget changes.
+So the delivery entrance (`admitThroughAuthority`, ordinary and shared, and the batched
+admission's attempts, `attemptAdmissionBatch`) extends the shared ladder past its budget
+(`runInflightAdmission`'s extension, `outbound_admission_contention.go`) while every
+attempt so far has failed POSITIVELY on a stale expectation: the boundary's own
+stale-sequence refusals that an admission reaches (the authority predecessor, a resource,
+an exchange, a name ownership, the identifier walk's ledger fence), which wrap
+`errMQTTStaleExpectation`, or the store's expected-last-sequence CAS rejection
+(`mqttIsStaleExpectation`). The ladder's `contended` flag is not the test: it also covers
+boundary refusals and transport failures. Each extension attempt is an ordinary one — the
+same allocation, custody reservation and attempt settlement, the same spacing before its
+fresh reads — and its write compares the standing authority with the entitlement the
+connection was accepted under, so a moved tenure refuses and ends the extension. It ends
+too on any other failure, on the incarnation's closing signal, and when the connection
+closes or stops being the session's (`connectionServes`, checked before every further
+attempt); the ladder then abandons the offer exactly as before. No other entrance's budget
+changes. A batch defeated only by stale expectations keeps the whole batch's place the
+same way: it is re-attempted with the same deliveries while every slot still reads empty.
 
 It is bounded by the connection's life, not by time: a periodic give-up while the
 connection lives would reorder exactly as before. A subscription can therefore stall for
 as long as its admissions keep losing, and the session's background authority writers
 stay yielded meanwhile (`docs/CONFORMANCE.md`). Making the losses rarer is the
 delivery-protocol redesign's business, not this extension's.
+
+### A subscription's fresh deliveries are admitted in batches
+
+Admission was most of a delivery's cost (28 of 42 ms per QoS 1 delivery on the 2026-10-27
+tree), and nothing it reads differs between two deliveries of one subscription: the
+connection's entitlement, the readiness of the source and PUBREL consumers, the authority,
+the generation's ledger and the source resource. So a subscription's fresh deliveries are
+admitted several per atomic batch (`outbound_delivery_batch.go`,
+`outbound_admission_batch.go`).
+
+**The carrier is unchanged.** nats.go dispatches a subscription's messages on one
+goroutine and reports how many it holds for it (`Subscription.Pending`, which counts the
+message whose callback is running until the callback returns). An offer of a non-shared
+QoS 1/2 subscription with another offer already queued behind it is HELD: nothing is read,
+allocated, acknowledged or recorded for it, and it keeps its own header length, because
+the per-subscription delivery client's is overwritten for every message. Up to
+`mqttAdmissionBatchMax` (16) offers are taken this way; the callback that finds nothing
+more queued, or the bound reached, processes every held offer and then its own, in arrival
+order. An offer is never held when nothing is queued behind it, so a delivery at rest is
+processed by the callback that received it: there is no intentional coalescing delay. A
+re-offer of an offer still held is dropped and the held one keeps its position. A held
+offer is an unacknowledged JetStream delivery exactly like those still queued in nats.go:
+if the subscription stops (unsubscribe, a re-SUBSCRIBE replacing it, the connection
+closing) neither is processed and AckWait re-offers both. Shared subscriptions never hold.
+
+**Only fresh ordinary deliveries are collected.** Each offer runs the whole delivery body
+(`mqttDeliverQoS12Offer`), every guard at processing time. A fresh, non-shared, not
+drain-claimed delivery is allocated and joins the collector; its Message Expiry is judged
+once, at the flush, against the original properties, and an expired one is disposed of at
+its own position, after the live deliveries collected ahead of it are admitted and sent.
+Every other offer ends the batch: the body's locked decision region has exactly one exit
+that releases the session lock without flushing the collector (the collect exit;
+`TestDeliveryOfferHasOneUnflushedExit` pins it), every other exit releases it through
+`unlockAndFlush`, the acknowledgement of a declined re-offer is submitted after that
+flush, the transmission gate flushes at the point it decides to wait and on every non-Open
+verdict, and the phase gate flushes before it waits. So before a later offer's callback
+submits client output, a source acknowledgement or NAK, performs a synchronous JetStream
+request or enters a wait, the deliveries collected ahead of it are admitted and sent.
+Locked bookkeeping may still schedule the existing workers (the disposal worker from
+`offerDisposalLocked`, the custody dispatcher from `trackPublish`), whose execution is not
+ordered after the flush, exactly as they already run beside a delivery's admission between
+two callbacks. They cannot invalidate a collected delivery unnoticed, because its safety
+rests on re-validation and durable arbitration rather than on the schedule: it keeps its
+scheduling-projection charge while collected, `openAdmissionCustodyLocked` checks its
+allocation nonce, readiness and the resource CAS arbitrate it against disposal,
+`stillOurs` and the entitlement comparison fence its write, and `beginSendLocked`, the
+acquisition and the authorized frame fence its send.
+
+**The batch.** A flush holding one live delivery admits it through the single route
+(`admitInflightPublish`), unchanged. For more, `admitInflightPublishBatch` opens every
+delivery's custody reservation in one critical section, captures the connection's
+entitlement once, gates the dependencies once per QoS present (the per-delivery readiness
+of "Admission readiness reads the name ownership once" is now per batch), runs the
+ladder's preamble for each delivery, and submits `opAdmitPublishes`: one authority read
+compared with the entitlement, one read per distinct resource, one ledger read, and
+`mqttAdmitPublishesTransition`, of which the single admission's composer is the one-entry
+case: every delivery's register, unsent marker and exchange, ONE member per resource
+carrying every edge the batch adds, ONE ledger member allocating every delivery's exchange
+duty, one authority revision. The boundary already judges every created exchange, register
+pair, duty and claimed identifier per member; the only rule that assumed one admission per
+batch was the resource step's one added edge.
+
+**Settlement before anything else.** Every participant records the batch's one handle on
+its own reservation. The handle is resolved once (abort create-only over an unresolved
+slot, resolve again) and the verdict applied to every participant together: LANDED or
+SUPERSEDED (the batch committed and a later authority revision stands) charges every
+exchange and proceeds; NEVER LANDED drops the attempt from every reservation; UNRESOLVED
+concludes nothing, so nothing is retried or split and every participant is abandoned as
+the ladder abandons on exhaustion, each keeping the continuity record its unsettled
+attempt owes. Only then: a landed batch reads each register back by nonce (the commit
+acknowledgement names the authority member) and settles it as the ladder does; a delivery
+whose read-back fails takes the single ladder under the reservation the batch opened,
+whose classifier adopts its standing register. A never-landed batch refused positively
+stale reads each register subject: all empty, it is re-attempted whole under the budget
+and the contention extension; one occupied, it splits there, the deliveries before it
+admitted first as a batch, the occupant through the single ladder (whose classifier
+decides the slot), the rest after it. Any other refusal hands the first delivery to the
+single ladder and re-attempts the rest. Deliveries are sent after admission, each send
+section (acquisition, intent, write, its deferred end and the shutdown barrier) complete
+before the next begins, in offer order.
+
+**What it arbitrates** is what one admission arbitrates, by the same records: the authority
+CAS and the entitlement comparison serving right, the create-only registers, the
+created-exchange rule and the identifier walk at the ledger's own CAS sequence identifier
+ownership, the resource CAS dependency ownership against disposal, and the per-delivery action
+acquisition emission. It makes no source exclusive to one broker; that is unchanged.
+
+**What it does not batch**: shared subscriptions (an acquisition dependency per delivery,
+the QoS 2 move), drain-claimed deliveries, retained replay, retransmissions, every
+replacement (decided by the single ladder after a failed create), and the acquisition,
+which stays one authority transition per delivery. A capacity withholding keeps its
+disposal and its stated ordering residual (`docs/CONFORMANCE.md`).
+
+**Measured** (`make bench-outbound`, three interleaved runs each against 6548ed9, median
+ratio): QoS 1 burst of 500 from 25.4 to 38.8 msg/s standalone (1.53x) and from 35.8 to 66.5
+on R3 (1.86x); QoS 2 1.43x / 1.75x; four subscribers 1.48x / 1.47x; at rest 1.41x / 1.56x;
+requests per delivery 115 to 80. Admission fell from 28.4 to 5.8 ms per delivery. What
+remains is the per-delivery acquisition and completion commits: on the pinned server an
+atomic batch costs about 6 ms however few members it carries (a plain store write 0.36 ms),
+and acquisitions sent back to back now overlap the client's completions, which raised the
+acquisition write from 6.4 to 9.7 ms standalone. Record: `docs/findings/nats-platform.md`,
+"Batched admission (2026-10-28)".
 
 ### The PUBREL consumer's name is claimed under contention
 
@@ -11331,7 +11439,13 @@ the list no longer holds. For the source-replay and canonical-PUBREL roles the r
 the very batch that ENDS the obligation (F-105 7c-lc), so it is never a later act and never
 beside an authorization. A retained-material edge is released once its exchange can no
 longer replay - ended, carrying the retained abandonment fact, or its generation closed
-with Discard - as `mqttCheckResourceStep` checks.
+with Discard - as `mqttCheckResourceStep` checks. Several admissions of one batch ("A
+subscription's fresh deliveries are admitted in batches") add their edges to a resource in
+ONE member, because two members on one subject would carry two expectations of which only
+the first can hold; so one act may add several edges, but only HOLD edges of a name-owned
+consumer, each judged exactly as a single one is (its exchange created by the batch, the
+resource not disposed, the name LIVE and owned). Every other role and resource kind keeps
+the one-edge rule, and an act releasing a non-hold edge still changes nothing else.
 
 An empty list is written as `[]` and never `null`: a null decodes to a nil slice that reads
 identically to an empty one, and "this record says nothing about its dependents" would become

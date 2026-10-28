@@ -1033,8 +1033,10 @@ var pendingStructureEscapes = map[string]int{
 	"intendPubRelSlot|ARG intendPubRelSlotOnly":                         1,
 	"intendPubRelSlot|ARG resolvePubRelIntent":                          4,
 	"mqttAckSnapshot|RETURN":                                            1,
-	"mqttDeliverMsgCbQoS12|ARG finalizeDrainSource":                     2,
-	"mqttDeliverMsgCbQoS12|ARG provenUnsentReleasableLocked":            1,
+	"mqttDeliverQoS12Offer|ARG finalizeDrainSource":                     1, // a retransmission's expiry drop (a collected delivery's is the flush's)
+	"mqttDeliverQoS12Offer|ARG provenUnsentReleasableLocked":            1,
+	"flush|ARG finalizeDrainSource":                                     1, // a collected delivery's expiry drop, judged at its flush
+	"sendAdmittedPublish|ARG finalizeDrainSource":                       1, // the oversize disposal of a proven-unsent delivery
 	"mqttDeliverQ2AffineCb|ARG provenUnsentReleasableLocked":            1,
 	"mqttExpectCaptured|ARG mqttExpectExactly":                          1,
 	"mqttExpectExactly|INLIT":                                           1,

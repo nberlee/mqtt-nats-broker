@@ -1354,3 +1354,182 @@ claimed its replacement consumer's name in ONE attempt and that attempt lost the
 CAS ("wrong last sequence") to concurrent authority writes. The claim now re-attempts on a
 positively stale expectation like the PUBREL name claim; the witness
 `TestMQTTReconcileRepairClaimSurvivesContention` fails when the claim gets one attempt.
+
+## Batched admission (2026-10-28)
+
+The section 2 roadmap item "Admit several deliveries per subscription in one batch" is recorded
+here. It stays OPEN: its acceptance gate is missed on both rigs (below). Scope from three
+consults (the item's lane): admission batched, the action acquisition kept per delivery, phases
+serialized per subscription, no intentional coalescing delay; acceptance twice the QoS 1 burst
+rate of a same-day baseline by the ratio of three-run medians, standalone and R3 separately.
+
+### Where the time went before the change
+
+Timing probes in the QoS 1/2 delivery callback on 6548ed9 (one run each rig, means per
+delivery):
+
+| Case | Rate standalone / R3 | callback | admission | acquisition | intent | write |
+|---|---|---|---|---|---|---|
+| QoS 1, 500 | 25.9 / 22.9 msg/s | 41.8 ms | 28.4 ms | 10.2 ms | 0.8 ms | 0.1 ms |
+| QoS 2, 200 | 14.1 / 22.1 msg/s | 62.1 ms | 46.9 ms | 11.7 ms | 1.0 ms | 0.1 ms |
+
+### What changed
+
+docs/ARCHITECTURE.md, "A subscription's fresh deliveries are admitted in batches": an
+offer with another already queued behind it is held (up to 16), the callback that finds
+nothing more queued processes them all in order, and their fresh ordinary deliveries are
+admitted in one atomic batch with one authority revision, one member per resource and one
+ledger member, settled once for every participant.
+
+### Measured
+
+`make bench-outbound`, the base tree (6548ed9) and the change interleaved, three runs each,
+msg/s:
+
+| Case | Rig | Base | Change | Median ratio |
+|---|---|---|---|---|
+| QoS 1, one subscriber, 500 | standalone | 25.9, 25.4, 25.1 | 38.8, 41.8, 38.4 | 1.53 |
+| QoS 1, one subscriber, 500 | R3 | 34.8, 35.8, 46.4 | 103.5, 63.8, 66.5 | 1.86 |
+| QoS 2, one subscriber, 200 | standalone | 14.4, 14.8, 14.1 | 19.3, 23.8, 20.6 | 1.43 |
+| QoS 2, one subscriber, 200 | R3 | 20.8, 21.3, 28.0 | 37.7, 36.9, 37.2 | 1.75 |
+| QoS 1, four subscribers, 200 each | standalone | 42.4, 41.9, 42.0 | 62.3, 61.4, 62.7 | 1.48 |
+| QoS 1, four subscribers, 200 each | R3 | 124.3, 142.3, 148.4 | 187.9, 209.8, 222.9 | 1.47 |
+| QoS 1, 20 at rest after 300 | standalone | 26.0, 25.4, 28.2 | 36.6, 32.0, 37.8 | 1.41 |
+| QoS 1, 20 at rest after 300 | R3 | 35.6, 36.9, 26.2 | 55.4, 49.7, 70.9 | 1.56 |
+
+Every row held its oracle (all delivered, first deliveries in publish order, every QoS 2
+exchange completed, every consumer settled, nothing delivered twice). Requests per
+delivery on the QoS 1 burst: 115-118 to 80-83 standalone, 101-108 to 69-73 on R3. Batch
+bound, single runs of the QoS 1 burst (not acceptance figures): 8 gave 36.9 / 59.6, 32
+gave 40.0 / 99.2; 16 is kept, the gain of 32 being within the run-to-run spread.
+
+### Why the gate is missed
+
+With batches of about 15, admission costs 5.8 ms per delivery (92.8 ms per batch) against
+28.4. The send section rose from 11 to 19.9 ms, nearly all of it the acquisition (16.5 ms,
+from 10.2). A commit-phase probe (boundary checks against the atomic batch write, mean per
+commit, standalone):
+
+| Kind | Before: checks / write | After: checks / write |
+|---|---|---|
+| acquire-action | 2.73 / 6.42 ms | 3.02 / 9.68 ms |
+| advance-exchange (completion) | 3.30 / 8.26 ms | 3.62 / 9.41 ms |
+| admit-exchange | 7.28 / 7.84 ms per delivery | 34.07 / 8.60 ms per batch |
+| release-holds | 12.84 / 9.28 ms | 20.30 / 10.35 ms |
+
+And a store probe on the same rig (200 writes each on `$MQTT_inflight`): a plain store
+write 0.36 ms mean (p50 0.33), an atomic batch of two 6.40 ms (p50 5.55, p90 9.41), of
+eight 6.16 ms (p50 5.27, p90 9.71). On the pinned server (v2.15.2, file storage, R1) an
+atomic batch costs about 6 ms however few members it carries. Each delivery still makes
+two of them, its acquisition and its completion, and acquisitions sent back to back now
+overlap the client's completions on the one stream, which raised the acquisition write by
+about 3 ms. Disabling the floor in a probe cut requests per delivery from 82 to 51 and
+changed neither the rate nor the acquisition time. A model consistent with these figures
+puts the standalone rate near 50 msg/s while those two commits remain; it is a model, not
+a proven ceiling.
+
+The remaining work is batching the acquisition (several send sections open at once), which
+consult 1 kept separate as a transmission-lifecycle audit. The atomic-batch latency is a
+candidate upstream performance report: plain 0.36 ms against 6.2-6.4 ms for an atomic batch
+of any size, standalone, file storage, reproducible with a 200-iteration loop of
+`newAtomicBatchRequest` beside `storeMsg` on one stream.
+
+### Tests and mutations
+
+`outbound_admission_batch_test.go` holds the item's tests: the resource step's
+several-hold rule and its refusals, a backlog admitted in committed multi-delivery batches
+in order, no hold at rest, the hold bound, held offers dying with their connection, a lost
+response settled once (two custody checkpoints), a superseded receipt landing, a
+never-landed batch settled before its retry, a contended batch extended whole past the
+budget, a takeover before the batch's commit, an occupied slot splitting the batch in
+order, a failed read-back taking the single ladder, an unresolved outcome abandoning every
+participant, held offers keeping their own headers, a shared subscription never holding, a
+retransmission following the collected deliveries, Message Expiry judged once at the flush
+(expired and still live), the flush before a gate wait, an immediate Withheld verdict and
+a declined re-offer's acknowledgement, and the census that the delivery body has one
+unflushed exit.
+
+Mutations, each run and each failing its paired test: 26 (no flush before a non-batch
+send; the hold bound ignored; held header lengths not restored; a batch settled without
+resolving its handle; only the first added edge judged; the suffix admitted before the
+split delivery; a contended batch abandoned at its budget; holding at a pending count of
+one; the settlement skipping a participant; one resource member per edge; Superseded not
+charged; the mixing rule on one added edge; expiry not judged at the flush; expiry reduced
+twice; an expired delivery disposed of before the live ones ahead of it; the batch
+operation without its entitlement comparison; the identifier walk given only the batch's
+first identifier; a non-stale refusal retried whole; a plain unlock on a non-collect exit;
+a plain unlock on the drain's exit; no flush before a gate wait; a declined re-offer
+acknowledged before the flush; no flush on an immediate Withheld; a never-landed verdict
+not applied to the reservations; the batch's reservations never finished; every
+participant given the first participant's dependencies). Two survived their
+first pairing and were re-paired: the declined re-offer test reached the terminal-source
+arm, not the decline, and was reworked so the re-offer really is declined; the identifier
+walk's mutation survived the two-broker test, whose displaced batch is refused at the
+entitlement before the walk runs, and is killed by a store-level batch claiming, as its
+second participant, an identifier a standing obligation holds.
+
+Written after holistic review round 1: the two-broker races (a displaced broker's batch
+paused before its authority read while the client resumes on the peer, which is then
+offered the same sources and allocates its own identifiers, and a displaced broker's batch
+paused after its commit and before its sends), the non-stale refusal handing its head to
+the single ladder, a drain standing when a later offer is processed, and an expired
+delivery behind live ones in one flush (whose disposal had run before the live ones were
+sent; fixed). After round 2: two subscriptions of one session whose first batches are held
+at the store until both arrive, so they race on the authority and ledger under one
+entitlement (the loser settled before it is attempted again, every message once and in
+order, no reservation or charge left); Receive Maximum 2 over a backlog of five; and a
+committed batch mixing QoS 1 and QoS 2 deliveries, each holding the source consumer and
+only the QoS 2 ones the PUBREL consumer, every exchange completed. Two batches claiming
+overlapping identifiers while both pass the entitlement comparison cannot be staged:
+identifiers come from one session's allocator, and a tenure belongs to exactly one
+accepted connection, which `opAdmitPublishes` compares before anything is composed; the
+identifier walk's own rule is tested against a standing obligation instead. Not written,
+covered structurally by the census and the flushing-exit rule: a deny release, a retired
+source, an uncertain terminal source and a phase-gate wait behind a collected delivery.
+
+Found along the way, pre-existing and fixed:
+`TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased` failed 2 of 8 runs on
+6548ed9 and 10 of 10 under `-v`. Its strand needs the source live at recovery and gone at
+the reap with no offer in between, but the resume installs interest before its CONNACK and
+JetStream redelivered the long-unacknowledged source at once, so the redelivery opened a
+send section and the reap rightly reserved the entry. The fixture now refuses that
+redelivery before tracking for the staged resume (6 of 6 under `-v`); no broker change.
+`TestMQTTInflightRetiredSourceSurvivesRestart` failed twice in `-race` shards and never in
+isolation: it stages a retired source between PUBREC and a register read, and with a 1 s
+AckWait a suite stall let JetStream redeliver the source in that window, which the
+retired-source settlement acknowledges with confirmation and so releases the register
+(correct behavior, the end of the staged state). Delaying the read past AckWait
+reproduces it every time. Its AckWait is 10 s; 3 s still lost the race once under a
+memory-starved shard. No broker change.
+
+Interleaved runs of shard 3's test list on 6548ed9 and on the change (three each, -race,
+the pod's memory) showed four more load-sensitive tests failing on both trees, each fixed
+in its fixture and none needing a broker change: `TestV5SharedSubscription`'s 10 s window
+was a throughput bound (a probe showed every offer arriving once, about a second apart,
+the last ones after the window; now 60 s); `TestMQTTDrainLevelUpCoversBothConsumers` read
+two PUBLISHes expecting one per consumer while its 250 ms AckWait could bring one
+consumer's retransmission first (it now reads until each consumer's first delivery,
+accepting only a same-identifier DUP retransmission in between);
+`TestMQTTReconcileStreamForcedThresholdRefusesAdmission` drained its captured warnings
+without waiting for the admission to log (it now waits for the first refusal); and
+`TestF105RetainedAbandonedArrowRefusedAfterDiscard` asserted the first attempt of an
+advance whose window the retained copy's background reclamation can move (it now
+re-attempts from fresh reads on a stale refusal, as production does). One more failed only
+on the change: `TestF105RetainedAbandonPassesToATakeover` (3 of 10 against 0-1 of 10),
+because its rig resumed while the server still held its first connection, the resume took
+that connection over and marked the client ID a flapper, and the test's own takeover was
+then refused; the batched path's slower close made that race likelier. The rig now waits
+for the session to release the first connection (20 of 20). Reading these also showed a
+lone collected delivery paying readiness twice (the batch's, then the single ladder's); a
+flush of one now takes the single route.
+
+The final chain on the reviewed tree then failed two more, once each.
+`TestWillUnconditionalWriteRefiresAPublishedWill` counted every fact read on the account,
+so the claim loop's own 50 ms pass could land in its window (1 of 10 on the change, 0 of
+10 on 6548ed9); it now pins the loop as its siblings do (20 of 20).
+`TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome` found one Receive Maximum charge
+left after a recovery release, in one of three runs of its shard and in none of 20
+isolated runs on either tree; it is a recovery path this change does not touch. Not
+reproduced, so not fixed: its assertion now reports the custody ledger's exchanges,
+admissions and uncertain subjects, so a recurrence names the holder (a read that timed out
+under the pod's memory pressure would be held as an uncertain subject, by design).

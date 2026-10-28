@@ -316,7 +316,8 @@ var censusInterpreters = map[string]string{
 	// ---- delivery callbacks ---------------------------------------------------
 	// The callback OCCURRENCE is itself an observation, which is how delivery and
 	// timer-driven redelivery enter this census without being classes of their own.
-	"mqttDeliverMsgCbQoS12":   "a QoS 1/2 delivery: the callback's occurrence, its delivery count, its ack subject and its headers are all interpreted, and the register store between confirmation and enqueue is the window F-034 audited",
+	"mqttDeliverQoS12Offer":   "a QoS 1/2 delivery: the offer's occurrence, its delivery count, its ack subject and its headers are all interpreted, and the register store between confirmation and enqueue is the window F-034 audited; a held offer is interpreted when its body runs, never when it is held (mqttDeliverMsgCbQoS12)",
+	"attemptAdmissionBatch":   "a batch of fresh deliveries' admission: after a positively stale refusal it reads each participant's register subject, and only a SETTLED absence counts as empty; an unreadable or present subject splits the batch there and leaves the slot to the single ladder's classifier",
 	"mqttDeliverPubRelCb":     "a stored PUBREL replayed under its ORIGINAL identifier; the record's presence is what owns the identifier past PUBREC",
 	"mqttDeliverQ2AffineCb":   "an affine copy delivery; the gate fails CLOSED on an absent claim and disposes a copy whose live claim names a different incarnation",
 	"mqttIssuePublication":    "issues an inbound QoS 1/2 PUBLISH (or a Will, or a release's onward delivery): waits on the subs barrier so a racing publish is not dropped by interest retention, and submits nothing once the connection's abort latch fired",

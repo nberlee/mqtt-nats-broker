@@ -570,26 +570,11 @@ type mqttAdmitDependency struct {
 // opAdmitPublish admits one outbound PUBLISH: the register and its unsent marker, the durable
 // exchange, an edge on each backing resource, and the authority's own revision, in ONE batch.
 func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, error) {
-	if r == nil || r.Register == nil {
+	if r == nil {
 		return mqttOpOutcome{}, fmt.Errorf("admitting a publish requires its register")
 	}
-	// THE REGISTER IS AT ITS PUBLISH TOO. The exchange this derives is at the beginning of
-	// its protocol, so a register in any other state would pair an obligation that has not
-	// started with a slot that has — and the operation would derive the contradiction rather
-	// than refuse it.
-	if r.Register.State != mqttInflightPublish {
-		return mqttOpOutcome{}, fmt.Errorf("admitting a publish for %q requires a register at "+
-			"its publish, not one in state %q", r.ID, r.Register.State)
-	}
-	// A CREATE STARTS A FRESH OBLIGATION, so its register's lineage is its own nonce
-	// (mqttLineageForWrite). The caller's Lin is what custody charges for this attempt and what
-	// the exchange below is named by; a register naming another lineage would be charged as one
-	// obligation while it claims another, and nothing else on this route states the rule — a
-	// create-only collision with a still-standing exchange would refuse it only by accident.
-	if lin, _ := mqttLineageForWrite(mqttLineageWriteCreate, nil, r.Register.Nonce); r.Register.Lin != lin {
-		return mqttOpOutcome{}, fmt.Errorf("admitting a publish for %q: its register carries lineage %q, "+
-			"but a create admits a FRESH obligation whose lineage is its own nonce %q, so the lineage "+
-			"custody charges would not be the lineage the batch writes", r.ID, r.Register.Lin, lin)
+	if err := mqttCheckAdmitRegister(r.ID, r.Register); err != nil {
+		return mqttOpOutcome{}, err
 	}
 	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
 	if err != nil {
@@ -633,6 +618,129 @@ func (jsa *mqttJSA) opAdmitPublish(r *mqttAdmitPublishRequest) (mqttOpOutcome, e
 		Deps:     deps,
 		Ledger:   led, LedgerSeq: ledSeq,
 	})
+	if terr != nil {
+		return mqttOpOutcome{}, terr
+	}
+	return jsa.commitOp(tr)
+}
+
+// mqttCheckAdmitRegister states what a CREATE's register must be before anything is read for it.
+func mqttCheckAdmitRegister(id string, reg *mqttInflightRecord) error {
+	if reg == nil {
+		return fmt.Errorf("admitting a publish requires its register")
+	}
+	// THE REGISTER IS AT ITS PUBLISH TOO. The exchange this derives is at the beginning of
+	// its protocol, so a register in any other state would pair an obligation that has not
+	// started with a slot that has — and the operation would derive the contradiction rather
+	// than refuse it.
+	if reg.State != mqttInflightPublish {
+		return fmt.Errorf("admitting a publish for %q requires a register at "+
+			"its publish, not one in state %q", id, reg.State)
+	}
+	// A CREATE STARTS A FRESH OBLIGATION, so its register's lineage is its own nonce
+	// (mqttLineageForWrite). The caller's Lin is what custody charges for this attempt and what
+	// the exchange below is named by; a register naming another lineage would be charged as one
+	// obligation while it claims another, and nothing else on this route states the rule — a
+	// create-only collision with a still-standing exchange would refuse it only by accident.
+	if lin, _ := mqttLineageForWrite(mqttLineageWriteCreate, nil, reg.Nonce); reg.Lin != lin {
+		return fmt.Errorf("admitting a publish for %q: its register carries lineage %q, "+
+			"but a create admits a FRESH obligation whose lineage is its own nonce %q, so the lineage "+
+			"custody charges would not be the lineage the batch writes", id, reg.Lin, lin)
+	}
+	return nil
+}
+
+// mqttAdmitPublishesRequest names several ordinary (non-shared) creates of one subscription, to be
+// admitted in ONE batch under one authority revision. Each entry is what an mqttAdmitPublishRequest
+// would carry for it; the identities of the transition and the captured entitlement are shared.
+type mqttAdmitPublishesRequest struct {
+	ID, Epoch, Txn, Op string
+	// Gen and Tenure are the entitlement the caller captured, compared with the standing
+	// authority rather than adopted from it, exactly as for one admission.
+	Gen, Tenure string
+	Entries     []mqttAdmitPublishesEntry
+}
+
+// mqttAdmitPublishesEntry is one create of a batched admission.
+type mqttAdmitPublishesEntry struct {
+	Register *mqttInflightRecord
+	Deps     []mqttAdmitDependency
+}
+
+// mqttTestAdmitBatchBeforeAuthorityHook runs inside opAdmitPublishes after every check that reads
+// nothing and immediately before the standing authority is read. Nil in production.
+var mqttTestAdmitBatchBeforeAuthorityHook = new(mqttKnob[func(r *mqttAdmitPublishesRequest)])
+
+// opAdmitPublishes admits several ordinary creates in one batch: one authority read compared with
+// the captured entitlement, one read per distinct resource, one ledger read, and the batch composed
+// by the one admission composer (mqttAdmitPublishesTransition). A shared source is refused: its
+// dependency is an acquisition checked per delivery (opAdmitPublish).
+func (jsa *mqttJSA) opAdmitPublishes(r *mqttAdmitPublishesRequest) (mqttOpOutcome, error) {
+	if r == nil || len(r.Entries) == 0 {
+		return mqttOpOutcome{}, fmt.Errorf("admitting publishes requires at least one register")
+	}
+	for _, e := range r.Entries {
+		if err := mqttCheckAdmitRegister(r.ID, e.Register); err != nil {
+			return mqttOpOutcome{}, err
+		}
+		if mqttIsSharedDurable(e.Register.Dur) {
+			return mqttOpOutcome{}, fmt.Errorf("admitting publishes for %q: shared delivery %s/%d is "+
+				"admitted one at a time, against its acquisition", r.ID, e.Register.Dur, e.Register.Seq)
+		}
+	}
+	if h := mqttTestAdmitBatchBeforeAuthorityHook.Get(); h != nil {
+		h(r)
+	}
+	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
+	if err != nil {
+		return mqttOpOutcome{}, err
+	}
+	if auth.Gen != r.Gen || auth.Tenure != r.Tenure {
+		return mqttOpOutcome{}, fmt.Errorf("admitting publishes for %q under %q/%q: the standing authority "+
+			"carries %q/%q, so these deliveries were decided under an entitlement that has moved on",
+			r.ID, r.Gen, r.Tenure, auth.Gen, auth.Tenure)
+	}
+	// EACH DISTINCT RESOURCE IS READ ONCE, and every entry naming it takes its edge from that read:
+	// the composer folds them into one member at that sequence.
+	type readRes struct {
+		res *mqttOutboundResource
+		seq uint64
+	}
+	reads := make(map[string]readRes)
+	entries := make([]mqttPublishAdmissionEntry, 0, len(r.Entries))
+	idHash := getHash(r.ID)
+	for _, e := range r.Entries {
+		// THE EXCHANGE IS DERIVED FROM THE REGISTER, not supplied beside it, as for one admission.
+		x := &mqttOutboundExchange{
+			ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: e.Register.Lin,
+			PI: e.Register.PI, QoS: e.Register.QoS, Phase: mqttExchangePublish,
+			AdmitTxn: r.Txn, Tenure: auth.Tenure,
+		}
+		deps := make([]mqttResourceDependency, 0, len(e.Deps))
+		for _, d := range e.Deps {
+			rr, ok := reads[d.Inc]
+			if !ok {
+				res, seq, lerr := jsa.loadOutboundResource(r.ID, r.Epoch, auth.Gen, d.Inc)
+				if lerr != nil {
+					return mqttOpOutcome{}, lerr
+				}
+				rr = readRes{res: res, seq: seq}
+				reads[d.Inc] = rr
+			}
+			deps = append(deps, mqttResourceDependency{Resource: rr.res, Seq: rr.seq, Role: d.Role})
+		}
+		entries = append(entries, mqttPublishAdmissionEntry{
+			Exchange: x, Register: e.Register,
+			RegSubj: mqttInflightSubject(idHash, auth.Gen, e.Register.PI), Deps: deps,
+		})
+	}
+	led, ledSeq, lerr := jsa.loadGenLedger(r.ID, r.Epoch, auth.Gen)
+	if lerr != nil {
+		return mqttOpOutcome{}, lerr
+	}
+	tr, terr := mqttAdmitPublishesTransition(&mqttPublishAdmission{
+		Auth: auth, AuthSeq: authSeq, Txn: r.Txn, Op: r.Op, Ledger: led, LedgerSeq: ledSeq,
+	}, entries)
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}

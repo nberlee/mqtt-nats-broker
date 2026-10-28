@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -66,10 +67,28 @@ func testRetainedAbandonUpExpiring(t *testing.T, id string, qos byte, resumeExpi
 		t.Fatalf("the first retained send went out at QoS %d, want %d", gotQoS, qos)
 	}
 	rig.pi = pi
+	// THE FIRST CONNECTION IS GONE BEFORE THE RESUME. A resume that arrives while the server
+	// still holds it takes it over instead, which marks the client ID a flapper, and a later
+	// takeover in the test is then jailed rather than accepted.
+	asm := testMQTTGetAccountSessionManager(t, s, id+"-pub")
 	c.Close()
+	checkFor(t, 10*time.Second, 5*time.Millisecond, func() error {
+		asm.mu.RLock()
+		sess := asm.sessions[id]
+		asm.mu.RUnlock()
+		if sess == nil {
+			return fmt.Errorf("the session is not resident")
+		}
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if sess.c != nil {
+			return fmt.Errorf("the session still serves the first connection")
+		}
+		return nil
+	})
 
 	if len(beforeResume) > 0 {
-		rig.asm = testMQTTGetAccountSessionManager(t, s, id)
+		rig.asm = asm
 		rig.epoch = rig.asm.sessStreamEpoch
 		for _, f := range beforeResume {
 			f(rig)
@@ -534,47 +553,63 @@ func TestF105RetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 			if order == "discard-before-read" {
 				discard()
 			}
-			reg, smsg, err := rig.asm.loadInflightRecord(subject)
-			if err != nil || smsg == nil || reg == nil || reg.State != mqttInflightDeliveryAbandoned || reg.Nonce != reg0.Nonce {
-				t.Fatalf("the fixture does not reach the arrow: the abandoned register is %+v (%v)", reg, err)
-			}
-			x, xSeq, xerr := jsa.loadOutboundExchange(rig.id, rig.epoch, gen1, reg.Lin)
-			if xerr != nil || x == nil || x.Phase != mqttExchangeDeliveryAbandoned {
-				t.Fatalf("the fixture does not reach the arrow: the exchange is %+v (%v)", x, xerr)
-			}
-			prev, prevSeq, aerr := jsa.requireAuthority(rig.id, rig.epoch)
-			if aerr != nil || prev == nil {
-				t.Fatalf("no authority: %v", aerr)
-			}
-			txn := mqttNewInflightNonce()
-			req := &mqttAdvanceExchangeAckRequest{ID: rig.id, Epoch: rig.epoch, Txn: txn, Op: "op-" + txn, Gen: gen1,
-				Nonce: reg.Lin, To: mqttExchangePubRecObserved, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
-				RelID: mqttNewInflightNonce()}
-			tr, terr := mqttAdvanceExchangeAckTransition(prev, prevSeq, req, x, xSeq)
-			if terr != nil {
-				t.Fatalf("composing the late PUBREC advance: %v", terr)
-			}
 			want := "a discarded generation takes no new canonical PUBREL"
 			if order == "discard-in-presend" {
-				// The advance's boundary read sees no closure; the Discard lands before its batch.
-				var fired atomic.Bool
-				hook := func(at *mqttAuthorityTransition) {
-					if at.Attempt != nil && at.Attempt.Txn == txn && fired.CompareAndSwap(false, true) {
-						discard()
-					}
-				}
-				jsa.testTransitionPresend.Store(&hook)
-				defer jsa.testTransitionPresend.Store(nil)
 				want = _EMPTY_
 			}
-			_, cerr := jsa.commitAuthorityTransition(tr)
+			// THE ADVANCE IS RE-ATTEMPTED FROM FRESH READS while it is refused only as stale, as the
+			// production caller re-attempts it: the copy's reclamation after the abandonment is a
+			// background authority writer that can land between the advance's reads and its
+			// commit, and the refusal this test is about is the answer to an attempt composed
+			// over the authority as it stood.
+			var cerr error
+			var fired atomic.Bool
+			var lin string
+			for attempt := 0; attempt < 20; attempt++ {
+				reg, smsg, err := rig.asm.loadInflightRecord(subject)
+				if err != nil || smsg == nil || reg == nil || reg.State != mqttInflightDeliveryAbandoned || reg.Nonce != reg0.Nonce {
+					t.Fatalf("the fixture does not reach the arrow: the abandoned register is %+v (%v)", reg, err)
+				}
+				lin = reg.Lin
+				x, xSeq, xerr := jsa.loadOutboundExchange(rig.id, rig.epoch, gen1, reg.Lin)
+				if xerr != nil || x == nil || x.Phase != mqttExchangeDeliveryAbandoned {
+					t.Fatalf("the fixture does not reach the arrow: the exchange is %+v (%v)", x, xerr)
+				}
+				prev, prevSeq, aerr := jsa.requireAuthority(rig.id, rig.epoch)
+				if aerr != nil || prev == nil {
+					t.Fatalf("no authority: %v", aerr)
+				}
+				txn := mqttNewInflightNonce()
+				req := &mqttAdvanceExchangeAckRequest{ID: rig.id, Epoch: rig.epoch, Txn: txn, Op: "op-" + txn, Gen: gen1,
+					Nonce: reg.Lin, To: mqttExchangePubRecObserved, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
+					RelID: mqttNewInflightNonce()}
+				tr, terr := mqttAdvanceExchangeAckTransition(prev, prevSeq, req, x, xSeq)
+				if terr != nil {
+					t.Fatalf("composing the late PUBREC advance: %v", terr)
+				}
+				if order == "discard-in-presend" {
+					// The advance's boundary read sees no closure; the Discard lands before its batch.
+					hook := func(at *mqttAuthorityTransition) {
+						if at.Attempt != nil && at.Attempt.Txn == txn && fired.CompareAndSwap(false, true) {
+							discard()
+						}
+					}
+					jsa.testTransitionPresend.Store(&hook)
+				}
+				_, cerr = jsa.commitAuthorityTransition(tr)
+				jsa.testTransitionPresend.Store(nil)
+				if !mqttIsStaleExpectation(cerr) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
 			if cerr == nil || (want != _EMPTY_ && !strings.Contains(cerr.Error(), want)) {
 				t.Fatalf("the late PUBREC advance of a discarded generation was answered %v, want a refusal %q", cerr, want)
 			}
 			if clo, _, cst := jsa.loadGenClosure(rig.id, rig.epoch, gen1); cst != mqttOutboundValid || clo == nil || !clo.Discard {
 				t.Fatalf("the fixture's Discard did not land: %+v (status %v)", clo, cst)
 			}
-			if _, gone := jsa.loadLastMsgFor(mqttInflightStreamName, mqttRetainedRelSubject(rig.idHash, gen1, reg.Lin)); gone == nil {
+			if _, gone := jsa.loadLastMsgFor(mqttInflightStreamName, mqttRetainedRelSubject(rig.idHash, gen1, lin)); gone == nil {
 				t.Fatal("a canonical PUBREL was created in a discarded generation")
 			}
 		})

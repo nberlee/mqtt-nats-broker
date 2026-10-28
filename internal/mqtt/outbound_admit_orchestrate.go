@@ -94,6 +94,16 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 		return false
 	}
 	defer sess.finishAdmissionCustody(gen, nonce)
+	return sess.admitUnderReservation(c, gen, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, shared)
+}
+
+// admitUnderReservation is admitThroughAuthority's ladder, run under the custody reservation its
+// caller opened for (gen, nonce) and will finish: a delivery a batched admission hands back to the
+// single ladder keeps the reservation the batch opened, so its charge never drops in between.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16, qos byte, jsDur string, sseq uint64,
+	nonce, q2AffClaim, q2AffCopy string, shared *mqttAdmitShared) bool {
 	// A FOREGROUND AUTHORITY OPERATION for the whole ladder (outbound_foreground_priority.go): its
 	// bounded attempts are what a burst of background authority writes — the retained workers' and
 	// the F-112 floor unit's resolutions, advances and watermark updates — would otherwise exhaust,

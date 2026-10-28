@@ -2168,36 +2168,39 @@ remains an unconditional alpha blocker.**
 ### Outbound QoS 1/2 delivery rate per subscriber: a measured ceiling
 
 **Residual, stated with its measurement.** Stored QoS 1 and QoS 2 messages reach one
-subscriber at 10-30 messages per second, against several hundred for stock nats-server's
+subscriber at 20-70 messages per second, against several hundred for stock nats-server's
 MQTT listener on the same storage. The cost is the design's: each delivery is admitted
 through the outbound obligation authority (docs/ARCHITECTURE.md, "The outbound
 obligation authority"), which reads and writes through atomic batches re-checked at the
-write boundary (about 100 requests per delivery), one delivery at a time per subscription.
+write boundary. A subscription's fresh deliveries are admitted several per batch since
+2026-10-28 (docs/ARCHITECTURE.md, "A subscription's fresh deliveries are admitted in
+batches"), but every ordinary QoS 1 delivery still makes two atomic commits of its own, its
+action acquisition and its completion, and on the pinned nats-server an atomic batch costs
+about 6 ms however few members it carries (a plain store write about 0.36 ms), measured
+standalone on local disk.
 
-Measured with `make bench-outbound` on 2026-10-27 (one machine, embedded JetStream on
-local disk; the burst published and acknowledged before the subscribers read; every
-message delivered, first deliveries in publish order, every QoS 2 exchange completed and
-every consumer settled, in every row), against the same bench on 2026-10-26 (21eca60):
+Measured with `make bench-outbound` on 2026-10-28 (one machine, embedded JetStream on local
+disk; the burst published and acknowledged before the subscribers read; every message
+delivered, first deliveries in publish order, every QoS 2 exchange completed and every
+consumer settled, in every row; three interleaved runs of each tree, medians), against the
+tree before batched admission (6548ed9):
 
-| Case | Standalone | Three nodes, R3 | 2026-10-26 (standalone / R3) |
+| Case | Standalone | Three nodes, R3 | 6548ed9 (standalone / R3) |
 |---|---|---|---|
-| QoS 1, one subscriber, 500 | 17.6 msg/s (21-26 falling to 13 per 50) | 18.6 msg/s | 6.2 / 8.0 |
-| QoS 2, one subscriber, 200 | 10.3 msg/s | 13.6 msg/s | 5.5 / 7.4 |
-| QoS 1, four subscribers, 200 each | 43.0 msg/s in aggregate | 101.3 msg/s in aggregate | 30.6 / 45.4 |
-| QoS 1, one subscriber, 20 at rest after 300 | 20.9 msg/s | 29.3 msg/s | 11.0 / 12.8 |
+| QoS 1, one subscriber, 500 | 38.8 msg/s | 66.5 msg/s | 25.4 / 35.8 |
+| QoS 2, one subscriber, 200 | 20.6 msg/s | 37.2 msg/s | 14.4 / 21.3 |
+| QoS 1, four subscribers, 200 each | 62.3 msg/s in aggregate | 209.8 msg/s in aggregate | 42.0 / 142.3 |
+| QoS 1, one subscriber, 20 at rest after 300 | 36.6 msg/s | 55.4 msg/s | 26.0 / 35.6 |
 
-No row delivered a message twice. What changed (docs/ARCHITECTURE.md, "A completion writes
-no authority record", 7c-lc's release-owed holds, and the identifier walk's identity
-cache): an acknowledgement no longer writes the client's authority record nor the source
-consumer's resource record, so an ordinary QoS 1 admission no longer loses its first
-attempt to the previous delivery's answer (contention waits per 500-message burst: 498 ->
-13), and an admission no longer reads every duty of its generation's unreclaimed span. A
-QoS 2 delivery still loses about two attempts per delivery: its PUBREL acquisition CASes
-the authority record the next admission also CASes. The rate still falls through a burst
-(each admission reads the positions the burst added that its walk has not seen, and the
-exchange of every duty naming its identifier). Raising it further needs concurrent
-admission per subscriber (the next roadmap item, which changes the ordering carrier), not
-a tuning.
+No row delivered a message twice. The roadmap item's acceptance (twice the QoS 1 burst rate
+on each rig) is not met (1.53x standalone, 1.86x R3), and the item stays open: per QoS 1
+delivery, admission now costs about 6 ms where it cost 28, and the acquisition and
+completion commits remain, the acquisition's slower (about 10 ms against 6) because
+acquisitions sent back to back now overlap the client's completions on the one stream. A
+QoS 2 delivery additionally loses about two attempts per delivery: its PUBREL acquisition
+CASes the authority record the next admission also CASes. Raising the rate further needs the
+acquisition batched too, which changes the transmission lifecycle (the open part of the
+roadmap item), not a tuning.
 
 **The identifier walk no longer re-detects a corrupted duty it has validated before.**
 Identifier exclusivity caches each duty position's validated identity (kind, reference,

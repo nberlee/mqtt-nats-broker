@@ -120,6 +120,19 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 
 	// (2)+(3) The same-object resume, with the source message removed after recovery has
 	// classified it LIVE and before the reap looks.
+	//
+	// The resume installs the source's interest BEFORE its CONNACK, and the source's AckWait
+	// (500 ms) has long passed, so JetStream redelivers it the moment that interest exists —
+	// before the before-connack delete below. Admitted, that offer opens a send section on the
+	// entry, which the reap then rightly reads as possibly attempted and reserves: the state
+	// this step stages ("live at recovery, gone at the reap, never offered in between") would
+	// not exist. So the redelivery is refused before tracking for this resume; the strand is
+	// asserted and the seam removed before step (5).
+	restorePre := setMQTTTestInflightPreSendHook(func(jsDur, reply string) bool {
+		seq, _, _, _, _ := ackReplyInfo(reply)
+		return jsDur != srcDur || seq != srcSeq
+	})
+	defer restorePre()
 	reaped := make(chan struct{}, 1)
 	restorePause := setMQTTTestRestorePause(func(at string) {
 		switch at {
@@ -168,6 +181,8 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 		t.Fatalf("fixture: the source consumer must still exist here, or the source was "+
 			"never Live at recovery: ci=%v err=%v", ci, err)
 	}
+
+	restorePre()
 
 	// (5) Now the consumer goes, and only now does the source classify Lost.
 	if _, err := asm.jsa.deleteConsumer(mqttStreamName, srcDur, true); err != nil {

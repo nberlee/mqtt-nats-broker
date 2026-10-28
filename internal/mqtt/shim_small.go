@@ -4,7 +4,10 @@
 
 package mqtt
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // msgHandler mirrors nats-server's delivery-callback signature. The MQTT core
 // registers these on subscriptions; the connection layer invokes them when a
@@ -27,6 +30,16 @@ type subscription struct {
 	// nsub is the underlying routing handle set by the connection layer; kept
 	// as any here to avoid importing nats.go into the protocol core.
 	nsub any
+
+	// queued reports how many messages the connection layer holds for this subscription,
+	// the one whose callback is running included (a func() int, set once the subscription
+	// exists). Atomic because the delivery handler can run before processSub stores nsub.
+	queued atomic.Value
+
+	// held are the QoS 1/2 offers this subscription's delivery callback holds while it reads the
+	// ones already queued behind them, so their fresh deliveries are admitted together. Touched
+	// only by the subscription's own dispatch goroutine (outbound_delivery_batch.go).
+	held []mqttHeldOffer
 }
 
 // Account identifies the NATS account the broker operates within. The standalone

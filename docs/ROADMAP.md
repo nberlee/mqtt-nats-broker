@@ -9441,7 +9441,29 @@ reads](findings/resolved.md#f-054).
   acquisition and socket dispatch across batches; a stale-only failure keeps the whole
   batch's place under the contention extension; ambiguous attempts settled before a retry
   or a split; every per-obligation check kept, intra-batch conflicts included. Measured
-  against the rows above.
+  against the rows above. Acceptance (consult 1 of the item, D4): twice the QoS 1 burst rate
+  of a same-day baseline by ratio of three-run medians, standalone and R3 separately.
+  **Admission batching landed 2026-10-28; the item stays OPEN** (consult 3): the gate is
+  missed on both rigs. Done: a subscription's queued offers are read together on its one
+  dispatch goroutine (an offer with another queued behind it is held, up to 16; none at
+  rest) and its fresh ordinary deliveries admitted in one atomic batch
+  (`opAdmitPublishes`, one authority revision, one member per resource, one ledger member),
+  settled once for every participant before any retry or split, re-attempted whole on
+  contention, split at an occupied slot; every offer that is not collected flushes the batch
+  before it acts; acquisition stays per delivery. docs/ARCHITECTURE.md "A subscription's
+  fresh deliveries are admitted in batches". Measured (`make bench-outbound`, three
+  interleaved runs each against 6548ed9): QoS 1 burst of 500 25.4 -> 38.8 msg/s standalone
+  (1.53x), 35.8 -> 66.5 on R3 (1.86x); QoS 2 1.43x / 1.75x; four subscribers 1.48x /
+  1.47x; at rest 1.41x / 1.56x; nothing delivered twice. Why the gate is missed: admission
+  fell from 28.4 to 5.8 ms per delivery, but each delivery still makes two atomic commits
+  (acquisition, completion), an atomic batch costs about 6 ms on the pinned server however
+  small (plain store write 0.36 ms), and back-to-back acquisitions now overlap the client's
+  completions. Remaining: batch the acquisition too (several send sections open at once, the
+  transmission-lifecycle audit consult 1 called separate), measured against the 6548ed9
+  baseline. Record: [Batched
+  admission](findings/nats-platform.md#batched-admission-2026-10-28); residual in
+  docs/CONFORMANCE.md "Outbound QoS 1/2 delivery rate per subscriber". The atomic-batch
+  latency is a candidate upstream performance report, evidence in the record.
 
 ### NATS platform follow-ups
 
