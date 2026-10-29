@@ -1188,6 +1188,7 @@ func TestMQTTInflightRecoveryReservesPubRelIdentifiers(t *testing.T) {
 	// The PUBREL consumer has to exist first: $MQTT_out is interest-retained, so a
 	// store with no interest keeps nothing.
 	e.subscribePubRel(t)
+	e.endPubRelDelivery(t)
 	msg, hdrLen := mqttNewCorrelatedPubRel(pi, "xxxxxxxxxxxxxxxxxxxxxx", dur, srcSeq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
@@ -1231,6 +1232,36 @@ func (e *testInflightEnv) subscribePubRel(t *testing.T) {
 	if err := e.sess.ensurePubRelConsumerSubscription(e.c); err != nil {
 		t.Fatalf("ensurePubRelConsumerSubscription: %v", err)
 	}
+}
+
+// endPubRelDelivery leaves the PUBREL consumer as a predecessor's lost connection leaves it: the
+// durable stands and retains what is stored to it, and the delivery subscription is gone with the
+// connection, its flag cleared as the CONNECT clears it. A recovery fixture calls it BEFORE it
+// stores the PUBREL its recovery is to meet: with the subscription live, the delivery callback
+// advances the same exchange concurrently, and whichever of the two reads the slot first decides
+// which route the walk takes. In production the CONNECT recovers before it subscribes again.
+func (e *testInflightEnv) endPubRelDelivery(t *testing.T) {
+	t.Helper()
+	e.sess.mu.Lock()
+	subject := string(e.sess.pubRelDeliverySubjectB)
+	e.sess.mu.Unlock()
+	var sid []byte
+	e.c.mu.Lock()
+	for _, sub := range e.c.subs {
+		if string(sub.subject) == subject {
+			sid = sub.sid
+		}
+	}
+	e.c.mu.Unlock()
+	if sid == nil {
+		t.Fatalf("no PUBREL delivery subscription on %q to end", subject)
+	}
+	if err := e.c.processUnsub(sid); err != nil {
+		t.Fatalf("ending the PUBREL delivery subscription: %v", err)
+	}
+	e.sess.mu.Lock()
+	e.sess.pubRelSubscribed = false
+	e.sess.mu.Unlock()
 }
 
 // installServingAuthority gives the env's session the SERVING outbound authority a real
@@ -1299,6 +1330,7 @@ func TestMQTTInflightRecoveryPubRelRetiresRegisterWhenSourceLive(t *testing.T) {
 	// rebinds the slot (consult 25). An exchange-less register is not a shape production writes.
 	pi := e.trackAdmitted(t, dur, sseq, 2)
 	e.subscribePubRel(t)
+	e.endPubRelDelivery(t)
 	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
@@ -1344,6 +1376,7 @@ func TestMQTTInflightRecoveryPubRelKeepsOwnerWhenSourceComplete(t *testing.T) {
 	// rebinds the slot (consult 25). An exchange-less register is not a shape production writes.
 	pi := e.trackAdmitted(t, dur, sseq, 2)
 	e.subscribePubRel(t)
+	e.endPubRelDelivery(t)
 	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)
@@ -4997,6 +5030,7 @@ func TestMQTTInflightRecoveryCompletesDrainOwnedPubRelHandoff(t *testing.T) {
 
 	// A stored PUBREL for the same source, so the exchange is past PUBREC.
 	e.subscribePubRel(t)
+	e.endPubRelDelivery(t)
 	msg, hdrLen := mqttNewCorrelatedPubRel(pi, e.nonceOf(pi), dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
 	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
 		t.Fatalf("store the PUBREL record: %v", err)

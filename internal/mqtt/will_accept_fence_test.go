@@ -1049,7 +1049,14 @@ func TestWillTimingInvariantHolds(t *testing.T) {
 // already in the past was never an ownership window at all, whereas the sanctioned
 // duplicate needs one minted correctly and then EXPIRED.
 func TestWillClaimMintsAFreshLease(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
+	// BOTH brokers' loops are quieted: they scan the same outbox, and the peer's has none of the
+	// hooks below, so its claims of these records go uncounted (observed in 3 of 10 unquieted
+	// runs). The fixture once saw one claim instead of two in a shard; that failure was not
+	// reproduced, and the peer's uncounted claim is the interference this removes.
+	quiet := testQuietWillClaimLoop(t)
+	a, b := testNewTeardownEnv(t)
+	quiet(a.asm)
+	quiet(b.asm)
 	testCapturePublishes(t, a.asm)
 	const cid = "fresh-lease"
 	origin := testSessStreamFloor(t, a.asm)
