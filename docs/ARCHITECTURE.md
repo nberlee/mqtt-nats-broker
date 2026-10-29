@@ -10230,6 +10230,14 @@ offer is an unacknowledged JetStream delivery exactly like those still queued in
 if the subscription stops (unsubscribe, a re-SUBSCRIBE replacing it, the connection
 closing) neither is processed and AckWait re-offers both. Shared subscriptions never hold.
 
+**The whole flush runs under the callback's one lease.** The held offers are processed and
+flushed by the callback that finds nothing more queued, inside the incarnation lease that
+callback acquired (`leasedHandler`), so a retirement of the connection (a takeover) waits
+for the whole flush in progress, not for one delivery as before batching; offers still
+queued in nats.go are refused at lease acquisition as before. That wait is a stated
+residual (docs/CONFORMANCE.md, "A takeover of a backlogged connection waits for its
+batched flush") and an open roadmap remainder.
+
 **Only fresh ordinary deliveries are collected.** Each offer runs the whole delivery body
 (`mqttDeliverQoS12Offer`), every guard at processing time. A fresh, non-shared, not
 drain-claimed delivery is allocated and joins the collector; its Message Expiry is judged
@@ -10346,11 +10354,25 @@ per-delivery acquisition became the larger part of the send section. With the ac
 batched too (2026-10-28, against a same-day 6548ed9 baseline, three interleaved runs each,
 median ratio): QoS 1 burst of 500 from 25.3 to 60.6 msg/s standalone (2.40x) and from 46.1
 to 89.5 on R3 (1.94x); QoS 2 1.82x / 1.58x; four subscribers 2.48x / 1.74x; at rest 1.71x
-/ 1.68x; requests per delivery 116 to 72 standalone. What remains per QoS 1 delivery is
-its completion commit, one atomic batch per PUBACK on the client's read loop: on the
-pinned server an atomic batch costs about 6 ms however few members it carries (a plain
-store write 0.36 ms). Record: `docs/findings/nats-platform.md`, "Batched admission
-(2026-10-28)" and "Batched acquisition (2026-10-28)".
+/ 1.68x; requests per delivery 116 to 72 standalone.
+
+What remains per QoS 1 delivery is the same work on both rigs, with different measured
+contributions (2026-10-29, throwaway probes): the completion, run on the client's read
+loop for each PUBACK (one advance-exchange commit with its write-boundary checks, the
+reads before it, then the source settlement and the register reclamation), and on the
+subscription's dispatch goroutine the batched admission's and acquisition's boundary
+reads. Standalone the advance's store write is a substantial part (about 7 of the 19 ms a
+PUBACK held the read loop); on R3 it measured 1.3 ms, and the boundary checks (3.5 ms),
+the reads and the cleanup (6-8 ms) made up most of the 11-16 ms. A probe on a dedicated
+stream (file storage, atomic batches of 2 and 16 members, 1 to 4 concurrent writers) kept
+a roughly flat standalone throughput as writers were added, and a throughput that scaled
+with them on R3; the inference is that standalone atomic commits serialize, not shown on
+the broker's own stream. Batching back-to-back acknowledgement advances was evaluated and
+deferred, and the write boundaries' independent member reads, the batched acquisition's
+checks first (62-82 ms per flush of about 16, against a 3-10 ms write), are the next
+remainder (`docs/ROADMAP.md`). Record: `docs/findings/nats-platform.md`, "Batched
+admission (2026-10-28)", "Batched acquisition (2026-10-28)" and "Completion evaluation
+(2026-10-29)".
 
 ### The PUBREL consumer's name is claimed under contention
 

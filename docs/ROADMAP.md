@@ -9456,10 +9456,11 @@ reads](findings/resolved.md#f-054).
   (1.53x), 35.8 -> 66.5 on R3 (1.86x); QoS 2 1.43x / 1.75x; four subscribers 1.48x /
   1.47x; at rest 1.41x / 1.56x; nothing delivered twice. Why the gate is missed: admission
   fell from 28.4 to 5.8 ms per delivery, but each delivery still makes two atomic commits
-  (acquisition, completion), an atomic batch costs about 6 ms on the pinned server however
-  small (plain store write 0.36 ms), and back-to-back acquisitions now overlap the client's
-  completions. The remainder then was batching the acquisition too (several send sections
-  open at once, the transmission-lifecycle audit consult 1 called separate), measured against
+  (acquisition, completion), an atomic batch of 2 or 8 members cost about 6 ms on the pinned
+  server standalone, file storage (plain store write 0.36 ms), and back-to-back acquisitions
+  now overlap the client's completions. The remainder then was batching the acquisition
+  too (several send sections open at once, the transmission-lifecycle audit consult 1 called
+  separate), measured against
   the 6548ed9 baseline: landed below. Record: [Batched
   admission](findings/nats-platform.md#batched-admission-2026-10-28). **Acquisition
   batching landed 2026-10-28; the item stays OPEN a second time** (consult C1 of the
@@ -9475,14 +9476,71 @@ reads](findings/resolved.md#f-054).
   burst of 500 25.3 -> 60.6 msg/s standalone (2.40x), 46.1 -> 89.5 on R3 (1.94x; the R3
   baseline's runs spread 34.9-46.7 and measured 35.8 the day before, context and not an
   exception); QoS 2 1.82x / 1.58x; four subscribers 2.48x / 1.74x; at rest 1.71x / 1.68x;
-  nothing delivered twice. Remaining: measure the completion's cost and evaluate batching
-  back-to-back acknowledgement advances (each PUBACK is one advance-exchange atomic commit
-  on the client's read loop), keeping each exchange's checks and acknowledgement order.
-  Not an alpha blocker. Record: [Batched
-  acquisition](findings/nats-platform.md#batched-acquisition-2026-10-28); residual in
-  docs/CONFORMANCE.md "Outbound QoS 1/2 delivery rate per subscriber". The atomic-batch
-  latency is a candidate upstream performance report, evidence in the batched-admission
-  record.
+  nothing delivered twice. The remainder then was measuring the completion's cost and
+  evaluating batching back-to-back acknowledgement advances: evaluated below. Record:
+  [Batched acquisition](findings/nats-platform.md#batched-acquisition-2026-10-28);
+  residual in docs/CONFORMANCE.md "Outbound QoS 1/2 delivery rate per subscriber". The
+  standalone atomic-batch latency (file storage) is a candidate upstream performance
+  report, evidence in the batched-admission and completion-evaluation records.
+  **Completion evaluated 2026-10-29; the item stays OPEN a third time** (consult C1 of the
+  completion evaluation). Same-day interleaved three-run medians of the QoS 1 burst of 500
+  against 6548ed9: standalone 25.0 -> 57.6 msg/s (2.30x), R3 46.2 -> 65.6 (1.42x), so R3
+  still misses the gate. Measured with throwaway probes: PUBACK handling occupied the
+  client's read loop for the whole burst standalone (19 ms per PUBACK) and 69-100 percent
+  of it on R3 (11-16 ms); the advance commit was 3.2 ms of boundary checks plus a 7.0 ms
+  store write standalone and 3.5 plus 1.3 ms on R3, followed by 6-8 ms of serial reads,
+  source settlement and register reclamation; the batched acquisition's boundary checks
+  took 62-82 ms per flush of about 16 against a 3-10 ms write. Batching back-to-back
+  advances is DEFERRED: its principal saving is the standalone commit write, where the
+  gate is met, while it needs a multi-obligation binding rule
+  (`checkAckPhaseAdvanceMembers` admits one obligation per advance by design), shared
+  settlement and fall-outs, and keeps every participant's reads and cleanup; the data show
+  it lacks demonstrated R3 headroom, not that it cannot help. An unbounded experiment
+  moving the completion off the read loop had lower medians on both rigs (44.1 / 56.9).
+  Next deliverable: bounded concurrency of demonstrably independent write-boundary member
+  reads, the acquisition and admission checks first, preserving every validation and its
+  dependencies (the validated exchange predecessors `checkExchangeOverwrites` produces
+  feed later checks), exact-sequence fencing, fail-closed read outcomes and receipt
+  semantics, tested against concurrent changes, read failures and malformed transitions as
+  well as for rate: the strongest next experiment, not a promised gate pass. Separately
+  reviewed, not a prerequisite of the deferred batching: the completion carries the
+  exchange it already read WITH its read sequence (the boundary still validates), and
+  drops the per-PUBACK authority read only with receipt identity and epoch provenance
+  treated explicitly (the builder takes authority fields even for authority-free
+  attempts), keeping the fenced retained exception. Acknowledgement order and every
+  per-exchange check stay; the acceptance is unchanged, and the R3 spread is context, not
+  an exception. Not an alpha blocker. Record: [Completion
+  evaluation](findings/nats-platform.md#completion-evaluation-2026-10-29).
+  **A takeover of a backlogged connection waits for a whole batched flush (found
+  2026-10-29, the item's other open remainder; consult C4 of the completion evaluation).**
+  A subscription's delivery callback holds its offers and flushes them (one admission, one
+  acquisition, each section's write and end) under ONE incarnation lease, and a
+  clean-start takeover's retirement waits for that lease, so it waits for the whole flush,
+  where before batching it waited for one delivery. Measured (100 trials each; three
+  overlapping subscriptions, 16 queued QoS 1 messages): CONNACK median 210 -> 480 ms, p95
+  285 -> 837, max 328 -> 1114 against 6548ed9; the shapes Paho's suite leaves behind show
+  no regression (60 / 61 ms), so this does not explain CI run 40887953897's two setUpClass
+  timeouts, which stay unexplained. A prototype (lane stop-cap-prototype.patch: a
+  cooperative stop at the next boundary after the incarnation's tracker starts closing,
+  plus a cap on held offers) measured cap 8: median 276, p95 415, max 446, standalone
+  throughput -2 percent; cap 6: 266 / 353 / 388, -9 percent; cap 4: 245 / 337 / 390, -15
+  percent; R3 throughput unreadable at three runs. None met the gates consult C3 set
+  (shape-C tail 350 ms, no 500 ms breach, at most 10 percent throughput loss), so nothing
+  landed. Deliverable: a stop contract that latches the closing cycle a callback started
+  under and propagates through every nested flush segment, expiry split, admission retry
+  and split, and singleton and fallback arm inside a batched callback, where a step
+  already started finishes and settles and no later step starts once the stop is observed;
+  stopped offers recorded withheld as a refused callback is; collected allocations
+  abandoned; admitted sections ended without intent; witnesses isolating each boundary,
+  with mutations no earlier check can mask, plus close-then-reopen and later redelivery;
+  order and DUP claims narrowed to what the refusal boundary already gives, and tested.
+  Acceptance (consult C3): at least 100 trials per shape and candidate across interleaved
+  rounds with raw results, timeout counts, median, p95 and maximum; a shape-C tail target
+  of 350 ms and no 500 ms breach; a CPU- or store-constrained run; throughput loss of at
+  most 10 percent against the same-day unfixed tree on standalone and R3; full local Paho
+  three times. Artifacts: stop-cap-prototype.patch, the probe scripts and the raw results
+  in the batched-completion lane. Residual meanwhile: docs/CONFORMANCE.md, "A takeover of
+  a backlogged connection waits for its batched flush".
 
 ### Connection close
 

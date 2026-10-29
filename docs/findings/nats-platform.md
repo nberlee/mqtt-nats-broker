@@ -1431,8 +1431,10 @@ a proven ceiling.
 The remaining work is batching the acquisition (several send sections open at once), which
 consult 1 kept separate as a transmission-lifecycle audit. The atomic-batch latency is a
 candidate upstream performance report: plain 0.36 ms against 6.2-6.4 ms for an atomic batch
-of any size, standalone, file storage, reproducible with a 200-iteration loop of
-`newAtomicBatchRequest` beside `storeMsg` on one stream.
+of 2 or 8 members, standalone, file storage, reproducible with a 200-iteration loop of
+`newAtomicBatchRequest` beside `storeMsg` on one stream. "Completion evaluation
+(2026-10-29)" adds a concurrency probe: standalone throughput stayed roughly flat from one
+to four writers, where R3's scaled.
 
 ### Tests and mutations
 
@@ -1593,5 +1595,132 @@ that flag was deleted.
 
 Each QoS 1 delivery still makes one atomic commit of its own, its completion (one
 advance-exchange per PUBACK on the client's read loop); whether back-to-back advances can
-share one, keeping each exchange's checks and acknowledgement order, is the item's open
-part.
+share one, keeping each exchange's checks and acknowledgement order, was the item's open
+part. Superseded: evaluated and deferred by consult C1 of the [completion
+evaluation](#completion-evaluation-2026-10-29), which names the next remainder.
+
+## Completion evaluation (2026-10-29)
+
+The third part of the section 2 roadmap item "Admit several deliveries per subscription in
+one batch": measure the completion's cost and evaluate batching back-to-back
+acknowledgement advances. Evaluated, and the batching deferred; the item stays OPEN (consult
+C1 of the evaluation). No code changed.
+
+### Method
+
+Timing probes in a throwaway worktree of a0daaea, never committed: the read loop's PUBACK
+handling, the completion's steps (`attemptTerminalRegisterReleaseOnce`,
+`opAdvanceExchangeAck`, `recoverPublishTerminalSlot`), every commit split into its
+client-side boundary checks and its store write, and the dispatch callback. `make
+bench-outbound`, case `qos1_subs1_burst500`. The timings below are composites of the code
+between two probes, not isolated operations.
+
+### Where a PUBACK's time goes
+
+| Per PUBACK, ms | Standalone | R3 |
+|---|---|---|
+| Read loop occupied by PUBACK handling, share of the burst | 100 percent | 69-100 percent |
+| Total per PUBACK | 19.0-19.2 | 10.8-16.1 |
+| Reads before the advance (register, exchange) | 1.8 | 2.0 |
+| Advance (authority and exchange reads, commit) | 11.7 | 6.3-6.5 |
+| Advance commit: boundary checks / store write | 3.19 / 7.01 | 3.51 / 1.28 |
+| After the advance (re-read and slot cleanup) | 6.0-6.1 | 7.8-8.1 |
+| Source-pair reads plus settlement | 2.74 | 3.65 |
+| Register reap (read plus delete) | 1.68 | 2.32 |
+| Release confirmation and marker reap | 1.02 | 1.15 |
+
+On the subscription's dispatch goroutine, per flush of about 16: the acquire-action
+commit's boundary checks 73 ms against a 3-10 ms write, the admit-exchange's 33-35 ms
+against 5-12 ms. With the read loop slow, 96 percent of PUBACKs were parsed with more bytes
+already buffered behind them.
+
+### Atomic batches on a dedicated stream
+
+A probe stream (file storage, `allow_atomic`, one message per subject, every member CAS'd,
+distinct subjects per writer, 100 batches per writer), batches per second / mean latency:
+
+| Rig | Members | 1 writer | 2 writers | 4 writers |
+|---|---|---|---|---|
+| standalone | 2 | 141 / 7.1 ms | 174 / 11.4 ms | 182 / 21.7 ms |
+| standalone | 16 | 170 / 5.9 ms | 169 / 11.7 ms | 168 / 23.8 ms |
+| R3 | 2 | 1169 / 0.85 ms | 2014 / 0.99 ms | 3636 / 1.08 ms |
+| R3 | 16 | 596 / 1.67 ms | 1003 / 1.99 ms | 1722 / 2.26 ms |
+
+Standalone throughput stays roughly flat as writers are added; R3's scales. The inference,
+not shown on the broker's own stream and not isolated to a storage cause, is that standalone
+atomic commits serialize there. This is evidence for the candidate upstream performance
+report the batched-admission record names; the report is the user's to write.
+
+### Same-day acceptance
+
+Three interleaved runs each, QoS 1 burst of 500, msg/s:
+
+| Tree | Standalone | Median | R3 | Median |
+|---|---|---|---|---|
+| 6548ed9 | 25.7, 24.8, 25.0 | 25.0 | 46.8, 35.0, 46.2 | 46.2 |
+| a0daaea | 55.4, 60.1, 57.6 | 57.6 (2.30x) | 68.7, 65.6, 62.6 | 65.6 (1.42x) |
+| unbounded off-loop experiment | 44.1, 42.3, 46.2 | 44.1 | 56.9, 56.0, 58.6 | 56.9 |
+
+The R3 gate is still missed, by more than the acquisition record's 1.94x; R3 runs of
+identical code have spread from about 60 to 90 msg/s across days, and a0daaea with 434380a
+reverted (65.6 with it, 63.1 without) showed no slowdown attributable to that repair.
+
+The experiment handed each PUBACK's completion to its own goroutine (no order, no bound).
+Its medians were lower on both rigs; standalone its advance writes rose to 14.4 ms,
+presumably queuing behind the dispatcher's. With the read loop fast, the parsed runs of
+consecutive PUBACKs read with more bytes buffered were mostly singletons (486 of 490
+standalone; 467 of 470 on R3, which also had runs of 15 and 16). Run lengths were not
+measured with the read loop slow, where the 96 percent above counts buffered bytes, not
+proven complete PUBACKs; that a collector driven by buffered input would batch while the
+read loop is slow and little once it is fast is an inference, to be measured before any
+such design. The experiment rejects its own design, not completion concurrency in general.
+
+### A backlogged takeover waits for a whole batched flush
+
+Found while chasing CI run 40887953897 (a0daaea), whose Paho test_dollar_topics and
+test_user_properties failed in setUpClass: the suite's clean-start cleanup CONNECT got no
+CONNACK within its 0.5 s socket timeout. Checkpoints in the CONNECT put a backlogged
+takeover's extra time inside the clean-start retirement, which waits for the old
+incarnation's leases; a probe on the delivery callback showed each slow takeover resuming
+exactly when a batched callback returned. That callback flushes its held offers under one
+lease, so the retirement waits for the whole flush.
+
+CONNACK latency of a clean-start takeover, ms, 100 trials each, interleaved:
+
+| Predecessor | 6548ed9 median / p95 / max | a0daaea median / p95 / max |
+|---|---|---|
+| three overlapping subscriptions, 16 queued QoS 1 messages | 210 / 285 / 328 | 480 / 837 / 1114 |
+| two overlapping subscriptions, five messages | 120 / 158 / 176 | 217 / 364 / 467 |
+| the test_subscribe_identifiers leftover (one message, acknowledged) | 60 / 75 / 97 | 61 / 84 / 103 |
+| the test_client_topic_alias leftover (error DISCONNECT, socket open) | 56 / 67 / 103 | 57 / 73 / 121 |
+
+The shapes the suite actually leaves show no regression, so the regression does not
+explain the CI timeouts, which stay unexplained (two unpinned and three CPU-pinned local
+Paho runs had no setup timeout; one pinned run lost test_request_response to the suite's
+own ordering race: it waits on the wrong client's SUBACK before publishing).
+
+A prototype (a cooperative stop at the next boundary after the connection's incarnation
+tracker starts closing, plus a cap on held offers) measured, on the 16-message shape: cap
+16 median 293, p95 493, max 563; cap 8 276 / 415 / 446 with standalone throughput -2
+percent; cap 6 266 / 353 / 388, -9 percent; cap 4 245 / 337 / 390, -15 percent. None met
+the gates (tail 350 ms, no 500 ms breach, at most 10 percent throughput loss), and the
+stop contract still owes the review findings on cycle latching, propagation through nested
+flush segments and singleton arms, and isolated witnesses (docs/ROADMAP.md). Below a cap
+of 8 the tail flattens: what remains is the step already in flight when the close lands.
+
+### Decision
+
+Batching back-to-back advances is deferred. Its principal saving is the standalone commit
+write, where the gate is met; on R3 the write measured 1.28 ms, while each participant's
+boundary reads and its 6-8 ms of cleanup would stay. It needs a multi-obligation binding rule
+(`checkAckPhaseAdvanceMembers` admits one obligation per advance by design), shared
+settlement and fall-outs. The data show it lacks demonstrated R3 headroom, not that it
+cannot help.
+
+The next remainder (docs/ROADMAP.md) is bounded concurrency of the write boundaries'
+demonstrably independent member reads, the acquisition and admission checks first,
+preserving every validation and its dependencies, exact-sequence fencing, fail-closed read
+outcomes and receipt semantics: the strongest next experiment, not a promised gate pass.
+Separately reviewed: the completion carrying the exchange it already read with its read
+sequence, and dropping the per-PUBACK authority read only with receipt identity and epoch
+provenance treated explicitly.

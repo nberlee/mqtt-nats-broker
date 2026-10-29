@@ -2175,15 +2175,20 @@ remains an unconditional alpha blocker.**
 
 **Residual, stated with its measurement.** Stored QoS 1 and QoS 2 messages reach one
 subscriber at roughly 25-100 messages per second, against several hundred for stock
-nats-server's MQTT listener on the same storage. The cost is the design's: each delivery is
-admitted through the outbound obligation authority (docs/ARCHITECTURE.md, "The outbound
+nats-server's MQTT listener on the same storage. The cost is the design's: each delivery
+is admitted through the outbound obligation authority (docs/ARCHITECTURE.md, "The outbound
 obligation authority"), which reads and writes through atomic batches re-checked at the
 write boundary. A subscription's fresh deliveries are admitted several per batch and their
 PUBLISH actions acquired several per batch (docs/ARCHITECTURE.md, "A subscription's fresh
 deliveries are admitted in batches"), but every ordinary QoS 1 delivery still makes one
-atomic commit of its own, its completion (one per PUBACK, on the client's read loop), and
-on the pinned nats-server an atomic batch costs about 6 ms however few members it carries
-(a plain store write about 0.36 ms), measured standalone on local disk.
+atomic commit of its own, its completion (one per PUBACK, on the client's read loop),
+followed by serial reads, the source settlement and the register reclamation. The same
+work remains on both rigs with different measured contributions: standalone (file storage)
+the completion's store write is a substantial part (about 7 of the 19 ms a PUBACK held the
+read loop, and atomic batches of 2, 8 and 16 members measured about 6 ms there against
+0.36 ms for a plain store write); on R3 the write measured 1.3 ms, and the write
+boundary's sequential member reads, on the read loop and in the batched admission and
+acquisition, made up most of the time.
 
 Measured with `make bench-outbound` on 2026-10-28 (one machine, embedded JetStream on local
 disk; the burst published and acknowledged before the subscribers read; every message
@@ -2203,10 +2208,27 @@ The roadmap item's acceptance (twice the QoS 1 burst rate of a same-day baseline
 rig, by the ratio of three-run medians) is met standalone (2.40x) and missed on R3 (1.94x),
 and the item stays open. The R3 baseline's own runs spread from 34.9 to 46.7 msg/s, and the
 same commit measured 35.8 the day before; that is context for the miss, not an exception to
-the gate. The remaining per-delivery commit is the completion; whether back-to-back
-acknowledgement advances can share one is the open part of the roadmap item. A QoS 2
+the gate. Measured again on 2026-10-29 (QoS 1 burst of 500 only, three interleaved runs each,
+medians): 6548ed9 25.0 / 46.2 msg/s standalone / R3, the current tree 57.6 / 65.6 (2.30x /
+1.42x); R3 runs of identical code have spread from about 60 to 90 msg/s across days.
+Batching back-to-back acknowledgement advances was evaluated and deferred: its principal
+saving is the standalone commit write, where the gate is met. The open part of the roadmap
+item is now bounded concurrency of the write boundaries' independent member reads
+(docs/findings/nats-platform.md, "Completion evaluation (2026-10-29)"). A QoS 2
 delivery's PUBREL acquisition still CASes the authority record a flush's acquisition also
 CASes, so the two still contend.
+
+**A takeover of a backlogged connection waits for its batched flush.**
+A subscription's QoS 1/2 delivery callback flushes the offers it held (up to 16: one
+admission, one acquisition, then each section's write and end) under one incarnation
+lease, and a takeover's retirement of the connection waits for that lease. A clean-start
+takeover of a connection with a backlog therefore waits for the whole flush in progress:
+measured locally with three overlapping subscriptions and 16 queued messages, CONNACK
+median 480 ms, p95 837, max 1114 (210 / 285 / 328 before batching), so a client whose
+CONNACK timeout is 500 ms or shorter can time out taking over such a session. The two
+predecessor shapes measured from Paho's suite (one acknowledged delivery; a server error
+DISCONNECT) showed no regression (about 60 ms). The fix is the roadmap item's open
+remainder (docs/ROADMAP.md, "Admit several deliveries per subscription in one batch").
 
 **The identifier walk no longer re-detects a corrupted duty it has validated before.**
 Identifier exclusivity caches each duty position's validated identity (kind, reference,
