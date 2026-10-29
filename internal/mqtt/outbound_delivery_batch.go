@@ -167,7 +167,7 @@ func (col *mqttDeliveryCollector) unlockAndFlush(sess *mqttSession) {
 }
 
 // flush admits the collected deliveries in one batch and sends each admitted one, in order, each
-// send section complete before the next begins.
+// send section ended before the next one writes.
 //
 // Session lock NOT held on entry.
 func (col *mqttDeliveryCollector) flush() {
@@ -214,8 +214,9 @@ func (col *mqttDeliveryCollector) flush() {
 	col.admitAndSend(live)
 }
 
-// admitAndSend admits collected deliveries in one batch and sends each admitted one, in order,
-// each send section complete before the next begins.
+// admitAndSend admits collected deliveries in one batch, acquires the admitted ones' PUBLISH
+// actions together, and writes them in order, each send section ended before the next one writes
+// (sendAdmittedPublishes).
 //
 // Session lock NOT held on entry.
 func (col *mqttDeliveryCollector) admitAndSend(live []*mqttCollectedDelivery) {
@@ -228,14 +229,5 @@ func (col *mqttDeliveryCollector) admitAndSend(live []*mqttCollectedDelivery) {
 		adms[i] = d.adm
 	}
 	sess.admitInflightPublishBatch(live[0].cc, adms)
-	for _, d := range live {
-		if !d.adm.stored {
-			continue
-		}
-		if h := mqttTestDeliveryAdmittedPauseV.Load(); h != nil {
-			(*h)(sess, d.adm.pi)
-		}
-		sess.sendAdmittedPublish(d.pc, d.cc, d.sub, d.adm.pi, d.adm.qos, d.adm.sseq, d.reply, d.retainAsPub,
-			d.subID, d.topic, d.msg, d.props)
-	}
+	sess.sendAdmittedPublishes(live)
 }

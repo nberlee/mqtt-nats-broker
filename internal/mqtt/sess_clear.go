@@ -238,6 +238,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// across every abandonment and clean start (checkpoint review WIP-2).
 	sess.abandonedAcks = nil
 	sess.withdrawOwed = nil // the discarded generation's owed withdrawals (F-088)
+	sess.dropAcquireSettleOwedLocked()
 	sess.admissionContinuity = nil
 	sess.discardDisposalsLocked()
 	// These verdicts are per-incarnation and they only ever reach durable state through

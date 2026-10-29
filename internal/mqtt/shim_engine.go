@@ -312,6 +312,10 @@ type Server struct {
 	// obligation is to a durable record and outlives both.
 	owedDrainsMu sync.Mutex
 	owedDrains   map[string]mqttOwedDrain
+	// owedAcquireSettles holds batched acquisition attempts whose landing is unknown, for one
+	// final settlement before the owed drains (outbound_acquisition_batch.go).
+	owedAcquireSettlesMu sync.Mutex
+	owedAcquireSettles   map[*mqttAcquireSettleOwed]mqttOwedAcquireSettle
 	// owedTerminals holds terminal cleanups refused worker admission because shutdown had
 	// begun; they are finished in Phase 3b alongside the owed drains.
 	owedTerminalsMu sync.Mutex

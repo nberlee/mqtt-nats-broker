@@ -51,6 +51,10 @@ type mqttSession struct {
 	// outbound_withdraw_owed.go). Owned by the custody dispatcher; protected by mu; replaced
 	// with the generation.
 	withdrawOwed map[string]*mqttWithdrawOwed
+	// acquireSettleOwed is the CURRENT generation's batched acquisition attempts whose landing is
+	// unknown, each carried by the custody dispatcher until its receipt decides
+	// (outbound_acquisition_batch.go).
+	acquireSettleOwed map[*mqttAcquireSettleOwed]struct{}
 	// admissionContinuity refuses the offers of a source delivery whose abandoned admission may
 	// have landed (F-097 WP5, outbound_admit_continuity.go), keyed by (durable, sequence). Owned by
 	// the custody dispatcher; protected by mu; replaced with the generation.
@@ -997,7 +1001,8 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	// Owed withdrawals name the retiring generation's obligations; its successor's recovery
 	// reconstructs any it still owes (F-088).
 	sess.withdrawOwed = nil
-	sess.admissionContinuity = nil // the retiring generation's admissions (F-097 WP5)
+	sess.dropAcquireSettleOwedLocked() // the retiring generation's owed acquisition settlements
+	sess.admissionContinuity = nil     // the retiring generation's admissions (F-097 WP5)
 	subject, deliver, _ := mqttPubRelNames(sess.idHash, gen)
 	sess.pubRelSubject = subject
 	sess.pubRelDeliverySubject = deliver

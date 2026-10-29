@@ -7524,6 +7524,17 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 			return false
 		}
 	}
+	sess.adoptAcquiredPublishAction(c, pi, tok, cur, seq)
+	return true
+}
+
+// adoptAcquiredPublishAction records, on the section's token and on the entry, an acquisition seen
+// to land: cur is the register as it stood before the acquisition, seq the register's sequence
+// read back after it. Shared by the single acquisition and a flush's batched one.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) adoptAcquiredPublishAction(c *client, pi uint16, tok *mqttSendToken,
+	cur *mqttInflightRecord, seq uint64) {
 	tok.slot.acq = cur.Acq
 	tok.slot.claim, tok.slot.claimSeq = cur.Claim, cur.ClaimSeq
 	tok.slot.seq = seq
@@ -7550,7 +7561,6 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	if run {
 		sess.handOffAcknowledgedPublish(c, ackPI, &mqttPending{slot: bound})
 	}
-	return true
 }
 
 // advancePublishTerminal records, DURABLY, that a PUBLISH phase ended without a PUBREL

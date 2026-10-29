@@ -10282,9 +10282,49 @@ stale reads each register subject: all empty, it is re-attempted whole under the
 and the contention extension; one occupied, it splits there, the deliveries before it
 admitted first as a batch, the occupant through the single ladder (whose classifier
 decides the slot), the rest after it. Any other refusal hands the first delivery to the
-single ladder and re-attempts the rest. Deliveries are sent after admission, each send
-section (acquisition, intent, write, its deferred end and the shutdown barrier) complete
-before the next begins, in offer order.
+single ladder and re-attempts the rest.
+
+**The acquisition is batched too** (`outbound_acquisition_batch.go`). After admission
+every admitted delivery's send section is opened (`openPublishSection`: the wire QoS from
+the entry, the in-memory reservation, the shutdown barrier), and their PUBLISH actions are
+acquired in ONE `acquire-action` transition (`opAcquireActions`): one authority read
+compared with the connection's entitlement, one authority revision, and per delivery its
+own token member and action record, each judged by the write boundary as a single
+acquisition is. A delivery whose register does not meet the single acquisition's premise
+when the batch reads it (a token standing, the slot moved, an unreadable read) falls out
+and is acquired by the single route at its own turn; a lone section takes the single route
+outright. Every submitted attempt is settled by its receipt (resolve, abort create-only,
+resolve), never by reading the registers: a batch whose request timed out can still land
+after a negative read, and only the abort makes never-landed permanent. LANDED or
+SUPERSEDED adopts every participant, each read back for its own register sequence with our
+exact token on it, which the single route's landed arm does not require: the receipt
+proves the acquisition committed, not that the register read afterwards is still ours (one
+whose read-back fails or names another token keeps its tentative ownership, is not sent,
+and its section's end drains only its own exact token); NEVER LANDED is re-attempted with
+the participants whose premise still holds, under the delivery entrance's contention
+extension when every refusal was positively stale (so, like an admission, the flush can
+wait for as long as its acquisitions keep losing while its connection serves, its sections
+open and its foreground announcement held), and a refusal before submission sends every
+participant to the single route at its turn; UNRESOLVED releases nothing: the attempt
+becomes an owed acquisition settlement (`mqttAcquireSettleOwed`) that the custody
+dispatcher re-settles until its receipt decides, then drains each exact token (landed) or
+releases the sections' ownership (never landed); nothing is sent meanwhile. A
+participant's own section end may drain first and find nothing, which concludes nothing
+the record relies on: once the attempt landed the record drains each exact token again.
+The server's shutdown makes one final settlement attempt after the publish-send barrier
+closed and before the owed drains.
+
+**Then each is written and ended in offer order**: section k is written (its admission,
+intent and write, `transmitAcquired`) and ended (its token drained, its reservation and
+barrier released) before section k+1 writes, and the later sections hold their
+acquisitions while the earlier ones write. Writes stay on the subscription's one dispatch
+goroutine in offer order, which is what carries per-(Topic, QoS) order; no first drain of
+a holder can run while its frame is being written, because every holder is its own section
+and each end follows its own write on the same goroutine. Before each section the
+connection's output gate is asked: once sealed (a close, a takeover's certification, a
+torn writer) that section and every later one end without recording intent, so none
+deletes its unsent marker after the seal. One deferred loop, armed before any section
+opens, ends every opened section exactly once on that exit and on a panic.
 
 **What it arbitrates** is what one admission arbitrates, by the same records: the authority
 CAS and the entitlement comparison serving right, the create-only registers, the
@@ -10294,19 +10334,23 @@ acquisition emission. It makes no source exclusive to one broker; that is unchan
 
 **What it does not batch**: shared subscriptions (an acquisition dependency per delivery,
 the QoS 2 move), drain-claimed deliveries, retained replay, retransmissions, every
-replacement (decided by the single ladder after a failed create), and the acquisition,
-which stays one authority transition per delivery. A capacity withholding keeps its
-disposal and its stated ordering residual (`docs/CONFORMANCE.md`).
+replacement (decided by the single ladder after a failed create), and the acquisition of a
+retransmission, a retained delivery or a PUBREL, which stays one authority transition
+each. A capacity withholding keeps its disposal and its stated ordering residual
+(`docs/CONFORMANCE.md`).
 
-**Measured** (`make bench-outbound`, three interleaved runs each against 6548ed9, median
-ratio): QoS 1 burst of 500 from 25.4 to 38.8 msg/s standalone (1.53x) and from 35.8 to 66.5
-on R3 (1.86x); QoS 2 1.43x / 1.75x; four subscribers 1.48x / 1.47x; at rest 1.41x / 1.56x;
-requests per delivery 115 to 80. Admission fell from 28.4 to 5.8 ms per delivery. What
-remains is the per-delivery acquisition and completion commits: on the pinned server an
-atomic batch costs about 6 ms however few members it carries (a plain store write 0.36 ms),
-and acquisitions sent back to back now overlap the client's completions, which raised the
-acquisition write from 6.4 to 9.7 ms standalone. Record: `docs/findings/nats-platform.md`,
-"Batched admission (2026-10-28)".
+**Measured.** Admission batching alone (33a2593; three interleaved runs each against
+6548ed9, median ratio): QoS 1 burst of 500 from 25.4 to 38.8 msg/s standalone (1.53x) and
+from 35.8 to 66.5 on R3 (1.86x); admission fell from 28.4 to 5.8 ms per delivery, and the
+per-delivery acquisition became the larger part of the send section. With the acquisition
+batched too (2026-10-28, against a same-day 6548ed9 baseline, three interleaved runs each,
+median ratio): QoS 1 burst of 500 from 25.3 to 60.6 msg/s standalone (2.40x) and from 46.1
+to 89.5 on R3 (1.94x); QoS 2 1.82x / 1.58x; four subscribers 2.48x / 1.74x; at rest 1.71x
+/ 1.68x; requests per delivery 116 to 72 standalone. What remains per QoS 1 delivery is
+its completion commit, one atomic batch per PUBACK on the client's read loop: on the
+pinned server an atomic batch costs about 6 ms however few members it carries (a plain
+store write 0.36 ms). Record: `docs/findings/nats-platform.md`, "Batched admission
+(2026-10-28)" and "Batched acquisition (2026-10-28)".
 
 ### The PUBREL consumer's name is claimed under contention
 
@@ -10410,7 +10454,10 @@ Row 2 of the cutover wires the output boundary to both ordinary emitters. Every 
 acquisition — and every ordinary PUBREL is written through `writeAuthorizedFrame` as the
 execution of the acquisition that authorized it.
 
-**One acquisition is two carriers in one batch.** `opAcquireAction` installs the
+**One acquisition is two carriers in one batch.** A flush acquires several in one batch
+(`opAcquireActions`, of which `opAcquireAction` is the one-request case: one authority
+revision, and each acquisition's own pair, which the boundary pairs per acquisition by lineage
+and counter and refuses twice for one exchange). `opAcquireAction` installs the
 register's output-custody token and creates the action record
 `act.<hash>.<gen>.<lineage>.<acq>` in ONE authority batch, CASing the authority and the
 register at their read sequences; there is no standalone register CAS for an ordinary slot

@@ -903,11 +903,59 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 
 // sendAdmittedPublish is the send section of one delivery whose identifier is admitted (or, for a
 // retransmission, already held): acquisition, durable intent, and the write, in that order, each
-// section complete (its deferred end and shutdown barrier released) before it returns.
+// section complete (its deferred end and shutdown barrier released) before it returns. A flush of
+// several admitted deliveries opens, acquires, transmits and ends the same sections
+// (sendAdmittedPublishes); this is the one-delivery route.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, pi uint16, qos byte, sseq uint64,
 	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte) {
+	sec := sess.openPublishSection(pc, cc, sub, pi, qos, sseq, reply, retainAsPub, subID, originalTopic, msg, props)
+	if sec == nil {
+		return
+	}
+	defer sec.end()
+	// THE DURABLE HALF OF THE EXCLUSION, and it comes first. Before F-098 this section's
+	// only hold was process memory, which fences no peer: two brokers may legitimately
+	// serve one incarnation. Taking it here rather than after admission fences the SIZE
+	// REFUSAL too, which is why that path's disposal now waits for the drain.
+	if !sess.acquirePublishAction(cc, pi, &sec.tok) {
+		return // a peer holds the action, or the slot moved; AckWait re-offers
+	}
+	sess.transmitAcquired(sec)
+}
+
+// mqttPublishSection is one opened PUBLISH send section: its token, the delivery it transmits, and
+// what its end records. It belongs to the goroutine that opened it.
+type mqttPublishSection struct {
+	pc, cc      *client
+	sub         *subscription
+	pi          uint16
+	qos         byte
+	reply       string
+	retainAsPub bool
+	subID       int
+	topic       []byte
+	msg         []byte
+	props       []byte
+	tok         mqttSendToken
+	// lic is the licence of the connection that opened the section: a disposal the section decides
+	// executes that connection's decision.
+	lic mqttDestroyLicence
+	// intent and wrote are what the end records on the entry. wrote is memory-only: true means
+	// POSSIBLY written, a partial, errored or timed-out write included.
+	intent mqttIntentOutcome
+	wrote  bool
+	ended  bool
+}
+
+// openPublishSection opens the send section of one admitted delivery: the wire QoS from the entry,
+// the in-memory reservation, and the shutdown barrier. Nil when the section cannot open; the
+// message then stays with JetStream and AckWait re-offers it.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) openPublishSection(pc, cc *client, sub *subscription, pi uint16, qos byte, sseq uint64,
+	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte) *mqttPublishSection {
 	// The SEND SECTION. queueOutbound is a synchronous socket write with no deadline, so
 	// between here and its return a teardown, a denial, a recovery pass or a terminal
 	// acknowledgement can free this identifier and bumpPI can re-mint it — two PUBLISHes
@@ -945,7 +993,7 @@ func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, 
 			sess.mu.Unlock()
 			cc.Warnf("MQTT: withholding delivery %s/%d for client %q: packet identifier %d carries no exchange QoS",
 				sub.mqtt.jsDur, sseq, sess.id, pi)
-			return
+			return nil
 		}
 		qos = ack.qos
 	}
@@ -955,7 +1003,7 @@ func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, 
 		// The entry is no longer sendable — a concurrent section, a condemnation, or a
 		// connection that is no longer this session's. The message stays with JetStream
 		// and AckWait re-offers it, the same cost a regPending decline already accepts.
-		return
+		return nil
 	}
 	// The section's three phases, in an order that IS the mechanism: ADMISSION (may this
 	// frame reach this receiver at all), then durable INTENT (the marker's confirmed delete,
@@ -976,28 +1024,44 @@ func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, 
 	// drain still in flight, which is the one thing it exists to prevent.
 	if !cc.srv.admitPublishSend() {
 		sess.endPublishSend(cc, pi, sendTok, mqttIntentNone, false)
+		return nil
+	}
+	return &mqttPublishSection{pc: pc, cc: cc, sub: sub, pi: pi, qos: qos, reply: reply, retainAsPub: retainAsPub,
+		subID: subID, topic: originalTopic, msg: msg, props: props, tok: sendTok, lic: mqttLicenceOf(cc)}
+}
+
+// end ends the section once: the durable action drained and the in-memory reservation released
+// (endPublishSend), then the shutdown barrier. The barrier is released LAST: releasing it before
+// endPublishSend would let the shutdown wait return with this section's drain still in flight,
+// which is the one thing it exists to prevent.
+//
+// Session lock NOT held on entry.
+func (sec *mqttPublishSection) end() {
+	if sec == nil || sec.ended {
 		return
 	}
-	defer cc.srv.publishSendDone()
-	intent, wrote := mqttIntentNone, false
-	defer func() { sess.endPublishSend(cc, pi, sendTok, intent, wrote) }()
-	// THE DURABLE HALF OF THE EXCLUSION, and it comes first. Before F-098 this section's
-	// only hold was process memory, which fences no peer: two brokers may legitimately
-	// serve one incarnation. Taking it here rather than after admission fences the SIZE
-	// REFUSAL too, which is why that path's disposal now waits for the drain.
-	if !sess.acquirePublishAction(cc, pi, &sendTok) {
-		return // a peer holds the action, or the slot moved; AckWait re-offers
-	}
+	sec.ended = true
+	sess := sec.cc.mqtt.sess
+	sess.endPublishSend(sec.cc, sec.pi, sec.tok, sec.intent, sec.wrote)
+	sec.cc.srv.publishSendDone()
+}
+
+// transmitAcquired is the rest of a send section whose durable action is held: admission of the
+// frame, durable intent, and the write.
+//
+// Session lock NOT held on entry.
+func (sess *mqttSession) transmitAcquired(sec *mqttPublishSection) {
+	cc, pi := sec.cc, sec.pi
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
 		return // a test-staged crash after the pair confirmed and BEFORE intent: proven-unsent
 	}
 	// DUP is the value the section captured under the lock, never a re-read at write
 	// time: the entry can be replaced or condemned while this write is out.
-	prep, admitted := pc.mqttPreparePublishMsgTo(cc, pi, qos, sendTok.dup, retainAsPub, subID, originalTopic, msg, props)
+	prep, admitted := sec.pc.mqttPreparePublishMsgTo(cc, pi, sec.qos, sec.tok.dup, sec.retainAsPub, sec.subID, sec.topic, sec.msg, sec.props)
 	if !admitted {
 		// Exceeds the client's MQTT 5.0 Maximum Packet Size at every framing. Spec5
 		// [3.1.2.11.4]. What may be done about it is the durable state's to say.
-		if !sess.oversizeDisposalAllowed(cc, pi, sendTok) {
+		if !sess.oversizeDisposalAllowed(cc, pi, sec.tok) {
 			return // POSSIBLY-ATTEMPTED: retained whole, nothing acknowledged
 		}
 		// PROVEN-UNSENT: no PUBLISH was ever attempted under this identifier, so discard
@@ -1009,26 +1073,26 @@ func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, 
 		// a live token — mqttSlotReleaseAuthority withholds on ANY of them, including this
 		// broker's own — and draining here rather than relying on the deferred end is what
 		// keeps the disposal in this function where its proof lives.
-		sess.drainPublishAction(cc, sendTok)
-		sendTok.actionHeld = false
+		sess.drainPublishAction(cc, sec.tok)
+		sec.tok.actionHeld = false
 		// Through the same removal as the expiry drop above: the identifier's exclusion is
 		// handed off before the untrack, because this delete can be refused or fail just as
 		// that one can (F-098, holistic review round 3, swept round 4).
-		removed := sess.dropProvenUnsentPublishEntry(pi, mqttLicenceOf(cc))
+		removed := sess.dropProvenUnsentPublishEntry(pi, sec.lic)
 		if !sess.finalizeDrainSource(cc, removed) {
-			_, _ = sess.submitSourceAck(reply, false, nil)
+			_, _ = sess.submitSourceAck(sec.reply, false, nil)
 		}
 		return
 	}
-	intent = sess.recordSendIntent(cc, pi, sendTok)
-	if intent == mqttIntentDefiniteFailure || intent == mqttIntentAmbiguous {
+	sec.intent = sess.recordSendIntent(cc, pi, sec.tok)
+	if sec.intent == mqttIntentDefiniteFailure || sec.intent == mqttIntentAmbiguous {
 		return // nothing written; the entry keeps (or holds unresolved) its marker; AckWait re-offers
 	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendIntent) {
 		return // a test-staged crash AFTER intent and before the write: possibly-attempted
 	}
-	prep.bindSection(sendTok)
-	wrote = pc.mqttEnqueuePreparedPublishMsgTo(cc, sub, prep)
+	prep.bindSection(sec.tok)
+	sec.wrote = sec.pc.mqttEnqueuePreparedPublishMsgTo(cc, sec.sub, prep)
 	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
 	// A refused transmission here is unreachable for an admitted frame (admission is
 	// monotone) and would in any case be a possibly-attempted exchange: nothing is disposed.

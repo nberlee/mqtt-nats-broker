@@ -156,8 +156,8 @@ var f088FrozenProvenance = map[f088ProvSite]int{
 	{fn: "mqttAdvanceExchangeAckTransition", what: "CancelOrigin=_EMPTY_"}: 1,
 	{fn: "mqttIsActionTokenAcquisition", what: "Cancelled=false"}:          1,
 	{fn: "mqttIsActionTokenAcquisition", what: "CancelOrigin=_EMPTY_"}:     1,
-	{fn: "opAcquireAction", what: "Cancelled=false"}:                       1,
-	{fn: "opAcquireAction", what: "CancelOrigin=_EMPTY_"}:                  1,
+	{fn: "composeAcquisition", what: "Cancelled=false"}:                    1,
+	{fn: "composeAcquisition", what: "CancelOrigin=_EMPTY_"}:               1,
 }
 
 // TestF088CancellationRegisterProducersAreFrozen is T32 (plan rule 7): the census of every

@@ -1964,6 +1964,10 @@ generic delete failure, since the store may have recorded the deletion before fa
   Receive Maximum of 1 one occurrence stops further QoS 1/2 delivery to that session. This
   says nothing about genuinely transmitted messages, and the logged consumer counters
   establish neither source deletion nor eventual delivery.
+  A flush whose deliveries were acquired together does not widen this: before each of its
+  sections the connection's output gate is asked, and once it is sealed that section and
+  every later one end without recording intent, so per flush only a section already past
+  that check when the seal lands can record intent after it, as one section could before.
 
   **A displaced subscription churns while its eviction is delayed (F-122, accepted as a
   residual 2026-10-12).** While a takeover's eviction of the displaced broker's resident
@@ -2170,39 +2174,39 @@ remains an unconditional alpha blocker.**
 ### Outbound QoS 1/2 delivery rate per subscriber: a measured ceiling
 
 **Residual, stated with its measurement.** Stored QoS 1 and QoS 2 messages reach one
-subscriber at 20-70 messages per second, against several hundred for stock nats-server's
-MQTT listener on the same storage. The cost is the design's: each delivery is admitted
-through the outbound obligation authority (docs/ARCHITECTURE.md, "The outbound
+subscriber at roughly 25-100 messages per second, against several hundred for stock
+nats-server's MQTT listener on the same storage. The cost is the design's: each delivery is
+admitted through the outbound obligation authority (docs/ARCHITECTURE.md, "The outbound
 obligation authority"), which reads and writes through atomic batches re-checked at the
-write boundary. A subscription's fresh deliveries are admitted several per batch since
-2026-10-28 (docs/ARCHITECTURE.md, "A subscription's fresh deliveries are admitted in
-batches"), but every ordinary QoS 1 delivery still makes two atomic commits of its own, its
-action acquisition and its completion, and on the pinned nats-server an atomic batch costs
-about 6 ms however few members it carries (a plain store write about 0.36 ms), measured
-standalone on local disk.
+write boundary. A subscription's fresh deliveries are admitted several per batch and their
+PUBLISH actions acquired several per batch (docs/ARCHITECTURE.md, "A subscription's fresh
+deliveries are admitted in batches"), but every ordinary QoS 1 delivery still makes one
+atomic commit of its own, its completion (one per PUBACK, on the client's read loop), and
+on the pinned nats-server an atomic batch costs about 6 ms however few members it carries
+(a plain store write about 0.36 ms), measured standalone on local disk.
 
 Measured with `make bench-outbound` on 2026-10-28 (one machine, embedded JetStream on local
 disk; the burst published and acknowledged before the subscribers read; every message
 delivered, first deliveries in publish order, every QoS 2 exchange completed and every
-consumer settled, in every row; three interleaved runs of each tree, medians), against the
-tree before batched admission (6548ed9):
+consumer settled, in every row; no row delivered a message twice or retransmitted one;
+three interleaved runs of each tree, medians), against the tree before batched admission
+(6548ed9), measured the same day:
 
 | Case | Standalone | Three nodes, R3 | 6548ed9 (standalone / R3) |
 |---|---|---|---|
-| QoS 1, one subscriber, 500 | 38.8 msg/s | 66.5 msg/s | 25.4 / 35.8 |
-| QoS 2, one subscriber, 200 | 20.6 msg/s | 37.2 msg/s | 14.4 / 21.3 |
-| QoS 1, four subscribers, 200 each | 62.3 msg/s in aggregate | 209.8 msg/s in aggregate | 42.0 / 142.3 |
-| QoS 1, one subscriber, 20 at rest after 300 | 36.6 msg/s | 55.4 msg/s | 26.0 / 35.6 |
+| QoS 1, one subscriber, 500 | 60.6 msg/s | 89.5 msg/s | 25.3 / 46.1 |
+| QoS 2, one subscriber, 200 | 25.6 msg/s | 33.1 msg/s | 14.1 / 20.9 |
+| QoS 1, four subscribers, 200 each | 104.2 msg/s in aggregate | 215.1 msg/s in aggregate | 42.0 / 123.3 |
+| QoS 1, one subscriber, 20 at rest after 300 | 41.1 msg/s | 52.1 msg/s | 24.1 / 31.1 |
 
-No row delivered a message twice. The roadmap item's acceptance (twice the QoS 1 burst rate
-on each rig) is not met (1.53x standalone, 1.86x R3), and the item stays open: per QoS 1
-delivery, admission now costs about 6 ms where it cost 28, and the acquisition and
-completion commits remain, the acquisition's slower (about 10 ms against 6) because
-acquisitions sent back to back now overlap the client's completions on the one stream. A
-QoS 2 delivery additionally loses about two attempts per delivery: its PUBREL acquisition
-CASes the authority record the next admission also CASes. Raising the rate further needs the
-acquisition batched too, which changes the transmission lifecycle (the open part of the
-roadmap item), not a tuning.
+The roadmap item's acceptance (twice the QoS 1 burst rate of a same-day baseline on each
+rig, by the ratio of three-run medians) is met standalone (2.40x) and missed on R3 (1.94x),
+and the item stays open. The R3 baseline's own runs spread from 34.9 to 46.7 msg/s, and the
+same commit measured 35.8 the day before; that is context for the miss, not an exception to
+the gate. The remaining per-delivery commit is the completion; whether back-to-back
+acknowledgement advances can share one is the open part of the roadmap item. A QoS 2
+delivery's PUBREL acquisition still CASes the authority record a flush's acquisition also
+CASes, so the two still contend.
 
 **The identifier walk no longer re-detects a corrupted duty it has validated before.**
 Identifier exclusivity caches each duty position's validated identity (kind, reference,
@@ -2212,12 +2216,13 @@ corrupted after it was cached is not re-detected by that walk; the census still 
 position. A restore of the stream under running brokers would leave stale identities the
 same way, so a restore requires every broker stopped.
 
-**And a subscription can stall.** An admission that loses only to stale expectations is
-re-attempted for its connection's life rather than abandoned, because an abandoned offer's
-re-offer arrives behind later messages (next section). A subscription whose admissions keep
-losing therefore stops delivering until they win or the connection closes, and the session's
-background authority writers stay yielded meanwhile. No such stall was observed in the measured
-runs.
+**And a subscription can stall.** An admission, or a flush's batched acquisition, that
+loses only to stale expectations is re-attempted for its connection's life rather than
+abandoned, because an abandoned offer's re-offer arrives behind later messages (next
+section). A subscription whose admissions or acquisitions keep losing therefore stops
+delivering until they win or the connection closes, and the session's background authority
+writers stay yielded meanwhile; a stalled acquisition also keeps its flush's sections open
+and their identifiers reserved. No such stall was observed in the measured runs.
 
 ### Per-(Topic, QoS) delivery order: an intended implementation property
 
@@ -3539,6 +3544,26 @@ Residuals:
   armed abort, a finite CAS or drain failure retries, and a proven generation discard
   retires the holder. What does NOT recover is process termination, a permanently leaked
   goroutine or blocked socket write, and indefinitely unavailable storage.
+
+  **A batched acquisition raises the population per crash.** A subscription's flush
+  acquires every admitted delivery's PUBLISH action in one transition before it writes the
+  first (`docs/ARCHITECTURE.md`, "A subscription's fresh deliveries are admitted in
+  batches"), so a process terminated between that transition and the writes leaves up to
+  16 acquired, unwritten sections per subscription holding their tokens, where the one-at-
+  a-time send left at most one. Each is the state described above (token, action record and
+  standing unsent marker, normally no persisted certificate) and ends the same ways; no
+  recovery specific to it exists. A connection that closes instead (a certified close,
+  graceful shutdown) ends every section, or its certificate clears them.
+
+  **The single acquisition still decides a lost response by reading the register.** A
+  retransmission's, a retained delivery's or a lone delivery's acquisition whose response
+  is lost re-reads its register and adopts its own token when it finds it there; finding
+  none, it gives the attempt up. A request that was still in flight then and lands after
+  that read leaves a token no holder drains, with the cost and the ends stated above. The
+  batched acquisition does not decide that way: it settles every submitted attempt by its
+  receipt (the create-only abort makes never-landed permanent), and an attempt it cannot
+  settle is carried by the custody dispatcher until it can, so the batch adds no such
+  token. Converting the single route the same way is not done here.
 
   There is deliberately no lease, TTL or steal, and that is not conservatism: a broker can
   pause AFTER its own expiry check and resume into the same stale write, and an MQTT client

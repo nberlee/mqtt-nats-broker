@@ -9458,12 +9458,31 @@ reads](findings/resolved.md#f-054).
   fell from 28.4 to 5.8 ms per delivery, but each delivery still makes two atomic commits
   (acquisition, completion), an atomic batch costs about 6 ms on the pinned server however
   small (plain store write 0.36 ms), and back-to-back acquisitions now overlap the client's
-  completions. Remaining: batch the acquisition too (several send sections open at once, the
-  transmission-lifecycle audit consult 1 called separate), measured against the 6548ed9
-  baseline. Record: [Batched
-  admission](findings/nats-platform.md#batched-admission-2026-10-28); residual in
+  completions. The remainder then was batching the acquisition too (several send sections
+  open at once, the transmission-lifecycle audit consult 1 called separate), measured against
+  the 6548ed9 baseline: landed below. Record: [Batched
+  admission](findings/nats-platform.md#batched-admission-2026-10-28). **Acquisition
+  batching landed 2026-10-28; the item stays OPEN a second time** (consult C1 of the
+  acquisition lane): the gate is met standalone and missed on R3. Done: a flush's admitted
+  deliveries are all opened and their PUBLISH actions acquired in one acquire-action
+  transition (`opAcquireActions`, one authority revision, one token member and action
+  record per delivery), every submitted attempt settled by its receipt, an unresolved one
+  carried by the custody dispatcher as an owed settlement, stale-only refusals under the
+  contention extension; then each written and ended in offer order, no later section
+  recording intent once the connection's output is sealed. docs/ARCHITECTURE.md "A
+  subscription's fresh deliveries are admitted in batches". Measured (`make
+  bench-outbound`, three interleaved runs each against a same-day 6548ed9 baseline): QoS 1
+  burst of 500 25.3 -> 60.6 msg/s standalone (2.40x), 46.1 -> 89.5 on R3 (1.94x; the R3
+  baseline's runs spread 34.9-46.7 and measured 35.8 the day before, context and not an
+  exception); QoS 2 1.82x / 1.58x; four subscribers 2.48x / 1.74x; at rest 1.71x / 1.68x;
+  nothing delivered twice. Remaining: measure the completion's cost and evaluate batching
+  back-to-back acknowledgement advances (each PUBACK is one advance-exchange atomic commit
+  on the client's read loop), keeping each exchange's checks and acknowledgement order.
+  Not an alpha blocker. Record: [Batched
+  acquisition](findings/nats-platform.md#batched-acquisition-2026-10-28); residual in
   docs/CONFORMANCE.md "Outbound QoS 1/2 delivery rate per subscriber". The atomic-batch
-  latency is a candidate upstream performance report, evidence in the record.
+  latency is a candidate upstream performance report, evidence in the batched-admission
+  record.
 
 ### Connection close
 

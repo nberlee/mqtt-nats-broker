@@ -742,26 +742,43 @@ func mqttActionPermittedAtPhase(qos byte, phase mqttExchangePhase, kind mqttActi
 	return fmt.Errorf("an exchange was asked to emit an unsupported packet %q", kind)
 }
 
-// mqttAcquireActionTransition assembles the transition that acquires one action.
-func mqttAcquireActionTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
-	a *mqttOutboundAction) (*mqttAuthorityTransition, error) {
+// mqttAcquireActionsTransition assembles the transition that acquires one action, or several
+// under ONE authority revision: a subscription's flush acquires every admitted delivery's PUBLISH
+// together. Each action is its own create-only record on its own acquisition counter, attributed
+// to this one transition; the write boundary judges every action, and every token member beside
+// it, per acquisition.
+func mqttAcquireActionsTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, op string,
+	acts []*mqttOutboundAction) (*mqttAuthorityTransition, error) {
 	if prev == nil {
 		return nil, fmt.Errorf("acquiring an action requires the authority it is acquired under")
 	}
-	if a == nil {
+	if len(acts) == 0 {
 		return nil, fmt.Errorf("acquiring an action requires the action")
 	}
-	if a.AcqTxn != txn {
-		return nil, fmt.Errorf("the action names acquiring transition %q, but this transition is %q",
-			a.AcqTxn, txn)
-	}
-	if a.Gen != prev.Gen {
-		return nil, fmt.Errorf("the action is acquired in generation %q but its authority carries %q",
-			a.Gen, prev.Gen)
-	}
-	body, err := json.Marshal(a)
-	if err != nil {
-		return nil, err
+	extra := make([]mqttTransitionMember, 0, len(acts))
+	for _, a := range acts {
+		if a == nil {
+			return nil, fmt.Errorf("acquiring an action requires the action")
+		}
+		if a.AcqTxn != txn {
+			return nil, fmt.Errorf("the action names acquiring transition %q, but this transition is %q",
+				a.AcqTxn, txn)
+		}
+		if a.Gen != prev.Gen {
+			return nil, fmt.Errorf("the action is acquired in generation %q but its authority carries %q",
+				a.Gen, prev.Gen)
+		}
+		body, err := json.Marshal(a)
+		if err != nil {
+			return nil, err
+		}
+		// Create-only on the acquisition counter, so a retransmission is a NEW action rather
+		// than an overwrite of the one that may still be executing.
+		extra = append(extra, mqttTransitionMember{
+			subj:   mqttActionSubject(getHash(prev.ID), a.Gen, a.Nonce, a.Acq),
+			expect: 0,
+			body:   body,
+		})
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
@@ -774,13 +791,7 @@ func mqttAcquireActionTransition(prev *mqttOutboundAuthority, prevSeq uint64, tx
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
 		},
-		// Create-only on the acquisition counter, so a retransmission is a NEW action rather
-		// than an overwrite of the one that may still be executing.
-		Extra: []mqttTransitionMember{{
-			subj:   mqttActionSubject(getHash(prev.ID), a.Gen, a.Nonce, a.Acq),
-			expect: 0,
-			body:   body,
-		}},
+		Extra: extra,
 	}, nil
 }
 

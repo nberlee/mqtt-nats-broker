@@ -1533,3 +1533,65 @@ isolated runs on either tree; it is a recovery path this change does not touch. 
 reproduced, so not fixed: its assertion now reports the custody ledger's exchanges,
 admissions and uncertain subjects, so a recurrence names the holder (a read that timed out
 under the pod's memory pressure would be held as an uncertain subject, by design).
+
+## Batched acquisition (2026-10-28)
+
+The second part of the section 2 roadmap item "Admit several deliveries per subscription in
+one batch": the PUBLISH action acquisition of a flush, batched. The item stays OPEN: the
+acceptance gate (twice the QoS 1 burst rate of a same-day 6548ed9 baseline, by the ratio of
+three-run medians, standalone and R3 separately) is met standalone and missed on R3.
+
+### What changed
+
+docs/ARCHITECTURE.md, "A subscription's fresh deliveries are admitted in batches": after a
+flush's admission every admitted delivery's send section is opened and their actions are
+acquired in one acquire-action transition (one authority revision, one token member and
+one action record per delivery); every submitted attempt is settled by its receipt, an
+unresolved one carried by the custody dispatcher as an owed settlement; then each section
+is written and ended in offer order, and none records intent once the connection's output
+is sealed.
+
+### Measured
+
+`make bench-outbound`, the base tree (6548ed9) and the change interleaved, three runs each,
+msg/s:
+
+| Case | Rig | Base | Change | Median ratio |
+|---|---|---|---|---|
+| QoS 1, one subscriber, 500 | standalone | 25.7, 25.3, 25.1 | 60.6, 62.6, 58.0 | 2.40 |
+| QoS 1, one subscriber, 500 | R3 | 46.1, 34.9, 46.7 | 90.5, 67.3, 89.5 | 1.94 |
+| QoS 2, one subscriber, 200 | standalone | 10.9, 14.1, 14.6 | 27.1, 22.5, 25.6 | 1.82 |
+| QoS 2, one subscriber, 200 | R3 | 20.8, 29.2, 20.9 | 33.1, 38.6, 21.2 | 1.58 |
+| QoS 1, four subscribers, 200 each | standalone | 42.0, 41.9, 42.1 | 101.7, 105.6, 104.2 | 2.48 |
+| QoS 1, four subscribers, 200 each | R3 | 121.0, 123.3, 127.0 | 215.1, 203.9, 269.4 | 1.74 |
+| QoS 1, 20 at rest after 300 | standalone | 21.5, 24.1, 24.7 | 37.9, 47.0, 41.1 | 1.71 |
+| QoS 1, 20 at rest after 300 | R3 | 31.1, 34.3, 30.1 | 61.6, 52.1, 49.6 | 1.68 |
+
+Every row held its oracle; no change run retransmitted a message or delivered one twice.
+Requests per delivery on the QoS 1 burst: 115-118 to 71-73 standalone, 103-107 to 66-71 on
+R3; contention waits 32-36 to 5-11 standalone. The slowest change R3 burst run (67.3) is
+uniformly slow across its ten windows (52-72), the shape of the slow base R3 run (34.9,
+windows 32-34 against 41-47 in the other two); the batched-admission record's base R3 runs
+on the same commit were 34.8, 35.8, 46.4. A single run before the measurement gave 57.1 /
+96.9. Consult C1 kept the gate as written: the spread is context, not an exception.
+
+### Mutations
+
+Fifteen, each killed by its paired test in `outbound_acquisition_batch_test.go`: the
+boundary's action-without-token and two-actions-for-one-exchange refusals removed; the
+adoption reading the pre-commit sequence; a failed read-back withdrawing ownership;
+settlement by a register read instead of the receipt; sections ended after the loop instead
+of each after its write; the aggregate end removed; the sealed-output check removed;
+composition under the serving authority's tenure; abandoning a contended batch; keeping a
+participant whose premise failed; dropping fall-outs; writing in reverse order; composing
+one token member only; not recording an unresolved attempt; the owed settlement not
+draining. One more (the planned skip of a section end's drain while an attempt is owed)
+survived because the owed record drains each exact token after a landed receipt anyway, and
+that flag was deleted.
+
+### Remaining
+
+Each QoS 1 delivery still makes one atomic commit of its own, its completion (one
+advance-exchange per PUBACK on the client's read loop); whether back-to-back advances can
+share one, keeping each exchange's checks and acknowledgement order, is the item's open
+part.

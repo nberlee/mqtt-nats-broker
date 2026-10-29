@@ -1086,7 +1086,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 		Kind: mqttActionPublish, PI: 7,
 		Run: bind.run, Conn: bind.conn, Tenure: auth.Tenure, AcqTxn: "txn-a1",
 	}
-	atr, err := mqttAcquireActionTransition(tr.Auth, xseq, "txn-a1", "op-a1", act)
+	atr, err := mqttAcquireActionsTransition(tr.Auth, xseq, "txn-a1", "op-a1", []*mqttOutboundAction{act})
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}

@@ -987,43 +987,120 @@ type mqttPubRelRebind struct {
 // The action is returned only with a nil error: an ambiguous outcome is resolved by rereading the
 // register, and an acquisition adopted that way never emits.
 func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome, *mqttOutboundAction, error) {
-	if r == nil {
+	out, acts, err := jsa.opAcquireActions([]*mqttAcquireActionRequest{r})
+	if err != nil {
+		return out, nil, err
+	}
+	return out, acts[0], nil
+}
+
+// opAcquireActions acquires several emitting operations in ONE authority transition: a
+// subscription's flush acquires every admitted delivery's PUBLISH together, because an atomic
+// batch costs the store about the same however few members it carries. Every request is judged
+// exactly as a single acquisition is, against the one authority read; they must share the
+// client, epoch, entitlement, binding and transition, and name distinct exchanges and
+// identifiers. opAcquireAction is its one-request case.
+//
+// The actions come back in request order, with a nil error or with a commit error (the attempt was
+// submitted and may have landed). The outcome carries the attempt's handle on every error after
+// composition, so a caller settles an unconfirmed attempt by its receipt rather than by reading
+// what it may have written.
+func (jsa *mqttJSA) opAcquireActions(reqs []*mqttAcquireActionRequest) (mqttOpOutcome, []*mqttOutboundAction, error) {
+	if len(reqs) == 0 || reqs[0] == nil {
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action requires the request")
 	}
-	auth, authSeq, err := jsa.servingAuthority(r.ID, r.Epoch)
+	r0 := reqs[0]
+	seen := make(map[string]struct{}, len(reqs))
+	seenPI := make(map[uint16]struct{}, len(reqs))
+	for _, r := range reqs {
+		if r == nil {
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action requires the request")
+		}
+		if r.ID != r0.ID || r.Epoch != r0.Epoch || r.Gen != r0.Gen || r.Tenure != r0.Tenure ||
+			r.Txn != r0.Txn || r.Op != r0.Op || r.Binding != r0.Binding {
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring actions together for %q requires one client, "+
+				"entitlement, connection and transition", r0.ID)
+		}
+		if _, dup := seen[r.Nonce]; dup {
+			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring two actions for exchange %q in one transition", r.Nonce)
+		}
+		seen[r.Nonce] = struct{}{}
+		if r.Register != nil {
+			if _, dup := seenPI[r.Register.PI]; dup {
+				return mqttOpOutcome{}, nil, fmt.Errorf("acquiring two actions on identifier %d in one transition",
+					r.Register.PI)
+			}
+			seenPI[r.Register.PI] = struct{}{}
+		}
+	}
+	auth, authSeq, err := jsa.servingAuthority(r0.ID, r0.Epoch)
 	if err != nil {
 		return mqttOpOutcome{}, nil, err
 	}
-	if auth.Gen != r.Gen || auth.Tenure != r.Tenure {
+	if auth.Gen != r0.Gen || auth.Tenure != r0.Tenure {
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for %q under %q/%q: the standing authority "+
 			"carries %q/%q, so this acquisition belongs to an entitlement that has moved on: %w",
-			r.ID, r.Gen, r.Tenure, auth.Gen, auth.Tenure, errMQTTEntitlementEnded)
+			r0.ID, r0.Gen, r0.Tenure, auth.Gen, auth.Tenure, errMQTTEntitlementEnded)
 	}
-	if r.Binding == nil {
-		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for %q requires the connection that will emit it", r.ID)
+	if r0.Binding == nil {
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for %q requires the connection that will emit it", r0.ID)
 	}
+	acts := make([]*mqttOutboundAction, 0, len(reqs))
+	toks := make([]mqttTransitionMember, 0, len(reqs))
+	for _, r := range reqs {
+		a, tok, cerr := jsa.composeAcquisition(auth, r)
+		if cerr != nil {
+			return mqttOpOutcome{}, nil, cerr
+		}
+		acts = append(acts, a)
+		toks = append(toks, tok)
+	}
+	tr, terr := mqttAcquireActionsTransition(auth, authSeq, r0.Txn, r0.Op, acts)
+	if terr != nil {
+		return mqttOpOutcome{}, nil, terr
+	}
+	tr.Extra = append(tr.Extra, toks...)
+	// THE CERTIFICATE'S CONTEXT IS REGISTERED BEFORE THE BATCH IS SENT (F-105 8c): from here on
+	// this connection may hold a token, whether or not this call learns that it landed.
+	if rerr := r0.Binding.registerAcquisition(jsa.newCertPersistCtx(r0.ID, r0.Epoch, auth.Gen)); rerr != nil {
+		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: %w", r0.Nonce, rerr)
+	}
+	out, cerr := jsa.commitOp(tr)
+	if cerr != nil {
+		// THE COMPOSED ACTIONS COME BACK WITH A COMMIT ERROR, beside the attempt's handle: a caller
+		// that settles the attempt by its receipt and finds it landed holds exactly what landed.
+		return out, acts, cerr
+	}
+	return out, acts, nil
+}
+
+// composeAcquisition judges one acquisition against the standing authority and composes its
+// action record and its register's token member.
+func (jsa *mqttJSA) composeAcquisition(auth *mqttOutboundAuthority, r *mqttAcquireActionRequest) (
+	*mqttOutboundAction, mqttTransitionMember, error) {
+	var tok mqttTransitionMember
 	if r.Acq == 0 {
-		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q requires its acquisition counter", r.Nonce)
+		return nil, tok, fmt.Errorf("acquiring an action for exchange %q requires its acquisition counter", r.Nonce)
 	}
 	if r.Register == nil {
-		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q requires the register its "+
+		return nil, tok, fmt.Errorf("acquiring an action for exchange %q requires the register its "+
 			"output-custody token is installed on: an action record alone excludes no second acquisition", r.Nonce)
 	}
 	x, _, lerr := jsa.loadOutboundExchange(r.ID, r.Epoch, auth.Gen, r.Nonce)
 	if lerr != nil {
-		return mqttOpOutcome{}, nil, lerr
+		return nil, tok, lerr
 	}
 	// WHICH PACKET THIS EXCHANGE MAY EMIT is decided from its stored phase, through the one
 	// function that states that relation: a PUBLISH only while the delivery is unanswered, a
 	// PUBREL only once a successful PUBREC transferred ownership.
 	if perr := mqttActionPermittedAtPhase(x.QoS, x.Phase, r.Kind); perr != nil {
-		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
+		return nil, tok, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
 	}
 	// NO OUTPUT OVER A CONTRADICTORY PAIR: a shared register whose exchange does not name exactly
 	// its acquisition (or any register whose exchange names one it may not) is a shape this broker
 	// does not write, refused BEFORE any action exists.
 	if perr := mqttCheckSharedAcqPair(r.Register, x); perr != nil {
-		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
+		return nil, tok, fmt.Errorf("exchange %q may not acquire a %q: %w", r.Nonce, r.Kind, perr)
 	}
 	// AND WHETHER IT MAY BE ACQUIRED NOW is the completion rules' question, asked as
 	// ACQUIRING MORE OUTPUT for BOTH packets.
@@ -1038,20 +1115,16 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		Op: mqttOpAcquireMore, Auth: auth, Exchange: x, Outstanding: r.Outstanding,
 	})
 	if verr != nil {
-		return mqttOpOutcome{}, nil, verr
+		return nil, tok, verr
 	}
 	if v != mqttCompletionProceed {
-		return mqttOpOutcome{}, nil, fmt.Errorf("exchange %q at phase %d may not acquire a %q now (verdict %d)",
+		return nil, tok, fmt.Errorf("exchange %q at phase %d may not acquire a %q now (verdict %d)",
 			r.Nonce, x.Phase, r.Kind, v)
 	}
 	a := &mqttOutboundAction{
 		ID: r.ID, Epoch: r.Epoch, Gen: auth.Gen, Nonce: r.Nonce, Acq: r.Acq,
 		Kind: r.Kind, PI: x.PI,
 		Run: r.Binding.run, Conn: r.Binding.conn, Tenure: auth.Tenure, AcqTxn: r.Txn,
-	}
-	tr, terr := mqttAcquireActionTransition(auth, authSeq, r.Txn, r.Op, a)
-	if terr != nil {
-		return mqttOpOutcome{}, nil, terr
 	}
 	{
 		// THE OUTPUT-CUSTODY TOKEN, INSTALLED IN THE SAME BATCH (F-105 row 2, §4.3 point 1). The
@@ -1061,12 +1134,12 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		// describe the SAME acquisition, so their exchange identity, identifier and counter agree
 		// — an action record acquired beside a token for a different slot is refused.
 		if r.Register.ActionToken != _EMPTY_ {
-			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: the register on "+
+			return nil, tok, fmt.Errorf("acquiring an action for exchange %q: the register on "+
 				"identifier %d already carries a live token, so a second acquisition may not overwrite it",
 				r.Nonce, r.Register.PI)
 		}
 		if r.Register.Lin != r.Nonce || r.Register.PI != x.PI || r.Register.Acq+1 != r.Acq {
-			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q at acquisition %d: its "+
+			return nil, tok, fmt.Errorf("acquiring an action for exchange %q at acquisition %d: its "+
 				"token member names obligation %q/identifier %d at counter %d, which is not the same "+
 				"acquisition", r.Nonce, r.Acq, r.Register.Lin, r.Register.PI, r.Register.Acq+1)
 		}
@@ -1081,7 +1154,7 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 		// standing marker is a genuine cancellation and the acquisition is refused there.
 		if r.Register.CancelOrigin == mqttCancelOriginPendingCreate {
 			// A pending fence is never acquired: it is not an exchange's identity carrier (F-088).
-			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: the register is a "+
+			return nil, tok, fmt.Errorf("acquiring an action for exchange %q: the register is a "+
 				"pending cancellation fence, which no acquisition may take", r.Nonce)
 		}
 		if r.Register.State == mqttInflightPublish && r.Register.Cancelled && !r.Register.Retired {
@@ -1093,7 +1166,7 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 			if r.Kind != mqttActionPubRel || r.Register.State != mqttInflightPubRelIntended ||
 				r.Rebind.Durable == _EMPTY_ || r.Rebind.StreamSeq == 0 ||
 				(r.Register.PubRelDurable != _EMPTY_ && r.Register.PubRelDurable != r.Rebind.Durable) {
-				return mqttOpOutcome{}, nil, fmt.Errorf("acquiring a %q action for exchange %q: a canonical "+
+				return nil, tok, fmt.Errorf("acquiring a %q action for exchange %q: a canonical "+
 					"rebind is the PUBREL direct arrow from an owed slot, and slot %q naming %q may not "+
 					"take %s/%d", r.Kind, r.Nonce, string(r.Register.State), r.Register.PubRelDurable,
 					r.Rebind.Durable, r.Rebind.StreamSeq)
@@ -1103,32 +1176,23 @@ func (jsa *mqttJSA) opAcquireAction(r *mqttAcquireActionRequest) (mqttOpOutcome,
 			next.PubRelStreamSeq = r.Rebind.StreamSeq
 		}
 		if kerr := mqttActionKindRegisterState(r.Kind, r.Register.State, next.State); kerr != nil {
-			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: %w", r.Nonce, kerr)
+			return nil, tok, fmt.Errorf("acquiring an action for exchange %q: %w", r.Nonce, kerr)
 		}
 		if verr := mqttValidateInflightShape(&next); verr != nil {
-			return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: its token member is an "+
+			return nil, tok, fmt.Errorf("acquiring an action for exchange %q: its token member is an "+
 				"unsupported register shape: %w", r.Nonce, verr)
 		}
 		body, merr := json.Marshal(&next)
 		if merr != nil {
-			return mqttOpOutcome{}, nil, merr
+			return nil, tok, merr
 		}
-		tr.Extra = append(tr.Extra, mqttTransitionMember{
+		tok = mqttTransitionMember{
 			subj:   mqttInflightSubject(getHash(r.ID), auth.Gen, r.Register.PI),
 			expect: r.RegisterSeq,
 			body:   body,
-		})
+		}
 	}
-	// THE CERTIFICATE'S CONTEXT IS REGISTERED BEFORE THE BATCH IS SENT (F-105 8c): from here on
-	// this connection may hold a token, whether or not this call learns that it landed.
-	if rerr := r.Binding.registerAcquisition(jsa.newCertPersistCtx(r.ID, r.Epoch, auth.Gen)); rerr != nil {
-		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: %w", r.Nonce, rerr)
-	}
-	out, cerr := jsa.commitOp(tr)
-	if cerr != nil {
-		return out, nil, cerr
-	}
-	return out, a, nil
+	return a, tok, nil
 }
 
 // errMQTTEntitlementEnded marks an acquisition refused because the standing authority's tenure is

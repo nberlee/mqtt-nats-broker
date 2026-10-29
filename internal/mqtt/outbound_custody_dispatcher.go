@@ -220,6 +220,9 @@ const (
 	// mqttCustodyUnitRelease: ONE release-holds batch over the owed completions
 	// (outbound_release_holds.go).
 	mqttCustodyUnitRelease
+	// mqttCustodyUnitAcquireSettle: ONE settlement of an owed batched acquisition attempt
+	// (outbound_acquisition_batch.go).
+	mqttCustodyUnitAcquireSettle
 )
 
 // mqttCustodyQueue is the dispatcher queue a unit was taken from, in the round-robin order.
@@ -233,7 +236,8 @@ const (
 	mqttCustodyQueueContinuity
 	mqttCustodyQueueFloor
 	mqttCustodyQueueRelease
-	mqttCustodyQueues = 7
+	mqttCustodyQueueAcquireSettle
+	mqttCustodyQueues = 8
 )
 
 type mqttCustodyUnit struct {
@@ -241,6 +245,7 @@ type mqttCustodyUnit struct {
 	target mqttCustodyTarget
 	w      *mqttWithdrawOwed
 	cont   *mqttAdmissionContinuity
+	acq    *mqttAcquireSettleOwed
 	// queue is where the unit came from: a unit a quit leaves unrun goes back there.
 	queue mqttCustodyQueue
 }
@@ -323,7 +328,8 @@ func (sess *mqttSession) rearmCustodyAfterReopen() {
 	// A throttled census is owed too: the tick a closing incarnation consumed was its only arm.
 	owed := len(sess.custodyHints) > 0 || sess.custodyPassWanted || len(sess.custodyPassQueue) > 0 ||
 		sess.custodyDemand || len(sess.custodyRetry) > 0 || len(sess.withdrawOwed) > 0 ||
-		len(sess.admissionContinuity) > 0 || (sess.custody != nil && sess.custody.censusWanted) ||
+		len(sess.admissionContinuity) > 0 || len(sess.acquireSettleOwed) > 0 ||
+		(sess.custody != nil && sess.custody.censusWanted) ||
 		sess.floorWanted || len(sess.releaseOwed) > 0
 	sess.mu.Unlock()
 	if owed {
@@ -436,6 +442,11 @@ func (sess *mqttSession) custodyItemDueLocked(now time.Time) bool {
 			return true
 		}
 	}
+	for o := range sess.acquireSettleOwed {
+		if mqttCustodyDue(o.nextEligibleAt, now) {
+			return true
+		}
+	}
 	return sess.floorDueLocked(now) || sess.releaseDueLocked(now)
 }
 
@@ -510,6 +521,12 @@ func (sess *mqttSession) nextCustodyUnits(gen, epoch string) ([]mqttCustodyUnit,
 			conts = append(conts, c)
 		}
 	}
+	var settles []*mqttAcquireSettleOwed
+	for o := range sess.acquireSettleOwed {
+		if mqttCustodyDue(o.nextEligibleAt, now) {
+			settles = append(settles, o)
+		}
+	}
 	floorDue := sess.floorDueLocked(now)
 	releaseDue := sess.releaseDueLocked(now)
 	queues := mqttCustodyQueues
@@ -580,6 +597,14 @@ func (sess *mqttSession) nextCustodyUnits(gen, epoch string) ([]mqttCustodyUnit,
 					units = append(units, mqttCustodyUnit{kind: mqttCustodyUnitRelease, queue: q})
 					progressed = true
 				}
+			case mqttCustodyQueueAcquireSettle:
+				if idx[7] < len(settles) {
+					o := settles[idx[7]]
+					idx[7]++
+					o.nextEligibleAt = now.Add(capd) // decided by the unit's outcome
+					units = append(units, mqttCustodyUnit{kind: mqttCustodyUnitAcquireSettle, acq: o, queue: q})
+					progressed = true
+				}
 			}
 		}
 		if !progressed {
@@ -637,6 +662,10 @@ func (sess *mqttSession) requeueCustodyUnits(gen string, units []mqttCustodyUnit
 			if len(sess.releaseOwed) > 0 {
 				sess.releaseDueAt = now
 			}
+		case mqttCustodyQueueAcquireSettle:
+			if _, ok := sess.acquireSettleOwed[u.acq]; ok {
+				u.acq.nextEligibleAt = now
+			}
 		}
 	}
 	if len(pass) > 0 {
@@ -667,6 +696,8 @@ func (sess *mqttSession) runCustodyUnit(gen, epoch string, ledger *mqttCustodyLe
 		sess.runFloorUnit(gen, epoch)
 	case mqttCustodyUnitRelease:
 		sess.runReleaseUnit(gen, epoch)
+	case mqttCustodyUnitAcquireSettle:
+		sess.runAcquireSettleOwedUnit(gen, u.acq)
 	}
 	return false
 }
@@ -787,6 +818,9 @@ func (sess *mqttSession) exitCustodyDispatcher(srv *Server, gen string, mayConti
 	}
 	for _, c := range sess.admissionContinuity {
 		earliest(c.nextEligibleAt)
+	}
+	for o := range sess.acquireSettleOwed {
+		earliest(o.nextEligibleAt)
 	}
 	if sess.floorWanted {
 		earliest(sess.floorDueAt)

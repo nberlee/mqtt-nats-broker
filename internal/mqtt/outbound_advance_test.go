@@ -789,7 +789,7 @@ func TestF105NoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 		Kind: mqttActionPublish, PI: 7,
 		Run: bind.run, Conn: bind.conn, Tenure: auth.Tenure, AcqTxn: "txn-acq",
 	}
-	acq, aerr := mqttAcquireActionTransition(atr.Auth, admSeq, "txn-acq", "op-acq", act)
+	acq, aerr := mqttAcquireActionsTransition(atr.Auth, admSeq, "txn-acq", "op-acq", []*mqttOutboundAction{act})
 	if aerr != nil {
 		t.Fatalf("assembling the acquisition failed: %v", aerr)
 	}

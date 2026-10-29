@@ -817,8 +817,8 @@ func TestPendingEntryStructureEngineReportsEveryBypass(t *testing.T) {
 // whole-value copy (DEREFCOPY).
 var pendingStructureFieldWrites = map[string]int{
 	"abandonInflightRegister|regPending|RESIDENT":                   1,
-	"acquirePublishAction|slot.acq|RESIDENT":                        1,
-	"acquirePublishAction|slot.seq|RESIDENT":                        1,
+	"adoptAcquiredPublishAction|slot.acq|RESIDENT":                  1,
+	"adoptAcquiredPublishAction|slot.seq|RESIDENT":                  1,
 	"advancePublishTerminal|slot.seq|RESIDENT":                      1,
 	"advancePublishTerminal|slot.state|RESIDENT":                    1,
 	"advanceResidentAfterClearanceLocked|regSeq|RESIDENT":           1,
@@ -956,7 +956,7 @@ var pendingStructureFieldWrites = map[string]int{
 }
 var pendingStructureEscapes = map[string]int{
 	"abandonInflightRegister|ARG delete":                            1,
-	"acquirePublishAction|ARG handOffAcknowledgedPublish":           1,
+	"adoptAcquiredPublishAction|ARG handOffAcknowledgedPublish":     1,
 	"admitRetainedCopyOnce|ARG mqttExpectExactly":                   1,
 	"admitRetainedCopyOnce|ARG mqttPromoteRetainedLanded":           1,
 	"admitRetainedCopyOnce|ARG setPendingLocked":                    1,
@@ -1036,7 +1036,7 @@ var pendingStructureEscapes = map[string]int{
 	"mqttDeliverQoS12Offer|ARG finalizeDrainSource":                     1, // a retransmission's expiry drop (a collected delivery's is the flush's)
 	"mqttDeliverQoS12Offer|ARG provenUnsentReleasableLocked":            1,
 	"flush|ARG finalizeDrainSource":                                     1, // a collected delivery's expiry drop, judged at its flush
-	"sendAdmittedPublish|ARG finalizeDrainSource":                       1, // the oversize disposal of a proven-unsent delivery
+	"transmitAcquired|ARG finalizeDrainSource":                          1, // the oversize disposal of a proven-unsent delivery
 	"mqttDeliverQ2AffineCb|ARG provenUnsentReleasableLocked":            1,
 	"mqttExpectCaptured|ARG mqttExpectExactly":                          1,
 	"mqttExpectExactly|INLIT":                                           1,
@@ -1141,6 +1141,7 @@ var pendingStructureEscapes = map[string]int{
 	"resolvePubRelIntent|ARG bindAbandonedAckOrigin":                    1,
 	"resolvePubRelIntent|ARG finishAbandonedAckResolution":              1,
 	"resolveUnacquiredPublishAction|ARG handOffAcknowledgedPublish":     3,
+	"releaseUnacquiredPublishAction|ARG handOffAcknowledgedPublish":     1, // a batched acquisition known not to have landed
 	"retainAndReconcileTerminal|ARG mqttExpectExactly":                  1,
 	"retainAndReconcileTerminal|ARG mqttNewTerminalReservation":         1,
 	"retainAndReconcileTerminal|ARG setPendingLocked":                   1,

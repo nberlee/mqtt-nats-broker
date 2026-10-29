@@ -104,7 +104,7 @@ var f088FrozenCancelledReaders = map[string]struct {
 	"mqttClearsCancellation": {2, f088CancelledRefutedClearance, "the SHAPE half of the clearance; the boundary's evidence half requires the marker absent"},
 	"mqttAdvanceExchangeAckTransition": {1, f088CancelledRefutedClearance,
 		"the acknowledgement's builder clears an occupant cancellation; checkRefutedCancellation admits it only on the marker's absence"},
-	"opAcquireAction": {1, f088CancelledRefutedClearance,
+	"composeAcquisition": {1, f088CancelledRefutedClearance,
 		"a retransmission's acquisition clears an occupant cancellation; refused at the boundary while the marker stands"},
 	"markInflightRegisterCancelled": {1, f088CancelledIdempotence, "an already-cancelled occupant of ours: AlreadySet, nothing destroyed"},
 	"markInflightRegisterCancelledPending": {1, f088CancelledIdempotence,

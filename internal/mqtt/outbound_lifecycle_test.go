@@ -66,7 +66,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		Kind: mqttActionPublish, PI: 7,
 		Run: bind.run, Conn: bind.conn, Tenure: auth.Tenure, AcqTxn: "txn-acq",
 	}
-	acq, err := mqttAcquireActionTransition(atr.Auth, admSeq, "txn-acq", "op-acq", act)
+	acq, err := mqttAcquireActionsTransition(atr.Auth, admSeq, "txn-acq", "op-acq", []*mqttOutboundAction{act})
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}

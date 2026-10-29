@@ -256,6 +256,7 @@ func (s *Server) runShutdown() {
 	// on the record that the next start cannot tell from a peer's. Each HOLDER performs
 	// its own drain — nothing here clears a token it does not hold (F-098).
 	s.closePublishSendBarrier()
+	s.finishOwedAcquireSettles()
 	s.finishOwedDrains()
 	// The PUBREL side of the same obligation: an action whose drain could not resolve after
 	// admission closed has no timer left, and recovery cannot steal its token (round 5,

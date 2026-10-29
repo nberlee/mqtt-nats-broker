@@ -775,7 +775,41 @@ func TestRefusedRestoreRecordsItsWithheldDelivery(t *testing.T) {
 	})
 	defer restore()
 
-	hits := testRestoreFailExit(t, b.asm, "consumer", errRestoreExitInjected)
+	// THE OWED DELIVERY IS PARKED AT THE RESTORE GATE BEFORE THE RESTORE FAILS. The durable pushes
+	// it once the restored subscription is installed, and the refusal's teardown removes that
+	// subscription; a push that loses that race (a loaded machine) is never withheld at all. So the
+	// injected failure waits, bounded, until a delivery of this session is about to wait on a gate.
+	parked := make(chan struct{})
+	var parkOnce sync.Once
+	aboutToWait := func(s *mqttSession) {
+		if s.id == id {
+			parkOnce.Do(func() { close(parked) })
+		}
+	}
+	mqttTestGateAboutToWaitV.Store(&aboutToWait)
+	defer mqttTestGateAboutToWaitV.Store(nil)
+	var hits atomic.Int32
+	var sawParked atomic.Bool
+	b.asm.mu.Lock()
+	prevFail := b.asm.testRestoreFilterFail
+	b.asm.testRestoreFilterFail = func(gotExit, _ string) error {
+		if gotExit != "consumer" {
+			return nil
+		}
+		hits.Add(1)
+		select {
+		case <-parked:
+			sawParked.Store(true)
+		case <-time.After(10 * time.Second):
+		}
+		return errRestoreExitInjected
+	}
+	b.asm.mu.Unlock()
+	defer func() {
+		b.asm.mu.Lock()
+		b.asm.testRestoreFilterFail = prevFail
+		b.asm.mu.Unlock()
+	}()
 
 	cc, rr := testMQTTConnectV5(t, &mqttV5ConnInfo{
 		clientID:   id,
@@ -787,6 +821,9 @@ func TestRefusedRestoreRecordsItsWithheldDelivery(t *testing.T) {
 	}
 	if hits.Load() == 0 {
 		t.Fatal("the consumer exit was never reached, so this fixture proves nothing")
+	}
+	if !sawParked.Load() {
+		t.Fatal("no delivery was parked at the restore gate before the restore failed")
 	}
 	select {
 	case <-blocked:

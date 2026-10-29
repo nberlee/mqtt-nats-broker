@@ -524,6 +524,7 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 	}
 	found := map[string]int{}
 	skipped := 0
+	bound := testSectionBoundTransmitters(t)
 
 	for _, file := range testMQTTProductionFiles(t) {
 		fset := token.NewFileSet()
@@ -627,6 +628,12 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 					}
 					return true
 				})
+			}
+			// A SECTION-BOUND TRANSMITTER takes its opened PUBLISH section as a parameter, and its
+			// landmarks are its callers' (testSectionBoundTransmitters checks every one of them):
+			// a flush opens every section and arms their end before any is written.
+			if cl.begin == "beginSendLocked" && bound[fn.Name.Name] {
+				continue
 			}
 			bp, hasBegin := beginPos[cl.begin]
 			if !hasBegin || bp > site.Pos() {
@@ -1052,6 +1059,128 @@ func testDefersSendEnd(d *ast.DeferStmt) bool {
 		return !found
 	})
 	return found
+}
+
+// testSectionBoundTransmitters names the functions that frame a PUBLISH under a send section
+// handed to them (a parameter of type *mqttPublishSection), and checks the four facts that make
+// that section the one the pairing guard demands of an in-function enqueue:
+//
+//   - the section is constructed only in openPublishSection, which calls beginSendLocked;
+//   - its end method calls endPublishSend;
+//   - every call of such a transmitter is in a function that obtained the section from
+//     openPublishSection, and armed a defer calling the section's end, BEFORE the call;
+//   - such a transmitter exists and is called, so the extension checks something.
+func testSectionBoundTransmitters(t *testing.T) map[string]bool {
+	t.Helper()
+	type fnDecl struct {
+		fset *token.FileSet
+		fn   *ast.FuncDecl
+	}
+	var all []fnDecl
+	for _, file := range testMQTTProductionFiles(t) {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		for _, decl := range f.Decls {
+			if fn, _ := decl.(*ast.FuncDecl); fn != nil && fn.Body != nil {
+				all = append(all, fnDecl{fset, fn})
+			}
+		}
+	}
+	isSection := func(e ast.Expr) bool {
+		st, _ := e.(*ast.StarExpr)
+		if st == nil {
+			return false
+		}
+		id, _ := st.X.(*ast.Ident)
+		return id != nil && id.Name == "mqttPublishSection"
+	}
+	calls := func(body ast.Node, name string) (first token.Pos) {
+		ast.Inspect(body, func(n ast.Node) bool {
+			if c, _ := n.(*ast.CallExpr); c != nil && testCalleeName(c) == name && first == token.NoPos {
+				first = c.Pos()
+			}
+			return true
+		})
+		return first
+	}
+	transmitters := map[string]bool{}
+	constructors := map[string]bool{}
+	for _, d := range all {
+		if d.fn.Recv != nil && len(d.fn.Recv.List) == 1 && isSection(d.fn.Recv.List[0].Type) && d.fn.Name.Name == "end" {
+			if calls(d.fn.Body, "endPublishSend") == token.NoPos {
+				t.Errorf("(*mqttPublishSection).end does not call endPublishSend")
+			}
+		}
+		for _, f := range d.fn.Type.Params.List {
+			if isSection(f.Type) && calls(d.fn.Body, "mqttPreparePublishMsgTo") != token.NoPos {
+				transmitters[d.fn.Name.Name] = true
+			}
+		}
+		ast.Inspect(d.fn.Body, func(n ast.Node) bool {
+			if cl, _ := n.(*ast.CompositeLit); cl != nil {
+				if id, _ := cl.Type.(*ast.Ident); id != nil && id.Name == "mqttPublishSection" {
+					constructors[d.fn.Name.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	if len(constructors) != 1 || !constructors["openPublishSection"] {
+		t.Errorf("a PUBLISH send section is constructed in %v, want only openPublishSection", constructors)
+	}
+	for _, d := range all {
+		if d.fn.Name.Name == "openPublishSection" && calls(d.fn.Body, "beginSendLocked") == token.NoPos {
+			t.Errorf("openPublishSection does not call beginSendLocked")
+		}
+	}
+	bound := map[string]bool{}
+	for name := range transmitters {
+		callers := 0
+		ok := true
+		for _, d := range all {
+			ast.Inspect(d.fn.Body, func(n ast.Node) bool {
+				c, _ := n.(*ast.CallExpr)
+				if c == nil || testCalleeName(c) != name {
+					return true
+				}
+				callers++
+				open := calls(d.fn.Body, "openPublishSection")
+				var deferEnd token.Pos
+				ast.Inspect(d.fn.Body, func(m ast.Node) bool {
+					ds, _ := m.(*ast.DeferStmt)
+					if ds == nil || deferEnd != token.NoPos {
+						return true
+					}
+					if calls(ds.Call, "end") != token.NoPos {
+						deferEnd = ds.Pos()
+					}
+					return true
+				})
+				if open == token.NoPos || open > c.Pos() {
+					t.Errorf("%s: %s is called on a section this function did not open first", d.fset.Position(c.Pos()), name)
+					ok = false
+				}
+				if deferEnd == token.NoPos || deferEnd > c.Pos() {
+					t.Errorf("%s: %s is called before this function armed a deferred end of its sections",
+						d.fset.Position(c.Pos()), name)
+					ok = false
+				}
+				return true
+			})
+		}
+		if callers == 0 {
+			t.Errorf("section-bound transmitter %s has no caller", name)
+			ok = false
+		}
+		bound[name] = ok
+	}
+	if len(bound) == 0 {
+		t.Errorf("no section-bound transmitter was found, so the extension checks nothing")
+	}
+	return bound
 }
 
 func testCalleeName(call *ast.CallExpr) string {
