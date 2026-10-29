@@ -64,6 +64,68 @@ func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
 	c.mu.Unlock()
 }
 
+// mqttDisconnectBeforeClose sends a server-initiated DISCONNECT that ends the connection, as
+// mqttEnqueueDisconnect does, and seals the output gate behind it in the same write section, so it
+// is the last MQTT packet on the wire. It reports whether the DISCONNECT was COMPLETED on the
+// socket: only then may the reader linger to let the client read it (mqttLingerAfterDisconnect).
+// The one-DISCONNECT claim is taken under c.mu and never given back.
+//
+// No lock held on entry.
+func (c *client) mqttDisconnectBeforeClose(reason byte, reasonStr string) bool {
+	pkt := c.mqttBuildDisconnect(reason, reasonStr)
+	if pkt == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.mqttClaimDisconnectLocked() {
+		return false
+	}
+	return c.writeActionlessFrameSealing(pkt)
+}
+
+// mqttDisconnectLinger bounds how long the reader keeps reading after an error DISCONNECT; the
+// payload ceiling below bounds how much it reads.
+var mqttDisconnectLinger = newMQTTKnob(5 * time.Second)
+
+// mqttDisconnectLingerBytes is the payload ceiling of that drain: bytes returned by the transport's
+// Read, already-buffered unread input included. A resource ceiling, not a delivery guarantee.
+const mqttDisconnectLingerBytes = 1 << 20
+
+// mqttLingerAfterDisconnect keeps reading, and discarding, what the client still sends after the
+// server's error DISCONNECT, until the client closes, a read fails, the bound passes or the
+// ceiling is reached; the caller then closes as before.
+//
+// WHY: a client still sending when the server closes makes the server's TCP answer a reset, and a
+// reset fails the client's next send and may discard data it has not read yet — the DISCONNECT
+// included. A client walks every acknowledgement queued ahead of the DISCONNECT before it reads
+// it, answering each, so the server keeps absorbing what it sends until it is done.
+//
+// Nothing read is parsed: no packet of it has any effect. The bound closes the transport when it
+// passes (see below), so it holds on every transport.
+//
+// Runs on the reader, which owns the transport's reads; no other reader exists.
+func (c *client) mqttLingerAfterDisconnect(buffered int) {
+	nc := c.nc
+	if nc == nil {
+		return
+	}
+	// THE BOUND IS A CLOSE, not a deadline: past it the transport is closed, which ends a read in
+	// progress on every transport, and a transport write a read is performing with it (a TLS
+	// KeyUpdate reply, a WebSocket Pong or Close), whether or not the transport honours deadlines.
+	watchdog := time.AfterFunc(mqttDisconnectLinger.Get(), c.closeTransport)
+	defer watchdog.Stop()
+	total := buffered
+	buf := make([]byte, 32*1024)
+	for total < mqttDisconnectLingerBytes {
+		n, err := nc.Read(buf)
+		total += n
+		if err != nil {
+			return
+		}
+	}
+}
+
 // mqttNotifyTakenOver tells a displaced connection that its session was taken over (0x8E),
 // and it has exactly ONE caller: discardTakenOverClient, the tail of an in-process
 // same-client-ID replacement this broker holds both ends of.

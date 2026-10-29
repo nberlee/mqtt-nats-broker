@@ -816,8 +816,9 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		// save alone: a transaction that begins after its own mutation cannot make
 		// that mutation invisible to another writer. See sess_recordtx.go.
 		tok := sess.beginRecordTx()
+		stamp := time.Now().Unix()
 		sess.mu.Lock()
-		sess.disconnectedAt = time.Now().Unix()
+		sess.disconnectedAt = stamp
 		sess.mu.Unlock()
 		if err := sess.save(tok); err != nil {
 			c.Debugf("Unable to persist session expiry deadline: %v", err)
@@ -825,7 +826,10 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		if err := sess.endRecordTx(tok); err != nil {
 			c.Errorf("MQTT: %v", err)
 		}
-		asm.scheduleSessionExpiry(s, idHash, time.Duration(expiry)*time.Second)
+		// ARMED TO THE STAMP'S DEADLINE, not a relative interval: the fire re-reads the deadline
+		// and returns without re-arming when it is not yet due, so a timer earlier than the
+		// deadline would leave the cleanup to the periodic sweep.
+		asm.scheduleSessionExpiry(s, idHash, time.Until(mqttSessionExpiryDeadline(stamp, expiry)))
 	}
 
 	// Capture the persisted session-record sequence as the delayed-Will takeover

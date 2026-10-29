@@ -722,17 +722,27 @@ func TestDeliveryOfferHasOneUnflushedExit(t *testing.T) {
 
 // TestAdmissionBatchRefusedAfterATakeoverBeforeItsCommit: a successor tenure installed after the
 // batch captured its connection's entitlement, immediately before the batch reads the standing
-// authority, refuses the batch: none of its registers exists and nothing reaches the displaced
-// connection.
+// authority, refuses the batch: none of its registers exists and nothing admitted after the
+// takeover reaches the displaced connection. A backlog's first offer can arrive alone and be
+// admitted singly before the first batch; that delivery precedes the takeover and may arrive.
 func TestAdmissionBatchRefusedAfterATakeoverBeforeItsCommit(t *testing.T) {
 	rig := newTestBatchRig(t, "ab-takeover", 1, nil)
 	var moved atomic.Int32
 	var participants []string
 	var pmu sync.Mutex
+	var admittedBefore, before atomic.Int32
+	admitted := func(*mqttSession, uint16) {
+		if moved.Load() == 0 {
+			admittedBefore.Add(1)
+		}
+	}
+	mqttTestDeliveryAdmittedPauseV.Store(&admitted)
+	t.Cleanup(func() { mqttTestDeliveryAdmittedPauseV.Store(nil) })
 	mqttTestAdmitBatchBeforeAuthorityHook.Set(func(r *mqttAdmitPublishesRequest) {
 		if moved.Add(1) != 1 {
 			return
 		}
+		before.Store(admittedBefore.Load())
 		pmu.Lock()
 		for _, e := range r.Entries {
 			participants = append(participants, mqttInflightSubject(getHash(r.ID), r.Gen, e.Register.PI))
@@ -757,8 +767,21 @@ func TestAdmissionBatchRefusedAfterATakeoverBeforeItsCommit(t *testing.T) {
 	})
 	t.Cleanup(func() { mqttTestAdmitBatchBeforeAuthorityHook.Set(nil) })
 	rig.backlog(10)
-	if _, _, ok := testMQTTReadPacketReady(rig.sr, 2*time.Second); ok {
-		t.Fatalf("a delivery reached the connection whose tenure was displaced")
+	got := 0
+	for {
+		b, pl, ok := testMQTTReadPacketReady(rig.sr, 2*time.Second)
+		if !ok {
+			break
+		}
+		if b&mqttPacketMask == mqttPacketPub {
+			_, pi, _, _ := testMQTTGetPubMsgExEx(t, nil, rig.sr, b, pl, "ab/t", nil)
+			testMQTTSendPIPacket(mqttPacketPubAck, t, rig.sc, pi)
+			got++
+		}
+	}
+	if k := int(before.Load()); got > k {
+		t.Fatalf("%d deliveries reached the connection whose tenure was displaced, %d of them admitted "+
+			"before the takeover", got, k)
 	}
 	pmu.Lock()
 	defer pmu.Unlock()

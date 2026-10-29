@@ -51,18 +51,20 @@ type testForegroundSchedule struct {
 	// presend whose Op matches each entry (exact, or a prefix ending in "-"). The entry "admit"
 	// instead parks the next background attempt AT ITS ADMISSION, before its reads, so it reads
 	// only once released; its batch is the next background presend after that release.
-	park     []string
-	parked   []chan struct{} // closed when entry k parked
-	release  []chan struct{} // closed to release entry k
-	commit   []chan struct{} // closed when entry k's batch committed
-	parkTxn  []string
-	trigger  bool // the foreground under test is the next claim
-	window   bool // the claim under test is announced
-	claims   int
-	fails    int
-	inWindow []string // background admissions and commits observed inside the window
-	capture  int      // the admission-parked entry whose batch the next background presend is
-	depth    int      // announcements standing; the window closes when it returns to zero
+	park    []string
+	parked  []chan struct{} // closed when entry k parked
+	release []chan struct{} // closed to release entry k
+	commit  []chan struct{} // closed when entry k's batch committed
+	parkTxn []string
+	trigger bool // the foreground under test is the next claim
+	window  bool // the claim under test is announced
+	// windowStamp is the window's announcement, by the handshake's count of announcements.
+	windowStamp uint64
+	claims      int
+	fails       int
+	inWindow    []string // background admissions and commits observed inside the window
+	capture     int      // the admission-parked entry whose batch the next background presend is
+	depth       int      // announcements standing; the window closes when it returns to zero
 	// fails is how many claim attempts the schedule costs; by default one per parked entry.
 	wantFails int
 	// onClaim runs at the claim's first attempt, before the hold, for a schedule that releases
@@ -93,7 +95,7 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 		sch.commit = append(sch.commit, make(chan struct{}))
 		sch.parkTxn = append(sch.parkTxn, _EMPTY_)
 	}
-	announce := func(on bool) {
+	announce := func(on bool, stamp uint64) {
 		sch.mu.Lock()
 		defer sch.mu.Unlock()
 		if on {
@@ -104,6 +106,7 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 		switch {
 		case on && sch.trigger && !sch.window && sch.claims == 0:
 			sch.window = true
+			sch.windowStamp = stamp
 			sch.events = append(sch.events, "announce")
 		case !on && sch.window && sch.depth == 0:
 			// Overlapping foreground scopes keep the window open: background waits for all of them.
@@ -112,9 +115,12 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 			sch.events = append(sch.events, "release")
 		}
 	}
-	admit := func() {
+	admit := func(stamp uint64) {
 		sch.mu.Lock()
-		if sch.window {
+		// DECIDED INSIDE THE WINDOW, by the announcement count the admission read under the
+		// handshake's lock: an admission decided just before the window's announcement may reach
+		// this hook after it, and is the one attempt the window allows, not a breach.
+		if sch.window && stamp >= sch.windowStamp {
 			sch.inWindow = append(sch.inWindow, "admit")
 		}
 		for k, pat := range sch.park {

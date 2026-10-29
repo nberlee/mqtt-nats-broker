@@ -2275,8 +2275,7 @@ RESTORE:
 	// enumeration watermark, F-034 — and releases the record) and hand back the reset
 	// object as a fresh session, with
 	// Session Present false — which is the truthful answer in both cases.
-	overdue := ps.DisconnectedAt > 0 && ps.ExpiryInterval > 0 && ps.ExpiryInterval != mqttSessionNeverExpire &&
-		time.Now().Unix() >= ps.DisconnectedAt+int64(ps.ExpiryInterval)
+	overdue := mqttSessionOverdue(ps.DisconnectedAt, ps.ExpiryInterval, time.Now())
 	if overdue || genRetired {
 		sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, ps.WID, ps.PWID, opts)
 		sess.asm = as

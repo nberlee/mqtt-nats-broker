@@ -75,7 +75,7 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 	t.Run("shutdown wakes a waiter without a grant", func(t *testing.T) {
 		sess, quit := newSess()
 		granted := false
-		h := func() { granted = true }
+		h := func(uint64) { granted = true }
 		sess.testBackgroundAdmit.Store(&h)
 		release := sess.announceForegroundAuthority()
 		defer release()

@@ -1399,7 +1399,7 @@ func (a *mqttDeferredDisconnect) expiryDeadline() (int64, bool) {
 	if a.expiryInterval == 0 || a.expiryInterval == mqttSessionNeverExpire {
 		return 0, false
 	}
-	return a.disconnectedAt + int64(a.expiryInterval), true
+	return mqttSessionExpiryDeadline(a.disconnectedAt, a.expiryInterval).Unix(), true
 }
 
 // endsAtDisconnect reports whether this session was to be discarded at connection

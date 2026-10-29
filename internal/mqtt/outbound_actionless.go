@@ -156,6 +156,21 @@ func (c *client) writeActionlessFrame(frame []byte) error {
 	return nil
 }
 
+// writeActionlessFrameSealing is writeActionlessFrameBy for a frame that must be the LAST one on
+// the wire: validated, written with no cap, and, when completed, the output gate sealed before wmu
+// is released. It reports whether the frame was COMPLETED; a refusal, a prevented write and a
+// failed one (which closes the socket, as the boundary always does) report false.
+func (c *client) writeActionlessFrameSealing(frame []byte) bool {
+	if _, err := mqttValidateActionlessFrame(frame); err != nil {
+		return false
+	}
+	out, err := c.writeSocketOutcome(frame, time.Time{}, true)
+	if err != nil {
+		c.closeTransport()
+	}
+	return out == mqttSocketWriteCompleted
+}
+
 // writeActionlessFrameBy is the actionless boundary's one write: it validates the frame, then
 // writes it under cap (zero for none), closing only the socket on a write failure.
 //

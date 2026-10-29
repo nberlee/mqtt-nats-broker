@@ -1646,9 +1646,11 @@ bounds neither teardown latency before the enqueue nor publisher blocking after 
 write deadline does not cover this interval.
 
 **Whole-second truncation against the session expiry deadline.** The close stamps that
-date session expiry are whole seconds while `FireAt` is nanoseconds, so a Will can fall
-due fractionally after the session's own persisted expiry deadline. Pre-existing, and
-neither introduced nor widened here.
+date session expiry are whole seconds while `FireAt` is nanoseconds. Expiry is dated
+conservatively from the stamp (`mqttSessionExpiryDeadline`: stamp + interval + 1 s), so
+a deadline derived from it is never before the true close plus the interval and can no
+longer precede a capped `FireAt`; what remains is the extra second, stated with session
+expiry below.
 
 **A takeover no longer destroys an owed-delayed Will; what it leaves.** The takeover tail
 consumes an owed-delayed Will into the outbox (`mqttSettleWillOnTakeover`), so a delay
@@ -4094,36 +4096,30 @@ and `ExpiryInterval` are written together at the close, carried across every
 park, and applied on both discharge branches. Two timing residuals remain, and
 neither is the deviation that item closed.
 
-- **This change adds expiry lateness, without a demonstrated sub-second bound.**
-  The close performs one extra record write on the override path, so every
-  sample taken after it — the disconnect stamps, the expiry timer — is later than
-  it was. The bound is not "tens of milliseconds": the record fence's blocking
-  acquisition carries no bounded-wait guarantee and the JetStream API timeout is
-  five seconds. Nor is the effect confined to a rounding boundary, because the
-  close timer schedules a full relative interval **after** the finite save.
-  **It can be client-visible.** With a one-second interval, a stamp at `t.990`
-  gives a resident deadline of `t+1.000` while a delayed stamp at `t+1.010`
-  gives `t+2.000`; a reconnect at `t+1.500` is overdue under the first and
-  resumable under the second, which changes Session Present and the restored
-  subscriptions. What holds in the other direction is only this: **for a fixed
-  interval, delaying these samples cannot make a computed deadline earlier**, so
-  a Will's `FireAt` — anchored at the untouched close observation — is never
-  overtaken as a result.
-- **A coarse expiry deadline can still precede a Will's `FireAt`, and that is
-  pre-existing.** `DisconnectedAt` is a seconds field while `FireAt` is
-  nanoseconds, so the deadline derived from it can precede a capped `FireAt` by
-  up to a second. Four consumers derive one that way: the parked action, the
-  resident `overdue` check in `mqttProcessConnect`, the expiry callback's
-  recheck, and the record-driven sweep. Where that happens a session can be
-  expired before the Will it was capping fires, and a reconnect in the gap
-  suppresses that Will — the acceptance-fact predicate compares against `FireAt`
-  and has no ended-session test. **F-041 leaves all four exactly as it found
-  them.** An earlier revision of that item tried to repair the ordering by
-  anchoring the close's deadlines earlier; three review rounds found it
-  corrupting a different consumer each time, the last being the resume decision
-  itself, so the attempt was deleted rather than widened. Repairing it means
-  either widening a persisted field or capping `FireAt` against the coarse
-  deadline, and both are wider than that item.
+- **This change adds expiry lateness, without a demonstrated sub-second bound.** The
+close performs one extra record write on the override path, so every sample taken after
+it — the disconnect stamps, the expiry timer — is later than it was. The bound is not
+"tens of milliseconds": the record fence's blocking acquisition carries no bounded-wait
+guarantee and the JetStream API timeout is five seconds. The close's timer is armed to
+the deadline of the stamp it took (`mqttSessionExpiryDeadline`), so the lateness is the
+stamp's: **it can be client-visible.** With a one-second interval, a stamp at `t.990`
+gives a deadline of `t+2.000` while a delayed stamp at `t+1.010` gives `t+3.000`; a
+reconnect at `t+2.500` is overdue under the first and resumable under the second, which
+changes Session Present and the restored subscriptions. What holds in the other
+direction is only this: **for a fixed interval, delaying these samples cannot make a
+computed deadline earlier**, so a Will's `FireAt` — anchored at the untouched close
+observation — is never overtaken as a result.
+- **Expiry is dated conservatively, a second late at most from the stamp.**
+`DisconnectedAt` is a seconds field, so the real disconnect lies in `[stamp, stamp+1)`;
+every consumer dates the expiry as stamp + interval + 1 s (`mqttSessionExpiryDeadline`),
+the first instant the interval is proven to have elapsed. A session is therefore never
+ended early, and it can be resumed with Session Present true up to one second after its
+interval elapsed, measured from the sampled stamp; that is the trade, not a claim that
+it is harmless. The four consumers that used to derive a deadline able to precede a
+capped `FireAt` (the parked action, the resident `overdue` check in
+`mqttProcessConnect`, the expiry callback's recheck, and the record-driven sweep) now
+derive one that cannot, for the ordinary close whose observation precedes its stamp; the
+missing-close- observation fallback is unchanged.
 - **A park's disconnect stamp is still dated at the park, not at the close**, so
   a slow ownership-gate spin dates it late. Pre-existing, unchanged, and subsumed
   by the first residual above.
@@ -4161,6 +4157,26 @@ connection's OBLIGATION". Three gaps remain.
   terms durable, exactly as on the close's own path (the F-041 residual above). The
   takeover still discards in memory and warns; a retirement that then fails after
   its detach leaves a resumable record.
+
+### A server error DISCONNECT and a client still sending
+
+When the read loop ends a connection for a protocol or processing error (Receive Maximum
+exceeded, a malformed packet, a packet too large), its DISCONNECT is written and the
+output gate sealed, and the reader then keeps reading and discarding what the client
+still sends, for at most five seconds or 1 MiB of payload, before it closes
+(docs/ARCHITECTURE.md, "A reader-owned error DISCONNECT lingers before the close"). A
+client still answering its acknowledgements therefore reads the DISCONNECT instead of
+failing on a TCP reset. The bounds are a resource ceiling, not a guarantee: a client
+that sends more than 1 MiB, or keeps sending for longer than five seconds, after the
+DISCONNECT may still lose it to a reset at the close, and a client that keeps its
+connection open delays its own teardown, and its Will, by up to the bound.
+
+**The inbound-pipeline worker's failure arm is not covered.** A compliant client still
+writing when an ordinary backend failure ends its connection through the
+inbound-pipeline worker may lose the server's DISCONNECT to a TCP reset, even if the
+DISCONNECT write completed. This worker path retains its existing immediate-close
+behavior; the reader-owned linger does not cover it. Carrying the linger there needs a
+separately designed handoff to the reader (docs/ROADMAP.md).
 
 ### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
 
@@ -5069,8 +5085,11 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
         A client told 0x89 by mistake reconnects and is handled normally.
       - **Non-DISCONNECT packets can still trail the final DISCONNECT** until the close
         lands — a PINGRESP, or an in-flight PUBLISH from a delivery goroutine — which
-        [MQTT-3.14.4-1] also forbids. Nothing gates those; closing it needs a delivery-side
-        gate, the "resident session never re-validates" item's territory.
+        [MQTT-3.14.4-1] also forbids. The reader-owned error DISCONNECTs (the parse-error
+        footer and 0x95) seal the output gate in the same write section, so nothing trails
+        those; the displacement notifications discussed here are not gated, and closing that
+        needs a delivery-side gate, the "resident session never re-validates" item's
+        territory.
       - **The notification write is deadline-bounded** (F-035) and the persist
         observation's eviction worker holds no lock across it, but it does still issue
         it inline and it takes `c.mu` to do so, so a stalled client still occupies that

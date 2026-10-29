@@ -2777,9 +2777,26 @@ displacement has its own single owner:
   guarantee is **at most one server-DISCONNECT ATTEMPT per connection**, not one delivered
   packet: a nil build never reaches the claim, the CONNACK gate can refuse before it, the
   shutdown drain's reservation can be spent without a write, and the winner's write stays
-  best-effort against a socket a concurrent close may already have taken down. Nothing
-  gates non-DISCONNECT traffic, so a PINGRESP or an in-flight PUBLISH can still trail the
-  winner until the close lands.
+  best-effort against a socket a concurrent close may already have taken down. On the
+  reader-owned error arms (the parse-error footer and 0x95) the write seals the output
+  gate before the socket's write lock is released (`mqttDisconnectBeforeClose`), so no
+  MQTT packet can trail that DISCONNECT; elsewhere nothing gates non-DISCONNECT traffic,
+  so a PINGRESP or an in-flight PUBLISH can still trail the winner until the close lands.
+- **A reader-owned error DISCONNECT lingers before the close.** A client still sending
+  when the server closes makes the server's TCP answer a reset, which fails the client's
+  next send and may discard what it has not read, the DISCONNECT included; a client
+  exceeding Receive Maximum walks every acknowledgement queued ahead of the DISCONNECT,
+  answering each, before it reads it (the Eclipse Paho interoperability client fails
+  this way). So when the read loop's error footer or its 0x95 arm wrote its DISCONNECT
+  COMPLETED and sealed the gate behind it, the reader keeps reading and discarding
+  (`mqttLingerAfterDisconnect`) until the client closes, a read fails, five seconds pass
+  (`mqttDisconnectLinger`; the transport is closed when it passes, which also ends a
+  transport write a TLS or WebSocket read may perform) or 1 MiB of payload is read,
+  buffered unread input included; then it closes as before. Nothing read is parsed. The
+  bounds are a resource ceiling, not a delivery guarantee. The inbound-pipeline worker's
+  failure position keeps its write-then-close: it runs on another goroutine, and
+  carrying the linger there needs a handoff to the reader that is designed separately
+  (docs/ROADMAP.md, docs/CONFORMANCE.md).
 - **Close**: `closeConnection` is idempotent (`c.closed.Swap(true)`). Any number of paths
   may call it; one runs.
 - **Will disposition**: `willDisposition`, transitioned only under `c.mu` and consumed
@@ -5964,6 +5981,29 @@ in memory and in the record, with no repair machinery at all. A session that
 was CLEARED rather than resumed — clean start, a legacy clean session, an
 overdue record — takes the requested terms at rebind instead: it has no prior
 lifetime to protect and its record is created fresh by the accept save.
+
+### A session's expiry is dated conservatively from its whole-second stamp
+
+The disconnect is stamped in whole Unix seconds (`disconnectedAt` in memory,
+`DisconnectedAt` on the record), so the real disconnect lies anywhere in `[stamp,
+stamp+1)`. Dating the expiry as `stamp + interval` ended a session up to a second before
+its Session Expiry Interval had elapsed (Spec5 [3.1.2.11.2]): a disconnect at `t.95`
+with an interval of 5 and a reconnect at `t+5.02`, 4.07 s later, read as overdue and
+discarded a live session (the intermittent Paho `test_session_expiry`). One definition
+now dates every expiry: `mqttSessionExpiryDeadline(stamp, interval)` is `stamp +
+interval + 1`, the first instant the interval is PROVEN to have elapsed, and
+`mqttSessionOverdue` asks it. The resume decision in `mqttProcessConnect`, the record
+restore in `createOrRestoreSessionWithin`, the fired timer's re-read, the remote
+reconciliation, the record-driven expiry, the sweep and a parked disconnect's deadline
+all ask it, and nothing else adds an interval to a stamp
+(`TestSessionExpiryHasOneDefinition`). The close arms its timer to that same deadline
+rather than to a relative interval: the fire re-reads the deadline and returns without
+re-arming when it is not yet due, so a timer earlier than the deadline would leave the
+cleanup to the periodic sweep. The cost is a session that can be resumed, with Session
+Present true, up to one second after its interval has elapsed measured from the sampled
+stamp; it is never ended early. A Will's `FireAt` is capped by the same interval from
+the close observation, which precedes the stamp, so a deadline derived from the stamp
+can no longer precede it.
 
 ### The DISCONNECT lifetime override is a connection's OBLIGATION
 

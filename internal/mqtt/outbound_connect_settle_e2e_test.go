@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -927,7 +928,9 @@ func TestF105OverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) 
 			if !late {
 				early = testF105PlantUnresolved(t, asm, cid, epoch, "t15")
 			}
-			time.Sleep(1200 * time.Millisecond) // overdue
+			// OVERDUE: a 1 s interval is proven elapsed at stamp + 2 s (mqttSessionExpiryDeadline), and the
+			// stamp is no later than the disconnect above.
+			time.Sleep(2100 * time.Millisecond)
 			log := testF105LogTransitions(t, &asm.jsa)
 			var boundarySteps atomic.Int32
 			var lateIntent atomic.Value
@@ -1067,7 +1070,8 @@ func TestF105RecordExpirySettlesAStandingProposal(t *testing.T) {
 	asm, epoch, gen := testF105Persistent(t, s, cid, 1)
 	testF105MakeNonResident(t, asm, cid)
 	i := testF105PlantUnresolved(t, asm, cid, epoch, "t21")
-	time.Sleep(1200 * time.Millisecond)
+	// OVERDUE: a 1 s interval is proven elapsed at stamp + 2 s (mqttSessionExpiryDeadline).
+	time.Sleep(2100 * time.Millisecond)
 	asm.expireSessionFromRecord(s, getHash(cid))
 	if !testF105RecordGone(asm, cid) {
 		t.Fatal("the overdue record still stands")
@@ -1113,9 +1117,17 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 				t.Fatalf("committing the successor: %v", err)
 			}
 			log := testF105LogTransitions(t, &asm.jsa)
+			// EACH DISCARD ENTRY IS ATTRIBUTED: the record-driven expiry meets the same overdue record and
+			// enters its discard before it settles (the non-CONNECT subtest asserts no order for it), so
+			// the ordering below is the CONNECT's own and is judged on the CONNECT's entry only.
 			hook := func(sess *mqttSession, window string) {
 				if sess.id == cid && window == mqttClearWindowPreEntry {
-					log.add("discard-entry")
+					buf := make([]byte, 1<<16)
+					if strings.Contains(string(buf[:runtime.Stack(buf, false)]), "mqttProcessConnect") {
+						log.add("discard-entry:connect")
+					} else {
+						log.add("discard-entry")
+					}
 				}
 			}
 			mqttTestClearWindowHookV.Store(&hook)
@@ -1141,14 +1153,18 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 			evts := log.snapshot()
 			fin := testF105IndexOf(evts, string(mqttTransitionFinalize)+":"+i.ID)
 			entry := testF105IndexOf(evts, "discard-entry")
+			if c := testF105IndexOf(evts, "discard-entry:connect"); entry < 0 || (c >= 0 && c < entry) {
+				entry = c
+			}
+			connectEntry := testF105IndexOf(evts, "discard-entry:connect")
 			if fin < 0 {
 				t.Fatalf("the committed proposal %q was never finalized: %v", i.ID, evts)
 			}
 			if entry < 0 {
 				t.Fatalf("the overdue successor was never discarded: %v", evts)
 			}
-			if viaConnect && fin > entry {
-				t.Fatalf("the finalize must precede the first discard entry: %v", evts)
+			if viaConnect && connectEntry >= 0 && fin > connectEntry {
+				t.Fatalf("the finalize must precede the CONNECT's discard entry: %v", evts)
 			}
 		})
 	}

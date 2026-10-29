@@ -149,7 +149,7 @@ func (as *mqttAccountSessionManager) reconcileRemoteSessionExpiry(s *Server, idH
 		as.cancelSessionExpiryLocked(idHash)
 		return
 	}
-	if remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0)); remaining > 0 {
+	if remaining := time.Until(mqttSessionExpiryDeadline(ps.DisconnectedAt, ps.ExpiryInterval)); remaining > 0 {
 		as.scheduleSessionExpiryLocked(s, idHash, remaining)
 		return
 	}
@@ -159,6 +159,29 @@ func (as *mqttAccountSessionManager) reconcileRemoteSessionExpiry(s *Server, idH
 	// issue JSA requests under the lock.
 	as.scheduleSessionExpiryLocked(s, idHash, 0)
 }
+
+// mqttSessionExpiryDeadline is the first instant at which a finite Session Expiry Interval is
+// PROVEN to have elapsed since the disconnect: the stamp is whole Unix seconds, so the
+// disconnect itself lies somewhere in [stamp, stamp+1), and stamp+interval would end a session
+// up to a second before its interval has passed. One second later than that is never early,
+// and at most a second late measured from the sampled stamp. Spec5 [3.1.2.11.2]. Every
+// decision and every timer that dates a session's expiry from its stamp asks this; none adds
+// the interval to the stamp itself.
+func mqttSessionExpiryDeadline(disconnectedAt int64, interval uint32) time.Time {
+	return time.Unix(disconnectedAt+int64(interval)+1, 0)
+}
+
+// mqttSessionOverdue reports whether a disconnected session's finite interval has elapsed at
+// now. A connected session (no stamp), a zero interval (ended at the close by its own route)
+// and a session that never expires are never overdue here.
+func mqttSessionOverdue(disconnectedAt int64, interval uint32, now time.Time) bool {
+	return disconnectedAt > 0 && interval > 0 && interval != mqttSessionNeverExpire &&
+		!now.Before(mqttSessionExpiryDeadline(disconnectedAt, interval))
+}
+
+// mqttTestExpiryNotDueHookV observes expireSessionFired returning on a deadline that has not
+// passed, by client ID hash. Nil in production.
+var mqttTestExpiryNotDueHookV atomic.Pointer[func(idHash string)]
 
 // scheduleSessionExpiry arms a timer to clean up a disconnected client's session
 // once its MQTT 5.0 Session Expiry Interval elapses. The timer is keyed by the
@@ -419,9 +442,12 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 	sess.mu.Lock()
 	notDue := sess.expiryInterval > 0 && sess.expiryInterval != mqttSessionNeverExpire &&
 		sess.disconnectedAt > 0 &&
-		time.Now().Unix() < sess.disconnectedAt+int64(sess.expiryInterval)
+		time.Now().Before(mqttSessionExpiryDeadline(sess.disconnectedAt, sess.expiryInterval))
 	sess.mu.Unlock()
 	if notDue {
+		if h := mqttTestExpiryNotDueHookV.Load(); h != nil {
+			(*h)(idHash)
+		}
 		as.unlockSession(sess)
 		return
 	}
@@ -645,7 +671,7 @@ func (as *mqttAccountSessionManager) loadExpiringSessionRecord(s *Server, idHash
 	}
 	// Not due yet (e.g. the record was refreshed by a newer disconnect after this
 	// timer was armed): re-arm for the remainder instead of dropping the cleanup.
-	if remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0)); remaining > 0 {
+	if remaining := time.Until(mqttSessionExpiryDeadline(ps.DisconnectedAt, ps.ExpiryInterval)); remaining > 0 {
 		as.scheduleSessionExpiry(s, idHash, remaining)
 		return ps, smsg.Sequence, false
 	}
@@ -851,7 +877,7 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 				continue
 			}
 		}
-		remaining := time.Until(time.Unix(ps.DisconnectedAt+int64(ps.ExpiryInterval), 0))
+		remaining := time.Until(mqttSessionExpiryDeadline(ps.DisconnectedAt, ps.ExpiryInterval))
 		if remaining < 0 {
 			remaining = 0
 		}

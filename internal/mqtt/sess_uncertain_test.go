@@ -290,7 +290,7 @@ func TestDeferredDisconnectPreservesOriginalDeadlines(t *testing.T) {
 	if !ok {
 		t.Fatal("a finite interval must have a deadline")
 	}
-	if want := disconnected.Unix() + 60; deadline != want {
+	if want := mqttSessionExpiryDeadline(disconnected.Unix(), 60).Unix(); deadline != want {
 		t.Errorf("expiry deadline = %v, want %v (measured from the ORIGINAL disconnect)", deadline, want)
 	}
 	if !finite.expiredBy(time.Now()) {

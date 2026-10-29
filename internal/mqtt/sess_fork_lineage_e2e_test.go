@@ -126,7 +126,9 @@ func TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill(t *testing.T) {
 			"'session taken over' — nothing established another owner. Got %x", reason)
 	}
 
-	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// The read loop's error DISCONNECT is followed by a bounded linger before the close
+	// (mqttLingerAfterDisconnect), so the close is awaited past that bound.
+	_ = c.SetReadDeadline(time.Now().Add(mqttDisconnectLinger.Get() + 3*time.Second))
 	var buf [256]byte
 	n, rerr := c.Read(buf[:])
 	if n > 0 {
@@ -581,7 +583,9 @@ func TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient(t *testing.T) {
 			"nothing establishes the two as siblings, and nothing establishes a successor "+
 			"either. Got %x", reason)
 	}
-	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// The read loop's error DISCONNECT is followed by a bounded linger before the close
+	// (mqttLingerAfterDisconnect), so the close is awaited past that bound.
+	_ = c.SetReadDeadline(time.Now().Add(mqttDisconnectLinger.Get() + 3*time.Second))
 	var buf [256]byte
 	n, rerr := c.Read(buf[:])
 	if n > 0 {

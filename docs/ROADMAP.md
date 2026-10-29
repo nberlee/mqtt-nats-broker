@@ -9465,6 +9465,32 @@ reads](findings/resolved.md#f-054).
   docs/CONFORMANCE.md "Outbound QoS 1/2 delivery rate per subscriber". The atomic-batch
   latency is a candidate upstream performance report, evidence in the record.
 
+### Connection close
+
+- [ ] **Carry the error-DISCONNECT linger to the inbound-pipeline worker's failure
+  arm.** Filed 2026-10-29 by consult C4 of the batched-acquisition lane, which deferred
+  it after three plan rounds did not converge (LC1 7 findings, LC2 5, LC3 4, every high
+  finding of the last two in the handoff). The reader-owned arms (the parse-error footer
+  and 0x95) linger since the Paho test_flow_control2 repair; the worker
+  (`mqttInboundPipe.fail`) still writes its DISCONNECT and closes the transport from
+  another goroutine, and ordinary backend failures (QoS 0/1 fan-out, retained update,
+  message-store submission or acknowledgement; QoS 2 hold CAS, lookup, cleanup; PUBREL
+  release claim, proof, retirement classification, commit; a service-epoch change) reach
+  it while a compliant client may still be writing (C3). Deliverable: a handoff to the
+  sole reader, designed and reviewed on its own, that closes the four interleavings LC3
+  named: the reader past its check holding buffered input, so it parses after the
+  failure; an error exit (`p.failed` set before `fail` runs) reaching the close before
+  the obligation is published; the keep-alive deadline rearm in `mqttParse` overwriting
+  the handoff deadline; TLS writes (a KeyUpdate reply) unbounded during the handoff.
+  Constraints from LC1-LC3: no half-close (TLS `CloseWrite` does not half-close TCP and
+  resets the write deadline; `wsConn` has no `CloseWrite` and latches every read error,
+  timeouts included, so a WebSocket read must not be interrupted by a deadline it is
+  meant to read past); the DISCONNECT written and the gate sealed in one write section,
+  the linger only after a COMPLETED write; one absolute deadline on reads and transport
+  writes; tests at both reader positions (socket read, pipeline wait) on TCP and
+  WebSocket. Residual meanwhile: docs/CONFORMANCE.md, "A server error DISCONNECT and a
+  client still sending".
+
 ### NATS platform follow-ups
 
 - [x] **Move the pin and the floor to nats-server 2.15.2, and the toolchain to Go 1.27.**

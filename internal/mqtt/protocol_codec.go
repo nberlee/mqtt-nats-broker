@@ -145,9 +145,9 @@ func (c *client) mqttParse(buf []byte) error {
 				}
 				// Tell a connected v5 client why before the close (no-op for 3.1.1
 				// and pre-CONNECT); maxPayloadViolation then logs and closes.
-				if connected {
-					c.mqttEnqueueDisconnect(mqttReasonPacketTooLarge,
-						fmt.Sprintf("packet size %d exceeds maximum packet size %d", pl, maxLen))
+				if connected && c.mqttDisconnectBeforeClose(mqttReasonPacketTooLarge,
+					fmt.Sprintf("packet size %d exceeds maximum packet size %d", pl, maxLen)) {
+					c.mqttLingerAfterDisconnect(len(r.buf) - r.pos)
 				}
 				c.maxPayloadViolation(pl, maxLen)
 			}
@@ -586,7 +586,9 @@ func (c *client) mqttParse(buf []byte) error {
 		// excluded: it already sent a DISCONNECT 0x95 and closed above. So is an aborted
 		// inbound pipeline: its failure position already told the client why, or its
 		// transport is already closed.
-		c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err), err.Error())
+		if c.mqttDisconnectBeforeClose(mqttDisconnectReasonFromErr(err), err.Error()) {
+			c.mqttLingerAfterDisconnect(len(r.buf) - r.pos)
+		}
 	}
 	return err
 }

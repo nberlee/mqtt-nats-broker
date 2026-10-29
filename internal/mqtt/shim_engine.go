@@ -1242,8 +1242,33 @@ var mqttWriteDeadline = newMQTTKnob(10 * time.Second)
 // production transport a concurrent close is what makes it fail and that leaves
 // no healthy connection to rescue.
 func (c *client) writeSocket(data []byte, cap time.Time) error {
+	_, err := c.writeSocketOutcome(data, cap, false)
+	return err
+}
+
+// mqttSocketWrite is what one writeSocketOutcome did with its frame.
+type mqttSocketWrite uint8
+
+const (
+	// mqttSocketWritePrevented: nothing was written — no socket, or the output gate is sealed.
+	mqttSocketWritePrevented mqttSocketWrite = iota
+	// mqttSocketWriteCompleted: every byte was handed to the transport.
+	mqttSocketWriteCompleted
+	// mqttSocketWriteFailed: the write returned an error; some bytes may have left.
+	mqttSocketWriteFailed
+)
+
+// mqttTestAfterSealingWriteV runs after a sealing write completed and before the gate is sealed,
+// still under wmu. Nil in production.
+var mqttTestAfterSealingWriteV atomic.Pointer[func(c *client)]
+
+// writeSocketOutcome is writeSocket reporting what happened, decided under wmu. With seal set, a
+// COMPLETED write seals the output gate before wmu is released: no other frame can follow it on
+// the wire, because every writer checks the gate under this lock. A seal is not a certificate;
+// certification still crosses this lock later.
+func (c *client) writeSocketOutcome(data []byte, cap time.Time, seal bool) (mqttSocketWrite, error) {
 	if c.nc == nil {
-		return nil
+		return mqttSocketWritePrevented, nil
 	}
 	if h := mqttTestWriterPreLockHookV.Load(); h != nil {
 		(*h)(c)
@@ -1259,7 +1284,7 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 	// A sealed gate is not an error to report upward: the connection is being torn down by
 	// the caller that sealed it, and the write simply does not happen.
 	if c.outBind != nil && !c.outBind.mayWrite() {
-		return nil
+		return mqttSocketWritePrevented, nil
 	}
 	d := time.Now().Add(mqttWriteDeadline.Get())
 	if !cap.IsZero() && cap.Before(d) {
@@ -1271,13 +1296,19 @@ func (c *client) writeSocket(data []byte, cap time.Time) error {
 		n, err := c.nc.Write(data)
 		data = data[n:]
 		if err != nil {
-			return err
+			return mqttSocketWriteFailed, err
 		}
 		if n == 0 {
-			return io.ErrShortWrite
+			return mqttSocketWriteFailed, io.ErrShortWrite
 		}
 	}
-	return nil
+	if seal {
+		if h := mqttTestAfterSealingWriteV.Load(); h != nil {
+			(*h)(c)
+		}
+		sealOutput(c.outBind)
+	}
+	return mqttSocketWriteCompleted, nil
 }
 
 // queueOutbound writes bytes to the client socket. On a write error it closes

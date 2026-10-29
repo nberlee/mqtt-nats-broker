@@ -90,6 +90,10 @@ type mqttForegroundAuthority struct {
 	n  int
 	// idle is closed when the count returns to zero; a fresh one is made when it leaves zero.
 	idle chan struct{}
+	// announced counts announcements ever made. Test hooks stamp an announcement and an admission
+	// with it, read under mu, so an observer can tell an admission decided before an announcement
+	// from one decided after it however the two hooks interleave.
+	announced uint64
 }
 
 // announceForegroundAuthority announces one foreground authority operation and returns its
@@ -103,9 +107,11 @@ func (sess *mqttSession) announceForegroundAuthority() (release func()) {
 		f.idle = make(chan struct{})
 	}
 	f.n++
+	f.announced++
+	stamp := f.announced
 	f.mu.Unlock()
 	if h := sess.testForegroundAnnounce.Load(); h != nil {
-		(*h)(true)
+		(*h)(true, stamp)
 	}
 	var once sync.Once
 	return func() {
@@ -117,7 +123,7 @@ func (sess *mqttSession) announceForegroundAuthority() (release func()) {
 			}
 			f.mu.Unlock()
 			if h := sess.testForegroundAnnounce.Load(); h != nil {
-				(*h)(false)
+				(*h)(false, stamp)
 			}
 		})
 	}
@@ -140,7 +146,7 @@ func (sess *mqttSession) tryAdmitBackgroundAuthority() bool {
 	}
 	f := &sess.foreground
 	f.mu.Lock()
-	idle := f.n == 0
+	idle, stamp := f.n == 0, f.announced
 	f.mu.Unlock()
 	if !idle {
 		if h := sess.testBackgroundWait.Load(); h != nil {
@@ -149,7 +155,7 @@ func (sess *mqttSession) tryAdmitBackgroundAuthority() bool {
 		return false
 	}
 	if h := sess.testBackgroundAdmit.Load(); h != nil {
-		(*h)()
+		(*h)(stamp)
 	}
 	return true
 }
@@ -178,9 +184,10 @@ func (sess *mqttSession) admitBackgroundAuthority() bool {
 		}
 		f.mu.Lock()
 		if f.n == 0 {
+			stamp := f.announced
 			f.mu.Unlock()
 			if h := sess.testBackgroundAdmit.Load(); h != nil {
-				(*h)()
+				(*h)(stamp)
 			}
 			return true
 		}

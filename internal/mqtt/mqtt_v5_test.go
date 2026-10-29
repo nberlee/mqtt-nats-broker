@@ -6514,13 +6514,29 @@ func TestMQTTv5SessionExpiryExpiredFirstReconnect(t *testing.T) {
 		}
 		return nil
 	})
+
+	// The stamp the close persisted: the restart's restore decision dates the expiry from it.
+	asm := testMQTTGetClient(t, s, "sefpub").mqtt.asm
+	asm.mu.Lock()
+	es := asm.sessByHash[getHash("sefirst")]
+	asm.mu.Unlock()
+	var stamp int64
+	if es != nil {
+		es.mu.Lock()
+		stamp = es.disconnectedAt
+		es.mu.Unlock()
+	}
+	if stamp == 0 {
+		t.Fatal("fixture: the closed session carries no disconnect stamp")
+	}
 	cp.Close()
 	cpub.Close()
 
-	// Restart on the same store, and make sure the session is overdue.
+	// Restart on the same store, and make sure the session is overdue: past the deadline the
+	// restore decision applies to that stamp.
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
 	s.Shutdown()
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(time.Until(mqttSessionExpiryDeadline(stamp, 1)) + 100*time.Millisecond)
 	o.MQTT.Port = -1
 	testSetStoreDir(o, dir)
 	s = testMQTTRunServer(t, o)

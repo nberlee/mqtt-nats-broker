@@ -83,6 +83,8 @@ var mqttRawOutputPrimitives = map[string]struct{}{
 	// type-assertion or embedding limits this check already admits to — they were simply
 	// missing from the list.
 	"writeSocket": {}, "writeFramePartLocked": {},
+	// writeSocket's reporting core, which the sealing DISCONNECT write calls directly.
+	"writeSocketOutcome": {},
 }
 
 // mqttOutputBoundarySites are the calls that ARE the boundary, plus the primitives' own
@@ -92,12 +94,14 @@ var mqttRawOutputPrimitives = map[string]struct{}{
 // beside a boundary function inherit its licence, and "direct output from an otherwise permitted
 // emitter" is one of the bypasses this check was required to catch.
 var mqttOutputBoundarySites = map[string]mqttOutputSite{
-	"outbound_frame_write.go|writeFramePartLocked|nc.Write":             {1, "the AUTHORIZED boundary's only write"},
-	"outbound_frame_write.go|writeAuthorizedFrame|writeFramePartLocked": {1, "the boundary's own part loop"},
-	"outbound_actionless.go|writeActionlessFrameBy|writeSocket":         {1, "the ACTIONLESS boundary's only write"},
-	"shim_engine.go|enqueueProto|queueOutbound":                         {1, "the alias chain's own definition"},
-	"shim_engine.go|queueOutbound|writeSocket":                          {1, "the alias chain reaching the transport"},
-	"shim_engine.go|writeSocket|nc.Write":                               {1, "the transport implementation the chain reaches"},
+	"outbound_frame_write.go|writeFramePartLocked|nc.Write":                 {1, "the AUTHORIZED boundary's only write"},
+	"outbound_frame_write.go|writeAuthorizedFrame|writeFramePartLocked":     {1, "the boundary's own part loop"},
+	"outbound_actionless.go|writeActionlessFrameBy|writeSocket":             {1, "the ACTIONLESS boundary's only write"},
+	"shim_engine.go|enqueueProto|queueOutbound":                             {1, "the alias chain's own definition"},
+	"shim_engine.go|queueOutbound|writeSocket":                              {1, "the alias chain reaching the transport"},
+	"outbound_actionless.go|writeActionlessFrameSealing|writeSocketOutcome": {1, "the ACTIONLESS boundary's sealing write: a validated last frame (the error DISCONNECT), the gate sealed behind it"},
+	"shim_engine.go|writeSocket|writeSocketOutcome":                         {1, "writeSocket is its reporting core with no seal"},
+	"shim_engine.go|writeSocketOutcome|nc.Write":                            {1, "the transport implementation the chain reaches"},
 }
 
 // mqttOutputBypassesOwed is the RECORDED FAILURE SET: every emitter that still reaches the
@@ -119,9 +123,10 @@ var mqttOutputBypassesOwed = map[string]mqttOutputSite{
 // TLS wrap, the WebSocket handshake and wrap, and teardown. Recording them rather than excluding the pattern is what keeps a new
 // one visible: `io.Copy(c.nc, buf)` added tomorrow lands in this check, not in silence.
 var mqttSocketPlumbingSites = map[string]mqttOutputSite{
-	"conn_lifecycle.go|createMQTTClient|nc (handed out)":  {3, "io.ReadFull on the connection: the READ side; the WebSocket opening handshake, which writes only its HTTP answer before any MQTT frame exists; and the WebSocket adapter wrapping the socket, through which every later MQTT frame still leaves by writeAuthorizedFrame or writeActionlessFrame, its own writes being Pong and Close control frames"},
-	"shim_engine.go|doTLSServerHandshake|nc (handed out)": {1, "tls.Server wraps the socket"},
-	"shim_engine.go|readLoop|nc (aliased)":                {1, "the read loop's own local"},
+	"conn_lifecycle.go|createMQTTClient|nc (handed out)":        {3, "io.ReadFull on the connection: the READ side; the WebSocket opening handshake, which writes only its HTTP answer before any MQTT frame exists; and the WebSocket adapter wrapping the socket, through which every later MQTT frame still leaves by writeAuthorizedFrame or writeActionlessFrame, its own writes being Pong and Close control frames"},
+	"shim_engine.go|doTLSServerHandshake|nc (handed out)":       {1, "tls.Server wraps the socket"},
+	"shim_engine.go|readLoop|nc (aliased)":                      {1, "the read loop's own local"},
+	"conn_disconnect.go|mqttLingerAfterDisconnect|nc (aliased)": {1, "the error DISCONNECT's drain: the READ side only, reading and discarding; it writes nothing"},
 }
 
 // TestF105EveryTransportWriteIsAccountedFor is the structural check itself.

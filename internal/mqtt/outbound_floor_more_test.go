@@ -348,7 +348,7 @@ func TestF112AnAdmissionHoldsTheFloorsAuthorityAttemptsBack(t *testing.T) {
 		mu.Unlock()
 	}
 	sess.testBackgroundWait.Store(&waitHook)
-	announce := func(on bool) {
+	announce := func(on bool, _ uint64) {
 		mu.Lock()
 		first := on && !started
 		if first {

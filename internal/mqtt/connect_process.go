@@ -1040,9 +1040,7 @@ restoreSession:
 		// a late expiry timer to the in-memory copy (the record-restore path
 		// has the same check). Spec5 [3.1.2.11.2].
 		es.mu.Lock()
-		overdue := es.disconnectedAt > 0 && es.expiryInterval > 0 &&
-			es.expiryInterval != mqttSessionNeverExpire &&
-			time.Now().Unix() >= es.disconnectedAt+int64(es.expiryInterval)
+		overdue := mqttSessionOverdue(es.disconnectedAt, es.expiryInterval, time.Now())
 		es.mu.Unlock()
 		// The retirement capsule of the clean-start path, if that is the path taken:
 		// it outlives the retirement because the SUCCESS arm still owes the displaced

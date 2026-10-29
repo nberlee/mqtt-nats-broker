@@ -249,5 +249,23 @@ func TestPubRelClaimSurvivesQuickClientIdentifierReuse(t *testing.T) {
 		if code != 2 {
 			t.Fatalf("round %d: the QoS 2 SUBSCRIBE of a reused clean-session identifier was answered %#x", round, code)
 		}
+		// THE SERVER HAS SEEN THE CLOSE before the identifier is reused: a CONNECT that arrives
+		// first REPLACES a connection the server still counts as live, which the duplicate client
+		// ID policy records as flapping and jails the next reuse for mqttSessJailDur. That policy
+		// is not what this test is about; the closing work the claim races still runs after the
+		// connection is dropped from the registry.
+		checkFor(t, 5*time.Second, 5*time.Millisecond, func() error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			for _, cl := range s.clients {
+				cl.mu.Lock()
+				live := cl.isMqtt() && cl.mqtt.cid == "pubrel-reuse"
+				cl.mu.Unlock()
+				if live {
+					return fmt.Errorf("round %d: the closed connection is still registered", round)
+				}
+			}
+			return nil
+		})
 	}
 }

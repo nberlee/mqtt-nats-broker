@@ -533,7 +533,7 @@ func TestMQTTPubRelRedispatchAnnouncesBetweenAcquisitions(t *testing.T) {
 	defer sess.testBackgroundWait.Store(nil)
 	result := make(chan string, 1)
 	granted := make(chan struct{})
-	ann := func(announced bool) {
+	ann := func(announced bool, _ uint64) {
 		if announced || !armed.Load() || !probed.CompareAndSwap(false, true) {
 			return
 		}
@@ -577,7 +577,7 @@ func TestMQTTForegroundLoopsLeaveAdmittingCallersUnannounced(t *testing.T) {
 	run := func(t *testing.T, sess *mqttSession, call func() bool) {
 		t.Helper()
 		var announced atomic.Int32
-		ann := func(a bool) {
+		ann := func(a bool, _ uint64) {
 			if a {
 				announced.Add(1)
 			}
