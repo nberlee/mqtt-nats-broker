@@ -8021,11 +8021,12 @@ real](findings/release-investigations.md#f-044).
   ledger](findings/release-investigations.md#verification-ledger); green CI is never
   waived. **Carried into the [verification
   ledger](findings/release-investigations.md#verification-ledger) 2026-10-30 (consult K1
-  of the four-unexplained-reds lane); the box stays unchecked while the third and fourth
-  are open.** The first two are accepted as nonblocking on present evidence, reopen on
-  recurrence, and their failures now name what they need (the remaining clients; the
-  pending write); the third is open, and CI now keeps the untagged race log on failure;
-  the fourth is open pending a CI run of a tree past a0daaea, which needs a push.
+  of the four-unexplained-reds lane); the box stays unchecked while the third is open.**
+  The first two are accepted as nonblocking on present evidence, reopen on recurrence, and
+  their failures now name what they need (the remaining clients; the pending write); the
+  fourth is accepted as nonblocking on present evidence, unexplained, reopen on recurrence
+  (consult K2, after a green CI run of a later tree); the third is open, and CI now keeps
+  the untagged race log on failure.
   - *`TestF105RetainedIndeterminateVerdictIsOwed/stays-indeterminate-closes`*
     (outbound_retained_abandon_test.go): after the server closed the connection under an
     indeterminate retained verdict, `checkClientsCount(t, s, 0)` (a 2 s wait) still saw 3
@@ -8035,8 +8036,8 @@ real](findings/release-investigations.md#f-044).
     (unsub_drain_recovery_test.go:1313): after `resolveUncertainNow` returned a foreign
     verdict and detached the client, `seqUncertain` was still true. Chain r2, tagged shard
     0; the `$MQTT_sess` resolution path, outside that change. Not reproduced: 0/40.
-    Unconfirmed candidate: the detached connection's asynchronous close writing the
-    record, and re-marking it uncertain, before the test reads the flag.
+    The detached connection's close as the writer that re-marked it is refuted (the
+    ledger entry); the writer is unknown.
   - *An untagged `go test -race ./...` failure whose test name was lost* (the log was
     truncated; tree 83db8577, 2026-10-29). Three full re-runs green with no data race.
     Unidentifiable as it stands: capturing a recurrence with full logs (CI keeps them)
@@ -8049,7 +8050,9 @@ real](findings/release-investigations.md#f-044).
     predecessor tests leave behind take about 60 ms to CONNACK locally on 6548ed9 and
     a0daaea alike (docs/findings/nats-platform.md, "A backlogged takeover waits for a
     whole batched flush"); five local Paho runs, three of them CPU-pinned, had no setup
-    timeout. Needs a CI run of a later tree to tell a regression from runner slowness. (A
+    timeout. CI run 41073089425 on e1082a6 (past a0daaea, without 4fa1dd8) was green, both
+    tests included; it does not distinguish a regression from runner slowness, and it does
+    not test 4fa1dd8's change to the takeover's flush wait. (A
     pinned local run also lost `test_request_response` to the suite's own race,
     client_test5.py waiting on the wrong client's SUBACK: not a broker defect, noted so it
     is not chased.)

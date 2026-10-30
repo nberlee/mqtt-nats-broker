@@ -1121,6 +1121,15 @@ from keep their full history.
   tests leave behind took about 60 ms to CONNACK locally, 6548ed9 and a0daaea alike (100
   trials each, `docs/findings/nats-platform.md`, "A backlogged takeover waits for a whole
   batched flush"), and five local Paho runs, three of them CPU-pinned, had no setup
-  timeout. Not explained. **Disposition: open**, pending a CI run of a later tree (a push,
-  which is the user's act); a green run there supports a nonblocking disposition but does
-  not establish runner slowness as the cause.
+  timeout. **Disposition: accepted as nonblocking on present evidence; unexplained; reopen
+  on recurrence** (consult K2, 2026-10-30). CI run 41073089425 on e1082a6, a tree past
+  a0daaea whose broker code is e412188's, was green in every job. Its Paho job reported no
+  regressions and no enumeration warning; `test/conformance/run.sh` runs each enumerated
+  test in its own process and records every nonzero exit, `setUpClass` errors included,
+  and neither test is baselined, so both test processes exited 0. Per-test output is not
+  available: the results artifact uploads only on failure. That one green later-tree run,
+  with the five local runs without a setup timeout, supports this disposition. The green
+  tree does not contain 4fa1dd8, which changes the backlogged takeover's flush wait
+  described in `docs/findings/nats-platform.md`, so the run neither validates that change
+  nor settles whether that mechanism caused the original timeouts; runner slowness is
+  unproven.
