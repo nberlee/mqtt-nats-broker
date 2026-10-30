@@ -8012,7 +8012,7 @@ real](findings/release-investigations.md#f-044).
     advanced twice) up to `mqttForegroundAcquireAttempts`, spaced by the contention wait;
     exhaustion by writers outside the handshake still falls back to the continuation.
 
-- [ ] **Resolve four unexplained reds met by the batching item's verification
+- [x] **Resolve four unexplained reds met by the batching item's verification
   (2026-10-29/30) before release.** Filed 2026-10-30 at the user's request. Each failed
   once and has not been reproduced; each was carried to a commit gate as an open incident
   (3948c4a, e412188) and accepted there only as disclosed, not as closed. Close each by a
@@ -8021,12 +8021,14 @@ real](findings/release-investigations.md#f-044).
   ledger](findings/release-investigations.md#verification-ledger); green CI is never
   waived. **Carried into the [verification
   ledger](findings/release-investigations.md#verification-ledger) 2026-10-30 (consult K1
-  of the four-unexplained-reds lane); the box stays unchecked while the third is open.**
-  The first two are accepted as nonblocking on present evidence, reopen on recurrence, and
-  their failures now name what they need (the remaining clients; the pending write); the
-  fourth is accepted as nonblocking on present evidence, unexplained, reopen on recurrence
-  (consult K2, after a green CI run of a later tree); the third is open, and CI now keeps
-  the untagged race log on failure.
+  of the four-unexplained-reds lane); all four are dispositioned there, none causally
+  resolved, and a recurrence of any reopens its entry.** The first two are accepted as
+  nonblocking on present evidence, reopen on recurrence, and their failures now name what
+  they need (the remaining clients; the pending write); the fourth is accepted as
+  nonblocking on present evidence, unexplained, reopen on recurrence (consult K2, after a
+  green CI run of a later tree); the third is accepted as nonblocking on present evidence,
+  unidentified (consult K3), and any untagged race failure reopens it and this box; CI now
+  keeps the untagged race log on failure.
   - *`TestF105RetainedIndeterminateVerdictIsOwed/stays-indeterminate-closes`*
     (outbound_retained_abandon_test.go): after the server closed the connection under an
     indeterminate retained verdict, `checkClientsCount(t, s, 0)` (a 2 s wait) still saw 3
@@ -8039,10 +8041,12 @@ real](findings/release-investigations.md#f-044).
     The detached connection's close as the writer that re-marked it is refuted (the
     ledger entry); the writer is unknown.
   - *An untagged `go test -race ./...` failure whose test name was lost* (the log was
-    truncated; tree 83db8577, 2026-10-29). Three full re-runs green with no data race.
-    Unidentifiable as it stands: capturing a recurrence with full logs (CI keeps them)
-    identifies it and starts the investigation, which then closes by the criteria above;
-    otherwise only an explicit accepted ledger closure closes it.
+    truncated; tree 83db8577, 2026-10-29). Unidentified: the kept tail names no test or
+    cause. Five later full untagged `-race` runs (three re-runs, a later chain, CI run
+    41073089425) passed with no data races reported. Closed by an explicit accepted disposition
+    without causal resolution (consult K3); any untagged `-race` failure reopens the entry
+    and this box, and its full output (CI keeps it) is investigated without presuming the
+    same cause.
   - *CI run 40887953897 (a0daaea): Paho `test_dollar_topics` and `test_user_properties`
     failed in `setUpClass`*: the suite's clean-start cleanup CONNECT got no CONNACK within
     the client's 0.5 s socket timeout. Their cleanup CONNECTs follow

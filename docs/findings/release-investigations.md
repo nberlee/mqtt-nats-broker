@@ -1110,10 +1110,15 @@ from keep their full history.
   save.
 - **An untagged `go test -race ./...` failure whose test name was lost.** Met 2026-10-29
   on tree 83db8577: the run failed and its log was kept only as a tail, which named no
-  test. Three full re-runs green, no data race. **Disposition: open.** CI now keeps the
-  untagged race output in a file and uploads it on failure (`untagged-race-log`), and the
-  local verification chains keep full logs; a captured recurrence starts attribution, and
-  the entry closes only with a disposition of what it shows.
+  test or cause, so the failure is unidentified. Five later full untagged `-race` runs
+  passed with no data races reported: three re-runs on the batched-completion lane, the
+  batching-remainders lane's chain r2, and CI run 41073089425. The tagged fixture races
+  fixed in 60c838d were separate failures met in the same verification; their relation to
+  this one is unknown. **Disposition: accepted as nonblocking on present evidence (consult
+  K3); closed by explicit disposition, without causal resolution.** Reopen this entry and
+  the §0.4 box on any untagged `-race` failure: CI keeps the output in a file and uploads
+  it on failure (`untagged-race-log`), and the local verification chains keep full logs;
+  preserve and investigate that output without presuming the same cause.
 - **CI run 40887953897 (a0daaea): Paho `test_dollar_topics` and `test_user_properties`
   failed in `setUpClass`.** The suite's clean-start cleanup CONNECT got no CONNACK within
   the client's 0.5 s socket timeout. Their cleanup CONNECTs follow
