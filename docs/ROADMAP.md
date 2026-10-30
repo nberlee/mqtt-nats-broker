@@ -8012,6 +8012,42 @@ real](findings/release-investigations.md#f-044).
     advanced twice) up to `mqttForegroundAcquireAttempts`, spaced by the contention wait;
     exhaustion by writers outside the handshake still falls back to the continuation.
 
+- [ ] **Resolve four unexplained reds met by the batching item's verification
+  (2026-10-29/30) before release.** Filed 2026-10-30 at the user's request. Each failed
+  once and has not been reproduced; each was carried to a commit gate as an open incident
+  (3948c4a, e412188) and accepted there only as disclosed, not as closed. Close each by a
+  deterministic reproduction and a root cause in the broker or the fixture, then a fix, or
+  by an explicit accepted closure in the [verification
+  ledger](findings/release-investigations.md#verification-ledger); green CI is never
+  waived.
+  - *`TestF105RetainedIndeterminateVerdictIsOwed/stays-indeterminate-closes`*
+    (outbound_retained_abandon_test.go): after the server closed the connection under an
+    indeterminate retained verdict, `checkClientsCount(t, s, 0)` (a 2 s wait) still saw 3
+    clients. Chain r1 of e412188's tree, tagged shard 0. Not reproduced: 0/10 on 3948c4a,
+    0/10 on the change, 0/10 pinned to one CPU.
+  - *`TestResolveUncertainNowDetachesAForeignSession`*
+    (unsub_drain_recovery_test.go:1313): after `resolveUncertainNow` returned a foreign
+    verdict and detached the client, `seqUncertain` was still true. Chain r2, tagged shard
+    0; the `$MQTT_sess` resolution path, outside that change. Not reproduced: 0/40.
+    Unconfirmed candidate: the detached connection's asynchronous close writing the
+    record, and re-marking it uncertain, before the test reads the flag.
+  - *An untagged `go test -race ./...` failure whose test name was lost* (the log was
+    truncated; tree 83db8577, 2026-10-29). Three full re-runs green with no data race.
+    Unidentifiable as it stands: capturing a recurrence with full logs (CI keeps them)
+    identifies it and starts the investigation, which then closes by the criteria above;
+    otherwise only an explicit accepted ledger closure closes it.
+  - *CI run 40887953897 (a0daaea): Paho `test_dollar_topics` and `test_user_properties`
+    failed in `setUpClass`*: the suite's clean-start cleanup CONNECT got no CONNACK within
+    the client's 0.5 s socket timeout. Their cleanup CONNECTs follow
+    `test_client_topic_alias` and `test_subscribe_identifiers`, and the states those
+    predecessor tests leave behind take about 60 ms to CONNACK locally on 6548ed9 and
+    a0daaea alike (docs/findings/nats-platform.md, "A backlogged takeover waits for a
+    whole batched flush"); five local Paho runs, three of them CPU-pinned, had no setup
+    timeout. Needs a CI run of a later tree to tell a regression from runner slowness. (A
+    pinned local run also lost `test_request_response` to the suite's own race,
+    client_test5.py waiting on the wrong client's SUBACK: not a broker defect, noted so it
+    is not chased.)
+
 ### 0.5 Small pre-alpha fixes
 
 Added 2026-10-26 at the user's request: three gaps `docs/CONFORMANCE.md` states that are
