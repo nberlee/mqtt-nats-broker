@@ -109,6 +109,7 @@ func TestJSAMsgGetHasNoAlternateRoute(t *testing.T) {
 var jsaMsgGetResponseHolders = map[string]string{
 	jsaMsgGetDecodeArm:          "decodes the reply",
 	"mqttTraverseInventoryOnce": "holds batched responses a message-GET method decoded",
+	"withBoundaryPrefetch":      "holds the write boundary's prefetched responses, which loadLastMsgForMulti decoded",
 }
 
 // TestJSAMsgGetHasNoSecondDecoder: the decoded response type is named only by the message-GET

@@ -1724,3 +1724,72 @@ outcomes and receipt semantics: the strongest next experiment, not a promised ga
 Separately reviewed: the completion carrying the exchange it already read with its read
 sequence, and dropping the per-PUBACK authority read only with receipt identity and epoch
 provenance treated explicitly.
+
+## Boundary prefetch (2026-10-30)
+
+The fourth part of the section 2 roadmap item "Admit several deliveries per subscription
+in one batch": the write boundary's independent member reads. The acceptance gate is met
+on both rigs; the item stays OPEN for its backlogged-takeover remainder.
+
+### Where the boundary's time went
+
+Timing probes in a throwaway worktree of 3948c4a, per validator of
+commitAuthorityTransition, QoS 1 burst of 500, mean ms per commit (standalone / R3):
+
+| Kind | Check | Standalone | R3 |
+|---|---|---|---|
+| acquire-action (flush of ~16) | checkActionMembers | 36.4 | 34.6 |
+| acquire-action | checkRegisterReplacements | 31.2 | 29.7 |
+| admit-exchange (flush) | checkResourceOverwrites | 11.8 | 11.5 |
+| admit-exchange | checkIdentifierExclusivity | 5.3 | 5.0 |
+| advance-exchange (per PUBACK) | the three member re-read checks | 2.3 | 2.8 |
+
+Both acquisition checks loop over the batch's members and read one record per member,
+serially: the action's exchange and the replaced register's occupant. Every such subject
+is known from the transition before the first comparison.
+
+### What changed
+
+docs/ARCHITECTURE.md, "The boundary reads what it re-reads in one request": those subjects
+are requested in one pipelined message GET and the first read of each is answered from it;
+every later read and every other subject reaches the store, so a re-read that observes
+progress still does. The comparisons, their order and their errors are unchanged.
+
+### Measured
+
+`make bench-outbound`, three interleaved runs each of 6548ed9, unmodified main (3948c4a)
+and the change, msg/s, medians:
+
+| Case | Rig | 6548ed9 | main | change | x base | x main |
+|---|---|---|---|---|---|---|
+| QoS 1, one subscriber, 500 | standalone | 25.4 | 56.7 | 66.1 | 2.60 | 1.17 |
+| QoS 1, one subscriber, 500 | R3 | 35.5 | 65.4 | 109.7 | 3.09 | 1.68 |
+| QoS 2, one subscriber, 200 | standalone | 14.3 | 23.9 | 23.5 | 1.64 | 0.98 |
+| QoS 2, one subscriber, 200 | R3 | 21.4 | 36.2 | 38.4 | 1.79 | 1.06 |
+| QoS 1, four subscribers, 200 each | standalone | 41.8 | 104.2 | 105.4 | 2.52 | 1.01 |
+| QoS 1, four subscribers, 200 each | R3 | 126.7 | 222.4 | 258.0 | 2.04 | 1.16 |
+| QoS 1, 20 at rest after 300 | standalone | 25.3 | 39.6 | 44.9 | 1.77 | 1.13 |
+| QoS 1, 20 at rest after 300 | R3 | 26.9 | 49.6 | 65.7 | 2.44 | 1.32 |
+
+Every row held its oracle; nothing was delivered twice. The R3 burst runs of the change
+were 75.9, 109.7 and 118.2; the R3 baseline (35.8, 35.5, 35.1) sits at the low end of its
+known range across days (34.8-46.7). The acceptance (twice the QoS 1 burst rate of a
+same-day 6548ed9 baseline by the ratio of three-run medians, standalone and R3 separately)
+is met: 2.60 and 3.09.
+
+The backlogged takeover (the item's other remainder), observed on the three-subscription,
+16-message shape, 100 trials each: main median 454, p95 784, max 974 ms; the change 484,
+811, 1088. The prefetch does not shorten it.
+
+### Tests and mutations
+
+outbound_boundary_prefetch_test.go: the prefetch set, one answer per subject, answers
+identical to the store's for an absence and an unreadable record, a partial batch kept,
+the read fault seam still reached, an acquisition's re-reads all sent before any reply,
+and a racing write refused at submission. Eight mutations, each killed by its paired test:
+a missing reply answered as absent, action exchanges not prefetched, a serial prefetch,
+the view consulted before the fault seam, create-only members prefetched, answers carried
+across transitions, every read answered, a partial batch discarded on its error. The first
+run of the not-prefetched-exchange mutation against the overlap test survived because that
+test computed its expectation with the function under test; it now derives it from the
+members.

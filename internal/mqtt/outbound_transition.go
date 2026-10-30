@@ -495,6 +495,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	// send (the real pre-submit check then refuses with the real error) or report a committed
 	// send as lost. Nil in production.
 	send := func() (uint64, error) {
+		// The comparisons below re-read what the transition overwrites and the exchanges its
+		// actions name: those reads are requested together first (outbound_boundary_prefetch.go).
+		jsa := jsa.withBoundaryPrefetch(a.ID, t.Extra)
 		if t.Prev != nil {
 			if err := jsa.checkPredecessorAgainstStore(a, t.Prev, t.PrevSeq); err != nil {
 				return 0, err

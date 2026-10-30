@@ -10117,6 +10117,37 @@ not the
 record actually replaced. A sequence is a position, not an identity. A creation displaces
 nothing and is deliberately unconstrained.
 
+### The boundary reads what it re-reads in one request
+
+The store comparisons above re-read, member by member, the records a transition overwrites
+(a member carried at a nonzero expectation is checked against what stands at its subject)
+and, for an acquisition, the exchange each action is acquired for. Each of those subjects
+is known from the transition alone before the first comparison runs, and each read was
+already taken after the transition was composed and before it is submitted. So
+`commitAuthorityTransition` requests them together, in one pipelined message GET
+(`withBoundaryPrefetch`, `outbound_boundary_prefetch.go`), at the start of that window,
+and runs the comparisons, unchanged, against a view of the assistant whose
+`loadLastMsgFor` answers the FIRST read of each prefetched subject from that response,
+message or error alike, exactly as the direct read returns it.
+
+**One answer per subject.** Every later read of a prefetched subject, and every read of
+any other subject, goes to the store. A comparison that re-reads to observe progress (the
+inventory traversal re-reads the ledger when it finds a position crossed, and restarts
+with the stale-expectation error the admission contention extension relies on) still
+observes it, and two comparisons reading one subject see what they saw before: the first a
+read from the start of the window, the second a read from the store.
+
+**Why reading earlier is the same read.** A member the batch writes is fenced at
+submission by its own expectation, exactly as before. A read-only judgment (an action's
+standing exchange) was never fenced by its read: an acknowledgement advance is
+authority-free, so the authority CAS does not order it against an acquisition; the shared
+register CAS does (the advance re-phases the register the acquisition rewrites with its
+token, each at its read sequence), and the prefetch leaves that untouched. A subject whose
+request got no reply is read from the store; a batch that timed out partway keeps the
+replies it received; a prefetch with no reply installs no view. The read fault seam
+(`mqttTestLoadLastMsgHookV`) still runs before every answer. The view lives for one call
+of the comparisons and is never shared between transitions.
+
 ### Admission readiness reads the name ownership once
 
 **Admission readiness reads the name ownership once** (`readyDependencyInc` and
@@ -10368,11 +10399,12 @@ stream (file storage, atomic batches of 2 and 16 members, 1 to 4 concurrent writ
 a roughly flat standalone throughput as writers were added, and a throughput that scaled
 with them on R3; the inference is that standalone atomic commits serialize, not shown on
 the broker's own stream. Batching back-to-back acknowledgement advances was evaluated and
-deferred, and the write boundaries' independent member reads, the batched acquisition's
-checks first (62-82 ms per flush of about 16, against a 3-10 ms write), are the next
-remainder (`docs/ROADMAP.md`). Record: `docs/findings/nats-platform.md`, "Batched
-admission (2026-10-28)", "Batched acquisition (2026-10-28)" and "Completion evaluation
-(2026-10-29)".
+deferred. The write boundaries' independent member reads (the batched acquisition's checks
+were 62-82 ms per flush of about 16, against a 3-10 ms write) are now requested together
+("The boundary reads what it re-reads in one request"): QoS 1 burst of 500 at 66.1 msg/s
+standalone and 109.7 on R3 (2026-10-30). Record: `docs/findings/nats-platform.md`,
+"Batched admission (2026-10-28)", "Batched acquisition (2026-10-28)", "Completion
+evaluation (2026-10-29)" and "Boundary prefetch (2026-10-30)".
 
 ### The PUBREL consumer's name is claimed under contention
 

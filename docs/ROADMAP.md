@@ -9511,6 +9511,23 @@ reads](findings/resolved.md#f-054).
   per-exchange check stay; the acceptance is unchanged, and the R3 spread is context, not
   an exception. Not an alpha blocker. Record: [Completion
   evaluation](findings/nats-platform.md#completion-evaluation-2026-10-29).
+  **The boundary reads landed 2026-10-30; the acceptance gate is MET on both rigs, and the
+  item stays OPEN for the backlogged-takeover remainder below** (consult S1 of the
+  batching-remainders lane). Done: the write boundary requests the records its comparisons
+  re-read (every member carried at a nonzero expectation and the exchange each action is
+  acquired for) in one pipelined message GET and answers the first read of each from it
+  (`outbound_boundary_prefetch.go`; docs/ARCHITECTURE.md, "The boundary reads what it
+  re-reads in one request"); the comparisons, their order and their errors are unchanged.
+  Per validator, two acquisition checks carried about 66 of 73 ms per flush, each one
+  store read per member. Measured (`make bench-outbound`, three interleaved runs each,
+  medians): QoS 1 burst of 500 25.4 -> 66.1 msg/s standalone (2.60x the same-day 6548ed9
+  baseline) and 35.5 -> 109.7 on R3 (3.09x; the R3 baseline sits at the low end of its
+  known 35-47 range, context and not an exception), against unmodified main 56.7 / 65.4
+  (1.17x / 1.68x); every row of the matrix held its oracle, nothing delivered twice. The
+  backlogged takeover is not shortened by it (16 queued, 100 trials: main median 454, p95
+  784, max 974 ms; change 484, 811, 1088). Still separate and unbuilt (S1): the completion
+  carrying the exchange it already read, and the per-PUBACK authority read. Record:
+  [Boundary prefetch](findings/nats-platform.md#boundary-prefetch-2026-10-30).
   **A takeover of a backlogged connection waits for a whole batched flush (found
   2026-10-29, the item's other open remainder; consult C4 of the completion evaluation).**
   A subscription's delivery callback holds its offers and flushes them (one admission, one

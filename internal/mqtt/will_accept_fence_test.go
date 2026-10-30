@@ -1645,8 +1645,8 @@ func testStagedCutoffs(t testing.TB, asm *mqttAccountSessionManager, seqs ...uin
 // missed it, which would tell a recovery claimant this decision rested on less
 // evidence than it did.
 func TestWillClaimantChasesTheCutoffForALateAcceptance(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	testQuietClaimLoop(t, a)
+	a, b := testNewTeardownEnv(t)
+	testQuietClaimLoop(t, a, b)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "cutoff-chase"
 	fireAt := testFarFuture()
@@ -1694,8 +1694,8 @@ func TestWillClaimantChasesTheCutoffForALateAcceptance(t *testing.T) {
 // it — the same wedge shape the persisted scan floor exists to prevent. Exhausting
 // the limit must therefore LICENSE under the cutoff verified so far.
 func TestWillCutoffChaseIsBoundedAndStillDecides(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	testQuietClaimLoop(t, a)
+	a, b := testNewTeardownEnv(t)
+	testQuietClaimLoop(t, a, b)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "cutoff-churn"
 	fireAt := testFarFuture()
@@ -1742,8 +1742,8 @@ func TestWillCutoffChaseIsBoundedAndStillDecides(t *testing.T) {
 // irreversible publication may have occurred is the one thing the persisted decision
 // exists to forbid, and TestWillRecoveryReusesThePersistedDecision pins that half.
 func TestWillAcceptanceAfterTheFinalCutoffIsMissed(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-	testQuietClaimLoop(t, a)
+	a, b := testNewTeardownEnv(t)
+	testQuietClaimLoop(t, a, b)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "cutoff-residual"
 	fireAt := testFarFuture()

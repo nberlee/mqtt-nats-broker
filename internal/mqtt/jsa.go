@@ -55,6 +55,9 @@ type mqttJSA struct {
 	// queued; a closed gate refuses that request with nothing sent (withRequestGate, F-119). Nil
 	// on every view but a background caller's that owes per-request admission and accounting.
 	gate func() bool
+	// prefetched, when set, answers the first read of each subject a transition's write boundary
+	// prefetched (outbound_boundary_prefetch.go). Nil on every other view.
+	prefetched *mqttPrefetchedReads
 }
 
 // mqttJSACore is the state every view of one account's assistant shares.
@@ -895,6 +898,9 @@ func (jsa *mqttJSA) loadLastMsgFor(streamName string, subject string) (*StoredMs
 		if err := (*h)(streamName, subject); err != nil {
 			return nil, err
 		}
+	}
+	if r, ok := jsa.prefetched.take(streamName, subject); ok {
+		return r.Message, r.ToError()
 	}
 	mreq := &JSApiMsgGetRequest{LastFor: subject}
 	req, err := json.Marshal(mreq)

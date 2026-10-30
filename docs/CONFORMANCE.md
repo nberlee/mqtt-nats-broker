@@ -2212,11 +2212,21 @@ the gate. Measured again on 2026-10-29 (QoS 1 burst of 500 only, three interleav
 medians): 6548ed9 25.0 / 46.2 msg/s standalone / R3, the current tree 57.6 / 65.6 (2.30x /
 1.42x); R3 runs of identical code have spread from about 60 to 90 msg/s across days.
 Batching back-to-back acknowledgement advances was evaluated and deferred: its principal
-saving is the standalone commit write, where the gate is met. The open part of the roadmap
-item is now bounded concurrency of the write boundaries' independent member reads
-(docs/findings/nats-platform.md, "Completion evaluation (2026-10-29)"). A QoS 2
+saving is the standalone commit write, where the gate is met. The write boundaries'
+independent member reads were the next part of the roadmap item and landed on 2026-10-30
+(below; docs/findings/nats-platform.md, "Completion evaluation (2026-10-29)"). A QoS 2
 delivery's PUBREL acquisition still CASes the authority record a flush's acquisition also
 CASes, so the two still contend.
+
+Measured again on 2026-10-30 after the write boundary began requesting the records it
+re-reads in one pipelined request (docs/ARCHITECTURE.md, "The boundary reads what it
+re-reads in one request"): QoS 1 burst of 500 at 66.1 msg/s standalone and 109.7 on R3
+(same-day 6548ed9: 25.4 / 35.5; three interleaved runs, medians). The rate is still far
+below stock nats-server's MQTT listener. What remains per delivery is the completion's
+work on the client's read loop (one advance per PUBACK with its reads, the source
+settlement and the register reclamation), the commits of the batched admission and
+acquisition (about 6 ms each on standalone, where atomic commits serialize), and their
+remaining sequential reads.
 
 **A takeover of a backlogged connection waits for its batched flush.**
 A subscription's QoS 1/2 delivery callback flushes the offers it held (up to 16: one
