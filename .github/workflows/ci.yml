@@ -30,8 +30,21 @@ jobs:
       - name: test
         # An explicit bound: the race-built internal/mqtt package runs close to go test's
         # default 10m on a small machine (597s measured on 2026-10-28), so the default
-        # would turn a slow runner into a spurious failure.
-        run: go test -race -count=1 -timeout 30m ./...
+        # would turn a slow runner into a spurious failure. The output is kept in a file as
+        # well, and pipefail keeps go test's exit status, so a failure keeps its test name.
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 30m ./... 2>&1 | tee untagged-race.log
+      # An intermittent failure is diagnosed from its full output, which the job log
+      # truncates; one failure was lost that way (docs/findings/release-investigations.md,
+      # verification ledger).
+      - name: upload the untagged race log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: untagged-race-log
+          path: untagged-race.log
+          if-no-files-found: ignore
 
   fulltests:
     name: test (upstream suite, shard ${{ matrix.shard }} of 8)

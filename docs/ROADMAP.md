@@ -8019,7 +8019,13 @@ real](findings/release-investigations.md#f-044).
   deterministic reproduction and a root cause in the broker or the fixture, then a fix, or
   by an explicit accepted closure in the [verification
   ledger](findings/release-investigations.md#verification-ledger); green CI is never
-  waived.
+  waived. **Carried into the [verification
+  ledger](findings/release-investigations.md#verification-ledger) 2026-10-30 (consult K1
+  of the four-unexplained-reds lane); the box stays unchecked while the third and fourth
+  are open.** The first two are accepted as nonblocking on present evidence, reopen on
+  recurrence, and their failures now name what they need (the remaining clients; the
+  pending write); the third is open, and CI now keeps the untagged race log on failure;
+  the fourth is open pending a CI run of a tree past a0daaea, which needs a push.
   - *`TestF105RetainedIndeterminateVerdictIsOwed/stays-indeterminate-closes`*
     (outbound_retained_abandon_test.go): after the server closed the connection under an
     indeterminate retained verdict, `checkClientsCount(t, s, 0)` (a 2 s wait) still saw 3

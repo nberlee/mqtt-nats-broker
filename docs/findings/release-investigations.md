@@ -1037,16 +1037,23 @@ from keep their full history.
   benchmark's inert seams), the same assertion, against 0 of 15 on the change, interleaved,
   tagged, `-race`. Found 2026-10-22. Mechanism: unattributed. **Disposition: open**; owed:
   which proposal moved before the step, and whether the certificate is missing or late.
-- **`TestF105RetainedIndeterminateVerdictIsOwed`, `stays-indeterminate-closes`.**
-  Intermittent, once in a sharded tagged `-race` run on the JetStream path benchmark's final
-  tree (`875fdcb`, shard 1 of its verification chain): "expected 0 clients, got 1" at
-  `outbound_retained_abandon_test.go:771`, the fixture's `checkClientsCount` waiting 2 s for
-  the closed connection to leave the server before the resume. Not reproduced: 15 of 15
-  passing on that tree and on its baseline arm (`97ffa57` plus the benchmark's inert seams),
-  interleaved, tagged, `-race`, and 10 of 10 each again on one CPU. Found 2026-10-23.
-  Hypothesis, not a finding: the server-side teardown of the first connection outlasts the
-  2 s wait under suite load. Mechanism: unattributed. **Disposition: open**; owed: a
-  reproduction under load on both trees, then whether the teardown or the wait is at fault.
+- - **`TestF105RetainedIndeterminateVerdictIsOwed`, `stays-indeterminate-closes`.**
+  Intermittent, once in a sharded tagged `-race` run on the JetStream path benchmark's
+  final tree (`875fdcb`, shard 1 of its verification chain): "expected 0 clients, got 1"
+  at `outbound_retained_abandon_test.go:771`, the fixture's `checkClientsCount` waiting 2
+  s for the closed connection to leave the server before the resume. Not reproduced: 15 of
+  15 passing on that tree and on its baseline arm (`97ffa57` plus the benchmark's inert
+  seams), interleaved, tagged, `-race`, and 10 of 10 each again on one CPU. Found
+  2026-10-23. Hypothesis, not a finding: the server-side teardown of the first connection
+  outlasts the 2 s wait under suite load. Mechanism: unattributed. Recurred 2026-10-30,
+  once, in shard 0 of chain r1 on e412188's tree: "expected 0 clients, got 3", the same
+  wait at `outbound_retained_abandon_test.go:854`. Not reproduced: 0 of 10 on 3948c4a, 0
+  of 10 on that change, 0 of 10 pinned to one CPU. Mechanism: unattributed. **Disposition
+  (2026-10-30, superseding "open"): accepted as nonblocking** on present evidence (the
+  2026-10-30 §0.4 investigation, consult K1); reopen on any further recurrence or causal
+  evidence. `checkClientsCount` now lists the remaining clients (kind, published label
+  with the client ID once its CONNECT named one, closed) in its failure, so a recurrence
+  names who is still there; its wait and its count are unchanged.
 - **A recovering session's PUBREC advance can exhaust its budget and close the
   connection: classified as F-126, a pre-existing broker defect.** In the JetStream path
   benchmark's session-recovery load (a subscriber reconnecting to 8 QoS 1 and 2 QoS 2
@@ -1079,3 +1086,34 @@ from keep their full history.
   test. The races it allowed are closed by the atomic `mqttKnob` settings; a leftover
   worker can still act on a later test's hooks. **Disposition: open**; owed: wait for
   `s.grWG` in the teardown, and check the other test-server teardowns for the same gap.
+- **`TestResolveUncertainNowDetachesAForeignSession`: "a foreign verdict resolves the
+  session's uncertainty".** Met 2026-10-30, once, in shard 0 of a tagged chain on
+  e412188's tree (`unsub_drain_recovery_test.go:1313`): after `resolveUncertainNow`
+  returned a foreign verdict and detached the client, `seqUncertain` was still set. The
+  disposal clears it in the same critical section that unbinds the client
+  (`disposeForeignStateFenced`), and only `markWriteUncertainLocked` (an ambiguous record
+  save) sets it, so a save of that session object after the disposal set it again.
+  REFUTED: the detached connection's close as that writer (`lockSession` fails when the
+  session no longer names the connection, so the close takes its not-ours exit; the
+  live-Will arm writes no record). The writer is unknown. Not reproduced: 0 of 40
+  isolated, 0 of 200 at `-test.parallel=16`. **Disposition: accepted as nonblocking** on
+  present evidence (consult K1); reopen on a recurrence or on evidence of a writer of a
+  disposed session. The failure now reports the pending write (base sequence, lineage, and
+  whether it is the bytes the test planted), which tells the planted write from a later
+  save.
+- **An untagged `go test -race ./...` failure whose test name was lost.** Met 2026-10-29
+  on tree 83db8577: the run failed and its log was kept only as a tail, which named no
+  test. Three full re-runs green, no data race. **Disposition: open.** CI now keeps the
+  untagged race output in a file and uploads it on failure (`untagged-race-log`), and the
+  local verification chains keep full logs; a captured recurrence starts attribution, and
+  the entry closes only with a disposition of what it shows.
+- **CI run 40887953897 (a0daaea): Paho `test_dollar_topics` and `test_user_properties`
+  failed in `setUpClass`.** The suite's clean-start cleanup CONNECT got no CONNACK within
+  the client's 0.5 s socket timeout. Their cleanup CONNECTs follow
+  `test_client_topic_alias` and `test_subscribe_identifiers`; the states those predecessor
+  tests leave behind took about 60 ms to CONNACK locally, 6548ed9 and a0daaea alike (100
+  trials each, `docs/findings/nats-platform.md`, "A backlogged takeover waits for a whole
+  batched flush"), and five local Paho runs, three of them CPU-pinned, had no setup
+  timeout. Not explained. **Disposition: open**, pending a CI run of a later tree (a push,
+  which is the user's act); a green run there supports a nonblocking disposition but does
+  not establish runner slowness as the cause.

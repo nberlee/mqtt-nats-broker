@@ -2,6 +2,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -23,6 +24,19 @@ func testMarkUncertain(sess *mqttSession, baseSeq uint64, body []byte) {
 // sess.mu — a hook firing inside another operation's critical section.
 func testMarkUncertainLocked(sess *mqttSession, baseSeq uint64, body []byte) {
 	testMarkUncertainCarrying(sess, baseSeq, body, 0)
+}
+
+// testDescribePendingWriteLocked describes the session's pending record write for a failure
+// message: whether one is recorded, its base sequence and lineage, and whether its digest is
+// planted's. It tells a pending write a test planted from one a later save left.
+//
+// sess.mu must be held.
+func testDescribePendingWriteLocked(sess *mqttSession, planted []byte) string {
+	pw := sess.pendingWrite
+	if pw == nil {
+		return "none"
+	}
+	return fmt.Sprintf("baseSeq=%d wid=%q planted=%v", pw.baseSeq, pw.wid, pw.digest == mqttRecordDigest(planted))
 }
 
 // testMarkUncertainCarrying is testMarkUncertainLocked for an attempt that

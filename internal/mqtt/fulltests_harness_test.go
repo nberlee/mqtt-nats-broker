@@ -16,6 +16,8 @@ import (
 	"math/rand"
 	"reflect"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -270,10 +272,32 @@ func checkClientsCount(t testing.TB, s *Server, expected int) {
 		n := len(s.clients)
 		s.mu.Unlock()
 		if n != expected {
-			return fmt.Errorf("expected %d clients, got %d", expected, n)
+			return fmt.Errorf("expected %d clients, got %d: %s", expected, n, testDescribeClients(s))
 		}
 		return nil
 	})
+}
+
+// testDescribeClients lists the server's clients for a failure message: each one's kind, its
+// published label (the atomically set "cid:N - \"client ID\"" once its CONNECT has named one,
+// "cid:N" until then) and whether it is closed, so a count that does not settle names who is
+// still there. The MQTT client ID itself is not read: CONNECT parsing writes it unlocked.
+func testDescribeClients(s *Server) string {
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for _, c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+	parts := make([]string, 0, len(clients))
+	for _, c := range clients {
+		c.mu.Lock()
+		kind := c.kind
+		c.mu.Unlock()
+		parts = append(parts, fmt.Sprintf("{kind=%d label=%q closed=%v}", kind, c.String(), c.isClosed()))
+	}
+	sort.Strings(parts)
+	return "[" + strings.Join(parts, " ") + "]"
 }
 
 // testMQTTWaitRetained blocks until the broker's retained-message index carries

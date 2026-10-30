@@ -1288,7 +1288,8 @@ func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	sess.c = c
 	baseSeq := sess.seq
 	// An attempted write whose digest will NOT match whatever is stored.
-	testMarkUncertainLocked(sess, baseSeq, []byte(`{"attempted":"ours"}`))
+	planted := []byte(`{"attempted":"ours"}`)
+	testMarkUncertainLocked(sess, baseSeq, planted)
 	sess.mu.Unlock()
 
 	// Somebody else advances the record with different content.
@@ -1304,14 +1305,17 @@ func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	sess.mu.Lock()
 	bound := sess.c
 	uncertain := sess.seqUncertain
+	// Read with the flag, so a failure says whether the write still pending is the one planted
+	// above or a later one.
+	pending := testDescribePendingWriteLocked(sess, planted)
 	sess.mu.Unlock()
 	if bound != nil {
 		t.Fatal("a foreign verdict must DETACH the stale client: left bound, the periodic resolver skips this session " +
 			"and the close path can act on state this broker may no longer write")
 	}
 	if uncertain {
-		t.Fatal("a foreign verdict resolves the session's uncertainty: the record is settled and " +
-			"is not ours, which is decided without identifying whoever wrote it")
+		t.Fatalf("a foreign verdict resolves the session's uncertainty: the record is settled and "+
+			"is not ours, which is decided without identifying whoever wrote it (pending write: %s)", pending)
 	}
 	if resident := testMQTTResidentSessionOrNil(sess.asm, sess.id); resident == sess {
 		t.Fatal("a foreign verdict must evict the session so a later CONNECT rebuilds from the authoritative record")
