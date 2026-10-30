@@ -71,7 +71,7 @@ func testContinuityOffer(t *testing.T, e *testInflightEnv, deliveries int) (uint
 	if pi == 0 || !isNew {
 		return 0, _EMPTY_, false
 	}
-	return pi, nonce, e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_)
+	return pi, nonce, e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_, nil)
 }
 
 // W5a. A DEFINITE admission failure (the batch never leaves; resolution proves it never landed):
@@ -170,7 +170,7 @@ func testF097W5b(t *testing.T, clientID string, resume bool) {
 	nonce1 := e.sess.pendingPublish[pi1].regNonce
 	firstSubject.Store(mqttInflightSubject(e.sess.idHash, e.sess.gen, pi1))
 	e.sess.mu.Unlock()
-	admitted1 := e.sess.admitInflightPublish(e.c, pi1, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce1, _EMPTY_, _EMPTY_)
+	admitted1 := e.sess.admitInflightPublish(e.c, pi1, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce1, _EMPTY_, _EMPTY_, nil)
 	e.sess.mu.Lock()
 	_, entry1 := e.sess.pendingPublish[pi1]
 	e.sess.mu.Unlock()

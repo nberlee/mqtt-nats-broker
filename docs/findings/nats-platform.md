@@ -1793,3 +1793,84 @@ across transitions, every read answered, a partial batch discarded on its error.
 run of the not-prefetched-exchange mutation against the overlap test survived because that
 test computed its expectation with the function under test; it now derives it from the
 members.
+
+## Retirement stop (2026-10-30)
+
+The section 2 batching item's last remainder: a clean-start takeover of a backlogged
+connection waited for the old connection's whole batched flush ("A backlogged takeover waits
+for a whole batched flush", above). docs/ARCHITECTURE.md, "A retiring incarnation stops its
+delivery callback's work".
+
+### Where the takeover's time went
+
+A prototype of consult C3's stop (a cooperative stop at the callback's boundaries, the
+closing channel captured at callback entry) re-measured on e1082a6, after the boundary
+prefetch, still missed the gate: three overlapping subscriptions, 16 queued QoS 1
+messages, 100 trials each, CONNACK median / p95 / max 317 / 485 / 570 ms with no cap and
+240 / 391 / 420 with the held offers capped at 8. Instrumented relative to the tracker's
+close, every slow trial waited on an ADMISSION in flight, never on the acquisition or the
+section ends (0-19 ms): a 14-delivery batch losing its attempts to the sibling
+subscriptions' commits on the session's authority record (stale at +78 and +153 ms, landed
+at +243), and single-delivery ladders of 50-100 ms. Both admission loops consulted the
+closing signal only past their base budget of six attempts. Adding a stop at every retry
+head (prototype) gave 115 / 159 / 200 with no cap, so consult 1 dropped C3's cap
+requirement: the batch bound stays 16.
+
+### What changed
+
+`mqttDeliveryLifecycle`: the delivery callback captures its connection's tracker and closing
+cycle once and hands the lifecycle to every step it reaches. No offer, segment, single hand-off,
+admission or acquisition attempt after the first, acquisition, expired-delivery disposal or
+transmission starts once it is over; each stop leaves the state that step's own refusal or
+exhaustion already leaves. The contention extension keeps its eligibility and spacing; the
+lifecycle is decided after its wait, before the next write. Stopped offers are recorded
+withheld while the leased tracker is still the session's, whatever its state.
+
+### Measured
+
+CONNACK latency of a clean-start takeover, ms, 10 interleaved rounds of 10 trials each, no
+probe timeouts:
+
+| Candidate | two subscriptions, 5 messages: median / p95 / max | three subscriptions, 16 messages: median / p95 / max | over 350 | over 500 |
+|---|---|---|---|---|
+| 6548ed9 (before batching) | 122 / 168 / 231 | 219 / 282 / 336 | 0 | 0 |
+| e1082a6 (unfixed) | 193 / 316 / 393 | 497 / 824 / 904 | 63 | 49 |
+| change | 84 / 121 / 134 | 108 / 153 / 188 | 0 | 0 |
+
+With the broker and nats-server pinned to one core (70 trials each): unfixed 542 / 1129 /
+1204 (37 over 500), change 187 / 274 / 344 (none over 350). Under that pinning three of
+ten probe rounds per candidate aborted in their own setup on BOTH trees: a CONNECT refused
+with "settling the standing ownership proposal: wrong last sequence" or "tearing down
+generation ...: wrong last sequence". It is not this change's and was not pursued here.
+
+Throughput (`make bench-outbound`, three interleaved runs each against the same-day unfixed
+e1082a6, medians, msg/s; the QoS 2 burst six runs each):
+
+| Case | Standalone unfixed / change | R3 unfixed / change |
+|---|---|---|
+| QoS 1 burst of 500 | 63.9 / 66.2 (1.04x) | 77.8 / 82.3 (1.06x) |
+| QoS 2 burst of 200 | 22.9 / 23.5 (1.03x) | 33.2 / 38.7 (1.16x) |
+| four subscribers, 200 each | 108.3 / 106.4 (0.98x) | 246.5 / 252.5 (1.02x) |
+| at rest, 20 | 42.8 / 44.7 (1.04x) | 58.3 / 76.0 (1.30x) |
+
+The Paho interoperability suite ran three times against the change with no regression (the
+baselined test_subscribe_identifiers only).
+
+No run delivered anything twice. The first three R3 QoS 2 runs read 0.86x (ranges 33.4-39.0
+against 31.6-38.7); three more pairs put it at 1.16x, so it is R3's known spread.
+
+### Tests and mutations
+
+outbound_delivery_retirement_stop_test.go: 33 tests. Each witness closes the tracker from
+a seam inside the boundary it tests, after every earlier check has passed, and counts the
+work started after the close; the offer-continuation witnesses stage a collected delivery
+ahead of the offer and close inside its admission, which runs in the offer's flush. Three
+pin the existing exits a stop meets (an unresolved batch receipt, an ambiguous
+acquisition, a cancelled allocation), one shows a declined drained offer is still
+acknowledged, and an AST census holds every flush in the offer body to the boundary. 34
+mutations, each removing or moving one stop (or weakening the withheld rule, the captured
+channel, the read-back exemption, the extension's eligibility, the census), each killed by
+its paired test; the stop tests passed five consecutive runs. Two first survived on
+fixture faults (an oracle that counted the collected offer's own abandonment record; a
+fallen-out participant whose foreign token still stood, so its acquisition could never
+commit), both fixed and killed.

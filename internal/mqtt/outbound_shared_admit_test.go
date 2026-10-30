@@ -54,7 +54,7 @@ func (r *testSharedAdmitRig) admit(t *testing.T, dep *mqttAdmitShared) (uint16, 
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
 	}
-	return pi, e.sess.admitSharedInflightPublish(e.c, pi, 1, r.dur, r.sseq, e.nonceOf(pi), dep)
+	return pi, e.sess.admitSharedInflightPublish(e.c, pi, 1, r.dur, r.sseq, e.nonceOf(pi), dep, nil)
 }
 
 func (r *testSharedAdmitRig) dep() *mqttAdmitShared {
@@ -118,7 +118,7 @@ func TestSharedAdmissionRefusesWithoutADependencyOrAtQoS2(t *testing.T) {
 	e.sess.mu.Lock()
 	pi, _ := e.sess.trackPublish(r.dur, testInflightAckSubject(r.dur, r.sseq+1, 1))
 	e.sess.mu.Unlock()
-	if e.sess.admitSharedInflightPublish(e.c, pi, 2, r.dur, r.sseq+1, e.nonceOf(pi), r.dep()) {
+	if e.sess.admitSharedInflightPublish(e.c, pi, 2, r.dur, r.sseq+1, e.nonceOf(pi), r.dep(), nil) {
 		t.Fatal("a shared delivery was admitted at QoS 2")
 	}
 }

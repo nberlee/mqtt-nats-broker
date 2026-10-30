@@ -705,7 +705,7 @@ func TestF088CancellationBeforeOpeningLeavesNoUnsettledPlaceholder(t *testing.T)
 			} else {
 				cancel()
 			}
-			if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+			if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_, nil) {
 				t.Fatal("a cancelled allocation must not be admitted")
 			}
 			if tc.afterOpening && !reached {

@@ -1449,7 +1449,7 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	if pi == 0 || !isNew {
 		t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
 	}
-	if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatalf("row 3: an unreadable marker must not release the identifier for sending")
 	}
 	e.asm.mu.Lock()

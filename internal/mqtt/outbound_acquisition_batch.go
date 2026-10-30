@@ -68,7 +68,7 @@ var mqttTestAcquisitionBatchReadBackHook = new(mqttKnob[func(sess *mqttSession, 
 // later one end without recording intent, so none deletes its unsent marker after the seal.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) sendAdmittedPublishes(live []*mqttCollectedDelivery) {
+func (sess *mqttSession) sendAdmittedPublishes(live []*mqttCollectedDelivery, life *mqttDeliveryLifecycle) {
 	var secs []*mqttPublishSection
 	// ARMED BEFORE ANY SECTION OPENS: every opened section is ended exactly once, in order, on the
 	// sealed-output exit and on a panic too ("only endSend removes" must not depend on no early
@@ -86,10 +86,15 @@ func (sess *mqttSession) sendAdmittedPublishes(live []*mqttCollectedDelivery) {
 			(*h)(sess, d.adm.pi)
 		}
 		sec := sess.openPublishSection(d.pc, d.cc, d.sub, d.adm.pi, d.adm.qos, d.adm.sseq, d.reply, d.retainAsPub,
-			d.subID, d.topic, d.msg, d.props)
+			d.subID, d.topic, d.msg, d.props, life)
 		if sec != nil {
 			secs = append(secs, sec)
 		}
+	}
+	// NO ACQUISITION STARTS once the callback's lifecycle has ended: the deferred loop ends every
+	// opened section without intent, the admitted deliveries standing as a sealed output leaves them.
+	if life.over() {
+		return
 	}
 	switch len(secs) {
 	case 0:
@@ -112,7 +117,7 @@ func (sess *mqttSession) sendAdmittedPublishes(live []*mqttCollectedDelivery) {
 		h(sess, pis)
 	}
 	for i, sec := range secs {
-		if b := sec.cc.outBind; b != nil && !b.mayWrite() {
+		if b := sec.cc.outBind; (b != nil && !b.mayWrite()) || life.over() {
 			return // the deferred loop ends this section and every later one, with no intent
 		}
 		switch {
@@ -194,12 +199,18 @@ func (sess *mqttSession) acquirePublishActions(secs []*mqttPublishSection) []mqt
 	// A BATCH THAT LOSES ONLY TO STALE EXPECTATIONS KEEPS ITS PLACE, under the delivery entrance's
 	// contention extension, exactly as the admission batch does: giving up would leave every
 	// participant to a re-offer queued behind later messages.
-	ext := &mqttDeliveryContentionExtension{sess: sess, c: c}
-	if c.mqtt != nil {
-		ext.closing = c.mqtt.tracker.closingSignal()
-	}
+	life := secs[0].tok.life
+	ext := newDeliveryContentionExtension(sess, c, life)
 	budget := mqttForegroundAcquireAttempts
 	for attempt := 0; ; attempt++ {
+		// After the previous attempt's wait and premise re-reads: only a positively-never-landed
+		// contended attempt loops, and the give-up below releases its participants in that state.
+		if attempt > 0 && life.over() {
+			for _, i := range in {
+				sess.releaseUnacquiredPublishAction(c, &secs[i].tok)
+			}
+			return parts
+		}
 		txn := mqttNewInflightNonce()
 		reqs := make([]*mqttAcquireActionRequest, len(in))
 		pis := make([]uint16, len(in))

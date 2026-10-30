@@ -67,8 +67,8 @@ func (e *testInflightEnv) trackSharedAdmitted(t *testing.T, dur string, sseq uin
 		t.Fatalf("no held acquisition selects %q: join the group first", dur)
 	}
 	e.acceptUnderServingAuthority(t)
-	if !e.sess.admitSharedInflightPublish(e.c, pi, 1, dur, sseq, e.nonceOf(pi), dep) {
-		t.Fatalf("admitSharedInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
+	if !e.sess.admitSharedInflightPublish(e.c, pi, 1, dur, sseq, e.nonceOf(pi), dep, nil) {
+		t.Fatalf("admitSharedInflightPublish(%d, %s/%d, nil) refused", pi, dur, sseq)
 	}
 	return pi
 }
@@ -131,8 +131,8 @@ func (e *testInflightEnv) trackSharedByGroupKey(t *testing.T, dur string, sseq u
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
 	}
-	if !e.sess.admitSharedInflightPublish(e.c, pi, 1, dur, sseq, e.nonceOf(pi), &mqttAdmitShared{Acq: ref, Tenure: tenure}) {
-		t.Fatalf("admitSharedInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
+	if !e.sess.admitSharedInflightPublish(e.c, pi, 1, dur, sseq, e.nonceOf(pi), &mqttAdmitShared{Acq: ref, Tenure: tenure}, nil) {
+		t.Fatalf("admitSharedInflightPublish(%d, %s/%d, nil) refused", pi, dur, sseq)
 	}
 	return pi
 }

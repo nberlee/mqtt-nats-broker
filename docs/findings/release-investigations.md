@@ -716,6 +716,13 @@ from keep their full history.
   observation, not a proven fixture flake (F-116's neighbourhood is a candidate only).
   Reproduce: `-run TestMQTTRedeliveryAckWait -count=10`. **Disposition: open**; owed: trace
   the mechanism, and file a §0.3 finding only if it shows loss.
+  A second symptom on the same test, 2026-10-30 (the retirement-stop verification, a
+  working tree on e1082a6): "Expected payload foo2, got foo1" in the second redelivery
+  round, foo1's redelivery arriving where foo2's was due, in one of two parallel tagged
+  shards (`GOMAXPROCS=2`, the pod at its memory limit), no broker warning in the test's
+  window. Not reproduced: 0 of 60 isolated runs and 0 of 60 pinned to one core, split
+  evenly between e1082a6 and the change, and the same shard pair re-run from the same
+  binary green. Not attributed; recorded here, not as a recurrence of the first symptom.
 - **F-123, `TestF097DispatcherIsFairUnderContinuousHints`.** Intermittent, "took 4
   iterations under continuous hints, want <= 3"; 1 of 10 at `d784cdb`. **Disposition:
   CLOSED 2026-10-16, a measurement defect; the dispatcher meets its bound.** Traced over 40

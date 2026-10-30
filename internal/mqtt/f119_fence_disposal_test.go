@@ -270,7 +270,7 @@ func TestF119DisplacedLadderCannotDisposeOfAServingFence(t *testing.T) {
 	other := mqttNewInflightNonce()
 	_, fseq := testF088WriteFence(t, f.e, f.pi, f.dur, f.sseq+100, other)
 	stale := f119StaleClient(t, f)
-	if f.e.sess.admitInflightPublish(stale, f.pi, f.qos, f.dur, f.sseq, f.nonce, _EMPTY_, _EMPTY_) {
+	if f.e.sess.admitInflightPublish(stale, f.pi, f.qos, f.dur, f.sseq, f.nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("a displaced connection's admission must not succeed")
 	}
 	if ok, seq := f.fenceStands(t); !ok || seq != fseq {

@@ -741,7 +741,7 @@ func TestF105AdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d new=%v", pi, isNew)
 	}
-	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, f.sseq+11, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, f.sseq+11, e.nonceOf(pi), _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("the displaced connection admitted a delivery under its successor's tenure")
 	}
 	e.sess.mu.Lock()
@@ -866,7 +866,7 @@ func testOwnWriteEnded(t *testing.T, clientID string, lost bool) {
 	}
 	e.asm.jsa.testTransitionCommit.Store(&hook)
 	t.Cleanup(func() { e.asm.jsa.testTransitionCommit.Store(nil) })
-	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, sseq, admNonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, sseq, admNonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("the ladder adopted a landed write whose obligation had since been ended")
 	}
 	if !withdrew.Load() {

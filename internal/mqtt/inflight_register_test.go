@@ -448,8 +448,8 @@ func (e *testInflightEnv) trackAdmitted(t *testing.T, dur string, sseq uint64, q
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
 	}
 	e.acceptUnderServingAuthority(t)
-	if !e.sess.admitInflightPublish(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
-		t.Fatalf("admitInflightPublish(%d, %s/%d) refused", pi, dur, sseq)
+	if !e.sess.admitInflightPublish(e.c, pi, qos, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_, nil) {
+		t.Fatalf("admitInflightPublish(%d, %s/%d, nil) refused", pi, dur, sseq)
 	}
 	return pi
 }
@@ -2553,7 +2553,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority(t *testing.T) {
 			e.asm.jsa.testTransitionCommit.Store(&hook)
 			t.Cleanup(func() { e.asm.jsa.testTransitionCommit.Store(nil) })
 
-			if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_) {
+			if e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_, nil) {
 				t.Fatal("a cancelled allocation must not be released for sending")
 			}
 			e.sess.mu.Lock()
@@ -3016,7 +3016,7 @@ func TestMQTTInflightStoreReapsCancelledOccupant(t *testing.T) {
 		if got != pi || !isNew {
 			t.Fatalf("the allocation must meet identifier %d, got %d (new=%v)", pi, got, isNew)
 		}
-		if e.sess.admitInflightPublish(e.c, pi, 2, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+		if e.sess.admitInflightPublish(e.c, pi, 2, dur, sseq, e.nonceOf(pi), _EMPTY_, _EMPTY_, nil) {
 			t.Fatal("an allocation over a possibly-attempted cancelled occupant must be withdrawn, not admitted")
 		}
 		rec, smsg := e.loadRegister(t, pi)

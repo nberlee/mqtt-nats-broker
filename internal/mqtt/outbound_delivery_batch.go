@@ -48,7 +48,9 @@ type mqttCollectedDelivery struct {
 // mqttDeliveryCollector carries one run's collected deliveries until they are admitted and sent.
 // It belongs to the subscription's dispatch goroutine for the length of one callback.
 type mqttDeliveryCollector struct {
-	sess  *mqttSession
+	sess *mqttSession
+	// life is the callback's delivery lifecycle, handed to every step the callback reaches.
+	life  *mqttDeliveryLifecycle
 	items []*mqttCollectedDelivery
 	// reached counts the offers whose processing passed the delivery-done seam's point, so the
 	// callback fires the seam for each once it has flushed (mqttDeliverQoS12Offer).
@@ -62,6 +64,22 @@ var mqttTestHeldOffersHook = new(mqttKnob[func(sub *subscription, held int)])
 // mqttTestDeliveryFlushHook runs at the start of every non-empty flush, before the collected
 // deliveries' expiry is judged. Nil in production.
 var mqttTestDeliveryFlushHook = new(mqttKnob[func(sess *mqttSession, n int)])
+
+// mqttTestDeliveryOfferHook runs in the processing callback as each offer's processing starts, held
+// or its own, after the lifecycle allowed it; col identifies the callback. Nil in production.
+var mqttTestDeliveryOfferHook = new(mqttKnob[func(sub *subscription, reply string, col *mqttDeliveryCollector)])
+
+// mqttTestOfferContinuationHook observes an offer starting its own work after a flush, by site:
+// "terminal", "drain-resolve", "drain-finalize", "denied", "retired". Nil in production.
+var mqttTestOfferContinuationHook = new(mqttKnob[func(site string)])
+
+// mqttTestPhaseGateWaitHook runs as an offer is about to wait on its subscription's phase gate,
+// after the lifecycle allowed the wait. Nil in production.
+var mqttTestPhaseGateWaitHook = new(mqttKnob[func(sub *subscription)])
+
+// mqttTestDeliveryCallbackDoneHook runs once as a processing callback returns, after its last
+// flush. Nil in production.
+var mqttTestDeliveryCallbackDoneHook = new(mqttKnob[func(sub *subscription, col *mqttDeliveryCollector)])
 
 // mqttDeliverMsgCbQoS12 is the callback attached to a JS durable subscription for a MQTT QoS 1+
 // sub.
@@ -79,6 +97,11 @@ var mqttTestDeliveryFlushHook = new(mqttKnob[func(sess *mqttSession, n int)])
 // A held offer is an unacknowledged JetStream delivery exactly like those still queued in the
 // connection layer: if the subscription stops (unsubscribe, a re-SUBSCRIBE replacing it, the
 // connection closing), neither is processed and AckWait re-offers both.
+//
+// A RETIREMENT WAITS FOR THIS CALLBACK'S LEASE, so the callback stops starting work once its
+// lifecycle has ended (mqttDeliveryLifecycle): an offer not yet processed is recorded withheld, as
+// a refused callback's is, and every later step it would have reached gives up as that step's own
+// refusal or exhaustion does.
 func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
 	if mqttDeliveryHoldable(sub) && mqttMoreQueued(sub) && len(sub.held) < mqttAdmissionBatchMax-1 {
 		// A RE-OFFER OF AN OFFER ALREADY HELD is dropped; the held one keeps its position and
@@ -93,21 +116,39 @@ func mqttDeliverMsgCbQoS12(sub *subscription, pc *client, _ *Account, subject, r
 	}
 	held := sub.held
 	sub.held = nil
-	col := &mqttDeliveryCollector{sess: sub.client.mqtt.sess}
+	sess := sub.client.mqtt.sess
+	col := &mqttDeliveryCollector{sess: sess, life: newDeliveryLifecycle(sess, sub.client)}
 	own := pc.pa.hdr
 	for _, h := range held {
+		if col.life.over() {
+			sess.recordWithheldStopped(col.life, sub, h.reply)
+			continue
+		}
+		if oh := mqttTestDeliveryOfferHook.Get(); oh != nil {
+			oh(sub, h.reply, col)
+		}
 		pc.pa.hdr = h.hdr
 		mqttDeliverQoS12Offer(sub, pc, h.subject, h.reply, h.rmsg, col)
 	}
 	pc.pa.hdr = own
 	if !mqttHeldOfferListed(held, reply) {
-		mqttDeliverQoS12Offer(sub, pc, subject, reply, rmsg, col)
+		if col.life.over() {
+			sess.recordWithheldStopped(col.life, sub, reply)
+		} else {
+			if oh := mqttTestDeliveryOfferHook.Get(); oh != nil {
+				oh(sub, reply, col)
+			}
+			mqttDeliverQoS12Offer(sub, pc, subject, reply, rmsg, col)
+		}
 	}
 	col.flush()
 	if dh := mqttTestDeliveryDoneHookV.Load(); dh != nil {
 		for i := 0; i < col.reached; i++ {
 			(*dh)(sub)
 		}
+	}
+	if ch := mqttTestDeliveryCallbackDoneHook.Get(); ch != nil {
+		ch(sub, col)
 	}
 }
 
@@ -160,10 +201,24 @@ func (col *mqttDeliveryCollector) collect(d *mqttCollectedDelivery) {
 // a NAK, a synchronous JetStream request, a wait, a send — follows the deliveries collected ahead
 // of it.
 //
+// It reports whether the callback's lifecycle still lasts after the flush. THE FLUSH RUNS WHAT WERE
+// EARLIER CALLBACKS before batching, and this offer's would have been refused had the retirement
+// begun during them, so an offer starts no fresh work of its own after a flush that ends the
+// lifecycle; it still settles a decision it made under the lock (an acknowledgement of a declined
+// offer, a withheld record). TestDeliveryOfferHasOneUnflushedExit holds every exit to that.
+//
 // Session lock held on entry; released on return.
-func (col *mqttDeliveryCollector) unlockAndFlush(sess *mqttSession) {
+func (col *mqttDeliveryCollector) unlockAndFlush(sess *mqttSession) bool {
 	sess.mu.Unlock()
+	return col.flushLasts()
+}
+
+// flushLasts flushes and reports whether the callback's lifecycle still lasts (unlockAndFlush).
+//
+// Session lock NOT held on entry.
+func (col *mqttDeliveryCollector) flushLasts() bool {
 	col.flush()
+	return !col.life.over()
 }
 
 // flush admits the collected deliveries in one batch and sends each admitted one, in order, each
@@ -198,6 +253,9 @@ func (col *mqttDeliveryCollector) flush() {
 	// IN ORDER: an expired delivery's disposal (a durable cleanup and its source acknowledgement)
 	// waits for the live deliveries collected ahead of it to be admitted and sent, exactly as a
 	// later offer's effects do; the live ones after it form the next batch.
+	//
+	// An expired delivery's disposal is work of its own: once the lifecycle has ended it and every
+	// later delivery are abandoned instead, unacknowledged, as admission would abandon them.
 	var live []*mqttCollectedDelivery
 	for i, d := range items {
 		if !expired[i] {
@@ -206,6 +264,10 @@ func (col *mqttDeliveryCollector) flush() {
 		}
 		col.admitAndSend(live)
 		live = nil
+		if col.life.over() {
+			col.abandon(items[i:])
+			return
+		}
 		removed := sess.dropProvenUnsentPublishEntry(d.adm.pi, d.lic)
 		if !sess.finalizeDrainSource(d.cc, removed) {
 			_, _ = sess.submitSourceAck(d.reply, false, nil)
@@ -224,10 +286,31 @@ func (col *mqttDeliveryCollector) admitAndSend(live []*mqttCollectedDelivery) {
 		return
 	}
 	sess := col.sess
+	// NO ADMISSION STARTS once the lifecycle has ended: the collected deliveries are abandoned as a
+	// batch without an entitlement abandons them.
+	if col.life.over() {
+		col.abandon(live)
+		return
+	}
 	adms := make([]*mqttBatchAdmission, len(live))
 	for i, d := range live {
 		adms[i] = d.adm
 	}
-	sess.admitInflightPublishBatch(live[0].cc, adms)
-	sess.sendAdmittedPublishes(live)
+	sess.admitInflightPublishBatch(live[0].cc, adms, col.life)
+	sess.sendAdmittedPublishes(live, col.life)
+}
+
+// abandon releases collected deliveries no admission will take, as abandonInflightRegister releases
+// an admission that gives up: the identifier excluded until settled, the source left
+// unacknowledged and recorded withheld.
+//
+// Session lock NOT held on entry.
+func (col *mqttDeliveryCollector) abandon(items []*mqttCollectedDelivery) {
+	for _, d := range items {
+		if d.adm.done {
+			continue
+		}
+		col.sess.abandonInflightRegister(d.lic, d.adm.pi, d.adm.jsDur, d.adm.sseq, d.adm.nonce)
+		d.adm.done = true
+	}
 }

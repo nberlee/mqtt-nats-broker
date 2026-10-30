@@ -213,7 +213,7 @@ func TestStaleExpectationClassification(t *testing.T) {
 		}
 	}
 	// AND EVERY ATTEMPT MUST QUALIFY: one attempt that failed otherwise disqualifies the extension.
-	x := &mqttDeliveryContentionExtension{sess: &mqttSession{}, c: &client{}}
+	x := &mqttDeliveryContentionExtension{life: &mqttDeliveryLifecycle{sess: &mqttSession{}, c: &client{}}}
 	x.noteWrite(errMQTTStaleExpectation)
 	x.noteWrite(errors.New("a read failure"))
 	if x.extend(2, errMQTTStaleExpectation) {

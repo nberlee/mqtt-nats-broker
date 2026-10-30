@@ -268,7 +268,7 @@ func TestMQTTFailedReplacementCreatesAtTheIncomingQoS(t *testing.T) {
 		return send()
 	})
 
-	sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_)
+	sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_, nil)
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -248,8 +248,8 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	//
 	// The collector is flushed before this offer waits on a gate and before it records a
 	// withholding: deliveries collected ahead of it are not held behind its wait.
-	if sess.awaitTransmissionGatesThen(cc, col.flush) != mqttTransmissionOpen {
-		col.flush()
+	if sess.awaitTransmissionGatesThen(cc, col.flushLasts) != mqttTransmissionOpen {
+		col.flushLasts()
 		mqttTestRestoreGateBlockedHook("qos12")
 		sess.recordWithheldDelivery(cc, sub, reply)
 		return
@@ -286,7 +286,10 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// every check below is re-evaluated afterwards. See sess_resume_reconcile.go.
 	if sub.mqtt != nil && sub.mqtt.phaseGate != nil {
 		gate := sub.mqtt.phaseGate
-		col.unlockAndFlush(sess)
+		if !col.unlockAndFlush(sess) {
+			sess.recordWithheldStopped(col.life, sub, reply)
+			return
+		}
 		timer := time.NewTimer(mqttPhaseGateWaitFor(cc))
 		// The retirement of THIS connection's incarnation cancels the wait, for the
 		// same reason it cancels the transmission gates: this cap is up to 30 seconds,
@@ -294,16 +297,21 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		// clean-start takeover refuse for a reason unrelated to the contender. The
 		// re-checks below then take the ordinary withheld path — recorded, not acked —
 		// because sub.mqtt.closed or the ownership term will have moved (F-036 unit 1).
-		var closing <-chan struct{}
-		if cc != nil && cc.mqtt != nil {
-			closing = cc.mqtt.tracker.closingSignal()
+		// The callback's own closing cycle, captured at its entry: a close and reopen during the
+		// flush must not leave this wait on the new cycle.
+		if h := mqttTestPhaseGateWaitHook.Get(); h != nil {
+			h(sub)
 		}
 		select {
 		case <-gate:
-		case <-closing:
+		case <-col.life.closing:
 		case <-timer.C:
 		}
 		timer.Stop()
+		if col.life.over() {
+			sess.recordWithheldStopped(col.life, sub, reply)
+			return
+		}
 		sess.mu.Lock()
 	}
 	if sess.c != cc || sub.mqtt == nil || sub.mqtt.closed {
@@ -352,9 +360,19 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 				}
 			}
 		}
-		col.unlockAndFlush(sess)
+		// The terminal owner already carries its own continuation; this offer's resolution and
+		// wake are extra, and each is a step of its own.
+		if !col.unlockAndFlush(sess) {
+			return
+		}
+		if h := mqttTestOfferContinuationHook.Get(); h != nil {
+			h("terminal")
+		}
 		if sess.isSeqUncertain() {
 			sess.resolveUncertainNow(cc)
+		}
+		if col.life.over() {
+			return
 		}
 		for _, ref := range wake {
 			sess.scheduleTerminalRegisterRelease(cc, ref.name.pi, ref, false)
@@ -395,8 +413,14 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 			// nothing about another's. See sourceRestrictedLocked.
 			restricted := sess.sourceRestrictedLocked(sub.mqtt.jsDur, sseq)
 			staged := d.staged || unconfirmed || restricted
-			col.unlockAndFlush(sess)
-			if unconfirmed || sess.isSeqUncertain() {
+			// The resolution below is a retry of its own and does not start once the lifecycle
+			// has ended; the decline's acknowledgement settles a decision already made, and runs
+			// either way.
+			lasts := col.unlockAndFlush(sess)
+			if lasts && (unconfirmed || sess.isSeqUncertain()) {
+				if h := mqttTestOfferContinuationHook.Get(); h != nil {
+					h("drain-resolve")
+				}
 				// This redelivery IS the retry clock. The finalizer's own immediate attempt
 				// may itself have failed, and the periodic pass only runs on its own
 				// schedule — so retrying here is what keeps an unresolved removal from
@@ -420,7 +444,12 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		case st.phase == drainPubRelConfirmed:
 			// The exchange is past PUBREC with a proven PUBREL: never deliver the
 			// payload again. Finalize (which acks on a confirmed save).
-			col.unlockAndFlush(sess)
+			if !col.unlockAndFlush(sess) {
+				return // the claim, the source and the identifier stand for a later attempt
+			}
+			if h := mqttTestOfferContinuationHook.Get(); h != nil {
+				h("drain-finalize")
+			}
 			sess.finalizeDrainDelivery(cc, sub.mqtt.jsDur, sseq, reply)
 			return
 		case st.phase == drainPubRelUncertain:
@@ -499,7 +528,11 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// it.
 	switch cc.checkDenySubVerdict(strippedSubj, string(sub.queue)) {
 	case mqttSubDeliverDenied:
-		col.unlockAndFlush(sess)
+		// The whole release, acknowledgement or hand-back continuation below is this offer's own
+		// work; stopped, the standing exchange and the source stay as they are.
+		if !col.unlockAndFlush(sess) {
+			return
+		}
 		// TERMINAL only for a subscription nobody else can serve. On a SHARED
 		// subscription the group consumer picked this member without consulting its
 		// ACL, so acknowledging here would consume the group's message on behalf of
@@ -518,6 +551,9 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		// life of the session. Nothing below this point can free it: the deny
 		// returns. Note the INDETERMINATE arm deliberately does not do this --
 		// it decides nothing, and freeing an identifier is a decision.
+		if h := mqttTestOfferContinuationHook.Get(); h != nil {
+			h("denied")
+		}
 		released := sess.releaseTransmittedIdentifier(cc, sub.mqtt.jsDur, reply)
 		if released == mqttAbandonPending {
 			// The restored delivery's abandonment is not durable yet (refused, vetoed,
@@ -615,7 +651,10 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 			col.unlockAndFlush(sess)
 			return
 		}
-		col.unlockAndFlush(sess)
+		// Its expiry disposal and its write are this offer's own work.
+		if !col.unlockAndFlush(sess) {
+			return // unacknowledged: the group re-offers it; QoS 0 owes no DUP
+		}
 		originalTopic := natsSubjectStrToMQTTTopic(strippedSubj)
 		var props []byte
 		if h != nil {
@@ -632,6 +671,11 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		}
 		if hook := mqttTestSharedQoS0OutputHook.Load(); hook != nil {
 			(*hook)(sub.mqtt.jsDur, reply)
+		}
+		// Not once the callback's lifecycle has ended: unacknowledged, the group re-offers it to
+		// whichever member AckWait reaches, as for a refused callback. QoS 0 owes no DUP.
+		if col.life.over() {
+			return
 		}
 		pc.mqttEnqueueQoS0PublishMsgTo(cc, sub, retainAsPub, subID, originalTopic, msg, props)
 		_, _ = sess.submitSourceAck(reply, false, nil)
@@ -697,7 +741,12 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		return
 	}
 	if !drainClaimed && sess.sourceRetiredLocked(sub.mqtt.jsDur, sseq) {
-		col.unlockAndFlush(sess)
+		if !col.unlockAndFlush(sess) {
+			return // suppression and the outstanding source obligation stand
+		}
+		if h := mqttTestOfferContinuationHook.Get(); h != nil {
+			h("retired")
+		}
 		sess.settleRetiredSource(cc, sub.mqtt.jsDur, sseq, reply)
 		return
 	}
@@ -822,8 +871,15 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// beside it (outbound_admission_batch.go). Every other offer ends the batch before it acts.
 	batchable := isNew && pi != 0 && !sub.mqtt.shared && !drainClaimed
 	sess.mu.Unlock()
-	if !batchable {
-		col.flush()
+	// AFTER THE FLUSH, NO FURTHER STEP of a non-collected offer once the callback's lifecycle has
+	// ended, neither an expiry disposal nor an admission nor a send: a fresh allocation is abandoned
+	// before its first attempt, as the shared entrance's own pre-attempt refusal abandons; an entry
+	// that already stood stays as it stands, for the re-offer.
+	if !batchable && !col.flushLasts() {
+		if isNew && pi != 0 {
+			sess.abandonInflightRegister(mqttLicenceOf(cc), pi, sub.mqtt.jsDur, sseq, regNonce)
+		}
+		return
 	}
 
 	if pi == 0 {
@@ -887,9 +943,9 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		// acquisition is refused there, never admitted without one.
 		var stored bool
 		if sub.mqtt.shared {
-			stored = sess.admitSharedInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, sharedDep)
+			stored = sess.admitSharedInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, sharedDep, col.life)
 		} else {
-			stored = sess.admitInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_)
+			stored = sess.admitInflightPublish(cc, pi, qos, sub.mqtt.jsDur, sseq, regNonce, _EMPTY_, _EMPTY_, col.life)
 		}
 		if !stored {
 			return
@@ -898,7 +954,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 			(*h)(sess, pi)
 		}
 	}
-	sess.sendAdmittedPublish(pc, cc, sub, pi, qos, sseq, reply, retainAsPub, subID, originalTopic, msg, props)
+	sess.sendAdmittedPublish(pc, cc, sub, pi, qos, sseq, reply, retainAsPub, subID, originalTopic, msg, props, col.life)
 }
 
 // sendAdmittedPublish is the send section of one delivery whose identifier is admitted (or, for a
@@ -909,12 +965,18 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, pi uint16, qos byte, sseq uint64,
-	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte) {
-	sec := sess.openPublishSection(pc, cc, sub, pi, qos, sseq, reply, retainAsPub, subID, originalTopic, msg, props)
+	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte, life *mqttDeliveryLifecycle) {
+	sec := sess.openPublishSection(pc, cc, sub, pi, qos, sseq, reply, retainAsPub, subID, originalTopic, msg, props, life)
 	if sec == nil {
 		return
 	}
 	defer sec.end()
+	// NO ACQUISITION STARTS once the callback's lifecycle has ended: the section ends without
+	// intent, as on a sealed output, and the entry stays as its admission (or its earlier
+	// transmission) left it.
+	if life.over() {
+		return
+	}
 	// THE DURABLE HALF OF THE EXCLUSION, and it comes first. Before F-098 this section's
 	// only hold was process memory, which fences no peer: two brokers may legitimately
 	// serve one incarnation. Taking it here rather than after admission fences the SIZE
@@ -955,7 +1017,7 @@ type mqttPublishSection struct {
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) openPublishSection(pc, cc *client, sub *subscription, pi uint16, qos byte, sseq uint64,
-	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte) *mqttPublishSection {
+	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte, life *mqttDeliveryLifecycle) *mqttPublishSection {
 	// The SEND SECTION. queueOutbound is a synchronous socket write with no deadline, so
 	// between here and its return a teardown, a denial, a recovery pass or a terminal
 	// acknowledgement can free this identifier and bumpPI can re-mint it — two PUBLISHes
@@ -999,6 +1061,7 @@ func (sess *mqttSession) openPublishSection(pc, cc *client, sub *subscription, p
 	}
 	sendTok, sendOK := sess.beginSendLocked(cc, pi, sub.mqtt.jsDur, sseq)
 	sess.mu.Unlock()
+	sendTok.life = life
 	if !sendOK {
 		// The entry is no longer sendable — a concurrent section, a condemnation, or a
 		// connection that is no longer this session's. The message stays with JetStream
@@ -1052,6 +1115,12 @@ func (sec *mqttPublishSection) end() {
 // Session lock NOT held on entry.
 func (sess *mqttSession) transmitAcquired(sec *mqttPublishSection) {
 	cc, pi := sec.cc, sec.pi
+	// NOTHING IS WRITTEN once the callback's lifecycle has ended: returning before intent is the
+	// state the seam below stages, this section having emitted nothing; an earlier transmission's
+	// evidence stays as it was.
+	if sec.tok.life.over() {
+		return
+	}
 	if !sess.markerSendWindowHook(pi, mqttMarkerSendReserved) {
 		return // a test-staged crash after the pair confirmed and BEFORE intent: proven-unsent
 	}

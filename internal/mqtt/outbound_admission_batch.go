@@ -73,8 +73,11 @@ var mqttTestAdmissionBatchSingleHook = new(mqttKnob[func(sess *mqttSession, nonc
 // attempt whose outcome stays unresolved abandons every participant exactly as the ladder's
 // exhaustion does, so each keeps the continuity record its unresolved attempt owes.
 //
+// life is the delivery callback's lifecycle: once it has ended no further segment, single hand-off
+// or attempt starts, and the deliveries not yet admitted are abandoned as on exhaustion.
+//
 // Session lock NOT held on entry.
-func (sess *mqttSession) admitInflightPublishBatch(c *client, items []*mqttBatchAdmission) {
+func (sess *mqttSession) admitInflightPublishBatch(c *client, items []*mqttBatchAdmission, life *mqttDeliveryLifecycle) {
 	if len(items) == 0 {
 		return
 	}
@@ -82,7 +85,7 @@ func (sess *mqttSession) admitInflightPublishBatch(c *client, items []*mqttBatch
 		// ONE DELIVERY IS THE SINGLE ROUTE, unchanged: a batch of one would only gate its
 		// dependencies twice (here and again in the ladder it would hand the delivery to).
 		it := items[0]
-		it.stored = sess.admitInflightPublish(c, it.pi, it.qos, it.jsDur, it.sseq, it.nonce, _EMPTY_, _EMPTY_)
+		it.stored = sess.admitInflightPublish(c, it.pi, it.qos, it.jsDur, it.sseq, it.nonce, _EMPTY_, _EMPTY_, life)
 		it.done = true
 		return
 	}
@@ -161,7 +164,7 @@ func (sess *mqttSession) admitInflightPublishBatch(c *client, items []*mqttBatch
 	if len(ready) == 0 {
 		return
 	}
-	sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, ready, abandon)
+	sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, ready, abandon, life)
 }
 
 // admissionBatchPreamble is runInflightAdmission's preamble for each delivery: the allocation must
@@ -220,18 +223,32 @@ func (sess *mqttSession) admissionBatchPreamble(c *client, items []*mqttBatchAdm
 // delivery order. Segments are worked front to back, so a split never lets a later delivery be
 // admitted ahead of an earlier one that is still undecided.
 //
+// EVERY SEGMENT AND EVERY SINGLE HAND-OFF IS FRESH WORK, the first included: a stale split's prefix
+// recurses here from inside its parent's attempt, and the delivery split out of a batch starts a
+// ladder of its own. Neither starts once life has ended; what is left is abandoned as on
+// exhaustion (abandon skips what is already settled).
+//
 // Session lock NOT held on entry.
 func (sess *mqttSession) runAdmissionBatch(c *client, gen, epoch string, auth mqttOutboundEntitlement,
-	depsByQoS map[byte][]mqttAdmitDependency, items []*mqttBatchAdmission, abandon func([]*mqttBatchAdmission)) {
+	depsByQoS map[byte][]mqttAdmitDependency, items []*mqttBatchAdmission, abandon func([]*mqttBatchAdmission),
+	life *mqttDeliveryLifecycle) {
 
 	for len(items) > 0 {
-		if len(items) == 1 {
-			sess.admitBatchDeliverySingly(c, gen, items[0])
+		if life.over() {
+			abandon(items)
 			return
 		}
-		rest, single := sess.attemptAdmissionBatch(c, gen, epoch, auth, depsByQoS, items, abandon)
+		if len(items) == 1 {
+			sess.admitBatchDeliverySingly(c, gen, items[0], life)
+			return
+		}
+		rest, single := sess.attemptAdmissionBatch(c, gen, epoch, auth, depsByQoS, items, abandon, life)
 		if single != nil {
-			sess.admitBatchDeliverySingly(c, gen, single)
+			if life.over() {
+				abandon(append([]*mqttBatchAdmission{single}, rest...))
+				return
+			}
+			sess.admitBatchDeliverySingly(c, gen, single, life)
 		}
 		items = rest
 	}
@@ -244,12 +261,9 @@ func (sess *mqttSession) runAdmissionBatch(c *client, gen, epoch string, auth mq
 // Session lock NOT held on entry.
 func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, auth mqttOutboundEntitlement,
 	depsByQoS map[byte][]mqttAdmitDependency, items []*mqttBatchAdmission,
-	abandon func([]*mqttBatchAdmission)) (rest []*mqttBatchAdmission, single *mqttBatchAdmission) {
+	abandon func([]*mqttBatchAdmission), life *mqttDeliveryLifecycle) (rest []*mqttBatchAdmission, single *mqttBatchAdmission) {
 
-	ext := &mqttDeliveryContentionExtension{sess: sess, c: c}
-	if c != nil && c.mqtt != nil {
-		ext.closing = c.mqtt.tracker.closingSignal()
-	}
+	ext := newDeliveryContentionExtension(sess, c, life)
 	budget := mqttForegroundAcquireAttempts
 	var lastErr error
 	for attempt := 0; ; attempt++ {
@@ -258,6 +272,12 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 				break
 			}
 			budget = attempt + 1
+		}
+		// AFTER the extension's spacing, before the write: only a positively-never-landed stale
+		// attempt loops, which is the state the spent budget gives up in.
+		if attempt > 0 && life.over() {
+			abandon(items)
+			return nil, nil
 		}
 		nonces := make([]string, len(items))
 		entries := make([]mqttAdmitPublishesEntry, len(items))
@@ -280,7 +300,7 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 		}
 		switch verdict {
 		case mqttTransitionLanded, mqttTransitionSuperseded:
-			sess.settleLandedBatch(c, gen, items)
+			sess.settleLandedBatch(c, gen, items, life)
 			return nil, nil
 		case mqttTransitionUnresolved:
 			// NOTHING CAN BE CONCLUDED, so nothing may be retried or split: a re-attempt of a batch
@@ -314,7 +334,7 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 				return items[1:], items[0]
 			}
 			// The deliveries before k are admitted first, as a batch of their own; k follows singly.
-			sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, items[:k], abandon)
+			sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, items[:k], abandon, life)
 			return items[k+1:], items[k]
 		}
 	}
@@ -330,14 +350,14 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 // reservation the batch opened for it.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) admitBatchDeliverySingly(c *client, gen string, it *mqttBatchAdmission) {
+func (sess *mqttSession) admitBatchDeliverySingly(c *client, gen string, it *mqttBatchAdmission, life *mqttDeliveryLifecycle) {
 	if it.done {
 		return
 	}
 	if h := mqttTestAdmissionBatchSingleHook.Get(); h != nil {
 		h(sess, it.nonce)
 	}
-	it.stored = sess.admitUnderReservation(c, gen, it.pi, it.qos, it.jsDur, it.sseq, it.nonce, _EMPTY_, _EMPTY_, nil)
+	it.stored = sess.admitUnderReservation(c, gen, it.pi, it.qos, it.jsDur, it.sseq, it.nonce, _EMPTY_, _EMPTY_, nil, life)
 	it.done = true
 }
 
@@ -392,12 +412,15 @@ func (sess *mqttSession) settleBatchAttempt(gen string, items []*mqttBatchAdmiss
 // read-back fails takes the single ladder under its reservation, whose create meets the standing
 // register and whose classifier adopts it by nonce.
 //
+// SETTLEMENT, NOT FRESH WORK: it runs to the end whatever life says, and the fallback ladder's first
+// attempt always runs (it adopts what landed); only that ladder's retries stop with life.
+//
 // Session lock NOT held on entry.
-func (sess *mqttSession) settleLandedBatch(c *client, gen string, items []*mqttBatchAdmission) {
+func (sess *mqttSession) settleLandedBatch(c *client, gen string, items []*mqttBatchAdmission, life *mqttDeliveryLifecycle) {
 	for _, it := range items {
 		seq, err := sess.landedRegisterSeq(it.subject, it.nonce)
 		if err != nil {
-			sess.admitBatchDeliverySingly(c, gen, it)
+			sess.admitBatchDeliverySingly(c, gen, it, life)
 			continue
 		}
 		it.stored = sess.settleLandedRegister(c, mqttLandedRegister{gen: gen, pi: it.pi, jsDur: it.jsDur,

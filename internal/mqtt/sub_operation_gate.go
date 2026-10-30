@@ -338,8 +338,9 @@ func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerd
 // awaitTransmissionGatesThen is awaitTransmissionGates with beforeWait, when non-nil, run once,
 // outside any lock, at the first point the loop decides to WAIT rather than answer: the QoS 1/2
 // delivery callback flushes the deliveries it collected there, so they are not held behind this
-// offer's wait.
-func (sess *mqttSession) awaitTransmissionGatesThen(cc *client, beforeWait func()) mqttTransmissionVerdict {
+// offer's wait. beforeWait reporting false (the callback's lifecycle ended during that flush)
+// answers WITHHELD without waiting.
+func (sess *mqttSession) awaitTransmissionGatesThen(cc *client, beforeWait func() bool) mqttTransmissionVerdict {
 	deadline := time.Now().Add(mqttPhaseGateWaitFor(cc))
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
@@ -389,8 +390,11 @@ func (sess *mqttSession) awaitTransmissionGatesThen(cc *client, beforeWait func(
 			return mqttTransmissionTimedOut
 		}
 		if beforeWait != nil {
-			beforeWait()
+			lasts := beforeWait()
 			beforeWait = nil
+			if !lasts {
+				return mqttTransmissionWithheld
+			}
 			continue
 		}
 		if !timer.Stop() {

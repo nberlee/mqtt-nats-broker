@@ -43,8 +43,12 @@ var errMQTTReplacementDepsNotReady = errors.New("the pair replacement's dependen
 // (opReplacePublish, register-only or pair). Every supported QoS 1/2 delivery — ordinary and, since
 // 7a, shared-group QoS 1 (admitSharedInflightPublish) — is admitted here. storeInflightRegister's
 // sole remaining production caller is the experimental affine route, whose conversion is chapter P's.
-func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string) bool {
-	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, nil)
+//
+// life is the delivery callback's lifecycle (mqttDeliveryLifecycle): the ladder stops at the head
+// of any attempt after the first once it has ended. Nil outside a delivery callback.
+func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string,
+	life *mqttDeliveryLifecycle) bool {
+	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, nil, life)
 }
 
 // admitSharedInflightPublish is the SHARED-GROUP QoS 1 admission (F-105 cutover, unit 7a): the same
@@ -54,7 +58,7 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 // readiness opAdmitPublish checks after its authority read. Supported shared delivery is QoS 1;
 // anything else is refused here, before a single write.
 func (sess *mqttSession) admitSharedInflightPublish(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce string,
-	shared *mqttAdmitShared) bool {
+	shared *mqttAdmitShared, life *mqttDeliveryLifecycle) bool {
 
 	if shared == nil || qos != 1 || !mqttIsSharedDurable(jsDur) {
 		c.Warnf("MQTT: refusing to admit shared delivery %s/%d at QoS %d for client %q: supported shared "+
@@ -62,13 +66,13 @@ func (sess *mqttSession) admitSharedInflightPublish(c *client, pi uint16, qos by
 		sess.abandonInflightRegister(mqttLicenceOf(c), pi, jsDur, sseq, nonce)
 		return false
 	}
-	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, _EMPTY_, _EMPTY_, shared)
+	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, _EMPTY_, _EMPTY_, shared, life)
 }
 
 // admitThroughAuthority is the one admission body both entrances share. shared is nil for an
 // ordinary delivery.
 func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, jsDur string, sseq uint64, nonce, q2AffClaim, q2AffCopy string,
-	shared *mqttAdmitShared) bool {
+	shared *mqttAdmitShared, life *mqttDeliveryLifecycle) bool {
 	// THE CONNECTION'S OWN ENTITLEMENT AND THE §5.1 DEPENDENCIES, assembled ONCE before the
 	// ladder: they do not change across its retry attempts. The entitlement is the one this
 	// connection was ACCEPTED under (recorded by the CONNECT accept loop), never a read of whatever
@@ -94,7 +98,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 		return false
 	}
 	defer sess.finishAdmissionCustody(gen, nonce)
-	return sess.admitUnderReservation(c, gen, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, shared)
+	return sess.admitUnderReservation(c, gen, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, shared, life)
 }
 
 // admitUnderReservation is admitThroughAuthority's ladder, run under the custody reservation its
@@ -103,7 +107,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16, qos byte, jsDur string, sseq uint64,
-	nonce, q2AffClaim, q2AffCopy string, shared *mqttAdmitShared) bool {
+	nonce, q2AffClaim, q2AffCopy string, shared *mqttAdmitShared, life *mqttDeliveryLifecycle) bool {
 	// A FOREGROUND AUTHORITY OPERATION for the whole ladder (outbound_foreground_priority.go): its
 	// bounded attempts are what a burst of background authority writes — the retained workers' and
 	// the F-112 floor unit's resolutions, advances and watermark updates — would otherwise exhaust,
@@ -149,10 +153,7 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 	//
 	// AND PAST IT, while every attempt has lost only to a stale expectation: abandoning the offer
 	// would let its re-offer reach the client behind later messages (outbound_admission_contention.go).
-	ext := &mqttDeliveryContentionExtension{sess: sess, c: c}
-	if c != nil && c.mqtt != nil {
-		ext.closing = c.mqtt.tracker.closingSignal()
-	}
+	ext := newDeliveryContentionExtension(sess, c, life)
 	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, mqttForegroundAcquireAttempts,
 		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, bool, error) {
 			if regExpect == 0 && !registerOnly {
@@ -228,7 +229,7 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 			}
 			seq, lerr := sess.landedRegisterSeq(subject, rec.Nonce)
 			return seq, false, lerr
-		}, ext.extend)
+		}, ext.extend, life)
 }
 
 // errMQTTAdmittedRegisterUnread reports that an admission batch LANDED but its register could not

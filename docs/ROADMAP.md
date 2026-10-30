@@ -9472,7 +9472,7 @@ reads](findings/resolved.md#f-054).
   [Outbound delivery
   protocol](findings/nats-platform.md#outbound-delivery-protocol-2026-10-27), residual in
   `docs/CONFORMANCE.md`.
-- [ ] **Admit several deliveries per subscription in one batch.** Filed 2026-10-27 by the
+- [x] **Admit several deliveries per subscription in one batch.** Filed 2026-10-27 by the
   item above (consult 2's L3), whose residual it is. One subscriber still receives a backlog
   at 10-30 msg/s because a subscription's deliveries are admitted one at a time, each
   admission a full atomic batch with its own reads and boundary re-checks, and a QoS 2
@@ -9598,8 +9598,27 @@ reads](findings/resolved.md#f-054).
   of 350 ms and no 500 ms breach; a CPU- or store-constrained run; throughput loss of at
   most 10 percent against the same-day unfixed tree on standalone and R3; full local Paho
   three times. Artifacts: stop-cap-prototype.patch, the probe scripts and the raw results
-  in the batched-completion lane. Residual meanwhile: docs/CONFORMANCE.md, "A takeover of
-  a backlogged connection waits for its batched flush".
+  in the batched-completion lane.
+  **The retirement stop landed 2026-10-30, and with it the item is DONE** (consult 1 of
+  the backlogged-takeover lane). Re-measured after the boundary prefetch, the C3 prototype
+  still missed (317 / 485 / 570 ms uncapped, 240 / 391 / 420 at cap 8): instrumented, the
+  takeover waited on an admission retrying under contention from the sibling
+  subscriptions, because both admission loops consulted the closing signal only past their
+  six-attempt budget. Done: the delivery callback captures one lifecycle (its tracker's
+  closing cycle and its connection) and hands it to every step it reaches; no offer,
+  segment, single hand-off, admission or acquisition retry, acquisition, expired disposal
+  or transmission starts once it is over, each stop leaving the state that step's own
+  refusal or exhaustion leaves; settling a landed batch stays exempt; stopped offers are
+  recorded withheld while the leased tracker is the session's (docs/ARCHITECTURE.md, "A
+  retiring incarnation stops its delivery callback's work"). Consult 1 revised C3's cap
+  requirement on that evidence: no cap, the batch bound stays 16. Measured (100 trials
+  each, interleaved): CONNACK 108 / 153 / 188 ms against 497 / 824 / 904 unfixed and 219 /
+  282 / 336 before batching, none over 350; pinned to one core 187 / 274 / 344 against 542
+  / 1129 / 1204; throughput against the same-day unfixed tree 0.98-1.30x on every row of
+  both rigs, nothing delivered twice. It neither explains nor closes CI run 40887953897's
+  Paho setUpClass timeouts (section 0.4, the four unexplained reds: the shapes Paho leaves
+  showed no takeover regression). Record: [Retirement
+  stop](findings/nats-platform.md#retirement-stop-2026-10-30).
 
 ### Connection close
 

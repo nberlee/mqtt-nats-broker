@@ -200,7 +200,7 @@ func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
 		t.Fatalf("B was not given an identifier after A's ending was observed: %d (new=%v)", bPI, bNew)
 	}
 	bNonce := f.e.nonceOf(bPI)
-	if !sess.admitInflightPublish(f.e.c, bPI, 1, testRealPubRelSrcDur, bSeq, bNonce, _EMPTY_, _EMPTY_) {
+	if !sess.admitInflightPublish(f.e.c, bPI, 1, testRealPubRelSrcDur, bSeq, bNonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("B was refused by the admission after A's ending was observed")
 	}
 	bLin := f.e.linOf(t, bPI)
@@ -294,7 +294,7 @@ func TestF105CustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 	e.sess.mu.Unlock()
 	nonce := e.nonceOf(pi)
 	e.acceptUnderServingAuthority(t)
-	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("fixture: an admission whose every batch was refused was admitted")
 	}
 	// ROUTE WITNESS: the refusal came from the ladder's composed batches, not from readiness.
@@ -481,7 +481,7 @@ func TestF105CustodyRefusalWithoutSubmissionReleases(t *testing.T) {
 	e.sess.mu.Unlock()
 	nonce := e.nonceOf(pi)
 	e.acceptUnderServingAuthority(t)
-	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("fixture: an admission whose every attempt was refused was admitted")
 	}
 	testCustodyEventually(t, "the reservation released at the ladder's end", func() bool {
@@ -504,7 +504,7 @@ func TestF105CustodyRefusalWithoutSubmissionReleases(t *testing.T) {
 	nonce2 := e.sess.pendingPublish[pi2].regNonce
 	delete(e.sess.pendingPublish, pi2)
 	e.sess.mu.Unlock()
-	if e.sess.admitInflightPublish(e.c, pi2, 1, testRealPubRelSrcDur, sseq, nonce2, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi2, 1, testRealPubRelSrcDur, sseq, nonce2, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("an allocation abandoned before admission was admitted")
 	}
 	if reached.Load() {
@@ -596,7 +596,7 @@ func TestF105CustodyLateCallbackOfAnOldGeneration(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, sseq, nonce, _EMPTY_, _EMPTY_)
+		e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, sseq, nonce, _EMPTY_, _EMPTY_, nil)
 	}()
 	select {
 	case <-committed:
@@ -1358,7 +1358,7 @@ func TestF105CustodyPairReplacementMovesOneCharge(t *testing.T) {
 	if c := testCustodyCapacity(sess); c != 1 {
 		t.Fatalf("fixture: one charge (the occupant's) before the replacement, capacity %d", c)
 	}
-	if !sess.admitInflightPublish(f.e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_) {
+	if !sess.admitInflightPublish(f.e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("the pair replacement was refused")
 	}
 	heir, _ := f.register(t)

@@ -2228,17 +2228,17 @@ settlement and the register reclamation), the commits of the batched admission a
 acquisition (about 6 ms each on standalone, where atomic commits serialize), and their
 remaining sequential reads.
 
-**A takeover of a backlogged connection waits for its batched flush.**
-A subscription's QoS 1/2 delivery callback flushes the offers it held (up to 16: one
-admission, one acquisition, then each section's write and end) under one incarnation
-lease, and a takeover's retirement of the connection waits for that lease. A clean-start
-takeover of a connection with a backlog therefore waits for the whole flush in progress:
-measured locally with three overlapping subscriptions and 16 queued messages, CONNACK
-median 480 ms, p95 837, max 1114 (210 / 285 / 328 before batching), so a client whose
-CONNACK timeout is 500 ms or shorter can time out taking over such a session. The two
-predecessor shapes measured from Paho's suite (one acknowledged delivery; a server error
-DISCONNECT) showed no regression (about 60 ms). The fix is the roadmap item's open
-remainder (docs/ROADMAP.md, "Admit several deliveries per subscription in one batch").
+**A takeover re-offers what the old connection's delivery callback had not started.** A
+takeover's retirement waits for the old connection's delivery callbacks, and a callback
+stops starting work once its incarnation begins retiring (docs/ARCHITECTURE.md, "A
+retiring incarnation stops its delivery callback's work"): offers it held but had not
+processed, deliveries not yet admitted and admitted ones not yet acquired or written are
+left to JetStream, NAK'd forward when a resumed session frees a slot or re-offered at
+AckWait, as a callback refused its lease always left them. Measured with three overlapping
+subscriptions and 16 queued messages, a clean-start CONNACK took a median 108 ms, p95 153,
+maximum 188 (219 / 282 / 336 before batching; 187 / 274 / 344 with the broker and
+nats-server pinned to one core). A takeover still waits for the one step in progress (an
+admission or acquisition attempt and its settlement, or a write).
 
 **The identifier walk no longer re-detects a corrupted duty it has validated before.**
 Identifier exclusivity caches each duty position's validated identity (kind, reference,

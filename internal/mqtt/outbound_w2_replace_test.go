@@ -166,7 +166,7 @@ func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if !sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_) {
+	if !sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("the register-only replacement was refused")
 	}
 	// ROUTE WITNESS: the replacement arm wrote register-only, and that was the ladder's last
@@ -318,7 +318,7 @@ func TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
 		return send()
 	})
 
-	admitted := sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_)
+	admitted := sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_, nil)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -417,7 +417,7 @@ func TestF105RegisterOnlyLostResponseChargesOnce(t *testing.T) {
 				return 0, errors.New("test: the register-only replacement's response was lost")
 			})
 
-			if !sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_) {
+			if !sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_, nil) {
 				t.Fatal("the register-only replacement whose response was lost was not adopted")
 			}
 			if !lost.Load() || !handled.Load() {
@@ -546,7 +546,7 @@ func TestF105AReplacementRespectsAThirdStandingExchange(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	admitted := sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_)
+	admitted := sess.admitInflightPublish(e.c, f.pi, 1, testRealPubRelSrcDur, f.sseq, nonce, _EMPTY_, _EMPTY_, nil)
 	// ROUTE WITNESS: the ladder decided a pair replacement and its replacement arm wrote.
 	mu.Lock()
 	decided, w := pairDecided, append([]bool(nil), writes...)

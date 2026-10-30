@@ -41,7 +41,7 @@ func TestConsult75UnconfirmedMarkerTerminalHandoff(t *testing.T) {
 				t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
 			}
 			if e.sess.admitInflightPublish(e.c, pi, tc.qos, dur, sseq,
-				e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+				e.nonceOf(pi), _EMPTY_, _EMPTY_, nil) {
 				t.Fatal("unreadable marker permitted sending")
 			}
 			e.asm.mu.Lock()

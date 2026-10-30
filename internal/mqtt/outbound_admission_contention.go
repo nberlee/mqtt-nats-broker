@@ -53,24 +53,82 @@ func mqttIsStaleExpectation(err error) bool {
 // whatever else of the session writes the records it CASes.
 //
 // So an admission (or a batch of them, attemptAdmissionBatch) that has lost ONLY to stale
-// expectations keeps its offer and attempts again,
-// with the same spacing before each attempt's fresh reads, for as long as this connection's
-// incarnation lives and its connection stays open. Each attempt is the ladder's ordinary one: the same allocation, custody
-// reservation and settlement, and the write compares the standing authority with the entitlement
-// this connection was accepted under, so a displaced tenure is refused and that refusal ends the
-// extension. It ends too on any failure that is not positively a stale expectation (attempts that
-// did not all fail that way never qualify), on the incarnation's closing signal, and when the
-// connection closes or stops being the session's, each checked before every further attempt; the ladder then gives up exactly as it always did.
+// expectations keeps its offer and attempts again, with the same spacing before each attempt's
+// fresh reads, for as long as its delivery lifecycle lasts (mqttDeliveryLifecycle). Each attempt is
+// the ladder's ordinary one: the same allocation, custody reservation and settlement, and the write
+// compares the standing authority with the entitlement this connection was accepted under, so a
+// displaced tenure is refused and that refusal ends the extension. It ends too on any failure that
+// is not positively a stale expectation (attempts that did not all fail that way never qualify);
+// the lifecycle ending is decided at the head of every attempt after the first, inside the budget
+// and past it alike, and the ladder then gives up exactly as it always did.
 //
 // Bounded by the incarnation, not by time: a periodic give-up while the connection lives would
 // reorder exactly as before. A subscription can therefore stall for as long as its admissions keep
 // losing, and this session's background authority writers stay yielded meanwhile
 // (docs/CONFORMANCE.md).
 type mqttDeliveryContentionExtension struct {
-	sess    *mqttSession
-	c       *client
+	life  *mqttDeliveryLifecycle
+	stale int // attempts whose write failed positively stale
+}
+
+// newDeliveryContentionExtension is the extension for an admission run on behalf of life. A caller
+// outside a delivery callback passes nil and gets a lifecycle of its own, captured now, so the
+// extension still ends with the incarnation and the connection as it always has; only the
+// callback's own lifecycle STOPS work at attempt heads (mqttDeliveryLifecycle).
+func newDeliveryContentionExtension(sess *mqttSession, c *client, life *mqttDeliveryLifecycle) *mqttDeliveryContentionExtension {
+	if life == nil {
+		life = newDeliveryLifecycle(sess, c)
+	}
+	return &mqttDeliveryContentionExtension{life: life}
+}
+
+// mqttDeliveryLifecycle is whether a subscription callback's delivery work may still START: the
+// connection's incarnation has not begun retiring in the closing cycle the callback started under,
+// and the connection is open and still the session's.
+//
+// A RETIREMENT WAITS FOR THE CALLBACK'S LEASE, so everything the callback starts after the
+// retirement began is time the takeover waits for (a whole batched flush, an admission losing
+// attempt after attempt to its sibling subscriptions). The callback creates one lifecycle and every
+// step it reaches is handed the same one; each stops where the code before batching would have
+// been between two callbacks — before an offer, before an admission, before an acquisition,
+// before a transmission, and at the head of every retry — and leaves exactly the state that
+// step's existing refusal or exhaustion leaves. A started attempt always finishes and settles.
+//
+// Monotone without a latch: the closing channel is captured once, and a closed channel stays
+// closed, so a reopen (an aborted takeover) never revives work the callback already stopped; a
+// connection that stopped serving never serves again. The callback's later offers come back as
+// re-offers, a delay and never a loss or a duplicate.
+type mqttDeliveryLifecycle struct {
+	sess *mqttSession
+	c    *client
+	// tr is the connection's tracker, whose lease the callback holds: it cannot retire, and the
+	// session cannot be re-minted under it, while the callback runs.
+	tr      *mqttIncarnationTracker
 	closing <-chan struct{}
-	stale   int // attempts whose write failed positively stale
+}
+
+// newDeliveryLifecycle captures c's tracker and its current closing cycle.
+func newDeliveryLifecycle(sess *mqttSession, c *client) *mqttDeliveryLifecycle {
+	l := &mqttDeliveryLifecycle{sess: sess, c: c}
+	if c != nil && c.mqtt != nil {
+		l.tr = c.mqtt.tracker
+		l.closing = l.tr.closingSignal()
+	}
+	return l
+}
+
+// over reports whether the lifecycle has ended. A nil lifecycle (work outside a delivery callback)
+// never ends.
+func (l *mqttDeliveryLifecycle) over() bool {
+	if l == nil {
+		return false
+	}
+	select {
+	case <-l.closing:
+		return true
+	default:
+	}
+	return !l.connectionServes()
 }
 
 // noteWrite records one attempt's write failure.
@@ -81,30 +139,33 @@ func (x *mqttDeliveryContentionExtension) noteWrite(err error) {
 }
 
 // extend is the ladder's mqttAdmissionExtension.
+//
+// Eligibility and spacing only: whether the lifecycle still lasts after the wait is decided at the
+// loop head that follows, before the next write.
 func (x *mqttDeliveryContentionExtension) extend(attempts int, lastErr error) bool {
-	if x.stale != attempts || !mqttIsStaleExpectation(lastErr) || !x.connectionServes() {
+	if x.stale != attempts || !mqttIsStaleExpectation(lastErr) || x.life.over() {
 		return false
 	}
 	if h := mqttTestAdmissionExtendedHook.Get(); h != nil {
-		h(x.sess, attempts)
+		h(x.life.sess, attempts)
 	}
-	return x.sess.authorityContentionWaitUnless(x.closing) && x.connectionServes()
+	return x.life.sess.authorityContentionWaitUnless(x.life.closing)
 }
 
 // connectionServes reports whether the delivery's connection is still open and still the
 // session's. A persistent session's connection can drop without its incarnation retiring, so the
-// closing signal alone would let the extension outlive the connection it delivers for; its offer
+// closing signal alone would let delivery work outlive the connection it delivers for; its offer
 // is then the next connection's to receive, as a re-offer.
-func (x *mqttDeliveryContentionExtension) connectionServes() bool {
-	if x.c == nil {
+func (l *mqttDeliveryLifecycle) connectionServes() bool {
+	if l.c == nil {
 		return false
 	}
-	if x.c.isClosed() {
+	if l.c.isClosed() {
 		return false
 	}
-	x.sess.mu.Lock()
-	serves := x.sess.c == x.c
-	x.sess.mu.Unlock()
+	l.sess.mu.Lock()
+	serves := l.sess.c == l.c
+	l.sess.mu.Unlock()
 	return serves
 }
 

@@ -1002,7 +1002,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 		t.Run("ordinary-replacement", func(t *testing.T) {
 			o := testF088OrdinaryCancelledOccupant(t, "f097-t2g-probe-ord", true)
 			e := o.e
-			if !e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_) {
+			if !e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_, nil) {
 				t.Fatalf("fixture: the allocation over the refuted cancellation must be admitted (events %v)", o.log())
 			}
 			rec, _ := e.loadRegister(t, 11)
@@ -1068,7 +1068,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 				return e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
 			}
 			e.asm.mu.Unlock()
-			if e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_) {
+			if e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_, nil) {
 				t.Fatal("fixture: the allocation over an undecided cancelled occupant must abandon")
 			}
 			if n := o.probes.Load(); n != 1 {

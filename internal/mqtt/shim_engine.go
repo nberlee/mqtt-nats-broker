@@ -1038,6 +1038,11 @@ const (
 // actually belongs to -- see the affine guard, whose sub.queue is nil and whose
 // group comes from its claim instead.
 func (c *client) checkDenySubVerdict(subject, queue string) mqttSubDeliveryVerdict {
+	if h := mqttTestDenySubVerdictHook.Get(); h != nil {
+		if v, ok := h(c, subject); ok {
+			return v
+		}
+	}
 	if !c.mqttAuthzApplies() {
 		return mqttSubDeliverAllow
 	}
@@ -1061,6 +1066,10 @@ func (c *client) checkDenySubVerdict(subject, queue string) mqttSubDeliveryVerdi
 	}
 	return mqttSubDeliverAllow
 }
+
+// mqttTestDenySubVerdictHook, when it answers ok, decides a delivery's subscribe verdict in place of
+// the connection's permissions. Nil in production.
+var mqttTestDenySubVerdictHook = new(mqttKnob[func(c *client, subject string) (mqttSubDeliveryVerdict, bool)])
 
 func (c *client) selectMappedSubject() bool { return false }
 

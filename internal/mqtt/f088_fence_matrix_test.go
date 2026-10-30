@@ -111,7 +111,7 @@ func (f *t36Fix) cancel(t *testing.T) []mqttRegCancellation {
 }
 
 func (f *t36Fix) admit() bool {
-	return f.e.sess.admitInflightPublish(f.e.c, f.pi, f.qos, f.dur, f.sseq, f.nonce, _EMPTY_, _EMPTY_)
+	return f.e.sess.admitInflightPublish(f.e.c, f.pi, f.qos, f.dur, f.sseq, f.nonce, _EMPTY_, _EMPTY_, nil)
 }
 
 func (f *t36Fix) register(t *testing.T) (*mqttInflightRecord, *StoredMsg) {

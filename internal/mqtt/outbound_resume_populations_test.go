@@ -308,7 +308,7 @@ func TestF105DelayedAdmissionAgainstTheSuccessorsFinalize(t *testing.T) {
 			if pi == 0 || !isNew {
 				t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)
 			}
-			e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_)
+			e.sess.admitInflightPublish(e.c, pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq, nonce, _EMPTY_, _EMPTY_, nil)
 			e.asm.mu.Lock()
 			e.asm.testAdmitWrite = nil
 			e.asm.mu.Unlock()

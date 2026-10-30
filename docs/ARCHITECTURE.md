@@ -10225,11 +10225,14 @@ boundary refusals and transport failures. Each extension attempt is an ordinary 
 same allocation, custody reservation and attempt settlement, the same spacing before its
 fresh reads — and its write compares the standing authority with the entitlement the
 connection was accepted under, so a moved tenure refuses and ends the extension. It ends
-too on any other failure, on the incarnation's closing signal, and when the connection
-closes or stops being the session's (`connectionServes`, checked before every further
-attempt); the ladder then abandons the offer exactly as before. No other entrance's budget
-changes. A batch defeated only by stale expectations keeps the whole batch's place the
-same way: it is re-attempted with the same deliveries while every slot still reads empty.
+too on any other failure. Whether the delivery's callback may still start work (its
+incarnation not retiring, its connection open and still the session's) is no longer the
+extension's to decide: it is the callback's delivery lifecycle, checked at the head of
+every attempt after the first, inside the budget as well as past it (next section but one,
+"A retiring incarnation stops its delivery callback's work"); the ladder then abandons the
+offer exactly as before. No other entrance's budget changes. A batch defeated only by
+stale expectations keeps the whole batch's place the same way: it is re-attempted with the
+same deliveries while every slot still reads empty.
 
 It is bounded by the connection's life, not by time: a periodic give-up while the
 connection lives would reorder exactly as before. A subscription can therefore stall for
@@ -10261,13 +10264,12 @@ offer is an unacknowledged JetStream delivery exactly like those still queued in
 if the subscription stops (unsubscribe, a re-SUBSCRIBE replacing it, the connection
 closing) neither is processed and AckWait re-offers both. Shared subscriptions never hold.
 
-**The whole flush runs under the callback's one lease.** The held offers are processed and
-flushed by the callback that finds nothing more queued, inside the incarnation lease that
+**The whole flush runs under the callback's one lease**, inside the incarnation lease that
 callback acquired (`leasedHandler`), so a retirement of the connection (a takeover) waits
-for the whole flush in progress, not for one delivery as before batching; offers still
-queued in nats.go are refused at lease acquisition as before. That wait is a stated
-residual (docs/CONFORMANCE.md, "A takeover of a backlogged connection waits for its
-batched flush") and an open roadmap remainder.
+for whatever the callback is doing; offers still queued in nats.go are refused at lease
+acquisition as before. The callback therefore stops STARTING work once its incarnation
+begins retiring ("A retiring incarnation stops its delivery callback's work", below), so a
+takeover waits for the step in progress, not for the rest of the flush.
 
 **Only fresh ordinary deliveries are collected.** Each offer runs the whole delivery body
 (`mqttDeliverQoS12Offer`), every guard at processing time. A fresh, non-shared, not
@@ -10405,6 +10407,100 @@ were 62-82 ms per flush of about 16, against a 3-10 ms write) are now requested 
 standalone and 109.7 on R3 (2026-10-30). Record: `docs/findings/nats-platform.md`,
 "Batched admission (2026-10-28)", "Batched acquisition (2026-10-28)", "Completion
 evaluation (2026-10-29)" and "Boundary prefetch (2026-10-30)".
+
+### A retiring incarnation stops its delivery callback's work
+
+A takeover retires the old connection's incarnation: `retireBoundIncarnationChecked`
+closes its tracker and waits for every lease to drain. A subscription's QoS 1/2 delivery
+callback holds one lease for everything it does, which since batching is up to 16 held
+offers' processing, admission, acquisition and writes. Measured with three overlapping
+subscriptions and 16 queued messages, what the takeover waited for was never the
+acquisition or the writes but an admission still re-attempting: the three subscriptions'
+commits contend on the session's one authority record, and both admission loops consulted
+the closing signal only past their base budget (`mqttForegroundAcquireAttempts`), so a
+clean-start CONNACK took a median 470-510 ms and over 500 ms in about half the trials
+(212 ms before batching). Capping the held offers did not help (cap 8: tail 420 ms), and
+a cap trades throughput.
+
+**One lifecycle, owned by the callback** (`mqttDeliveryLifecycle`,
+`outbound_admission_contention.go`). `mqttDeliverMsgCbQoS12` captures, at entry, the
+connection's tracker and its current closing cycle; the lifecycle is over once that cycle's
+closing channel is closed or the connection is closed or no longer the session's. Every
+delivery step the callback reaches is handed the same lifecycle explicitly: the admission
+entrances (`admitInflightPublish`, `admitSharedInflightPublish`, `admitThroughAuthority`,
+`admitUnderReservation`, `admitInflightPublishBatch` and its segments), the send sections
+(`openPublishSection` stores it on the send token), and through them both acquisitions and
+the transmission. It needs no latch: a closed channel stays closed, so a reopen (an aborted
+takeover) never revives work the callback already stopped, and a connection that stopped
+serving never serves again. Sections opened elsewhere (retained replay and restore, the
+experimental affine move) carry none and are unchanged.
+
+**A started step finishes and settles; no later step starts.** The stops sit where the code
+before batching would have been between two callbacks, and each leaves the state that
+step's own refusal or exhaustion already leaves:
+
+- before each offer the callback has not yet processed, held or its own: not processed,
+  recorded withheld (below);
+- at the head of every admission and acquisition attempt after the first, after the
+  previous attempt's wait and re-reads (and after the contention extension's spacing),
+  before the next write: the batch admission abandons its participants, the single ladder
+  breaks to its exhaustion tail (`abandonInflightRegister`), the batched acquisition
+  releases its participants' unacquired actions, the single acquisition takes
+  `resolveUnacquiredPublishAction`. Only a positively never-landed attempt loops in each,
+  and the spent budget gives up from the same states; an unresolved attempt still hands off
+  to its owed settlement and never loops;
+- before every admission segment, the first included (a stale split's prefix recurses from
+  inside its parent's attempt), before the delivery a split hands to the single ladder,
+  before a collected segment's admission, and before an admission outside the collector
+  (shared and drain-claimed deliveries): abandoned without an attempt, as a delivery
+  without an entitlement is;
+- before an expired delivery's disposal, collected or not: a collected one and every later
+  one are abandoned, unacknowledged; one outside the collector is abandoned when fresh and
+  otherwise left as it stands for the re-offer;
+- before any acquisition of a flush's opened sections and of the single route's section:
+  the sections end without intent, as on a sealed output;
+- before every transmission (`transmitAcquired`), and before a shared QoS 0 write: nothing
+  is written. For a section this is the pre-intent state; it proves only that this section
+  emitted nothing, so a stopped retransmission keeps its earlier transmission evidence and
+  its next send still carries DUP. A shared QoS 0 offer is left unacknowledged for the
+  group to re-offer.
+
+Settling a landed batch is not fresh work: `settleLandedBatch` runs to its end whatever
+the lifecycle says, and the ladder a failed read-back falls back to always makes its first
+attempt, which adopts the landed register by nonce.
+
+**Every flush ends the step before it.** An offer that does not join the collector flushes
+it before acting (`unlockAndFlush`), and that flush runs the earlier deliveries'
+admission, acquisition and writes, which before batching were earlier callbacks: had the
+retirement begun during them, this offer's callback would have been refused its lease. So
+the flush reports whether the lifecycle still lasts, and after a flush that ended it the
+offer starts no work of its own: not a terminal source's resolution or wake, a drain's
+resolution retry or finalization, a denied re-offer's release, acknowledgement or
+hand-back, a retired source's settlement, a shared QoS 0 offer's expiry or write, a fresh
+offer's expiry or admission, or a phase-gate wait (which also waits on the callback's own
+captured closing channel, so a close and reopen during the flush cannot leave it waiting
+on the new cycle). It still settles what it decided under the lock: a declined offer's
+acknowledgement, a withheld record. The collector's plain flush does not appear in the
+offer body, and `TestDeliveryOfferStartsNoWorkAfterAStoppingFlush` holds every flush exit
+to this.
+
+**Withheld accounting.** An offer the callback stops before processing is recorded withheld
+when the tracker the callback leased is still the session's, whatever its state
+(`recordWithheldStopped`): the held lease means that tracker cannot have retired nor the
+session been re-minted under it, so the record is owed after a reopen too. A callback
+refused its lease keeps the stricter rule (still the session's and still closing,
+`recordWithheldRefused`). An abandoned admission records the same through
+`abandonInflightRegister`, or installs its continuity record when an attempt may have
+landed. The withheld record is the NAK subject that lets a freed slot re-offer the message
+before AckWait; a redelivery of an abandoned fresh delivery is a new allocation and carries
+DUP=0 because nothing was transmitted under it.
+
+What a stop costs is a re-offer: the deliveries written before it are a prefix of the
+flush in offer order, the rest come back by NAK or AckWait (on a clean start the session
+and its consumers are discarded), with the order a refused callback's re-offer already has.
+Measured on the three-subscription, 16-message shape, 100 trials (2026-10-30): CONNACK
+median 108 ms, p95 153, maximum 188, against 497 / 824 / 904 before and 219 / 282 / 336
+before batching. Record: `docs/findings/nats-platform.md`, "Retirement stop (2026-10-30)".
 
 ### The PUBREL consumer's name is claimed under contention
 

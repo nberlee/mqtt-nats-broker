@@ -81,7 +81,7 @@ func (r *testAdmitLosesToClosureRig) closeGeneration(t *testing.T) error {
 
 func (r *testAdmitLosesToClosureRig) admit() bool {
 	return r.e.sess.admitInflightPublish(r.e.c, r.pi, 1, testRealPubRelSrcDur, testRealPubRelSrcSeq,
-		r.nonce, _EMPTY_, _EMPTY_)
+		r.nonce, _EMPTY_, _EMPTY_, nil)
 }
 
 // requireNothingAdmitted asserts that no member of the admission stands, nothing was written, and

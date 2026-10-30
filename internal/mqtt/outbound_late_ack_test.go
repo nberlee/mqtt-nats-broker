@@ -1110,7 +1110,7 @@ func TestF097DifferentSourceArmReservesAPossiblyAttemptedOccupant(t *testing.T) 
 	if pi != 11 || !isNew {
 		t.Fatalf("fixture: the allocation must land on the occupied identifier 11, got %d (new %v)", pi, isNew)
 	}
-	if e.sess.admitInflightPublish(e.c, pi, 1, dur, 600, e.nonceOf(pi), _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, pi, 1, dur, 600, e.nonceOf(pi), _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("an allocation over a possibly-attempted occupant of another delivery must not be admitted")
 	}
 	if !askedOccupant.Load() {
@@ -1323,7 +1323,7 @@ func TestF088InheritedReplacementCancellationEnrolsTheDrain(t *testing.T) {
 		return out, err
 	}
 	e.asm.mu.Unlock()
-	e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_)
+	e.sess.admitInflightPublish(e.c, pi, 1, dur, sseq, nonce, _EMPTY_, _EMPTY_, nil)
 	if !registerOnly.Load() {
 		t.Fatal("witness: the admission never landed a register-only replacement over the inherited occupant")
 	}
@@ -2126,7 +2126,7 @@ func TestF088MarkerlessCancelledOccupantIsReplacedRegisterOnly(t *testing.T) {
 		e.asm.mu.Unlock()
 		// Non-fatal: the admission's verdict follows from the replacement below, which is the target
 		// (M26).
-		if !e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_) {
+		if !e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_, nil) {
 			t.Errorf("the allocation over a refuted cancellation must be admitted (events %v)", o.log())
 		}
 		if !registerOnly.Load() {
@@ -2210,7 +2210,7 @@ func TestF088CancelledOccupantMarkerIndeterminateAbandons(t *testing.T) {
 		return write()
 	}
 	e.asm.mu.Unlock()
-	if e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_) {
+	if e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("an allocation over a cancelled occupant whose marker is indeterminate must not be admitted")
 	}
 	if o.probes.Load() == 0 {

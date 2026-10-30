@@ -674,22 +674,39 @@ func (sess *mqttSession) leasedHandler(h msgHandler, recordWithheld bool) msgHan
 	return func(sub *subscription, pc *client, acc *Account, subject, reply string, msg []byte) {
 		l, ok := tr.acquire()
 		if !ok {
-			if !recordWithheld {
-				return
+			if recordWithheld {
+				sess.recordWithheldRefused(tr, sub, reply)
 			}
-			sess.mu.Lock()
-			// Both conditions, in the one critical section that can settle them: the
-			// tracker must still be this session's, and still be closing.
-			if sess.leases == tr {
-				if isClosing, _ := tr.closingAndDecided(); isClosing {
-					sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
-				}
-			}
-			sess.mu.Unlock()
 			return
 		}
 		defer l.release()
 		h(sub, pc, acc, subject, reply, msg)
+	}
+}
+
+// recordWithheldRefused records a delivery whose callback was REFUSED its lease. Both conditions, in
+// the one critical section that can settle them: the tracker must still be this session's, and
+// still be closing — with no lease held, a retired tracker's session may already be re-minted.
+func (sess *mqttSession) recordWithheldRefused(tr *mqttIncarnationTracker, sub *subscription, reply string) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.leases == tr {
+		if isClosing, _ := tr.closingAndDecided(); isClosing {
+			sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
+		}
+	}
+}
+
+// recordWithheldStopped records an offer a LEASED callback did not process because its lifecycle
+// had ended. The callback holds a lease on life.tr, so that tracker cannot have retired and the
+// session cannot have been re-minted under it: the tracker being this session's is the whole
+// condition, whatever its state now. A reopen after the stop, or a connection that stopped serving
+// without a retirement, still owes the record (recordWithheldDeliveryLocked decides the rest).
+func (sess *mqttSession) recordWithheldStopped(life *mqttDeliveryLifecycle, sub *subscription, reply string) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if life.tr != nil && sess.leases == life.tr {
+		sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
 	}
 }
 

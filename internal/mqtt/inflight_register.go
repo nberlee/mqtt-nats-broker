@@ -5697,9 +5697,16 @@ func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) 
 //
 // extend, when non-nil, may take the ladder past its budget (mqttAdmissionExtension).
 //
+// life, when non-nil, is the delivery callback's lifecycle: once it has ended, the head of the next
+// attempt gives up exactly as the spent budget does. Every iteration that loops — a failed write, a
+// failed re-read, a reap, a replacement mode — already reaches that exhaustion at the head, so the
+// stop leaves no state the budget cannot. The first attempt always runs: a caller that must not
+// start one checks before it calls.
+//
 // Session lock NOT held on entry.
 func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, jsDur string, sseq uint64,
-	nonce, q2AffClaim, q2AffCopy string, budget int, write mqttInflightWrite, extend mqttAdmissionExtension) bool {
+	nonce, q2AffClaim, q2AffCopy string, budget int, write mqttInflightWrite, extend mqttAdmissionExtension,
+	life *mqttDeliveryLifecycle) bool {
 	as := sess.asm
 	// Opportunistic, and free when nothing is pending: one of the convergence points that
 	// is guaranteed to come round again on a live session, so a void verdict whose save was
@@ -5803,6 +5810,8 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 	// The occupant the previous attempt loaded, carried forward so the replacement write can
 	// rewrite it; nil on the first attempt, whose write is always a create.
 	var lastCur *mqttInflightRecord
+	// stopped: the lifecycle ended, which gives up as exhaustion does but is not a failure.
+	stopped := false
 	for attempt := 0; ; attempt++ {
 		if attempt >= budget {
 			// THE BUDGET IS SPENT. An extension takes one more attempt — the same allocation,
@@ -5815,6 +5824,11 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 				break
 			}
 			budget = attempt + 1
+		}
+		// AFTER the extension's spacing, before the write: the wait is the previous attempt's.
+		if attempt > 0 && life.over() {
+			stopped = true
+			break
 		}
 		// THE WRITE IS THE ONLY THING THAT DIFFERS between the standalone register/marker pair
 		// this ladder was born with and the F-105 admission that carries the authority, exchange
@@ -6315,11 +6329,13 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerStore, subject, true)
 		}
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("in-flight register not resolved after %d attempts", budget)
+	if !stopped {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("in-flight register not resolved after %d attempts", budget)
+		}
+		c.Errorf("MQTT: unable to record the in-flight register for packet identifier %d of client %q: %v",
+			pi, sess.id, lastErr)
 	}
-	c.Errorf("MQTT: unable to record the in-flight register for packet identifier %d of client %q: %v",
-		pi, sess.id, lastErr)
 	sess.abandonInflightRegister(mqttLicenceOf(c), pi, jsDur, sseq, nonce)
 	return false
 }
@@ -6360,7 +6376,7 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 			}
 			seq, err := sess.asm.storeInflightPair(subject, regExpect, markerExpect, rec)
 			return seq, false, err
-		}, nil)
+		}, nil, nil)
 }
 
 // confirmInflightRegister stamps a confirmed register onto its pending entry and
@@ -7239,6 +7255,10 @@ type mqttSendToken struct {
 	// section (the retained driver's) yields every acquisition attempt to announced foreground
 	// operations (outbound_foreground_priority.go). Nil for a foreground section.
 	admit func() bool
+	// life is the delivery callback's lifecycle for a section a subscription callback opened: once
+	// it has ended no further acquisition attempt starts and nothing is transmitted. Nil for every
+	// other section (retained replay and restore, the affine move).
+	life *mqttDeliveryLifecycle
 	// dup is the DUP flag this transmission carries: the entry's transmitted bit as it
 	// stood when the section opened.
 	dup bool
@@ -7429,6 +7449,12 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 		var acquired *mqttOutboundAction
 		for attempt := 0; ; attempt++ {
 			if tok.admit != nil && !tok.admit() {
+				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+				return false
+			}
+			// After the previous attempt's wait and re-read: the exit the spent budget takes, whose
+			// resolver decides what an ambiguous earlier attempt left.
+			if attempt > 0 && tok.life.over() {
 				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 				return false
 			}

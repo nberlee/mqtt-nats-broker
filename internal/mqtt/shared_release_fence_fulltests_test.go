@@ -111,7 +111,7 @@ func testAdmitInBackground(t *testing.T, r *testSharedAdmitRig, dep *mqttAdmitSh
 	}
 	nonce := e.nonceOf(pi)
 	out := make(chan bool, 1)
-	go func() { out <- e.sess.admitSharedInflightPublish(e.c, pi, 1, r.dur, r.sseq, nonce, dep) }()
+	go func() { out <- e.sess.admitSharedInflightPublish(e.c, pi, 1, r.dur, r.sseq, nonce, dep, nil) }()
 	return pi, out
 }
 
