@@ -9655,21 +9655,35 @@ reads](findings/resolved.md#f-054).
 
 ### Outbound retransmission
 
-- [ ] **Stop retransmitting an unacknowledged delivery on the same MQTT 5.0 connection.**
-  Filed 2026-10-31 by consult 1 of the worker-error-disconnect-linger lane, while repairing
-  `TestQueuedReofferOfAcknowledgedSourceIsDeclined` (a pre-existing fixture race; its
-  0x3a shape was a 3.1.1 client receiving the DUP retransmission after acknowledging). A
-  JetStream re-offer of a transmitted, unacknowledged QoS 1/2 delivery is retransmitted on
-  the same connection with DUP and the same identifier (`trackPublish`'s standing entry;
-  `TestReofferOfUnacknowledgedDeliveryIsRetransmitted` pins it for 3.1.1, which permits
-  it). MQTT 5.0 [MQTT-4.4.0-1] forbids resending except on a reconnect with a session.
-  Reproduction: a v5 subscriber on a broker with a short AckWait receives a QoS 1 PUBLISH
-  and does not acknowledge it; past AckWait it receives the same PUBLISH again with DUP,
-  on the same connection. Deliverable: a v5 connection absorbs such a re-offer (refreshes
-  the entry's acknowledgement reply without writing) while a reconnect still retransmits
-  and a withheld delivery's first send still goes out; 3.1.1 behavior decided explicitly;
-  the source's ownership unchanged. Residual meanwhile: docs/CONFORMANCE.md, "A JetStream
-  re-offer retransmits on the same connection".
+- [x] **Stop retransmitting an unacknowledged delivery on the same MQTT 5.0 connection.**
+  Filed 2026-10-31 by consult 1 of the worker-error-disconnect-linger lane, while
+  repairing `TestQueuedReofferOfAcknowledgedSourceIsDeclined` (a pre-existing fixture
+  race; its 0x3a shape was a 3.1.1 client receiving the DUP retransmission after
+  acknowledging). A JetStream re-offer of a transmitted, unacknowledged QoS 1/2 delivery
+  was retransmitted on the same connection with DUP and the same identifier, and a stored
+  PUBREL whose PUBCOMP had not arrived was written again the same way; MQTT 5.0
+  [MQTT-4.4.0-1] forbids resending except on a reconnect with a session. **Done
+  2026-10-31.** On a connection that negotiated MQTT 5.0, a re-offer to the connection
+  that may hold the packet is absorbed: nothing written, acknowledged or NAKed, the
+  source's ownership unchanged, the client's acknowledgement settling it. PUBLISH:
+  `mqttPending.transmittedOn` is the cid a write possibly reached (stamped on the write,
+  not on intent, and by a PUBREC rollback), refused in `beginSendLocked`. PUBREL: the send
+  hold's owner-scoped PUBCOMP debt (`pubRelHeldOnLocked`), judged only in the timer-driven
+  stored-PUBREL callback; the retained PUBREL emitter is never re-offered and is
+  unchanged. A duplicate PUBREC still gets its one PUBREL (`answerOwed`, consumed by
+  emission). A reconnect is a new cid, so its resend goes out; a withheld or prevented
+  first write still goes out. Decided by consult (lane DECISIONS.md): MQTT 3.1.1 keeps the
+  inherited retry every AckWait, which its §4.4 permits and which is the one-connection
+  route to the F-115, F-116, drain and exchange-QoS mechanisms (consult 2 reversed a first
+  "both levels" decision after the suite showed 33 tests depending on it); PUBREL in
+  scope; the PUBREC rollback keeps the PUBLISH held. Six v5 tests that read a
+  same-connection resend were restaged per test (an acknowledgement on the live
+  connection, a duplicate PUBREC, or a reconnect), and the No Local drain fixture's
+  coverage claim corrected to the two guards together. Stated in docs/CONFORMANCE.md: "An
+  MQTT 3.1.1 connection is resent an unacknowledged delivery every AckWait" (a decision)
+  and "On MQTT 5.0, an asynchronous PUBREL-intent rollback waits for a reconnect" (a
+  residual). Mechanism: docs/ARCHITECTURE.md, "A transmission is not repeated on the
+  connection that may hold it".
 
 ### NATS platform follow-ups
 

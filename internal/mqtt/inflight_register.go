@@ -7085,6 +7085,20 @@ func (sess *mqttSession) beginSendLocked(cc *client, pi uint16, jsDur string, ss
 	if ack.sendNonce != _EMPTY_ || ack.sendSettle.kind != mqttSendSettleNone {
 		return none, false // a section is already active, or one parked a settle
 	}
+	// A JETSTREAM RE-OFFER IS NOT RESENT TO AN MQTT 5.0 CONNECTION THAT MAY HOLD IT
+	// ([MQTT-4.4.0-1]): the re-offer exists because AckWait passed, not because the client asked,
+	// and 5.0 resends only on a reconnect with a session — a new cid, which passes. A 3.1.1
+	// connection keeps the retry, which its §4.4 permits (docs/CONFORMANCE.md). Decided HERE, at
+	// the one opener every offer of a JetStream-backed entry reaches, and not at tracking: two
+	// offers can both pass trackPublish before the first one's write ends. Refused like any other
+	// unsendable entry, so the client's acknowledgement still settles the source. A retained
+	// replay names no source and is never a re-offer.
+	if jsDur != _EMPTY_ && cc.mqtt.proto == mqttProtoLevel5 && cc.cid != 0 && ack.transmittedOn == cc.cid {
+		if h := mqttTestSameConnectionResendRefusedHook.Get(); h != nil {
+			h(mqttPacketPub, pi)
+		}
+		return none, false
+	}
 	// LIVENESS, not presence. An inert hold — its write returned, its acknowledgement
 	// debt owed to a connection that is no longer ours — reserves nothing, and bumpPI
 	// will hand this identifier out. Refusing here on presence is how that identifier,
@@ -8289,6 +8303,9 @@ func (sess *mqttSession) consumePubRelAckLocked(c *client, pi uint16) {
 		return
 	}
 	h.pubCompOwed--
+	if h.pubCompOwed == 0 {
+		h.answerOwed = false // the exchange is answered: no PUBREL is owed to anyone any more
+	}
 	// The shared predicate, NOT a hand-written "token empty and no debt". Re-spelling the
 	// condition is what made this mutator blind to the retained term: a PUBCOMP would
 	// have deleted the whole hold and with it a buffered retained PUBLISH's only
@@ -8773,6 +8790,11 @@ func (sess *mqttSession) endPublishSend(c *client, pi uint16, tok mqttSendToken,
 	// on a blocked identifier spends the very wake the refusal was promised.
 	defer sess.wakePubRelRedriveIfClear(pi, tok.slot.name.subject)
 	sess.endSendWith(c, pi, tok.token, func(ack *mqttPending) {
+		// On the WRITE, not on intent: an intent whose write never happened leaves this
+		// connection without the PUBLISH, so its next offer here is the first one it receives.
+		if wrote && c != nil {
+			ack.transmittedOn = c.cid
+		}
 		switch intent {
 		case mqttIntentConfirmed:
 			ack.markerSeq, ack.intentUnresolved, ack.transmitted = 0, false, true
@@ -8838,6 +8860,15 @@ func (sess *mqttSession) endSendCore(c *client, pi uint16, token string,
 			if p := sess.pendingPubRel[pi]; p != nil && p.awaitingPubCompOwner == h.owner {
 				sess.retireReleasedDeliveryLocked(pi, p)
 			}
+		}
+	}
+	// THE ANSWER THIS ATTEMPT TOOK is owed again when its frame provably never left: the
+	// duplicate PUBREC it answers is still unanswered (bindPubRelAnswerLocked). Behind the same
+	// exact-token match, so it is restored onto the hold that token named and nowhere else.
+	if h.answering {
+		h.answering = false
+		if unemitted && h.pubCompOwed > 0 {
+			h.answerOwed = true
 		}
 	}
 	// The hold goes only when it reserves nothing more. A PUBREL transmitted under this

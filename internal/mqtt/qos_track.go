@@ -729,8 +729,10 @@ func (sess *mqttSession) settleRetiredSource(c *client, jsDur string, sseq uint6
 // pendingPubRel with no ack subject anything will ever fill, and the delivery's
 // tracking is gone, so it can neither be redelivered nor acknowledged.
 //
+// c is the connection the PUBREC arrived on.
+//
 // Lock held on entry.
-func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
+func (sess *mqttSession) retrackPublishLocked(c *client, pi uint16, ack *mqttPending) {
 	if ack == nil {
 		return
 	}
@@ -747,6 +749,12 @@ func (sess *mqttSession) retrackPublishLocked(pi uint16, ack *mqttPending) {
 	// retransmission and carries DUP=1 (N-8.3 item 2). The marker sequence travels with
 	// the restored entry; its clean-up ran when the PUBREC was processed.
 	ack.transmitted = true
+	// And that connection HOLDS it, whatever the write's end recorded: the PUBREC can remove the
+	// entry before its section's end stamps it. A re-offer is not resent there ([MQTT-4.4.0-1]);
+	// the exchange continues when the client reconnects.
+	if c != nil && c.cid != 0 {
+		ack.transmittedOn = c.cid
+	}
 	// ANY: this is the exact entry the caller removed, put back. Its kind and evidence are the
 	// ones its constructor gave it, and the writer's gate asks the question the reinstallation
 	// depends on — does custody still hold its lineage; if not, the exchange ended meanwhile and

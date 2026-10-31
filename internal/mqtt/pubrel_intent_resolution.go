@@ -122,7 +122,7 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 		if cur := sess.pendingPubRel[r.key.name.pi]; cur != nil &&
 			cur == r.placeholder && cur.jsAckSubject == _EMPTY_ {
 			delete(sess.pendingPubRel, r.key.name.pi)
-			sess.retrackPublishLocked(r.key.name.pi, &r.ack)
+			sess.retrackPublishLocked(r.c, r.key.name.pi, &r.ack)
 		}
 		sess.mu.Unlock()
 		return true

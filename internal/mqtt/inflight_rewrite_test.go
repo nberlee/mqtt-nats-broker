@@ -895,6 +895,10 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.pubCompEmittableOwnerLocked": {},
 		// The open PUBREL attempt's write-entry fact, set behind the exact token (F-116).
 		"mqttSession.markPubRelEnteredLocked": {},
+		// The PUBREL a connection may already hold: a PUBCOMP debt that connection owns
+		// ([MQTT-4.4.0-1]; a re-offer to it is a resend). It addresses one transmission's debt and
+		// its owed answer to a duplicate PUBREC, never whether the identifier is reserved.
+		"mqttSession.pubRelHeldOnLocked": {},
 		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither

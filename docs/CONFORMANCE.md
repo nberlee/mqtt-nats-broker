@@ -4248,20 +4248,30 @@ guarantee:
 - The one packet the reader had already started when the pipeline failed is processed as
   before; only packets that start after it are discarded.
 
-### A JetStream re-offer retransmits on the same connection
+### An MQTT 3.1.1 connection is resent an unacknowledged delivery every AckWait
 
-Found 2026-10-31 while repairing `TestQueuedReofferOfAcknowledgedSourceIsDeclined`. When
-JetStream re-offers a QoS 1 or 2 delivery that was transmitted and is still unacknowledged
-(the consumer's AckWait, 30 s by default, passed), the broker retransmits it on the SAME
-connection, under the same Packet Identifier with DUP set (`trackPublish` finds the
-standing entry; `TestReofferOfUnacknowledgedDeliveryIsRetransmitted` pins it). MQTT 3.1.1
-permits that. MQTT 5.0 does not: resending is required only on a reconnect with a session
-present, and "Clients and Servers MUST NOT resend messages at any other time"
-[MQTT-4.4.0-1]. So a v5 client that takes longer than AckWait to acknowledge receives a
-duplicate PUBLISH without reconnecting. Closing it needs the delivery path to tell a
-retransmission on the current connection apart from a reconnect's retransmission and from
-the first send of a previously withheld delivery, while keeping the source's ownership;
-docs/ROADMAP.md carries it.
+When JetStream re-offers a QoS 1 or 2 delivery that was transmitted and is still
+unacknowledged (the consumer's AckWait, 30 s by default, passed), or a stored PUBREL whose
+PUBCOMP has not arrived, an MQTT 3.1.1 connection receives it again on the SAME
+connection: the PUBLISH under the same Packet Identifier with DUP set, the PUBREL as it
+was. This is a decision, not a gap: 3.1.1 §4.4 requires the resend on a reconnect with a
+session and does not forbid one at other times, and it is the inherited nats-server
+behavior (`TestReofferOfUnacknowledgedDeliveryIsRetransmitted`,
+`TestMQTTQoS2RetriesPublish`, `TestMQTTQoS2RetriesPubRel` pin it). An MQTT 5.0 connection
+is not resent either packet while it may already hold it ([MQTT-4.4.0-1]); see
+docs/ARCHITECTURE.md, "A transmission is not repeated on the connection that may hold it".
+
+### On MQTT 5.0, an asynchronous PUBREL-intent rollback waits for a reconnect
+
+One path reinstates a PUBLISH after the client's PUBREC on a connection that does not end:
+the asynchronous resolver of a PUBREL intent (`pubrel_intent_resolution.go`) rolls the
+exchange back to its PUBLISH phase when the intent is classified as never recorded. The
+client proved receipt on that connection, so on MQTT 5.0 the reinstated PUBLISH is held by
+it and not resent there; the client, which answered PUBREC, receives no PUBREL either, and
+the exchange continues only when it reconnects. Before this change the next AckWait
+re-offer resent the PUBLISH, which [MQTT-4.4.0-1] forbids for 5.0; a 3.1.1 connection
+still gets that resend. The synchronous rollback in the PUBREC handler ends the
+connection, so it has no such wait.
 
 ### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
 

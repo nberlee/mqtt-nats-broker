@@ -7244,9 +7244,11 @@ connection on a legitimate duplicate. Returning silently instead leaves the clie
 for `AckWait` — a configurable interval, and at a Receive Maximum of 1 the session's whole
 outbound QoS 1/2 stream stalls behind that one exchange. The NAK re-offers the record at
 once so the ordinary delivery path retransmits it with its fencing, send holds and
-acknowledgement debt intact, which writing a PUBREL from the read loop would bypass. In the
-window before the first delivery attempt the entry has no ack subject yet, and `sendMsg`
-declines an empty subject, so the placeholder needs no special case.
+acknowledgement debt intact, which writing a PUBREL from the read loop would bypass; the
+branch first records the answer as owed (`owePubRelAnswerLocked`), so that re-offer is not
+absorbed as a resend (see "A transmission is not repeated on the connection that may hold
+it"). In the window before the first delivery attempt the entry has no ack subject yet, and
+`sendMsg` declines an empty subject, so the placeholder needs no special case.
 
 A stored PUBREL's headers are decoded as ONE shape, by `mqttDecodeStoredPubRel`, and no
 field of it authorizes anything until every field is legal. That includes CARDINALITY and
@@ -8649,6 +8651,72 @@ release that removes a PUBCOMP-converted reservation whose captured phase is sti
 the advance and the slot's re-phase are one atomic batch — so it never opens the window
 early. A takeover or clean start has no reservation; its connection admits on the durable
 slot, where a retransmission on reconnect is what [MQTT-4.4.0-1] asks for.
+
+### A transmission is not repeated on the connection that may hold it
+
+JetStream re-offers an unacknowledged source at AckWait (30 s by default), and a stored
+PUBREL whose PUBCOMP has not arrived the same way. Both used to go out again on the
+connection that already had them: the PUBLISH under its identifier with DUP set, the
+PUBREL with a second PUBCOMP unit. MQTT 5.0 [MQTT-4.4.0-1] resends PUBLISH and PUBREL only
+when a client reconnects with a session, and forbids it at any other time. On a connection
+that negotiated **MQTT 5.0**, a re-offer to the connection that may hold the packet is
+**absorbed**: nothing is written, acknowledged or NAKed, the source stays pending on its
+consumer (no `MaxDeliver`), and the client's acknowledgement settles it as before. A
+reconnect is a new connection (`c.cid`, never reused), so every resend route on it (the
+resume's NAK, AckWait, a drain) writes, with DUP from `transmitted` as before.
+
+**MQTT 3.1.1 keeps the retry, by decision.** 3.1.1 §4.4 requires the same reconnect resend
+and does not forbid more, and the inherited nats-server behavior is a resend every AckWait
+on the live connection. That retry is also the one-connection route by which several
+mechanisms here are reached and exercised: an answered PUBLISH section (F-115), PUBCOMP
+units per written PUBREL copy (F-116), an UNSUBSCRIBE drain completing its started
+exchange, and an exchange's QoS carried across a re-SUBSCRIBE. The transmission evidence
+below is recorded on every connection; only the two refusals read the delivering
+connection's negotiated protocol (`c.mqtt.proto`, fixed at CONNECT). On 5.0 those
+mechanisms are reached through a reconnect's resend instead.
+
+**PUBLISH: the entry records the connection a write reached.** `mqttPending.transmittedOn`
+is the cid of the connection a write of the entry possibly reached, set in
+`endPublishSend` when `wrote` is true, and in `retrackPublishLocked` from the PUBREC that
+a rollback answers (the client proved receipt there, and the PUBREC can remove the entry
+before its section's end stamps it). It is a different fact from `transmitted`, the DUP
+fact: an intent confirmed without a write sets `transmitted` and leaves the connection
+without the PUBLISH, so its next offer there is written (DUP=1), and recovery's
+`transmitted` names a write by an earlier process. Recovery and promotions build entries
+before any write in this process, so a takeover or restart resends by construction. The
+refusal is in `beginSendLocked`, the one opener every offer of a JetStream-backed entry
+reaches, not in `trackPublish`: two offers can both pass tracking before the first one's
+write ends. It applies only when the opening connection negotiated 5.0. A retained replay
+names no source and is never a re-offer.
+
+**PUBREL: the send hold already records it.** `mqttSendHold.pubCompOwed` with `owner` is a
+PUBREL possibly emitted on that connection and unanswered (units for provably unemitted
+frames are given back, F-116; the identifier cannot change exchange while the debt
+stands), stated as `pubRelHeldOnLocked`. Only the stored-PUBREL callback
+(`mqttDeliverPubRelCb`) is timer-driven, so only it judges the re-offer
+(`pubRelResendLocked`, which answers "not a resend" for a 3.1.1 connection), before its
+opener, whose own unit would make every debt look standing; the acquired action drains
+through the existing defer. The retained PUBREL emitter has no consumer and is never
+re-offered, so the shared opener `beginPubRelSendLocked` is unchanged. A predecessor's
+debt is not the successor's, which is what keeps a reconnect's PUBREL resend going out
+even where no sweep has retired the old hold.
+
+**A duplicate PUBREC is answered, once.** The client's successful PUBREC sent again owes
+one PUBREL in answer ([MQTT-4.3.3]), and that answer is produced by NAKing the stored
+PUBREL so the delivery path re-sends it. The duplicate-PUBREC branch records `answerOwed`
+on the hold first (`owePubRelAnswerLocked`, only on the owner connection), and the
+callback that proceeds on it binds the answer to the token it opens (`answering`). It is
+consumed by emission, not by admission: an attempt whose frame provably never left
+restores it at the section's end, behind the exact-token match; a duplicate PUBREC during
+the section sets it independently and survives; the PUBCOMP that ends the debt clears it,
+and a reconnect's fresh hold never has it.
+
+The cost on 5.0 is that an absorbed PUBLISH or PUBREL waits for the client's
+acknowledgement or its reconnect, where it used to be repeated every AckWait; a stored
+PUBREL re-offer still performs its admission (slot load, action CAS, drain) before it is
+absorbed. The asynchronous PUBREL intent rollback (`pubrel_intent_resolution.go`)
+reinstates the PUBLISH as held by the PUBREC's connection, which does not end; on 5.0 that
+exchange waits for a reconnect (`docs/CONFORMANCE.md`).
 
 ### An exchange's LINEAGE is carried, where its nonce is deliberately re-minted
 

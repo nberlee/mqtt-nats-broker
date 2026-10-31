@@ -902,6 +902,20 @@ func TestMQTTRestoreLaterFailureDoesNotRollBackAConfirmedConversion(t *testing.T
 // turns No Local on ([MQTT-3.8.4-3] replaces the subscription), and a later UNSUBSCRIBE
 // stages a drain that copies the NEW option over an exchange started under the old one.
 // Fixing only the restore-converted drain's field would leave exactly this standing.
+//
+// WHAT IT DETECTS, exactly. Two guards keep this exchange: the claimed-sequence exemption
+// (`!drainClaimed` in the delivery callback) and, since F-117, the ownership-time No Local
+// stamp, which is EMPTY here because the message was owned and delivered before No Local was
+// turned on. The fixture detects the COMBINED regression (mutation: delete the exemption AND
+// judge by the live option `sub.mqtt.noLocal`, the pre-F-117 rule), not the removal of either
+// guard alone. On this fixture's production path a message carrying a matching exclusion stamp
+// is filtered before delivery and so can never become the claimed exchange; that bounds what it
+// can reach, and is not a claim about every recovery path.
+//
+// The oracle is the re-offer reaching the send section: this MQTT 5.0 connection holds the
+// PUBLISH, so the re-offer is refused there as a resend ([MQTT-4.4.0-1]) rather than written,
+// and the No Local arm precedes that refusal. Under the mutation the arm acknowledges the source
+// and returns first, so no refusal is ever observed.
 func TestMQTTNoLocalDoesNotAckAwayAClaimedDrainedExchange(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
@@ -962,16 +976,47 @@ func TestMQTTNoLocalDoesNotAckAwayAClaimedDrainedExchange(t *testing.T) {
 		t.Fatalf("the drain must claim the started exchange, got %d claims", claims)
 	}
 
-	// The redelivery must reach the client, and the exchange must complete. If No Local were
-	// applied, the source would be acked away and this would time out with the claim stuck.
-	// DUP is deliberately NOT the oracle: it is derived from JetStream's delivery count, so
-	// asserting it here would pin the scheduler rather than the rule. The identifier and the
-	// completion are what matter.
-	_, rpi := testMQTTReadPublishV5(t, r, topic, []byte("mine"))
-	if rpi != pi {
-		t.Fatalf("the drained retransmission must reuse identifier %d, got %d", pi, rpi)
+	// The claimed re-offer must pass the No Local arm and reach the send section, where it is
+	// refused as a resend; its source must not be acknowledged before the client answers.
+	sess.mu.Lock()
+	var srcSeq uint64
+	if e := sess.pendingPublish[pi]; e != nil {
+		srcSeq = e.sseq
 	}
-	testMQTTSendPIPacket(mqttPacketPubAck, t, c, rpi)
+	sess.mu.Unlock()
+	if srcSeq == 0 {
+		t.Fatalf("no in-flight entry for identifier %d: the fixture never reached its route", pi)
+	}
+	refused := make(chan struct{}, 1)
+	mqttTestSameConnectionResendRefusedHook.Set(func(packet byte, rpi uint16) {
+		if packet == mqttPacketPub && rpi == pi {
+			select {
+			case refused <- struct{}{}:
+			default:
+			}
+		}
+	})
+	var ackedEarly atomic.Bool
+	obs := func(reply string, positive bool) {
+		if seq, _, _, _, _ := ackReplyInfo(reply); positive && seq == srcSeq {
+			ackedEarly.Store(true)
+		}
+	}
+	mqttTestSourceAckObserver.Store(&obs)
+	t.Cleanup(func() {
+		mqttTestSameConnectionResendRefusedHook.Set(nil)
+		mqttTestSourceAckObserver.Store(nil)
+	})
+	select {
+	case <-refused:
+	case <-time.After(10 * o.MQTT.AckWait):
+		t.Fatalf("no re-offer of the claimed exchange reached the send section: the No Local arm took it")
+	}
+	if ackedEarly.Load() {
+		t.Fatal("the claimed exchange's source was acknowledged before the client answered it")
+	}
+	mqttTestSourceAckObserver.Store(nil)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 	testMQTTFlush(t, c, nil, r)
 	checkFor(t, 3*time.Second, 20*time.Millisecond, func() error {
 		if n := testDrainClaims(sess); n != 0 {

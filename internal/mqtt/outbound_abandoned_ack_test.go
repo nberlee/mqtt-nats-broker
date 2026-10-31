@@ -96,7 +96,7 @@ func TestUnitCAbandonedAckBindingHandoff(t *testing.T) {
 		}
 	}
 	before := sess.receiveMaxOccupancyLocked()
-	sess.retrackPublishLocked(f.pi, mqttAckSnapshot(b))
+	sess.retrackPublishLocked(nil, f.pi, mqttAckSnapshot(b))
 	if sess.pendingPublish[f.pi] != nil || sess.cpending[b.dur][b.seq] != 0 ||
 		sess.receiveMaxOccupancyLocked() != before {
 		t.Fatal("pre-intent rollback restored PUBLISH or added a charge")

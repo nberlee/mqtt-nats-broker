@@ -1708,7 +1708,7 @@ func TestMQTTInflightPubRecRollbackMarksTransmitted(t *testing.T) {
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
 	ack := &mqttPending{jsDur: "d", sseq: 1, regSeq: 4, regNonce: mqttNewInflightNonce(), markerSeq: 3}
-	e.sess.retrackPublishLocked(5, ack)
+	e.sess.retrackPublishLocked(nil, 5, ack)
 	if !ack.transmitted || ack.markerSeq != 3 {
 		t.Fatalf("a PUBREC rollback restores a TRANSMITTED entry carrying its marker sequence, got %+v", ack)
 	}

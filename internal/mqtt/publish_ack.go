@@ -304,6 +304,9 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 					sess.emitRetainedPubRel(c, pi)
 					return nil
 				}
+				// The re-offer this NAK causes would otherwise be refused as a resend on this
+				// connection (mqttDeliverPubRelCb): record that the client asked for it.
+				sess.owePubRelAnswerLocked(c, pi)
 				dupNak := _EMPTY_
 				if rel.acts() {
 					// Only an entry that ACTS for its exchange may have its delivery re-offered;
@@ -503,7 +506,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 					sess.mu.Lock()
 					if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ {
 						delete(sess.pendingPubRel, pi)
-						sess.retrackPublishLocked(pi, removed)
+						sess.retrackPublishLocked(c, pi, removed)
 					}
 					sess.mu.Unlock()
 				}
@@ -548,7 +551,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			sess.mu.Lock()
 			if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ {
 				delete(sess.pendingPubRel, pi)
-				sess.retrackPublishLocked(pi, removed)
+				sess.retrackPublishLocked(c, pi, removed)
 			}
 			sess.mu.Unlock()
 			return errMQTTInvalidSession
@@ -663,7 +666,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ &&
 				!intent.intentRecorded() {
 				delete(sess.pendingPubRel, pi)
-				sess.retrackPublishLocked(pi, removed)
+				sess.retrackPublishLocked(c, pi, removed)
 			}
 			sess.mu.Unlock()
 			// Failure to send out PUBREL will terminate the connection.

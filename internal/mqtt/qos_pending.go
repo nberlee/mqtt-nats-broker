@@ -140,6 +140,16 @@ type mqttPending struct {
 	// says so (the register present and its unsent marker absent). Nothing derives it from
 	// a JetStream delivery count, and nothing else writes it. See inflight_marker.go.
 	transmitted bool
+	// transmittedOn is the connection a write of this entry possibly REACHED (its cid; zero when
+	// none in this process did). The same PUBLISH is never written to that connection again: a
+	// JetStream re-offer of an unacknowledged delivery is a resend, and both protocol levels
+	// resend only on a reconnect with a session ([MQTT-4.4.0-1]); a reconnect is a new cid, so
+	// its resend goes out (beginSendLocked). Distinct from transmitted, which is the DUP fact and
+	// is also set by an intent whose write never happened, and by recovery for a write some
+	// earlier process made. Set where a write possibly happened (endPublishSend) and where the
+	// client's PUBREC proved receipt (retrackPublishLocked); a scalar for the reason
+	// mqttSendHold.owner gives.
+	transmittedOn uint64
 	// markerSeq is the unsent marker's exact stream sequence, captured when the pair's
 	// commit was followed by the authoritative load (step 3 of the store) or by recovery's
 	// marker walk. Memory-only. Zero on a transmitted entry ("none held"): the marker was
@@ -328,6 +338,17 @@ type mqttSendHold struct {
 	// again or perform a new handoff — the predicate is POSSESSION OF THIS CONTINUATION,
 	// not current custody.
 	action *mqttSendAction
+	// answerOwed says the client sent a successful PUBREC again on the owner connection after a
+	// PUBREL may already have reached it, so one more PUBREL is owed as the ANSWER ([MQTT-4.3.3]).
+	// A stored PUBREL re-offered while pubCompOwed stands on the owner connection is otherwise a
+	// resend the client never asked for, and [MQTT-4.4.0-1] forbids it (pubRelHeldOnLocked). Not a
+	// counter: several duplicates before one answer are answered by that one.
+	//
+	// Consumed by EMISSION, not by admission: the section the answer admits moves it to answering,
+	// and its end restores it when the frame provably never left. A hold that a reconnect replaces
+	// starts without it, and the PUBCOMP that ends the debt clears it.
+	answerOwed bool
+	answering  bool
 	// pubIdent names the PUBLISH transmission whose write has not returned, and it
 	// survives the PUBREC map handoff.
 	//

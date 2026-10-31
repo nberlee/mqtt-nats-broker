@@ -365,24 +365,37 @@ func TestF115SectionOpenAtPubAckDoesNotWrite(t *testing.T) {
 
 // T4b, shape A on a REFUSED PUBREC (MQTT 5, reason 0x80): the exchange ends without a PUBREL,
 // and the open section must not write the refused PUBLISH either.
+//
+// The section is the RESUME's: an MQTT 5.0 connection that already holds the PUBLISH is never
+// resent it ([MQTT-4.4.0-1]), so on 5.0 the only section that can be open under a received
+// identifier is one on a reconnected session. The client received the PUBLISH on its first
+// connection, reconnects with its session, and refuses the exchange from its own state while
+// the resumed section is still before its write.
 func TestF115SectionOpenAtFailedPubRecDoesNotWrite(t *testing.T) {
 	const id = "f115-t4b"
 	connect := func(o *Options) (net.Conn, *mqttReader) {
-		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true, props: mqttV5ConnPropsSessionExpiry(300)},
+			o.MQTT.Host, o.MQTT.Port)
 		testMQTTReadConnAckV5(t, r)
 		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: f115Topic, opts: 2}})
 		testMQTTFlush(t, c, nil, r)
 		return c, r
 	}
-	rig, _ := f115Start(t, id, 2, connect)
+	rig, o := f115Start(t, id, 2, connect)
 	qos, pi := testMQTTReadPublishV5(t, rig.r, f115Topic, []byte("payload"))
 	if qos != 2 {
 		t.Fatalf("fixture: expected a QoS 2 delivery, got %d", qos)
 	}
 
 	parked, release := rig.holdNextSection(pi)
-	rig.nakSource()
-	f115Await(t, parked, "the retransmission section reaching its write")
+	rig.c.Close()
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, props: mqttV5ConnPropsSessionExpiry(300)}, o.MQTT.Host, o.MQTT.Port)
+	t.Cleanup(func() { c.Close() })
+	if present, rc, _ := testMQTTReadConnAckV5(t, r); rc != mqttReasonSuccess || !present {
+		t.Fatalf("fixture: the reconnect must resume the session: reason %x present %v", rc, present)
+	}
+	rig.c, rig.r = c, r
+	f115Await(t, parked, "the resumed section reaching its write")
 
 	if _, err := testMQTTWrite(rig.c, []byte{mqttPacketPubRec, 3, byte(pi >> 8), byte(pi), 0x80}); err != nil {
 		t.Fatalf("writing the refused PUBREC: %v", err)

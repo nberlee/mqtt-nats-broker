@@ -1439,7 +1439,26 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// queued under an identifier whose PUBREL bytes are still going out. Opened in the
 	// SAME critical section as the tracking below, so nothing can free the identifier
 	// between deciding to transmit and reserving it (F-089).
+	// A PUBREL THIS CONNECTION MAY ALREADY HOLD IS NOT WRITTEN TO IT AGAIN ([MQTT-4.4.0-1]): this
+	// offer is the record's AckWait re-offer, and a PUBREL is resent only on a reconnect with a
+	// session — a new connection, whose debt is not this one's. The one exception is the client's
+	// own duplicate PUBREC, answered by one PUBREL ([MQTT-4.3.3]); that answer is bound to the
+	// token opened below. Decided before the opener, whose own unit would make every debt look
+	// standing; returning here leaves the record unacknowledged and the acquired action to the
+	// deferred drain, exactly as the opener's refusal does. Only this timer-driven path judges it:
+	// a retained exchange's PUBREL has no consumer and is never re-offered.
+	resend, answer := sess.pubRelResendLocked(cc, pi)
+	if resend {
+		sess.mu.Unlock()
+		if h := mqttTestSameConnectionResendRefusedHook.Get(); h != nil {
+			h(mqttPacketPubRel, pi)
+		}
+		return
+	}
 	sendTok, sendOK := sess.beginPubRelSendLocked(cc, pi)
+	if sendOK && answer {
+		sess.bindPubRelAnswerLocked(cc, pi)
+	}
 	if !sendOK {
 		// A transmission is already out under this identifier. Return WITHOUT
 		// acknowledging: the record stays pending and AckWait re-offers it once that

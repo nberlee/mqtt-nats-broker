@@ -113,7 +113,7 @@ func TestPendingClosureRollbackReinstallsOnlyWhileHeld(t *testing.T) {
 				cp := *removed
 				back = &cp
 			}
-			e.sess.retrackPublishLocked(pi, back)
+			e.sess.retrackPublishLocked(nil, pi, back)
 			got := e.sess.pendingPublish[pi]
 			e.sess.mu.Unlock()
 			if tc.release && got != nil {

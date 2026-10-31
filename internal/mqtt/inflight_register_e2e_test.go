@@ -1170,9 +1170,12 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 // exercise the takeover machinery rather than this repair. The cost of that choice is
 // stated plainly: the recovery half of the schedule is covered by unit tests, and what
 // this test establishes is the repair and the liveness that follows it, on the wire.
-// Everything after that point is real: the record is re-offered by the consumer's own
-// AckWait, the PUBREL arrives on the unchanged connection, the client completes it with
-// PUBCOMP, and the identifier's Receive Maximum slot is released for the next message.
+// Everything after that point is real: the client's duplicate PUBREC requests the PUBREL
+// ([MQTT-4.3.3]) and the broker answers it by NAKing the stored record, so the consumer re-offers
+// it through admission; the PUBREL arrives on the unchanged connection, the client completes it
+// with PUBCOMP, and the identifier's Receive Maximum slot is released for the next message. The
+// request is what drives it: this MQTT 5.0 connection already holds the PUBREL, so a bare
+// AckWait re-offer is not resent to it ([MQTT-4.4.0-1]).
 //
 // Mutation check (F-105 7b, M16): re-add claim equality to the ordinary PUBREL admission and the
 // PUBREL never arrives — the read below times out, which is precisely the stall. (Before 7b this
@@ -1180,8 +1183,8 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
-	// A short AckWait is what makes the redelivery observable within the test's patience;
-	// the repair itself is driven by that re-offer and nothing else.
+	// A short AckWait bounds the action drain the fixture waits for before installing the
+	// stall; the PUBREL itself is driven by the duplicate PUBREC's re-offer.
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1304,10 +1307,11 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 		t.Fatalf("installing the foreign-claimed slot: %v", err)
 	}
 
-	// The client has not sent PUBCOMP, so the server re-sends the PUBREL
-	// ([MQTT-4.4.0-1]) and the consumer re-offers the record. Under the stall every one
-	// of those is refused; with the repair the first re-offer takes custody and the
-	// PUBREL reaches the client on this same connection.
+	// The client has not received an answer it can act on, so it sends PUBREC again, which
+	// owes it one PUBREL and re-offers the record at once. Under the stall that re-offer is
+	// refused by admission; with the repair it is served and the PUBREL reaches the client on
+	// this same connection.
+	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
 
 	// The durable proof, since F-105 7b: the foreign stamp DECIDES NOTHING on an ordinary slot

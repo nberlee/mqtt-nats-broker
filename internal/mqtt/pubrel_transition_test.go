@@ -45,7 +45,7 @@ func TestPubRelStoreFailureRollsBack(t *testing.T) {
 		t.Fatalf("expected an empty PUBREL placeholder, got %v (present=%v)", ack, ok)
 	}
 	delete(sess.pendingPubRel, pi)
-	sess.retrackPublishLocked(pi, removed)
+	sess.retrackPublishLocked(nil, pi, removed)
 	sess.mu.Unlock()
 
 	if _, wedged := sess.pendingPubRel[pi]; wedged {
@@ -97,7 +97,7 @@ func TestPubRelRollbackIsConditional(t *testing.T) {
 	sess.mu.Lock()
 	if ack, ok := sess.pendingPubRel[pi]; ok && ack != nil && ack.jsAckSubject == _EMPTY_ {
 		delete(sess.pendingPubRel, pi)
-		sess.retrackPublishLocked(pi, removed)
+		sess.retrackPublishLocked(nil, pi, removed)
 	}
 	sess.mu.Unlock()
 
