@@ -123,10 +123,9 @@ var mqttOutputBypassesOwed = map[string]mqttOutputSite{
 // TLS wrap, the WebSocket handshake and wrap, and teardown. Recording them rather than excluding the pattern is what keeps a new
 // one visible: `io.Copy(c.nc, buf)` added tomorrow lands in this check, not in silence.
 var mqttSocketPlumbingSites = map[string]mqttOutputSite{
-	"conn_lifecycle.go|createMQTTClient|nc (handed out)":        {3, "io.ReadFull on the connection: the READ side; the WebSocket opening handshake, which writes only its HTTP answer before any MQTT frame exists; and the WebSocket adapter wrapping the socket, through which every later MQTT frame still leaves by writeAuthorizedFrame or writeActionlessFrame, its own writes being Pong and Close control frames"},
-	"shim_engine.go|doTLSServerHandshake|nc (handed out)":       {1, "tls.Server wraps the socket"},
-	"shim_engine.go|readLoop|nc (aliased)":                      {1, "the read loop's own local"},
-	"conn_disconnect.go|mqttLingerAfterDisconnect|nc (aliased)": {1, "the error DISCONNECT's drain: the READ side only, reading and discarding; it writes nothing"},
+	"conn_lifecycle.go|createMQTTClient|nc (handed out)":  {3, "io.ReadFull on the connection: the READ side; the WebSocket opening handshake, which writes only its HTTP answer before any MQTT frame exists; and the WebSocket adapter wrapping the socket, through which every later MQTT frame still leaves by writeAuthorizedFrame or writeActionlessFrame, its own writes being Pong and Close control frames"},
+	"shim_engine.go|doTLSServerHandshake|nc (handed out)": {1, "tls.Server wraps the socket"},
+	"shim_engine.go|readLoop|nc (aliased)":                {1, "the read loop's own local"},
 }
 
 // TestF105EveryTransportWriteIsAccountedFor is the structural check itself.

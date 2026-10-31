@@ -1106,6 +1106,9 @@ func (c *client) bindMQTTReader() {
 	}
 }
 
+// mqttTestReaderReadV runs in readLoop immediately before each socket Read. Nil in production.
+var mqttTestReaderReadV atomic.Pointer[func(c *client)]
+
 // readLoop reads from the client socket and feeds the MQTT parser. The
 // mqttReader accumulates partial packets across reads.
 func (c *client) readLoop(pre []byte) {
@@ -1126,6 +1129,9 @@ func (c *client) readLoop(pre []byte) {
 		// The inbound pipeline first: abort it and join its goroutines, so nothing of this
 		// connection's inbound work runs beside, or after, the teardown (inbound_pipeline.go).
 		c.mqttInboundClose()
+		// Then the drain its failure position may have handed over: only after the join is
+		// that obligation final (mqttDrainHandedOffClose).
+		c.mqttDrainHandedOffClose()
 		if c.srv != nil {
 			c.srv.mqttHandleClosedClient(c)
 		}
@@ -1145,6 +1151,9 @@ func (c *client) readLoop(pre []byte) {
 	}
 	buf := make([]byte, 32*1024)
 	for {
+		if h := mqttTestReaderReadV.Load(); h != nil {
+			(*h)(c)
+		}
 		n, err := nc.Read(buf)
 		if n > 0 {
 			if perr := c.mqttParse(buf[:n]); perr != nil {

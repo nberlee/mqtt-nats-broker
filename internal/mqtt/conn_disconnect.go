@@ -18,6 +18,7 @@ package mqtt
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,30 +44,10 @@ func (c *client) mqttClaimDisconnectLocked() bool {
 	return true
 }
 
-// mqttEnqueueDisconnect sends an MQTT 5.0 DISCONNECT with the given reason code
-// (and, when allowed and it fits, a Reason String) to the client, before the
-// connection is closed on a protocol/processing error. It is a no-op for 3.1.1
-// connections, which have no server-initiated DISCONNECT, and for a connection
-// whose one DISCONNECT another path already claimed. Spec5 [3.14].
-func (c *client) mqttEnqueueDisconnect(reason byte, reasonStr string) {
-	pkt := c.mqttBuildDisconnect(reason, reasonStr)
-	if pkt == nil {
-		// Nothing was sent, so [MQTT-3.14.4-1] never triggered: the claim stays
-		// available to a later sender rather than being spent on no packet.
-		return
-	}
-	c.mu.Lock()
-	if c.mqttClaimDisconnectLocked() {
-		// Claim and write in this one section. A refusal spends the claim and writes nothing,
-		// which "at most one ATTEMPT" already permits.
-		_ = c.writeActionlessFrameBy(pkt, time.Time{})
-	}
-	c.mu.Unlock()
-}
-
-// mqttDisconnectBeforeClose sends a server-initiated DISCONNECT that ends the connection, as
-// mqttEnqueueDisconnect does, and seals the output gate behind it in the same write section, so it
-// is the last MQTT packet on the wire. It reports whether the DISCONNECT was COMPLETED on the
+// mqttDisconnectBeforeClose sends a server-initiated MQTT 5.0 DISCONNECT that ends the connection
+// (a no-op for 3.1.1, which has none, and for a connection whose one DISCONNECT another path
+// already claimed; Spec5 [3.14]), and seals the output gate behind it in the same write section, so
+// it is the last MQTT packet on the wire. It reports whether the DISCONNECT was COMPLETED on the
 // socket: only then may the reader linger to let the client read it (mqttLingerAfterDisconnect).
 // The one-DISCONNECT claim is taken under c.mu and never given back.
 //
@@ -106,8 +87,7 @@ const mqttDisconnectLingerBytes = 1 << 20
 //
 // Runs on the reader, which owns the transport's reads; no other reader exists.
 func (c *client) mqttLingerAfterDisconnect(buffered int) {
-	nc := c.nc
-	if nc == nil {
+	if c.nc == nil {
 		return
 	}
 	// THE BOUND IS A CLOSE, not a deadline: past it the transport is closed, which ends a read in
@@ -115,15 +95,92 @@ func (c *client) mqttLingerAfterDisconnect(buffered int) {
 	// KeyUpdate reply, a WebSocket Pong or Close), whether or not the transport honours deadlines.
 	watchdog := time.AfterFunc(mqttDisconnectLinger.Get(), c.closeTransport)
 	defer watchdog.Stop()
+	c.mqttDrainToClose(buffered)
+}
+
+// mqttDrainToClose reads and discards until the client closes, a read fails or the payload
+// ceiling is reached, and then closes the transport. Both lingers drain through it; the caller
+// owns the bound.
+//
+// IT ENDS IN A CLOSE, before the caller stops its bound: the teardown that follows is not bounded
+// by the linger (it may wait on session ownership), and a socket left open past the drain would
+// hold unread input nobody reads, which is the reset the drain exists to avoid. The output gate
+// is already sealed, and the certification closeConnection performs later is idempotent over a
+// closed socket.
+//
+// Reader only. It has no parser reference: nothing it reads is interpreted.
+func (c *client) mqttDrainToClose(buffered int) {
+	defer c.closeTransport()
 	total := buffered
 	buf := make([]byte, 32*1024)
 	for total < mqttDisconnectLingerBytes {
-		n, err := nc.Read(buf)
+		n, err := c.nc.Read(buf)
 		total += n
 		if err != nil {
 			return
 		}
 	}
+}
+
+// mqttDisconnectHandingOff is the inbound pipeline's failure position's DISCONNECT: it claims,
+// writes and seals as mqttDisconnectBeforeClose does, and when the write COMPLETED it hands the
+// close to the reader, in the same c.mu section: the reader owes the drain (handoffOwed) and the
+// bound that ends it is armed (handoffBound). It reports whether the close was handed over;
+// otherwise the caller closes at once, as before.
+//
+// WHY A HANDOFF: the failure position runs on a pipeline goroutine while the client may still be
+// sending, and only the reader may read the transport. ONE BOUND OWNER: this side arms it,
+// because it alone knows the write completed while the reader may be unreachable (blocked in a
+// socket Read on a silent client); the reader's drain arms none.
+//
+// No lock held on entry.
+func (c *client) mqttDisconnectHandingOff(reason byte, reasonStr string) bool {
+	pkt := c.mqttBuildDisconnect(reason, reasonStr)
+	if pkt == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.mqttClaimDisconnectLocked() || !c.writeActionlessFrameSealing(pkt) {
+		return false
+	}
+	c.mqtt.handoffOwed = true
+	c.mqtt.handoffBound = time.AfterFunc(mqttDisconnectLinger.Get(), c.closeTransport)
+	return true
+}
+
+// mqttTestHandoffDrainV runs when the reader starts a handed-over drain. Nil in production.
+var mqttTestHandoffDrainV atomic.Pointer[func(c *client)]
+
+// mqttDrainHandedOffClose runs the drain the failure position handed to the reader, if it did:
+// readLoop's exit, AFTER the pipe was joined (mqttInboundClose) and before the teardown.
+//
+// AFTER THE JOIN, because only then is handoffOwed final: the failure position (fail) runs only
+// inside emit, emit only on the pipe's own goroutines, every one of them counted in its wait group
+// (TestMQTTInboundFailureRunsOnJoinedGoroutines), and the reader can leave its parse on p.failed
+// before fail has written anything.
+//
+// NO LOCK: the join orders the failure position's write of the flag before this read (its only
+// writer runs on a joined goroutine), and c.mu must not be taken here: every readLoop exit passes
+// this point, and a delivery can hold c.mu in a blocked write for up to the write deadline, which
+// would delay the start of a teardown the transport owns (TestWSNonReadingPingerClosedAtKeepAlive).
+//
+// The keep-alive deadline the reader armed after its last parse is cleared first, as mqttParse's
+// entry clears it before the reader-owned linger; a refused clear only shortens the drain, and the
+// bound closes regardless.
+func (c *client) mqttDrainHandedOffClose() {
+	if c.mqtt == nil || !c.mqtt.handoffOwed {
+		return
+	}
+	bound := c.mqtt.handoffBound
+	if h := mqttTestHandoffDrainV.Load(); h != nil {
+		(*h)(c)
+	}
+	if c.nc != nil {
+		_ = c.nc.SetReadDeadline(time.Time{})
+		c.mqttDrainToClose(0)
+	}
+	bound.Stop()
 }
 
 // mqttNotifyTakenOver tells a displaced connection that its session was taken over (0x8E),
@@ -182,8 +239,9 @@ func (c *client) mqttNotifyDisplaced(voc mqttDisposalVocabulary) {
 // DISCONNECT with the given reason code (and, when allowed and it fits, a Reason
 // String), or nil for a 3.1.1 connection (which has no server DISCONNECT) or
 // when even the 3-byte short form would exceed the client's Maximum Packet Size.
-// It builds only; the caller enqueues (mqttEnqueueDisconnect) or writes it
-// directly under a deadline (shutdownDisconnect). Spec5 [3.14].
+// It builds only; the caller writes it, sealing the gate behind it
+// (mqttDisconnectBeforeClose, mqttDisconnectHandingOff), or under a deadline
+// (shutdownDisconnect). Spec5 [3.14].
 func (c *client) mqttBuildDisconnect(reason byte, reasonStr string) []byte {
 	if c.mqtt == nil || c.mqtt.proto != mqttProtoLevel5 {
 		return nil

@@ -54,8 +54,9 @@ import (
 //     dropped, submitted stores are awaited (which releases their reply registrations), and
 //     nothing is written afterwards.
 //   - FAILURE KEEPS THE PREFIX. A job's failure is recorded at its position; earlier
-//     responses are still written; at the failure the connection is told why and its
-//     transport closed, and the readLoop runs the ordinary teardown.
+//     responses are still written; at the failure the connection is told why, the close is
+//     handed to the readLoop (it drains what the client still sends, bounded, then closes),
+//     and the readLoop runs the ordinary teardown.
 
 // mqttInboundWindow bounds a connection's reserved positions. A PUBLISH or PUBREL arriving at
 // a full pipe waits for space before its packet lease is taken (back-pressure on the socket).
@@ -265,6 +266,15 @@ func (p *mqttInboundPipe) waitChangedLocked() {
 
 func (p *mqttInboundPipe) aborted() bool { return mqttLatchFired(p.abort) }
 
+// stopped reports whether the pipe failed or aborted: the connection is ending, and the readLoop
+// interprets no packet that starts after this. p.failed is set before the failure position writes
+// its DISCONNECT, so a packet the client sent after reading it always finds the pipe stopped.
+func (p *mqttInboundPipe) stopped() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.failed || p.aborted()
+}
+
 // emptyLocked: no job queued and no response being written. p.mu held.
 func (p *mqttInboundPipe) emptyLocked() bool { return len(p.jobs) == 0 && !p.emitting }
 
@@ -453,6 +463,7 @@ func (p *mqttInboundPipe) waitSpace() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for len(p.jobs) >= mqttInboundWindow.Get() {
+		mqttTestInboundWait(p.c, "space")
 		if !p.waitLocked() {
 			return errMQTTInboundAborted
 		}
@@ -466,6 +477,9 @@ func (p *mqttInboundPipe) waitSpace() error {
 func (p *mqttInboundPipe) drain() error {
 	p.mu.Lock()
 	for !p.emptyLocked() {
+		if !p.failed {
+			mqttTestInboundWait(p.c, "drain")
+		}
 		if p.failed || !p.waitLocked() {
 			p.mu.Unlock()
 			return errMQTTInboundAborted
@@ -848,9 +862,17 @@ func (p *mqttInboundPipe) emit() {
 	p.mu.Unlock()
 }
 
-// fail is what the readLoop's error exit does before its close, at the failure position:
-// tell a v5 client why, then close the transport. The readLoop's Read fails and it runs the
-// ordinary teardown (mqttHandleClosedClient before closeConnection); no worker runs teardown.
+// fail is what the readLoop's error exit does at the failure position: tell a v5 client why,
+// then end the connection. No worker runs teardown; the readLoop runs the ordinary one
+// (mqttHandleClosedClient before closeConnection).
+//
+// A v5 DISCONNECT written COMPLETED HANDS THE CLOSE TO THE READER instead of closing here: the
+// client may still be sending, and a close with its input unread answers it with a reset that
+// can discard the DISCONNECT. The DISCONNECT seals the output gate, the reader owes a bounded
+// drain (mqttDisconnectHandingOff), and the latch, fired without a close, wakes the reader from
+// any pipeline wait and stops the issuer. The reader parses nothing that starts after p.failed
+// (stopped) and drains after joining this goroutine (mqttDrainHandedOffClose). Anything else
+// (3.1.1, the claim already spent, a sealed gate, a failed write, an abort) closes at once.
 func (p *mqttInboundPipe) fail(j *mqttInboundJob) {
 	c := p.c
 	err := j.err
@@ -860,11 +882,15 @@ func (p *mqttInboundPipe) fail(j *mqttInboundJob) {
 	}
 	if err == ErrMaxPayload {
 		c.Warnf("MQTT maximum payload exceeded")
-	} else {
-		c.Errorf("%v", err)
-		if c.mqtt.proto == mqttProtoLevel5 {
-			c.mqttEnqueueDisconnect(mqttDisconnectReasonFromErr(err), err.Error())
-		}
+		c.closeTransport()
+		return
+	}
+	c.Errorf("%v", err)
+	mqttTestInboundFail(c, "before-claim")
+	if c.mqttDisconnectHandingOff(mqttDisconnectReasonFromErr(err), err.Error()) {
+		mqttTestInboundFail(c, "handed-over")
+		c.mqtt.fireAbort()
+		return
 	}
 	c.closeTransport()
 }
@@ -1006,7 +1032,25 @@ var (
 	mqttTestInboundJoinedV         atomic.Pointer[func(c *client)]
 	mqttTestInboundDispatchV       atomic.Pointer[func(c *client, pt byte, drain bool, pending bool)]
 	mqttTestInboundPauseV          atomic.Pointer[func(j *mqttInboundJob, step string)]
+	// mqttTestInboundWaitV runs, with p.mu held, when the readLoop is about to block in a
+	// pipeline wait ("space" or "drain"); it must not block.
+	mqttTestInboundWaitV atomic.Pointer[func(c *client, which string)]
+	// mqttTestInboundFailV observes the failure position: "before-claim" after p.failed and
+	// before the DISCONNECT, "handed-over" once the close was handed to the reader.
+	mqttTestInboundFailV atomic.Pointer[func(c *client, phase string)]
 )
+
+func mqttTestInboundWait(c *client, which string) {
+	if h := mqttTestInboundWaitV.Load(); h != nil {
+		(*h)(c, which)
+	}
+}
+
+func mqttTestInboundFail(c *client, phase string) {
+	if h := mqttTestInboundFailV.Load(); h != nil {
+		(*h)(c, phase)
+	}
+}
 
 // mqttTestInboundPause parks a job at a named step for a test. Nil in production.
 func mqttTestInboundPause(j *mqttInboundJob, step string) {

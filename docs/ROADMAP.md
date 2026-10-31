@@ -9629,29 +9629,29 @@ reads](findings/resolved.md#f-054).
 
 ### Connection close
 
-- [ ] **Carry the error-DISCONNECT linger to the inbound-pipeline worker's failure
+- [x] **Carry the error-DISCONNECT linger to the inbound-pipeline worker's failure
   arm.** Filed 2026-10-29 by consult C4 of the batched-acquisition lane, which deferred
-  it after three plan rounds did not converge (LC1 7 findings, LC2 5, LC3 4, every high
-  finding of the last two in the handoff). The reader-owned arms (the parse-error footer
-  and 0x95) linger since the Paho test_flow_control2 repair; the worker
-  (`mqttInboundPipe.fail`) still writes its DISCONNECT and closes the transport from
-  another goroutine, and ordinary backend failures (QoS 0/1 fan-out, retained update,
-  message-store submission or acknowledgement; QoS 2 hold CAS, lookup, cleanup; PUBREL
-  release claim, proof, retirement classification, commit; a service-epoch change) reach
-  it while a compliant client may still be writing (C3). Deliverable: a handoff to the
-  sole reader, designed and reviewed on its own, that closes the four interleavings LC3
-  named: the reader past its check holding buffered input, so it parses after the
-  failure; an error exit (`p.failed` set before `fail` runs) reaching the close before
-  the obligation is published; the keep-alive deadline rearm in `mqttParse` overwriting
-  the handoff deadline; TLS writes (a KeyUpdate reply) unbounded during the handoff.
-  Constraints from LC1-LC3: no half-close (TLS `CloseWrite` does not half-close TCP and
-  resets the write deadline; `wsConn` has no `CloseWrite` and latches every read error,
-  timeouts included, so a WebSocket read must not be interrupted by a deadline it is
-  meant to read past); the DISCONNECT written and the gate sealed in one write section,
-  the linger only after a COMPLETED write; one absolute deadline on reads and transport
-  writes; tests at both reader positions (socket read, pipeline wait) on TCP and
-  WebSocket. Residual meanwhile: docs/CONFORMANCE.md, "A server error DISCONNECT and a
-  client still sending".
+  it after three plan rounds did not converge (LC1-LC3), leaving the residual "A server
+  error DISCONNECT and a client still sending" in docs/CONFORMANCE.md. **Done 2026-10-30.**
+  The failure position (`mqttInboundPipe.fail`) now writes its v5 DISCONNECT and seals the
+  output gate in one write section and, when the write COMPLETED, hands the close to the
+  reader (`mqttDisconnectHandingOff`): the owed drain and the bound that ends it are
+  recorded in the same `c.mu` section, and the abort latch is fired without a close. The
+  reader interprets no packet that starts after the pipe failed, and on its exit joins the
+  pipe's goroutines before it drains (`mqttDrainHandedOffClose`), which is what makes the
+  obligation final (the failure position runs only on wait-group-counted pipe goroutines,
+  held by an AST census). A packet the reader finds in error after the failure position
+  sends no DISCONNECT and does not close. Both arms now end their drain in a close, before
+  the teardown, which the linger does not bound. The bullet's "one absolute deadline" was
+  superseded by the reader-owned arm as landed: the bound is a watchdog CLOSE, so LC3's
+  keep-alive-rearm and TLS-write interleavings have no deadline to act on, and no
+  WebSocket read is interrupted by one. Measured: a client pipelining QoS 1 PUBLISHes at
+  about 1 ms lost the DISCONNECT or failed a send in 20 of 20 iterations with the
+  immediate close and 0 of 20 with the handoff, on TCP and on WebSocket. The residual
+  paragraph is gone; the bounds' limits (a keep-alive expiry ends the drain early, the
+  join shares the bound, the packet already started is processed) are stated there. Four
+  plan rounds, the last APPROVE. Record: [Pipeline failure
+  handoff](findings/nats-platform.md#pipeline-failure-handoff-2026-10-30).
 
 ### Outbound retransmission
 

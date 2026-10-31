@@ -4224,23 +4224,29 @@ connection's OBLIGATION". Three gaps remain.
 
 ### A server error DISCONNECT and a client still sending
 
-When the read loop ends a connection for a protocol or processing error (Receive Maximum
-exceeded, a malformed packet, a packet too large), its DISCONNECT is written and the
+When the server ends a connection for a protocol or processing error, whether the read
+loop found it (Receive Maximum exceeded, a malformed packet, a packet too large) or a
+queued publication's backend work failed on the inbound pipeline (a store, retained,
+QoS 2 hold or release failure, a service-epoch move), its DISCONNECT is written and the
 output gate sealed, and the reader then keeps reading and discarding what the client
 still sends, for at most five seconds or 1 MiB of payload, before it closes
-(docs/ARCHITECTURE.md, "A reader-owned error DISCONNECT lingers before the close"). A
-client still answering its acknowledgements therefore reads the DISCONNECT instead of
-failing on a TCP reset. The bounds are a resource ceiling, not a guarantee: a client
-that sends more than 1 MiB, or keeps sending for longer than five seconds, after the
-DISCONNECT may still lose it to a reset at the close, and a client that keeps its
-connection open delays its own teardown, and its Will, by up to the bound.
+(docs/ARCHITECTURE.md, "An error DISCONNECT lingers before the close"). A client still
+answering its acknowledgements, or still pipelining publications, therefore reads the
+DISCONNECT instead of failing on a TCP reset. The bounds are a resource ceiling, not a
+guarantee:
 
-**The inbound-pipeline worker's failure arm is not covered.** A compliant client still
-writing when an ordinary backend failure ends its connection through the
-inbound-pipeline worker may lose the server's DISCONNECT to a TCP reset, even if the
-DISCONNECT write completed. This worker path retains its existing immediate-close
-behavior; the reader-owned linger does not cover it. Carrying the linger there needs a
-separately designed handoff to the reader (docs/ROADMAP.md).
+- A client that sends more than 1 MiB, or keeps sending for longer than five seconds,
+  after the DISCONNECT may still lose it to a reset at the close.
+- On the inbound pipeline's failure position the five seconds run from the DISCONNECT and
+  include the reader's join of the pipeline's goroutines, so a join slowed by a submitted
+  store awaiting its result leaves less of the bound for the drain.
+- A keep-alive deadline that has expired, or expires during the drain, ends it early; a
+  WebSocket transport keeps that timeout as its read error, so the drain cannot resume
+  past it. A client still sending at that moment may still lose the DISCONNECT to a reset.
+- A client that keeps its connection open delays its own teardown, and its Will, by up to
+  the bound; the bound limits transport I/O, not the teardown that follows it.
+- The one packet the reader had already started when the pipeline failed is processed as
+  before; only packets that start after it are discarded.
 
 ### A JetStream re-offer retransmits on the same connection
 

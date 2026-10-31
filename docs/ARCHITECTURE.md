@@ -2778,25 +2778,47 @@ displacement has its own single owner:
   packet: a nil build never reaches the claim, the CONNACK gate can refuse before it, the
   shutdown drain's reservation can be spent without a write, and the winner's write stays
   best-effort against a socket a concurrent close may already have taken down. On the
-  reader-owned error arms (the parse-error footer and 0x95) the write seals the output
-  gate before the socket's write lock is released (`mqttDisconnectBeforeClose`), so no
-  MQTT packet can trail that DISCONNECT; elsewhere nothing gates non-DISCONNECT traffic,
-  so a PINGRESP or an in-flight PUBLISH can still trail the winner until the close lands.
-- **A reader-owned error DISCONNECT lingers before the close.** A client still sending
-  when the server closes makes the server's TCP answer a reset, which fails the client's
-  next send and may discard what it has not read, the DISCONNECT included; a client
-  exceeding Receive Maximum walks every acknowledgement queued ahead of the DISCONNECT,
-  answering each, before it reads it (the Eclipse Paho interoperability client fails
-  this way). So when the read loop's error footer or its 0x95 arm wrote its DISCONNECT
-  COMPLETED and sealed the gate behind it, the reader keeps reading and discarding
-  (`mqttLingerAfterDisconnect`) until the client closes, a read fails, five seconds pass
-  (`mqttDisconnectLinger`; the transport is closed when it passes, which also ends a
-  transport write a TLS or WebSocket read may perform) or 1 MiB of payload is read,
-  buffered unread input included; then it closes as before. Nothing read is parsed. The
-  bounds are a resource ceiling, not a delivery guarantee. The inbound-pipeline worker's
-  failure position keeps its write-then-close: it runs on another goroutine, and
-  carrying the linger there needs a handoff to the reader that is designed separately
-  (docs/ROADMAP.md, docs/CONFORMANCE.md).
+  error arms (the parse-error footer, 0x95, and the inbound pipeline's failure position)
+  the write seals the output gate before the socket's write lock is released
+  (`mqttDisconnectBeforeClose`, `mqttDisconnectHandingOff`), so no MQTT packet can trail
+  that DISCONNECT; elsewhere nothing gates non-DISCONNECT traffic, so a PINGRESP or an
+  in-flight PUBLISH can still trail the winner until the close lands.
+- **An error DISCONNECT lingers before the close.** A client still sending when the
+  server closes makes the server's TCP answer a reset, which fails the client's next send
+  and may discard what it has not read, the DISCONNECT included; a client exceeding
+  Receive Maximum walks every acknowledgement queued ahead of the DISCONNECT, answering
+  each, before it reads it (the Eclipse Paho interoperability client fails this way), and
+  a client pipelining PUBLISHes is still writing when a backend failure ends it. So once
+  an error DISCONNECT was written COMPLETED and the gate sealed behind it, the reader, the
+  only goroutine that reads the transport, keeps reading and discarding until the client
+  closes, a read fails, five seconds pass (`mqttDisconnectLinger`) or 1 MiB of payload is
+  read, and then closes the transport itself (`mqttDrainToClose`), before the teardown,
+  which the linger does not bound. Nothing read is parsed. THE BOUND IS A CLOSE, not a
+  deadline: when it passes the transport is closed, which ends a read in progress and a
+  transport write a TLS or WebSocket read may perform, on every transport, so no deadline
+  is installed that the keep-alive rearm could overwrite or a WebSocket read could latch.
+  The bounds are a resource ceiling over transport I/O, not a delivery guarantee, and they
+  do not bound the reader's own completion, the session's detachment or its Will. Two
+  arms:
+  - *Reader-owned* (the read loop's error footer, its 0x95 arm): the reader lingers in
+    place (`mqttLingerAfterDisconnect`), arming the bound itself.
+  - *The inbound pipeline's failure position* (`mqttInboundPipe.fail`), on a pipe
+    goroutine, HANDS THE CLOSE TO THE READER: its DISCONNECT write, when COMPLETED, also
+    records the owed drain and arms the bound in the same `c.mu` section
+    (`mqttDisconnectHandingOff`; one bound owner, the side that knows the write completed
+    while the reader may be blocked in a socket Read), and the abort latch is fired without
+    a close. The reader parses no packet that starts after the pipe failed (`p.failed` is
+    set before the DISCONNECT is written), and drains in its exit path only AFTER joining
+    the pipe's goroutines (`mqttDrainHandedOffClose` after `mqttInboundClose`): the failure
+    position runs only inside `emit`, `emit` only on the pipe's wait-group-counted
+    goroutines (`TestMQTTInboundFailureRunsOnJoinedGoroutines`), and the reader can leave
+    its parse on `p.failed` before anything was written, so only after the join is the
+    obligation final. The bound runs from the DISCONNECT, so a slow join (a submitted store
+    awaiting its result) shortens the drain. A packet the reader finds in error after the
+    failure position sends no DISCONNECT of its own and does not close: its drain of the
+    pipe reports the abort, and the failure position, which precedes it, owns the ending.
+  A DISCONNECT the sealed gate prevented, one whose claim another sender held, or a failed
+  write closes at once on either arm.
 - **Close**: `closeConnection` is idempotent (`c.closed.Swap(true)`). Any number of paths
   may call it; one runs.
 - **Will disposition**: `willDisposition`, transitioned only under `c.mu` and consumed
@@ -15320,17 +15342,28 @@ is aged from the hold's store time, once more at its issuance.
 **Abort, failure, close, takeover, shutdown.** Every close of an accepted client's socket
 goes through `closeTransport`, which also fires the connection's ABORT LATCH; the latch
 belongs to the connection, made before anything can close it, so a pipe created after a
-close starts aborted. Every pipeline wait selects on it, the subs barrier included (which
-then reports the abort and the store is not submitted). A job failure (a store failure, a
-retained failure joined with it, an unconfirmed release, an epoch move, a refused lease)
-is recorded at its position; earlier responses are still written; at the failure position
-the emitter logs, sends the v5 DISCONNECT the readLoop's error exit would have sent, and
-closes the transport, and the readLoop's failed Read runs the ordinary teardown. When the
-readLoop ITSELF ends the connection on a packet (a protocol violation, a Receive Maximum
-overrun, a packet over the Maximum Packet Size, a refusal that closes a 3.1.1 client), the
-packets before that one were accepted and the serial path had already completed and
-answered them, so the readLoop first drains the pipe, without its packet lease, and only
-then sends its DISCONNECT and closes; no such path closes the transport before that drain.
+close starts aborted. The latch also fires WITHOUT a close, at the failure position's
+handoff and at the readLoop's exit, so "the latch fired" means "stop work", never "the
+socket is gone": every consumer (the pipeline waits, the issuer, the subs barrier, a
+queued job's lease acquisition) only stops. Every pipeline wait selects on it, the subs
+barrier included (which then reports the abort and the store is not submitted). A job
+failure (a store failure, a retained failure joined with it, an unconfirmed release, an
+epoch move, a refused lease) is recorded at its position; earlier responses are still
+written; at the failure position the emitter logs and sends the v5 DISCONNECT the
+readLoop's error exit would have sent, sealing the output gate behind it; when that
+write COMPLETED it hands the close to the readLoop (the owed drain and its bound, see "An
+error DISCONNECT lingers before the close") and fires the latch, which wakes the readLoop
+from any pipeline wait; otherwise (3.1.1, a prevented or failed write, the claim already
+spent) it closes the transport. The readLoop interprets no packet that starts after the
+pipe failed, and on its exit joins the pipe, drains if the close was handed over, and runs
+the ordinary teardown. When the readLoop ITSELF ends the connection on a packet (a
+protocol violation, a Receive Maximum overrun, a packet over the Maximum Packet Size, a
+refusal that closes a 3.1.1 client), the packets before that one were accepted and the
+serial path had already completed and answered them, so the readLoop first drains the
+pipe, without its packet lease, and only then sends its DISCONNECT and closes; no such
+path closes the transport before that drain. If that drain finds the pipe failed or
+aborted, the packet sends nothing and closes nothing: the failure position precedes it in
+receipt order and owns the connection's ending.
 On every readLoop exit the latch then fires: unstarted jobs are dropped (only possible
 when the transport went away underneath them), a release the issuer has not yet claimed
 stops before its onward store (`endQoS2ReleaseOp`, claim left: the state an indeterminate

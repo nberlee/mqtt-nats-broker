@@ -85,6 +85,8 @@ func (c *client) mqttParse(buf []byte) error {
 	var b byte
 	var pl int
 	var complete bool
+	// pipeEnded: this packet's error found the inbound pipe failed or aborted when it drained.
+	var pipeEnded bool
 
 	// This packet's completion lease (F-036 unit 1). Reassigned per iteration and
 	// released at the end of the iteration; the deferred release below covers every
@@ -99,6 +101,19 @@ func (c *client) mqttParse(buf []byte) error {
 	}()
 
 	for err == nil && r.hasMore() {
+
+		// NOTHING THAT STARTS AFTER THE PIPE STOPPED IS INTERPRETED. Its failure position has
+		// told the client why and handed the close to this reader, or the connection is closing;
+		// what the client sent after that is the drain's to discard (mqttDrainHandedOffClose),
+		// not this parser's to act on. Checked before the packet's first byte, so a packet the
+		// client sent after reading the DISCONNECT, or one buffered behind the failure, is never
+		// read; the one packet already past this check when the pipe failed is not recalled.
+		if connected {
+			if p := mqtt.inPipe; p != nil && p.stopped() {
+				err = errMQTTInboundAborted
+				break
+			}
+		}
 
 		// Keep track of the starting of the packet, in case we have a partial
 		r.pstart = r.pos
@@ -141,7 +156,15 @@ func (c *client) mqttParse(buf []byte) error {
 					if h := mqttTestReadLoopErrorV.Load(); h != nil {
 						(*h)(c, err)
 					}
-					_ = c.mqttInboundDrain()
+					if derr := c.mqttInboundDrain(); errors.Is(derr, errMQTTInboundAborted) {
+						// The pipe failed or the connection is closing: the ending is the
+						// failure position's (it precedes this packet) or the closer's.
+						// No DISCONNECT of this packet's, and no close here, which would
+						// close under a handed-over drain; readLoop's exit joins the pipe,
+						// drains if that was handed over, and tears down.
+						c.Warnf("MQTT maximum payload exceeded: %d > %d", pl, maxLen)
+						break
+					}
 				}
 				// Tell a connected v5 client why before the close (no-op for 3.1.1
 				// and pre-CONNECT); maxPayloadViolation then logs and closes.
@@ -571,7 +594,12 @@ func (c *client) mqttParse(buf []byte) error {
 			pktLease.release()
 			pktLease = nil
 		}
-		_ = c.mqttInboundDrain()
+		if derr := c.mqttInboundDrain(); errors.Is(derr, errMQTTInboundAborted) {
+			// The pipe failed (its failure position precedes this packet and owns the
+			// connection's DISCONNECT) or the connection is closing: this packet's error is
+			// still returned and logged, but it sends nothing.
+			pipeEnded = true
+		}
 	}
 	if err == nil && rd > 0 {
 		if derr := r.reader.SetReadDeadline(time.Now().Add(rd)); derr != nil {
@@ -580,12 +608,12 @@ func (c *client) mqttParse(buf []byte) error {
 			// the read loop closes it.
 			return derr
 		}
-	} else if err != nil && err != ErrMaxPayload && !errors.Is(err, errMQTTInboundAborted) && connected && c.mqtt.proto == mqttProtoLevel5 {
+	} else if err != nil && err != ErrMaxPayload && !errors.Is(err, errMQTTInboundAborted) && !pipeEnded && connected && c.mqtt.proto == mqttProtoLevel5 {
 		// Best-effort: tell the v5 client why we are about to close. The read
 		// loop closes the connection right after this returns. ErrMaxPayload is
 		// excluded: it already sent a DISCONNECT 0x95 and closed above. So is an aborted
-		// inbound pipeline: its failure position already told the client why, or its
-		// transport is already closed.
+		// inbound pipeline, and an error whose drain found the pipe failed or aborted: its
+		// failure position tells the client why, or the transport is closing.
 		if c.mqttDisconnectBeforeClose(mqttDisconnectReasonFromErr(err), err.Error()) {
 			c.mqttLingerAfterDisconnect(len(r.buf) - r.pos)
 		}

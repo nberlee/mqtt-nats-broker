@@ -652,6 +652,15 @@ type mqtt struct {
 	// write nothing at all), never exactly-once delivery.
 	disconnectSent bool
 
+	// handoffOwed records that the inbound pipeline's failure position wrote this
+	// connection's error DISCONNECT COMPLETED and handed the close to the reader, which
+	// owes the drain (mqttDrainHandedOffClose) before its teardown; handoffBound is the
+	// close that bounds it, armed with the flag. Set together, once, in the DISCONNECT's
+	// own c.mu section (mqttDisconnectHandingOff); read without a lock by the reader once it
+	// has joined the pipe, whose goroutine is the only writer, so the flag is final then.
+	handoffOwed  bool
+	handoffBound *time.Timer
+
 	// maxPacketSize is the current connection's MQTT 5.0 Maximum Packet Size:
 	// the largest PUBLISH (whole control packet) the client is willing to
 	// accept. 0 means no client-imposed limit (3.1.1, or not sent). Set at

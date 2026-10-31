@@ -1875,6 +1875,47 @@ fixture faults (an oracle that counted the collected offer's own abandonment rec
 fallen-out participant whose foreign token still stood, so its acquisition could never
 commit), both fixed and killed.
 
+## Pipeline failure handoff (2026-10-30)
+
+The section 2 "Connection close" item: the inbound pipeline's failure position wrote its
+DISCONNECT and closed the transport from a pipe goroutine while the client could still be
+sending, so the close's TCP reset could discard the DISCONNECT. docs/ARCHITECTURE.md, "An
+error DISCONNECT lingers before the close", and "Abort, failure, close, takeover,
+shutdown".
+
+### What changed
+
+The failure position hands the close to the reader instead of closing: write and seal in
+one write section, and on a COMPLETED write record the owed drain and arm its bound under
+`c.mu`, then fire the abort latch without a close. The reader stops at the next packet
+boundary once the pipe failed, and drains on its exit only after joining the pipe's
+goroutines. The reader's own error arms send nothing when their drain finds the pipe
+failed. Both arms' drains end in a close before the teardown (the reader-owned arm had
+left the socket open, unread, while a slow teardown ran).
+
+### Measured
+
+A client queued behind a held store that then fails, pipelining QoS 1 PUBLISHes at about
+1 ms, 20 iterations per transport: with the immediate close (mutation M1) 20 of 20 lost the
+DISCONNECT or failed a send on TCP and 20 of 20 on WebSocket; with the handoff 0 of 20 on
+each.
+
+### Tests and mutations
+
+conn_disconnect_handoff_test.go: the still-writing client on TCP and WebSocket; the reader
+in a socket Read and blocked in the pipeline's space wait, on both; the bound on a silent
+peer; nothing sent after the failure dispatched, published or acted on; a reader that
+leaves its parse before the failure position writes; a prevented DISCONNECT; the write
+lock held from the DISCONNECT to the seal; a later malformed and a later oversized packet
+sending no DISCONNECT of their own; both arms' drains closing at the ceiling while the
+teardown is parked. inbound_failure_goroutines_test.go: the AST census holding the failure
+position to the pipe's counted goroutines. Ten mutations, each killed by its paired test:
+the immediate close, no bound, the owed check before the join, no stop check, the write
+lock released before the seal, a handoff on a prevented write, the footer and the 0x95 arm
+each still claiming after an aborted drain, no close at the drain's end, and an untracked
+`go p.emit()`. A drain that parses what it reads is killed by the reader-owned arm's
+not-parsed test; on the worker arm the stop check masks it, as the plan predicted.
+
 ## Pre-existing reds repaired (2026-10-31)
 
 Three intermittent reds the worker-handoff lane's verification suite surfaced, both measured
