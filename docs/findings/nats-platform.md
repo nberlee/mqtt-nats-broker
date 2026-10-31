@@ -1874,3 +1874,62 @@ its paired test; the stop tests passed five consecutive runs. Two first survived
 fixture faults (an oracle that counted the collected offer's own abandonment record; a
 fallen-out participant whose foreign token still stood, so its acquisition could never
 commit), both fixed and killed.
+
+## Pre-existing reds repaired (2026-10-31)
+
+Three intermittent reds the worker-handoff lane's verification suite surfaced, both measured
+on the tree before that change under three parallel copies of the test, and repaired ahead
+of it at the user's direction (consult 1 of that lane: a prerequisite repair commit).
+
+### A resume's owed retained replay could be overtaken
+
+The worker-handoff lane's verification suite failed
+`TestF105RetainedReplayIsTheOriginalCopy` once ("Expected payload original, got
+rewritten"). It is pre-existing: under three parallel copies of the test it failed 1 of
+240 runs on the tree before this change and 2 of 120 with it. A probe showed the first
+PUBLISH after the resume was the later publication's FIRST transmission (QoS 1, no DUP, a
+new identifier), followed by the owed retained retransmission (DUP, retain, the original
+identifier): the restore verdict opened before `replayRecoveredRetained` ran, so a live
+delivery the restored interest already held went out first, and the client was left
+holding the older message last. The replay now runs, once the accept transaction has
+ended, before the verdict opens (docs/ARCHITECTURE.md, "The restore gate").
+`TestRetainedResumeReplayPrecedesLiveDeliveries` delays the replay through a hook; opening
+the verdict first fails it 3 of 3, and the original test passed 300 of 300 under the same
+parallel load after the fix.
+
+A replayed PUBLISH whose send fails transiently is re-attempted inline, within the owed
+obligation's budget, before the verdict opens; exhausted, the connection's close is
+requested and the verdict abandoned (holistic review round 1 of the repair found that the
+first version handed such a send to the background owner and opened the verdict anyway).
+`TestRetainedResumeReplayRetriedBeforeLiveDeliveries` refuses the first two sends and
+`TestRetainedResumeReplayExhaustedClosesBeforeLiveDeliveries` all of them; handing the
+first failure to the background owner fails the first. Opening the verdict on exhaustion
+instead of abandoning it passes the second: the requested close lands first.
+
+### The acknowledged-source decline test raced its own PUBACKs
+
+`TestQueuedReofferOfAcknowledgedSourceIsDeclined` failed 29 of 120 runs on the tree before
+the handoff change and 31 of 120 with it, in three shapes: re-offers that met no decline
+(22 and 22), a backlog that never outlasted AckWait (5 and 4), and a DUP retransmission
+reaching the client after its PUBACK (2 and 5). A re-offer is declined only once the
+client's PUBACK has recorded its source; one processed while the delivery is still pending
+is retransmitted (same identifier, DUP), which is what the 3.1.1 client saw. The test
+relied on the PUBACKs winning a race against the queued re-offers. It now stages the race:
+one message, its re-offer parked at arrival until the PUBACK has recorded the source and
+no terminal owner holds it, then released. The assertions are unchanged. Removing the
+decline fails it; 120 of 120 under the same parallel load. The same-connection
+retransmission is an MQTT 5.0 conformance gap ([MQTT-4.4.0-1]), stated in
+docs/CONFORMANCE.md and filed in docs/ROADMAP.md section 2, "Outbound retransmission".
+
+### The drain-restart test required the client to beat AckWait
+
+`TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel` failed once in a full chain (Expected
+packet 60, got 30: a PUBLISH where A's PUBREL was due). It uses an AckWait of 1 s, and its
+setup before the restart required each answer to be the next packet; a client answer
+arriving later than AckWait meets the same-connection retransmission above (a probe with
+the PUBREC 1.5 s late got A's DUP PUBLISH first, 3 of 3). The setup now reads through a
+test-local reader that sets aside only a verified retransmission of an exchange already
+seen (same identifier and payload, QoS 2 with DUP; A's PUBLISH only until its PUBREL, and
+A's PUBREL repeated); every expected packet is still required, and the phase is bounded.
+The post-restart assertions are unchanged. Forced late answers pass; restoring no drained
+claim, or re-establishing no PUBREL delivery after the restart, fails it.

@@ -9653,6 +9653,24 @@ reads](findings/resolved.md#f-054).
   WebSocket. Residual meanwhile: docs/CONFORMANCE.md, "A server error DISCONNECT and a
   client still sending".
 
+### Outbound retransmission
+
+- [ ] **Stop retransmitting an unacknowledged delivery on the same MQTT 5.0 connection.**
+  Filed 2026-10-31 by consult 1 of the worker-error-disconnect-linger lane, while repairing
+  `TestQueuedReofferOfAcknowledgedSourceIsDeclined` (a pre-existing fixture race; its
+  0x3a shape was a 3.1.1 client receiving the DUP retransmission after acknowledging). A
+  JetStream re-offer of a transmitted, unacknowledged QoS 1/2 delivery is retransmitted on
+  the same connection with DUP and the same identifier (`trackPublish`'s standing entry;
+  `TestReofferOfUnacknowledgedDeliveryIsRetransmitted` pins it for 3.1.1, which permits
+  it). MQTT 5.0 [MQTT-4.4.0-1] forbids resending except on a reconnect with a session.
+  Reproduction: a v5 subscriber on a broker with a short AckWait receives a QoS 1 PUBLISH
+  and does not acknowledge it; past AckWait it receives the same PUBLISH again with DUP,
+  on the same connection. Deliverable: a v5 connection absorbs such a re-offer (refreshes
+  the entry's acknowledgement reply without writing) while a reconnect still retransmits
+  and a withheld delivery's first send still goes out; 3.1.1 behavior decided explicitly;
+  the source's ownership unchanged. Residual meanwhile: docs/CONFORMANCE.md, "A JetStream
+  re-offer retransmits on the same connection".
+
 ### NATS platform follow-ups
 
 - [x] **Move the pin and the floor to nats-server 2.15.2, and the toolchain to Go 1.27.**

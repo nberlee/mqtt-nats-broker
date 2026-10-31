@@ -170,31 +170,77 @@ func (rig *testAckedReofferRig) readInOrder(t *testing.T, n int, quiet time.Dura
 	}
 }
 
-// TestQueuedReofferOfAcknowledgedSourceIsDeclined: a backlog queued longer than AckWait is
-// re-offered while its first offers are still queued; the client receives every message once, in
-// order, and each declined re-offer's own reply is acknowledged.
+// TestQueuedReofferOfAcknowledgedSourceIsDeclined: a re-offer JetStream dispatched while its source
+// was still unacknowledged, and processed only after the client's PUBACK settled it, is declined
+// and acknowledged on its own reply; the client receives the message once.
+//
+// STAGED, not raced: the re-offer is parked at its arrival, before every guard, until the session
+// has recorded the source as acknowledged and no terminal owner holds it, so the decline is the one
+// guard left to meet it. A backlog queued past AckWait reaches the same state by timing alone,
+// which made this test depend on the PUBACKs winning a race against the queued re-offers.
 func TestQueuedReofferOfAcknowledgedSourceIsDeclined(t *testing.T) {
 	rig := newTestAckedReofferRig(t, "ar-backlog", 500*time.Millisecond)
-	const n = 30
-	for i := 0; i < n; i++ {
-		testMQTTPublish(t, rig.pc, rig.pr, 1, false, false, "ar/t", uint16(i+1), []byte(fmt.Sprintf("m%d", i)))
+	parked, release := make(chan struct{}), make(chan struct{})
+	var once, released sync.Once
+	var dur string
+	var seq uint64
+	h := func(sub *subscription, reply string) {
+		if sub.client == nil || sub.client.mqtt == nil || sub.client.mqtt.cid != "ar-backlog" {
+			return
+		}
+		if s, _, dc, _, _ := ackReplyInfo(reply); dc > 1 {
+			once.Do(func() {
+				dur, seq = sub.mqtt.jsDur, s
+				close(parked)
+				<-release
+			})
+		}
 	}
-	rig.readInOrder(t, n, 3*time.Second)
+	mqttTestDeliveryOfferedHookV.Store(&h)
+	t.Cleanup(func() {
+		released.Do(func() { close(release) })
+		mqttTestDeliveryOfferedHookV.Store(nil)
+	})
+
+	testMQTTPublish(t, rig.pc, rig.pr, 1, false, false, "ar/t", 1, []byte("m0"))
+	_, pi, _, payload := testMQTTGetPubMsgEx(t, rig.sc, rig.sr, "ar/t", nil)
+	if string(payload) != "m0" {
+		t.Fatalf("delivery carried %q, want m0", payload)
+	}
+	// Unacknowledged past AckWait: JetStream re-offers it, and the re-offer parks.
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fixture: JetStream never re-offered the unacknowledged message")
+	}
+	testMQTTSendPIPacket(mqttPacketPubAck, t, rig.sc, pi)
+	checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
+		rig.sess.mu.Lock()
+		defer rig.sess.mu.Unlock()
+		if !rig.sess.ackedSources.has(dur, seq) || rig.sess.terminalSourceHeldLocked(dur, seq) {
+			return fmt.Errorf("the PUBACK of sequence %d has not settled its source", seq)
+		}
+		return nil
+	})
+	released.Do(func() { close(release) })
+
+	if b, _, ok := testMQTTReadPacketReady(rig.sr, 3*time.Second); ok {
+		t.Fatalf("a further packet %x arrived after the one unique delivery", b)
+	}
 	delivered, floor, _ := rig.consumer(t)
-	if delivered <= n {
-		t.Fatalf("fixture: JetStream re-offered nothing (%d deliveries of %d messages): the backlog "+
-			"did not outlast AckWait", delivered, n)
+	if delivered <= 1 {
+		t.Fatalf("fixture: JetStream re-offered nothing (%d deliveries)", delivered)
 	}
-	if floor != n {
-		t.Fatalf("the source consumer's floor is %d after %d messages were acknowledged", floor, n)
+	if floor != seq {
+		t.Fatalf("the source consumer's floor is %d after sequence %d was acknowledged", floor, seq)
 	}
 	d := rig.declined()
 	if len(d) == 0 {
-		t.Fatalf("JetStream re-offered %d time(s) and no re-offer was declined", delivered-n)
+		t.Fatalf("JetStream re-offered %d time(s) and no re-offer was declined", delivered-1)
 	}
-	for _, seq := range d {
-		if !rig.reAcked(seq) {
-			t.Fatalf("the declined re-offer of sequence %d was not acknowledged on its own reply", seq)
+	for _, s := range d {
+		if !rig.reAcked(s) {
+			t.Fatalf("the declined re-offer of sequence %d was not acknowledged on its own reply", s)
 		}
 	}
 }

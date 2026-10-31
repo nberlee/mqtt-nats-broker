@@ -5860,14 +5860,26 @@ touches `sub.mqtt`:
   are kept so no future path has to re-derive either argument.
 - **opened** after a confirmed success CONNACK — but **not immediately**, and the gap is
   deliberate. `[MQTT-3.2.0-1]` forbids opening it any earlier; what pushes it later is the
-  3.1.1 forced leave, which can still refuse the connection after the CONNACK is
-  written. An
-  opened verdict is *immediate* permission for the delivery callbacks, which run on
-  their own
-  goroutines, and a transmission cannot be retracted by a refusal that follows it — so the
-  verdict opens only once that leave has settled. `opened` is stored strictly before the
-  channel closes, so a waiter released by that close reads the final value rather than racing
-  it.
+  3.1.1 forced leave, which can still refuse the connection after the CONNACK is written.
+  An opened verdict is *immediate* permission for the delivery callbacks, which run on
+  their own goroutines, and a transmission cannot be retracted by a refusal that follows
+  it — so the verdict opens only once that leave has settled. It also opens only AFTER the
+  resume's restored retained exchanges were re-sent (`replayRecoveredRetained`, run once
+  the accept transaction has ended): those PUBLISHes and PUBRELs were transmitted before
+  the disconnect, the replay itself does not wait on the verdict, and no JetStream
+  redelivery carries it, so this is the one point that orders it ahead of every live
+  delivery the restored interest already holds. Opening first let a later publication on
+  the same topic reach the client before the owed retained retransmission, leaving the
+  client holding the older message last (Spec5 [4.6];
+  `TestRetainedResumeReplayPrecedesLiveDeliveries`). The replayed PUBLISH whose send
+  cannot complete yet (an indeterminate verdict, a refused section, a failed acquisition)
+  is re-attempted INLINE with the owed obligation's budget and backoff (eight attempts,
+  about 6.4 s of backoff) while the verdict stays closed; exhausted, the connection's
+  close is requested and the verdict is ABANDONED, so the reconnect's resume replays it
+  and nothing withheld overtakes it. The cost is that live deliveries, and the CONNECT
+  that runs the replay, wait for that section. `opened` is stored strictly before the
+  channel closes, so a waiter released by that close reads the final value rather than
+  racing it.
 - **abandoned** on every refusal, before the client detaches. Two shapes, and the difference
   is the acknowledgement: a **pre-CONNACK** refusal abandons through the abort helper, which
   also discards the Will and clears acceptance; a **post-CONNACK** refusal — only the forced

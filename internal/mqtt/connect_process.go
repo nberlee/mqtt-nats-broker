@@ -2683,11 +2683,6 @@ restoreSession:
 	es.commitStagedReleases(c, stagedReleases)
 	es.commitDisposalRecovery(c)
 
-	// The leave has settled, so the restore verdict may OPEN: every delivery it withheld goes
-	// out now, as the first transmission it is. Never skipped on a success, or the session's
-	// backlog would sit until AckWait. See sess_restore_gate.go.
-	es.openRestoreGate()
-
 	// Subscription restoration ran BEFORE the CONNACK above, which is F-050's fix:
 	// a filter whose delivery path could not be installed refuses the CONNECT
 	// rather than being dropped in silence behind a Session-Present acknowledgement.
@@ -2697,6 +2692,26 @@ restoreSession:
 	// transaction of its own, and the fence's blocking form would deadlock against
 	// one still held by this frame. Idempotent, so the deferred release is a no-op.
 	endAcceptTx()
+
+	// The restored RETAINED exchanges (F-105 7c) are re-sent BEFORE the restore verdict opens:
+	// they were transmitted before the disconnect, so a live delivery the restored interest
+	// already holds — a later publication on the same topic among them — must not reach the
+	// client ahead of them, or the client is left holding the older message as the newer one
+	// (Spec5 [4.6]). The replay does not wait on the verdict, and no JetStream redelivery carries
+	// it, so this is the one point where it can be ordered ahead of every live delivery.
+	replayed := es.replayRecoveredRetained(c)
+
+	// The leave has settled and the owed retained replay is out, so the restore verdict may
+	// OPEN: every delivery it withheld goes out now, as the first transmission it is. Never
+	// skipped on a success, or the session's backlog would sit until AckWait. See
+	// sess_restore_gate.go. A replayed PUBLISH still owed after its budget has had this
+	// connection's close requested instead: the verdict is ABANDONED, so nothing it withheld
+	// overtakes the retransmission the reconnect still owes.
+	if replayed {
+		es.openRestoreGate()
+	} else {
+		es.abandonRestoreGate()
+	}
 
 	// Restore the drains this session carries, so their started deliveries can be
 	// redelivered and completed. Each of the steps below opens a record transaction
@@ -2740,9 +2755,6 @@ restoreSession:
 	// offline) on resume, whether or not saved subscriptions were restored: a
 	// session can carry unacknowledged PUBRELs with no active subscription.
 	es.resendPendingRedelivery(c, resumePubs, resumeRels)
-	// And the restored RETAINED exchanges (F-105 7c): replayed from their verified copies and
-	// canonicals, since no JetStream redelivery exists to carry them.
-	es.replayRecoveredRetained(c)
 	// A RESUMED generation settles what its displaced tenures left undecided or unretired
 	// (F-105 7f): this accept is what fenced them out.
 	if sessp {

@@ -1308,24 +1308,31 @@ leaves:
 - **The SUBACK precedes the reservation.** The replay is executed after the SUBACK, so a
   crash between the two loses the replay of a subscription that stands: retained messages
   are sent at SUBSCRIBE, and the resume restores admitted exchanges only.
-- **QoS 1/2 live deliveries may overtake the retained replay.** The gate covers the
-  subscription's raw QoS 0 path only; a live QoS 1/2 delivery rides the durable consumer
-  and can arrive before that subscription's retained frames. A live QoS 0 delivery waits
-  on the gate; its memory is bounded by the NATS pending limits, beyond which the client
-  library drops QoS 0 messages, and a departure drops the waiting ones.
+- **QoS 1/2 live deliveries may overtake the retained replay at SUBSCRIBE.** The gate covers
+  the subscription's raw QoS 0 path only; a live QoS 1/2 delivery rides the durable consumer
+  and can arrive before that subscription's retained frames. This is the SUBSCRIBE-time
+  replay only: on a resume, the owed retained retransmissions are re-sent before the restore
+  verdict lets any live delivery out (docs/ARCHITECTURE.md, "The restore gate"). A live
+  QoS 0 delivery waits on the gate; its memory is bounded by the NATS pending limits,
+  beyond which the client library drops QoS 0 messages, and a departure drops the waiting
+  ones.
 - **An obligation this connection cannot settle closes the connection** (consult 106). A
   retained PUBLISH or PUBREL that cannot be acquired, bound or written, a withdrawal whose
   register delete is refused, a PUBREL entry whose installation is refused, and a replay
   whose authorization verdict is INDETERMINATE are each re-attempted with backoff while
   the connection serves; after eight attempts the connection is closed so the reconnect's
   resume replays the exchange from its records. Authorization recovering while the
-  connection stays open delivers the replay there. A PUBREC whose advance is not recorded
-  closes the connection as an ordinary one does. An admission that LANDED but whose
-  register cannot be read back to promote the allocation is treated the same way — never
-  as an unadmitted copy — and so is a materialization step whose attempt could not be
-  settled, whose copy the next CONNECT's discovery reclaims. An abandonment decision that
-  cannot stand within the budget closes its connection too. A connection is therefore
-  closed for a sustained store fault, not only for a protocol violation.
+  connection stays open delivers the replay there. A restored retained PUBLISH on a resume
+  is re-attempted before the connection releases any live delivery, so the connection does
+  not serve meanwhile: its live deliveries and the CONNECT wait up to the budget's backoff
+  (about 6.4 s), and an exhausted budget closes it before any of them goes out. A PUBREC
+  whose advance is not recorded closes the connection as an ordinary one does. An
+  admission that LANDED but whose register cannot be read back to promote the allocation
+  is treated the same way — never as an unadmitted copy — and so is a materialization step
+  whose attempt could not be settled, whose copy the next CONNECT's discovery reclaims. An
+  abandonment decision that cannot stand within the budget closes its connection too. A
+  connection is therefore closed for a sustained store fault, not only for a protocol
+  violation.
 - **A copy's reclamation is retried, not dropped, on a store failure** while its session
   object is resident; a store that keeps refusing keeps a capped retry running per copy
   for the session's life.
@@ -4234,6 +4241,21 @@ inbound-pipeline worker may lose the server's DISCONNECT to a TCP reset, even if
 DISCONNECT write completed. This worker path retains its existing immediate-close
 behavior; the reader-owned linger does not cover it. Carrying the linger there needs a
 separately designed handoff to the reader (docs/ROADMAP.md).
+
+### A JetStream re-offer retransmits on the same connection
+
+Found 2026-10-31 while repairing `TestQueuedReofferOfAcknowledgedSourceIsDeclined`. When
+JetStream re-offers a QoS 1 or 2 delivery that was transmitted and is still unacknowledged
+(the consumer's AckWait, 30 s by default, passed), the broker retransmits it on the SAME
+connection, under the same Packet Identifier with DUP set (`trackPublish` finds the
+standing entry; `TestReofferOfUnacknowledgedDeliveryIsRetransmitted` pins it). MQTT 3.1.1
+permits that. MQTT 5.0 does not: resending is required only on a reconnect with a session
+present, and "Clients and Servers MUST NOT resend messages at any other time"
+[MQTT-4.4.0-1]. So a v5 client that takes longer than AckWait to acknowledge receives a
+duplicate PUBLISH without reconnecting. Closing it needs the delivery path to tell a
+retransmission on the current connection apart from a reconnect's retransmission and from
+the first send of a previously withheld delivery, while keeping the source's ownership;
+docs/ROADMAP.md carries it.
 
 ### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
 

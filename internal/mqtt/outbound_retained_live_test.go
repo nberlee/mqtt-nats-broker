@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net"
@@ -1100,6 +1101,135 @@ func TestF105RetainedReplayIsTheOriginalCopy(t *testing.T) {
 	got := testMQTTCheckPubMsgNoAck(t, sub2, subr2, "rt/c", mqttPubQos1|mqttPubFlagRetain|mqttPubFlagDup, []byte("original"))
 	if got != pi {
 		t.Fatalf("the replay went out under identifier %d, want the original %d", got, pi)
+	}
+}
+
+// A RESUME'S OWED RETAINED REPLAY PRECEDES EVERY LIVE DELIVERY. A retained QoS 1 delivery left
+// unacknowledged is owed on reconnect; a later publication on the same topic, which the restored
+// interest pushes at once, must not reach the client ahead of it (Spec5 [4.6]), however long the
+// replay takes: the restore verdict opens only after it. The replay is delayed here, so a verdict
+// opened first lets the live delivery through every time.
+func TestRetainedResumeReplayPrecedesLiveDeliveries(t *testing.T) {
+	r := testRetainedRigUp(t, "ret-order", "rt/o", 1, []byte("original"))
+	defer r.done()
+	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
+	testMQTTCheckConnAck(t, subr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, sub, subr, []*mqttFilter{{filter: "rt/o", qos: 1}}, []byte{1})
+	pi := testMQTTCheckPubMsgNoAck(t, sub, subr, "rt/o", mqttPubQos1|mqttPubFlagRetain, []byte("original"))
+	sub.Close()
+	inboundAwaitClientGone(t, r.s, r.id)
+
+	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id + "-pub2", cleanSess: true}, r.o.MQTT.Host, r.o.MQTT.Port)
+	defer pub.Close()
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, pub, pubr, 1, false, true, "rt/o", 1, []byte("rewritten"))
+	testMQTTFlush(t, pub, nil, pubr)
+
+	var delayed atomic.Bool
+	h := func(c *client) {
+		if c.mqtt != nil && c.mqtt.cid == r.id && delayed.CompareAndSwap(false, true) {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	mqttTestRetainedResumeReplayV.Store(&h)
+	defer mqttTestRetainedResumeReplayV.Store(nil)
+	sub2, subr2 := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
+	defer sub2.Close()
+	testMQTTCheckConnAck(t, subr2, mqttConnAckRCConnectionAccepted, true)
+	got := testMQTTCheckPubMsgNoAck(t, sub2, subr2, "rt/o", mqttPubQos1|mqttPubFlagRetain|mqttPubFlagDup, []byte("original"))
+	if got != pi {
+		t.Fatalf("the replay went out under identifier %d, want the original %d", got, pi)
+	}
+	if !delayed.Load() {
+		t.Fatal("fixture: the resume's retained replay never ran")
+	}
+	testMQTTCheckPubMsgNoAck(t, sub2, subr2, "rt/o", mqttPubQos1, []byte("rewritten"))
+}
+
+// testRetainedOwedReplayRig leaves a retained QoS 1 delivery of "original" unacknowledged, closes
+// its subscriber, publishes "rewritten" on the same topic (a first transmission the resume's
+// restored interest will hold), and returns the rig and the resident session, so the resume's
+// replay can be failed through its verdict.
+func testRetainedOwedReplayRig(t *testing.T, id, topic string) (*testRetainedRig, *mqttSession, uint16) {
+	t.Helper()
+	r := testRetainedRigUp(t, id, topic, 1, []byte("original"))
+	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
+	testMQTTCheckConnAck(t, subr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTSub(t, 1, sub, subr, []*mqttFilter{{filter: topic, qos: 1}}, []byte{1})
+	pi := testMQTTCheckPubMsgNoAck(t, sub, subr, topic, mqttPubQos1|mqttPubFlagRetain, []byte("original"))
+	sub.Close()
+	inboundAwaitClientGone(t, r.s, r.id)
+	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id + "-pub2", cleanSess: true}, r.o.MQTT.Host, r.o.MQTT.Port)
+	t.Cleanup(func() { pub.Close() })
+	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
+	testMQTTPublish(t, pub, pubr, 1, false, true, topic, 1, []byte("rewritten"))
+	testMQTTFlush(t, pub, nil, pubr)
+	return r, testMQTTResidentSession(t, r.s, r.id), pi
+}
+
+// A resume's restored retained PUBLISH whose send is refused for now (an INDETERMINATE verdict) is
+// re-attempted before the restore verdict opens, so the live delivery still follows it.
+func TestRetainedResumeReplayRetriedBeforeLiveDeliveries(t *testing.T) {
+	r, sess, pi := testRetainedOwedReplayRig(t, "ret-order-retry", "rt/or")
+	defer r.done()
+	var attempts atomic.Int32
+	h := func(v mqttRetainedReplayVerdict, reason string) (mqttRetainedReplayVerdict, string) {
+		if attempts.Add(1) <= 2 {
+			return mqttRetainedReplayIndeterminate, _EMPTY_
+		}
+		return v, reason
+	}
+	sess.testRetainedVerdict.Store(&h)
+	defer sess.testRetainedVerdict.Store(nil)
+	sub2, subr2 := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
+	defer sub2.Close()
+	testMQTTCheckConnAck(t, subr2, mqttConnAckRCConnectionAccepted, true)
+	got := testMQTTCheckPubMsgNoAck(t, sub2, subr2, "rt/or", mqttPubQos1|mqttPubFlagRetain|mqttPubFlagDup, []byte("original"))
+	if got != pi {
+		t.Fatalf("the replay went out under identifier %d, want the original %d", got, pi)
+	}
+	if n := attempts.Load(); n < 3 {
+		t.Fatalf("fixture: the replay's send was attempted %d time(s), want the two refusals and a success", n)
+	}
+	testMQTTCheckPubMsgNoAck(t, sub2, subr2, "rt/or", mqttPubQos1, []byte("rewritten"))
+}
+
+// A resume's restored retained PUBLISH that stays unsendable past its budget closes the
+// connection, and the live delivery the restored interest holds never goes out ahead of it.
+func TestRetainedResumeReplayExhaustedClosesBeforeLiveDeliveries(t *testing.T) {
+	r, sess, _ := testRetainedOwedReplayRig(t, "ret-order-exhaust", "rt/oe")
+	defer r.done()
+	var attempts atomic.Int32
+	h := func(mqttRetainedReplayVerdict, string) (mqttRetainedReplayVerdict, string) {
+		attempts.Add(1)
+		return mqttRetainedReplayIndeterminate, _EMPTY_
+	}
+	sess.testRetainedVerdict.Store(&h)
+	defer sess.testRetainedVerdict.Store(nil)
+	sub2, subr2 := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
+	defer sub2.Close()
+	testMQTTCheckConnAck(t, subr2, mqttConnAckRCConnectionAccepted, true)
+	_ = sub2.SetReadDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 4096)
+	// What the CONNACK's read already buffered behind it counts too: a live PUBLISH coalesced with
+	// the CONNACK would otherwise never be looked at.
+	seen := append([]byte(nil), subr2.buf[subr2.pos:]...)
+	for {
+		n, err := sub2.Read(buf)
+		seen = append(seen, buf[:n]...)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				t.Fatalf("the connection was not closed after %d refused replay attempts", attempts.Load())
+			}
+			break
+		}
+	}
+	if bytes.Contains(seen, []byte("rewritten")) {
+		t.Fatal("a live delivery went out while the retained retransmission it follows was still owed")
+	}
+	if n := attempts.Load(); n < int32(mqttRetainedOwedAttempts) {
+		t.Fatalf("fixture: %d replay attempts before the close, want the budget of %d", n, mqttRetainedOwedAttempts)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -330,12 +331,25 @@ func (sess *mqttSession) continueRecoveredRetainedTerminals(c *client, rrs []mqt
 	}()
 }
 
-// replayRecoveredRetained re-sends, after CONNACK, every restored retained exchange this connection
-// owns: a PUBLISH from its held, verified bytes (DUP as the marker said), a PUBREL from its
-// canonical. In identifier order; entries the custody gate refused were never installed.
+// mqttTestRetainedResumeReplayV runs on entry to replayRecoveredRetained. Nil in production.
+var mqttTestRetainedResumeReplayV atomic.Pointer[func(c *client)]
+
+// replayRecoveredRetained re-sends, after CONNACK and before the restore verdict opens, every
+// restored retained exchange this connection owns: a PUBLISH from its held, verified bytes (DUP as
+// the marker said), a PUBREL from its canonical. In identifier order; entries the custody gate
+// refused were never installed. Running while the verdict is still closed is what keeps every live
+// delivery behind it.
+//
+// It reports whether every restored PUBLISH is settled. One that is still owed after its budget
+// has had its connection's close requested, and the caller must not open the verdict: a live
+// delivery released past an owed retransmission is the overtaking this ordering exists to prevent.
+// A PUBREL still owed goes to its background owner as before; no live PUBLISH is ordered against it.
 //
 // No lock held on entry.
-func (sess *mqttSession) replayRecoveredRetained(c *client) {
+func (sess *mqttSession) replayRecoveredRetained(c *client) bool {
+	if h := mqttTestRetainedResumeReplayV.Load(); h != nil {
+		(*h)(c)
+	}
 	sess.mu.Lock()
 	disc := sess.retainedDiscovery
 	sess.retainedDiscovery = mqttRetainedDiscovery{}
@@ -362,26 +376,41 @@ func (sess *mqttSession) replayRecoveredRetained(c *client) {
 		sess.emitRetainedPubRel(c, pi)
 	}
 	for _, pi := range pubs {
-		sess.replayRestoredRetainedPublish(c, pi)
+		if !sess.replayRestoredRetainedPublish(c, pi) {
+			// The later ones stay owed on their records too: the reconnect replays them all.
+			return false
+		}
 	}
+	return true
 }
 
-// replayRestoredRetainedPublish transmits one restored retained PUBLISH through the send section.
-func (sess *mqttSession) replayRestoredRetainedPublish(c *client, pi uint16) {
-	sess.mu.Lock()
-	p := sess.pendingPublish[pi]
-	if p == nil || p.kind != mqttPendingRetained || p.retainedReplay == nil {
+// replayRestoredRetainedPublish transmits one restored retained PUBLISH through the send section,
+// re-attempting INLINE with the owed obligation's budget and backoff, because live deliveries are
+// held behind it (replayRecoveredRetained). Exhausted, it requests the connection's close, owning the
+// obligation until the close is effective, and reports false; the exchange stays owed on its records
+// and the reconnect's resume replays it.
+func (sess *mqttSession) replayRestoredRetainedPublish(c *client, pi uint16) bool {
+	for attempt := 0; ; attempt++ {
+		sess.mu.Lock()
+		p := sess.pendingPublish[pi]
+		if p == nil || p.kind != mqttPendingRetained || p.retainedReplay == nil {
+			sess.mu.Unlock()
+			return true
+		}
+		mat := p.retainedReplay
+		qos, nonce := p.qos, p.regNonce
 		sess.mu.Unlock()
-		return
-	}
-	mat := p.retainedReplay
-	qos, nonce := p.qos, p.regNonce
-	sess.mu.Unlock()
-	f := mqttRetainedFrame{pi: pi, nonce: nonce, qos: qos,
-		mat: &mqttRetainedMaterial{Topic: mat.m.Topic, QoS: qos, Props: mat.m.Props, ExpiresAt: mat.m.ExpiresAt,
-			SessionHash: mat.m.SessionHash, SubID: mat.m.SubID, Data: mat.data}}
-	if !sess.transmitRetained(c, nil, f, mat.m, mqttLandedRegister{}, false) {
-		sess.ownRetainedOwed(c, pi, nonce, mqttRetainedOwedPublish)
+		f := mqttRetainedFrame{pi: pi, nonce: nonce, qos: qos,
+			mat: &mqttRetainedMaterial{Topic: mat.m.Topic, QoS: qos, Props: mat.m.Props, ExpiresAt: mat.m.ExpiresAt,
+				SessionHash: mat.m.SessionHash, SubID: mat.m.SubID, Data: mat.data}}
+		if sess.transmitRetained(c, nil, f, mat.m, mqttLandedRegister{}, false) {
+			return true
+		}
+		if attempt+1 >= mqttRetainedOwedAttempts || c.isClosed() {
+			sess.oweRetainedClose(c, pi, nonce, "replayed PUBLISH")
+			return false
+		}
+		time.Sleep(mqttRetainedStepBackoff(attempt))
 	}
 }
 

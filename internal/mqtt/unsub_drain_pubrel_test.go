@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,6 +25,144 @@ func testDrainQoS2Restart(t *testing.T, s *Server, o *Options) *Server {
 	o.MQTT.Port = -1
 	testSetStoreDir(o, dir)
 	return testMQTTRunServer(t, o)
+}
+
+// q2PreRestartReader reads the setup's packets before the restart, setting aside only a
+// same-connection retransmission of an exchange already seen: a JetStream re-offer past AckWait
+// is retransmitted on a 3.1.1 connection (docs/CONFORMANCE.md, "A JetStream re-offer retransmits
+// on the same connection"), so a client answer that arrives late meets its exchange's DUP
+// PUBLISH, or A's PUBREL again, ahead of the packet it is waiting for. A retransmission never
+// stands in for an expected packet, and anything else that arrives fails the test.
+type q2PreRestartReader struct {
+	t         testing.TB
+	r         *mqttReader
+	published map[uint16]string // identifier -> payload of a first transmission seen
+	pubrels   map[uint16]bool   // identifiers whose PUBREL was seen
+	deadline  time.Time
+}
+
+func newQ2PreRestartReader(t testing.TB, r *mqttReader) *q2PreRestartReader {
+	return &q2PreRestartReader{t: t, r: r, published: map[uint16]string{}, pubrels: map[uint16]bool{},
+		deadline: time.Now().Add(30 * time.Second)}
+}
+
+type q2Packet struct {
+	typ, flags byte
+	pi         uint16
+	payload    string
+}
+
+// next returns the next packet that is not a retransmission of an exchange already seen.
+func (q *q2PreRestartReader) next() q2Packet {
+	q.t.Helper()
+	for skipped := 0; ; skipped++ {
+		if skipped > 32 || time.Now().After(q.deadline) {
+			q.t.Fatalf("only retransmissions arrived (%d) while a setup packet was owed", skipped)
+		}
+		b, pl := testMQTTReadPacket(q.t, q.r)
+		p := q2Packet{typ: b & mqttPacketMask}
+		switch p.typ {
+		case mqttPacketPub:
+			flags, pi, _, payload := testMQTTGetPubMsgExEx(q.t, nil, q.r, b, pl, "q2restart/topic", nil)
+			p.flags, p.pi, p.payload = flags, pi, string(payload)
+			seen, ok := q.published[pi]
+			if ok && seen == p.payload && flags == mqttPubQoS2|mqttPubFlagDup && !q.pubrels[pi] {
+				continue
+			}
+		case mqttPacketPubRel, mqttPacketUnsubAck:
+			// Framed exactly as 3.1.1 frames them, before anything is read or set aside.
+			if (p.typ == mqttPacketPubRel && b != mqttPacketPubRel|0x2) ||
+				(p.typ == mqttPacketUnsubAck && b != mqttPacketUnsubAck) || pl != 2 {
+				q.t.Fatalf("malformed packet %x with remaining length %d", b, pl)
+			}
+			pi, err := q.r.readUint16("packet identifier")
+			if err != nil {
+				q.t.Fatalf("reading the packet identifier: %v", err)
+			}
+			p.pi = pi
+			if p.typ == mqttPacketPubRel && q.pubrels[pi] {
+				continue
+			}
+		case mqttPacketPingResp:
+			if b != mqttPacketPingResp || pl != 0 {
+				q.t.Fatalf("malformed packet %x with remaining length %d", b, pl)
+			}
+		}
+		return p
+	}
+}
+
+// firstPublish requires the next packet to be a first transmission of payload, and records it.
+func (q *q2PreRestartReader) firstPublish(payload string) uint16 {
+	q.t.Helper()
+	p := q.next()
+	if p.typ != mqttPacketPub || p.flags != mqttPubQoS2 || p.payload != payload || p.pi == 0 {
+		q.t.Fatalf("want the first transmission of %q, got type %x flags %x identifier %d %q",
+			payload, p.typ, p.flags, p.pi, p.payload)
+	}
+	if _, dup := q.published[p.pi]; dup {
+		q.t.Fatalf("identifier %d was already in use by %q", p.pi, q.published[p.pi])
+	}
+	q.published[p.pi] = payload
+	return p.pi
+}
+
+// expect requires the next packet to be typ with identifier pi (0 for PINGRESP), and records a
+// PUBREL.
+func (q *q2PreRestartReader) expect(typ byte, pi uint16) {
+	q.t.Helper()
+	p := q.next()
+	if p.typ != typ || p.pi != pi {
+		q.t.Fatalf("want packet %x identifier %d, got %x identifier %d", typ, pi, p.typ, p.pi)
+	}
+	if typ == mqttPacketPubRel {
+		q.pubrels[pi] = true
+	}
+}
+
+// q2FatalRecorder is a testing.TB whose Fatalf records the failure and ends the goroutine, so a
+// test can assert that the reader refuses a packet.
+type q2FatalRecorder struct {
+	testing.TB
+	failed atomic.Bool
+}
+
+func (r *q2FatalRecorder) Helper() {}
+
+func (r *q2FatalRecorder) Fatalf(string, ...any) {
+	r.failed.Store(true)
+	runtime.Goexit()
+}
+
+// TestQ2PreRestartReaderSetsAsideOnlyWellFormedRepeats: the reader sets aside a repeated PUBREL
+// only when it is framed as 3.1.1 frames it; a malformed one fails the read.
+func TestQ2PreRestartReaderSetsAsideOnlyWellFormedRepeats(t *testing.T) {
+	read := func(stream []byte, seen uint16, want byte) bool {
+		rec := &q2FatalRecorder{TB: t}
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		go func() { _, _ = c2.Write(stream) }()
+		q := newQ2PreRestartReader(rec, &mqttReader{reader: c1})
+		q.pubrels[seen] = true
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			q.expect(want, 0)
+		}()
+		<-done
+		return !rec.failed.Load()
+	}
+	pingresp := []byte{mqttPacketPingResp, 0}
+	if !read(append([]byte{mqttPacketPubRel | 0x2, 2, 0, 1}, pingresp...), 1, mqttPacketPingResp) {
+		t.Fatal("a well-formed repeated PUBREL was not set aside")
+	}
+	if read(append([]byte{mqttPacketPubRel, 2, 0, 1}, pingresp...), 1, mqttPacketPingResp) {
+		t.Fatal("a repeated PUBREL with fixed-header flags 0 was set aside")
+	}
+	if read(append([]byte{mqttPacketPubRel | 0x2, 3, 0, 1, 0}, pingresp...), 1, mqttPacketPingResp) {
+		t.Fatal("a repeated PUBREL of remaining length 3 was set aside")
+	}
 }
 
 // TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel is plan test 16 in its exact
@@ -58,18 +197,32 @@ func TestMQTTDrainQoS2SurvivesRestartWithStoredPubRel(t *testing.T) {
 		testMQTTReadPIPacket(mqttPacketPubComp, t, pr, uint16(i+1))
 	}
 
-	// Both are delivered and unacknowledged.
-	piA := testMQTTCheckPubMsgNoAck(t, c, r, "q2restart/topic", mqttPubQoS2, []byte("past-pubrec"))
-	piB := testMQTTCheckPubMsgNoAck(t, c, r, "q2restart/topic", mqttPubQoS2, []byte("still-publish"))
+	// Both are delivered and unacknowledged. Every read before the restart goes through q, which
+	// sets aside what this 3.1.1 connection may legitimately retransmit when a client answer
+	// arrives after AckWait (1 s here) and nothing else.
+	q := newQ2PreRestartReader(t, r)
+	piA := q.firstPublish("past-pubrec")
+	piB := q.firstPublish("still-publish")
 
 	// Take A past PUBREC — its PUBREL is now stored and delivered, and deliberately
 	// not PUBCOMP'd — while B stays in the PUBLISH phase.
 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, piA)
-	testMQTTReadPIPacket(mqttPacketPubRel, t, r, piA)
+	q.expect(mqttPacketPubRel, piA)
 
 	// UNSUBSCRIBE now: only B is still started, so the drain claims exactly it.
-	testMQTTUnsub(t, 2, c, r, []*mqttFilter{{filter: "q2restart/topic"}})
-	testMQTTFlush(t, c, nil, r)
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketUnsub | mqttUnsubscribeFlags)
+	w.WriteVarInt(2 + 2 + len("q2restart/topic"))
+	w.WriteUint16(2)
+	w.WriteBytes([]byte("q2restart/topic"))
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("UNSUBSCRIBE: %v", err)
+	}
+	q.expect(mqttPacketUnsubAck, 2)
+	if _, err := testMQTTWrite(c, []byte{mqttPacketPing, 0}); err != nil {
+		t.Fatalf("PINGREQ: %v", err)
+	}
+	q.expect(mqttPacketPingResp, 0)
 
 	sess := testMQTTResidentSession(t, s, "q2restart")
 	if n := testDrainCount(sess); n != 1 {
