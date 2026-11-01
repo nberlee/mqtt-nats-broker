@@ -5,7 +5,9 @@ broker's code and both are answered the same way - a route inventory, fixtures i
 isolated nats-server checkout, and one discriminating mutation per live mechanism.
 
 **Can the Will outbox's terminal state be regressed?** The executable canary for
-`docs/findings/ha-arbitration.md` F-030, **closed 2026-08-16**. Both routes by which the
+[issue #131](https://github.com/nberlee/mqtt-nats-broker/issues/131)
+[issue #34](https://github.com/nberlee/mqtt-nats-broker/issues/34), **closed
+2026-08-16**. Both routes by which the
 hazard could occur are refused on the supported floor. Closure does not rest on this
 harness alone: it combines the route inventory and mutations here, pinned source
 mechanisms, and the NATS maintainer's explicit confirmation that leader-local in-flight
@@ -53,7 +55,8 @@ expectation is checked pre-proposal and the in-process per-subject state is clea
 The claim assumes the validated `$MQTT_willq` shape remains conforming while the manager
 serves it. An operator adding a source after initialization can introduce unconditional
 foreign writes; startup validation is a snapshot, so that configuration-drift residual
-is outside F-030 and remains documented in `docs/CONFORMANCE.md`.
+is outside [issue #34](https://github.com/nberlee/mqtt-nats-broker/issues/34)
+and remains documented in `docs/CONFORMANCE.md`.
 
 ## Route inventory
 
@@ -71,7 +74,7 @@ conditioned on `S` could reach a proposal after `done` is committed, and what st
 | **R-unclustered** | `node == nil` (an R1 stream, or a scale-up with queued inbound), where the write goes straight to `processJetStreamMsg`. | The per-subject expectation is then enforced at apply (`canConsistencyCheck := !isClustered`), against the same store the write would land in. There is no leader transition and no window: this broker also refuses to run with a `$MQTT_willq` that is not R3 when replicas are configured (`internal/mqtt/stream_prereqs.go`). | written refutation |
 | **R-batch** | `ProposeMulti`, the atomic-batch path. Its own shape: a FIFO prefix of the batch is committed and the commit entry is not, so the acceptance fact could be durable without the session record it was supposed to arrive with. | For `$MQTT_willq`, nothing to refuse: it is not an atomic-batch stream - only `$MQTT_sess` sets `AllowAtomicPublish`, for the record-plus-acceptance-fact commit. For `$MQTT_sess`, the prefix split is REAL at the Raft layer and applies NOTHING: batch identity lives in the stream entry encoding, a committed non-commit member is counted and buffered in memory, and only a gap-free commit op replays the members into the store under one `mset.mu` hold. The term comparison is inherited by citation - `ProposeMulti`'s guard is verbatim `proposeLocked`'s (`raft.go`) - and the batch commit derives its per-subject expectation through the same `checkMsgHeadersPreClusteredProposal` a single clustered write uses. | `TestJetStreamAcceptBatchPrefixStoresNothing`, mutation `m-batch-apply-eager`, the unmutated `^TestJetStreamAtomicBatchPublish` pin, and the accept sentinel `TestMQTTAcceptBatchReplicatedIndivisible` with `m-accept-split-write` |
 | **R-forward** | `ForwardProposal`, the one proposal entry point that does not take a term. | Its only stream-data call site is a message DELETE, proposed directly when this node is the stream leader and forwarded to it otherwise (`stream.go`), and a forwarded proposal always uses the receiving node's CURRENT term (asserted by upstream's own `TestNRGTermFencedProposals`). It carries no per-subject expectation, so it cannot be the write this claim is about; a delete is separately harmless here, since reaping a terminal record is what the protocol does with it. | written refutation |
-| **R-mirror/source** | The stream ingests writes from somewhere other than a conditional client publish. | Initial provisioning refuses a `$MQTT_willq` mirror or sources. Because validation is a snapshot, a source added after manager initialization is not a conditional-write route at all: it is retained outside F-030 as live configuration drift, not falsely refuted by this inventory. The closure is for a conforming stream. | scoped exclusion; `validateBrokerOwnedStreamShape`, `validateWillQStream`, and the configuration-drift residual |
+| **R-mirror/source** | The stream ingests writes from somewhere other than a conditional client publish. | Initial provisioning refuses a `$MQTT_willq` mirror or sources. Because validation is a snapshot, a source added after manager initialization is not a conditional-write route at all: it is retained outside [issue #34](https://github.com/nberlee/mqtt-nats-broker/issues/34) as live configuration drift, not falsely refuted by this inventory. The closure is for a conforming stream. | scoped exclusion; `validateBrokerOwnedStreamShape`, `validateWillQStream`, and the configuration-drift residual |
 | **R-delete** | This broker's own terminal cleanup, which deletes by sequence. | It targets the sequence the finalize returned, and a delete cannot revive `publishing`: the record is gone, and an absent record is the scan's "nothing owed" (`finalizeWillPublish`, `willPublishWorker`). | written refutation |
 
 Two properties bound every route above, and both belong to this broker rather than

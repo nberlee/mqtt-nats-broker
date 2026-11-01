@@ -72,7 +72,7 @@ func enforceEmbeddedOptions(opts *server.Options, jsDomain string) error {
 		return errors.New("jetstream store_dir must be set")
 	}
 	// Zero is what both an absent and an explicit 0 parse to, and the server reads it as
-	// "use the default", which caps every stream at 1000 consumers (F-095). The broker's
+	// "use the default", which caps every stream at 1000 consumers (issue #97). The broker's
 	// streams require no cap.
 	switch opts.JetStreamLimits.DefaultMaxConsumers {
 	case 0:

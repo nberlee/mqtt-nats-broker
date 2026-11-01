@@ -32,7 +32,7 @@ import (
 )
 
 // The custody ledger owns every ordinary exchange's Receive Maximum charge and identifier
-// (F-105 cutover, row 5; plan-row5.md rev 6 §6). Unless stated, each test runs at Receive
+// (issue #107 cutover, row 5; plan-row5.md rev 6 §6). Unless stated, each test runs at Receive
 // Maximum 1 with a large MaxAckPending, so the local scheduling budget cannot mask an RM
 // defect, and "B sent" is read as capacityAvailableLocked() > 0.
 
@@ -275,7 +275,7 @@ func TestF105CustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 	e := testNewInflightEnv(t, "custody-refused")
 	testReadyForRealPubRelDelivery(t, e)
 	// The source's name must be claimed, or readiness refuses before the ladder is ever entered
-	// and the batch this test refuses is never composed (F-105 WP-F W2, row 10).
+	// and the batch this test refuses is never composed (issue #107 WP-F W2, row 10).
 	e.admissionPrerequisites(t, testRealPubRelSrcDur, 1)
 	testCustodyRM1(t, e.sess)
 	var refused atomic.Int64
@@ -683,12 +683,12 @@ func TestF105CustodyDestructionWithoutEvidenceKeepsItsCharge(t *testing.T) {
 	}
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("writing the tombstone: %v", err)
 	}
-	// RE-EXPRESSED by F-097/F-088 (ruling R-impl-1, the WithdrawNeverManufactured class): the door
+	// RE-EXPRESSED by issue #99/issue #90 (ruling R-impl-1, the WithdrawNeverManufactured class): the door
 	// used to destroy this marker-less tombstone "on its own proof", the deleted premise. It now
 	// REFUSES and the register is kept; every custody, charge and identifier assertion below is
 	// unchanged — the Publish exchange still holds the identifier and the charge, live and resumed.
@@ -854,7 +854,7 @@ func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
 	}
 }
 
-// T21, on the inventory (F-105 7b: the census is the duty traversal, not a subject listing). A
+// T21, on the inventory (issue #107 7b: the census is the duty traversal, not a subject listing). A
 // ledger that cannot be read is an incomplete census, never an empty inventory; and uncertainty is
 // never recomputed from scratch by a later census — an exchange subject a duty named unreadably
 // stays uncertain after that duty itself becomes unreadable.
@@ -1443,7 +1443,7 @@ func TestF105CustodyExhaustionRequestsObservation(t *testing.T) {
 	if room {
 		t.Fatal("fixture: the ledger withholds for another reason, which kicks a pass of its own")
 	}
-	// RE-EXPRESSED (F-097 WP4, ruling R-impl-2): this used to recover the store first and assert
+	// RE-EXPRESSED (issue #99 WP4, ruling R-impl-2): this used to recover the store first and assert
 	// that NO pass ran for 100 ms - HEAD's "there is no timer". WP4 (C1 clause (e)) deliberately
 	// retries a failed observation on the dispatcher's own cadence, so that premise is the one the
 	// change replaces. The fault is now HELD through the window (the dispatcher's own retries fail
@@ -1540,7 +1540,7 @@ func TestF105CustodyRetainedCapacityRequestsObservation(t *testing.T) {
 	t.Run("incomplete-census", func(t *testing.T) {
 		t.Parallel()
 		e := testNewInflightEnv(t, "custody-retained-census")
-		// RE-EXPRESSED (F-097, consult C8 / R-impl-4): the census is admitted at most once per cap
+		// RE-EXPRESSED (issue #99, consult C8 / R-impl-4): the census is admitted at most once per cap
 		// interval, stamped at ADMISSION (C3), so a census that fails just before the store recovers
 		// holds the next one back a full cap interval - and at the default AckWait that interval
 		// (5 s) equalled this test's bound, so convergence landed on the bound by construction. The

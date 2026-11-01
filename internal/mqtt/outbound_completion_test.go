@@ -42,7 +42,7 @@ func testF105Authority(state mqttAuthorityState) *mqttOutboundAuthority {
 //
 // Completing an obligation that was ALREADY ADMITTED must not require current serving
 // authority. If it did, transfer and closure would themselves destroy the completion route
-// of every obligation admitted before them — which is the defect F-105 exists to remove.
+// of every obligation admitted before them — which is the defect issue #107 exists to remove.
 // Beginning new work is the only thing the authority governs.
 func TestF105CompletionDoesNotNeedServingAuthority(t *testing.T) {
 	for name, state := range map[string]mqttAuthorityState{

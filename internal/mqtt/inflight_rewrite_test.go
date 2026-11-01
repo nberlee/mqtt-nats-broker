@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-// F-087: every retargeted CAS on $MQTT_inflight rebuilds from the record it just read.
+// issue #89: every retargeted CAS on $MQTT_inflight rebuilds from the record it just read.
 //
 // The tests below are organized by what a rebuild PRESERVES — the fact a concurrent
 // writer proved between the caller's build and its re-target — because that is the
@@ -72,7 +72,7 @@ func TestMQTTInflightRetireRetargetPreservesConcurrentCancellation(t *testing.T)
 	// The first retirement CAS is aimed at the stale sequence, so it rejects; the
 	// re-read then finds a record carrying BOTH the foreign claim and a cancellation.
 	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) {
-		r.Cancelled, r.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+		r.Cancelled, r.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: provenance is written
 	})
 
 	if _, ok := e.sess.markInflightRegisterRetired(e.c, pi, dur, sseq, smsg.Sequence,
@@ -148,7 +148,7 @@ func TestMQTTInflightRetiredDominatesCancelledAtRecovery(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
 	testMarkRegister(t, e, pi, func(r *mqttInflightRecord) {
-		r.Retired, r.Cancelled, r.CancelOrigin = true, true, mqttCancelOriginOccupant // F-088: provenance
+		r.Retired, r.Cancelled, r.CancelOrigin = true, true, mqttCancelOriginOccupant // issue #90: provenance
 	})
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("persist session: %v", err)
@@ -250,7 +250,7 @@ func TestMQTTInflightSweepRetainsAVerdictItCannotForget(t *testing.T) {
 	e := testNewInflightEnv(t, "client-sweep-retention")
 	// AFFINE, because the disposal is: this sweep arm is reached only for a retired affine
 	// register. An ordinary register is an admitted obligation, ended through its exchange
-	// under an entitlement (F-105 7b), never by this licence-less disposal.
+	// under an entitlement (issue #107 7b), never by this licence-less disposal.
 	dur := mqttQ2AffineConsumerDurablePrefix + e.sess.idHash + "_plain"
 	sseq := e.publishSource(t, dur)
 	pi := e.track(t, dur, sseq, 2)
@@ -266,7 +266,7 @@ func TestMQTTInflightSweepRetainsAVerdictItCannotForget(t *testing.T) {
 	}
 	carrying := *rec
 	carrying.Retired, carrying.Cancelled = true, true
-	carrying.CancelOrigin = mqttCancelOriginOccupant // F-088: provenance is written
+	carrying.CancelOrigin = mqttCancelOriginOccupant // issue #90: provenance is written
 
 	// NO resident, identity-fenced session: nothing here can forget the verdict, so the
 	// register — the verdict's only carrier — must survive.
@@ -493,7 +493,7 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 // path could not frame a packet by hand, and it does not resolve an alias that crosses
 // a function boundary. One identifier-bearing transmission is deliberately outside it:
 // a RETAINED QoS 1/2 message allocates through trackPublishRetained, builds its frame
-// directly and is flushed by a later queueOutbound with no section at all (F-091),
+// directly and is flushed by a later queueOutbound with no section at all (issue #93),
 // which this guard cannot see because the retained path uses neither helper.
 //
 // The QoS 0 enqueues (a literal 0 identifier) allocate nothing and are excluded by the
@@ -664,7 +664,7 @@ func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
 // testFramingCloseSet is the other half of the guarantee above, and it exists because the
 // pairing guard can only see the two enqueue helpers.
 //
-// A hand-built frame escapes it entirely, which is what F-091 was: the retained path
+// A hand-built frame escapes it entirely, which is what issue #93 was: the retained path
 // framed its own PUBLISH with mqttMakePublishHeader and was flushed by a later
 // queueOutbound with no section at all, and this guard's own comment used to record that
 // as an accepted exclusion.
@@ -701,7 +701,7 @@ func testFramingCloseSet(t *testing.T) {
 		// identifier-bearing callers open beginSendLocked, which the pairing guard binds.
 		"client.mqttPreparePublishMsgTo":         "the caller's beginSendLocked",
 		"client.mqttEnqueuePreparedPublishMsgTo": "the caller's beginSendLocked",
-		// A RETAINED copy's frame (F-105 7c): built for the verdict before the section opens and for
+		// A RETAINED copy's frame (issue #107 7c): built for the verdict before the section opens and for
 		// the write inside it — the caller, transmitRetained, opens beginSendLocked and its written
 		// frame goes out through mqttEnqueuePreparedPublishMsgTo, which the pairing guard binds.
 		"client.mqttPrepareRetainedPublish": "the caller's beginSendLocked (transmitRetained)",
@@ -814,7 +814,7 @@ func testFramingCloseSet(t *testing.T) {
 // registry is not it: a hold whose write returned and whose acknowledgement debt is owed
 // to a connection that is no longer ours reserves nothing. A reader that tested presence
 // would strand a re-minted identifier, its register and a Receive Maximum slot for the
-// session's life (F-089).
+// session's life (issue #91).
 //
 // So the registry is behind an ownership boundary: the predicate and the four helpers
 // that MUTATE a hold may touch the field, and every other reader asks
@@ -843,12 +843,12 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.endSendCore": {}, "mqttSession.consumePubRelAckLocked": {},
 		// A retained frame's reservation: one opener and two release verbs, because
 		// written completion is fenced by the session incarnation and abandonment is not
-		// (F-091). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
+		// (issue #93). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
 		// they only take the lock and delegate, so the map access stays in these three.
 		"mqttSession.beginRetainedSendLocked":            {},
 		"mqttSession.releaseRetainedSendAbandonedLocked": {},
 		"mqttSession.dropRetainedSendLocked":             {},
-		// The retained hold's HANDOVER to the send section that replaces it (F-105 7c): it ends
+		// The retained hold's HANDOVER to the send section that replaces it (issue #107 7c): it ends
 		// the snapshot's hold in the section's own critical section, never answering whether the
 		// identifier is reserved.
 		"mqttSession.handRetainedHoldToSectionLocked": {},
@@ -879,27 +879,27 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.publishSectionLiveLocked": {},
 		// The open PUBLISH section's OUTPUT, which only the hold names (pubOut beside pubIdent):
 		// the client's acknowledgement marks it answered so the section does not then write
-		// (F-115). It asks no reservation question; it addresses one transmission's output.
+		// (issue #117). It asks no reservation question; it addresses one transmission's output.
 		"mqttSession.answerOpenPublishLocked": {},
 		// The EXACT live PUBREL action token, for the same reason: delegating a PUBCOMP'd
 		// slot's cleanup to a local drain needs the action holding the token finalize saw,
 		// which a reservation (an exclusion, an older action) does not establish. It answers
 		// which ACTION holds a token, never whether the identifier is reserved.
 		// The PUBREL write entry's exact-holder membership: pointer identity, which a token
-		// comparison cannot give (F-105 row 2, holistic review round 1).
+		// comparison cannot give (issue #107 row 2, holistic review round 1).
 		"mqttSession.registeredActionLocked":   {},
 		"mqttSession.localActionHoldingLocked": {},
-		// The owner of a live PUBCOMP debt for a PUBREL POSSIBLY EMITTED (F-116): the lineage
+		// The owner of a live PUBCOMP debt for a PUBREL POSSIBLY EMITTED (issue #118): the lineage
 		// release's question, which discounts an open attempt that has not entered its write. It
 		// is not "is this identifier reserved" — the open unit still reserves it.
 		"mqttSession.pubCompEmittableOwnerLocked": {},
-		// The open PUBREL attempt's write-entry fact, set behind the exact token (F-116).
+		// The open PUBREL attempt's write-entry fact, set behind the exact token (issue #118).
 		"mqttSession.markPubRelEnteredLocked": {},
 		// The PUBREL a connection may already hold: a PUBCOMP debt that connection owns
 		// ([MQTT-4.4.0-1]; a re-offer to it is a resend). It addresses one transmission's debt and
 		// its owed answer to a duplicate PUBREC, never whether the identifier is reserved.
 		"mqttSession.pubRelHeldOnLocked": {},
-		// The acknowledged exchange's IDENTIFIER hold (F-098, holistic review round 1, finding
+		// The acknowledged exchange's IDENTIFIER hold (issue #100, holistic review round 1, finding
 		// 5): one opener, installed in the untrack's own critical section, and one nonce-guarded
 		// release, called when the terminal cleanup is confirmed. Both MUTATE a hold; neither
 		// answers "is this identifier reserved", which stays sendReservedLocked's.
@@ -908,7 +908,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		"mqttSession.sendTransmissionOpenLocked":       {},
 		"mqttSession.holdTerminalCleanupLocked":        {},
 		"mqttSession.releaseTerminalCleanupHoldLocked": {}, // the terminal hold's owner (the unlocked wrapper only locks)
-		// The IDENTIFIER EXCLUSION a removal site hands off (F-098, C-IV's consolidation):
+		// The IDENTIFIER EXCLUSION a removal site hands off (issue #100, C-IV's consolidation):
 		// an install, a lift bound to the instance it observed, an adoption for a recovered
 		// exchange's own exclusion, and the instance read that pairs an out-of-lock absence
 		// observation with the reservation it may clear. All four MUTATE or address a hold
@@ -930,7 +930,7 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// share anyExclusionHeldLocked instead of walking the map twice.
 		"mqttSession.anyExclusionHeldLocked":          {},
 		"mqttSession.snapshotExclusionReclaimLocked_": {},
-		// F-088 WP3 rule 6: the reclaim pass's fence-cursor write-back mutates the exclusion
+		// issue #90 WP3 rule 6: the reclaim pass's fence-cursor write-back mutates the exclusion
 		// object's SCHEDULING state; it answers no reservation question.
 		"mqttSession.advanceExclusionFenceCursorLocked": {},
 		// actionHeldLocked is deliberately ABSENT. It is the fourth liveness term and it
@@ -1042,7 +1042,7 @@ func testQualifiedFuncName(fn *ast.FuncDecl) string {
 // calls, and empty for anything else.
 // testDefersSendEnd reports whether a defer statement ends a send section: a direct
 // `defer endSend(...)`, or a deferred function literal whose body calls endPublishSend,
-// endPubRelSend (F-116: the PUBREL end reads its emission flag at exit) or endSend.
+// endPubRelSend (issue #118: the PUBREL end reads its emission flag at exit) or endSend.
 func testDefersSendEnd(d *ast.DeferStmt) bool {
 	switch testCalleeName(d.Call) {
 	case "endSend", "endPublishSend", "endPubRelSend":
@@ -1443,7 +1443,7 @@ func TestMQTTInflightSendSectionSurvivesTheDiscard(t *testing.T) {
 //
 // The second clause is not decoration. The verdict set lives on a session, so a caller
 // with none resident can consult nothing however well it knows the nonce — which is
-// F-090, filed under docs/ROADMAP.md §P, and why one allow-list entry below reads as it
+// issue #92, filed under docs/ROADMAP.md §P, and why one allow-list entry below reads as it
 // does.
 //
 // Three separate reviews each found one more stranding delete site — the affine sweep,
@@ -1461,7 +1461,7 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 	// delete, else a tombstone on the register, else the nonce verdict — which is not a
 	// bypass but the full version of what the helper does in one step. And a site that
 	// can name the nonce but cannot REACH the verdict set, which lives on a session:
-	// the orphan sweep with none resident, which is F-090.
+	// the orphan sweep with none resident, which is issue #92.
 	allowed := map[string]string{
 		"reapRegisterWithVerdict":          "the property's own implementation",
 		"deleteInflightRegister":           "the fire-and-forget transport primitive the property calls",
@@ -1470,44 +1470,44 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 		"voidRegistersOnStream":            "the teardown's own three-rung ladder: confirmed delete then tombstone then verdict, forgetting on each proven rung",
 		"confirmInflightRegister":          "the cancelled-allocation settle, which runs that same three-rung ladder for one register",
 		"reapIncarnationRegisters":         "the generation reap: the whole incarnation goes, verdicts with it",
-		"deleteDiscardRecord": "a DISCARDED generation's census delete (F-105 7d): the same generation-wide " +
+		"deleteDiscardRecord": "a DISCARDED generation's census delete (issue #107 7d): the same generation-wide " +
 			"retirement as the reap, after the closure — no session of that generation serves, so no verdict " +
 			"set exists to strand; it takes only a register whose lineage is the discarded obligation's nonce, " +
 			"by its exact sequence",
 		"reconcileOrphanInflight": "the account-wide sweep's candidate router, which holds no session to consult",
-		"deleteRetiredPositionsUpTo": "removes a duty entry the F-112 floor RETIRED, never a register. A duty subject " +
+		"deleteRetiredPositionsUpTo": "removes a duty entry the issue #114 floor RETIRED, never a register. A duty subject " +
 			"carries the f105 class token, which no register parser can place and no void verdict can " +
 			"name; the entry is LOADED and decoded before the delete, by the exact sequence read",
-		"deleteReclaimedExchange": "removes an exchange record the F-112 floor RECLAIMED, never a register. An " +
+		"deleteReclaimedExchange": "removes an exchange record the issue #114 floor RECLAIMED, never a register. An " +
 			"exchange subject carries the f105 class token, which no register parser can place and no " +
 			"void verdict can name; it is read first and deleted by the exact sequence read, and only " +
 			"once the register subject no longer names its lineage (the reclamation predicate)",
-		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (F-072). A marker carries no cancellation " +
+		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (issue #76). A marker carries no cancellation " +
 			"verdict — a verdict names the REGISTER's nonce, and the register's own delete routes through the " +
 			"property — so there is nothing here to strand; the sequence comes only from an observation the " +
 			"marker boundary admitted",
-		"deleteChunkInterval": "removes F-105 retained MATERIAL, never a register. A chunk subject carries the " +
+		"deleteChunkInterval": "removes issue #107 retained MATERIAL, never a register. A chunk subject carries the " +
 			"f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
 			"register parser can place it and no void verdict can name it. The record is LOADED and " +
 			"its materialization checked before the delete, so what is taken is identified rather than " +
 			"addressed",
-		"finishMaterialRemoval": "removes the F-105 retained MANIFEST, by the EXACT sequence its caller was " +
+		"finishMaterialRemoval": "removes the issue #107 retained MANIFEST, by the EXACT sequence its caller was " +
 			"authorized for, and only once every chunk is CONFIRMED removed. Same class as the chunks: not a " +
 			"register, so there is no verdict to strand",
-		"disposeRetainedRel": "removes a RETAINED exchange's CANONICAL PUBREL record (`rel`, F-105 7c), never a " +
+		"disposeRetainedRel": "removes a RETAINED exchange's CANONICAL PUBREL record (`rel`, issue #107 7c), never a " +
 			"register. A rel subject carries the f105 class token, which satisfies neither mqttValidIDHashToken " +
 			"nor mqttValidSessGen, so no register parser can place it and no void verdict can name it. " +
 			"It is LOADED and its identity (the register's rel_id, the identifier) checked before the delete, " +
 			"by the exact sequence read, once its exchange is terminal at PUBCOMP. Same class as the chunks " +
 			"and the manifest",
-		"retireRecoveryRoot": "removes an F-105 RECOVERY ROOT, never a register, by the EXACT sequence it was " +
+		"retireRecoveryRoot": "removes an issue #107 RECOVERY ROOT, never a register, by the EXACT sequence it was " +
 			"read at and only after its completion certificate is CONFIRMED to stand. A root subject carries " +
 			"the f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
 			"register parser can place it and no void verdict can name it — there is nothing here to " +
 			"strand. Same class as the retained material's chunk and manifest deletes",
 		"disposeSettledAffineRegister": "routes through the property where an identity-fenced session is resident, " +
 			"and RETAINS a register that CARRIES a cancellation where none is. A verdict living only in a " +
-			"non-resident session's persisted VoidedRegs is invisible from there and is NOT covered: F-090",
+			"non-resident session's persisted VoidedRegs is invisible from there and is NOT covered: issue #92",
 	}
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
@@ -1600,7 +1600,7 @@ func TestMQTTInflightBeginSendRefusesUnsendableEntries(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F-089: a PUBREL transmission holds its identifier until its PUBCOMP
+// issue #91: a PUBREL transmission holds its identifier until its PUBCOMP
 // ---------------------------------------------------------------------------
 
 // testConnIdentity gives a fixture connection a REAL identity, minted the way an
@@ -1615,7 +1615,7 @@ func testConnIdentity(t *testing.T, e *testInflightEnv, c *client) *client {
 		t.Fatal("a fixture connection must have a nonzero identity, or every ownership assertion is vacuous")
 	}
 	// AND ITS OUTPUT IDENTITY, assigned beside the cid exactly as a real connection's is: every
-	// ordinary acquisition names the connection that will emit it (F-105 row 2).
+	// ordinary acquisition names the connection that will emit it (issue #107 row 2).
 	if c.outBind == nil {
 		c.outBind = mqttBindConnection(c.cid)
 	}
@@ -1624,7 +1624,7 @@ func testConnIdentity(t *testing.T, e *testInflightEnv, c *client) *client {
 
 // testInflightWire is a socket that accepts every byte, for a fixture whose PUBRELs must really
 // be transmitted. testNewInflightEnv's client has none, so its authorized writes are all
-// PREVENTED — and since F-116 a prevented PUBREL owes no PUBCOMP, so a fixture asserting the debt
+// PREVENTED — and since issue #118 a prevented PUBREL owes no PUBCOMP, so a fixture asserting the debt
 // of a "transmitted" copy, or the released delivery that debt makes, must first transmit it.
 type testInflightWire struct {
 	net.Conn
@@ -1893,11 +1893,11 @@ func TestMQTTInflightPubRelSectionRefusesUnderALivePublishWrite(t *testing.T) {
 	}
 	e.sess.endSend(e.c, pi, pubTok.token)
 
-	// UNCHANGED by F-091, and deliberately so: F-091 leaves ALL PUBREL admission exactly as
+	// UNCHANGED by issue #93, and deliberately so: issue #93 leaves ALL PUBREL admission exactly as
 	// it was. Three candidate refusals were tried there and all three were deleted (D4), so
 	// what this test exercises is the pre-existing rule alone — an active write token refuses,
 	// nothing else does. Correlating a stored PUBREL record against the entry that owns its
-	// identifier is F-092's, not this item's.
+	// identifier is issue #94's, not this item's.
 	e.sess.mu.Lock()
 	relTok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
 	e.sess.mu.Unlock()
@@ -2068,7 +2068,7 @@ func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
 		t.Fatal("a hold reserving nothing must be swept")
 	}
 	if tok, _, _, present := testPubRelHold(t, e.sess, 12); !present || tok != "live-write" {
-		t.Fatal("a hold whose write has not returned must survive the discard (F-087 WP5 class F2)")
+		t.Fatal("a hold whose write has not returned must survive the discard (issue #89 WP5 class F2)")
 	}
 	if _, owed, _, present := testPubRelHold(t, e.sess, 13); !present || owed != 1 {
 		t.Fatal("a debt of the still-bound connection must survive clear(): sess.c is untouched here")
@@ -2197,7 +2197,7 @@ func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 
 // testDeliverPubRelAs delivers a stored PUBREL naming an EXPLICIT exchange nonce, which is
 // what lets a test distinguish "this record belongs to the identifier's exchange" from
-// "this record is stale" — the whole discriminator F-092 rests on.
+// "this record is stale" — the whole discriminator issue #94 rests on.
 func testDeliverPubRelAs(t *testing.T, e *testInflightEnv, pi uint16, reply, nonce string) {
 	t.Helper()
 	testDeliverPubRelCorrelated(t, e, pi, reply, nonce, "SRC", 41)
@@ -2206,7 +2206,7 @@ func testDeliverPubRelAs(t *testing.T, e *testInflightEnv, pi uint16, reply, non
 // testDeliverPubRelCorrelated delivers a stored PUBREL with an EXPLICIT source correlation.
 //
 // The correlation matters more than it looks: a record with an empty one takes a different
-// route through admission, and F-092's holistic review round 1 found that every acceptance
+// route through admission, and issue #94's holistic review round 1 found that every acceptance
 // fixture used the empty form — so none of them ever reached the ORDINARY correlated path,
 // which was at that moment bypassing the slot entirely. A fixture that never reaches the
 // route it names proves nothing about it (feedback_fixture_must_reach_its_route).
@@ -2223,7 +2223,7 @@ func testDeliverPubRelCorrelated(t *testing.T, e *testInflightEnv, pi uint16, re
 //
 // Counted at the write block hook, which sits INSIDE the send section, so it observes an
 // actual transmission rather than a decision to transmit. That distinction is what makes
-// the F-092 assertions meaningful: a refusal must produce no bytes, and "no bytes" is only
+// the issue #94 assertions meaningful: a refusal must produce no bytes, and "no bytes" is only
 // observable here.
 func testCountPubRelWrites(t *testing.T, e *testInflightEnv, fn func()) int {
 	t.Helper()
@@ -2290,7 +2290,7 @@ func TestMQTTInflightPubCompDuringABlockedPubRelWrite(t *testing.T) {
 	e := testNewInflightEnv(t, "client-pubcomp-blocked")
 	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
 	testReadyForRealPubRelDelivery(t, e)
-	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
+	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (issue #118)
 	seed := testSeedRealPubRelReady(t, e)
 	pi := seed.pi
 
@@ -2376,7 +2376,7 @@ func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
 	// ON THE REAL STORE (consult 26): an ordinary exchange's PUBCOMP is one authority batch.
 	e := testNewInflightEnv(t, "client-stray-pubcomp")
 	testReadyForRealPubRelDelivery(t, e)
-	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
+	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (issue #118)
 	seed := testSeedRealPubRelReady(t, e)
 	pi := seed.pi
 
@@ -2406,12 +2406,12 @@ func TestMQTTInflightStrayPubCompCannotTakeAReMintedIdentifier(t *testing.T) {
 // its identifier.
 func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	t.Parallel()
-	// ON THE REAL STORE (F-105 row 2, consult 29): an ORDINARY exchange admitted through the
+	// ON THE REAL STORE (issue #107 row 2, consult 29): an ORDINARY exchange admitted through the
 	// authority and answered by the real PUBREC handler, so the PUBREL delivery acquires its
 	// action through the authority as production does.
 	e := testNewInflightEnv(t, "client-withheld-pubcomp")
 	testReadyForRealPubRelDelivery(t, e)
-	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (F-116)
+	testWireInflightEnv(t, e) // its PUBRELs are transmitted, so their PUBCOMPs are owed (issue #118)
 	seed := testSeedRealPubRelReady(t, e)
 	pi := seed.pi
 	dur := seed.pubRel
@@ -2451,7 +2451,7 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	e.c.mqttProcessPubComp(pi)
 	// THE ACCOUNTING MUST STAY EXACT, and the identifier must stay EXCLUDED. This check
 	// used to require the registry hold to disappear entirely; it is corrected rather than
-	// loosened (F-098, consult D-4), and the debt half it also proved is kept verbatim.
+	// loosened (issue #100, consult D-4), and the debt half it also proved is kept verbatim.
 	//
 	// What is WITHDRAWN is precise: the registry hold's DISAPPEARANCE after debt
 	// consumption. It was never an end-to-end reclamation guarantee — pendingPubRel[pi]
@@ -2516,7 +2516,7 @@ func TestMQTTInflightWithheldPubCompStillConsumesItsDebt(t *testing.T) {
 	e.sess.cpending = make(map[string]map[uint64]uint16)
 	e.sess.last_pi = pi - 1
 	// The EXCHANGE is unfinished (its PUBREL is still owed), so it keeps its Receive Maximum
-	// charge (Spec5 [4.9]) — held since F-105 row 5 by the custody ledger, not by the maps
+	// charge (Spec5 [4.9]) — held since issue #107 row 5 by the custody ledger, not by the maps
 	// emptied above. What this fixture measures is the EXCLUSION's charge: everything the
 	// ledger does not account for, which with the maps emptied is whatever the exclusion
 	// adds. The ledger's own charge is asserted separately, as exactly this one exchange.
@@ -2736,7 +2736,7 @@ func TestPubRelWithholdsAgainstAClaimedDrainWithNoIntent(t *testing.T) {
 
 // A RETIRED shared QoS 2 register is a shape this broker no longer writes (7a: a supported shared
 // delivery is QoS 1 beside its exchange, and is never retired by a PUBREC). It replaced, BY NAME, the
-// two contest tests that pinned how the shared claim contest (deleted in F-105 7b) re-targeted over a
+// two contest tests that pinned how the shared claim contest (deleted in issue #107 7b) re-targeted over a
 // concurrent retirement and refused to close a retired tombstone: that population cannot arise, so
 // recovery refuses it outright — the register untouched, no custody write, its identifier reserved
 // with nothing deliverable, and no source retirement (the suppression that acknowledges re-offers
@@ -2753,7 +2753,7 @@ func TestMQTTInflightUnsupportedSharedShapeIsRefusedBeforeTheContest(t *testing.
 	}{
 		{"retired", func(r *mqttInflightRecord) { r.Retired = true }},
 		{"retired and cancelled", func(r *mqttInflightRecord) {
-			r.Retired, r.Cancelled, r.CancelOrigin = true, true, mqttCancelOriginOccupant // F-088: provenance
+			r.Retired, r.Cancelled, r.CancelOrigin = true, true, mqttCancelOriginOccupant // issue #90: provenance
 		}},
 	} {
 		tc := tc

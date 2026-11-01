@@ -30,7 +30,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// The F-105 client-visible witnesses (WP-F step 4): an obligation whose PUBREC was taken on one
+// The issue #107 client-visible witnesses (WP-F step 4): an obligation whose PUBREC was taken on one
 // broker, carried to a PEER broker by the client's next CONNECT, through the assembled production
 // route with real clients.
 //
@@ -494,7 +494,7 @@ func TestF105PreservedObligationCompletesOnThePeer(t *testing.T) {
 // [MQTT-4.3.3]. The original source stays pending until B takes over, so B ENCOUNTERS it, and the
 // encounter is a settlement, never a delivery; the PUBREL exchange completes on B.
 //
-// A PUBLISH of the original message here is F-115 across brokers.
+// A PUBLISH of the original message here is issue #117 across brokers.
 func TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer(t *testing.T) {
 	// Not parallel: the delivery offer seam is process-wide.
 	var (

@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// A COMPLETION LEAVES ITS HOLDS RELEASE-OWED (F-105 7c-lc, as amended).
+// A COMPLETION LEAVES ITS HOLDS RELEASE-OWED (issue #107 7c-lc, as amended).
 //
 // An admitted obligation takes an edge on its source consumer (and, at QoS 2, on the canonical
 // PUBREL consumer). The client's answer that ENDS it (a PUBACK, a PUBCOMP, a refused PUBREC, the

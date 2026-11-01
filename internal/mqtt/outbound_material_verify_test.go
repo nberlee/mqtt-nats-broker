@@ -246,7 +246,7 @@ func TestF105SealingAPayloadResourceIsAnswerable(t *testing.T) {
 		t.Fatalf("the refusal did not come from the material: %v", err)
 	}
 
-	// READY IS NOT ENOUGH SINCE F-105 7c: an admission may still take a READY copy, so the seal
+	// READY IS NOT ENOUGH SINCE issue #107 7c: an admission may still take a READY copy, so the seal
 	// would describe material a delivery is about to need. The copy must be CLOSED first.
 	testF105SealManifest(t, e, 2)
 	err = testF105TrySeal(t, e, "inc-pay")

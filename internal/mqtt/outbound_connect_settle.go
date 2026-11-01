@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// Settling a standing ownership proposal before anything is destroyed (F-105 8a).
+// Settling a standing ownership proposal before anything is destroyed (issue #107 8a).
 //
 // An acceptance that crashed — or one still running on another broker — can leave its
 // reservation or preparation standing, its metadata half committed, aborted or unresolved. Two
@@ -84,7 +84,7 @@ func (jsa *mqttJSA) boundarySettlementTotal() time.Duration { return jsa.timeout
 
 // abandonOwnProposal is the owed abandonment of an accepting CONNECT's OWN proposal that was
 // positively aborted and whose abandonment did not confirm — the in-place cleanup failed, or the
-// deadline cut it off (F-105 8a). The CONNECT has already been refused and certified; this runs
+// deadline cut it off (issue #107 8a). The CONNECT has already been refused and certified; this runs
 // after it, off the CONNECT path, ONE attempt under its own deadline of one request timeout.
 //
 // It acts on the CAPTURED target only: close for a reservation, cancel for a preparation, and

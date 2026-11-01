@@ -280,7 +280,7 @@ const (
 	mqttInflightStreamName          = "$MQTT_inflight"
 	mqttInflightStreamSubjectPrefix = mqttPrefix + "inflight."
 
-	// The shared-group lifecycle records (F-105 transfer): the per-group group
+	// The shared-group lifecycle records (issue #107 transfer): the per-group group
 	// record and the per-generation acquisition ledger. Kept on their OWN stream
 	// rather than on $MQTT_inflight, even though both are MaxMsgsPer:1 CAS slots
 	// like the in-flight registers. The registers are rewritten and then deleted
@@ -503,7 +503,7 @@ var (
 	// success -- PUBACK, PUBCOMP, or a nil return to a Will worker -- while this
 	// stands. The CLIENT re-sends; the broker does not re-attempt on its own, because
 	// a retry lands at a newer sequence and can overwrite another publisher's newer
-	// value. F-060.
+	// value. issue #64.
 	errMQTTRetainedStoreUnconfirmed = errors.New("the retained update was not confirmed by the store")
 	errMQTTMalformedPacket          = errors.New("malformed packet")
 )
@@ -551,7 +551,7 @@ type mqtt struct {
 	sess *mqttSession               // quick reference to session, immutable after processConnect()
 	cid  string                     // client ID
 
-	// tracker is the incarnation this connection was BOUND to (F-036 unit 1; see
+	// tracker is the incarnation this connection was BOUND to (issue #40 unit 1; see
 	// sess_lease.go). Set at each bind, in the same sess.mu section as sess.c = c,
 	// and deliberately NEVER cleared: a displaced packet arriving after the detach
 	// must still acquire the OLD, retired tracker and be refused there — clearing it
@@ -563,7 +563,7 @@ type mqtt struct {
 	// tenure its CONNECT's ownership drive established as serving. Written once, under c.mu, when
 	// the accept loop reaches a servable outcome, and never rewritten. Every ordinary acquisition
 	// names THIS pair rather than whatever the store serves when it asks, so a connection whose
-	// tenure a takeover ended can never acquire output under its successor's (F-105 row 2). Zero
+	// tenure a takeover ended can never acquire output under its successor's (issue #107 row 2). Zero
 	// means no accepted entitlement, and an ordinary acquisition then refuses.
 	outEnt mqttOutboundEntitlement
 
@@ -605,7 +605,7 @@ type mqtt struct {
 	// carries and which the broker may still refuse -- those must never reach the
 	// close, which is what mqttAbortAcceptedConnect exists to guarantee. Because
 	// this is written only by the DISCONNECT packet handler, a connection whose
-	// CONNECT was refused never has one. F-041.
+	// CONNECT was refused never has one. issue #45.
 	//
 	// Written and read only under c.mu, never marshalled, never crossing a
 	// broker.

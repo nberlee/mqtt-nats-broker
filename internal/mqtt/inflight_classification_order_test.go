@@ -1,4 +1,4 @@
-// F-099: recovery classification follows adopted slot state and ordered PUBREL evidence.
+// issue #101: recovery classification follows adopted slot state and ordered PUBREL evidence.
 //
 // Two arms, one property. Arm A: per-exchange evidence is read AFTER the register it
 // judges, so an absence cannot predate the record it rules out. Arm B: a contest's OWNED
@@ -396,7 +396,7 @@ func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing
 // from the failure is unsafe, and the guess that costs most is the absence, which frees an
 // identifier another exchange still holds.
 //
-// SLOT-ONLY (experimental affine): since F-105 7b the contest runs for that class alone, and an
+// SLOT-ONLY (experimental affine): since issue #107 7b the contest runs for that class alone, and an
 // ordinary slot's ownership is its exchange's entitlement, not a claim.
 //
 // Mutation check: N21-C16br, the reread replaced by a guessed absence -> the rival's identifier
@@ -537,7 +537,7 @@ func (a *f099AdoptedContest) store(_ string, _ uint64, _ *mqttInflightRecord) (u
 // M8 (split into the PRE-contest pastPubRec input, which re-contests and re-exposes the
 // stale verdict) and M9 (a state guard at the apply install instead of routing).
 //
-// SLOT-ONLY (experimental affine) since F-105 7b: the plain contest runs for that class alone, an
+// SLOT-ONLY (experimental affine) since issue #107 7b: the plain contest runs for that class alone, an
 // ordinary slot's ownership being its exchange's entitlement, so the source is affine-class.
 func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T) {
 	t.Parallel()
@@ -647,11 +647,11 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 // Retirement is NOT a substitute phase, so the oracle requires the retirement disposition —
 // a non-actionable reservation and source suppression — and NOT an invented pubrel_ready
 // transition. Retired-AND-Cancelled is included because retirement dominates cancellation
-// (F-087 WP3), so the contest's pure-cancellation branch does not consume it.
+// (issue #89 WP3), so the contest's pure-cancellation branch does not consume it.
 //
 // Mutation check: M14, which drops the retirement split at this site alone.
 //
-// SLOT-ONLY (experimental affine) since F-105 7b: the plain contest runs for that class alone, an
+// SLOT-ONLY (experimental affine) since issue #107 7b: the plain contest runs for that class alone, an
 // ordinary slot's ownership being its exchange's entitlement, so the source is affine-class.
 func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing.T) {
 	t.Parallel()
@@ -742,7 +742,7 @@ type f099OwnedRoute struct {
 }
 
 // f099OwnedRouteManifest is the reviewed inventory, in the source order discovery walks.
-// The two claimRecoveredSharedInflight routes are gone with the Shared contest scope (F-105 7b):
+// The two claimRecoveredSharedInflight routes are gone with the Shared contest scope (issue #107 7b):
 // a shared register's ownership is its exchange's entitlement, never a claim.
 var f099OwnedRouteManifest = []f099OwnedRoute{
 	{"claimRecoveredTransferableInflight", "TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery"},

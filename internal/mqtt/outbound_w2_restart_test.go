@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// METADATA RELEASE RESTS ON DURABLE FACTS, AND THE CLEANUP THEY PROMISE SURVIVES A RESTART (F-105
+// METADATA RELEASE RESTS ON DURABLE FACTS, AND THE CLEANUP THEY PROMISE SURVIVES A RESTART (issue #107
 // WP-F W2, row D1 and §7.3 scenario 8).
 //
 // A discarding teardown releases the session's metadata while its physical cleanup is still

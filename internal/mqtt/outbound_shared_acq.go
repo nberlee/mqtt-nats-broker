@@ -21,7 +21,7 @@ import (
 	"sync/atomic"
 )
 
-// A shared exchange depends on its exact acquisition (F-105 cutover, unit 7a; consult 82).
+// A shared exchange depends on its exact acquisition (issue #107 cutover, unit 7a; consult 82).
 //
 // A shared-subscription GROUP consumer is not a resource any generation owns: several
 // generations hold it at once, through ACQUISITIONS listed in each generation's ledger on
@@ -196,7 +196,7 @@ func (jsa *mqttJSA) mqttSharedAcqReadyForDependency(id, epoch, gen, jsDur string
 		return fmt.Errorf("%w: the ledger of generation %q reads %v", errMQTTSharedAcqNotReady, gen, l.status)
 	}
 	// OPEN FOR A NEW DEPENDENCY: the ledger is not sealed, and the acquisition is not CLOSED — the
-	// release fence's first step (F-105 7e), which this check observing is what the fence's
+	// release fence's first step (issue #107 7e), which this check observing is what the fence's
 	// authority advance makes exclusive.
 	if l.rec.State != mqttSharedLedgerOpen {
 		return fmt.Errorf("%w: the ledger of generation %q is sealed", errMQTTSharedAcqNotReady, gen)

@@ -19,7 +19,7 @@ import (
 // (evictDisplacedOnRemotePersist) that reads and classifies the surviving record
 // first: a proven same-base sibling is a FORK, which mints a repair grant, and
 // everything else is ownership-unsettled, which mints nothing. Neither claims a
-// takeover — no record shape proves a successor (F-084) — and this route cancels no
+// takeover — no record shape proves a successor (issue #86) — and this route cancels no
 // Will on any verdict.
 //
 // Every fixture here is a REAL record over a real JetStream; observations are
@@ -216,7 +216,7 @@ func (e *testRejectionEnv) landRecord(t *testing.T, shape func(*mqttPersistedSes
 //
 // A sibling is the one lineage shape that licenses the FORKED vocabulary, and even that
 // is not a takeover claim: forked says our acknowledged record was erased by a write
-// that is not demonstrably descended from it (F-084).
+// that is not demonstrably descended from it (issue #86).
 func (e *testRejectionEnv) siblingRecordWrite(t *testing.T, node, clientID string) uint64 {
 	t.Helper()
 	_, psess, _ := e.peer(t, node, clientID)
@@ -379,7 +379,7 @@ func TestMQTTPersistEvictForkedSiblingBound(t *testing.T) {
 // TestMQTTPersistEvictDisplacementPreservesWill is the paired child-shaped case: a real
 // peer RESUME save is a child of our acknowledged record. That is a CLAIM of descent and
 // not proof of one — restore adopts WID/PWID without validating provenance — so since
-// F-084 the claim is 0x89 ownership-unsettled, not 0x8E.
+// issue #86 the claim is 0x89 ownership-unsettled, not 0x8E.
 //
 // And the delayed Will is PRESERVED even so, which is the change this pins. The
 // eviction used to run a scoped outbox cancel here; it no longer does, on either
@@ -405,7 +405,7 @@ func TestMQTTPersistEvictDisplacementPreservesWill(t *testing.T) {
 	// proof: this broker sees a body it did not write and cannot tell a real replacement
 	// from a replay, a stranger or a forged shape. So the claim is ownership-unsettled.
 	// 0x8E is reserved for the in-process replacement this broker holds both ends of.
-	// F-084.
+	// issue #86.
 	claims := b.disconnectClaims(t)
 	if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
 		t.Fatalf("a remote record observation licenses ownership-unsettled, got %+v", claims)
@@ -473,7 +473,7 @@ func TestMQTTPersistEvictResidentUnbound(t *testing.T) {
 // TestMQTTPersistEvictLicenseTable drives the concede/refuse table with planted
 // records and synthetic observations. The license is the OBSERVATION: a record
 // the worker cannot read — absent, undecodable, or older than the write that
-// licensed the eviction — narrows nothing, so those rows CONCEDE. Since F-084 they
+// licensed the eviction — narrows nothing, so those rows CONCEDE. Since issue #86 they
 // concede to 0x89 ownership-unsettled rather than 0x8E, and this route cancels no
 // Will on any verdict. The one refusal is equality: no remote write can land
 // AT our acknowledged sequence within a stream epoch, so the session's own
@@ -485,7 +485,7 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 		// stage returns the sequence to deliver as the observation.
 		stage   func(t *testing.T, e *testRejectionEnv) uint64
 		evicted bool
-		// voc is the WHOLE claim, not its reason code. Since F-084 the forked and the
+		// voc is the WHOLE claim, not its reason code. Since issue #86 the forked and the
 		// unsettled vocabularies both carry 0x89, so a code-only assertion cannot tell a
 		// proven sibling from an unclassifiable observation — and telling them apart is
 		// exactly what decides whether a fork grant is minted.
@@ -496,7 +496,7 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 		// absent, undecodable, identity-less or below-target record is an observation this
 		// broker cannot classify; it establishes that the subject is no longer ours and
 		// nothing whatever about who holds it, so 0x8E asserted a successor none of them
-		// produced. F-084.
+		// produced. issue #86.
 		{"absent record concedes", func(t *testing.T, e *testRejectionEnv) uint64 {
 			smsg, err := e.asm.jsa.loadSessionMsg(e.asm.domainTk, e.idHash)
 			if err != nil {
@@ -514,7 +514,7 @@ func TestMQTTPersistEvictLicenseTable(t *testing.T) {
 			}
 			return resp.Sequence
 		}, true, mqttDisposalOwnershipUnsettled},
-		// INVERTED by F-029, deliberately. This row used to assert that a different
+		// INVERTED by issue #31, deliberately. This row used to assert that a different
 		// incarnation concedes, which was the generation short-circuit in
 		// classifyRecordLineage. That short-circuit hid the one fork the rule exists to
 		// catch: a clean-start sibling is written by a session clear() re-minted, so it
@@ -831,7 +831,7 @@ func TestMQTTPersistEvictDefersToOpenRecordTx(t *testing.T) {
 // observation delivered while the worker is parked post-load makes it RE-LOAD
 // and apply the newer record's verdict — here flipping UNSETTLED to forked, which the
 // vocabulary and the Will record's final state assert (M9). ("Takeover to forked" before
-// F-084; this route claims no takeover now.)
+// issue #86; this route claims no takeover now.)
 func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 	t.Parallel()
 	e := testNewEvictEnv(t, "pevfresh")
@@ -840,7 +840,7 @@ func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 	done := e.armEvictObserver()
 	parked, release := e.parkEvictWorker(t, true)
 
-	// A child-shaped record at N: verdict UNSETTLED (it proves no successor, F-084).
+	// A child-shaped record at N: verdict UNSETTLED (it proves no successor, issue #86).
 	succ := e.landRecord(t, func(ps *mqttPersistedSession) {
 		e.sess.mu.Lock()
 		ps.PWID = e.sess.wid
@@ -873,7 +873,7 @@ func TestMQTTPersistEvictFreshTriggerReloads(t *testing.T) {
 // one — the worker must re-load, and the record readable at the new level may
 // prove the fork. A worker that skips the freshness arm on the unusable path decides at
 // the old level and loses the fork — and with it the repair grant. (It also conceded
-// 0x8E and cancelled a Will there; F-084 removed the first and an earlier item the
+// 0x8E and cancelled a Will there; issue #86 removed the first and an earlier item the
 // second, so what the freshness arm now protects is the classification and the mint.)
 func TestMQTTPersistEvictUnusableLoadFreshTrigger(t *testing.T) {
 	t.Parallel()
@@ -984,7 +984,7 @@ func TestMQTTPersistEvictClassifiesAtDecisionTime(t *testing.T) {
 //
 //   - a remote sibling of the UNADOPTED attempt ({b,a}) reads unrelated against
 //     {a,p} and CONCEDES to the UNSETTLED vocabulary — the stated one-hop
-//     recognition miss. It used to concede to 0x8E; F-084 corrected that, because
+//     recognition miss. It used to concede to 0x8E; issue #86 corrected that, because
 //     failing to recognise a sibling leaves the broker knowing LESS, not more, and
 //     the weaker knowledge cannot license the stronger claim;
 //   - a remote sibling of the ACKNOWLEDGED record ({b,p}) still classifies

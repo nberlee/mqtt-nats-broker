@@ -87,7 +87,7 @@ func (sess *mqttSession) markWriteRejectedLocked(baseSeq uint64) {
 // resolver's adoption, a repair save's adopting arms — invalidates the marker without
 // having to be enumerated. Each conjunct earns its place:
 //
-//   - armed because a base-0 rejection is now REAL (F-029 made the create conditional),
+//   - armed because a base-0 rejection is now REAL (issue #31 made the create conditional),
 //     so the sequence alone can no longer stand in for "is there a marker": zero used
 //     to mean none. It is the ONE fact this predicate cannot derive, which is why
 //     clear() — the route that re-mints at seq = 0 — carries an explicit obligation to
@@ -285,7 +285,7 @@ const (
 	// mqttBoundDisposed: the probe proved the session foreign and this settlement disposed
 	// it, so this connection is the one that owes the client its DISCONNECT. Not a takeover
 	// claim: the probe established that the record is not ours and nothing about who holds
-	// it, so what it owes is 0x89 ownership-unsettled. F-084.
+	// it, so what it owes is 0x89 ownership-unsettled. issue #86.
 	mqttBoundDisposed
 )
 
@@ -387,7 +387,7 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 			// to mqttBoundUnsettled above and never disposes — so the UNSETTLED vocabulary is
 			// the only one this tail can owe. It used to say taken-over, which claimed a
 			// successor the probe never found: a definite rejection proves the subject moved
-			// past our base and nothing about who moved it. F-084.
+			// past our base and nothing about who moved it. issue #86.
 			stale.mqttNotifyForeignDisposal(sess.id, mqttDisposalOwnershipUnsettled)
 			stale.closeConnection(mqttDisposalOwnershipUnsettled.closeReason)
 		}
@@ -443,7 +443,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// resolver displacement as the three producers of a moved binding.
 		//
 		// Only a DIFFERENT, NON-NIL local client is the licensed evidence, and only it
-		// discards. F-084.
+		// discards. issue #86.
 		switch {
 		case stale == c:
 			return mqttBoundUnsettled, nil
@@ -470,7 +470,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// The probe found a record that is not ours. It does NOT identify who holds it, so
 		// the Will is consumed rather than discarded — the forked arm below already refuses
 		// to suppress a Will "nothing arbitrated", and this arm arbitrated no more about a
-		// SUCCESSOR than that one did. F-084.
+		// SUCCESSOR than that one did. issue #86.
 		//
 		// Phase 1 prepares it and phase 2 runs it here, with this frame's own record
 		// transaction already closed by settleRecordRejectionBound and the ownership gate
@@ -500,7 +500,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// Both arms now treat the Will the same way, and this comment used to say
 		// otherwise: the foreign arm applied the takeover's discard "because a
 		// demonstrated takeover owns the Will's fate", when nothing there demonstrated
-		// one. F-084 made it consume, which is what this arm always did — suppressing a
+		// one. issue #86 made it consume, which is what this arm always did — suppressing a
 		// Will nothing arbitrated was the defect, on either arm.
 		return mqttBoundUnsettled, nil
 	case mqttRejectionKeep:

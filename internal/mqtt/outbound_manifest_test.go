@@ -45,7 +45,7 @@ func testF105Manifest(e *testF105Env, state mqttManifestState, chunks, written u
 	}
 }
 
-// testF105StandingTenure is the tenure a reservation binds its copy to (F-105 7c): the standing
+// testF105StandingTenure is the tenure a reservation binds its copy to (issue #107 7c): the standing
 // authority's, or a well-formed placeholder where none stands yet (a shape-only fixture).
 func testF105StandingTenure(e *testF105Env) string {
 	if e == nil || e.asm == nil {
@@ -325,7 +325,7 @@ func TestF105ManifestBodiesAreRefusedWhenUnsupported(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,
 			State: mqttManifestProvisioning, Topic: "a/b", QoS: 1, Bytes: 8, Chunks: 1,
 			Digest: "d", Tenure: "tenure-fixture"}, false},
-		// THE PRODUCING TENURE is what the close's tenure fence reads (F-105 7c): a copy without
+		// THE PRODUCING TENURE is what the close's tenure fence reads (issue #107 7c): a copy without
 		// one could never be told apart from a successor's.
 		"no producing tenure": {&mqttRetainedManifest{
 			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Payload: testF105Payload,

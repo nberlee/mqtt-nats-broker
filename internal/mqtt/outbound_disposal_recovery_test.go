@@ -23,7 +23,7 @@ func testUnitCRecoverySuccessor(t *testing.T, f *testAbandonFix, deny bool) stri
 		t.Fatal("successor entitlement was not installed")
 	}
 	// And the session is bound to it, as the accept loop records beside the connection's
-	// entitlement (F-105 7b): a resume applies only for the entitlement its session is bound to.
+	// entitlement (issue #107 7b): a resume applies only for the entitlement its session is bound to.
 	f.e.sess.mu.Lock()
 	f.e.sess.boundEnt, f.e.sess.boundEntOK = mqttOutboundEntitlement{Gen: f.gen, Tenure: tenure}, true
 	f.e.sess.mu.Unlock()

@@ -2,7 +2,7 @@
 #
 # Dependency canary: run the repository-owned JetStream write-contract regressions
 # inside an isolated nats-server checkout. Two questions -- the Will outbox's terminal
-# state (F-030) and the accepted-CONNECT atomic batch -- answered the same way.
+# state (issue #34) and the accepted-CONNECT atomic batch -- answered the same way.
 #
 # The fixtures live in testdata/ because they are package `server` files: they cannot
 # compile inside this module, and the Go tool never builds a directory called

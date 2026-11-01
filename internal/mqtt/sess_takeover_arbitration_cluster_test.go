@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// F-029's arbitration over REAL replicated JetStream.
+// issue #31's arbitration over REAL replicated JetStream.
 //
 // Every other test of the conditional create runs against one embedded stream, where the
 // expected-last-subject-sequence check is a single-writer store check. That is NOT the
@@ -40,7 +40,7 @@ func testClusterFreshSession(t *testing.T, s *Server, clientID string) *mqttSess
 
 // TestMQTTTakeoverCreateRaceReplicated is B1 on the path B1 is actually about.
 //
-// Two brokers both find no record for one client and both create. Before F-029 the create
+// Two brokers both find no record for one client and both create. Before issue #31 the create
 // carried no CAS header, so both landed, the later apply won under MaxMsgsPer:1, and the
 // earlier broker's acknowledged record was erased with no rejection anywhere — a silent
 // loss of a session's subscriptions, consumers and lifetime grant. With the header at
@@ -151,7 +151,7 @@ func TestMQTTTakeoverCreateRaceReplicated(t *testing.T) {
 // TestMQTTTakeoverSupersededClaimReplicated is the stomp, on replicated JetStream.
 //
 // Broker A owns the session. Broker B holds a stale view and runs a clean-start discard:
-// its teardown claim is superseded, and before F-029 it went on to an accept save framed
+// its teardown claim is superseded, and before issue #31 it went on to an accept save framed
 // at sequence 0 — which landed unconditionally and erased A's record inside one leader
 // term. Here the claim must report superseded and the create that used to follow it must
 // be refused, with A's record byte-identical afterwards.

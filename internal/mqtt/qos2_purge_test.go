@@ -94,7 +94,7 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	// clear() re-minted the incarnation, so a later session for the same client ID
 	// hashes to the same idHash but holds on a DIFFERENT subject. That is what makes a
 	// late purge from the discarded incarnation harmless TO THE NEXT INCARNATION: it can
-	// no longer name this record. (F-062 for what it does not protect.)
+	// no longer name this record. (issue #66 for what it does not protect.)
 	sess2, _, err := asm.createOrRestoreSession(clientID, s.getOpts())
 	if err != nil {
 		t.Fatalf("createOrRestoreSession (second session): %v", err)
@@ -124,7 +124,7 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	// nonce re-check cannot close — must not touch the new incarnation's record.
 	// This is the arbitration walk now, and it is scoped by the retired generation, so it
 	// cannot name the NEW incarnation's subjects. (A peer still serving the retiring
-	// generation is a different matter: F-062.)
+	// generation is a different matter: issue #66.)
 	if err := asm.arbitrateQoS2ReleaseClaims(s, sess.idHash, retiringGen); err != nil {
 		t.Fatalf("replaying the retired incarnation's arbitration: %v", err)
 	}

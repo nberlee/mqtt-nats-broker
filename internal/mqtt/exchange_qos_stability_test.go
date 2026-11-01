@@ -25,7 +25,7 @@ import (
 //
 // DUP is deliberately NOT used as an oracle anywhere in this file: it is derived from
 // the JetStream delivery count, so a redelivery carries DUP=1 whether or not this
-// mechanism works (F-072).
+// mechanism works (issue #76).
 
 // testExchangeQoSAckSubject returns the JetStream ack subject of the delivery currently
 // outstanding under pi, which is what a test NAKs to schedule a re-offer.
@@ -557,7 +557,7 @@ func TestExchangeQoSWireMatchesPreservedRecord(t *testing.T) {
 
 	// The occupant: an ADMITTED allocation for the delivery that is about to be allocated,
 	// carrying QoS 2 — its register, unsent marker and exchange, as the production admission
-	// writes them. Since F-105 a register is written only inside an authority batch, so the
+	// writes them. Since issue #107 a register is written only inside an authority batch, so the
 	// occupant is admitted the same way, from inside the caller's own admission: the caller's
 	// register is cloned out of its batch, given a fresh nonce and lineage and QoS 2, and
 	// admitted first. The caller's batch then collides with it, and the ladder meets a

@@ -15,7 +15,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// F-059: the retained index is ordered by $MQTT_rmsgs stream sequence across all of its
+// issue #63: the retained index is ordered by $MQTT_rmsgs stream sequence across all of its
 // writers, and a lost observer application is detected and repaired by resuming the
 // observer from W+1. See retained_index.go. Every test here names the mutation it exists
 // to kill.

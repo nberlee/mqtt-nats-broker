@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// Releasing session metadata before physical cleanup (F-105, row 8).
+// Releasing session metadata before physical cleanup (issue #107, row 8).
 //
 // # The coupling being broken
 //
@@ -228,7 +228,7 @@ func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mq
 	// recovery finishes first; accepting the certificate alone would release a generation whose
 	// duties nothing has ever traversed.
 	//
-	// A ROOT IS OWNERSHIP ONLY WHERE AN IMPLEMENTED EXECUTOR OWNS WHAT IT LEADS TO (F-105 7d). Its
+	// A ROOT IS OWNERSHIP ONLY WHERE AN IMPLEMENTED EXECUTOR OWNS WHAT IT LEADS TO (issue #107 7d). Its
 	// executor performs a DISCARDED generation's retirement in full — every obligation ended and
 	// its records deleted, every consumer disposed of, authorized and deleted, the affine and
 	// retained work as before — so there a reachable root is durable recovery ownership even while

@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// A closing batch enrols its generation for recovery (F-105, row 6).
+// A closing batch enrols its generation for recovery (issue #107, row 6).
 //
 // # Why this is keyed on the CLOSURE and not on the members present
 //
@@ -128,7 +128,7 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 		// that can neither close nor be recovered is exactly the stranding this enrolment exists
 		// to prevent.
 		// A FLOOR ADVANCE on an already-sealed ledger rewrites it SEALED with only its deletion
-		// watermark moved (F-112); checkFloorAdvance refuses it unless the stored ledger was
+		// watermark moved (issue #114); checkFloorAdvance refuses it unless the stored ledger was
 		// already sealed, so it seals nothing.
 		if gen, found := mqttSealsLedgerOutsideAClosure(t, idHash); found && a.Kind != mqttTransitionAdvanceFloor {
 			return fmt.Errorf("transition %q seals the inventory ledger of generation %q and "+

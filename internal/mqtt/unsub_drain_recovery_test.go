@@ -50,11 +50,11 @@ func drainTestSession(t *testing.T, clientID string) (*Server, *client, *mqttSes
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
 	// A real drain-recovery session reached PUBREL provisioning through a CONNECT that minted a
-	// serving authority (F-105 cutover); this env never CONNECTs, so install it here so the
+	// serving authority (issue #107 cutover); this env never CONNECTs, so install it here so the
 	// claim-before-create provisioning has an authority to admit under.
 	testInstallServingAuthority(t, asm, sess)
 	// And its connection is ACCEPTED under it, as the CONNECT's accept loop records on the
-	// connection and the session object (F-105 7b): cancellations are staged against it.
+	// connection and the session object (issue #107 7b): cancellations are staged against it.
 	testAcceptRigConnection(t, asm, sess, c)
 	return s, c, sess, nc
 }
@@ -388,7 +388,7 @@ func TestDrainRecoveryPrunesAMessageAbsentAboveFirstSeq(t *testing.T) {
 
 // The per-consumer inactivity-timer SHEDDING mechanism (commitDrains reporting timed
 // drains + clearDrainInactivityTimers re-issuing the create with a zeroed threshold)
-// was DELETED in the F-105 cutover: enrolled source consumers are now created with NO
+// was DELETED in the issue #107 cutover: enrolled source consumers are now created with NO
 // inactivity threshold from the outset (mqttClearConsumerInactivity), so a committed
 // drain has nothing to shed and the un-cleared-drain state is unreachable through the
 // production path. TestDrainClearsTheConsumerInactivityTimer, which built a drain on a
@@ -1581,7 +1581,7 @@ func TestResolutionRefusesWhileAnotherTransactionIsOpen(t *testing.T) {
 // damage a replacement session installed by a competing CONNECT.
 //
 // A foreign verdict means the record is not ours, so this object must go. (Not that
-// another owner holds it — nothing here establishes one; F-084.)
+// another owner holds it — nothing here establishes one; issue #86.)
 // But eviction by client ID is not safe on its own: a CONNECT can have already
 // evicted this object and installed a restored replacement under the same ID, and an
 // unconditional delete then removes THAT — leaving a live connection with a session
@@ -1671,7 +1671,7 @@ func TestPeriodicForeignVerdictClosesTheBoundClient(t *testing.T) {
 	sess.mu.Unlock()
 
 	// A competing write advances the record with different content. It makes the record NOT
-	// OURS, which is all the resolver reads from it — no successor is demonstrated (F-084).
+	// OURS, which is all the resolver reads from it — no successor is demonstrated (issue #86).
 	subject := mqttSessStreamSubjectPrefix + sess.domainTk + sess.idHash
 	if _, err := sess.jsa.storeMsg(subject, 0, []byte(`{"owner":"someone-else"}`)); err != nil {
 		t.Fatalf("foreign write: %v", err)
@@ -2183,7 +2183,7 @@ func TestDrainIntentPastPubRecWithNoIdentifierIsQuarantined(t *testing.T) {
 			sess.mu.Lock()
 			hold := sess.drainSidHoldLocked(sid)
 			sess.mu.Unlock()
-			// The REASON matters, not just that it is held: F-094 widened the predicate so
+			// The REASON matters, not just that it is held: issue #96 widened the predicate so
 			// every past-PUBREC intent holds its sid, and an unattributable one must still
 			// report the stronger condition — it is the one that needs an operator, and the
 			// refusal message says so.

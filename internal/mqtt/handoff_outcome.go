@@ -19,7 +19,7 @@ import (
 	"strconv"
 )
 
-// The handoff metadata outcome (F-105).
+// The handoff metadata outcome (issue #107).
 //
 // $MQTT_sess and $MQTT_inflight cannot commit together — a JetStream atomic batch is per
 // stream — so an ownership handoff is three durable steps: PREPARE on $MQTT_inflight, which
@@ -66,7 +66,7 @@ func mqttValidProposalKind(k mqttProposalKind) bool {
 }
 
 // mqttHandoffVerdict is the permanent verdict of one handoff's metadata half. As elsewhere
-// in F-105 the zero value names neither, so a body missing the member cannot decode as the
+// in issue #107 the zero value names neither, so a body missing the member cannot decode as the
 // permissive one.
 type mqttHandoffVerdict uint8
 

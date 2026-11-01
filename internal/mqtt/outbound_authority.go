@@ -24,7 +24,7 @@ import (
 	"strings"
 )
 
-// The outbound authority (F-105).
+// The outbound authority (issue #107).
 //
 // Retirement must not destroy the durable representation, or the completion route, of an
 // obligation that was admitted before it. That is the whole invariant, and the reason a
@@ -87,7 +87,7 @@ func mqttF105SubjectPrefix() string {
 	return mqttInflightStreamSubjectPrefix + mqttF105ClassTk + "."
 }
 
-// mqttIsF105Subject reports whether a subject belongs to any F-105 record class.
+// mqttIsF105Subject reports whether a subject belongs to any issue #107 record class.
 func mqttIsF105Subject(subject string) bool {
 	return strings.HasPrefix(subject, mqttF105SubjectPrefix())
 }
@@ -116,7 +116,7 @@ func mqttIsF105ArbitrationSubject(subject string) bool {
 }
 
 // mqttF105ObligationClass returns the obligation class a subject names, and whether it is
-// one at all. A subject under the F-105 prefix that is neither an arbitration record nor a
+// one at all. A subject under the issue #107 prefix that is neither an arbitration record nor a
 // known obligation class is refused rather than guessed at.
 //
 // The GENERATION LEDGER and the DUTY INVENTORY are obligation classes, not arbitration records,
@@ -193,7 +193,7 @@ const (
 	//
 	// Two once existed — admit-tenure at revision 1 and readmit-tenure over a closure — and
 	// both were the bootstrap gap itself: an authority entitled to serve a client with no
-	// reservation behind it and no committed metadata half, which is the entitlement F-105
+	// reservation behind it and no committed metadata half, which is the entitlement issue #107
 	// exists to make impossible. Every route to SERVING is now reserve-creation, a metadata
 	// commit, and finalize-creation, whose verdict check reads the permanent receipt.
 	mqttTransitionPrepareIntent mqttTransitionKind = "prepare-intent"
@@ -209,7 +209,7 @@ const (
 	// carries that receipt's retirement onto the transition so the boundary binds the affine
 	// enrolment to the target the receipt selected, exactly as a finalization binds to its
 	// intent's. Ending a generation is still not authority to abandon what it owes; the
-	// receipt is that authority (F-105, row 8, Gap 1).
+	// receipt is that authority (issue #107, row 8, Gap 1).
 	mqttTransitionCloseTeardown mqttTransitionKind = "close-teardown"
 	mqttTransitionAdmitExchange mqttTransitionKind = "admit-exchange"
 	mqttTransitionAcquireAction mqttTransitionKind = "acquire-action"
@@ -306,13 +306,13 @@ const (
 	mqttTransitionWithdrawUnsent mqttTransitionKind = "withdraw-unsent"
 	// mqttTransitionAbandonDelivery records that the broker abandoned delivery of one restored
 	// ordinary obligation on a positive authorization deny: its register moves to
-	// delivery_abandoned and its exchange Publish -> DeliveryAbandoned, in one batch (F-105 row
+	// delivery_abandoned and its exchange Publish -> DeliveryAbandoned, in one batch (issue #107 row
 	// 5, consult 34). Unlike an ending it is a DECISION made under a connection's entitlement,
 	// so it requires the SERVING authority at exactly that generation and tenure; like an
 	// ending it moves no ownership and admits nothing.
 	mqttTransitionAbandonDelivery mqttTransitionKind = "abandon-delivery"
 	// mqttTransitionTombstoneRegister records that the serving connection CANCELLED one ordinary
-	// allocation without whole-exchange evidence (F-105 7b): the register becomes the cancellation
+	// allocation without whole-exchange evidence (issue #107 7b): the register becomes the cancellation
 	// tombstone — an overwrite of its untokened publish occupant with Cancelled set and nothing
 	// else, or, for an allocation whose own store is still in flight, a create-only tombstone —
 	// and the exchange, if any, is left where it is. Like abandon-delivery it is a DECISION under
@@ -321,13 +321,13 @@ const (
 	mqttTransitionTombstoneRegister mqttTransitionKind = "tombstone-register"
 	// mqttTransitionRebindCanonical re-binds an ordinary `pubrel_ready` slot whose canonical
 	// PUBREL record vanished for a reason other than PUBCOMP to a freshly published, proven
-	// record (F-105 7b, continuation 3): the register moves `pubrel_ready(old tuple) ->
+	// record (issue #107 7b, continuation 3): the register moves `pubrel_ready(old tuple) ->
 	// pubrel_ready(new tuple)` with nothing else changed, and its exchange must stand at
 	// PubRecObserved. The slot is never re-phased, so a PUBCOMP completes it at any moment by
 	// today's arm. Choosing to re-emit is the serving connection's decision, so it requires the
 	// SERVING authority at exactly the attempt's generation and tenure and moves no ownership.
 	mqttTransitionRebindCanonical mqttTransitionKind = "rebind-canonical"
-	// mqttTransitionDiscardExchange ends one obligation of a DISCARDED generation (F-105 7d): its
+	// mqttTransitionDiscardExchange ends one obligation of a DISCARDED generation (issue #107 7d): its
 	// exchange moves from a phase that does not yet release its holds to Discarded, and the batch
 	// releases every hold it has. Its licence is a FACT, not an entitlement: the exchange's own
 	// generation carries a committed discarding closure, which is immutable, so a check against it
@@ -337,14 +337,14 @@ const (
 	// (the reaper may already have taken it), no duty (the census resolves it later).
 	mqttTransitionDiscardExchange mqttTransitionKind = "discard-exchange"
 	// mqttTransitionFenceSharedRelease advances a SERVING authority's revision and nothing else
-	// (F-105 7e): the second step of a shared acquisition's release, written after the ledger
+	// (issue #107 7e): the second step of a shared acquisition's release, written after the ledger
 	// closed the acquisition, so every shared admission that read readiness before the close —
 	// and CASes the authority sequence it read — loses its CAS. It carries no member and changes
 	// no state or ownership; its licence (the verdict) lives on $MQTT_shared, out of this
 	// boundary's sight, and its whole cost to a concurrent operation is one CAS re-read.
 	mqttTransitionFenceSharedRelease mqttTransitionKind = "fence-shared-release"
 	// mqttTransitionFencePendingDisposal advances a SERVING authority's revision and nothing else,
-	// under the DECIDING connection's entitlement (F-119): the step a pending cancellation fence of
+	// under the DECIDING connection's entitlement (issue #121): the step a pending cancellation fence of
 	// the serving generation owes before the one door deletes it. Every admission of the fence's
 	// nonce prepared before it CASes an authority sequence it moves past, and a displaced connection
 	// cannot commit it. It carries no member and changes no state or ownership. See
@@ -605,7 +605,7 @@ type mqttRetirementRequest struct {
 	// retirement that named fewer could be satisfied by a predecessor whose metadata half
 	// had since been replaced.
 	//
-	// ONE EXCEPTION, stated (F-105 8b, consult 122): a receipt the adopted teardown's receiptless
+	// ONE EXCEPTION, stated (issue #107 8b, consult 122): a receipt the adopted teardown's receiptless
 	// continuation authors (claimTeardownReceipt) carries SessWID = the retired record's write
 	// identity (the marker's parent) but SessSeq = the PRE-BATCH MARKER's sequence, because the
 	// retired record's own sequence is not recoverable from the marker. There the two are not
@@ -621,7 +621,7 @@ type mqttRetirementRequest struct {
 	// transaction; it is never itself authority to discard.
 	Discard bool `json:"discard"`
 	// The predecessor's AFFINE target, carried so the closure that ends its generation can
-	// enrol it AFTER the accepted batch has displaced the record that named it (F-105).
+	// enrol it AFTER the accepted batch has displaced the record that named it (issue #107).
 	//
 	// Retention, not proof. `$MQTT_sess` carries MaxMsgsPer 1, so the write that displaces a
 	// session record EVICTS its body: by the time the finalization writes the closure, the
@@ -693,7 +693,7 @@ const (
 	// teardown — and unlike a plain expiry/takeover it DOES discard, which is the fact the
 	// durable teardown receipt authorizes and the discarding closure records. It exists
 	// because Clean Start was the only reason that could discard, and a session that ends
-	// with no successor still has to close its own authority (F-105, row 8, Gap 1).
+	// with no successor still has to close its own authority (issue #107, row 8, Gap 1).
 	mqttRetireSessionEnd mqttRetirementReason = "session-end"
 )
 
@@ -1149,7 +1149,7 @@ func mqttValidateAffineDescriptor(idHash, gen, affGen, affDurable, pubRelDurable
 
 // mqttAffineRetireDescriptor is the affine target a retirement names: the affine durable, its
 // affine generation and the PUBREL consumer that carries its proofs — all three when the retiring
-// generation holds an affine QoS 2 consumer, none when it holds none (F-113).
+// generation holds an affine QoS 2 consumer, none when it holds none (issue #115).
 //
 // The PUBREL durable is the affine target's PROOF SOURCE, never a target of its own: an ordinary
 // QoS 2 session's PUBREL consumer is a provisioned resource, enrolled when it was created and

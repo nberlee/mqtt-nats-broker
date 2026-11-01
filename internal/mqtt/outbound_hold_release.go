@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// An ending other than an acknowledgement's releases its holds in its own batch (F-105 7c-lc).
+// An ending other than an acknowledgement's releases its holds in its own batch (issue #107 7c-lc).
 //
 // An admitted obligation takes an edge on its source consumer (and, at QoS 2, on the canonical
 // PUBREL consumer), and that edge is what keeps the consumer from being retired while the

@@ -1,6 +1,6 @@
 // Verifying a shared group durable a resume is about to restore membership in.
 //
-// THE FINDING (F-076). processSharedJSConsumer's resume fall-through subscribes to the
+// THE FINDING (issue #78). processSharedJSConsumer's resume fall-through subscribes to the
 // recorded deliver subject and stops. Every proof that the group durable still exists sits
 // behind its `!exists` branch, and the post-subscribe repair sits behind `charged != 0`,
 // which is false on that path by construction. So a client whose group durable was deleted
@@ -9,20 +9,20 @@
 // a subject nothing publishes to. No error, no reason code, and it recurs on every reconnect
 // to the same broker while the condition persists.
 //
-// It is NOT the F-050 shape: F-050 refuses a CONNECT whose restoration REPORTS a failure,
+// It is NOT the issue #54 shape: issue #54 refuses a CONNECT whose restoration REPORTS a failure,
 // and here every step returns success, so the per-filter aggregation cannot see it.
 //
 // WHAT THIS FILE ESTABLISHES, AND WHAT IT DELIBERATELY DOES NOT. It establishes
 // CONFIGURATION EVIDENCE: the durable exists and carries a configuration this broker would
 // recognise. It establishes NOTHING about ownership — a present canonical consumer does not
 // prove this broker still owns the membership the restore is keyed on. That fact needs its
-// own instrument, and F-077 added it: on the CONNECT path a classified record write proves
+// own instrument, and issue #79 added it: on the CONNECT path a classified record write proves
 // ownership before the CONNACK (shared_group_arbitrate.go). On the LIVE SUBSCRIBE path
-// nothing did, which was F-078 — now closed: the live path arbitrates through its own
+// nothing did, which was issue #80 — now closed: the live path arbitrates through its own
 // packet-scoped gate and the same classified proof. See sub_operation_gate.go.
 //
 // The verification arm still issues no group-durable write of its own. What changed with
-// F-077 is which verdicts it may hand on to a repair: an AUTHORITATIVE ABSENCE is
+// issue #79 is which verdicts it may hand on to a repair: an AUTHORITATIVE ABSENCE is
 // repairable, so the resume arm recreates the durable and the ownership write then proves
 // the membership it was recreated into is still ours. Every other error stays terminal, and
 // the POST-pass keeps absence terminal too — a durable absent again after the repair is one
@@ -44,7 +44,7 @@ import (
 // established it.
 var (
 	// errSharedGroupAbsent: the lookup COMPLETED and reported the consumer not there.
-	// Authoritative, and the ONE verdict F-077 made repairable: the CONNECT pre-pass hands
+	// Authoritative, and the ONE verdict issue #79 made repairable: the CONNECT pre-pass hands
 	// it to the resume arm, which recreates the durable, and the ownership CAS then proves
 	// the membership it was recreated into is still ours. It stays terminal in the
 	// POST-pass, where an absence is no longer something to create but something being
@@ -60,7 +60,7 @@ var (
 // is failed so the pre-CONNACK aggregation refuses.
 //
 // The rule is stated as a CLASS, not as a list of failure modes, and that is deliberate.
-// F-076's batching seam took four review rounds and closed only when the rule became "any
+// issue #78's batching seam took four review rounds and closed only when the rule became "any
 // verdict carrying an error is terminal, no special cases"; re-opening it with an
 // `if errors.Is(v.err, errSharedGroupAbsent)` at each decision site is the regression those
 // rounds paid for. So there is exactly one predicate, and repairability is a property of
@@ -70,7 +70,7 @@ var (
 //
 // errSharedGroupAbsent is the only repairable verdict, because it is the only one an
 // authoritative reading can act on: the durable provably is not there, so recreating it
-// under a proven membership is a defined operation (F-077). A non-canonical durable may be
+// under a proven membership is a defined operation (issue #79). A non-canonical durable may be
 // serving other members and is not this broker's to normalize; an indeterminate reading
 // established nothing at all, and recreating on it turns one broker's transient error into
 // a group-wide change (feedback_absence_is_not_a_fact).
@@ -81,7 +81,7 @@ func mqttSharedGroupVerdictIsTerminal(v mqttSharedGroupVerdict) bool {
 	return v.err != nil && !mqttSharedGroupVerdictIsRepairable(v)
 }
 
-// mqttSharedGroupVerdictIsRepairable reports whether F-077's resume repair may act on this
+// mqttSharedGroupVerdictIsRepairable reports whether issue #79's resume repair may act on this
 // verdict. Exactly one verdict qualifies; see mqttSharedGroupVerdictIsTerminal.
 //
 // PRE-PASS ONLY. The post-pass calls the terminal predicate through
@@ -423,7 +423,7 @@ func (as *mqttAccountSessionManager) classifySharedGroups(targets []mqttSharedGr
 	//
 	// The predicate is the caller's because the two passes disagree about exactly one
 	// verdict. In the PRE-pass an authoritative absence is REPAIRABLE, so classification
-	// continues and the resume arm recreates the durable (F-077); in the POST-pass it is
+	// continues and the resume arm recreates the durable (issue #79); in the POST-pass it is
 	// terminal, because an absence after the repair is something being deleted underneath
 	// this CONNECT rather than something to create. Everything else is terminal in both.
 	//
@@ -551,7 +551,7 @@ func applySharedGroupPostPass(as *mqttAccountSessionManager, sess *mqttSession,
 // first is the batch termination in classifySharedGroups, the third is the resume arm's own
 // return — and moving only one of them leaves the repair unreachable: a filter failed here
 // never reaches processSubs at all, because mqttFirstUnrestoredFilter refuses the CONNECT
-// before it (F-077).
+// before it (issue #79).
 func failSharedGroupFilters(filters []*mqttFilter, verdicts map[string]mqttSharedGroupVerdict,
 	ends func(mqttSharedGroupVerdict) bool) {
 

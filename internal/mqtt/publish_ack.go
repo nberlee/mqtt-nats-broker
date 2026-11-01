@@ -167,7 +167,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		ack := mqttAckSnapshot(binding)
 		if phase != mqttExchangePubRecObserved {
 			sess.holdTerminalCleanupLocked(pi, binding.nonce)
-			if ack.slot.namesSource() { // a retained abandonment settles no source (F-105 7c)
+			if ack.slot.namesSource() { // a retained abandonment settles no source (issue #107 7c)
 				sess.holdTerminalSourceLocked(ack.slot)
 			}
 		}
@@ -179,7 +179,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// as the live-entry path below does: the drain's claim is released only by a
 			// CONFIRMED PUBREL, and the canonical PUBREL is delivered only for the exchange the
 			// intent names. An AckRoute installed by a drain-owned deny reaches here with the
-			// drain still claiming its source (F-088 T29: without the intent the PUBREL was
+			// drain still claiming its source (issue #90 T29: without the intent the PUBREL was
 			// withheld forever and the drain stayed claimed).
 			if _, _, drained := sess.drainPubRelState(binding.dur, binding.seq); drained {
 				if _, _, ierr := sess.recordPubRelIntent(c, binding.dur, binding.seq, pi, binding.nonce); ierr != nil {
@@ -190,7 +190,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			case mqttPubRelIntentUnresolved, mqttPubRelIntentStillOwed:
 				sess.scheduleIntentResolution(c, pi, ack)
 			case mqttPubRelIntentConfirmed:
-				// An ABANDONED RETAINED exchange's advance created its canonical PUBREL (F-105 7c):
+				// An ABANDONED RETAINED exchange's advance created its canonical PUBREL (issue #107 7c):
 				// nothing is materialized, so the PUBREL entry is installed here and emitted from it.
 				if binding.payload != _EMPTY_ {
 					sess.continueAbandonedRetainedPubRel(c, pi, ack)
@@ -236,7 +236,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		//     and regSeq 0 — indistinguishable from a live retained exchange — tear down the
 		//     PUBLISH entry so the store then finds it gone and transmits nothing, and ack
 		//     the source away. PUBREL delivery would later admit that entry as retained and
-		//     put a PUBREL on the wire with no durable action: F-092's own class plus the
+		//     put a PUBREL on the wire with no durable action: issue #94's own class plus the
 		//     lost source. The failed arm skips the PUBREL but still untracks and acks the
 		//     source, the same loss without the stray PUBREL.
 		//   - regCancelled: a settled-but-unproven cancellation placeholder is bodyless and
@@ -298,7 +298,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		if _, hasPub := sess.pendingPublish[pi]; !hasPub {
 			if rel, hasRel := sess.pendingPubRel[pi]; hasRel {
 				if rel.kind == mqttPendingRetained {
-					// A RETAINED exchange's PUBREL has no $MQTT_out delivery to re-offer (F-105 7c):
+					// A RETAINED exchange's PUBREL has no $MQTT_out delivery to re-offer (issue #107 7c):
 					// a NEW PUBREL action is acquired on the register and written from the canonical.
 					sess.mu.Unlock()
 					sess.emitRetainedPubRel(c, pi)
@@ -323,14 +323,14 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		}
 		// A section still transmitting this PUBLISH is told FIRST, while the entry it was opened
 		// for is still resident to name it: the PUBREC moves the exchange past its PUBLISH, so
-		// that section must not now begin its write (F-115).
+		// that section must not now begin its write (issue #117).
 		sess.answerOpenPublishLocked(pi)
 		// The JS ACK subject for the PUBREL will be filled in at the delivery
 		// attempt.
 		sess.trackAsPubRel(pi, _EMPTY_)
 	}
 	// An IDENTIFIER-FREEING acknowledgement arriving while this entry's transmission has
-	// not returned parks its freeing half instead of performing it (F-087 WP5, class D).
+	// not returned parks its freeing half instead of performing it (issue #89 WP5, class D).
 	// TCP ordering proves only that this acknowledgement followed an EARLIER
 	// transmission; it says nothing about a concurrent REDELIVERY of the same entry whose
 	// write is blocked on this same connection, the read loop and the JetStream
@@ -350,7 +350,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		if pubRecFailed {
 			kind = mqttSendSettlePubRecFailed
 		}
-		// The acknowledged PUBLISH is not written by a section still open for it (F-115); the
+		// The acknowledged PUBLISH is not written by a section still open for it (issue #117); the
 		// settle parked below still runs at that section's end.
 		sess.answerOpenPublishLocked(pi)
 		if sess.condemnSendLocked(pi, kind) {
@@ -379,7 +379,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	}
 	if removed != nil {
 		jsAckSubject, q2AffClaim, q2AffCopy = removed.jsAckSubject, removed.q2AffClaim, removed.q2AffCopy
-		// A retained exchange's acknowledgement settles no source (F-105 7c), so it installs no
+		// A retained exchange's acknowledgement settles no source (issue #107 7c), so it installs no
 		// source owner: its identifier hold above is released by the terminal attempt itself.
 		if (!isPubRec || pubRecFailed) && removed.slot.slotOK() && removed.slot.namesSource() &&
 			!mqttDurIsSlotOnlyClass(removed.jsDur) {
@@ -593,7 +593,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		default:
 			if removed != nil && removed.kind == mqttPendingRetained {
 				// A RETAINED exchange's canonical PUBREL was created by the advance itself, on
-				// $MQTT_inflight (F-105 7c): nothing is stored on $MQTT_out, and the PUBREL goes
+				// $MQTT_inflight (issue #107 7c): nothing is stored on $MQTT_out, and the PUBREL goes
 				// out directly once this handler releases the locks.
 				retainedPubRel = true
 				break
@@ -643,7 +643,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// placeholder: a filled one is proof the store landed, and the callback
 			// owns completion from there.
 			//
-			// AND NOT AT ALL ONCE THE INTENT IS DURABLE (F-098). `intendPubRelSlot` moves
+			// AND NOT AT ALL ONCE THE INTENT IS DURABLE (issue #100). `intendPubRelSlot` moves
 			// the slot to `pubrel_intended` BEFORE the store, and refuses the store if it
 			// cannot — so a slot-backed exchange reaching this failure has the client's
 			// PUBREC written down. Rolling it back to PUBLISH would contradict that
@@ -689,12 +689,12 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 	switch {
 	case removed != nil && removed.kind == mqttPendingRetained && isPubRec && !pubRecFailed:
 		// A RETAINED exchange past PUBREC has no source to acknowledge and nothing to retire
-		// (F-105 7c): its PUBREL is the canonical the advance created, emitted on return.
+		// (issue #107 7c): its PUBREL is the canonical the advance created, emitted on return.
 	case removed != nil && (!isPubRec || pubRecFailed) && removed.slot.slotOK() &&
 		!mqttDurIsSlotOnlyClass(removed.jsDur):
 		// Advance the protocol now; only the terminal owner may settle this source.
 		releaseRegister(removed)
-		// A RETAINED exchange's ending is the wake for its copy's reclamation (F-105 7c).
+		// A RETAINED exchange's ending is the wake for its copy's reclamation (issue #107 7c).
 		if removed.kind == mqttPendingRetained && removed.retainedInc != _EMPTY_ {
 			sess.wakeRetainedReclaim(removed.ev.gen, removed.retainedInc)
 		}
@@ -719,7 +719,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// NEGATIVE PUBREC — and there no pendingPubRel entry and no PUBREL record are
 		// created, so there is no PUBCOMP and therefore no event at which an unlanded
 		// durable mark could ever be retried. Retiring there would install machinery
-		// whose retry point does not exist. A rejected delivery keeps its pre-F-065
+		// whose retry point does not exist. A rejected delivery keeps its pre-issue #69
 		// behaviour instead: complete the affine side if it can be, then release the
 		// register. Nothing is stranded by that, because with no PUBREL there is nothing
 		// for recovery to arbitrate against and the live copy stays independently
@@ -770,7 +770,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			break
 		}
 		// A rejected delivery: no retirement, and the register is released as it was
-		// before F-065. The copy stays unacknowledged, so AckWait re-offers it and the
+		// before issue #69. The copy stays unacknowledged, so AckWait re-offers it and the
 		// gate re-runs once the claim store heals.
 		releaseRegister(removed)
 	case drainedPubRel:
@@ -801,7 +801,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// authority moved to the PUBREL record. It does not move any more: the slot owns
 		// the exchange for its whole life and was re-phased at the store.
 		//
-		// BUT THE ACKNOWLEDGED EXCHANGE'S OWN TERMINAL CLEANUP STILL RUNS (F-098, holistic
+		// BUT THE ACKNOWLEDGED EXCHANGE'S OWN TERMINAL CLEANUP STILL RUNS (issue #100, holistic
 		// review round 7). "The source was handled" is not "the register disappeared": the
 		// drain's release legitimately PRESERVES a transmitted register under Reserved
 		// authority, and it can equally be refused or come back indeterminate. Skipping the
@@ -958,7 +958,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// different questions: a withheld PUBCOMP costs a PUBREL redelivery, and that
 	// redelivery's own send section re-incurs the debt, so the accounting stays exact
 	// across any number of retries. Deferring the consume below the gates instead makes
-	// a withheld exchange double-count and never release its identifier (F-089).
+	// a withheld exchange double-count and never release its identifier (issue #91).
 	sess.consumePubRelAckLocked(c, pi)
 	if sess.recoveryPIHeldLocked(pi) {
 		sess.mu.Unlock()
@@ -1030,7 +1030,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// lose and the pre-existing behaviour stands.
 	ack := sess.pendingPubRel[pi]
 	// A RETAINED exchange's PUBREL has no $MQTT_out delivery, so no ACK subject: its evidence is the
-	// entry's slot, checked below (F-105 7c).
+	// entry's slot, checked below (issue #107 7c).
 	if sess.recoveryPIHeldLocked(pi) || ack == nil || (ack.jsAckSubject == _EMPTY_ && ack.kind != mqttPendingRetained) ||
 		ack.jsDur != jsDur || ack.sseq != sseq {
 		sess.mu.Unlock()
@@ -1046,7 +1046,7 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	}
 	// The slot reference is captured BEFORE the untrack, because the untrack is what
 	// drops the entry that carries it. Without this the terminal transition below would
-	// have nothing to address, and a sequence-addressed fallback is the addressing F-034
+	// have nothing to address, and a sequence-addressed fallback is the addressing issue #38
 	// forbids.
 	termSlot := ack.slot
 	// Replace the delivered entry with a terminal reservation under the SAME lock. The

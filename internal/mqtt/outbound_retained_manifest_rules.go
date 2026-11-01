@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// The retained manifest ARBITRATES (F-105 7c).
+// The retained manifest ARBITRATES (issue #107 7c).
 //
 // Three acts touch a READY copy and must exclude each other, and they do it by all CASing the one
 // record rather than by observing each other:
@@ -139,7 +139,7 @@ func (jsa *mqttJSA) checkRetainedAdmission(a *mqttTransitionAttempt, extra []mqt
 	case x.QoS != m.QoS:
 		return fmt.Errorf("transition %q admits a QoS %d exchange against a QoS %d copy", a.Txn, x.QoS, m.QoS)
 	case x.RetainedOwner != m.Inc:
-		// THE OWNER ADDRESS is the copy's own owner (F-112): the floor reads it to prove the
+		// THE OWNER ADDRESS is the copy's own owner (issue #114): the floor reads it to prove the
 		// material edge released, so an exchange naming another incarnation, or none, would
 		// point that proof at a resource this obligation never held.
 		return fmt.Errorf("transition %q admits exchange %q against manifest %q owned by %q while the "+
@@ -349,7 +349,7 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 		}
 		return false
 	}
-	// THE OTHER DIRECTION OF THE OWNER ADDRESS (F-112): an exchange created naming a retained owner
+	// THE OTHER DIRECTION OF THE OWNER ADDRESS (issue #114): an exchange created naming a retained owner
 	// is a retained admission, so the batch must carry that owner's copy naming it admitted.
 	ownedAdmission := func(gen, owner, nonce string) bool {
 		for _, e := range extra {
@@ -420,7 +420,7 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 	return nil
 }
 
-// mqttIsExchangeMember reports whether a member subject is an F-105 exchange record.
+// mqttIsExchangeMember reports whether a member subject is an issue #107 exchange record.
 func mqttIsExchangeMember(subj string) bool {
 	cls, ok := mqttF105ObligationClass(subj)
 	return ok && cls == mqttExchangeClassTk

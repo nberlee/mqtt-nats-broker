@@ -60,7 +60,7 @@ func testF105PlantResourceProv(t *testing.T, e *testF105Env, inc string, kind mq
 		Prov: prov, Deps: []mqttResourceEdge{},
 	}
 	if mqttResourceLogicalUseKind(kind) {
-		// A claimed consumer carries the tenure that claimed it (F-105 7f).
+		// A claimed consumer carries the tenure that claimed it (issue #107 7f).
 		r.ProvTenure = "prov-t0"
 	}
 	b, _ := json.Marshal(r)
@@ -69,7 +69,7 @@ func testF105PlantResourceProv(t *testing.T, e *testF105Env, inc string, kind mq
 	if err != nil {
 		t.Fatalf("planting resource %q: %v", inc, err)
 	}
-	// CLAIM-BEFORE-CREATE (F-105 §5.1): a name-governed consumer (source/PUBREL) has a LIVE
+	// CLAIM-BEFORE-CREATE (issue #107 §5.1): a name-governed consumer (source/PUBREL) has a LIVE
 	// name-ownership record standing for it, owned by this incarnation, before any dependency
 	// may be admitted against it. Planting it alongside the resource is what production does at
 	// subscribe; tests that need a MISSING or RETIRED owner delete or retire it afterwards.
@@ -562,7 +562,7 @@ func testF105FinishExchange(t *testing.T, e *testF105Env, nonce string) {
 }
 
 // testF105WithHoldReleases adds to a hand-composed ending the release of the exchange's holds,
-// through the production helper (F-105 7c-lc), where the ending releases in its own batch: an
+// through the production helper (issue #107 7c-lc), where the ending releases in its own batch: an
 // ending of that kind without them is refused at the boundary.
 func testF105WithHoldReleases(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition,
 	cur *mqttOutboundExchange, to mqttExchangePhase) *mqttAuthorityTransition {

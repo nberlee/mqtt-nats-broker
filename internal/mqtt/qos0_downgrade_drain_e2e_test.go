@@ -725,7 +725,7 @@ func testRolledBackHold(s *Server, sess *mqttSession, dur, nonce string) (mqttNa
 //
 // Release is not deletion. A release DECIDES the consumer (`rolled-back`) and hands it to the
 // retirement owner, which WITHHOLDS the delete while an obligation still holds the consumer
-// (F-105 7c-lc): the started exchange is one. The test stops at that held state. What becomes of
+// (issue #107 7c-lc): the started exchange is one. The test stops at that held state. What becomes of
 // the exchange afterwards is a stated residual in docs/CONFORMANCE.md (a possibly-attempted
 // PUBLISH on a consumer a failed SUBSCRIBE created is not retransmitted on resume), and no
 // assertion here makes it a contract.

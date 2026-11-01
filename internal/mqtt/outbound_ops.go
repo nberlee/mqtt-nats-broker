@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 )
 
-// THE OPERATION SURFACE (F-105).
+// THE OPERATION SURFACE (issue #107).
 //
 // This is what a caller of the outbound arbitration mechanism uses, and it is deliberately
 // the ONLY thing a caller uses. Every entry point here takes the operation's own arguments —
@@ -318,7 +318,7 @@ func (jsa *mqttJSA) opFinalizeClaim(id, epoch, txn, intentID string) (mqttOpOutc
 // delayed until tenure B has finished resuming would otherwise match on the generation and
 // permanently close the generation B is serving.
 func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn string) (mqttOpOutcome, error) {
-	// EVERY CLOSURE SEALS AND ROOTS (F-105, row 6), so this composes the enrolment with an empty
+	// EVERY CLOSURE SEALS AND ROOTS (issue #107, row 6), so this composes the enrolment with an empty
 	// target set rather than being a second, barer way to close a generation. A closure with no
 	// root would be refused at the boundary — and the reason it is refused there rather than
 	// merely composed correctly here is that the rule must hold for a batch assembled by
@@ -382,7 +382,7 @@ var mqttTestPrepareHandoffReadHookV atomic.Pointer[func(id string)]
 // that is not there. The preparation must displace
 // EXACTLY that authority: its own read must stand at fence, and its transition CASes it. A later
 // sequence means the authority was written after those reads — a successor-tenure disposal among
-// the possibilities — and is refused with errMQTTForkFenceMoved, never refreshed (F-105 7f).
+// the possibilities — and is refused with errMQTTForkFenceMoved, never refreshed (issue #107 7f).
 func (jsa *mqttJSA) opPrepareHandoffFenced(id, epoch, txn string, i *mqttHandoffIntent, fence uint64) (mqttOpOutcome, error) {
 	if h := mqttTestPrepareHandoffReadHookV.Load(); h != nil {
 		(*h)(id)
@@ -453,7 +453,7 @@ func (jsa *mqttJSA) opFinalizeHandoff(id, epoch, txn, intentID string) (mqttOpOu
 	// reader the session was resumable. The closure is derived from the intent's own
 	// retirement request, never supplied.
 	if i.Retire != nil && i.Retire.Discard {
-		// AND IT ENROLS THE GENERATION IT CLOSES, in the same batch (F-105, row 6). The
+		// AND IT ENROLS THE GENERATION IT CLOSES, in the same batch (issue #107, row 6). The
 		// predecessor's held durables are the intent's to name — it was written while the
 		// predecessor's record still stood, which is what makes them nameable after the accepted
 		// batch displaced that record — and the enrolment, the seal, the shard allocation and the
@@ -894,7 +894,7 @@ func (jsa *mqttJSA) opReplacePublish(r *mqttReplacePublishRequest) (mqttOpOutcom
 			return mqttOpOutcome{}, terr
 		}
 		// The superseded predecessor's holds go in this batch, merged into the fresh obligation's
-		// own member where both hold one resource (F-105 7c-lc).
+		// own member where both hold one resource (issue #107 7c-lc).
 		if herr := jsa.appendHoldReleases(tr, pred, mqttExchangeSupersededUnsent); herr != nil {
 			return mqttOpOutcome{}, herr
 		}
@@ -950,7 +950,7 @@ type mqttAcquireActionRequest struct {
 	// Register is the exact in-flight register occupant this acquisition installs its output
 	// custody TOKEN on, and RegisterSeq the sequence it was read at; Token is the lease itself.
 	// The token acquisition and the action record are committed as ONE atomic authority batch
-	// (F-105 row 2, §4.3 point 1): the register CAS at RegisterSeq installs the token, binds it to
+	// (issue #107 row 2, §4.3 point 1): the register CAS at RegisterSeq installs the token, binds it to
 	// the occupant's existing custody, and advances Acq, BESIDE the create-only action record —
 	// neither is an independent acquisition. REQUIRED: an action record with no token beside it
 	// excludes no second acquisition. A retained send has no durable slot and so acquires no
@@ -1060,7 +1060,7 @@ func (jsa *mqttJSA) opAcquireActions(reqs []*mqttAcquireActionRequest) (mqttOpOu
 		return mqttOpOutcome{}, nil, terr
 	}
 	tr.Extra = append(tr.Extra, toks...)
-	// THE CERTIFICATE'S CONTEXT IS REGISTERED BEFORE THE BATCH IS SENT (F-105 8c): from here on
+	// THE CERTIFICATE'S CONTEXT IS REGISTERED BEFORE THE BATCH IS SENT (issue #107 8c): from here on
 	// this connection may hold a token, whether or not this call learns that it landed.
 	if rerr := r0.Binding.registerAcquisition(jsa.newCertPersistCtx(r0.ID, r0.Epoch, auth.Gen)); rerr != nil {
 		return mqttOpOutcome{}, nil, fmt.Errorf("acquiring an action for exchange %q: %w", r0.Nonce, rerr)
@@ -1127,7 +1127,7 @@ func (jsa *mqttJSA) composeAcquisition(auth *mqttOutboundAuthority, r *mqttAcqui
 		Run: r.Binding.run, Conn: r.Binding.conn, Tenure: auth.Tenure, AcqTxn: r.Txn,
 	}
 	{
-		// THE OUTPUT-CUSTODY TOKEN, INSTALLED IN THE SAME BATCH (F-105 row 2, §4.3 point 1). The
+		// THE OUTPUT-CUSTODY TOKEN, INSTALLED IN THE SAME BATCH (issue #107 row 2, §4.3 point 1). The
 		// register is CASed at the sequence it was read at: the token is installed, bound to the
 		// custody the slot already carries (the validator requires the two equal), and the
 		// acquisition counter advances. The batch's action record and this token member must
@@ -1148,12 +1148,12 @@ func (jsa *mqttJSA) composeAcquisition(auth *mqttOutboundAuthority, r *mqttAcqui
 		next.ActionClaim = r.Register.Claim
 		next.ActionClaimSeq = r.Register.ClaimSeq
 		next.Acq = r.Register.Acq + 1
-		// A RETRANSMISSION OVER A KNOWN-FALSE CANCELLATION clears it (F-088): the write boundary
+		// A RETRANSMISSION OVER A KNOWN-FALSE CANCELLATION clears it (issue #90): the write boundary
 		// lets the member land only when the allocation's unsent marker reads authoritatively
 		// absent (the PUBLISH was already attempted, so the bit's "never sent" is false); a
 		// standing marker is a genuine cancellation and the acquisition is refused there.
 		if r.Register.CancelOrigin == mqttCancelOriginPendingCreate {
-			// A pending fence is never acquired: it is not an exchange's identity carrier (F-088).
+			// A pending fence is never acquired: it is not an exchange's identity carrier (issue #90).
 			return nil, tok, fmt.Errorf("acquiring an action for exchange %q: the register is a "+
 				"pending cancellation fence, which no acquisition may take", r.Nonce)
 		}
@@ -1236,7 +1236,7 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 		Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
 	}
 	if mqttResourceLogicalUseKind(kind) {
-		// The tenure that claims it, which the boundary proves is the serving one (F-105 7f).
+		// The tenure that claims it, which the boundary proves is the serving one (issue #107 7f).
 		r.ProvTenure = auth.Tenure
 	}
 	if verr := mqttValidateOutboundResource(r, id, epoch, auth.Gen, inc); verr != nil {
@@ -1271,7 +1271,7 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 		expect: 0,
 		body:   body,
 	}}, inv...)
-	// A SOURCE or PUBREL consumer's physical NAME is claimed LIVE in this same batch (F-105
+	// A SOURCE or PUBREL consumer's physical NAME is claimed LIVE in this same batch (issue #107
 	// cutover, consult 4). The physical CONSUMER.CREATE is a queued request the broker can
 	// neither fence nor retract, so the name — not the create — is what an obligation depends
 	// on, and this record is what makes "this name is owned by exactly one live resource"
@@ -1339,11 +1339,11 @@ func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc string,
 
 // errMQTTDisposalEntitlementMoved reports that the entitlement a disposal decision was taken under
 // no longer serves: the decision is never re-made under the successor, so its custodian drops it
-// and the resource is left for the recovery executor (F-105 7c-lc's handoff to 7d).
+// and the resource is left for the recovery executor (issue #107 7c-lc's handoff to 7d).
 var errMQTTDisposalEntitlementMoved = errors.New("the disposal's entitlement no longer serves")
 
 // errMQTTDisposalEntitlementPreparing reports that the entitlement a disposal was taken under is
-// the one a handoff is PREPARING to displace (F-105 7f). That is not yet a move: a preparation can
+// the one a handoff is PREPARING to displace (issue #107 7f). That is not yet a move: a preparation can
 // be cancelled, which restores exactly this tenure, so the decision is withheld and re-attempted
 // rather than dropped — dropping it would strand the consumer with no successor to settle it.
 var errMQTTDisposalEntitlementPreparing = errors.New("a handoff is preparing to displace the disposal's entitlement")
@@ -1359,7 +1359,7 @@ type mqttRequestDisposalRequest struct {
 	Entitlement mqttOutboundEntitlement
 }
 
-// opRequestDisposal records that a source or PUBREL consumer is ended (F-105 7c-lc).
+// opRequestDisposal records that a source or PUBREL consumer is ended (issue #107 7c-lc).
 //
 // The write is licensed by the entitlement the route decided under, never by the authority that
 // happens to stand when it is sent (mqttCheckDisposalLicence). Idempotent on a decision already
@@ -1446,7 +1446,7 @@ func (jsa *mqttJSA) opAuthorizeDeletion(id, epoch, txn, op, gen, inc string) (mq
 	if terr != nil {
 		return mqttOpOutcome{}, terr
 	}
-	// AUTHORIZING DELETION IS WHERE THE PHYSICAL NAME IS SPENT (F-105 cutover, consult 4). For
+	// AUTHORIZING DELETION IS WHERE THE PHYSICAL NAME IS SPENT (issue #107 cutover, consult 4). For
 	// a source or PUBREL consumer the same batch retires the name's ownership LIVE -> RETIRED,
 	// retaining the owner: from here no obligation may depend on the name and no replacement
 	// may claim it, so a queued CREATE that resurrects the physical consumer afterwards is a
@@ -1461,7 +1461,7 @@ func (jsa *mqttJSA) opAuthorizeDeletion(id, epoch, txn, op, gen, inc string) (mq
 				"ownership record, so its retirement cannot be authorized (a missing record is withheld, "+
 				"never taken as permission)", inc, cur.Name)
 		}
-		// THE DISPOSING RESOURCE MUST BE THE NAME'S OWNER (F-105 cutover, Codex consult 14 finding 1).
+		// THE DISPOSING RESOURCE MUST BE THE NAME'S OWNER (issue #107 cutover, Codex consult 14 finding 1).
 		// This batch retires the name on behalf of resource (gen, inc); if the standing ownership names
 		// a DIFFERENT owner, this resource does not own the name and disposing it must not retire another
 		// owner's LIVE name. Enforced explicitly rather than copying the owner through, so a RETIRED
@@ -1520,7 +1520,7 @@ func (jsa *mqttJSA) commitResourceStep(auth *mqttOutboundAuthority, authSeq uint
 
 // mqttJudgeReadyResource is the resource half of readiness for use: the resource stands LIVE for
 // a logical-use kind and undisposed, and its kind names the owned stream its consumer lives on.
-// Readiness for use is the live admission gate a source or PUBREL dependency must pass (F-105
+// Readiness for use is the live admission gate a source or PUBREL dependency must pass (issue #107
 // cutover, consult 4's §5.1): this half, the ownership half and the stream half below are the
 // durable and configuration facts; the consumer's own usability is the live lookup beside them.
 // readyDependencyInc applies all of them, in that order.
@@ -1539,7 +1539,7 @@ func mqttJudgeReadyResource(gen, inc string, r *mqttOutboundResource, rerr error
 		return _EMPTY_, fmt.Errorf("resource %q/%q is in state %d, so it is not ready for use", gen, inc, r.State)
 	}
 	// A DISPOSED consumer serves nothing new: the route that ended it has decided, and the
-	// boundary refuses an edge against it anyway (F-105 7c-lc).
+	// boundary refuses an edge against it anyway (issue #107 7c-lc).
 	if r.Disposal != nil {
 		return _EMPTY_, fmt.Errorf("resource %q/%q was disposed (%s), so it is not ready for use", gen, inc, r.Disposal.Reason)
 	}

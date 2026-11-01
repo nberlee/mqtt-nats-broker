@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// The F-105 clean-start HANDOFF over a LIVE serving authority.
+// The issue #107 clean-start HANDOFF over a LIVE serving authority.
 //
 // A clean start that lands on a client whose outbound authority is SERVING no longer destroys
 // the record and then acquires ownership — that premature destruction left the authority
@@ -232,7 +232,7 @@ func TestF105CleanStartHandoffCleansUpThePredecessorConsumer(t *testing.T) {
 // successor record and its COMMITTED receipt are durable, the authority stands PREPARING, and
 // a fresh CONNECT must complete the SAME proposal — finalizing the successor it committed
 // rather than proposing another (Codex consult 6: a committed proposal must finalize exactly
-// as proposed). F-105 8a: the seam moved from the metadata ACK, where a failure is now a lost
+// as proposed). issue #107 8a: the seam moved from the metadata ACK, where a failure is now a lost
 // response the executor resolves in place (TestF105LostResponseMetadataCommitFinalizesInPlace),
 // to the finalize step, where only a stopped process leaves this residue.
 func TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) {

@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// A vanished canonical PUBREL is RE-MATERIALISED, not waited on for ever (F-105 7b, row 6's
+// A vanished canonical PUBREL is RE-MATERIALISED, not waited on for ever (issue #107 7b, row 6's
 // continuation 3).
 //
 // An ordinary `pubrel_ready` slot names its canonical PUBREL record by sequence. A PUBCOMP ends
@@ -231,7 +231,7 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 	x, _, xerr := jsa.loadOutboundExchange(sess.id, epoch, gen, cur.Lin)
 	if xerr != nil && mqttExchangeReadAbsent(xerr) &&
 		jsa.classifyExchangeAbsence(sess.id, epoch, gen, cur.Lin, mqttLandingValidatedRegister) == mqttAbsenceReclaimed {
-		// RECLAIMED behind the floor (F-112): the slot's validated register proves the exchange
+		// RECLAIMED behind the floor (issue #114): the slot's validated register proves the exchange
 		// landed, and a complete inventory without a representative proves it ended — so PUBCOMP
 		// completed it, and there is nothing left to re-materialise.
 		return mqttRematerializeDone
@@ -243,7 +243,7 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 		return mqttRematerializeDone
 	}
 	// 1. Eligibility. The one not-ready reason this continuation repairs is a consumer verified
-	// ABSENT under its standing LIVE ownership (F-105 7f); the attempt after the repair publishes.
+	// ABSENT under its standing LIVE ownership (issue #107 7f); the attempt after the repair publishes.
 	if !sess.pubRelResourceHoldsExchange(c, epoch, gen, dur, cur.Lin) {
 		sess.repairAbsentPubRelConsumer(c, epoch, gen, dur)
 		return mqttRematerializeRetry
@@ -310,7 +310,7 @@ var mqttTestPubRelRepairV atomic.Pointer[func(reason string)]
 
 // repairAbsentPubRelConsumer recreates the generation's PUBREL consumer when — and only when — it
 // is verified ABSENT while its name stands LIVE for this generation and its resource LIVE without
-// a disposal (F-105 7f). That is the sanctioned same-owner rematerialization of a stable,
+// a disposal (issue #107 7f). That is the sanctioned same-owner rematerialization of a stable,
 // generation-scoped name (consult 110): the ensure re-creates it under the standing ownership. A
 // consumer that is present but not ready (an armed InactiveThreshold), a stream whose inactivity
 // limit could reap it, a spent or foreign name, a decided resource, and an indeterminate read all

@@ -16,7 +16,7 @@ package mqtt
 // Resources that must be released by the path that ends them: a shutdown registry entry
 // whose retry ended, a subscription installed after its connection closed, an accept loop
 // that met an error, and the pending-binding buckets of a persistent session. See
-// docs/findings/resource-lifetime.md for the census these come from.
+// https://github.com/nberlee/mqtt-nats-broker/issues/138 for the census these come from.
 
 import (
 	"errors"

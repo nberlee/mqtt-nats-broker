@@ -161,7 +161,7 @@ func setMQTTTestGoneRetireIdentityHook(h func(sess *mqttSession)) func() {
 // ---- from sess_manager.go ----
 
 // setMQTTSessionExpirySweepInterval installs a new interval and returns the restore
-// func. The value it guards stays in sess_manager.go (F-054).
+// func. The value it guards stays in sess_manager.go (issue #58).
 func setMQTTSessionExpirySweepInterval(d time.Duration) func() {
 	old := mqttSessionExpirySweepIntervalNS.Swap(int64(d))
 	return func() { mqttSessionExpirySweepIntervalNS.Store(old) }

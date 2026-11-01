@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// RESUME RESTORES FROM THE INVENTORY (F-105 7b, plan-7b §3.1-§3.2). The generation's duty
+// RESUME RESTORES FROM THE INVENTORY (issue #107 7b, plan-7b §3.1-§3.2). The generation's duty
 // inventory — the ledger's Hi and every ordinal below it, terminal entries included — is the
 // root of what a resume restores, and an ordinal it cannot read is uncertainty, never a hole.
 // The register walk stays the occupant superset, and an ordinary register the inventory did not
@@ -34,7 +34,7 @@ import (
 //
 // The source is reported LIVE: the fixtures' admitted deliveries have a standing source consumer
 // but no stored source message, and a proven-unsent obligation over a lost source is legitimately
-// consumed (F-102), which is not the population these tests restore.
+// consumed (issue #104), which is not the population these tests restore.
 func testRestart(e *testInflightEnv) {
 	lostSourceHook(e, mqttInflightSourceLive)
 	e.forgetInMemory()
@@ -310,7 +310,7 @@ func TestF105ResumeDropsAPendingTombstoneWithoutAnExchange(t *testing.T) {
 	}
 	// The cancellation lands its create-only tombstone before any admission was written.
 	//
-	// RE-EXPRESSED by F-097/F-088 (plan rev 20, seven-red-tests table): the fixture used to hand
+	// RE-EXPRESSED by issue #99/issue #90 (plan rev 20, seven-red-tests table): the fixture used to hand
 	// a hand-built body to the tombstone sink, a shape that no longer carries enough to be told
 	// apart from a copied admitted register. It now runs the REAL producer, which writes the
 	// fence with its written provenance (`pending-create`); the drop and PI-reclamation contract

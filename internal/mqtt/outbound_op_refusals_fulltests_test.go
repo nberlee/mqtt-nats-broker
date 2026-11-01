@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// testOpRefusalEnv is an F-105 world with a serving authority and the two consumer resources a QoS 2
+// testOpRefusalEnv is an issue #107 world with a serving authority and the two consumer resources a QoS 2
 // obligation depends on.
 func testOpRefusalEnv(t *testing.T, name string) (*testF105Env, *mqttOutboundAuthority, *testJSAObserver) {
 	t.Helper()
@@ -82,7 +82,7 @@ func TestOpRefusalCosts(t *testing.T) {
 		t.Fatal("an admission under a moved generation must be refused")
 	}
 	if n := o.sends(m, f105); n != 1 || o.sends(m, testSubjectIs(mqttOutboundAuthoritySubject(idHash))) != 1 {
-		t.Fatalf("the refused admission made %d F-105 reads, want only the authority: %v", n, o.sentSubjects(m, f105))
+		t.Fatalf("the refused admission made %d issue #107 reads, want only the authority: %v", n, o.sentSubjects(m, f105))
 	}
 
 	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 9, 2, "inc-src", "inc-rel")

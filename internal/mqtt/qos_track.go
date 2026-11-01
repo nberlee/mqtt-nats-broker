@@ -56,13 +56,13 @@ func (sess *mqttSession) bumpPI() uint16 {
 		// entry with a PUBREL one, clear() removes both while the socket write is still
 		// blocked, and a PUBCOMP untracks the PUBREL entry while a duplicate copy is
 		// still unanswered — so the registry, not the maps, is what says an identifier
-		// is still in use (F-087 WP5, F-089).
+		// is still in use (issue #89 WP5, issue #91).
 		usedInSend := sess.sendReservedLocked(next)
 		// And the EXCHANGE's custody: an admitted exchange holds its identifier until it
 		// durably ends, whatever the maps say — a metadata disposition or a destruction
 		// without evidence removes the entry while the client may still hold the
 		// identifier. Checked here, at the allocator, so every exclusion-lift route and
-		// every map removal is covered at once (F-105 row 5).
+		// every map removal is covered at once (issue #107 row 5).
 		usedInCustody := sess.custody.holdsPI(next)
 		custodyHeld = custodyHeld || usedInCustody
 		if !usedInPublish && !usedInPubRel && !usedInSend && !usedInCustody && !sess.disposalPILocked(next) {
@@ -82,7 +82,7 @@ func (sess *mqttSession) bumpPI() uint16 {
 		return 0
 	}
 	// A withholding gate's latched demand is met once an allocation succeeds with nothing left
-	// deferred (F-097 WP4).
+	// deferred (issue #99 WP4).
 	sess.noteAllocationSucceededLocked()
 	return sess.last_pi
 }
@@ -176,7 +176,7 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	// Minted rather than derived: there is no register to take an identity from, which is
 	// exactly why retained is the one exchange whose identity lives only in memory. Its
 	// authority is this entry, so a retained record surviving a restart has none.
-	// A HOLD until the admission lands (F-105 7c): the identifier is reserved across the
+	// A HOLD until the admission lands (issue #107 7c): the identifier is reserved across the
 	// materialization and the admission, and acts for nothing until the landing promotes it to a
 	// register-backed Retained entry the ledger charges.
 	sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectEmpty(),
@@ -219,7 +219,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 	if sess.disposalSourceLocked(jsDur, sseq) {
 		return 0, false
 	}
-	// AN ABANDONED ADMISSION OF THIS VERY DELIVERY MAY HAVE LANDED (F-097 WP5): the offer is
+	// AN ABANDONED ADMISSION OF THIS VERY DELIVERY MAY HAVE LANDED (issue #99 WP5): the offer is
 	// withheld, never admitted a second time; the continuity record re-offers it (NAK, with this
 	// latest reply) once its first admission is decided.
 	if c := sess.admissionContinuityLocked(jsDur, sseq); c != nil {
@@ -277,7 +277,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 		}
 		// An active send section declines too: this entry's payload is already on its
 		// way out on a write that has not returned, and re-entering the send path would
-		// queue a second PUBLISH behind it under one identifier (F-087 WP5, class E).
+		// queue a second PUBLISH behind it under one identifier (issue #89 WP5, class E).
 		if ack != nil && ack.sendNonce != _EMPTY_ {
 			return 0, false
 		}
@@ -287,7 +287,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			return 0, false
 		}
 	} else {
-		// A SOURCE WHOSE EXCHANGE IS PAST PUBREC IS NOT ADMITTED AGAIN (F-115). The PUBREC handoff
+		// A SOURCE WHOSE EXCHANGE IS PAST PUBREC IS NOT ADMITTED AGAIN (issue #117). The PUBREC handoff
 		// removed this source's link above and installed its PUBREL-phase entry in the same
 		// critical section, so a re-offer arriving after it — an AckWait redelivery racing the
 		// handler, or one JetStream dispatched before it processed the source acknowledgement —
@@ -385,7 +385,7 @@ func (sess *mqttSession) untrackPublish(pi uint16, why mqttUntrackReason) (jsAck
 //
 // Returns nil when the identifier was not tracked as a PUBLISH.
 //
-// THE REASON IS MANDATORY (F-088 WP2): an UNANSWERED removal of a transmitted entry installs its
+// THE REASON IS MANDATORY (issue #90 WP2): an UNANSWERED removal of a transmitted entry installs its
 // AckRoute binding here, before the entry goes and under the same lock, so the client's late
 // acknowledgement still finds the exchange it answers. See outbound_ack_route.go.
 //
@@ -422,7 +422,7 @@ type mqttRetiredSource struct {
 	regSeq     uint64 // the register's current sequence: CAS base while unmarked, delete target once settled
 	nonce      string // the register's identity, so a later CAS can prove the record is ours
 	q2AffClaim string // preserved across the rewrite; empty for an ordinary delivery
-	q2AffCopy  string // the copy SUBJECT this delivery carried, which binds the claim reference to it (F-065)
+	q2AffCopy  string // the copy SUBJECT this delivery carried, which binds the claim reference to it (issue #69)
 	durable    bool
 }
 
@@ -500,7 +500,7 @@ func (sess *mqttSession) sourceRetiredLocked(jsDur string, sseq uint64) bool {
 // copy, and it exists because that copy's claim owes an affine-side completion that
 // an ordinary source ack does not discharge.
 //
-// The route here is the one F-065's review found unowned. A successful PUBREC stores
+// The route here is the one issue #69's review found unowned. A successful PUBREC stores
 // the correlated PUBREL BEFORE it records AffineDone, so a crash between the two
 // leaves both the PUBREL and the register; on restart the PUBREL wins over
 // pendingPublish, the live register is classified RETIRED rather than restored, and
@@ -508,7 +508,7 @@ func (sess *mqttSession) sourceRetiredLocked(jsDur string, sseq uint64) bool {
 // side: the affine delivery callback went straight to trackPublish, which returns
 // identifier zero because the restored PUBREL already reserves that source, and
 // returned without acknowledging the copy — so the copy NAK-looped and the claim
-// never completed, which is F-065's own harm re-entered through recovery.
+// never completed, which is issue #69's own harm re-entered through recovery.
 //
 // Three dispositions, and the ORDER inside each is the correctness property:
 //
@@ -670,7 +670,7 @@ func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sse
 	if regSeq != 0 && sess.asm != nil {
 		// Through the verdict property: this settle holds the exchange nonce, so a
 		// void verdict naming the register it deletes is released against the
-		// proof of that deletion rather than stranded (F-087 WP3).
+		// proof of that deletion rather than stranded (issue #89 WP3).
 		//
 		// PHASE-GATED (census C08). Clearing the retired SOURCE is what this settle
 		// discharges; the exchange's owner slot is a different fact, and past PUBREC that
@@ -894,7 +894,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// predicate the two Message Expiry paths and the drain's withdrawal ask
 	// (provenUnsentReleasableLocked). Releasing on source absence alone freed a slot the
 	// client was still spending, and durable per-identifier occupancy does not protect
-	// that: a later allocation of a DIFFERENT identifier transmits (F-100).
+	// that: a later allocation of a DIFFERENT identifier transmits (issue #102).
 	//
 	// The lookups run outside the session lock. Spec5 [3.3.2.3.3], [MQTT-2.3.1-4].
 	if si, err := jsa.lookupStream(mqttStreamName); err == nil && si != nil {
@@ -963,7 +963,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 				// rather than exclusion against the next acquisition: the durable slot may
 				// survive, and a peer may acquire it between this decision and its delete.
 				// The entry's removal and its capacity release are unchanged; the identifier
-				// is excluded until a confirmed absence settles it (F-098).
+				// is excluded until a confirmed absence settles it (issue #100).
 				var exNonce string
 				if ack := sess.pendingPublish[n.pi]; ack != nil {
 					exNonce = ack.regNonce
@@ -1052,7 +1052,7 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	pubNaks = live
 	// Everything in flight that is NOT being NAK'd still occupies a slot at the client:
 	// a fresh delivery, a pre-resume entry with no ack subject to NAK, every exchange the
-	// custody ledger charges, and — since F-100 — an entry this pass reserved because its
+	// custody ledger charges, and — since issue #102 — an entry this pass reserved because its
 	// source is gone but the receiver may hold its identifier. All of them come off the
 	// redelivery budget. The replayed entries themselves are ALREADY counted, so exactly
 	// their counts come back out (replayAllowanceLocked): budgeting them as new work would
@@ -1128,13 +1128,13 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	// Losing them here silently disarms the terminal release: PUBCOMP addresses the slot
 	// through this entry, and with a zero reference it does nothing at all, so the slot
 	// stays past PUBREC forever and its identifier is reserved for the life of the
-	// session. That defect appeared twice during F-092's implementation, at two different
+	// session. That defect appeared twice during issue #94's implementation, at two different
 	// sites, before being fixed here where every caller inherits it.
 	//
 	// AND SO DOES ITS AUTHORITY, and no more of it: the successor inherits the predecessor's
 	// kind and evidence (mqttNewPubRelSuccessor) and never mints any. Prefer an existing
 	// pendingPubRel: on record redelivery it is already the PUBREL-side authority, while a
-	// resident pendingPublish entry may be the stale half F-093's ordered handoff is about.
+	// resident pendingPublish entry may be the stale half issue #95's ordered handoff is about.
 	// The first PUBREC handoff runs before untrackPublishEntry, so the PUBLISH entry supplies
 	// the identity there — including for RETAINED QoS 2, where there is deliberately no
 	// durable slot to recover it from (retainedPubRelAdmittedLocked_ finds the Retained kind),

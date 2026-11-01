@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// A closure certificate that outlives its process (F-105 8c).
+// A closure certificate that outlives its process (issue #107 8c).
 //
 // A connection's certificate (transport_binding.go) is the positive statement that the
 // connection can emit nothing more, and only the process holding the socket can make it. That
@@ -287,7 +287,7 @@ func (sess *mqttSession) clearCertifiedActionToken(c *client, subject string, se
 	if as == nil || sess.jsa == nil || pre == nil || pre.ActionToken == _EMPTY_ || mqttDurIsSlotOnlyClass(pre.Dur) ||
 		pre.CancelOrigin == mqttCancelOriginPendingCreate {
 		// (A pending fence carries no token, so the shape matrix already keeps one out of here;
-		// the provenance is named anyway so this sink states the generic refusal itself, F-088.)
+		// the provenance is named anyway so this sink states the generic refusal itself, issue #90.)
 		return mqttCertifiedClearWithheld, 0
 	}
 	sess.mu.Lock()

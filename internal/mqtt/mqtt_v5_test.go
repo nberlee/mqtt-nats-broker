@@ -1105,7 +1105,7 @@ func TestMQTTv5WillDelay(t *testing.T) {
 // For a DELAYED, takeover or uncertainty-replayed Will nothing holds:
 // pubAllowedFullCheck is hardcoded to true, so none is ever withheld, and the
 // replay publishes through the internal client on the service connection -- live
-// fan-out included. F-079; this orphan comment is kept because it states the
+// fan-out included. issue #81; this orphan comment is kept because it states the
 // requirement the fix must satisfy.
 
 // testMQTTConnectRetryV5 is testMQTTConnectRetry for a v5 CONNECT: it dials and
@@ -2608,7 +2608,7 @@ func TestMQTTv5SessionTakenOverDisconnect(t *testing.T) {
 //
 // This is the CONNECT-takeover route's half of the CONNACK gate every displacement path
 // shares (mqttNotifyDisplaced — the takeover-CLAIMING tail above it is this route's alone
-// since F-084); the persist, resolver and settlement routes are covered in
+// since issue #86); the persist, resolver and settlement routes are covered in
 // disconnect_claim_test.go. Forcing connAckWritten false is targeted state injection — the
 // second CONNECT still runs the real mqttProcessConnect displacement branch — and the test
 // makes no claim about how such a connection arises. Its positive twin is the test above,
@@ -3145,7 +3145,7 @@ func TestMQTTv5MaxPacketSizeInboundEnforced(t *testing.T) {
 
 // A 3.1.1 client is not subject to the MQTT 5.0 Maximum Packet Size framing
 // limit: none was advertised to it. Its framing bound is max_payload plus room
-// for a topic or filter (mqttConnectedPacketOverhead, F-120), so a post-connect
+// for a topic or filter (mqttConnectedPacketOverhead, issue #122), so a post-connect
 // packet larger than max_payload but within that room is processed as before.
 func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
 	t.Parallel()
@@ -3165,7 +3165,7 @@ func TestMQTTv5MaxPacketSizeInboundV4Unaffected(t *testing.T) {
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: filter, qos: 0}}, []byte{0})
 }
 
-// A connected v5 client's claimed length is judged at the fixed header (F-120):
+// A connected v5 client's claimed length is judged at the fixed header (issue #122):
 // over the advertised Maximum Packet Size it is Packet Too Large, even when the
 // length is also wrong for its type; within it, a fixed-length type claiming a
 // body is Malformed. Neither waits for the claimed body.
@@ -4757,7 +4757,7 @@ func TestMQTTv5ReceiveMaximumResumeCap(t *testing.T) {
 // PUBACK was lost. On resume such an entry is therefore RESERVED — identifier and Receive
 // Maximum slot held — and not released.
 //
-// This test asserted the opposite until F-100. It is the same population recovery already
+// This test asserted the opposite until issue #102. It is the same population recovery already
 // reserves through the marker phase (inflight_register.go, the routed-Complete reservation
 // arm), and the two rules contradicting each other about one record is what the finding
 // was.
@@ -5063,7 +5063,7 @@ func TestMQTTv5ReceiveMaximumPromptReleaseQoS2(t *testing.T) {
 	testMQTTReadPublishV5(t, rs, "rmpr2/t", []byte("m2"))
 }
 
-// TestMQTTv5RetainedTransmittedSendSurvivesAResume, REWRITTEN for F-105 7c with its guarantee kept:
+// TestMQTTv5RetainedTransmittedSendSurvivesAResume, REWRITTEN for issue #107 7c with its guarantee kept:
 // a transmitted, unanswered retained QoS 2 exchange keeps its identifier across a resume. Since 7c
 // the exchange is a durable obligation of its own: the resume REPLAYS it, with DUP, from its own
 // copy — the original bytes, even though the retained topic was rewritten meanwhile — and it keeps
@@ -5114,7 +5114,7 @@ func TestMQTTv5RetainedTransmittedSendSurvivesAResume(t *testing.T) {
 	}
 }
 
-// TestMQTTv5RetainedReservationsCanExhaustTheSessionCapacity: THE STARVATION CASE, CLOSED by F-105
+// TestMQTTv5RetainedReservationsCanExhaustTheSessionCapacity: THE STARVATION CASE, CLOSED by issue #107
 // 7c. Five retained QoS 2 exchanges are transmitted and never acknowledged, and the session's
 // Receive Maximum is five. Before 7c every slot stayed held by an exchange nothing could replay, and
 // ordinary delivery was withheld for the rest of the session's life. Now each exchange is a durable
@@ -5892,7 +5892,7 @@ func TestMQTTv5MessageExpiryMaxPayload(t *testing.T) {
 	}
 	pp := &mqttPublish{topic: []byte("foo"), subject: subj, msg: payload, sz: len(payload), props: props}
 	// A delivered message carries the Nmqtt-NoLocal stamp only when the publisher has a
-	// No Local filter reaching the subject (F-117); this publisher has none, so neither
+	// No Local filter reaching the subject (issue #119); this publisher has none, so neither
 	// form carries one. Match production so the boundary is exact.
 	origin := _EMPTY_
 	// This publish is not retained, so no Nmqtt-Ret header on either form.
@@ -7122,7 +7122,7 @@ func testMQTTStartParkedReconcile(t testing.TB, asm *mqttAccountSessionManager, 
 func testMQTTPendingExpiryTimer(asm *mqttAccountSessionManager, idHash string) *time.Timer {
 	asm.mu.Lock()
 	defer asm.mu.Unlock()
-	// The entry carries its install token beside the timer since F-036 unit 1; what
+	// The entry carries its install token beside the timer since issue #40 unit 1; what
 	// this helper's callers ask about is the timer.
 	return asm.pendingExpiries[idHash].timer
 }
@@ -9229,7 +9229,7 @@ func TestMQTTInjectTopicAlias(t *testing.T) {
 }
 
 // A clean-start contender that meets an incumbent whose incarnation will not drain is
-// TOLD 0x89, not just dropped (F-036 unit 1). The whole disposition of that ceiling is
+// TOLD 0x89, not just dropped (issue #40 unit 1). The whole disposition of that ceiling is
 // "retry": nothing is detached, cleared or disposed, so the contender has to be able to
 // tell a retryable refusal from a transport failure, and a bare socket close leaves
 // that to the client's own guesswork. docs/CONFORMANCE.md states this reason.

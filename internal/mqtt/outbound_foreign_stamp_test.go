@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// NO ORDINARY DECISION DEPENDS ON THE REGISTER'S CLAIM STAMP (F-105 7b, plan-7b §3.5, T12).
+// NO ORDINARY DECISION DEPENDS ON THE REGISTER'S CLAIM STAMP (issue #107 7b, plan-7b §3.5, T12).
 // Ownership of an ordinary obligation is the connection's accepted entitlement, compared with the
 // serving authority inside the batch that commits the decision. So a register carrying ANOTHER
 // incarnation's valid stamp is served normally by the current connection, and a register
@@ -105,7 +105,7 @@ func TestF105ForeignStampDecidesNothingOnAnOrdinaryRoute(t *testing.T) {
 		testStampForeign(t, f)
 		cur, seq := f.register(t)
 		next := *cur
-		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
+		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: an occupant CAS
 		if _, err := f.e.sess.storeCancellationTombstone(f.subject, seq, &next, mqttLicenceOf(f.e.c)); err != nil {
 			t.Fatalf("tombstone under a foreign stamp: %v", err)
 		}
@@ -158,7 +158,7 @@ func TestF105OwnStampWithAStaleEntitlementIsRefused(t *testing.T) {
 		testSupersedeTenure(t, f.e)
 		cur, seq := f.register(t)
 		next := *cur
-		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
+		next.Cancelled, next.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: an occupant CAS
 		_, err := f.e.sess.storeCancellationTombstone(f.subject, seq, &next, mqttLicenceOf(f.e.c))
 		if !mqttTombstoneRefusedTerminally(err) {
 			t.Fatalf("a stale entitlement's tombstone must be refused terminally, got %v", err)

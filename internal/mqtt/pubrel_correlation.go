@@ -50,7 +50,7 @@ const (
 	// The PAIR is the reference, never the claim subject alone. A claim subject is
 	// reused by a later incarnation of the same assignment, so a bare subject would
 	// credit a SUCCESSOR claim with a delivery it never made and let its own copy be
-	// acknowledged away unpublished — the loss F-065 exists to prevent. The copy
+	// acknowledged away unpublished — the loss issue #69 exists to prevent. The copy
 	// subject carries the incarnation nonce, which is what distinguishes them.
 	mqttPubRelAffClaimHeader = "Nmqtt-Q2AffClaim"
 	mqttPubRelAffCopyHeader  = "Nmqtt-Q2AffCopy"

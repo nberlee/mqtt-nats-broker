@@ -12,7 +12,7 @@ import (
 )
 
 // No Local is decided when the server takes OWNERSHIP of a message, not when the message is
-// later forwarded (F-117). [MQTT-4.5.0-1] adds an owned message to the Session State of the
+// later forwarded (issue #119). [MQTT-4.5.0-1] adds an owned message to the Session State of the
 // clients whose subscriptions match at that moment, and [MQTT-3.8.3-3] excludes the
 // publisher from a No Local subscription; [MQTT-3.8.4-3] replaces a subscription with a NEW
 // one and [MQTT-3.8.4-4] forbids losing messages by doing so. So a re-SUBSCRIBE that changes

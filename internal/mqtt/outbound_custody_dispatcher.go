@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// THE AUTONOMOUS CUSTODY RECONCILIATION DRIVER (F-097 / F-088, WP4).
+// THE AUTONOMOUS CUSTODY RECONCILIATION DRIVER (issue #99 / issue #90, WP4).
 //
 // Before this, the custody observer ran only when something hinted it or a withholding gate asked
 // for a pass, and "there is no timer": a failed read released nothing and nothing re-read it, an
@@ -54,7 +54,7 @@ const (
 	mqttCustodyMaxDelay  = 5 * time.Second
 )
 
-// mqttCustodyDriverSeams instruments one session's dispatcher (F-097 T2b, T2f, T2g, T2i). Nil in
+// mqttCustodyDriverSeams instruments one session's dispatcher (issue #99 T2b, T2f, T2g, T2i). Nil in
 // production; a fixture installs it under the session lock before the dispatcher starts.
 type mqttCustodyDriverSeams struct {
 	// startEntry runs at the start site's entry, BEFORE admission and the lease.
@@ -79,7 +79,7 @@ type mqttCustodyDriverSeams struct {
 	// the session lock held.
 	exited func(gen string)
 	// floorHeld, when it reports true, holds this session's floor unit back: the unit does
-	// nothing and is due again later, its latch kept (F-112 T14: a process that crashes between a
+	// nothing and is due again later, its latch kept (issue #114 T14: a process that crashes between a
 	// completion and its resolution).
 	floorHeld func(gen string) bool
 	// releaseHeld, when it reports true, holds this session's releaser back the same way: the
@@ -213,9 +213,9 @@ const (
 	mqttCustodyUnitTarget mqttCustodyUnitKind = iota + 1
 	// mqttCustodyUnitWithdraw: ONE withdrawUnsent for an owed withdrawal.
 	mqttCustodyUnitWithdraw
-	// mqttCustodyUnitContinuity: ONE bounded step for an admission continuity record (F-097 WP5).
+	// mqttCustodyUnitContinuity: ONE bounded step for an admission continuity record (issue #99 WP5).
 	mqttCustodyUnitContinuity
-	// mqttCustodyUnitFloor: ONE bounded step of the inventory floor (F-112, outbound_floor_unit.go).
+	// mqttCustodyUnitFloor: ONE bounded step of the inventory floor (issue #114, outbound_floor_unit.go).
 	mqttCustodyUnitFloor
 	// mqttCustodyUnitRelease: ONE release-holds batch over the owed completions
 	// (outbound_release_holds.go).

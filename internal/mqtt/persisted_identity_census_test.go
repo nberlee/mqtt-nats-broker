@@ -1,12 +1,12 @@
 // The persisted-identity census, as a drift guard.
 //
-// F-034 inherits the cross-stream identity enumeration F-033 deliberately did not
+// issue #38 inherits the cross-stream identity enumeration issue #37 deliberately did not
 // attempt. Four earlier attempts were each falsified by review, and every one failed
 // the same way: it was a FILTER presented as a sweep — the streams already known, the
 // `json:` tags, a keyword grep, a hand-listed carrier set. Two of them were refuted by
 // an entry in the table they themselves introduced.
 //
-// So the enumeration in docs/findings/persisted-identity-census.md is not trusted to
+// So the enumeration in https://github.com/nberlee/mqtt-nats-broker/issues/134 is not trusted to
 // stay complete on care alone. This file is what makes it fail loudly instead: every
 // field of every persisted artifact type carries exactly one disposition, derived by
 // REFLECTION rather than listed by hand, so a dependency bump or a new field breaks the
@@ -24,7 +24,7 @@
 //     asserting which type it embeds.
 //
 //  2. A `json:` TAG IS NOT THE TEST OF PERSISTENCE. mqttRetainedMsg carries NO json tags
-//     at all: since F-056 removed the legacy reader it is persisted as headers, its
+//     at all: since issue #60 removed the legacy reader it is persisted as headers, its
 //     `expires` field is persisted and UNEXPORTED, and two of its exported fields are not
 //     persisted at all. A tag-driven walk sees one of the ten streams as having no fields
 //     whatsoever. So the walk covers unexported fields and records each field's ENCODING.
@@ -35,8 +35,8 @@
 //     application payload. A map, slice or []byte field must declare which of those it is
 //     and what its keys and elements carry.
 //
-// See docs/findings/persisted-identity-census.md for the census itself, and
-// docs/findings/ha-arbitration.md#f-034 for what the audit established.
+// See https://github.com/nberlee/mqtt-nats-broker/issues/134 for the census itself, and
+// https://github.com/nberlee/mqtt-nats-broker/issues/38 for what the audit established.
 
 package mqtt
 
@@ -178,12 +178,12 @@ type censusDisposition struct {
 	// ConsumerConfig.Durable: the broker MINTS the name before the create, so no stream
 	// issues it — but the consumer it names lives on a stream, and recreating that
 	// stream strands the name. Calling it identityLocal contradicted identityLocal's own
-	// definition, and the F-066 oracle accepted it anyway because it only checked
+	// definition, and the issue #70 oracle accepted it anyway because it only checked
 	// issuers. Minting authority and lifecycle namespace are two different questions and
 	// now have two different fields.
 	lifecycle string
 	// elemIssuer is set when a container's ELEMENTS are themselves cross-stream
-	// references. Added because the F-066 oracle pass found the model could not
+	// references. Added because the issue #70 oracle pass found the model could not
 	// express VoidedRegs — a slice of $MQTT_inflight register nonces — which is a
 	// cross-stream reference the container disposition alone would have hidden.
 	elemIssuer string
@@ -222,14 +222,14 @@ var censusComposites = []censusComposite{
 		kind:    "cross-artifact binding",
 		typ:     "mqttInflightRecord",
 		members: []string{"Q2AffClaim", "Q2AffCopy"},
-		reason: "F-065 established neither field alone identifies the delivery; the binding is what " +
+		reason: "issue #69 established neither field alone identifies the delivery; the binding is what " +
 			"stops a claim on $MQTT_qos2assign being misattributed to a copy on $MQTT_out",
 	},
 	{
 		kind:    "transmission identity",
 		typ:     "mqttInflightRecord",
 		members: []string{"Nonce", "Acq"},
-		reason: "C-I (F-098). Nonce names the ALLOCATION and Acq counts the ACQUISITIONS within " +
+		reason: "C-I (issue #100). Nonce names the ALLOCATION and Acq counts the ACQUISITIONS within " +
 			"it, and neither alone is the authority a destructive disposition binds to. Nonce " +
 			"alone cannot distinguish two transmissions of one allocation, which is the schedule " +
 			"that defeated three release proofs: B holds evidence from the first while A installs " +
@@ -255,7 +255,7 @@ var censusComposites = []censusComposite{
 		members: []string{"OriginSessionSeq", "OriginSessEpoch"},
 		reason: "an mseq is only comparable within the $MQTT_sess incarnation that issued it, so the " +
 			"epoch is what makes the sequence mean anything — this is one of the three ad hoc " +
-			"couplings F-066 names",
+			"couplings issue #70 names",
 	},
 	{
 		kind:    "scan interval",
@@ -281,7 +281,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Nonce": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
 			reason: "minted by mqttNewInflightNonce at allocation and never rewritten; this is what " +
 				"proves a landed write is ours, since the subject is reused within an incarnation " +
-				"(R4). COMPOSITE rather than local since F-098: it is the allocation half of the " +
+				"(R4). COMPOSITE rather than local since issue #100: it is the allocation half of the " +
 				"transmission identity, and a destructive disposition binds to the whole triple " +
 				"(subject, Nonce, Acq) — see the composite oracle, paired with Acq"},
 		"Lin": {kind: identityLocal, encoding: encJSON,
@@ -299,7 +299,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"an heir a FRESH exchange's value and read an old obligation as a new one",
 		},
 		"Acq": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
-			reason: "the exchange's TRANSMISSION IDENTITY counter (C-I, F-098), and the third term " +
+			reason: "the exchange's TRANSMISSION IDENTITY counter (C-I, issue #100), and the third term " +
 				"of the triple (slot subject, Nonce, Acq) that every release, deletion and capacity " +
 				"free CASes on. Composite rather than local because it names nothing on its own: an " +
 				"Acq of 3 is meaningless without the subject and nonce it belongs to, and it is the " +
@@ -320,7 +320,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Cancelled":  {kind: notAnIdentity, encoding: encJSON, reason: "a fact about this allocation never having been transmitted; names nothing"},
 		"CancelOrigin": {kind: notAnIdentity, encoding: encJSON,
 			reason: "the written provenance of a cancellation (pending-create or occupant), from a closed set, present " +
-				"iff Cancelled (F-088, consult C4); says which writer produced the cancellation and names nothing"},
+				"iff Cancelled (issue #90, consult C4); says which writer produced the cancellation and names nothing"},
 		"AbandonReason": {kind: notAnIdentity, encoding: encJSON,
 			reason: "why the broker abandoned delivery, from a closed set; set only on a delivery_abandoned register; names nothing"},
 		"AbandonTenure": {kind: identityLocal, encoding: encJSON,
@@ -351,11 +351,11 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"PubRelDurable": {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON,
 			reason: "the PUBREL consumer durable that delivers the canonical record, on $MQTT_out. " +
 				"Dispositioned as a cross-stream reference rather than half a composite, following " +
-				"mqttQ2AffClaim.CopySubject/AffDurable: the F-066 row carries the pairing, and each " +
+				"mqttQ2AffClaim.CopySubject/AffDurable: the issue #70 row carries the pairing, and each " +
 				"field is independently a reference into another stream's naming space. It is also " +
 				"what makes a record from a retired generation recognisable as belonging to an " +
 				"exchange that is gone, since the next incarnation uses a different PUBREL subject"},
-		// THE RETAINED ARM (F-105 7c): exclusive with Dur/Seq, so a register names a copy or a
+		// THE RETAINED ARM (issue #107 7c): exclusive with Dur/Seq, so a register names a copy or a
 		// source delivery, never both.
 		"Payload": {kind: identityLocal, encoding: encJSON,
 			reason: "the retained copy's payload token, naming its manifest $MQTT.inflight.f105.pay.<hash>.<gen>." +
@@ -378,14 +378,14 @@ func censusManifest() map[string]map[string]censusDisposition {
 			reason: "an absolute $MQTT_out sequence naming the CANONICAL PUBREL record, so recreating " +
 				"that stream strands it — the same hazard class as mqttPersistedDrainSeq.RegSeq. It is " +
 				"taken from the stored message or an exact readback and NEVER from Nats-Msg-Id, a drain " +
-				"attempt counter or the source sequence. Under F-034 it may not by itself select or " +
+				"attempt counter or the source sequence. Under issue #38 it may not by itself select or " +
 				"authorize a destructive operation: the slot subject and the exchange nonce do that, and " +
 				"this pair identifies WHICH record the exchange is about"},
 	}
 
 	m["mqttInflightMarker"] = map[string]censusDisposition{
 		"Nonce": {kind: identityLocal, encoding: encJSON,
-			reason: "the register nonce this UNSENT MARKER names (F-072): the marker is the sibling of " +
+			reason: "the register nonce this UNSENT MARKER names (issue #76): the marker is the sibling of " +
 				"$MQTT.inflight.<hash>.<gen>.<pi>, present iff nothing was transmitted under that " +
 				"identifier, and its body carries only the register's own nonce so a stale marker cannot " +
 				"be attributed to a later exchange on the reused subject. Deleted at the transmission; " +
@@ -394,7 +394,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 
 	m["mqttPersistedDrainRelease"] = map[string]censusDisposition{
 		"Subject": {kind: identityLocal, encoding: encJSON,
-			reason: "the slot's own SUBJECT, which is the identity (F-034) and not a sequence into " +
+			reason: "the slot's own SUBJECT, which is the identity (issue #38) and not a sequence into " +
 				"any stream. It carries the incarnation, so a request can never be applied across a " +
 				"generation discard"},
 		"Nonce": {kind: identityComposite, compos: "transmission identity", encoding: encJSON,
@@ -413,7 +413,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"PubRel": {kind: notAnIdentity, encoding: encJSON, reason: "the QoS 2 second phase's intent, written before the PUBREL is stored so recovery is positive rather than a guess"},
 		"Rel": {kind: embeddedType, embeds: "mqttPersistedDrainRelease", encoding: encJSON,
 			reason: "the POSITIVE record that this drained delivery has release work outstanding " +
-				"against one exact exchange (L4, F-098). Its ABSENCE means no release is pending and " +
+				"against one exact exchange (L4, issue #100). Its ABSENCE means no release is pending and " +
 				"never that one happened, which is the asymmetry the whole field exists for: the " +
 				"finalizer used to release the register and only then open its transaction, and " +
 				"REVERSING that does not help because a persisted claim REMOVAL is an omission — " +
@@ -421,19 +421,19 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"vanish with the entry and recovery is back to inferring authority from an absence. " +
 				"It is a REQUEST and not evidence: it confers no release authority, and " +
 				"mqttSlotReleaseAuthority must still authorize the disposition"},
-		"PI":      {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, and since F-034 also what DERIVES the register subject the release addresses — see the drain release in inflight_register.go"},
+		"PI":      {kind: identityLocal, encoding: encJSON, reason: "the packet identifier, and since issue #38 also what DERIVES the register subject the release addresses — see the drain release in inflight_register.go"},
 		"Attempt": {kind: notAnIdentity, encoding: encJSON, reason: "the deduplication attempt counter; a dedupe entry outlives its message, so a verified-absent recreate bumps this rather than trusting the window"},
 		"OwnerNonce": {kind: identityLocal, encoding: encJSON,
 			reason: "the EXCHANGE identity this drained delivery owns, persisted with the intent and before the PUBREL store. Not redundant with the record's own header: recovery may find the record missing and have to recreate it, and minting a replacement nonce there would create a DIFFERENT exchange that the durable owner slot does not name and could therefore never act"},
-		// The F-066 oracle pass corrected this. An earlier draft called it
-		// notAnIdentity on the ground that F-034 demoted it to a hint — but demoting
+		// The issue #70 oracle pass corrected this. An earlier draft called it
+		// notAnIdentity on the ground that issue #38 demoted it to a hint — but demoting
 		// what a mechanism RELIES on does not stop the field being a cross-stream
-		// reference, and F-066's table records it as one. Both facts belong in the row.
+		// reference, and issue #70's table records it as one. Both facts belong in the row.
 		"RegSeq": {kind: identityCrossStream, issuer: mqttInflightStreamName, encoding: encJSON,
 			reason: "an absolute $MQTT_inflight sequence, so recreating that stream strands it — which is " +
-				"exactly the V1 defect F-034 closed, since the drain's release used to ADDRESS its delete " +
+				"exactly the V1 defect issue #38 closed, since the drain's release used to ADDRESS its delete " +
 				"by this value and would then destroy an unrelated register at the reused sequence. " +
-				"F-034 demotes it to a HINT: it may never select or authorize a deletion, and the subject " +
+				"issue #38 demotes it to a HINT: it may never select or authorize a deletion, and the subject " +
 				"derived from PI does that instead. It remains a cross-stream reference either way"},
 	}
 
@@ -453,7 +453,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"MarkerSeq": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON,
 			reason: "the $MQTT_sess sequence this teardown's claim marker landed at, and the ONLY thing " +
 				"the advance is decided by. Comparable only within the incarnation epoch $MQTT_teardown " +
-				"carries in its stream metadata — one of F-066's three ad hoc couplings"},
+				"carries in its stream metadata — one of issue #70's three ad hoc couplings"},
 		"Nonce":     {kind: identityLocal, encoding: encJSON, reason: "this teardown's own identity"},
 		"Origin":    {kind: notAnIdentity, encoding: encJSON, reason: "the authoring broker, for diagnostics; no reader arbitrates on it"},
 		"StartedAt": {kind: notAnIdentity, encoding: encJSON, reason: "a wall-clock stamp for diagnostics"},
@@ -491,7 +491,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		// said ("the hold stream's own space") while its kind claimed otherwise.
 		// qos2_release_claim.go states the identity half directly: "It is IDENTITY, not
 		// forensics, because it is read and it decides."
-		"Fence":  {kind: identityLocal, encoding: encJSON, reason: "F-062's proven purge cutoff: the highest $MQTT_qos2in sequence a discarded marker's writer was entitled to destroy, in the hold stream's own space, on a record stored in that same stream"},
+		"Fence":  {kind: identityLocal, encoding: encJSON, reason: "issue #66's proven purge cutoff: the highest $MQTT_qos2in sequence a discarded marker's writer was entitled to destroy, in the hold stream's own space, on a record stored in that same stream"},
 		"Origin": {kind: notAnIdentity, encoding: encJSON, reason: "the authoring broker, for diagnostics"},
 		"At":     {kind: notAnIdentity, encoding: encJSON, reason: "a wall-clock stamp"},
 	}
@@ -515,7 +515,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Durable": {kind: identityLocal, lifecycle: "the stream the consumer is created on", encoding: encJSON,
 			reason: "the durable name. MINTED LOCALLY — randomly for a plain consumer, deterministically " +
 				"for a shared group — BEFORE the consumer create, so JetStream holds the consumer under a " +
-				"name this broker authored rather than issuing it. Named by F-066's table wherever a record " +
+				"name this broker authored rather than issuing it. Named by issue #70's table wherever a record " +
 				"persists it: recreating the stream the consumer lives on strands the name"},
 		"Name": {kind: identityLocal, lifecycle: "the stream the consumer is created on", encoding: encJSON, reason: "the consumer's name as the server reports it; for a durable it equals Durable, scoped to the same stream lifecycle"},
 		"DeliverSubject": {kind: identityLocal, encoding: encJSON,
@@ -568,7 +568,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 	}
 
 	// mqttQ2AffClaim was MISSING from an earlier draft of this manifest entirely, and
-	// the F-066 oracle pass is what found it: two of the sample's fourteen rows name
+	// the issue #70 oracle pass is what found it: two of the sample's fourteen rows name
 	// this type. That is the oracle working as designed — it is applied AFTER an
 	// independent enumeration precisely so a gap surfaces as a failure rather than as
 	// a shorter table.
@@ -576,10 +576,10 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Winner":       {kind: identityLocal, encoding: encJSON, reason: "the session object that won this assignment's election"},
 		"Gen":          {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the affine generation's owning incarnation"},
 		"GroupDurable": {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "the shared group consumer that delivered the source; a consumer on $MQTT_msgs, so recreating that stream strands it"},
-		"SourceSeq":    {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "the source message's sequence. F-066's table names this: after a recreation a new message reuses the sequence and the source-absence inference the reaper depends on breaks"},
+		"SourceSeq":    {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "the source message's sequence. issue #70's table names this: after a recreation a new message reuses the sequence and the source-absence inference the reaper depends on breaks"},
 		"ClaimHash":    {kind: identityCrossStream, issuer: mqttStreamName, encoding: encJSON, reason: "derived FROM the source sequence, so it inherits that sequence space and is stranded with it — a derived name is not a local one"},
-		"Nonce":        {kind: identityLocal, encoding: encJSON, reason: "the incarnation nonce minted at the election and never rewritten; F-065 made it scope the copy subject and the copy's Nats-Msg-Id"},
-		"CopySubject":  {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON, reason: "the copy's subject on $MQTT_out; F-066's table names it"},
+		"Nonce":        {kind: identityLocal, encoding: encJSON, reason: "the incarnation nonce minted at the election and never rewritten; issue #69 made it scope the copy subject and the copy's Nats-Msg-Id"},
+		"CopySubject":  {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON, reason: "the copy's subject on $MQTT_out; issue #70's table names it"},
 		"AffDurable":   {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON, reason: "the session-affine consumer that delivers the copy, on $MQTT_out"},
 		"SubID":        {kind: notAnIdentity, encoding: encJSON, reason: "the client's subscription identifier, client-scoped"},
 		"Retained":     {kind: notAnIdentity, encoding: encJSON, reason: "whether the copy was retained; a fact about the delivery"},
@@ -668,7 +668,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Acq":   {kind: identityCrossStream, issuer: mqttSharedLifecycleStreamName, encoding: encJSON, reason: "the acquisition nonce the ledger lists; the identity a release verdict names"},
 	}
 	m["mqttSharedGroupRecord"] = map[string]censusDisposition{
-		"Epoch":    {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the account recovery epoch this record is stamped with; a sequence is comparable across F-105 records only when the epochs are equal"},
+		"Epoch":    {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the account recovery epoch this record is stamped with; a sequence is comparable across issue #107 records only when the epochs are equal"},
 		"Group":    {kind: identityLocal, encoding: encJSON, reason: "the group key, getHashSize of (ShareName, subject); the record's own subject carries it and this member agrees with it"},
 		"Live":     {kind: embeddedType, embeds: "mqttSharedLive", encoding: encJSON, reason: "the incarnation currently served and its holder count; null exactly when nobody holds one"},
 		"Retiring": {kind: container, elems: "retired incarnation ordinals owed a CONSUMER.DELETE", encoding: encJSON, reason: "the incarnations whose consumer deletion is owed; bounded, written as [] when empty (never null)"},
@@ -685,7 +685,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"State":  {kind: notAnIdentity, encoding: encJSON, reason: "open or sealed; the sealed state is the generation fence and names nothing"},
 		"Tenure": {kind: embeddedType, embeds: "mqttSharedTenure", encoding: encJSON, reason: "which CONNECT of the generation may acquire"},
 		"Acqs":   {kind: container, elems: "mqttSharedAcqRef", encoding: encJSON, reason: "the acquisitions this generation currently holds, dispositioned under mqttSharedAcqRef; written as [] when empty (never null)"},
-		"Closed": {kind: container, elems: "acquisition nonces, each one this same ledger lists in Acqs", encoding: encJSON, reason: "the listed acquisitions closed to new dependencies, the release fence's first step (F-105 7e); a subset of Acqs by validation, so it names no identity Acqs does not; written as [] when empty (never null)"},
+		"Closed": {kind: container, elems: "acquisition nonces, each one this same ledger lists in Acqs", encoding: encJSON, reason: "the listed acquisitions closed to new dependencies, the release fence's first step (issue #107 7e); a subset of Acqs by validation, so it names no identity Acqs does not; written as [] when empty (never null)"},
 	}
 	m["mqttSharedTenure"] = map[string]censusDisposition{
 		"Seq": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the $MQTT_sess sequence at which this CONNECT's accept save landed; the ordered tenure that decides which resume of a generation may acquire"},
@@ -739,7 +739,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Name":     {kind: identityLocal, encoding: encJSON, reason: "the stream's own name, which the broker authors and every $MQTT_* constant fixes"},
 		"Subjects": {kind: container, elems: "the stream's subject space", encoding: encJSON, reason: "the subject SPACE is the identity space every record on this stream is addressed in; three of the ten carry the JS domain token and seven do not, and the validators compare the set order-independently"},
 		"Metadata": {kind: container, keys: "metadata keys", elems: "metadata values", elemIssuer: mqttSessStreamName, encoding: encJSON,
-			reason: "the carrier of $MQTT_teardown's adopted incarnation EPOCH — one of F-066's three couplings, and the one no body walk can see. Recorded as cross-stream through its elements for that reason"},
+			reason: "the carrier of $MQTT_teardown's adopted incarnation EPOCH — one of issue #70's three couplings, and the one no body walk can see. Recorded as cross-stream through its elements for that reason"},
 		"Sources":                {kind: container, elems: "StreamSource", encoding: encJSON, reason: "cross-account sourcing, supported on $MQTT_rmsgs and fatal elsewhere; the elements name another stream's identity space"},
 		"Mirror":                 {kind: embeddedType, embeds: "StreamSource", encoding: encJSON, reason: "a mirror names another stream; rejected by the shared shape on every broker-owned stream"},
 		"SubjectTransform":       {kind: embeddedType, embeds: "SubjectTransformConfig", encoding: encJSON, reason: "a transform rewrites the subject space, so it rewrites the identity space; rejected by the shared shape"},
@@ -829,7 +829,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 	}
 
 	m["StreamConsumerLimits"] = map[string]censusDisposition{
-		"InactiveThreshold": local("a stream-forced consumer inactivity threshold. Fatal on $MQTT_out, where it would reap a disconnected session's affine consumer; waived on $MQTT_msgs, where the drain and shared paths refuse it at RUNTIME instead. Since F-036 course E this refusal is also why an uncollected affine consumer leaks with no backstop at all"),
+		"InactiveThreshold": local("a stream-forced consumer inactivity threshold. Fatal on $MQTT_out, where it would reap a disconnected session's affine consumer; waived on $MQTT_msgs, where the drain and shared paths refuse it at RUNTIME instead. Since issue #40 course E this refusal is also why an uncollected affine consumer leaks with no backstop at all"),
 		"MaxAckPending":     local("a stream-forced in-flight cap; fatal when below the broker's effective cap"),
 	}
 
@@ -840,8 +840,8 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Created": {kind: identityLocal, encoding: encJSON,
 			reason: "the JetStream-issued consumer INSTANCE fingerprint. The orphan sweep's PUBREL class " +
 				"uses it as an identity and explicitly not as an age. A create-or-update leaves it " +
-				"UNCHANGED, which is why it cannot see an adoption — the blind spot F-033's audit " +
-				"recorded against the AFFINE consumer delete, now HISTORICAL because F-036 course E " +
+				"UNCHANGED, which is why it cannot see an adoption — the blind spot issue #37's audit " +
+				"recorded against the AFFINE consumer delete, now HISTORICAL because issue #40 course E " +
 				"removed that delete outright. Local because the consumer's own lifecycle issues it, " +
 				"but it is issued by a different Raft group than the state it guards"},
 		"Delivered":      {kind: embeddedType, embeds: "SequenceInfo", encoding: encJSON, reason: "the delivery cursor: consumer STATE, which acks mutate"},
@@ -950,7 +950,7 @@ var censusOutOfScope = map[string]string{
 // universe used to be a hand-written list, so a newly persisted body type — or a nested
 // one like SequenceInfo inside ConsumerInfo — was covered only if somebody remembered to
 // add it. A hand-written universe is the same shape as the hand-listed carrier set that
-// was one of F-033's four falsified attempts, one level up.
+// was one of issue #37's four falsified attempts, one level up.
 //
 // time.Time is a leaf: it is a scalar with a custom encoding, not a structure to walk.
 // The seen set makes recursive types terminate.
@@ -1268,7 +1268,7 @@ func TestPersistedIdentityCensusEmbeddingsResolve(t *testing.T) {
 	// argued rather than assumed.
 	deferred := map[string]string{
 		"ConsumerConfig": "the consumer-configuration artifact family, audited as its own family in " +
-			"docs/findings/persisted-identity-census.md; 35 fields reached from five embedding sites, " +
+			"https://github.com/nberlee/mqtt-nats-broker/issues/134; 35 fields reached from five embedding sites, " +
 			"which is why the manifest is type-keyed",
 	}
 	for name, why := range deferred {
@@ -1317,14 +1317,14 @@ func isCensusTypeName(s string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// The F-066 oracle
+// The issue #70 oracle
 // ---------------------------------------------------------------------------
 
-// censusOracleRow is one row of F-066's verified cross-stream identity sample
-// (docs/findings/ha-arbitration.md#f-066), transcribed so the census can be checked
+// censusOracleRow is one row of issue #70's verified cross-stream identity sample
+// (https://github.com/nberlee/mqtt-nats-broker/issues/70), transcribed so the census can be checked
 // AGAINST it.
 //
-// The direction matters and is the whole point. F-066's table is a SAMPLE — its own
+// The direction matters and is the whole point. issue #70's table is a SAMPLE — its own
 // text says "a verified sample with a worked consequence, not a census" — so it is
 // used as an ORACLE applied AFTER an independent enumeration, never as the seed for
 // one. Seeding from it would inherit its blind spots and make the completeness claim
@@ -1349,7 +1349,7 @@ type censusOracleRow struct {
 	reason string
 }
 
-// censusF066Sample is F-066's fourteen-row table, transcribed row for row.
+// censusF066Sample is issue #70's fourteen-row table, transcribed row for row.
 var censusF066Sample = []censusOracleRow{
 	{
 		holder: mqttTeardownStreamName, what: "stream Metadata + body MarkerSeq", issuer: mqttSessStreamName,
@@ -1413,7 +1413,7 @@ var censusF066Sample = []censusOracleRow{
 	{
 		holder: mqttSessStreamName, what: "body drain Started[].RegSeq", issuer: mqttInflightStreamName,
 		satisfiedBy: []string{"mqttPersistedDrainSeq.RegSeq"},
-		reason:      "this is the carrier of F-034's own V1 defect; the census records it as a cross-stream reference even though F-034 demotes it to a hint",
+		reason:      "this is the carrier of issue #38's own V1 defect; the census records it as a cross-stream reference even though issue #38 demotes it to a hint",
 	},
 	{
 		holder: mqttSessStreamName, what: "body VoidedRegs[]", issuer: mqttInflightStreamName,
@@ -1422,7 +1422,7 @@ var censusF066Sample = []censusOracleRow{
 }
 
 // TestPersistedIdentityCensusRediscoversF066Sample applies the oracle. Every row of
-// F-066's sample must already be carried by the census — either by a named manifest
+// issue #70's sample must already be carried by the census — either by a named manifest
 // entry whose issuer agrees, or by an explicitly named artifact family with a reason.
 //
 // A row may be DEFERRED to a family; it may not be silently absent, and it may not be
@@ -1443,7 +1443,7 @@ func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
 	// ActionClaim/ActionClaimSeq still have no row of their own: they are members of the
 	// arbitration relation the ClaimSeq row carries, not a second coupling to $MQTT_sess.
 	if len(censusF066Sample) != 15 {
-		t.Fatalf("the oracle carries %d rows; F-066's sample has 15. A row was dropped or added "+
+		t.Fatalf("the oracle carries %d rows; issue #70's sample has 15. A row was dropped or added "+
 			"without re-reading the dossier", len(censusF066Sample))
 	}
 
@@ -1481,10 +1481,10 @@ func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
 			switch d.kind {
 			case identityCrossStream, identityComposite, identityLocal, container:
 			default:
-				t.Errorf("%s: %s.%s is dispositioned %v, but F-066's sample records it as carrying a "+
+				t.Errorf("%s: %s.%s is dispositioned %v, but issue #70's sample records it as carrying a "+
 					"cross-stream identity", label, tname, fname, d.kind)
 			}
-			// And a row F-066 records as CROSS-STREAM may not be satisfied by a bare
+			// And a row issue #70 records as CROSS-STREAM may not be satisfied by a bare
 			// local identity. Review found this hole: ConsumerConfig.Durable was
 			// identityLocal and the oracle accepted it, because it checked issuers and
 			// a local identity has none. A local identity satisfies a cross-stream
@@ -1492,7 +1492,7 @@ func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
 			// cross-stream — which is the distinction between who minted a value and
 			// what invalidates it.
 			if d.kind == identityLocal && row.issuer != "" && d.lifecycle == "" {
-				t.Errorf("%s: %s.%s is identityLocal with no lifecycle namespace, but F-066's sample "+
+				t.Errorf("%s: %s.%s is identityLocal with no lifecycle namespace, but issue #70's sample "+
 					"records this row as issued by %q — a locally minted value satisfies a cross-stream "+
 					"row only when it names what recreating invalidates it",
 					label, tname, fname, row.issuer)

@@ -16,7 +16,7 @@ package mqtt
 import "testing"
 
 // The slot-only (experimental affine) class keeps its plain fence disposal: it has no authority to
-// advance, needs no licence, and its cancellation durability is chapter P's (F-119). An ordinary
+// advance, needs no licence, and its cancellation durability is chapter P's (issue #121). An ordinary
 // fence with no store to advance against is KEPT, never disposed of by default.
 func TestPendingFenceDisposalKeepsTheSlotOnlyClassPlain(t *testing.T) {
 	sess := &mqttSession{}

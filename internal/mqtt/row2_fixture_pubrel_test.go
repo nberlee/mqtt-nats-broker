@@ -2,7 +2,7 @@ package mqtt
 
 import "testing"
 
-// Real-store PUBREL fixtures for the F-092 acquisition tests (F-105 row 2, consult 29): an
+// Real-store PUBREL fixtures for the issue #94 acquisition tests (issue #107 row 2, consult 29): an
 // ordinary exchange acquires its PUBREL only through the authority, so these tests seed it through
 // admission, the real PUBREC and the canonical rebind (testSeedRealPubRelReady) rather than into a
 // map, and observe the acquisition at the authority commit rather than at the register store.

@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// THE FLOOR, END TO END (F-112): real clients, real deliveries, the custody dispatcher's floor
+// THE FLOOR, END TO END (issue #114): real clients, real deliveries, the custody dispatcher's floor
 // unit doing the work.
 
 type testF112Sub struct {

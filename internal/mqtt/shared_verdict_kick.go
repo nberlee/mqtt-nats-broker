@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 )
 
-// The owner's re-trigger of a withheld shared release (F-105 7e).
+// The owner's re-trigger of a withheld shared release (issue #107 7e).
 //
 // A release withheld behind a dependant still owing delivery from the source becomes possible the
 // moment that dependant leaves Publish — a PUBACK, a withdrawal, an abandonment, a discard. The

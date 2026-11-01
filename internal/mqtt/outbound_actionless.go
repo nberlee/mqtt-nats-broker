@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// The ACTIONLESS half of the output boundary (F-105, row 2; plan §7.1).
+// The ACTIONLESS half of the output boundary (issue #107, row 2; plan §7.1).
 //
 // §7.1's property is about what reaches the writer, not about who calls it:
 //

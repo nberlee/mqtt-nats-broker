@@ -18,7 +18,7 @@
 // releaser writes `releasing`, a discard writes `discarded`, and exactly one
 // create can succeed WHILE A RECORD OCCUPIES THE SUBJECT. The loser does nothing
 // irreversible. Exclusivity is per-occupancy, not per-identifier for all time; what
-// that costs is stated once, in F-062 (docs/findings/ha-arbitration.md).
+// that costs is stated once, in issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131).
 //
 //  1. The claim fences a DISCARD. A re-read of the hold record could not: read
 //     then fan out is check-then-act, and the discard is on another broker.
@@ -55,7 +55,7 @@
 //     it must remove whatever occupies the subject — a held PUBLISH, a tombstone, or a
 //     record it cannot read. It is nonetheless BOUNDED: every call carries the highest
 //     sequence its caller can prove it was entitled to destroy, and anything above that
-//     is spared (F-062). Naming a subject was never sufficient on its own — generation
+//     is spared (issue #66). Naming a subject was never sufficient on its own — generation
 //     scoping protects the NEXT incarnation, but a resume preserves the generation, so
 //     it never protected a peer still serving the retiring one. Naming was never
 //     sufficient for a CLAIM either, which is why every claim delete is sequenced.
@@ -261,7 +261,7 @@ type mqttQoS2RelClaim struct {
 // and a discard needs no generation to identify the exchange it competed for.
 //
 // The reason this comment used to give — that a discard "can only ever concern the one
-// exchange live on that generation-scoped subject" — is FALSE; see F-062, mechanism 2.
+// exchange live on that generation-scoped subject" — is FALSE; see issue #66, mechanism 2.
 // With no generation on the marker a stale one is indistinguishable from an applicable
 // one, so the fence supplies that evidence instead, and a `discarded` marker therefore
 // REQUIRES one. A fence-less marker is an unsupported persisted shape: it is refused
@@ -644,7 +644,7 @@ func (st mqttQoS2VerifyStatus) String() string {
 //
 // Holding the claim fences a discard that has not yet committed to this subject's
 // purge. It does not fence one that has, nor the orphan sweep. The exceptions are
-// enumerated once, in F-062 (docs/findings/ha-arbitration.md); do not re-derive them
+// enumerated once, in issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131); do not re-derive them
 // here.
 func (as *mqttAccountSessionManager) verifyQoS2HoldForRelease(holdSubject, gen string, holdSeq uint64) (mqttQoS2VerifyStatus, uint64, error) {
 	rec, curSeq, err := as.loadQoS2Record(holdSubject)
@@ -862,7 +862,7 @@ func (as *mqttAccountSessionManager) enumerateQoS2Holds(filter string) (map[stri
 // Acting on that sample is the one thing this walk must never do: a zero cutoff would
 // become a `discarded` marker's fence, the identity rule then classifies that marker
 // unreadable, and the unreadable disposition on the PUBREL path deletes the
-// acknowledged hold and answers 0x92 — manufacturing exactly the loss F-062 closes.
+// acknowledged hold and answers 0x92 — manufacturing exactly the loss issue #66 closes.
 // So the sample is re-taken, and NOTHING is written in between, which is what makes
 // retrying safe.
 //
@@ -992,7 +992,7 @@ func (as *mqttAccountSessionManager) discardQoS2Hold(s *Server, holdSubject stri
 // meets a FOREIGN generation's `releasing` claim reaps it at its exact sequence and only
 // then retries its own create (claimQoS2ReleaseInner). The subject is empty in between.
 //
-// So the window is real and the loss it produced was the F-062 class again: E1 completes
+// So the window is real and the loss it produced was the issue #66 class again: E1 completes
 // and leaves its claim to be reaped; E2 lands on the vacated hold subject and is answered
 // PUBREC; the teardown enumerates with E2 at or below its watermark, meets E1's stale
 // claim, and waits. E2's PUBREL then reaps that stale claim, and a poll landing in the gap
@@ -1040,7 +1040,7 @@ func (as *mqttAccountSessionManager) awaitQoS2Release(s *Server, holdSubject, cl
 // was never a bound, because a resume preserves the generation, so a peer still
 // serving the retiring incarnation can accept and PUBREC-acknowledge a new exchange on
 // this very subject after the caller stopped looking. Whatever lands above upTo is
-// SPARED and left to a later walk or the orphan sweep (F-062, mechanism 1).
+// SPARED and left to a later walk or the orphan sweep (issue #66, mechanism 1).
 //
 // Confirmed even where the caller asked for a no-wait teardown, for the reason
 // releaseTeardown documents: an unclassifiable outcome is not an outcome, and this

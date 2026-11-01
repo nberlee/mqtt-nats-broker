@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// F-084's fixtures: the broker may claim a takeover only where it holds the successor,
+// issue #86's fixtures: the broker may claim a takeover only where it holds the successor,
 // and every record-derived disposal owes the displaced session's Will.
 //
 // The claim half is covered where each producer already lives (sess_fork_connect_test.go,
@@ -314,7 +314,7 @@ func TestF084DelayedParkedWillReachesTheOutbox(t *testing.T) {
 	}
 }
 
-// TestF084RemotePersistEvictionDischargesWill is R4, and it fails against the pre-F-084
+// TestF084RemotePersistEvictionDischargesWill is R4, and it fails against the pre-issue #86
 // broker outright.
 //
 // The remote-persist eviction detaches the client inside its as.mu section and then closes
@@ -488,7 +488,7 @@ func TestF084VocabulariesSayDifferentThings(t *testing.T) {
 	}
 }
 
-// TestF084OnlyOneReaderOfTheTakeoverClaim is the invariant F-084 rests on, asserted where a
+// TestF084OnlyOneReaderOfTheTakeoverClaim is the invariant issue #86 rests on, asserted where a
 // reader can see it: the takeover vocabulary is reachable from exactly one notifier, and
 // that notifier from exactly one tail.
 //
@@ -501,7 +501,7 @@ func TestF084OnlyOneReaderOfTheTakeoverClaim(t *testing.T) {
 	// Its definition in sess_fork_lineage.go, and mqttNotifyTakenOver. Nothing else.
 	if len(readers) != 2 {
 		t.Fatalf("mqttDisposalTakenOver must have exactly ONE reader beside its definition; "+
-			"found %d sites:\n%s\nA new one is a takeover claim on unproven evidence (F-084).",
+			"found %d sites:\n%s\nA new one is a takeover claim on unproven evidence (issue #86).",
 			len(readers), strings.Join(readers, "\n"))
 	}
 	callers := testTakeoverClaimSites(t, "mqttNotifyTakenOver")
@@ -659,7 +659,7 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 		"disposeForeignSessionLocked",
 		"disposeForeignStateLocked",
 		"disposeForeignStateFenced",
-		// The retirement path's phase 1 (F-036 unit 1): it builds the disposition from
+		// The retirement path's phase 1 (issue #40 unit 1): it builds the disposition from
 		// the capsule instead of the session, and a bypass through it would run the Will
 		// inside the accept transaction exactly as one through the others would.
 		"asm.disposeCaptured(",
@@ -703,11 +703,11 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 
 	// EXACT, not a minimum. A loose floor lets an arm be replaced by a bypass while the
 	// count still passes, which is how a guard stops guarding. The seven are: the
-	// teardown-incomplete arm (which since F-036 unit 1 is the CAPSULE-consuming
+	// teardown-incomplete arm (which since issue #40 unit 1 is the CAPSULE-consuming
 	// helper, because by then the displaced client has been detached and es.c is nil),
-	// refuseDisposing, the three forced-leave arms, (F-105 8a) the disposal of a stale
+	// refuseDisposing, the three forced-leave arms, (issue #107 8a) the disposal of a stale
 	// resident object a committed ownership proposal moved the record past, at the top of
-	// restoreSession, and (F-040) the disposing verdicts of the ending write a takeover
+	// restoreSession, and (issue #44) the disposing verdicts of the ending write a takeover
 	// performs on behalf of a still-bound connection whose DISCONNECT ended the session.
 	// (Neither helper's own definition is a call, and neither is counted.)
 	const wantHelperCalls = 7
@@ -811,7 +811,7 @@ func (w *testWarningCapture) text() string {
 
 // testCaptureServerWarnings swaps in a capturing logger for the duration of the test.
 //
-// It exists because several F-084 residuals are "the Will is lost, and the loss is logged":
+// It exists because several issue #86 residuals are "the Will is lost, and the loss is logged":
 // the log IS the guarantee there, so a fixture that does not read it cannot tell a
 // documented loss from a silent one.
 func testCaptureServerWarnings(t *testing.T, s *Server) *testWarningCapture {
@@ -1037,7 +1037,7 @@ func TestF084RemotePersistWillPhaseIsUngated(t *testing.T) {
 //
 // The two arms are different code and different consequences. With a parked deferred close,
 // the eviction owes that action's Will against its ORIGINAL deadline, not the connection's
-// live one; before F-084 it owed nothing and the action was dropped.
+// live one; before issue #86 it owed nothing and the action was dropped.
 func TestF084RemotePersistEvictionDischargesParkedAction(t *testing.T) {
 	e := testNewEvictEnv(t, "f084r4park")
 	watch := e.watchDelivery(t, "will/topic")

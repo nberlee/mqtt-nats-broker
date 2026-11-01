@@ -97,7 +97,7 @@ func testAwaitProducedState(t *testing.T, sess *mqttSession, dur string, fired *
 				continue
 			}
 			if h := sess.drainSidHoldLocked(sid); h != mqttDrainNotHeld {
-				t.Fatalf("the drain must be UNHELD, or F-094 refuses it and this tests nothing, got %v", h)
+				t.Fatalf("the drain must be UNHELD, or issue #96 refuses it and this tests nothing, got %v", h)
 			}
 			if indexed := sess.drainByDur[dur] != nil; indexed != wantIndexed {
 				return fmt.Errorf("drainByDur entry: want %v, got %v", wantIndexed, indexed)
@@ -126,7 +126,7 @@ func testAwaitProducedState(t *testing.T, sess *mqttSession, dur string, fired *
 // before the handler has written the SUBACK. testMQTTSub expects the SUBACK to be the
 // very next packet and fails on the PUBLISH.
 //
-// IT REPORTS RATHER THAN DISCARDS, and that distinction is the whole of F-098's
+// IT REPORTS RATHER THAN DISCARDS, and that distinction is the whole of issue #100's
 // full-suite regression. This helper used to skip such a PUBLISH silently, which made
 // the caller's next assertion depend on an ordering NOTHING ESTABLISHES: the delivery
 // callback runs on an independent dispatch goroutine, so the replay may land on either
@@ -192,7 +192,7 @@ func testMQTTSubAwaitingSubAck(t *testing.T, pi uint16, c net.Conn, r *mqttReade
 // exchange this replays was deliberately never acknowledged by the fixture
 // (testDrainSetup reads it with testMQTTCheckPubMsgNoAck), so the broker OWES it after
 // the reconnect. A test that merely tolerated it would pass just as happily against a
-// broker that withheld it forever — which is exactly how F-098's durable PUBLISH
+// broker that withheld it forever — which is exactly how issue #100's durable PUBLISH
 // exclusion, when disabled, looked like a repair rather than a suppressed delivery.
 func testMQTTRequireOutstandingReplay(t *testing.T, c net.Conn, r *mqttReader, seen int,
 	topic string, payload []byte) {
@@ -724,7 +724,7 @@ func TestMQTTAQoS2DrainWithheldByPubRelSetupIsReclaimedOnceItRecovers(t *testing
 	const topic = "r1route/topic"
 	const control = "r1route/control"
 	// QoS 2, and NO PUBREC is sent, so the drain carries a PUBLISH-phase claim with no
-	// intent — the subset F-094's hold does NOT cover, which is what makes it adoptable.
+	// intent — the subset issue #96's hold does NOT cover, which is what makes it adoptable.
 	conn, sess, _ := testDrainSetup(t, s, o, "r1route", topic, 2)
 
 	testMQTTSub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: control, qos: 1}}, []byte{1})

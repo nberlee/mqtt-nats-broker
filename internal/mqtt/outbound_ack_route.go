@@ -13,7 +13,7 @@
 
 package mqtt
 
-// A LATE ACKNOWLEDGEMENT IS BOUND BEFORE IT ARRIVES (F-088 / F-097, WP2).
+// A LATE ACKNOWLEDGEMENT IS BOUND BEFORE IT ARRIVES (issue #90 / issue #99, WP2).
 //
 // A transmitted PUBLISH whose scheduling entry is removed before the client answers used to lose
 // its answer: the handler found no entry and no binding and dropped the PUBACK, and the exchange
@@ -33,7 +33,7 @@ const (
 	// mqttSendEvidencePossiblyAttempted: POSITIVE evidence of a possible attempt — an acting,
 	// settled, own entry classified possibly attempted: it recorded its own transmission intent,
 	// or recovery found its marker authoritatively absent or a recovered output token beside it
-	// (F-088). Not proof of wire receipt, and no local write is required.
+	// (issue #90). Not proof of wire receipt, and no local write is required.
 	mqttSendEvidencePossiblyAttempted
 	// mqttSendEvidenceMarkerStanding: the allocation's unsent marker stands and no possible
 	// attempt is recorded; never transmitted.

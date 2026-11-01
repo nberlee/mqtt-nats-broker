@@ -18,7 +18,7 @@ import (
 	"testing"
 )
 
-// Fixture-scoped capture of execution cells (F-105 integrated gate, round 1). Untagged so the shared
+// Fixture-scoped capture of execution cells (issue #107 integrated gate, round 1). Untagged so the shared
 // inflight fixture can register its client.
 
 // testExecCells records the execution cells created for the connections a fixture REGISTERED

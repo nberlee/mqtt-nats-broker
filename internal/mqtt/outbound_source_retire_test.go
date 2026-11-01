@@ -28,7 +28,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-105 7c-lc: the retirement owner's source step, and the routes that hand it decisions.
+// issue #107 7c-lc: the retirement owner's source step, and the routes that hand it decisions.
 
 // testClaimedSourceConsumer claims a fresh source name through the production claim and creates
 // its physical consumer, returning the claim.

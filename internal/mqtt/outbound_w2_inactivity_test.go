@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// The inactivity prerequisite of a depended-on consumer (F-105 WP-F W2, rows D4 and D4c).
+// The inactivity prerequisite of a depended-on consumer (issue #107 WP-F W2, rows D4 and D4c).
 
 // TestF105ReadinessRefusesAStreamInactivityLimit pins that readiness for use refuses a source
 // whose STREAM imposes a consumer inactivity limit, and does so itself: the refusal is the typed

@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// C-IV ARM 2 AT THE ONE DESTRUCTIVE DOOR (F-098, holistic review round 1, finding 0).
+// C-IV ARM 2 AT THE ONE DESTRUCTIVE DOOR (issue #100, holistic review round 1, finding 0).
 //
 // Any live action withholds every destructive disposition, OUR OWN TOKEN INCLUDED. A holder
 // whose write has not returned may still act on the record, so nothing may remove it from
@@ -89,7 +89,7 @@ func TestMQTTInflightDestructiveDispositionsRefuseALiveAction(t *testing.T) {
 					}
 					testInstallPassThroughSeams(e)
 				case mqttInflightPublish:
-					// REBUILT by F-097/F-088 (ruling R-impl-1): the publish rows used to seed an
+					// REBUILT by issue #99/issue #90 (ruling R-impl-1): the publish rows used to seed an
 					// ordinary register with NO exchange, a shape admission never writes and the
 					// door now refuses (WP3 edit 2), so the positive control could not reach the
 					// delete. The slot is now a REAL admission (register, exchange and unsent

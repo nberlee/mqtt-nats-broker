@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// The generation ledger and its duty inventory (F-105, rows 6 and 8).
+// The generation ledger and its duty inventory (issue #107, rows 6 and 8).
 //
 // # Why a walk filter is not a discovery mechanism
 //
@@ -66,7 +66,7 @@ import (
 // same cost the outcome and closure records already carry.
 
 // The record classes this file owns. Both fail mqttValidIDHashToken and mqttValidSessGen the
-// same way every other F-105 class does, so neither can ever parse as a register.
+// same way every other issue #107 class does, so neither can ever parse as a register.
 const (
 	mqttLedgerClassTk = "led"  // one generation's lifecycle state and inventory high-water
 	mqttDutyClassTk   = "duty" // one predeclared duty, at a stable ordinal
@@ -164,13 +164,13 @@ type mqttGenLedger struct {
 	// the CAS lands nothing, so no ordinal is consumed by a refused transition and there is no
 	// hole for a cursor to mistake for the end.
 	Hi uint64 `json:"hi"`
-	// Lo is the FLOOR (F-112): every position below it is RETIRED — reclaimed, or relocated to a
+	// Lo is the FLOOR (issue #114): every position below it is RETIRED — reclaimed, or relocated to a
 	// representative at or above it — so an entry below Lo may be absent and its absence is
 	// legitimate by the floor's own proof. Every position in [Lo, Hi] must exist and decode, or
 	// it is an inconsistency, exactly as before the floor existed. 1 <= Lo <= Hi+1; Lo == Hi+1
 	// is an inventory with nothing outstanding.
 	Lo uint64 `json:"lo"`
-	// Del is the physical-deletion watermark (F-112): every position below Del is DELETED, its
+	// Del is the physical-deletion watermark (issue #114): every position below Del is DELETED, its
 	// duty entry and, for a reclaimed exchange duty, its exchange record. 1 <= Del <= Lo. The
 	// positions in [Del, Lo) are retired but may still be stored; no reader consults them.
 	Del uint64 `json:"del"`
@@ -321,7 +321,7 @@ const (
 	mqttDutyNotYetActionable mqttDutyState = 2
 	// mqttDutyTerminal: the WHOLE duty completed, with its classified result. Irreversible.
 	mqttDutyTerminal mqttDutyState = 3
-	// mqttDutyRelocated (F-112): this POSITION was retired by a floor advance and the duty it
+	// mqttDutyRelocated (issue #114): this POSITION was retired by a floor advance and the duty it
 	// held was carried, unchanged, to the representative at To. It is NOT an ending — the duty
 	// lives on at To — and not a duty state anything continues: it is legal only below the
 	// ledger's floor, where no reader consults it, until the deletion watermark removes it.
@@ -373,10 +373,10 @@ type mqttDutyEntry struct {
 	LeaseUntil int64  `json:"lease_until,omitempty"`
 	// Outcome is the whole duty's classified result, present only at TERMINAL.
 	Outcome string `json:"outcome,omitempty"`
-	// To is a RELOCATION MARKER's representative (F-112): the position the duty was carried
+	// To is a RELOCATION MARKER's representative (issue #114): the position the duty was carried
 	// to. Present exactly when the state is Relocated, and always above Ord.
 	To uint64 `json:"to,omitempty"`
-	// From is a REPRESENTATIVE's provenance (F-112): the position a floor advance carried this
+	// From is a REPRESENTATIVE's provenance (issue #114): the position a floor advance carried this
 	// duty from. Present only on an entry a floor advance created, and always below Ord.
 	// Provenance only: no reader decides anything on it but the floor's own write boundary,
 	// which binds the copy to the marker it carries.

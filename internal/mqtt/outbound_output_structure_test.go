@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-// The structural half of the output boundary (F-105, row 2; plan §7.1).
+// The structural half of the output boundary (issue #107, row 2; plan §7.1).
 //
 // §7.1's property is about what REACHES THE WRITER, and no amount of validation inside the two
 // boundary functions establishes it: a caller that never touches them writes to the socket
@@ -184,7 +184,7 @@ func TestF105EveryTransportWriteIsAccountedFor(t *testing.T) {
 		len(mqttOutputBoundarySites), len(mqttOutputBypassesOwed))
 }
 
-// mqttAlphaMixedSites is the ALPHA requirement on the recorded failure set (F-105 WP-F step 1,
+// mqttAlphaMixedSites is the ALPHA requirement on the recorded failure set (issue #107 WP-F step 1,
 // consult 125): exactly the two MIXED emitters, each with its count.
 //
 // A SEPARATE literal on purpose. Compared against itself, or by key alone, the bypass table passes

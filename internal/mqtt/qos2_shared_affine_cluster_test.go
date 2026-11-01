@@ -300,7 +300,7 @@ func TestQ2AffineCrossBrokerAffinity(t *testing.T) {
 	testMQTTExpectNothing(t, otherReader)
 }
 
-// TestQ2AffClusterCopyLossOnDeletedConsumer is F-063 across brokers.
+// TestQ2AffClusterCopyLossOnDeletedConsumer is issue #67 across brokers.
 //
 // $MQTT_out is interest-retained, so a copy stored onto a subject no consumer filters
 // SUCCEEDS AND KEEPS NOTHING. Neither broker can tell that from its own state: the
@@ -321,7 +321,7 @@ func TestQ2AffineCrossBrokerAffinity(t *testing.T) {
 // `deferred` disposition for this claim through its own `testQ2AffMoveDone` seam. Reading
 // the replicated claim through both nodes would only prove replication. The two brokers
 // refuse for different reasons and both are needed for the invariant: the elected winner
-// refuses at the presence check (F-063's remedy), and the contender refuses when the
+// refuses at the presence check (issue #67's remedy), and the contender refuses when the
 // winner's affine consumer lookup fails.
 //
 // AckWait is shortened on both brokers BEFORE they start, because the group consumer bakes
@@ -334,7 +334,7 @@ func TestQ2AffineCrossBrokerAffinity(t *testing.T) {
 // claim — the SOURCE MESSAGE is still on `$MQTT_msgs`. That last one is not redundant:
 // `confirmAck` commits before the `SourceAcked` CAS, so `SourceAcked == false` alone cannot
 // distinguish "never acked" from "acked, record not yet updated". What the refusal strands
-// is F-064's; this fixture's business is that nothing was released against a store response.
+// is issue #68's; this fixture's business is that nothing was released against a store response.
 //
 // Discriminating mutation: verify only on a REJECTED create-only CAS (mutation 1).
 // Whichever broker moves then advances the claim to materialized and acknowledges the

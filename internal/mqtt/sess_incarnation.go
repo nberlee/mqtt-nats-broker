@@ -17,14 +17,14 @@
 // generation and therefore new names. That much is harmless by construction, with no
 // atomicity requirement anywhere.
 //
-// It does NOT follow that a late delete names nothing live, and F-062 is what that
+// It does NOT follow that a late delete names nothing live, and issue #66 is what that
 // over-reading cost. A plain resume PRESERVES the generation (see below), so a peer may
 // still be serving the very incarnation a teardown is retiring, and a name-scoped
 // deletion reaches whatever that peer has created under it since. Generation scoping
 // protects the NEXT incarnation; it does not arbitrate against the current one. Where a
 // late removal had to be made safe, the bound came from somewhere else entirely: on
 // $MQTT_qos2in every hold purge carries the highest sequence its remover could prove it
-// was entitled to destroy (F-062), which is a fact about the removal, not about the name.
+// was entitled to destroy (issue #66), which is a fact about the removal, not about the name.
 // The generation is minted when a session is
 // first created and re-minted by clear() (which every discard path runs,
 // including the two that REUSE the session object as a fresh session); a plain
@@ -70,7 +70,7 @@ func mqttNewSessGen() string { return nuid.Next() }
 // Resetting the bundle mints a new epoch, which is exactly how records naming
 // sequences of the old store are recognised as uncomparable rather than misread. Every
 // broker-owned stream carries it, not just $MQTT_sess: the ten are one recreation
-// unit (F-066), and recreating any one of them alone is refused at startup.
+// unit (issue #70), and recreating any one of them alone is refused at startup.
 //
 // It is an identity token: equality means "same incarnation, sequences comparable",
 // inequality means "another incarnation". Nothing is ever ordered by it.
@@ -242,13 +242,13 @@ func mqttQoS2HoldWalkFilter(idHash, gen string) string {
 //
 // That is the whole of the invariant. It is NOT that the subject is unused: a resume
 // preserves the generation, so a peer may still be serving the retiring incarnation and
-// using these very subjects. F-034 paid that cost the same way F-062 paid it on
+// using these very subjects. issue #38 paid that cost the same way issue #66 paid it on
 // $MQTT_qos2in — not by naming, but by BOUNDING every removal to what its remover could
 // prove it was entitled to destroy. The teardown's reap enumerates, loads, checks each
 // occupant's identity and deletes only at or below its own enumeration watermark; the
 // drain's release addresses a register by the subject its packet identifier names and
 // deletes only a matching occupant. What neither can arbitrate is a genuinely live owner
-// of the same register, which is F-036's predicate. So the naming here is still not the
+// of the same register, which is issue #40's predicate. So the naming here is still not the
 // safety argument — the bound is.
 func mqttInflightSubject(idHash, gen string, pi uint16) string {
 	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") +
@@ -257,7 +257,7 @@ func mqttInflightSubject(idHash, gen string, pi uint16) string {
 
 // mqttInflightWalkFilter returns the filter enumerating one incarnation's in-flight
 // registers, and only those: exactly one token past the generation. Used by the
-// resume barrier and by the teardown's BOUNDED REAP — since F-034 there is no purge on
+// resume barrier and by the teardown's BOUNDED REAP — since issue #38 there is no purge on
 // this stream; the reap enumerates with this filter and then deletes at exact sequences.
 func mqttInflightWalkFilter(idHash, gen string) string {
 	return mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"

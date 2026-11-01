@@ -1,6 +1,6 @@
 //go:build mqtt_fulltests
 
-// The broker-level sentinel for F-030's terminal Will state, over a genuine 3-node
+// The broker-level sentinel for issue #34's terminal Will state, over a genuine 3-node
 // embedded JetStream cluster and the production CAS helpers.
 //
 // It is an INTEGRATION SENTINEL, not sole proof that the internal window was reached:
@@ -110,7 +110,7 @@ func TestMQTTWillOutboxReplicatedTerminalDoneStands(t *testing.T) {
 	reclaim := licensed
 	if _, rerr := asm.storeWillClaimCAS(subject, licensedSeq, &reclaim); rerr == nil {
 		t.Fatal("a claimant write conditioned on the superseded base was ACCEPTED: the " +
-			"terminal record is regressible and F-030's consequence is live")
+			"terminal record is regressible and issue #34's consequence is live")
 	} else {
 		// Either rejection is correct here and both are the server refusing the write:
 		// a wrong-last-sequence rejection, or the in-process contention code, which

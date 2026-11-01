@@ -190,7 +190,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 	}
 	toTrace := []mqttPublish{}
 	// The entitlement this SUBSCRIBE runs under, captured once: every durable act of the replay is
-	// fenced by it (F-105 7c).
+	// fenced by it (issue #107 7c).
 	ent, _ := c.outboundEntitlement()
 	as.retmsgs.Match(sub.subject, func(subj []byte, ref *mqttRetainedMsgRef) {
 		if ref.deleted {
@@ -221,7 +221,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		}
 		// A broad wildcard subscription can overlap a subscribe deny clause, and
 		// retained replay rides the SERVICE connection, so NATS does not filter it
-		// -- this guard is the only thing that does. F-081.
+		// -- this guard is the only thing that does. issue #83.
 		//
 		// Both non-allow verdicts return, and here they need no other disposal:
 		// nothing has been allocated yet (the packet identifier is taken below), so
@@ -232,7 +232,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		var pi uint16
 		// nonce is THIS allocation's identity, read back under the same lock that minted
 		// it. The frame carries it so its eventual disposition can name the exchange it
-		// disposes of rather than an identifier a later allocation may hold (F-101).
+		// disposes of rather than an identifier a later allocation may hold (issue #103).
 		var nonce string
 		qos := min(mqttGetQoS(rm.Flags), sub.mqtt.qos)
 		if qos > 0 {
@@ -244,7 +244,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			// nils it and resets last_pi while a flush is still to come, and the
 			// displaced connection's write outlives the call. Taken in this same
 			// sess.mu acquisition so the identifier is never allocated-and-unreserved
-			// (F-091).
+			// (issue #93).
 			if pi != 0 {
 				if ack := sess.pendingPublish[pi]; ack != nil {
 					nonce = ack.regNonce
@@ -306,15 +306,15 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			if pi != 0 {
 				// The one place a RESERVED retained frame is provably never written: it
 				// was never even buffered. Abandoned rather than written, so the
-				// generation fence does not apply — no bytes reached the client (F-091).
+				// generation fence does not apply — no bytes reached the client (issue #93).
 				// The abandonment untracks the entry itself, so the separate
 				// untrackPublish this site used to issue is gone rather than left beside
-				// it: two mechanisms freeing one identifier is one too many (F-101).
+				// it: two mechanisms freeing one identifier is one too many (issue #103).
 				sess.releaseRetainedSendAbandonedLocked(c, pi, nonce)
 			}
 			return
 		}
-		// STAGED, not framed for a later raw write (F-105 7c). A QoS 0 item keeps its frame and is
+		// STAGED, not framed for a later raw write (issue #107 7c). A QoS 0 item keeps its frame and is
 		// written by the driver through the actionless writer; a QoS 1/2 item carries the immutable
 		// SNAPSHOT the driver materializes, admits and transmits through the authorized boundary.
 		f := mqttRetainedFrame{header: headerBytes, msg: rm.Msg, pi: pi, nonce: nonce, qos: qos}
@@ -750,7 +750,7 @@ func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm *mq
 // It returns an error whenever the retained update it was asked for is not confirmed --
 // a store error (the write may still have landed) or a fence that refused to write --
 // so that the publication can withhold final success. Nil when there was nothing to
-// retain or the store confirmed the update. F-060.
+// retain or the store confirmed the update. issue #64.
 func (c *client) mqttHandlePubRetain(pp *mqttPublish, origin string) error {
 	retainMQTT := mqttIsRetained(pp.flags)
 	isBirth, _, isCertificate := sparkbParseBirthDeathTopic(pp.topic)
@@ -922,7 +922,7 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 		(*h)(subs)
 		c.mu.Unlock()
 	}
-	// TRANSFERRED to the session's driver, never written here (F-105 7c): the readLoop returns to
+	// TRANSFERRED to the session's driver, never written here (issue #107 7c): the readLoop returns to
 	// reading at once, and the driver materializes, admits and transmits in order.
 	c.transferRetainedReplays(subs)
 }
@@ -938,7 +938,7 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 // transfers the frames and their reservations to the replacement, because a duplicate-filter
 // SUBSCRIBE still owes that replay, while a teardown abandons them because nothing will ever
 // write them and the identifier would otherwise stay reserved against reallocation for the
-// session's life (F-091).
+// session's life (issue #93).
 //
 // The detach shares the c.mu section that mutates c.subs, which is what makes a flusher and
 // a departure contend on ONE mutex: exactly one of them takes the slice, so each frame gets
@@ -954,7 +954,7 @@ func (c *client) detachRetainedFramesLocked(sub *subscription) []mqttRetainedFra
 	if sub == nil || sub.mqtt == nil {
 		return nil
 	}
-	// A DEPARTURE of the replay lineage (F-105 7c): the driver gives its remaining items their
+	// A DEPARTURE of the replay lineage (issue #107 7c): the driver gives its remaining items their
 	// departure dispositions; an object the driver does not hold retires here, so no live callback
 	// is left waiting on a gate nothing will close.
 	if r := sub.mqtt.replay; r != nil && !r.retired {
@@ -1018,7 +1018,7 @@ func (c *client) releaseDetachedRetainedFrames(frames []mqttRetainedFrame) {
 //
 // It replaced an identifier-only helper rather than sitting beside one: the abandonment
 // releases the pending entry as well as the hold, and only the allocation identifies which
-// exchange that entry is, so a bare identifier is not enough for any caller (F-101).
+// exchange that entry is, so a bare identifier is not enough for any caller (issue #103).
 func mqttRetainedFrameRefs(frames []mqttRetainedFrame) []mqttRetainedRef {
 	var refs []mqttRetainedRef
 	for _, f := range frames {

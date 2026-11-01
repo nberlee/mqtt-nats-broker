@@ -27,7 +27,7 @@ import (
 	"time"
 )
 
-// F-105 8a: a proposal some acceptance left standing is SETTLED by the next one, through a
+// issue #107 8a: a proposal some acceptance left standing is SETTLED by the next one, through a
 // real CONNECT, and never mistaken for that acceptance's own.
 //
 // The residue each test meets is left by a REAL accepting CONNECT stopped at the point a
@@ -1170,7 +1170,7 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 	}
 }
 
-// T22 (THE RESIDUE) moved to TestF105_8bReceiptlessTeardownWithholds: since F-105 8b the
+// T22 (THE RESIDUE) moved to TestF105_8bReceiptlessTeardownWithholds: since issue #107 8b the
 // residue's teardown withholds the record's release instead of releasing it receiptless
 // (consult 121), and its continuation is TestF105_8bExpiryAdoptionContinuesReceiptless.
 
@@ -1632,7 +1632,7 @@ func TestF105CompetitorFinalizesUnderAResidentObject(t *testing.T) {
 // T2 resident, BOUND incumbent: the stale resident object still has its connection, which
 // armed a Will. Disposing it as foreign closes that connection and CONSUMES its Will — no
 // successor of it was established by this CONNECT, so its Will is not a takeover's to discard
-// (F-084). A disposal that did nothing would leave the object to an ordinary takeover, which
+// (issue #86). A disposal that did nothing would leave the object to an ordinary takeover, which
 // discards the Will. Mutation M26.
 func TestF105StaleResidentIncumbentIsDisposedAsForeign(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()

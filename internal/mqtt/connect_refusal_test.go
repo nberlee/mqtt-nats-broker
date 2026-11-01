@@ -12,7 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// A refused CONNECT is told which refusal it was before the close (F-061). These fixtures
+// A refused CONNECT is told which refusal it was before the close (issue #65). These fixtures
 // read the CONNACK off a raw socket, so the code is the byte on the wire and not a client
 // library's reading of it, and every refusal arm sits beside an accepted control on the same
 // broker: a refusal assertion alone passes against a broker that refuses everyone.
@@ -112,7 +112,7 @@ func readConnAckCode(t *testing.T, broker string, proto byte, clientID, user, pa
 	return code
 }
 
-// TestRefusedConnectIsToldWhy is F-061's witness through the real auth-passthrough route,
+// TestRefusedConnectIsToldWhy is issue #65's witness through the real auth-passthrough route,
 // one row per refusal class, each at both protocol versions.
 func TestRefusedConnectIsToldWhy(t *testing.T) {
 	oneAccount, _ := authzBroker(t, authzConfOneAccount)

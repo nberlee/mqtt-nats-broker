@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// The F-105 arbitration against a real JetStream.
+// The issue #107 arbitration against a real JetStream.
 //
 // Everything below drives the actual stream, because the properties being established are
 // properties of the STORE and not of the Go code: that a create-only outcome member and a
@@ -77,7 +77,7 @@ func testF105NewEnv(t *testing.T, clientID string) (*testF105Env, func()) {
 // testF105ClearMintedAuthority returns a freshly-connected client to the PRE-AUTHORITY
 // substrate.
 //
-// A production CONNECT now mints a SERVING outbound authority (F-105 rows 1-9), but the
+// A production CONNECT now mints a SERVING outbound authority (issue #107 rows 1-9), but the
 // substrate tests each build their OWN authority state from a clean client — a first
 // reservation, a bootstrapped serving tenure, a standing predecessor. They cannot
 // opClaimClient over a subject the harness already minted. The mint's OTHER batch members —
@@ -224,7 +224,7 @@ func testF105Closure(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64
 
 	rev := prev.Rev + 1
 	// EVERY CLOSURE SEALS AND ROOTS, so the fixture composes what the boundary requires rather
-	// than a bare closure the boundary would refuse (F-105, row 6). The enrolment is derived from
+	// than a bare closure the boundary would refuse (issue #107, row 6). The enrolment is derived from
 	// the ledger and the shard header as they stand, exactly as the production composer derives
 	// it: a fixture that hand-wrote the members would be asserting the shape rather than reaching
 	// the rule.
@@ -511,7 +511,7 @@ func TestF105UnresolvedIsNotNeverLanded(t *testing.T) {
 }
 
 // TestF105AnUnreadableOutcomeIsNotNeverLanded is the INDETERMINATE half of the pin above
-// (F-105 WP-F W2, row M10). A transition X that COMMITTED, and was then superseded by two later
+// (issue #107 WP-F W2, row M10). A transition X that COMMITTED, and was then superseded by two later
 // revisions, has an outcome that cannot be read for a reason other than its absence. The read
 // failed, so nothing was established: X is UNRESOLVED from its handle, never "never landed" -
 // a caller that took the unreadable receipt as an abort would re-issue an obligation X already
@@ -751,7 +751,7 @@ func TestF105ClosedAuthorityCanClaimAFreshGeneration(t *testing.T) {
 }
 
 // TestF105SweepSkipsArbitrationRecords pins that the orphan sweep neither sweeps nor
-// mis-logs F-105's permanent records, and does not spend its bounded budget on them.
+// mis-logs issue #107's permanent records, and does not spend its bounded budget on them.
 //
 // They share $MQTT_inflight with the registers because a batch is per stream, so the sweep
 // walks straight over them. Before this they were retained as "unattributable registers":
@@ -1020,7 +1020,7 @@ func TestF105HandleCannotBeBuiltFromAReceipt(t *testing.T) {
 func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-admit")
 	defer done()
-	// A well-formed lineage: the acquisition installs its token on a register naming it (F-105 row 2).
+	// A well-formed lineage: the acquisition installs its token on a register naming it (issue #107 row 2).
 	xchNonce := mqttNewInflightNonce()
 
 	auth, seq := e.bootstrap(t, "txn-1")

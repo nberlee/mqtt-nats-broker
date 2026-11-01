@@ -88,7 +88,7 @@ func (c *client) mqttParse(buf []byte) error {
 	// pipeEnded: this packet's error found the inbound pipe failed or aborted when it drained.
 	var pipeEnded bool
 
-	// This packet's completion lease (F-036 unit 1). Reassigned per iteration and
+	// This packet's completion lease (issue #40 unit 1). Reassigned per iteration and
 	// released at the end of the iteration; the deferred release below covers every
 	// early exit out of the middle of an iteration — the rejection gate's error and
 	// displaced arms, the SUBSCRIBE live-arbitration disposal, and DISCONNECT — since
@@ -205,7 +205,7 @@ func (c *client) mqttParse(buf []byte) error {
 
 		// ACQUIRE THIS PACKET'S COMPLETION LEASE on the incarnation this connection
 		// was bound to, before the rejection gate and before any mutable session
-		// observation (F-036 unit 1). A displaced connection whose session object has
+		// observation (issue #40 unit 1). A displaced connection whose session object has
 		// since been re-minted holds a RETIRED tracker, so it is refused here rather
 		// than serving a packet under a generation that is not the one it was admitted
 		// under — which is how an acknowledged QoS 2 message was silently lost.
@@ -354,7 +354,7 @@ func (c *client) mqttParse(buf []byte) error {
 					// DISCONNECT claim refuses whichever attempt is second, so the
 					// cost would be a WRONG reason rather than a second packet. The
 					// same shape mqttGateDispatchOnRejection uses above. See
-					// sub_operation_gate.go (F-078).
+					// sub_operation_gate.go (issue #80).
 					return nil
 				}
 				// NOT called when the live tail owned this packet's ambiguity: it
@@ -438,7 +438,7 @@ func (c *client) mqttParse(buf []byte) error {
 			}
 			// A CONNECT the parser refuses still lost to the CONNECT deadline if it
 			// arrived after the window, and is then owed no refusal CONNACK either:
-			// the deadline is arbitrated before ANY response (F-074). The accepted
+			// the deadline is arbitrated before ANY response (issue #77). The accepted
 			// path arbitrates in mqttProcessConnect, which also admits.
 			late := false
 			if rc != 0 || err != nil {
@@ -522,7 +522,7 @@ func (c *client) mqttParse(buf []byte) error {
 						// recorded as an OBLIGATION of this accepted connection rather
 						// than applied to the session here -- which is what the code
 						// this replaced did, under sess.c == c, leaving sess.clean
-						// behind and reaching $MQTT_sess never (F-041). The close
+						// behind and reaching $MQTT_sess never (issue #45). The close
 						// applies it under the ownership gate, inside a record
 						// transaction, and every park carries it. nil means this
 						// connection ends on whatever the session was granted.
@@ -553,7 +553,7 @@ func (c *client) mqttParse(buf []byte) error {
 			// RELEASE BEFORE THE TEARDOWN. mqttHandleClosedClient runs the discard,
 			// which closes this incarnation's tracker and waits for it to drain — so
 			// holding this packet's own lease into it would make the graceful
-			// DISCONNECT wait for itself until the ceiling (F-036 unit 1). Idempotent,
+			// DISCONNECT wait for itself until the ceiling (issue #40 unit 1). Idempotent,
 			// so the deferred release stays correct.
 			if pktLease != nil {
 				pktLease.release()
@@ -573,7 +573,7 @@ func (c *client) mqttParse(buf []byte) error {
 		// response enqueue — is over, so its ownership ends here. An effect it
 		// handed to the transport is NOT an owner: its target was frozen while this
 		// lease was held, and its safety is a property of that target rather than of
-		// this ledger (F-036 unit 1; see sess_lease.go).
+		// this ledger (issue #40 unit 1; see sess_lease.go).
 		if pktLease != nil {
 			pktLease.release()
 			pktLease = nil
@@ -642,7 +642,7 @@ func mqttCheckFixedHeaderFlags(packetType, flags byte) error {
 
 // mqttInboundPacketBound is the largest full packet this connection may claim in
 // a fixed header; a larger claim is refused before its body is buffered, so a
-// client cannot make the broker hold a packet it will never accept (F-120).
+// client cannot make the broker hold a packet it will never accept (issue #122).
 // Before CONNECT it is max_payload. A connected MQTT 5.0 client is held to the
 // Maximum Packet Size its CONNACK advertised, and to nothing else: the enforced
 // value IS the advertised one [MQTT-3.2.2-15]; 0 (nothing advertised) occurs only
@@ -808,7 +808,7 @@ func (r *mqttReader) reset(buf []byte) {
 	r.owned = len(r.pbuf) > 0
 	if r.owned {
 		// Append to the partial packet, so a trickled packet is not copied in full
-		// on every read: growth is amortized, total copying linear (F-120).
+		// on every read: growth is amortized, total copying linear (issue #122).
 		buf = append(r.pbuf, buf...)
 		r.pbuf = nil
 	}
@@ -832,7 +832,7 @@ func (r *mqttReader) readByte(field string) (byte, error) {
 
 // readPacketLen reads a packet's Remaining Length and reports whether the whole
 // packet is in the buffer, keeping a partial one in pbuf. A claimed length is
-// judged before anything is buffered (F-120): first against maxLen, so a v5
+// judged before anything is buffered (issue #122): first against maxLen, so a v5
 // packet over the advertised Maximum Packet Size is Packet Too Large (0x95) even
 // when its length is also wrong for its type, then against the length its type
 // fixes (mqttCheckRemainingLength), so a PINGREQ claiming a body is refused at

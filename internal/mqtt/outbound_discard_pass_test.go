@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// F-105 7d: the discard census, the executor's discard work, the release gate's root arm and the
+// issue #107 7d: the discard census, the executor's discard work, the release gate's root arm and the
 // prompt worker's scheduling (plan-7d T3, T4d-f, T7, T9, T12, T13, T15).
 
 // testDiscardClose closes the environment's SERVING generation DISCARDING through the production

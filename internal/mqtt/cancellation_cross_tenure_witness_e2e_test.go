@@ -27,7 +27,7 @@ import (
 	"time"
 )
 
-// The F-088 cross-tenure witnesses (PS-1, PS-2) and W6a, on production input.
+// The issue #90 cross-tenure witnesses (PS-1, PS-2) and W6a, on production input.
 //
 // A send section's durable action token is acquired by the broker that opened the section, and
 // the section's writer validates its ORIGINAL binding, not the current serving authority. A
@@ -366,7 +366,7 @@ type testF088XWorld struct {
 type testF088Order int
 
 const (
-	// testF088AFirst: A's certificate persisted before B's recovery cleared A's token (F-121's
+	// testF088AFirst: A's certificate persisted before B's recovery cleared A's token (issue #123's
 	// schedule, as run 1 resolved naturally). CHECKED: anything else fails the fixture.
 	testF088AFirst testF088Order = iota
 	// testF088BFirstCertHeld: A's closure-certificate persist is HELD, so B's recovery runs with A's
@@ -446,7 +446,7 @@ func (o testF088AObservation) wireReceipt(pi uint16) bool {
 //
 // order selects the ordering (testF088Order). For either B-first ordering the REACH of the premise is
 // that B's entry acts, names A's allocation, has slot.actionLive over A's own token still on the
-// register, and — since F-088's fix I — reads POSSIBLY ATTEMPTED with the marker retained as
+// register, and — since issue #90's fix I — reads POSSIBLY ATTEMPTED with the marker retained as
 // deletion debt (it read PROVEN-UNSENT before the fix: witness runs 1-3). For A-first the ordering
 // itself is checked: A's certificate cleared the token before B's read, so B's entry is proven-unsent.
 func testF088XHarness(t *testing.T, cid string, order testF088Order) *testF088XWorld {
@@ -607,7 +607,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 	looksUnsent := ack != nil && ack.acts() && ack.regNonce == w.nonce && ack.markerSeq != 0 &&
 		w.sessB.provenUnsentReleasableLocked(ack)
 	// POSSIBLY ATTEMPTED with the marker kept as debt: what B must derive over A's outstanding
-	// output token (F-088 fix I).
+	// output token (issue #90 fix I).
 	possiblyAttempted := ack != nil && ack.acts() && ack.regNonce == w.nonce && ack.markerSeq != 0 &&
 		ack.transmitted && !w.sessB.provenUnsentReleasableLocked(ack)
 	actionLive := ack != nil && ack.slot.actionLive
@@ -1026,7 +1026,7 @@ func (w *testF088XWorld) coldContract(t *testing.T, sess3 *mqttSession, met []te
 
 // requireTombstoneLanded waits for B's teardown, finding no marker naming A's allocation, to land
 // the standalone occupant tombstone over the register A drained, with the exchange still at
-// Publish. label names what a miss is (WP1's REACH, or F-121's characterization).
+// Publish. label names what a miss is (WP1's REACH, or issue #123's characterization).
 func (w *testF088XWorld) requireTombstoneLanded(t *testing.T, label string, attempts func() []testF088Attempt) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -1054,7 +1054,7 @@ func (w *testF088XWorld) requireTombstoneLanded(t *testing.T, label string, atte
 }
 
 // requireEnrolledNoTombstone asserts what B's UNSUBSCRIBE does with a POSSIBLY ATTEMPTED message 1
-// (F-088 fix I): its drain CLAIMS the delivery as started, B keeps the acting entry, and no
+// (issue #90 fix I): its drain CLAIMS the delivery as started, B keeps the acting entry, and no
 // tombstone reaches the commit seam.
 func (w *testF088XWorld) requireEnrolledNoTombstone(t *testing.T, label string, attempts func() []testF088Attempt) {
 	t.Helper()
@@ -1083,10 +1083,10 @@ func (w *testF088XWorld) requireEnrolledNoTombstone(t *testing.T, label string, 
 	}
 }
 
-// testF088PS1 is WP1 through the REACH for the cold test. A-FIRST since F-088's fix I: a B-first
+// testF088PS1 is WP1 through the REACH for the cold test. A-FIRST since issue #90's fix I: a B-first
 // recovery now reads A's outstanding token as a possible attempt and enrols the delivery, so the
 // only schedule left that hands B's teardown a tombstone input is A-first — A's certificate
-// cleared the token before B's read, and A's post-certification intent (F-121) then removes the
+// cleared the token before B's read, and A's post-certification intent (issue #123) then removes the
 // marker B's proven-unsent entry relied on.
 func testF088PS1(t *testing.T, cid string) (*testF088XWorld, func() []testF088Attempt) {
 	t.Helper()
@@ -1106,9 +1106,9 @@ func testF088PS1(t *testing.T, cid string) (*testF088XWorld, func() []testF088At
 	return w, attempts
 }
 
-// PS-1, COLD. A-first (re-checked under F-088's fix I, which removed the B-first input): A's
+// PS-1, COLD. A-first (re-checked under issue #90's fix I, which removed the B-first input): A's
 // certificate cleared its token before B's recovery, so B derives a proven-unsent entry; A's
-// released section then records intent after certification (F-121) with its gate sealed, so
+// released section then records intent after certification (issue #123) with its gate sealed, so
 // nothing is written; B's UNSUBSCRIBE (a real drain, message 2 started) lands the standalone
 // occupant tombstone over the now markerless register. No PUBACK on B; the client resumes on A under a
 // third tenure. Recovery's classification must meet message 1 markerless and cancelled, restore it
@@ -1133,7 +1133,7 @@ func TestF088CrossTenureTombstoneOverAPossiblyAttemptedRegisterCold(t *testing.T
 
 // testF088SeedPersistedVerdict makes a void verdict naming nonce DURABLE on sess's session
 // record: staged through the production entry under the object's accepted entitlement and covered
-// by a landed save. This is SEEDED PERSISTED STATE, stated as such: since F-088's fix I no
+// by a landed save. This is SEEDED PERSISTED STATE, stated as such: since issue #90's fix I no
 // production schedule this file drives stages it over a possibly-attempted register (witness run 3
 // is the production reach evidence for the shape).
 func testF088SeedPersistedVerdict(t *testing.T, sess *mqttSession, nonce string) {
@@ -1278,7 +1278,7 @@ func testF088AwaitPublish(t *testing.T, r *mqttReader, pi uint16, deadline time.
 }
 
 // W-PS2C. A PERSISTED verdict over a possibly-attempted register with its marker ABSENT is
-// superseded by the restoration (F-088 fix II), and the exchange completes through a real
+// superseded by the restoration (issue #90 fix II), and the exchange completes through a real
 // retransmission.
 //
 // SEEDED PERSISTED STATE, stated as such: message 1 is really transmitted on A (the client reads it,
@@ -1516,13 +1516,13 @@ func TestF088RecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 	w.awaitReleased(t, sess3, w.asmA, "CONTRACT (C1 closure, PUBACK after the second recovery)")
 }
 
-// F-121, PINNED DEFECTIVE BEHAVIOUR, in BOTH race orderings. This test characterizes a defect; it
-// does not state the intended contract. F-121's fix must INVERT these assertions deliberately, with
+// issue #123, PINNED DEFECTIVE BEHAVIOUR, in BOTH race orderings. This test characterizes a defect; it
+// does not state the intended contract. issue #123's fix must INVERT these assertions deliberately, with
 // an ordering fix and assertions of the corrected behaviour — never by loosening them.
 //
 // The schedule: the takeover displaces A, whose certification SEALS A's gate. A's parked section,
 // released, then DELETES THE UNSENT MARKER (a confirmed intent) after its binding was certified,
-// and its write is prevented by the sealed gate: no PUBLISH left. That is F-121, in both orderings.
+// and its write is prevented by the sealed gate: no PUBLISH left. That is issue #123, in both orderings.
 //
 // What it does to B differs by ordering:
 //   - A-FIRST (the remaining stranding): A's certificate cleared the token before B's read, so B
@@ -1530,7 +1530,7 @@ func TestF088RecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 //     it and lands the standalone occupant tombstone; the exchange stays at Publish, B holds no entry
 //     and no AckRoute, and the ledger keeps holding and charging the identifier: a markerless
 //     reservation no legitimate acknowledgement will ever release.
-//   - B-FIRST (repaired by F-088's fix I): B read A's token and kept the delivery possibly attempted,
+//   - B-FIRST (repaired by issue #90's fix I): B read A's token and kept the delivery possibly attempted,
 //     so the UNSUBSCRIBE enrols it and nothing is stranded; before the fix this ordering stranded
 //     exactly as A-first does (witness runs 2-3).
 //
@@ -1545,7 +1545,7 @@ func TestF088RecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 // transition; B's exchange, entry, ack bindings and ledger. The source consumer's
 // NumAckPending/AckFloor are RECORDED as read, not inferred. Input: production-reached, two real
 // Servers on one JetStream. Not exercised: abrupt process death; a transmission that actually
-// reached the client (that removal losing completion is F-088's contract, witnessed by
+// reached the client (that removal losing completion is issue #90's contract, witnessed by
 // TestF088CrossTenureLegitimateTransmissionThenCancellation).
 func TestF121IntentDeleteAfterCertificationStrandsAWithdrawnExchange(t *testing.T) {
 	// Not parallel: the send-window, writer and certificate hooks are process-wide.
@@ -1562,32 +1562,32 @@ func testF121Run(t *testing.T, cid string, order testF088Order) {
 	w.releaseCert()
 	obs := w.observeA(t)
 	if !obs.intent || !obs.markerGone {
-		t.Errorf("F-121: A's released section must confirm its marker delete AFTER its certification: %v", obs)
+		t.Errorf("issue #123: A's released section must confirm its marker delete AFTER its certification: %v", obs)
 	}
 	if obs.gateOpen {
-		t.Errorf("F-121: A's output gate must be sealed by the displacement: %v", obs)
+		t.Errorf("issue #123: A's output gate must be sealed by the displacement: %v", obs)
 	}
 	if obs.oldPkt != nil {
-		t.Errorf("F-121: no PUBLISH may reach A's old connection through a sealed gate, read %v", *obs.oldPkt)
+		t.Errorf("issue #123: no PUBLISH may reach A's old connection through a sealed gate, read %v", *obs.oldPkt)
 	}
 	attempts := testF088RecordAttempts(t, &w.asmB.jsa, w.regSubj)
 	testF088Unsub(t, w.cB, w.rB, 7, &w.pkts)
 	w.checkWindow(t, "B's UNSUBSCRIBE")
 	if order.bFirst() {
-		// B-FIRST, REPAIRED by F-088's fix I: B's recovery read A's outstanding token and kept the
+		// B-FIRST, REPAIRED by issue #90's fix I: B's recovery read A's outstanding token and kept the
 		// delivery POSSIBLY ATTEMPTED with the marker as debt, so the UNSUBSCRIBE enrols it — no
 		// withdrawal, no tombstone — and the exchange stays owed at Publish on B's acting entry. The
-		// post-certification intent asserted above is F-121's and is unchanged; it no longer
+		// post-certification intent asserted above is issue #123's and is unchanged; it no longer
 		// strands anything here. The conservative cost: nothing was written, yet the delivery is
 		// retained and will be offered again with DUP=1 (CONFORMANCE).
-		w.requireEnrolledNoTombstone(t, "F-121 (B-first, repaired)", attempts)
+		w.requireEnrolledNoTombstone(t, "issue #123 (B-first, repaired)", attempts)
 		if x, _, _ := w.asmB.jsa.loadOutboundExchange(w.cid, w.epoch, w.gen, w.lin); x == nil || x.Phase != mqttExchangePublish {
-			t.Errorf("F-121 (B-first, repaired): the preserved exchange must stand at Publish, got %+v", x)
+			t.Errorf("issue #123 (B-first, repaired): the preserved exchange must stand at Publish, got %+v", x)
 		}
-		t.Logf("F-121 (%v) state on B: %s", order, w.state(w.sessB, w.asmB))
+		t.Logf("issue #123 (%v) state on B: %s", order, w.state(w.sessB, w.asmB))
 		return
 	}
-	w.requireTombstoneLanded(t, "F-121", attempts)
+	w.requireTombstoneLanded(t, "issue #123", attempts)
 	// The stranded reservation, polled until B's removal has settled.
 	var why string
 	deadline := time.Now().Add(10 * time.Second)
@@ -1616,7 +1616,7 @@ func testF121Run(t *testing.T, cid string, order testF088Order) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if why != _EMPTY_ {
-		t.Errorf("F-121: the stranded reservation was not observed: %s state %s", why, w.state(w.sessB, w.asmB))
+		t.Errorf("issue #123: the stranded reservation was not observed: %s state %s", why, w.state(w.sessB, w.asmB))
 	}
 	ci, cerr := w.asmB.jsa.lookupConsumer(mqttStreamName, w.srcDur)
 	if ci != nil {
@@ -1625,16 +1625,16 @@ func testF121Run(t *testing.T, cid string, order testF088Order) {
 	} else {
 		t.Logf("source consumer %q as observed: does not read back (%v)", w.srcDur, cerr)
 	}
-	t.Logf("F-121 (%v) state on B: %s", order, w.state(w.sessB, w.asmB))
+	t.Logf("issue #123 (%v) state on B: %s", order, w.state(w.sessB, w.asmB))
 }
 
-// W-LEGIT. A LEGITIMATE transmission followed by a cross-tenure cancellation: F-088's contract on
+// W-LEGIT. A LEGITIMATE transmission followed by a cross-tenure cancellation: issue #90's contract on
 // the window C-W2 named.
 //
 // B-first with A's EVICTION held (testEvictPauseBeforeLoad, for this client only): A never
 // certifies its connection, so its gate stays open while the client resumes on B under a new
 // tenure. B's recovery reads A's outstanding output token and derives the entry POSSIBLY ATTEMPTED
-// with the marker kept as deletion debt (F-088 fix I; before it, B derived proven-unsent and the
+// with the marker kept as deletion debt (issue #90 fix I; before it, B derived proven-unsent and the
 // delivery was lost — witness runs 3, 4/4). A's released section records intent and its writer
 // WRITES message 1 to the old connection — the client's old reader READS it, which is decisive.
 // B's UNSUBSCRIBE (a real drain, message 2 started) then ENROLS message 1 in the drain as a started
@@ -1644,13 +1644,13 @@ func testF121Run(t *testing.T, cid string, order testF088Order) {
 // resume.
 //
 // A's eviction is released after A's write and token drain are observed and before the PUBACK
-// (plan rev 11, 13.1), so F-122's displaced-subscription churn cannot starve B's advances.
+// (plan rev 11, 13.1), so issue #124's displaced-subscription churn cannot starve B's advances.
 //
 // Fixture validity, checked before any contract outcome is classified: the eviction hold was
 // reached and A's gate was open with no certificate before A's release; the cancellation window's
 // elapsed bound holds; B opened no section for message 1 (re-asserted through completion). The gate
 // claim is scoped to this schedule: the seam does not rule out unrelated transport failures or an
-// A-side rejection. A failure of the contract is F-088's contract failure, recorded as such.
+// A-side rejection. A failure of the contract is issue #90's contract failure, recorded as such.
 //
 // Witness: B's recovered classification (premise), the old connection's reader (wire receipt), A's
 // token drain, the drain's claim of message 1 with no tombstone at the commit seam, the exchange
@@ -1682,7 +1682,7 @@ func TestF088CrossTenureLegitimateTransmissionThenCancellation(t *testing.T) {
 	t.Logf("legitimate transmission observed: %v (dup=%v)", *obs.oldPkt, obs.oldPkt.flags&mqttPubFlagDup != 0)
 	// A's eviction is released once A's write and token drain are observed and BEFORE the PUBACK
 	// (plan rev 11, 13.1): a held eviction keeps the displaced resident subscription re-offering
-	// and refusing admissions (F-122), and the authority writes of that churn starve B's
+	// and refusing admissions (issue #124), and the authority writes of that churn starve B's
 	// acknowledgement advances — the fixture would cause the outcome (1 failure in 6 runs).
 	w.releaseEvict()
 	w.requireANotResident(t)
@@ -1731,7 +1731,7 @@ func TestF088CrossTenureLegitimateTransmissionThenCancellation(t *testing.T) {
 // B-first with A's eviction held, as W-LEGIT. A's section is parked at WROTE — after its enqueue,
 // with its token still on the register — and the client's old reader has READ message 1. A's
 // eviction is then released while the token still stands (plan rev 11, 13.1; a held eviction's
-// F-122 churn starved every advance for 15 s). The PUBACK is sent on B; B PROCESSING it is observed
+// issue #124 churn starved every advance for 15 s). The PUBACK is sent on B; B PROCESSING it is observed
 // as the registration of its acknowledged terminal retry, with the token still standing; only then
 // is A's write barrier released.
 //
@@ -1757,7 +1757,7 @@ func TestF088CrossTenureAckBeforeTheHoldersDrainCompletes(t *testing.T) {
 		t.Fatalf("REACH: the client's old reader must READ message 1's PUBLISH before the PUBACK, read %v (ok %v)", p, ok)
 	}
 	// A's eviction is released now, with the section still parked after its write: a displaced
-	// resident subscription otherwise keeps re-offering and refusing admissions (F-122), and the
+	// resident subscription otherwise keeps re-offering and refusing admissions (issue #124), and the
 	// authority writes that churn produces out-race B's acknowledgement advance (observed: every
 	// attempt lost its authority CAS for 15 s). The token is the section's and still stands.
 	w.releaseEvict()
@@ -1808,15 +1808,15 @@ func TestF088CrossTenureAckBeforeTheHoldersDrainCompletes(t *testing.T) {
 //     drain's consumer is deleted IN-SESSION.
 //   - ONE FAILED SAVE (the existing save-failure seam, mqttTestSessSaveHookV): the failure is
 //     consumed and, before any resume, the claim retires, the exchange completes and the resources
-//     are released. The rest of this arm is the F-124 CHARACTERIZATION OF THE CURRENT DEFECTIVE
-//     CONSEQUENCE, re-expressed when F-124 lands: the retry that marks the removal runs with no
+//     are released. The rest of this arm is the issue #126 CHARACTERIZATION OF THE CURRENT DEFECTIVE
+//     CONSEQUENCE, re-expressed when issue #126 lands: the retry that marks the removal runs with no
 //     connection, so the consumer's disposal is not decided in-session; at the next resume the
-//     F-105 7f executor decides it under the resuming entitlement and the consumer is then
+//     issue #107 7f executor decides it under the resuming entitlement and the consumer is then
 //     authoritatively absent (a CLASSIFIED consumer-not-found; any other lookup error fails). This
 //     arm earns no credit for in-session disposal after a failure.
 //
 // A's eviction is released after the enrolment and before the acknowledgements: a displaced
-// resident subscription otherwise keeps re-offering and refusing admissions (F-122), and the drain
+// resident subscription otherwise keeps re-offering and refusing admissions (issue #124), and the drain
 // consumer would keep a live subscriber.
 func TestF088RecoveredDrainClaimRetiresDespiteAFailedSave(t *testing.T) {
 	// Not parallel: the send-window, writer, eviction and save hooks are process- or account-wide.
@@ -1844,7 +1844,7 @@ func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
 	w.requireANotResident(t)
 	var failed atomic.Int32
 	if inject {
-		// F-124's population is a connectionless retry that removes the drain's LAST claim. Which
+		// issue #126's population is a connectionless retry that removes the drain's LAST claim. Which
 		// finalize removes the last claim depends on the order the two acknowledgements are
 		// processed in, so the order is FORCED: message 2 is acknowledged and its claim removal
 		// made DURABLE first, through the connection; only then is the save that removes message
@@ -1961,19 +1961,19 @@ func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
 		t.Logf("W-DRN baseline: drain retired, consumer %q deleted in-session", w.srcDur)
 		return
 	}
-	// INJECTED ARM — F-124 CHARACTERIZATION of the current defective consequence: the retry that
+	// INJECTED ARM — issue #126 CHARACTERIZATION of the current defective consequence: the retry that
 	// marked the drain's removal ran with no connection, so its disposal decision carries no
 	// entitlement and is not recorded; the consumer is left for recovery. These assertions pin that
-	// consequence and are re-expressed when F-124 lands.
+	// consequence and are re-expressed when issue #126 lands.
 	if consumerGone(10 * time.Second) {
-		t.Fatalf("F-124 characterization: the consumer %q was deleted in-session; F-124's consequence no longer "+
+		t.Fatalf("issue #126 characterization: the consumer %q was deleted in-session; issue #126's consequence no longer "+
 			"holds — re-express this arm", w.srcDur)
 	}
 	if r, _, _ := w.asmB.jsa.loadOutboundResource(w.cid, w.epoch, w.gen, inc); r == nil || r.Disposal != nil {
-		t.Fatalf("F-124 characterization: before the resume the drain consumer's resource must carry NO disposal "+
+		t.Fatalf("issue #126 characterization: before the resume the drain consumer's resource must carry NO disposal "+
 			"decision, got %+v", r)
 	}
-	// The next resume: the F-105 7f executor decides the consumer under the resuming tenure, and the
+	// The next resume: the issue #107 7f executor decides the consumer under the resuming tenure, and the
 	// consumer is then authoritatively absent.
 	w.cB.Close()
 	cB2, _ := testInflightReconnect(t, w.oB, w.cid)
@@ -1991,7 +1991,7 @@ func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the next resume's F-105 7f executor must decide the drain consumer's disposal and authorize its "+
+			t.Fatalf("the next resume's issue #107 7f executor must decide the drain consumer's disposal and authorize its "+
 				"deletion, resource %+v", r)
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -2002,7 +2002,7 @@ func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
 	if !consumerGone(15 * time.Second) {
 		t.Errorf("the drain consumer %q must be authoritatively absent after the resume's decision; resource %+v", w.srcDur, r)
 	}
-	t.Logf("W-DRN injected (F-124 characterization): resume decision %+v, resource state %v; consumer %q not found",
+	t.Logf("W-DRN injected (issue #126 characterization): resume decision %+v, resource state %v; consumer %q not found",
 		*r.Disposal, r.State, w.srcDur)
 }
 

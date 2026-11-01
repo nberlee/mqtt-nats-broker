@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// The retained materialization operations (F-105 7c).
+// The retained materialization operations (issue #107 7c).
 //
 // A retained QoS 1/2 delivery becomes durable in four acts, each one authority batch on
 // $MQTT_inflight, each fenced by the producing connection's CAPTURED entitlement (compared with the

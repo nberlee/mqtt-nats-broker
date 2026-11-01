@@ -15,7 +15,7 @@ package mqtt
 
 import "sync/atomic"
 
-// The ordinary-source sinks refuse anything that names no ordinary source (F-105 7c).
+// The ordinary-source sinks refuse anything that names no ordinary source (issue #107 7c).
 //
 // A retained register has no source consumer and no sequence, and the readers that ask a consumer
 // about a delivery would read its EMPTY coordinates as a consumer that is gone — LOST — and LOST

@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// The writer's half of the output gate (F-105 WP-F W2, R1 third).
+// The writer's half of the output gate (issue #107 WP-F W2, R1 third).
 //
 // Certification seals the gate and then crosses wmu, and that pairing only means "no write is in
 // progress" if every writer reads the gate UNDER wmu. A writer that read it before taking the lock

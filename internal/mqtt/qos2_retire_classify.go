@@ -1,12 +1,12 @@
 // Classifying an inbound QoS 2 release against the generation-retirement watermark.
 //
 // The release claim decides the occupancy a discard ENUMERATED and competed for, and
-// F-062's cutoff decides how much of a subject a purge was entitled to destroy. Neither
+// issue #66's cutoff decides how much of a subject a purge was entitled to destroy. Neither
 // reaches the two populations this file exists for: a hold the discard's one-shot
 // enumeration never named, and one the cutoff SPARED above its own watermark. For both of
 // those the session was durably discarded and this broker was never told — so a PUBREL
 // arriving afterwards fans an acknowledged payload out onward and answers the client
-// 0x00, for a session that no longer exists. That is F-036's site 2.
+// 0x00, for a session that no longer exists. That is issue #40's site 2.
 //
 // What makes a decision possible here is that the retirement watermark is written BEFORE
 // any teardown deletion (recordGenRetirement), and a write that cannot be confirmed
@@ -16,7 +16,7 @@
 // second arbitration of its own, and it does not replace either fence.
 //
 // THE CLASSIFICATION IS TWO-DIMENSIONAL, and one dimension alone is wrong in a way that
-// cost F-036 an attempt. Refusing on a bare generation MISMATCH is wrong because the
+// cost issue #40 an attempt. Refusing on a bare generation MISMATCH is wrong because the
 // watermark is a single slot replaced by increasing MarkerSeq alone: retire G1, then
 // create and retire G2, and a broker still serving G1 reads "a different generation" and
 // fans out. Refusing only on a generation MATCH is wrong for the same slot reason from the
@@ -28,7 +28,7 @@
 // adoption takes either a store response for this broker's own bytes or a digest-matched
 // readback, and a marked record is never restored into a bound session.
 //
-// THE IDENTITY TERM IS THE PACKET LEASE, and this is what F-036's second attempt found
+// THE IDENTITY TERM IS THE PACKET LEASE, and this is what issue #40's second attempt found
 // unproved. mqttParse acquires the packet's completion lease against c.mqtt.tracker — the
 // incarnation the CONNECTION was bound to — before the rejection gate and before any
 // mutable session observation, and releases it only at the end of that packet's iteration.
@@ -58,7 +58,7 @@
 // decide".
 //
 // See docs/ARCHITECTURE.md, "The generation-retirement watermark", and
-// docs/findings/ha-arbitration.md F-036.
+// https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
 
 package mqtt
 
@@ -179,7 +179,7 @@ func (sess *mqttSession) classifyQoS2ReleaseInTx(asm *mqttAccountSessionManager,
 	r, _, status := asm.jsa.loadGenRetirement(asm.domainTk, idHash)
 	switch status {
 	case mqttRetirementAbsent:
-		// No retirement was ever recorded for this client. F-066 makes a lone
+		// No retirement was ever recorded for this client. issue #70 makes a lone
 		// recreation of $MQTT_teardown a refused state — an account holding nine of
 		// the ten streams fails the account-wide preflight before anything is
 		// provisioned — so absence here is absence rather than a lost fence.

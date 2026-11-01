@@ -26,11 +26,11 @@ import (
 	"time"
 )
 
-// A long-lived connection keeps no execution history per transmission (F-105 integrated gate, round
+// A long-lived connection keeps no execution history per transmission (issue #107 integrated gate, round
 // 1): the consume-once fact lives on each acquisition's holder, so once every exchange a connection
 // carried has ended, nothing reachable from the connection and its session grows with how many it
 // carried. The schedules that end an entered PUBREL unwritten (S6, S8) repeat in a sibling test on the
-// same harness: since F-116 an attempt whose frame was provably not emitted gives its PUBCOMP unit back,
+// same harness: since issue #118 an attempt whose frame was provably not emitted gives its PUBCOMP unit back,
 // so each such exchange ends with the one PUBCOMP its written retransmission is owed. A sibling rather
 // than two more schedules here only for the run's length: every exchange costs the store a little more
 // than the last, so one connection carrying all eight takes about as long as the two tests together
@@ -345,7 +345,7 @@ func (l *testLongLived) iteration(t *testing.T, first bool) {
 	l.s7(t, first)
 }
 
-// refusedIteration runs every repeated schedule that ends an entered PUBREL unwritten once (F-116).
+// refusedIteration runs every repeated schedule that ends an entered PUBREL unwritten once (issue #118).
 func (l *testLongLived) refusedIteration(t *testing.T, first bool) {
 	t.Helper()
 	l.s6(t, first)
@@ -355,7 +355,7 @@ func (l *testLongLived) refusedIteration(t *testing.T, first bool) {
 // s6 is ONE QoS 2 exchange at pubrel_ready carrying S6 then S5: a stored PUBREL delivered through
 // the delivery callback enters its write and is refused by the client's Maximum Packet Size, then
 // its redelivery executes the next acquisition, and the client's ONE PUBCOMP ends the exchange. The
-// refused attempt's unit was given back (F-116), so that one PUBCOMP is all the identifier owes.
+// refused attempt's unit was given back (issue #118), so that one PUBCOMP is all the identifier owes.
 func (l *testLongLived) s6(t *testing.T, first bool) {
 	t.Helper()
 	e := l.e
@@ -381,7 +381,7 @@ func (l *testLongLived) s6(t *testing.T, first bool) {
 
 // s8 is ONE retained QoS 2 exchange carrying S8 then S7: the client's PUBREC emits the PUBREL, which
 // enters its write and is refused by the client's Maximum Packet Size, then a re-emission executes
-// the next acquisition, and the client's ONE PUBCOMP ends the exchange (F-116, as in s6).
+// the next acquisition, and the client's ONE PUBCOMP ends the exchange (issue #118, as in s6).
 func (l *testLongLived) s8(t *testing.T, first bool) {
 	t.Helper()
 	e := l.e
@@ -553,7 +553,7 @@ func TestF105ALongLivedConnectionRetainsNoTransmissionHistory(t *testing.T) {
 }
 
 // TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp is the same for S6 and S8, the
-// schedules that end an entered PUBREL unwritten and then complete with ONE PUBCOMP: before F-116 each
+// schedules that end an entered PUBREL unwritten and then complete with ONE PUBCOMP: before issue #118 each
 // refusal left a send hold {no token, no action, pubCompOwed 1}, two per round, 220 after 110.
 func TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp(t *testing.T) {
 	testLongLivedRun(t, "f116-longlived", (*testLongLived).refusedIteration)
@@ -839,7 +839,7 @@ func (h *testEnteredHolder) capture(sess *mqttSession, pi uint16, lin string, ac
 // requireRefusedAfterEntry is what both single-shot tests assert once the production call returned:
 // entry happened once, nothing reached the wire, the EXACT holder's cell is ABANDONED at the
 // acquisition's key, its action and token drained on the store, and the attempt's PUBCOMP unit was
-// given back (F-116): the refusal is a provably prevented write, so no PUBCOMP is owed for it.
+// given back (issue #118): the refusal is a provably prevented write, so no PUBCOMP is owed for it.
 //
 // NOT asserted: that the identifier is free. The exchange is still at pubrel_ready and its PUBREL
 // is still owed, so the identifier stays the exchange's; s6 and s8 carry it on to its PUBCOMP.

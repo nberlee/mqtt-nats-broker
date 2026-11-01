@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// Driving an accepted CONNECT to a SERVING authority IN the accept transaction (F-105 cutover,
+// Driving an accepted CONNECT to a SERVING authority IN the accept transaction (issue #107 cutover,
 // row 9 / Codex consult-5 steps 3-4). This is the route by which an accepted CONNECT reaches a
 // serving authority: the metadata half is composed and committed through
 // sess.saveAcceptWithOwnership, so the record, the acceptance fact AND the ownership receipt
@@ -53,7 +53,7 @@ type mqttCleanStartRetireTargets struct {
 // WIN at that sequence and retire what the object's memory names.
 var errMQTTDisplacedRecordUnproven = errors.New("the session record a clean start would displace could not be proven")
 
-// displacedRetireTargets is the clean start's ONE retirement disposition (F-105 8b, P2;
+// displacedRetireTargets is the clean start's ONE retirement disposition (issue #107 8b, P2;
 // consult 123), run as the retirement's pre-detach proof from the discard boundary's CARRIED
 // load. A clean start that hands off from a SERVING predecessor must name the targets of the
 // record its accepted batch DISPLACES, never the object's memory; and a clean start must never
@@ -144,7 +144,7 @@ func (sess *mqttSession) newAcceptOwnershipExecutorRun(jsa *mqttJSA, st *mqttCon
 	domainTk := sess.domainTk
 	// THE FORK FENCE, captured once for the whole drive: every preparation attempt this executor
 	// makes — including a re-attempt after one that positively never landed — CASes the sequence
-	// fork repair read under, never a fresher one (F-105 7f).
+	// fork repair read under, never a fresher one (issue #107 7f).
 	sess.mu.Lock()
 	fence := sess.forkFence
 	sess.mu.Unlock()
@@ -302,7 +302,7 @@ func (sess *mqttSession) newAcceptOwnershipExecutorRun(jsa *mqttJSA, st *mqttCon
 // another settler acted on it first, or replaced it. Nothing of this step landed. The executor
 // returns it WITH a fresh read, and the driver continues from that read: the act was owed to a
 // proposal that is no longer there, so the right next step is to decide again, never to act on
-// whatever now stands in its place (F-105 8a).
+// whatever now stands in its place (issue #107 8a).
 var errMQTTOwnershipTargetMoved = errors.New("the proposal this step names no longer stands")
 
 // runOwnershipSettlementArm performs one SETTLEMENT act on the named proposal: settle its slot,
@@ -413,7 +413,7 @@ func (sess *mqttSession) driveAcceptToServingAuthority(tok recordTx, clientID, s
 		// A clean start's handoff (over a live predecessor) discards the predecessor; the retire
 		// request names the predecessor SESSION identity AND its backing-resource targets, so the
 		// closure that ends its generation can enrol them AFTER the accepted batch has displaced
-		// the record that made them nameable (F-105 row 8/9 ordering, Codex consult 6).
+		// the record that made them nameable (issue #107 row 8/9 ordering, Codex consult 6).
 		// opPrepareHandoffFenced stamps the predecessor gen/tenure/owner from the serving authority.
 		retire = &mqttRetirementRequest{
 			SessWID: prevSessWID, SessSeq: prevSessSeq,
@@ -524,7 +524,7 @@ func (sess *mqttSession) settleFailedMetadataCommit(jsa *mqttJSA, obs *mqttOwnOb
 	proposal mqttOwnershipProposal, detail mqttSessSaveDetail, domainTk string, step mqttOwnershipStep,
 	cleanup func() error, load func(*mqttForeignRecovery) mqttConnectOwnershipInput,
 	err error) (mqttConnectOwnershipInput, error) {
-	// WHO ABORTED IT decides what the abort means (F-105 8a, H-1, H-2). Aborted by another
+	// WHO ABORTED IT decides what the abort means (issue #107 8a, H-1, H-2). Aborted by another
 	// party means the acceptance has LOST — it cleans up and refuses, and no re-drive may
 	// propose again for it. Aborted by this acceptance's own settlement means only that the
 	// attempt lost the record race (a rival's record, a moved predecessor) and nothing of it
@@ -657,7 +657,7 @@ func mqttReconcileOwnershipStep(jsa *mqttJSA, op func(txn string) (mqttOpOutcome
 			continue
 		}
 		// STILL UNRESOLVED: the transition may have landed. Marked, so a caller whose transition
-		// would have created a proposal records it as one that may stand (F-105 8a, consult 120).
+		// would have created a proposal records it as one that may stand (issue #107 8a, consult 120).
 		return _EMPTY_, fmt.Errorf("%w: %w", errMQTTOwnershipStepUnresolved, err)
 	}
 }
@@ -712,7 +712,7 @@ func (sess *mqttSession) noteOwnershipBeforeMetadata(action mqttConnectOwnership
 }
 
 // mqttOwnIdentity is what one CONNECT knows about its OWN proposals, which is the only basis on
-// which a standing proposal may be called its own (F-105 8a).
+// which a standing proposal may be called its own (issue #107 8a).
 //
 // The current proposal is the one this drive made, once its reservation or preparation landed;
 // the earlier ones are what previous drives of the SAME CONNECT made before a re-drive. A

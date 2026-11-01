@@ -22,7 +22,7 @@ import (
 //
 // It bounds two things, and both are enforced: the connection's LIFETIME (the timer
 // callback closes the socket whenever it runs) and ADMISSION (a CONNECT arriving after the
-// window is refused by the clock, whether or not the callback has run; F-074).
+// window is refused by the clock, whether or not the callback has run; issue #77).
 //
 // The bound is unconditional and fail-closed. It is not a DoS defense: a peer
 // can still hold roughly (accept rate x window) connections open. It makes an

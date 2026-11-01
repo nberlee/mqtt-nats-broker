@@ -31,7 +31,7 @@ var (
 	errDrainTestStillDraining     = errors.New("the drain has not retired yet")
 )
 
-// TestMQTTReSubscribeOverAnUnfinishedDrainedIntentIsRefused is F-094 end to end, and it is
+// TestMQTTReSubscribeOverAnUnfinishedDrainedIntentIsRefused is issue #96 end to end, and it is
 // the test that has to fail on the DAMAGE rather than on the refusal.
 //
 // The window it occupies is real and is the only route to a drained past-PUBREC intent:
@@ -526,7 +526,7 @@ func TestMQTTRestoredIntentWhoseRecreateFailedHoldsItsFilter(t *testing.T) {
 	// already finished, and the drain's recreation of the PUBREL needs its own resume. It
 	// does NOT follow that no PUBREL can appear before then — L1's owed materialization,
 	// enrolled when the intent was recorded, rebuilds the record from the slot once stores
-	// work again (F-098), and admission may transmit it on THIS connection.
+	// work again (issue #100), and admission may transmit it on THIS connection.
 	//
 	// Nothing below depends on which path produces it. The client does not answer here, so
 	// an unacknowledged PUBREL is re-sent on the next resume either way, and the third
@@ -561,7 +561,7 @@ func TestMQTTRestoredIntentWhoseRecreateFailedHoldsItsFilter(t *testing.T) {
 
 	// Counted from JETSTREAM: exactly one consumer on the filter, so the retired drain's
 	// durable was not left behind beside the fresh one. Polled: the drain's consumer is retired
-	// by the session's retirement owner once its obligation's ending released it (F-105 7c-lc),
+	// by the session's retirement owner once its obligation's ending released it (issue #107 7c-lc),
 	// not deleted inline by the drain.
 	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
 		if n := testStreamConsumersForFilter(t, sess3, topic); n != 1 {

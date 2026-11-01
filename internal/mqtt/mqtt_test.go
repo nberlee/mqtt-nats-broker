@@ -360,7 +360,7 @@ func TestMQTTPacketLenMaxPayloadViolation(t *testing.T) {
 	require_Equal(t, len(r.pbuf), 0)
 }
 
-// A connected client's claimed length is judged at the fixed header (F-120):
+// A connected client's claimed length is judged at the fixed header (issue #122):
 // a packet over the bound is refused after a few body bytes, not held until the
 // claimed body arrives. Ported from upstream nats-server (#8692).
 func TestMQTTIncompletePacketMaxPayloadViolationDisconnects(t *testing.T) {
@@ -399,7 +399,7 @@ func TestMQTTIncompletePacketMaxPayloadViolationDisconnects(t *testing.T) {
 }
 
 // A fixed-length packet type claiming a body is malformed at its fixed header:
-// it is refused there, not after the claimed body arrives (F-120).
+// it is refused there, not after the claimed body arrives (issue #122).
 func TestMQTTIncompleteFixedLengthPacketDisconnects(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -432,7 +432,7 @@ func TestMQTTIncompleteFixedLengthPacketDisconnects(t *testing.T) {
 // The reserved-namespace branch of mqttProcessPub discards a PUBLISH before its
 // payload is checked, so a complete oversized one used to be discarded with the
 // connection kept. Over the connected 3.1.1 bound it is now refused at its fixed
-// header like any other packet: a reserved topic earns no exemption (F-120).
+// header like any other packet: a reserved topic earns no exemption (issue #122).
 func TestMQTTOversizedReservedTopicPublishDisconnects(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -454,7 +454,7 @@ func TestMQTTOversizedReservedTopicPublishDisconnects(t *testing.T) {
 
 // max_payload bounds the NATS message, and a QoS 0 PUBLISH's topic is not part
 // of it, so the connected 3.1.1 bound leaves room for a topic beyond max_payload
-// (F-120). Ported from upstream nats-server (#8692).
+// (issue #122). Ported from upstream nats-server (#8692).
 func TestMQTTMaxPayloadDoesNotCapPublishTopic(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -471,7 +471,7 @@ func TestMQTTMaxPayloadDoesNotCapPublishTopic(t *testing.T) {
 }
 
 // A trickled packet is appended to, not copied in full on every read: buffer
-// growth is amortized (F-120). Ported from upstream nats-server (#8692).
+// growth is amortized (issue #122). Ported from upstream nats-server (#8692).
 func TestMQTTPartialPacketNotCopiedOnEveryRead(t *testing.T) {
 	const payloadLen = 64 * 1024
 	w := newMQTTWriter(0)
@@ -509,7 +509,7 @@ func TestMQTTPartialPacketNotCopiedOnEveryRead(t *testing.T) {
 
 // An owned buffer is kept as the partial's buffer only while it holds nothing
 // but the partial. Once a packet has been parsed out of it, the partial after
-// that packet is copied out, so the parsed packet is never parsed again (F-120).
+// that packet is copied out, so the parsed packet is never parsed again (issue #122).
 func TestMQTTPartialPacketAfterCompletePacketIsCopied(t *testing.T) {
 	ping := []byte{mqttPacketPing, 0}
 	pub := newMQTTWriter(0)
@@ -554,7 +554,7 @@ func TestMQTTPartialPacketAfterCompletePacketIsCopied(t *testing.T) {
 
 // The remaining length a packet type fixes is judged at the fixed header, before
 // any body is buffered, under the rules of the connection's protocol level
-// (F-120).
+// (issue #122).
 func TestMQTTReadPacketLenRefusesRemainingLengthBeforeBuffering(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -3980,7 +3980,7 @@ func TestMQTTQoS2InflightMsgsDeliveredAfterUnsubscribe(t *testing.T) {
 	// legitimate retransmission overtakes PUBREL 2 and the strict packet order
 	// below fails for a timing reason. The old 10ms window raced the batch read;
 	// 250ms still raced PUBREL 2, which can wait for a concurrent PI 2 send
-	// section to drain (F-115). The retries the loop below relies on still come
+	// section to drain (issue #117). The retries the loop below relies on still come
 	// well inside the 10s packet-read deadline.
 	o.MQTT.AckWait = 2 * time.Second
 	s := testMQTTRunServer(t, o)
@@ -4190,7 +4190,7 @@ func TestMQTTQoS2RetriesPubRel(t *testing.T) {
 	// AckWait governs how long the server waits before REDELIVERING an unacknowledged
 	// outbound packet. This test asserts that a PUBREL is redelivered repeatedly until
 	// PUBCOMP and then ceases — the redelivery behaviour, not a teardown-latency budget. A
-	// concurrent clean-session disconnect now closes its outbound authority (F-105 row 8),
+	// concurrent clean-session disconnect now closes its outbound authority (issue #107 row 8),
 	// which adds a few JetStream round trips the 50ms window could not absorb, so a stray
 	// PUBLISH redelivery raced ahead of the first PUBREL. 250ms keeps the redelivery
 	// assertions exactly and stops timing the teardown instead of the retry.
@@ -4530,7 +4530,7 @@ func TestMQTTMaxAckPendingForMultipleSubs(t *testing.T) {
 	// Now we should get the second message. It was WITHHELD at the cap and never put on
 	// the wire (testMQTTExpectNothing above), so its arrival is a FIRST transmission and
 	// carries DUP=0 — even though JetStream's delivery count is above one. Deriving DUP
-	// from that count was the defect F-072 removes (N-1.1); the marker records that this
+	// from that count was the defect issue #76 removes (N-1.1); the marker records that this
 	// identifier's PUBLISH was never sent.
 	testMQTTCheckPubMsg(t, c, r, "bar", mqttPubQos1, []byte("msg2"))
 }

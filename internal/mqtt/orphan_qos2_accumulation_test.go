@@ -1,6 +1,6 @@
 //go:build mqtt_experimental_shared_qos2
 
-// Fixtures for F-064's accumulation half: settled affine QoS 2 state that nothing
+// Fixtures for issue #68's accumulation half: settled affine QoS 2 state that nothing
 // reaped while the owning session's record was live.
 //
 // These tests do NOT run in parallel, and that is load-bearing rather than incidental.
@@ -145,7 +145,7 @@ func (e *testOrphanEnv) countClaimLoads(t *testing.T, subject string) func() int
 // ---------------------------------------------------------------------------
 
 // A claim of a live generation that is already durably terminal — AffineDone with the
-// source proven — is REAPED. Before F-064's accumulation half the live reference made
+// source proven — is REAPED. Before issue #68's accumulation half the live reference made
 // the pass skip it, so it survived for the life of a session that never resumed.
 //
 // Paired with M1.
@@ -163,7 +163,7 @@ func TestOrphanSweepReapsATerminalAssignmentOfALiveGeneration(t *testing.T) {
 
 	if got := e.claimOn(t, subject); got != nil {
 		t.Fatalf("a terminal assignment of a LIVE generation was not reaped in ONE pass: %+v; "+
-			"that is the accumulation F-064's remaining half exists to close", got)
+			"that is the accumulation issue #68's remaining half exists to close", got)
 	}
 }
 
@@ -389,12 +389,12 @@ func TestOrphanSweepSettleableRegisterRefusesEachUnsupportedShape(t *testing.T) 
 
 	// Retired ALONGSIDE Cancelled is a SUPPORTED shape, and the precedence rule decides
 	// it: Retired dominates, so the register is settleable exactly as a pure retirement
-	// is (F-087 WP3). Refusing it — as this clause once did, calling the two mutually
+	// is (issue #89 WP3). Refusing it — as this clause once did, calling the two mutually
 	// exclusive — retains the register unsettled for the life of a long-lived
 	// generation, because a cancellation racing a retirement now leaves both bits
 	// durably.
 	rec, name := base()
-	rec.Cancelled, rec.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+	rec.Cancelled, rec.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: provenance is written
 	if err := mqttQ2AffSettleableRegister(rec, name); err != nil {
 		t.Errorf("a retired register carrying a cancellation must be settleable under the precedence rule: %v", err)
 	}
@@ -666,7 +666,7 @@ func TestOrphanSweepRetainsARetiredRegisterWhoseConsumerIsGone(t *testing.T) {
 }
 
 // A register whose OWN SOURCE does not prove its carried pair is refused. This is
-// F-065's third binding: the record's shape and the claim naming the copy back are both
+// issue #69's third binding: the record's shape and the claim naming the copy back are both
 // satisfied by a register that names some OTHER claim's copy while its own delivery is a
 // different message entirely, and crediting that claim would let its copy be
 // acknowledged away unpublished.

@@ -94,7 +94,7 @@ func TestMQTTWatchConvergesWithoutTheBackstop(t *testing.T) {
 }
 
 // TestMQTTBackstopConvergesWithoutTheWatch is plan test 1's dropped half, and the
-// one that closes F-036: the delivery is LOST — the state the old at-most-once
+// one that closes issue #40: the delivery is LOST — the state the old at-most-once
 // notification left behind for good — and one periodic pass still converges it.
 func TestMQTTBackstopConvergesWithoutTheWatch(t *testing.T) {
 	t.Parallel()

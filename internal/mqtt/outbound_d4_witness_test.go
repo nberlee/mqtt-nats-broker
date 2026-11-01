@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// F-097 WP6 (plan rev 20): the D4 witness gate. condemnSendLocked is FIRST-WINS: a continuation
+// issue #99 WP6 (plan rev 20): the D4 witness gate. condemnSendLocked is FIRST-WINS: a continuation
 // parked on an open send section keeps the first kind it was given. D4 asks whether a production
 // route parks a NON-ACK kind first and then loses the client's acknowledgement to it.
 

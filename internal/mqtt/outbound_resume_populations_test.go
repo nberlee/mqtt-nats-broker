@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// The resume's populations beyond the inventory root (F-105 7b, plan-7b §3.2, §3.6): terminal
+// The resume's populations beyond the inventory root (issue #107 7b, plan-7b §3.2, §3.6): terminal
 // duties still count, a PUBREL record alone authorizes nothing, a resume whose entitlement is
 // superseded mid-walk is refused, and a withdrawal cut before its register delete is finished.
 

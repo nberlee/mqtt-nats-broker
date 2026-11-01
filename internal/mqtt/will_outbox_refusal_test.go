@@ -1,6 +1,6 @@
 //go:build mqtt_fulltests
 
-// Refusal of unsupported delayed-Will outbox records (F-058).
+// Refusal of unsupported delayed-Will outbox records (issue #62).
 //
 // $MQTT_willq carries no released format contract, so a record that is not one
 // this broker can have written is refused at every decode boundary rather than
@@ -424,7 +424,7 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 	const refusedID = "enqueue-refusal-pub"
 	cidHash := getHash(refusedID)
 	will := &mqttWill{topic: []byte("will/enqueue-refusal"), message: []byte("failsafe")}
-	// _EMPTY_ generation: the F-058 invariant, breaking nothing else.
+	// _EMPTY_ generation: the issue #62 invariant, breaking nothing else.
 	// The writer-validation refusal whose fail-safe SUCCEEDS: terminal, and now
 	// classified as published-instead rather than reported by a nil error alone.
 	outcome, err := asm.enqueueDelayedWill(s, refusedID, _EMPTY_, will, nil, _EMPTY_,

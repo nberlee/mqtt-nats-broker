@@ -195,7 +195,7 @@ func TestMQTTOptionsNoTLS(t *testing.T) {
 }
 
 // TestMQTTOptionsWireMaxConns pins -max-conns to the field the accept path reads. It used
-// to be written to an MQTTOpts field nothing read, so the flag was silently ignored (F-052).
+// to be written to an MQTTOpts field nothing read, so the flag was silently ignored (issue #56).
 func TestMQTTOptionsWireMaxConns(t *testing.T) {
 	cfg := config.Default()
 	cfg.MaxConns = 7

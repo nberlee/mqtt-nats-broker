@@ -627,7 +627,7 @@ var mqttLineageWriteSinks = map[string][]string{
 		"storeInflightCAS",
 		"storeInflightPair",
 		"casInflightSlot",
-		// F-088 (consult C4, plan rev 12): the ONE slot-only entry that may write a pending
+		// issue #90 (consult C4, plan rev 12): the ONE slot-only entry that may write a pending
 		// cancellation fence. A sink in its own right, so every caller of it is audited.
 		"storePendingFenceCAS",
 	},
@@ -671,21 +671,21 @@ type mqttLineageSite struct {
 // A changed count fails, in either direction. That is deliberate: a removed write is as much
 // a change to the lineage story as an added one.
 var mqttLineageSiteCounts = map[mqttLineageSite]int{
-	// F-105's authority transition. It reaches the batch primitive because the authority
+	// issue #107's authority transition. It reaches the batch primitive because the authority
 	// and everything it authorizes commit together, so the census sees it as a potential
 	// register writer — but it WRITES NO REGISTER BODY of its own: its own members are the
 	// authority, the permanent outcome and an optional closure, and every caller-supplied
-	// member is refused if it names an F-105 arbitration subject. A register carried as a
+	// member is refused if it names an issue #107 arbitration subject. A register carried as a
 	// caller member arrives ALREADY BUILT by the deciding writer, whose lineage disposition
 	// is the one that applies. One call site, in commitAuthorityTransition.
 	{fn: "commitAuthorityTransition", sink: "newAtomicBatchRequest"}: 1,
 
-	// F-105's metadata commit. Reaches the batch primitive on $MQTT_sess — the session
+	// issue #107's metadata commit. Reaches the batch primitive on $MQTT_sess — the session
 	// record, the acceptance fact and the handoff receipt — and writes NO register body at
 	// all: it does not touch $MQTT_inflight. One call site, in commitMetadataAttempt.
 	{fn: "commitMetadataAttempt", sink: "newAtomicBatchRequest"}: 1,
 
-	// F-105's shared-group lifecycle writer. Reaches the batch primitive for a two-member
+	// issue #107's shared-group lifecycle writer. Reaches the batch primitive for a two-member
 	// join or release, and writes NO register body: its members are the group record and the
 	// acquisition ledger under $MQTT.shared.{grp,shl}, neither of which carries a
 	// register lineage. One call site, in commitSharedLifecycleBatch.
@@ -695,11 +695,11 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	{fn: "storeInflightRegister", sink: "storeInflightPair"}: 1,
 	{fn: "storeInflightRegister", sink: "storeInflightCAS"}:  1,
 
-	// The cancellation tombstone store both cancellation writers route through (F-105 7b): the
+	// The cancellation tombstone store both cancellation writers route through (issue #107 7b): the
 	// slot-only plain CAS. The ordinary arm commits through opTombstoneRegister's authority
 	// transition, which carries the same body.
 	{fn: "storeCancellationTombstone", sink: "storeInflightCAS"}: 1,
-	// ...and, for a slot-only PENDING FENCE, the validated create-only entry (F-088).
+	// ...and, for a slot-only PENDING FENCE, the validated create-only entry (issue #90).
 	{fn: "storeCancellationTombstone", sink: "storePendingFenceCAS"}: 1,
 	// The validated entry itself writes through the raw boundary once.
 	{fn: "storePendingFenceCAS", sink: "storeInflightCAS"}: 1,
@@ -720,11 +720,11 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	{fn: "phaseSlotToPubRelReady", sink: "casInflightSlot"}:        1,
 	// TWO: the slot-only class's publish -> pubrel_ready CAS, and the ordinary class's
 	// canonical rebind from pubrel_intended after recordRecoveredPubRec has recorded the
-	// PUBREC through the one arrow (F-105 PUBCOMP arm, consult 25). Both carry the loaded
+	// PUBREC through the one arrow (issue #107 PUBCOMP arm, consult 25). Both carry the loaded
 	// record forward through casInflightSlot, so both preserve its lineage.
 	{fn: "phaseRecoveredPublishSlotToReady", sink: "casInflightSlot"}: 2,
 	{fn: "transferCustodyForAdmission", sink: "casInflightSlot"}:      1,
-	// F-105 8c's certified clearance: ONE exact-sequence CAS of the register as read with its
+	// issue #107 8c's certified clearance: ONE exact-sequence CAS of the register as read with its
 	// live custody fields cleared (mqttCertifiedClearanceOf), deliberately NOT through
 	// casInflightSlot, whose reload loop would rebase the licence onto a later state. The
 	// body is the loaded record copied forward, so its lineage rides along unchanged.
@@ -740,13 +740,13 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// record write, lineage decided by claimTeardown) and its create-only teardown receipt
 	// on $MQTT_sess, and touches no $MQTT_inflight register. Listed for the same reason
 	// commitMetadataAttempt is — the name-based bypass guard cannot tell one atomic batch from
-	// another, so naming it keeps that limitation visible (F-105 Gap 1). One call site, in
+	// another, so naming it keeps that limitation visible (issue #107 Gap 1). One call site, in
 	// storeTeardownClaimBatch.
 	{fn: "storeTeardownClaimBatch", sink: "newAtomicBatchRequest"}: 1,
 }
 
 var mqttLineageWriterManifest = map[string]string{
-	// F-105's authority transition: NO LINEAGE OF ITS OWN. It carries the arbitration
+	// issue #107's authority transition: NO LINEAGE OF ITS OWN. It carries the arbitration
 	// records and passes through whatever register body its caller already built, so the
 	// lineage decision belongs to that builder and not here. This entry exists so the
 	// pass-through is audited rather than invisible: if this writer ever constructed a
@@ -754,12 +754,12 @@ var mqttLineageWriterManifest = map[string]string{
 	// disposition for it.
 	"commitAuthorityTransition": "carries: no register body of its own, so the caller's disposition applies",
 
-	// F-105's metadata commit: NOT A REGISTER WRITER. It commits on $MQTT_sess and has no
+	// issue #107's metadata commit: NOT A REGISTER WRITER. It commits on $MQTT_sess and has no
 	// register lineage to decide. The entry exists so the census sees it rather than a
 	// future reader assuming an unlisted batch caller is unreachable.
 	"commitMetadataAttempt": "none: writes on $MQTT_sess and carries no register body",
 
-	// F-105's shared-group lifecycle writer: NOT A REGISTER WRITER. Its atomic batch carries
+	// issue #107's shared-group lifecycle writer: NOT A REGISTER WRITER. Its atomic batch carries
 	// the group record and the acquisition ledger, neither of which is an in-flight register,
 	// so it decides no register lineage. Listed so the batch caller is audited rather than
 	// assumed unreachable.
@@ -770,7 +770,7 @@ var mqttLineageWriterManifest = map[string]string{
 	// replace-register-only (INHERITED, occupant possibly-attempted).
 	"storeInflightRegister": "decides: per-attempt write mode",
 
-	// The cancellation tombstone store (F-105 7b). It builds no body: both cancellation writers
+	// The cancellation tombstone store (issue #107 7b). It builds no body: both cancellation writers
 	// hand it theirs. markInflightRegisterCancelledPending's create-only body starts its own
 	// lineage, because a create-only CAS proves the subject was empty, and its conflict arm
 	// rebuilds from the landed record and carries whatever it holds; markInflightRegisterCancelled
@@ -809,7 +809,7 @@ var mqttLineageWriterManifest = map[string]string{
 	// from a writer nobody audited.
 	"storeInflightCAS":  "boundary: validates, decides nothing",
 	"storeInflightPair": "boundary: validates, decides nothing",
-	// F-088: the slot-only pending-fence entry. It builds no body; it validates the sparse
+	// issue #90: the slot-only pending-fence entry. It builds no body; it validates the sparse
 	// fence form, whose lineage is its own allocation's (Lin == Nonce, written create-only).
 	"storePendingFenceCAS": "boundary: validates the create-only fence form (its own lineage), decides nothing",
 }

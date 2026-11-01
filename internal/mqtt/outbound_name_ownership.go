@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// Physical-name ownership for source/PUBREL consumers (F-105 cutover, consult 4).
+// Physical-name ownership for source/PUBREL consumers (issue #107 cutover, consult 4).
 //
 // # Why a name-keyed record, when resources are keyed by incarnation
 //
@@ -30,7 +30,7 @@ import (
 //
 // It does not answer the other question the consumer lifecycle needs: "may this physical
 // consumer NAME be used at all, right now, and by whom". JetStream's CONSUMER.CREATE and
-// CONSUMER.DELETE both carry a stream and a consumer NAME, not an F-105 incarnation, and a
+// CONSUMER.DELETE both carry a stream and a consumer NAME, not an issue #107 incarnation, and a
 // CREATE is a queued request the broker can neither fence nor retract. So the broker cannot
 // make a resource record the arbiter of the physical consumer's EXISTENCE. What it can
 // arbitrate is USE: whether an obligation may depend on a name, and whether a delete of a
@@ -66,7 +66,7 @@ import (
 // removes. A MISSING ownership record is therefore withheld, never read as permission.
 
 // mqttNameOwnClassTk is the record class for a physical consumer name's ownership. Like every
-// other F-105 class it fails mqttValidIDHashToken and mqttValidSessGen, so it can never parse
+// other issue #107 class it fails mqttValidIDHashToken and mqttValidSessGen, so it can never parse
 // as a register.
 const mqttNameOwnClassTk = "own"
 
@@ -98,7 +98,7 @@ func mqttStreamForOwned(s mqttOwnedStream) (string, error) {
 
 // mqttNameOwnState is whether a physical name may still be used.
 //
-// Numbered from 1 for the reason every other F-105 enum is: a missing or null member decodes
+// Numbered from 1 for the reason every other issue #107 enum is: a missing or null member decodes
 // to zero, and a zero naming a real state would make an unsupported record read as the most
 // permissive one.
 type mqttNameOwnState uint8
@@ -260,7 +260,7 @@ func mqttIsNameOwnershipSubject(subject string) bool {
 // loadNameOwnership reads a physical name's ownership record as it durably stands. ABSENT is
 // returned as a nil record and a zero sequence rather than an error, because the first claim
 // legitimately acts on it; a CORRUPT or INDETERMINATE read is an error and is never treated as
-// absent, on the same ground every F-105 loader gives — an absence a failed read invented would
+// absent, on the same ground every issue #107 loader gives — an absence a failed read invented would
 // let a spent name be reclaimed.
 func (jsa *mqttJSA) loadNameOwnership(id, epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, uint64, error) {
 	o, seq, err := jsa.loadNameOwnershipPhysical(epoch, stream, name)

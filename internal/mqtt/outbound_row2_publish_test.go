@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-// The PUBLISH half of the row-2 output boundary (F-105 row 2, plan-row2.md §6): an ordinary QoS
+// The PUBLISH half of the row-2 output boundary (issue #107 row 2, plan-row2.md §6): an ordinary QoS
 // 1/2 PUBLISH is the execution of the acquisition that authorized it, consumed once and only for
 // its live section, and an acquisition given up before it wrote is local evidence of finish.
 
@@ -240,7 +240,7 @@ func TestF105Row2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 // is admitted beside an exchange naming its exact acquisition, its PUBLISH is an acquired action,
 // and its PUBACK ends the exchange Terminal — end to end through a real subscription.
 //
-// Mutations: M1 (the shared branch admits through the pre-F-105 writer: no exchange), M9 (shared
+// Mutations: M1 (the shared branch admits through the pre-issue #107 writer: no exchange), M9 (shared
 // stays slot-only: no action record, the exchange never reaches Terminal).
 func TestF105Row2SharedQoS1PublishIsAnAcquiredAction(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()

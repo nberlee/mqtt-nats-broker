@@ -372,7 +372,7 @@ func TestMQTTExpiryReEntryLeavesTheParkedDiscardUntouched(t *testing.T) {
 	//
 	// The IN-MEMORY copy stays ELAPSED, because an expiry fire means the session's own
 	// copy says it is due, and the in-memory path now RE-READS that deadline under the
-	// gate (F-036 unit 1): a callback delayed past a reconnect and a later disconnect
+	// gate (issue #40 unit 1): a callback delayed past a reconnect and a later disconnect
 	// would otherwise destroy a session whose lifetime had not run out. An earlier
 	// version of this fixture instead relied on that path never re-checking.
 	//

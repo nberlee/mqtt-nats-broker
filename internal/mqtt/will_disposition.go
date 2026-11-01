@@ -329,12 +329,12 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 		// decision taken at CONNECT is what governs -- and it is READ here, not
 		// re-derived. By this point the connection is gone and its snapshot has been
 		// invalidated, so re-deriving would refuse every Will rather than the denied
-		// ones. See the capture in mqttProcessConnect. F-079.
+		// ones. See the capture in mqttProcessConnect. issue #81.
 		willAllowed := c.willPublishAuthorized()
 		// The authorized DESTINATION, captured under c.mu in the same frame as the
 		// client id and the authorization decision. Sampling it after the unlock is
 		// the same class of bug as re-deriving willPublishAuthorized there, which
-		// F-079 already fixed on this exact frame: by then the connection's snapshot
+		// issue #81 already fixed on this exact frame: by then the connection's snapshot
 		// is invalidated. The enqueue compares it against the current service
 		// account and refuses a mismatch, which moves deliverWillRecord's own fire-
 		// time fence earlier.
@@ -398,7 +398,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	// it needs the decision read directly. Unlike the other three its core publish
 	// does ride c.nrc and so is dropped by NATS -- but its persistence and, for a
 	// Sparkplug birth topic, its derived certificate effect do not, which is
-	// exactly the bypass. F-079.
+	// exactly the bypass. issue #81.
 	allowed := c.willPublishAuthorized()
 	c.mu.Unlock()
 	if !allowed {
@@ -495,7 +495,7 @@ func (s *Server) mqttPublishOwedWill(c *client, asm *mqttAccountSessionManager) 
 	// Will is governed by the decision captured at CONNECT and read here. Asking
 	// now would refuse every Will rather than the denied ones: this runs on the
 	// teardown path, where the dying connection's snapshot is already invalid.
-	// F-079.
+	// issue #81.
 	allowed := will != nil && c.willPublishAuthorized()
 	c.mu.Unlock()
 	if will == nil || !allowed {

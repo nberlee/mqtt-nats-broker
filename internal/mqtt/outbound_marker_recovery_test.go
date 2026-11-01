@@ -15,7 +15,7 @@ func TestConsult75UnconfirmedMarkerTerminalHandoff(t *testing.T) {
 	}{
 		{"landed-qos1", 1},
 		{"landed-qos2", 2},
-		// The "occupant-qos2" row is gone with F-105 7b: its occupant was a register with no
+		// The "occupant-qos2" row is gone with issue #107 7b: its occupant was a register with no
 		// exchange and no duty, which production no longer writes, and a resume now REFUSES its
 		// continuation (the unpaired-register refusal), so the handoff it asserted cannot occur.
 	} {
@@ -25,7 +25,7 @@ func TestConsult75UnconfirmedMarkerTerminalHandoff(t *testing.T) {
 			dur := e.sess.idHash + "_ordinary"
 			sseq := e.publishSource(t, dur)
 			e.bind()
-			// Admitted as production admits it (F-105 7b): the register, its exchange and its duty
+			// Admitted as production admits it (issue #107 7b): the register, its exchange and its duty
 			// in one batch, so the resume's inventory reaches the obligation this test follows.
 			e.admissionPrerequisites(t, dur, tc.qos)
 			e.acceptUnderServingAuthority(t)

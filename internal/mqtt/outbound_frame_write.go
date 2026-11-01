@@ -30,7 +30,7 @@ var mqttTestWriterPreLockHookV atomic.Pointer[func(c *client)]
 // production.
 var mqttTestTornWriterUnlockedHookV atomic.Pointer[func(c *client)]
 
-// The action-consuming output boundary (F-105, row 2).
+// The action-consuming output boundary (issue #107, row 2).
 //
 // The conversion's structural property is not about a deleted symbol, because four of the
 // production emitters never called the one that was deleted — the retained flush inside
@@ -125,7 +125,7 @@ func mqttActionKeyOf(a *mqttOutboundAction) mqttActionKey {
 // holder is gone, nothing can execute under it and the cell goes with it. A connection-wide record
 // would instead outlive every acquisition it ever saw (the integrated gate's finding: one entry per
 // transmission, retained for the life of the connection). This bounds execution history; a
-// prevented PUBREL's PUBCOMP unit on its send hold is given back at its section's end (F-116).
+// prevented PUBREL's PUBCOMP unit on its send hold is given back at its section's end (issue #118).
 //
 // conn is the connection the holder was acquired for, fixed at creation — an action is never
 // redirected through another one. The cell is process-local and deliberately not durable: an

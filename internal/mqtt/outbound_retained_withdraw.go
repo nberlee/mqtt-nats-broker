@@ -13,7 +13,7 @@
 
 package mqtt
 
-// Withdrawing an admitted, proven-unsent retained exchange (F-105 7c).
+// Withdrawing an admitted, proven-unsent retained exchange (issue #107 7c).
 //
 // THE ENTRY IS THE OBLIGATION UNTIL THE WITHDRAWAL IS CONFIRMED. The ordinary proven-unsent door
 // (dropProvenUnsentPublishEntry) untracks first and ignores the delete's outcome, because a

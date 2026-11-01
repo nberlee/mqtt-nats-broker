@@ -26,7 +26,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-088 / F-097 (consult C4, plan rev 20): the pending cancellation fence and its dedicated
+// issue #90 / issue #99 (consult C4, plan rev 20): the pending cancellation fence and its dedicated
 // disposal rule, witnessed on the real store. T33-T35, T37-T39 and T41.
 
 // testF088WriteFence runs the REAL producer for allocation nonce on pi and returns the fence it
@@ -542,7 +542,7 @@ func TestF088FalseExchangeAbsenceDoesNotMakeAFence(t *testing.T) {
 	// the inventory census is UNCERTAIN here, not complete: that census decides nothing about
 	// this register, and its uncertainty withholds every new allocation instead (HEAD's
 	// incomplete-census rule). Only a COMPLETE census reserves the register as P-d2 - and no
-	// cancellation bit exempts it from that any more (F-088).
+	// cancellation bit exempts it from that any more (issue #90).
 	if entry != nil && entry.acts() && !withheld {
 		t.Fatal("recovery restored an exchange-less occupant cancellation ACTING with allocation open")
 	}

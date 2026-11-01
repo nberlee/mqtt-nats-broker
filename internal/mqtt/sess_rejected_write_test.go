@@ -102,7 +102,7 @@ func (e *testRejectionEnv) dropPersistObservations(t *testing.T, idHash string) 
 //
 // Named for what it DOES, not for a conclusion about it. The local broker sees a record
 // that moved; that it was a peer restoring the same client ID is the fixture's knowledge
-// and never the broker's, so no route under test may call this a takeover (F-084).
+// and never the broker's, so no route under test may call this a takeover (issue #86).
 func (e *testRejectionEnv) remoteRecordWrite(t *testing.T, node, clientID string) uint64 {
 	t.Helper()
 	_, psess, _ := e.peer(t, node, clientID)
@@ -234,7 +234,7 @@ func TestMQTTRejectedRecordContendedKeepsMarker(t *testing.T) {
 // TestMQTTRejectedRecordGoneIsForeign covers the released-record arm: our write cannot
 // have landed and then vanished on its own, so an absent record means SOMETHING released
 // this session and its state is not ours to rebuild. It does not name the releaser, and it
-// is not evidence of a successor (F-084).
+// is not evidence of a successor (issue #86).
 func TestMQTTRejectedRecordGoneIsForeign(t *testing.T) {
 	t.Parallel()
 	e := testNewRejectionEnv(t, "rejgone")
@@ -590,7 +590,7 @@ func (e *testRejectionEnv) bind(t *testing.T) {
 	t.Helper()
 	var accepted mqttOutboundEntitlement
 	if e.c.mqtt != nil {
-		accepted = e.c.mqtt.outEnt // the entitlement the rig was accepted under (F-105 7b)
+		accepted = e.c.mqtt.outEnt // the entitlement the rig was accepted under (issue #107 7b)
 	}
 	e.c.mqtt = &mqtt{sess: e.sess, proto: mqttProtoLevel5, asm: e.asm, pp: &mqttPublish{}, cp: &mqttConnectProto{},
 		outEnt: accepted}
@@ -1396,7 +1396,7 @@ func (e *testRejectionEnv) bindSocketOver(t *testing.T, proto byte, out *testWir
 	e.sess.mu.Lock()
 	e.sess.c = bc
 	// Accepted under the session object's accepted entitlement, as the CONNECT that bound it
-	// would have recorded (F-105 7b).
+	// would have recorded (issue #107 7b).
 	if e.sess.boundEntOK {
 		bc.mqtt.outEnt = e.sess.boundEnt
 	}
@@ -1543,7 +1543,7 @@ func (b *testBoundConn) disconnectAttempts(t *testing.T) []byte {
 // disconnectClaims returns the (reason code, Reason String) of every server DISCONNECT the
 // broker tried to write, in order.
 //
-// It exists because F-084 gave the FORKED and the UNSETTLED vocabularies the same reason
+// It exists because issue #86 gave the FORKED and the UNSETTLED vocabularies the same reason
 // code, 0x89: a reason-code assertion can no longer tell "a sibling body erased our record"
 // from "nothing established anything", and a test that checks only the byte would pass
 // against a broker that confused the two. The Reason String is what still separates them,
@@ -1749,7 +1749,7 @@ func TestMQTTBoundRejectionForeignStopsPublish(t *testing.T) {
 			if e.resident(e.sess) {
 				t.Fatal("a foreign verdict must evict the session object")
 			}
-			// The Will IS PUBLISHED, and that is F-084's correction rather than a relaxed
+			// The Will IS PUBLISHED, and that is issue #86's correction rather than a relaxed
 			// assertion. This arm reached its verdict from a record probe, which establishes
 			// that the record is no longer ours and NOT that anyone took the session over —
 			// the same thing the forked arm below already says of itself when it refuses to
@@ -2035,7 +2035,7 @@ func TestMQTTBoundRejectionGatesPingReq(t *testing.T) {
 		t.Fatalf("a PINGREQ must be gated too: wire %x", b.out.bytes())
 	}
 	// The bound settlement's disposing arm now claims ownership-unsettled: its probe found a
-	// record that is not ours and identified no successor. F-084.
+	// record that is not ours and identified no successor. issue #86.
 	if !b.sawDisconnect(t, mqttReasonServerBusy) || !b.closed() || e.resident(e.sess) {
 		t.Fatalf("the settlement must run on a PINGREQ: closed=%v resident=%v wire %x",
 			b.closed(), e.resident(e.sess), b.out.bytes())
@@ -2313,7 +2313,7 @@ func TestMQTTBoundRejectionDisplacedSaysNothing(t *testing.T) {
 			t.Fatal("a displaced connection must not be served")
 		}
 		// EXACTLY ONE, still. The old form asked whether a 0x89 followed the displacement's
-		// 0x8E, and F-084 gave both the same code — so that question is now satisfied by the
+		// 0x8E, and issue #86 gave both the same code — so that question is now satisfied by the
 		// displacement's own DISCONNECT and would pass against a broker that appended a
 		// second. Counting is what the assertion was always about.
 		if got := b.disconnectAttempts(t); len(got) != 1 {
@@ -2478,7 +2478,7 @@ func TestMQTTBoundRejectionKeepSuspendedInWindow(t *testing.T) {
 // this arm deliberately does not — would let the loop re-enter and turn a queued packet
 // into a SECOND DISCONNECT on the same socket, or close it before the first reached the
 // client at all. (The two used to differ in code as well as in count, 0x89 after 0x8E;
-// since F-084 the foreign arm says 0x89 too, so what is forbidden is the second packet.)
+// since issue #86 the foreign arm says 0x89 too, so what is forbidden is the second packet.)
 //
 // The second packet is staged ACROSS THE SOCKET rather than appended to the first buffer:
 // the foreign arm returns nil from mid-parse, so a same-buffer remainder is discarded
@@ -2527,7 +2527,7 @@ func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
 		n, err := clientSide.Read(buf)
 		seen = append(seen, buf[:n]...)
 		// 0x89 ownership-unsettled: this displacement was observed through a record, which
-		// proves no successor. F-084.
+		// proves no successor. issue #86.
 		if mqttTestSawDisconnect(t, seen, mqttReasonServerBusy) {
 			break
 		}
@@ -2552,7 +2552,7 @@ func TestMQTTBoundRejectionNoReentryAfterForeign(t *testing.T) {
 			break
 		}
 	}
-	// EXACTLY ONE, for the same reason as above: both vocabularies carry 0x89 since F-084,
+	// EXACTLY ONE, for the same reason as above: both vocabularies carry 0x89 since issue #86,
 	// so "did a 0x89 appear" no longer distinguishes a contradicting second DISCONNECT from
 	// the first one this test just waited for.
 	if n := mqttTestCountDisconnects(t, seen); n != 1 {

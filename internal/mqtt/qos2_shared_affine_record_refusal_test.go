@@ -323,7 +323,7 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 // while the session it describes may own an affine consumer and outstanding claims
 // — so reconcileOrphanQ2AffClaims is suppressed. That ONE pass, and not "every affine
 // resource": the retired affine register arm is outside this gate, and affine consumer
-// deletion no longer exists (F-036 course E). Its IDENTITY is sound, though:
+// deletion no longer exists (issue #40 course E). Its IDENTITY is sound, though:
 // the inbound, in-flight and PUBREL references it contributes are complete, so
 // those classes must keep being reclaimed. Returning early instead would let one
 // such record disable every class account-wide, and PERMANENTLY, since nothing
@@ -336,7 +336,7 @@ func TestQ2AffMaterializeOnBehalfRefusesAnUninterpretableWinnerRecord(t *testing
 // dropped.
 //
 // The affine half is asserted on a CLAIM TRANSITION rather than on a consumer. Since
-// F-036 course E this gate governs no consumer decision at all — the candidate-reclamation
+// issue #40 course E this gate governs no consumer decision at all — the candidate-reclamation
 // route is gone — so a surviving-consumer assertion would pass by default against any
 // implementation, including one with the guard removed. What affineUsable still gates is
 // reconcileOrphanQ2AffClaims.

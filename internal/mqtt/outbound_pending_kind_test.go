@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// The behavioural half of the pending-entry closure (F-105 cutover checkpoint; plan §6.1). The
+// The behavioural half of the pending-entry closure (issue #107 cutover checkpoint; plan §6.1). The
 // structural half is pending_entry_structure_test.go.
 
 // testPendingPubRel is the resident PUBREL entry at pi.
@@ -120,7 +120,7 @@ func TestPendingClosureDeliveredPubRelGoesWithItsLineage(t *testing.T) {
 			t.Run(acq+"/"+route.name, func(t *testing.T) {
 				e := testNewInflightEnv(t, "pending-t1")
 				testReadyForRealPubRelDelivery(t, e)
-				testWireInflightEnv(t, e) // its PUBREL is transmitted, so its PUBCOMP is owed (F-116)
+				testWireInflightEnv(t, e) // its PUBREL is transmitted, so its PUBCOMP is owed (issue #118)
 				var pi uint16
 				var nonce, lin string
 				var canon uint64

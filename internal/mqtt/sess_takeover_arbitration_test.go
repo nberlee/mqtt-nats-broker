@@ -13,8 +13,8 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-029 (Slice B): arbitrating two frontends taking over one session from the same
-// record base. See sess_takeover_redrive.go and docs/findings/ha-arbitration.md#f-029.
+// issue #31 (Slice B): arbitrating two frontends taking over one session from the same
+// record base. See sess_takeover_redrive.go and https://github.com/nberlee/mqtt-nats-broker/issues/31.
 //
 // The record-level half lives here. The binding transitions T1/T2 need a live CONNECT
 // and are in sess_takeover_redrive_connect_test.go.
@@ -97,7 +97,7 @@ func TestSessBaseZeroCreateIsConditional(t *testing.T) {
 	d, err := testSaveDetail(t, sb)
 	if err == nil {
 		t.Fatal("a base-0 create against an OCCUPIED subject must be rejected: " +
-			"this is the erasure F-029 closes")
+			"this is the erasure issue #31 closes")
 	}
 	if !mqttIsRecordCASRejection(d.rawErr) {
 		t.Fatalf("the rejection must be a definite CAS rejection, got %v", d.rawErr)
@@ -178,7 +178,7 @@ func TestSessSupersededClaimCannotStompTheWinner(t *testing.T) {
 // The verdict is the one this change GIVES UP, and it is asserted in both directions
 // deliberately. A resume child of base a is {b, a}. A clean-start survivor written after
 // tearing a down was briefly {c, a} and is now {c, ""} again, so the two have nothing in
-// common, and a broker whose record that survivor erased CONCEDES — since F-084 with
+// common, and a broker whose record that survivor erased CONCEDES — since issue #86 with
 // 0x89 ownership-unsettled, which is truthful; it used to answer 0x8E "session taken over",
 // a claim nothing arbitrated. That is the residual stated in docs/CONFORMANCE.md,
 // and it is the cost of removing an inherited identity that outlived the interval it
@@ -215,7 +215,7 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 	// base: its acknowledged pair is {b, a}, a child of a, and it is asked about the
 	// survivor {c, ""}. Sibling-hood is defined against the acknowledged pair, and with
 	// the survivor carrying no parent there is nothing to match — the answer is the
-	// UNSETTLED vocabulary (0x8E before F-084).
+	// UNSETTLED vocabulary (0x8E before issue #86).
 	//
 	// The resume child's identity is synthetic because the two records cannot both be
 	// current — one erased the other. What has to come from the production path is the
@@ -244,7 +244,7 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 	// The authored-record fork is NOT given up, and this is the discrimination: a
 	// child-shaped record written through the production path by the other broker is not a
 	// fork, while a body CLAIMING that same parent is (TestSessAuthoredForkStillClassifies).
-	// Neither verdict says who holds the session — this is lineage only (F-084).
+	// Neither verdict says who holds the session — this is lineage only (issue #86).
 	sessB := testFreshSession(b, cid)
 	sessB.mu.Lock()
 	sessB.seq, sessB.wid, sessB.pwid = survivorSeq, survivor.WID, survivor.PWID
@@ -769,7 +769,7 @@ func TestRejectionMarkerRepresentsBaseZero(t *testing.T) {
 	const cid = "b4marker"
 
 	// A rival occupies the subject, so this broker's first-ever create is REJECTED at
-	// base 0 — the shape that did not exist before F-029.
+	// base 0 — the shape that did not exist before issue #31.
 	rival := testFreshSession(b, cid)
 	if err := testSessSave(t, rival); err != nil {
 		t.Fatalf("the rival's create: %v", err)

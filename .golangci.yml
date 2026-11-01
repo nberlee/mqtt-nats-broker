@@ -1,6 +1,6 @@
 # golangci-lint configuration (schema v2 — golangci-lint 2.x).
 #
-# No file is excluded from any analyzer (F-055). `make lint-go` runs this one configuration
+# No file is excluded from any analyzer (issue #59). `make lint-go` runs this one configuration
 # over four builds — production only, the default tests, and both tagged builds — because
 # only the production-only pass sees a declaration that nothing but tests still reaches.
 # The deliberate exceptions are per-declaration `//nolint:unused` directives, each stating

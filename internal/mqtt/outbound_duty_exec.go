@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 )
 
-// What a recovery pass may DO about an outstanding duty (F-105, row 6).
+// What a recovery pass may DO about an outstanding duty (issue #107, row 6).
 //
 // # The permitted operations are NAMED, not inferred
 //
@@ -35,17 +35,17 @@ import (
 //	the provisioning SEAL of a ready affine
 //	resource                                     -> performed
 //	provision / cleanup, for a RETAINED PAYLOAD  -> performed, BEFORE classification: one step of
-//	                                                the copy's reclamation (F-105 7c,
+//	                                                the copy's reclamation (issue #107 7c,
 //	                                                outbound_retained_reclaim.go), whose boundary
 //	                                                arms decide whether the copy may close
 //	authorize-deletion / cleanup, a SOURCE or
-//	PUBREL consumer of a DISCARDED generation    -> performed (F-105 7d); in a live generation their
+//	PUBREL consumer of a DISCARDED generation    -> performed (issue #107 7d); in a live generation their
 //	                                                retirement is the session's
 //	                                                (outbound_source_retire.go). Shared group
 //	                                                durables are no resource kind at all
 //	                                                (shared_lifecycle.go)
 //	discard-end / discard-cleanup / dispose,
-//	a DISCARDED generation                       -> performed (F-105 7d, outbound_discard_exec.go),
+//	a DISCARDED generation                       -> performed (issue #107 7d, outbound_discard_exec.go),
 //	                                                each licensed by the committed discarding closure
 //	deliver, release                             -> WITHHELD: both need an action acquired under a
 //	                                                SERVING authority, which this pass holds none of;
@@ -67,7 +67,7 @@ import (
 // executeRecoveryDuty acts on one swept duty, within the pass's budget.
 //
 // discarded says the root's generation's committed closure discards, read once by the visit
-// (F-105 7d). For a CENSUS entry — a resolved exchange duty of a discarded generation — it reports
+// (issue #107 7d). For a CENSUS entry — a resolved exchange duty of a discarded generation — it reports
 // whether discard work remained when the entry was classified, which is what keeps the root from
 // certifying past it; for every other entry the result is unused (it is unresolved by being swept).
 func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRecoveryRoot,
@@ -143,7 +143,7 @@ func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRe
 }
 
 // dispatchRetainedPayloadDuty performs one step of a retained copy's reclamation for either of its
-// duties, and reports whether the duty was a retained payload's (F-105 7c).
+// duties, and reports whether the duty was a retained payload's (issue #107 7c).
 //
 // BEFORE CLASSIFICATION, because the classifier's answers for this kind are the wrong question: it
 // withholds a cleanup while the owner still carries its retained-material edge and a provision while
@@ -179,7 +179,7 @@ func (as *mqttAccountSessionManager) performRecoveryWork(s *Server, root *mqttRe
 	switch v.Work {
 	case mqttDutyWorkAuthorizeDeletion, mqttDutyWorkCleanup:
 	case mqttDutyWorkDiscardEnd, mqttDutyWorkDiscardCleanup, mqttDutyWorkDispose:
-		// A DISCARDED generation's retirement (F-105 7d), each licensed by its closure.
+		// A DISCARDED generation's retirement (issue #107 7d), each licensed by its closure.
 		as.performDiscardWork(s, root, d, v, b)
 		return
 	default:
@@ -198,7 +198,7 @@ func (as *mqttAccountSessionManager) performRecoveryWork(s *Server, root *mqttRe
 	if !isConsumer || (r.Kind != mqttResourceAffineConsumer && !mqttResourceLogicalUseKind(r.Kind)) {
 		// THE TRANSFERRED CONSUMER KINDS: the affine one, and — in a discarded generation, the only
 		// place their cleanup duty classifies as owed work without a live route's decision — the
-		// source and PUBREL consumers (F-105 7d). Shared group durables are not a resource kind at
+		// source and PUBREL consumers (issue #107 7d). Shared group durables are not a resource kind at
 		// all; they are released by arbitration on their own group record (shared_lifecycle_ops.go).
 		return
 	}
@@ -347,7 +347,7 @@ func (as *mqttAccountSessionManager) concludeRecoveryRoot(s *Server, root *mqttR
 	if lerr != nil {
 		return
 	}
-	// DELETIONS AUTHORIZED BELOW A SEALED FLOOR FINISH HERE (F-112), one bounded step per visit,
+	// DELETIONS AUTHORIZED BELOW A SEALED FLOOR FINISH HERE (issue #114), one bounded step per visit,
 	// before the root may retire: a root that retired with them outstanding would leave them
 	// nobody's.
 	if led != nil && led.Del < led.Lo {
@@ -371,7 +371,7 @@ func (as *mqttAccountSessionManager) concludeRecoveryRoot(s *Server, root *mqttR
 		}
 	}
 	if mqttRootRetires(root, led) {
-		// A DISCARDED GENERATION CERTIFIES ONLY WITH ITS SHARED LEDGER SEALED AND EMPTY (F-105
+		// A DISCARDED GENERATION CERTIFIES ONLY WITH ITS SHARED LEDGER SEALED AND EMPTY (issue #107
 		// 7e). Checked here, after the roll decision, so an unresolved sweep still rolls whatever
 		// the shared closing does; the root stays until a visit completes it.
 		if !as.stepSharedClosing(s, root, b, stop) {
@@ -547,7 +547,7 @@ func (as *mqttAccountSessionManager) performAffineReadiness(s *Server, root *mqt
 // transferred: a record this broker cannot read is one it may neither act on nor reason about.
 //
 // The affine consumer is transferred by its enrolment; a source or PUBREL consumer only in a
-// DISCARDED generation (F-105 7d), where no live route remains to retire it. In a live generation
+// DISCARDED generation (issue #107 7d), where no live route remains to retire it. In a live generation
 // their retirement is the session's (outbound_source_retire.go).
 func (as *mqttAccountSessionManager) transferredCleanupKind(root *mqttRecoveryRoot, inc string, discarded bool) bool {
 	r, _, err := as.jsa.loadOutboundResource(root.ID, root.Epoch, root.Gen, inc)

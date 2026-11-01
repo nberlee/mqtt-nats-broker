@@ -1,4 +1,4 @@
-// F-102: a recovery reservation over a Lost source has no release edge.
+// issue #104: a recovery reservation over a Lost source has no release edge.
 //
 // Recovery consumed a PUBLISH-phase pair only when its source classified Complete. A pair
 // whose source classified LOST — the consumer authoritatively gone, which on an
@@ -35,7 +35,7 @@ func lostSourceHook(e *testInflightEnv, st mqttInflightSourceState) {
 // Three properties have to hold together, and a test of one of them alone passes for the
 // wrong reason. The LOST/present row is the finding. The LOST/absent row is the safety
 // half — a possibly-attempted exchange may be in the client's hands and is never released
-// on the source alone, which is the inference F-100 and F-101 both rejected. And the
+// on the source alone, which is the inference issue #102 and issue #103 both rejected. And the
 // UNKNOWN and LIVE rows pin the predicate to mqttInflightSourceMayReoffer rather than to
 // "anything that is not Complete": an unreadable lookup concludes nothing, and a live
 // source is a delivery that will come round again.
@@ -126,7 +126,7 @@ func TestMQTTInflightRecoveryConsumesAProvenUnsentRegisterOverALostSource(t *tes
 // droppable, for COMPLETE sources as well as Lost ones.
 //
 // So both rows are here. The Complete row is not redundant: it is the half that shows the
-// regression was never specific to F-102's own classification.
+// regression was never specific to issue #104's own classification.
 func TestMQTTInflightDrainOwnedRegisterIsNeverConsumedByTheSourceArm(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -367,14 +367,14 @@ func TestMQTTInflightMarkerProvenDropDoesNotInitiateMarkerCleanup(t *testing.T) 
 // it goes through claimRecoveredTransferableInflight and comes back as a REBUILT
 // mqttRecoveredInflightReg. The routing verdict was decided before that contest, so a
 // rebuild that forgets to carry it turns a droppable pair back into a reservation — and
-// nothing else in the suite would notice, because every other F-102 fixture is QoS 1 and
+// nothing else in the suite would notice, because every other issue #104 fixture is QoS 1 and
 // never enters the contest at all.
 //
 // Two arms, because the rebuilds are not interchangeable. The successful CAS and the
 // moved-and-ours reread each produce an eligible PUBLISH register that returns to the
 // marker-proven arm. The THIRD rebuild — the action/terminal reread — yields
 // mqttInflightClaimWithheld and is routed to pastPubRec, which never comes back here, so
-// no F-102 oracle covers it and the plan says so rather than pretending otherwise.
+// no issue #104 oracle covers it and the plan says so rather than pretending otherwise.
 func TestMQTTInflightLostSourceDropSurvivesTheClaimContest(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

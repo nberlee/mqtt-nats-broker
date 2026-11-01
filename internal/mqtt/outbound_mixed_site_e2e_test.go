@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// The runtime half of the restated output boundary (F-105 WP-F step 1).
+// The runtime half of the restated output boundary (issue #107 WP-F step 1).
 //
 // Two raw writers stay outside both boundaries because they are MIXED: they carry supported QoS 0
 // and actionless acknowledgements beside chapter P's slot-only QoS 1/2. The structural check can

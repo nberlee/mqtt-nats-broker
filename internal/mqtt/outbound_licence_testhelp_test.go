@@ -14,7 +14,7 @@
 package mqtt
 
 // Test rigs that drive a destructive or cancelling path directly, without a CONNECT, need the
-// licence a real connection would carry (F-105 7b): the entitlement the accept loop records on the
+// licence a real connection would carry (issue #107 7b): the entitlement the accept loop records on the
 // connection and, beside it, on the session object (boundEnt). These helpers bind a rig exactly as
 // the accept loop does and return that connection's licence. They never widen a licence: a rig
 // whose connection already carries an entitlement gets THAT one; otherwise the serving authority's
@@ -92,7 +92,7 @@ func testHookAcceptedClient(as *mqttAccountSessionManager, sess *mqttSession) *c
 }
 
 // testHookSeedCustody gives a hook-driven rig the custody ledger its resume census would have
-// built from the exchanges beside recs (F-105 7b): each record's lineage held, charged, on its
+// built from the exchanges beside recs (issue #107 7b): each record's lineage held, charged, on its
 // identifier. A rig with no JetStream cannot run the inventory traversal, and the resume's install
 // gate admits only a lineage the ledger holds, exactly as it does in production.
 func testHookSeedCustody(sess *mqttSession, recs ...*mqttInflightRecord) {

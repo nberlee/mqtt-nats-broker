@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// AN INCOMPLETE RELEASE REQUEST REFUSES THE WHOLE RECORD (F-098 L4, holistic review round 5,
+// AN INCOMPLETE RELEASE REQUEST REFUSES THE WHOLE RECORD (issue #100 L4, holistic review round 5,
 // finding 4). Every member of a persisted Rel is mandatory, and the one that typed decoding
 // silently supplies is the transmission counter: an omitted `acq` arrives as zero, which is a
 // REAL counter — a register never re-acquired carries it — so nothing downstream can tell the
@@ -27,7 +27,7 @@ import (
 // superseding it and consume the request without resolving its target.
 //
 // The refusal therefore has to happen where the difference between "absent" and "zero" still
-// exists, and it refuses the RECORD, on F-057's precedent: a later save would otherwise
+// exists, and it refuses the RECORD, on issue #61's precedent: a later save would otherwise
 // normalize the missing field, which is migration.
 //
 // Mutation M127: decode the request without checking member presence.

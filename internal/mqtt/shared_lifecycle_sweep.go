@@ -18,7 +18,7 @@ import (
 	"strings"
 )
 
-// The shared-group lifecycle's SWEEP arms (F-105, the shared-group lifecycle transfer): what
+// The shared-group lifecycle's SWEEP arms (issue #107, the shared-group lifecycle transfer): what
 // the periodic per-account maintenance does for group durables now that no walk of the
 // session records decides their fate.
 //
@@ -36,7 +36,7 @@ import (
 //     committed release verdicts, connected or not — the verdict is the release authority,
 //     and a hard crash leaves DisconnectedAt at zero on a record nothing else revisits when its
 //     session never expires — once the same verdicts have been observed on two consecutive
-//     passes, WHATEVER the record's sequence did meanwhile (F-105 7e): a connected session's
+//     passes, WHATEVER the record's sequence did meanwhile (issue #107 7e): a connected session's
 //     unrelated saves move the sequence on every pass, and keying on it left a verdict whose
 //     owner's run failed with no executor at all. It never writes the record: the owner clears
 //     a verdict on its next save, and the release CAS makes this executor converge with a live

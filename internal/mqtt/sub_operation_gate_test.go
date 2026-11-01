@@ -149,7 +149,7 @@ func TestAwaitTransmissionGatesRequiresBoth(t *testing.T) {
 		sess.armRestoreGate()
 		sess.openRestoreGate()
 		sess.armSubGate(c).resolve(mqttSubGateWithheld)
-		// This is the whole point of F-078: on a LIVE connection the restore gate is
+		// This is the whole point of issue #80: on a LIVE connection the restore gate is
 		// already open, so a delivery that consulted only it would transmit under
 		// interest whose ownership was never proved.
 		if got := sess.awaitTransmissionGates(c); got != mqttTransmissionWithheld {

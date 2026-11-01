@@ -234,7 +234,7 @@ type mqttWillOutbox struct {
 	//
 	// That state USED TO be reachable through a supported operation, when $MQTT_willq
 	// sat outside the coupled recreation unit and survived a $MQTT_sess recreation.
-	// F-066 made all ten streams one recreation unit, so no supported operation
+	// issue #70 made all ten streams one recreation unit, so no supported operation
 	// produces it any more; the scoping stays as defence in depth against
 	// administrative deletion or a partial restore.
 	ScanFrom uint64 `json:"sfrom,omitempty"`
@@ -625,7 +625,7 @@ func mqttTestDelayedWillEnqueued(rec *mqttWillOutbox) {
 // established is authorized — by the decision captured at CONNECT, not by a check
 // made here, which could not be truthful on a teardown path. So a record on this
 // stream IS the durable evidence that authorization passed, which is what lets the
-// replay publish through the internal client without re-deriving anything. F-079.
+// replay publish through the internal client without re-deriving anything. issue #81.
 //
 // The outbox is the only durable fire mechanism, so a transient store failure
 // must not silently drop the Will: the create is retried (idempotently — the
@@ -786,7 +786,7 @@ func (as *mqttAccountSessionManager) enqueueDelayedWill(s *Server, clientID, ses
 //     ack is lost, and if every bounded re-read is also indeterminate the loop
 //     exits here with a durable pending record in place. That record fires later,
 //     so the Will is published twice. This is pre-existing behavior, not something
-//     the F-058 validation introduced, and it is the outbox's sanctioned
+//     the issue #62 validation introduced, and it is the outbox's sanctioned
 //     at-least-once duplicate reached by a second route: the alternative is
 //     staying silent on an enqueue that may never have landed, which is loss.
 //     TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates pins it.
@@ -1747,7 +1747,7 @@ func validateWillQStream(si *StreamInfo, domainTk string, wantReplicas int, bund
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
 	// what makes the ten broker-owned streams one recreation unit rather than ten
-	// independently recoverable stores (F-066).
+	// independently recoverable stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
 	}

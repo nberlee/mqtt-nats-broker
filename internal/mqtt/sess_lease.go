@@ -20,12 +20,12 @@ import (
 	"time"
 )
 
-// The incarnation completion lease (F-036, unit 1).
+// The incarnation completion lease (issue #40, unit 1).
 //
 // A session object is REUSED across incarnations: clear() re-mints its generation
 // and two paths hand the same object back as a fresh session. Property P — the
 // incarnation generation changes only while no client is bound to the object — was
-// proved sound by F-036's third attempt and violated by exactly one call site, the
+// proved sound by issue #40's third attempt and violated by exactly one call site, the
 // CONNECT clean-start arm, which re-minted while the displaced client was still
 // bound and admitted. The observable cost was single-broker silent loss of an
 // acknowledged QoS 2 message: a displaced PUBREL derived its hold subject under the
@@ -94,7 +94,7 @@ type mqttIncarnationTracker struct {
 	reopened bool
 	// onReopen, when set, runs (on its own goroutine, after the tracker's lock is released)
 	// each time a closing transition is ABORTED and the incarnation re-admits: work a closing
-	// tracker refused to start — the custody dispatcher (F-097 WP4) — is re-armed by it.
+	// tracker refused to start — the custody dispatcher (issue #99 WP4) — is re-armed by it.
 	// Set once at construction by the session that owns the tracker.
 	onReopen func()
 
@@ -397,7 +397,7 @@ var mqttTestTrackerEventV atomic.Pointer[func(t *mqttIncarnationTracker, event s
 // this connection was bound to — c.mqtt.tracker, captured at the bind, NOT the
 // session's current tracker. That is the whole discrimination: after a re-mint the
 // displaced connection still names the RETIRED tracker and is refused, while the
-// replacement names the fresh one (F-036 unit 1).
+// replacement names the fresh one (issue #40 unit 1).
 //
 // While the tracker is CLOSING the caller parks on that cycle's decision rather
 // than refusing outright: a transition that reopens — a drain ceiling, or an
@@ -550,7 +550,7 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnationChecked(sess *mqttSe
 	capsule.action = sess.takeDeferredDisconnectLocked()
 	// The detached connection stays the AUTHORITY for its own outstanding send-hold
 	// debts across the re-mint: it is closed on another goroutine, so its write can
-	// outlive this discard and the identifier is still its (F-089, F-087 WP5).
+	// outlive this discard and the identifier is still its (issue #91, issue #89 WP5).
 	if sess.c != nil {
 		sess.retiringOwnerCID = sess.c.cid
 	}
@@ -607,14 +607,14 @@ func (asm *mqttAccountSessionManager) runRetirementProof(sess *mqttSession,
 }
 
 // disposeCaptured is disposeForeignStateFenced for a caller that has ALREADY
-// detached the displaced client and holds it in a capsule (F-036 unit 1). It
+// detached the displaced client and holds it in a capsule (issue #40 unit 1). It
 // performs no identity check and no detach — both already happened, atomically,
 // inside retireBoundIncarnationChecked — and it sources the displaced client and the
 // parked action from the capsule rather than from the session, which by now names
 // a fresh incarnation and a nil client.
 //
 // The Will disposition is the same rule the fenced form applies, with the same
-// F-084 ordering: a licensed disposal (a successor held in hand) discards, a parked
+// issue #86 ordering: a licensed disposal (a successor held in hand) discards, a parked
 // action outranks a live Will because parking is what MOVED the Will off the
 // connection, and otherwise a live connection's Will is consumed.
 //
@@ -649,7 +649,7 @@ func (asm *mqttAccountSessionManager) disposeCaptured(sess *mqttSession,
 }
 
 // leasedHandler wraps a session delivery callback in its incarnation's completion
-// ownership (F-036 unit 1). The tracker is CAPTURED AT INSTALL, so a callback that
+// ownership (issue #40 unit 1). The tracker is CAPTURED AT INSTALL, so a callback that
 // is dispatched after its incarnation was retired acquires the retired tracker and
 // is refused — it cannot reach the reused object's fresh state, which is the class
 // that defeated the second, third and fourth attempts: an ordinary QoS 1/2 delivery

@@ -18,7 +18,11 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
 - `docs/ARCHITECTURE.md`'s "Compatibility boundary" is **normative for every
   plan**: no migration, legacy-format or rolling-upgrade machinery, no residual
   conditioned on a rollout, and an unsupported persisted shape is **refused**
-  rather than migrated (F-056, F-057, F-058). There are no releases and no
+  rather than migrated
+  ([issue #60](https://github.com/nberlee/mqtt-nats-broker/issues/60),
+  [issue #61](https://github.com/nberlee/mqtt-nats-broker/issues/61),
+  [issue #62](https://github.com/nberlee/mqtt-nats-broker/issues/62)). There are
+  no releases and no
   pushes, so a mixed fleet is a population that does not exist; reasoning about
   one costs review rounds and invites preserving behavior for a broker that will
   never run.
@@ -39,7 +43,10 @@ workaround:
 1. **Verify it against the pinned version**, reading each function from its
    entry rather than taking a line number on report, and reproduce it with a
    real-server witness. A source-reading claim is the start of the work, not
-   the end of it — F-108 and F-110 got theirs on 2026-09-21, after two runs had
+   the end of it —
+   [issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) and
+   [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) got
+   theirs on 2026-09-21, after two runs had
    rested on source reading alone. **Where the witness lives is the plan's
    decision, not this rule's**: a defect in the dependency's
    store is a dependency-level test, and the form its maintainers can act on
@@ -53,7 +60,7 @@ workaround:
    approval before it is posted — the direction does not need re-asking, the
    wording does. Prefer a comment on an existing issue over a duplicate.
 4. **Record the issue in the roadmap bullet** and leave the item blocked on the
-   correction. `docs/findings/` gets the reference.
+   correction. The broker's own GitHub issue for the finding links it too.
 
 **Never fork, never `replace`, and never patch around it.** The module pin is
 evidence about the tested contract, and changing a client build's dependency
@@ -72,15 +79,13 @@ item recorded as blocked; moving elsewhere is the user's explicit call.
 Name things after the protocol fact they encode, and comment the invariant
 rather than the mechanics. That is the existing style; match it.
 
-**No finding numbers in Go file names, tests included.** A `.go` file is named
+**No issue numbers in Go file names, tests included.** A `.go` file is named
 for what it contains (`outbound_companion_members_test.go`), never for the
-finding that produced it (no `f088_*`, `*_f105helpers_*`, `*_8b_*`). Findings
-are moving from `docs/findings/` to GitHub issues, so the number stops being a
-pointer; and a reader must be able to tell from the name alone whether to open
-the file, without first looking up what a finding was about. Renaming a file
+issue or work unit that produced it (no issue number, former finding ID or unit
+label in the name). A reader must be able to tell from the name alone whether to
+open the file, without first looking up what an issue was about. Renaming a file
 later is costlier than rewording a comment, so get the name right when the file
-is created. The `f088_*`, `f115_*`, `f116_*`, `f117_*`, `f119_*` and
-`*_f105helpers_*` test files predate this rule.
+is created.
 
 Never loosen a test assertion to make a change pass. If a test fails, the
 default hypothesis is that the broker is wrong. Trace the root cause in

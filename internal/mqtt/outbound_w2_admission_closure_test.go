@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// An ordinary admission racing its generation's closure (F-105 WP-F W2, row C1/M1).
+// An ordinary admission racing its generation's closure (issue #107 WP-F W2, row C1/M1).
 //
 // The closure is permanent: once it commits, nothing new may be admitted under the generation it
 // closed, because the closure's enrolment is the complete inventory recovery will work from. An

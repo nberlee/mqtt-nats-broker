@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-// Fixtures for the PUBREL-side row-2 tests (F-105 row 2): the output boundary observed on the
+// Fixtures for the PUBREL-side row-2 tests (issue #107 row 2): the output boundary observed on the
 // wire, the connection's frame guard read directly, and a second entitled broker.
 
 // testRow2Timeout bounds every wait on an asynchronous drain in these tests.

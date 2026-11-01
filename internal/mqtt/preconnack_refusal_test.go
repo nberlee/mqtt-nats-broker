@@ -9,7 +9,7 @@ import (
 //
 // A refusal that DISPOSES is told to the client by preConnackRefusalFor, and that
 // projection is deliberately NOT the disposal vocabulary: the vocabulary's takeover text
-// asserts a successor most arms reaching it never established, which is F-084's class.
+// asserts a successor most arms reaching it never established, which is issue #86's class.
 // So the projection has its own small vocabulary, and the tests below pin both halves —
 // what each outcome says, and that no outcome can acquire an ownership claim by default.
 
@@ -63,7 +63,7 @@ func TestPreConnackRefusalProjectionIsExhaustive(t *testing.T) {
 // purpose. If a future edit routes the vocabulary's Reason String to the CONNACK — M8a —
 // a client whose record was merely unreadable, absent, at-or-below base or simply
 // different is told "session taken over by a new connection", which is the claim this
-// item was careful not to make and which F-084 owns.
+// item was careful not to make and which issue #86 owns.
 func TestPreConnackRefusalNeverCarriesTheTakeoverText(t *testing.T) {
 	t.Parallel()
 	for _, o := range []mqttPreConnackOutcome{

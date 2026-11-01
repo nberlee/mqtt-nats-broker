@@ -15,7 +15,7 @@ package mqtt
 
 import "sync/atomic"
 
-// The recovery pass: what walks the directory and finishes what a closure left (F-105, row 6).
+// The recovery pass: what walks the directory and finishes what a closure left (issue #107, row 6).
 //
 // # Who runs it: any broker serving the account, and no election decides which
 //
@@ -82,7 +82,7 @@ const (
 	// mqttRecoveryMinimumUnit is what one complete duty costs at worst: its entry read, the
 	// records a classification reads, the acts an execution performs, and the cursor write.
 	//
-	// 16 since F-105 7d, counted from the spends: the entry read (1), the dispatch (1), a
+	// 16 since issue #107 7d, counted from the spends: the entry read (1), the dispatch (1), a
 	// discarded exchange's classification with its canonical PUBREL and register (4), and the
 	// costliest work step — a cleanup's resource read, delete and completion batch (1 + 3), or a
 	// discard step's reads and act (3) — plus the cursor write from the reserve. Every visit's
@@ -357,7 +357,7 @@ func (as *mqttAccountSessionManager) visitAdmittedRecoveryRoot(s *Server, root *
 	if !charge() {
 		return
 	}
-	// THE GENERATION'S DISPOSITION, read ONCE per visit (F-105 7d). A discarded generation owes
+	// THE GENERATION'S DISPOSITION, read ONCE per visit (issue #107 7d). A discarded generation owes
 	// its retirement, and its sweep runs the census over resolved exchange duties; a closure this
 	// broker cannot read concludes nothing about either, so the visit withholds rather than
 	// sweeping it as a live one.
@@ -380,7 +380,7 @@ func (as *mqttAccountSessionManager) visitAdmittedRecoveryRoot(s *Server, root *
 	}
 
 	examined := out.Examined
-	// The lowest CENSUS entry whose discard work remained when it was classified (F-105 7d). The
+	// The lowest CENSUS entry whose discard work remained when it was classified (issue #107 7d). The
 	// batch read keeps census entries out of its own accumulator, so this is the only place they
 	// enter it — which is why no early exit below may advance past one it did not classify.
 	var censusLowest uint64
@@ -422,7 +422,7 @@ func (as *mqttAccountSessionManager) visitAdmittedRecoveryRoot(s *Server, root *
 		// before this stands, and the next visit re-derives from the records themselves.
 		s.Debugf("MQTT recovery pass: the cursor of %q/%q was not confirmed: %v", root.ID, root.Gen, perr)
 	}
-	// THE SHARED CLOSING, after the discard work and its progress, never before (F-105 7e): its
+	// THE SHARED CLOSING, after the discard work and its progress, never before (issue #107 7e): its
 	// outcome gates only certification, so a failing closing cannot hold the discard back.
 	if discarded {
 		as.stepSharedClosing(s, root, b, stop)

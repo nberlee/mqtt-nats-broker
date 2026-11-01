@@ -27,7 +27,7 @@ import (
 	"testing"
 )
 
-// The drain census (F-105 row 2, consult 28).
+// The drain census (issue #107 row 2, consult 28).
 //
 // The PUBREL output boundary decides write entry under the session lock and then writes under wmu
 // with no holder read, and that is sound for ONE reason: no first drain of a holder can run while
@@ -48,7 +48,7 @@ var mqttDrainEntrySites = map[string]mqttOutputSite{
 	"pubrel_action.go|scheduleActionReconcile|noteOwedAction":                  {1, "a drain that already ran hands itself to shutdown"},
 	"pubrel_action.go|scheduleActionReconcile|startActionDrain":                {1, "the reconcile timer, enrolled only by a drain"},
 	"publish_deliver.go|mqttDeliverPubRelCb|startActionDrain":                  {1, "the delivery callback's deferred drain, after the synchronous write returns"},
-	"outbound_retained_replay_emit.go|emitRetainedPubRelOnce|startActionDrain": {1, "a retained PUBREL's emission (F-105 7c): the same deferred drain, after the same synchronous write (mqttWriteAuthorizedPubRel) returns"},
+	"outbound_retained_replay_emit.go|emitRetainedPubRelOnce|startActionDrain": {1, "a retained PUBREL's emission (issue #107 7c): the same deferred drain, after the same synchronous write (mqttWriteAuthorizedPubRel) returns"},
 	"shim_public.go|finishOwedActions|startActionDrain":                        {1, "the shutdown pass over drains a drain enrolled"},
 	"shim_public.go|runShutdown|finishOwedActions":                             {1, "the shutdown sequence, after the send barriers drained"},
 }

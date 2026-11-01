@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// T8, the write boundary (F-105). Every legal batch shape is accepted and ROUND-TRIPS through
+// T8, the write boundary (issue #107). Every legal batch shape is accepted and ROUND-TRIPS through
 // the production decoders, and every refusal row is refused with nothing stored. The round-trip
 // is load-bearing: the two production defects the plan's nine clean rounds missed were both a
 // legal-looking batch that the DECODER refused on read (an empty list marshalled as JSON null),
@@ -94,7 +94,7 @@ func (x *testBoundaryEnv) refused(t *testing.T, what string, b *mqttSharedBatch)
 	}
 }
 
-// install lands the tenure's installation over the absent ledger: since F-105 8b the ONE
+// install lands the tenure's installation over the absent ledger: since issue #107 8b the ONE
 // creator of a ledger, which every join then steps from.
 func (x *testBoundaryEnv) install(t *testing.T, tenure mqttSharedTenure) {
 	t.Helper()
@@ -116,7 +116,7 @@ func TestSharedBoundaryLegalShapesRoundTrip(t *testing.T) {
 	acqA := mqttNewInflightNonce()
 	acqB := mqttNewInflightNonce()
 
-	// The INSTALLATION creates the ledger (F-105 8b); the first JOIN creates the group at
+	// The INSTALLATION creates the ledger (issue #107 8b); the first JOIN creates the group at
 	// incarnation 1. The retiring list is written as [] — the shape defect I1 turned into JSON
 	// null.
 	x.install(t, tenure)
@@ -143,7 +143,7 @@ func TestSharedBoundaryLegalShapesRoundTrip(t *testing.T) {
 		t.Fatalf("the second join did not reach two holders: %+v", g.rec)
 	}
 
-	// CLOSE B (F-105 7e): the release fence's first step, the closed list gaining exactly B.
+	// CLOSE B (issue #107 7e): the release fence's first step, the closed list gaining exactly B.
 	l = x.ledger(t)
 	closeB, err := mqttComposeSharedClose(x.epoch, x.id, x.gen, mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqB}, l)
 	if err != nil || closeB == nil {
@@ -342,7 +342,7 @@ func TestSharedBoundaryRefusesTheInvariantViolations(t *testing.T) {
 	}))
 
 	// A release changing the tenure. Last, because it first lands the close the release fence
-	// requires (F-105 7e), which moves the ledger past the prior every row above composed from;
+	// requires (issue #107 7e), which moves the ledger past the prior every row above composed from;
 	// closed, the release is otherwise legal, so the tenure rule alone refuses it.
 	closeA, err := mqttComposeSharedClose(x.epoch, x.id, x.gen, mqttSharedAcqRef{Group: x.qkey, Inc: 1, Acq: acqA}, l)
 	if err != nil || closeA == nil {
@@ -446,7 +446,7 @@ func TestSharedBoundaryDecoderRefusesCorruptRecords(t *testing.T) {
 		t.Fatalf("an open ledger with no tenure read %v, want corrupt", l.status)
 	}
 
-	// THE CLOSED LIST (F-105 7e): mandatory, never null, a subset of acqs, no duplicates.
+	// THE CLOSED LIST (issue #107 7e): mandatory, never null, a subset of acqs, no duplicates.
 	acq := mqttNewInflightNonce()
 	base := `{"epoch":"` + x.epoch + `","id":"` + x.id + `","gen":"` + x.gen + `","state":1,"tenure":{"seq":1,"id":"` +
 		mqttNewInflightNonce() + `"},"acqs":[{"group":"` + x.qkey + `","inc":1,"acq":"` + acq + `"}]`
@@ -465,7 +465,7 @@ func TestSharedBoundaryDecoderRefusesCorruptRecords(t *testing.T) {
 	}
 }
 
-// T1 (F-105 7e): the close shape and the release's closed-or-sealed rule at the write boundary.
+// T1 (issue #107 7e): the close shape and the release's closed-or-sealed rule at the write boundary.
 // Mutations M1 (the release rule removed), M11 (a release keeping its nonce in the closed list).
 func TestSharedBoundaryCloseShape(t *testing.T) {
 	x := testNewBoundaryEnv(t)

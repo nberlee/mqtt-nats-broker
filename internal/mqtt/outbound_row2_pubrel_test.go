@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// The PUBREL side of F-105 row 2, on the real store: an ordinary PUBREL is acquired ONLY as one
+// The PUBREL side of issue #107 row 2, on the real store: an ordinary PUBREL is acquired ONLY as one
 // authority batch of its token and its action record, under the connection's own accepted
 // entitlement, and its frame is written through the authorized boundary, consumed once and only
 // for its live holder. Every test asserts it reached the route it names, so a mutation that stops
@@ -486,7 +486,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 	// Each variant seeds its OWN source delivery. The variants share one session and leave
 	// their exchanges past PUBREC, and one source delivery has at most one un-ended exchange:
 	// re-seeding the same source would ask the broker to admit a second exchange for a source
-	// it is still holding at PUBREL, which it refuses (F-115).
+	// it is still holding at PUBREL, which it refuses (issue #117).
 	nextSeq := testRealPubRelSrcSeq
 	seedFresh := func() testRealPubRelSeed {
 		t.Helper()

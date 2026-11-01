@@ -1,4 +1,4 @@
-// Unit coverage for F-077: a restored shared membership is arbitrated against the record.
+// Unit coverage for issue #79: a restored shared membership is arbitrated against the record.
 //
 // The oracle throughout is the OWNERSHIP WRITE ITSELF, counted at the store boundary and
 // identified by its own attempt rather than by a total. That is not fussiness: several of
@@ -199,11 +199,11 @@ func TestSharedOwnershipUnresolvedKeepsMutation(t *testing.T) {
 // Case 12/13. The repairable verdict class.
 // ---------------------------------------------------------------------------
 
-// TestSharedPrePassRepairableDoesNotPoisonLaterTargets pins the pre-pass rule F-077 adds,
+// TestSharedPrePassRepairableDoesNotPoisonLaterTargets pins the pre-pass rule issue #79 adds,
 // in BOTH directions.
 //
 // The rule is stated as a class — terminal unless repairable — rather than as an
-// `if absent` at each decision site, because F-076's batching seam took four rounds and
+// `if absent` at each decision site, because issue #78's batching seam took four rounds and
 // closed only when the special cases were deleted. So the negative control matters as much
 // as the positive one: a chunk-level transport failure is NOT a per-target verdict and must
 // still stop the batch (M16 in reverse).
@@ -298,7 +298,7 @@ func TestSharedPrePassRepairableDoesNotPoisonLaterTargets(t *testing.T) {
 // Case 9. The create census, as a drift guard.
 // ---------------------------------------------------------------------------
 
-// TestSharedGroupCreateCensus holds down the class F-077 arbitrates: every group-durable
+// TestSharedGroupCreateCensus holds down the class issue #79 arbitrates: every group-durable
 // create must live inside processSharedJSConsumer, so a new create site cannot join the
 // class without someone deciding whether it needs arbitration.
 //
@@ -321,7 +321,7 @@ func TestSharedGroupCreateCensus(t *testing.T) {
 	}
 	if len(offenders) != 0 {
 		t.Fatalf("group-durable create(s) outside processSharedJSConsumer: %v\n"+
-			"F-077 arbitrates ownership after every group create; a create elsewhere is "+
+			"issue #79 arbitrates ownership after every group create; a create elsewhere is "+
 			"unarbitrated. Either move it, or extend the arbitration to cover it and update "+
 			"this census.", offenders)
 	}
@@ -339,7 +339,7 @@ func TestSharedGroupCreateCensus(t *testing.T) {
 // operation that raised it.
 //
 // A fact parked on mqttSession would govern the NEXT operation on the same object, which is
-// exactly the stale-generation defect F-078 solved for its packet gate, by scoping it to the
+// exactly the stale-generation defect issue #80 solved for its packet gate, by scoping it to the
 // connection AND a per-session generation. The mutation
 // this kills is the stale form specifically: a session field that is reset per invocation
 // behaves correctly, so the mutation must omit the reset to be the defect (M3b).
@@ -380,7 +380,7 @@ func TestSharedOwnershipTriggerIsStackLocal(t *testing.T) {
 // TestSharedOwnershipDirectRejectionClassifiesLineage pins the 10071 arm's own
 // classification, which is the one arm that never consults the contention resolver.
 //
-// A CAS rejection says the subject moved. It does NOT say who moved it, and since F-084
+// A CAS rejection says the subject moved. It does NOT say who moved it, and since issue #86
 // the broker no longer pretends otherwise: BOTH classes say 0x89 "reconnect". What still
 // differs is the Reason String and the REPAIR — a record claiming the same PARENT as ours
 // is a sibling, so our write was erased by something not demonstrably our successor and a
@@ -401,7 +401,7 @@ func TestSharedOwnershipDirectRejectionClassifiesLineage(t *testing.T) {
 		{"a sibling claiming our parent is FORKED", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandSibling(t, e, testMutateSibling)
 		}, mqttGroupOwnershipForked, mqttDisposalForked},
-		// A CHILD-SHAPED body is not a takeover, and calling it one was F-084's defect:
+		// A CHILD-SHAPED body is not a takeover, and calling it one was issue #86's defect:
 		// restore adopts WID/PWID without validating provenance, so this shape claims
 		// descent rather than proving it. The OUTCOME still separates it from a sibling —
 		// Foreign disposes, Forked does not mint here — while the CLAIM is the honest one.
@@ -448,7 +448,7 @@ func TestSharedOwnershipDirectRejectionClassifiesLineage(t *testing.T) {
 			if v.outcome != tc.want {
 				t.Fatalf("ownership verdict = %v, want %v (err=%v)", v.outcome, tc.want, v.err)
 			}
-			// The WHOLE vocabulary, not its reason code: since F-084 the forked and the
+			// The WHOLE vocabulary, not its reason code: since issue #86 the forked and the
 			// unsettled values both carry 0x89, so only the Reason String and the log line
 			// separate a proven sibling from an unclassifiable stranger.
 			if v.voc != tc.voc {

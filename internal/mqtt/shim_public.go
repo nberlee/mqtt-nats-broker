@@ -254,7 +254,7 @@ func (s *Server) runShutdown() {
 	// path still works, which is the point: a PUBLISH section's durable action is ended by
 	// a JetStream write, and a section still open when quitCh closes leaves a live token
 	// on the record that the next start cannot tell from a peer's. Each HOLDER performs
-	// its own drain — nothing here clears a token it does not hold (F-098).
+	// its own drain — nothing here clears a token it does not hold (issue #100).
 	s.closePublishSendBarrier()
 	s.finishOwedAcquireSettles()
 	s.finishOwedDrains()
@@ -616,7 +616,7 @@ func (s *Server) admitWillWorker() bool {
 // accounting trivially correct (a displaced timer has no unambiguous owner for
 // its release once its map entry is gone).
 //
-// The custody dispatcher's tick (F-097 WP4, outbound_custody_dispatcher.go) is
+// The custody dispatcher's tick (issue #99 WP4, outbound_custody_dispatcher.go) is
 // the other user, under its own key namespace
 // ("$MQTT_custody_tick.<client>.<gen>.<arm>"): the same shutdown drain covers it.
 // Every arm is a fresh key, because a key stays registered until its callback

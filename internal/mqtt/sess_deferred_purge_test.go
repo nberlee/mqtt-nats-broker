@@ -167,7 +167,7 @@ func TestMQTTDeferredCloseRunsSharedPurge(t *testing.T) {
 	t.Parallel()
 	e := testNewDeferredEnv(t, "client-deferred-purge", "deferred.purge")
 	action := testSurvivingAction()
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
@@ -239,7 +239,7 @@ func TestMQTTDeferredCloseWritesVerdictAndDeadlineTogether(t *testing.T) {
 
 	action := testSurvivingAction()
 
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 
@@ -314,7 +314,7 @@ func TestMQTTDeferredCloseUnlandedWriteIsRetried(t *testing.T) {
 	// hook runs after the store, and the save hook exits before the write.
 	mqttTestSessStoreSuppressV.Store(true)
 	action := testSurvivingAction()
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 	mqttTestSessStoreSuppressV.Store(false)
@@ -367,7 +367,7 @@ func TestMQTTDeferredCloseSecondAmbiguityReArms(t *testing.T) {
 
 	mqttTestSessStoreSuppressV.Store(true)
 	action := testSurvivingAction()
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 	mqttTestSessStoreSuppressV.Store(false)
@@ -444,7 +444,7 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 
 	action := testSurvivingAction()
 
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 
@@ -569,7 +569,7 @@ func TestMQTTDeferredCloseLateSettleConvergesAtGateRelease(t *testing.T) {
 
 	action := testSurvivingAction()
 
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 	e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 
@@ -634,7 +634,7 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 
 		mqttTestSessStoreSuppressV.Store(true)
 		action := testSurvivingAction()
-		action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+		action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 		e.gate(t)
 		e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 		mqttTestSessStoreSuppressV.Store(false)
@@ -686,7 +686,7 @@ func TestMQTTDeferredCloseAmbiguousWriteWithLateStaging(t *testing.T) {
 
 		action := testSurvivingAction()
 
-		action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+		action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 		e.gate(t)
 		e.s.applyDeferredDisconnect(e.asm, e.sess, action)
 		settle()
@@ -1085,7 +1085,7 @@ func (e *testDeferredEnv) testParkDeferredAfterUnlandedWrite(t *testing.T) *mqtt
 		t.Fatal("an ambiguous write must leave the session unresolved")
 	}
 	action := testSurvivingAction()
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	if !e.sess.deferDisconnect(action) {
 		t.Fatal("the close must park its obligations")
 	}
@@ -1429,7 +1429,7 @@ func TestMQTTContendedSaveCreditsMarshalledVerdicts(t *testing.T) {
 func TestMQTTDeferredDischargeReparksWhenUnresolvedAgain(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-discharge-repark", "discharge.repark")
 	action := testSurvivingAction()
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 
 	// The competing writer: it took the fence after the resolution released it, and its own
@@ -2025,7 +2025,7 @@ func (e *testDeferredEnv) handoffPending(t *testing.T) bool {
 func TestMQTTDeferredDischargeReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-discharge-fence", "discharge.fence")
 	action := testSurvivingAction()
-	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (F-105 7b)
+	action.lic = mqttLicenceOf(e.c) // the CLOSING connection's licence, captured at park (issue #107 7b)
 	e.gate(t)
 
 	armed := false

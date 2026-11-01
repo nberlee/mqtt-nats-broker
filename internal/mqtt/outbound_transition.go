@@ -24,7 +24,7 @@ import (
 	"sync/atomic"
 )
 
-// The authority transition (F-105).
+// The authority transition (issue #107).
 //
 // One transition is ONE atomic batch: the permanent outcome that records the attempt's
 // verdict, the authority record the transition contends on, and every exchange, dependency
@@ -48,7 +48,7 @@ import (
 // Atomicity commits what it is given. It does not validate MEANING — so this file, not its
 // callers, is where every member of every transition is classified and refused.
 
-// mqttOutboundLoadStatus classifies a read of one F-105 record.
+// mqttOutboundLoadStatus classifies a read of one issue #107 record.
 //
 // Deliberately the same four-way shape the retirement watermark uses, and for the same
 // reason: corrupt and indeterminate are not absent. A record this broker cannot interpret
@@ -117,7 +117,7 @@ func (jsa *mqttJSA) loadGenClosure(id, epoch, gen string) (*mqttGenClosure, uint
 }
 
 // requireDiscardingClosure is the licence of every act a DISCARDED generation's retirement takes
-// without an entitlement (F-105 7d): the generation's committed closure, read here, says Discard.
+// without an entitlement (issue #107 7d): the generation's committed closure, read here, says Discard.
 //
 // The closure is create-only and its Discard member is immutable, written by the act that ended
 // the generation, so a positive answer cannot become false between this read and the write it
@@ -289,7 +289,7 @@ type mqttTransitionMember struct {
 // Extra carries the exchange, dependency and inventory mutations the transition authorizes.
 // They belong in the SAME batch rather than in a follow-up write, because a transition that
 // installed its authority and then failed to install what it authorized would leave an
-// obligation nothing admitted — the precise state F-105 exists to make unreachable.
+// obligation nothing admitted — the precise state issue #107 exists to make unreachable.
 type mqttAuthorityTransition struct {
 	// Attempt is the description the commit, the abort and the resolution all agree about.
 	Attempt *mqttTransitionAttempt
@@ -564,7 +564,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if err := jsa.checkActionTokenMembers(a, t.Extra); err != nil {
 			return 0, err
 		}
-		// AND EVERY SLOT MEMBER OF AN ADVANCE IS BOUND TO ITS EXCHANGE ADVANCE (F-105 rows 3-4).
+		// AND EVERY SLOT MEMBER OF AN ADVANCE IS BOUND TO ITS EXCHANGE ADVANCE (issue #107 rows 3-4).
 		// A register member moving along an acknowledgement arrow (publish_terminal,
 		// pubrel_intended, pubrel_terminal), or a PUBREL holder's token clearance, records one
 		// fact beside the exchange member; this validates it against that member and the
@@ -591,7 +591,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if err := jsa.checkManifestMembers(a, t.Prev, t.Extra); err != nil {
 			return 0, err
 		}
-		// AND A RETAINED CANONICAL PUBREL IS CREATED BY EXACTLY ITS ARROW (F-105 7c).
+		// AND A RETAINED CANONICAL PUBREL IS CREATED BY EXACTLY ITS ARROW (issue #107 7c).
 		if err := jsa.checkRetainedRelMembers(a, t.Extra); err != nil {
 			return 0, err
 		}
@@ -702,7 +702,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // closure" a property of the mechanism rather than of its callers. Every rule is stated as
 // what the operation needs, so a kind added without one fails closed at the default.
 // mqttCheckDisposalLicence requires every disposal decision this transition introduces to be made
-// under the serving entitlement it names (F-105 7c-lc).
+// under the serving entitlement it names (issue #107 7c-lc).
 //
 // A route decides a consumer is ended under the connection that ran it, and records that
 // entitlement in the decision. Composing the write later against whatever authority stands would
@@ -712,7 +712,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // introduced by the transition it names (the store comparison in mqttCheckResourceStep refuses
 // anything else), which is how one carried from an earlier batch is told apart without a read.
 //
-// ONE DECISION IS LICENSED BY A FACT INSTEAD (F-105 7d): `generation-discarded`, the decision a
+// ONE DECISION IS LICENSED BY A FACT INSTEAD (issue #107 7d): `generation-discarded`, the decision a
 // discarded generation's retirement records about its own consumers after the generation has
 // stopped serving. No entitlement exists to take it under; its licence is the resource
 // generation's committed discarding closure, which discarding() reads and which cannot become
@@ -747,7 +747,7 @@ func mqttCheckDisposalLicence(t *mqttAuthorityTransition, discarding func(gen st
 				"serving one: a decision taken under an entitlement that has moved on is never "+
 				"re-made under its successor", t.Attempt.Txn, r.Inc, r.Disposal.Gen, r.Disposal.Tenure)
 		}
-		// THE TWO SETTLEMENT REASONS ARE A SOURCE CONSUMER'S ONLY (F-105 7f). The generation's PUBREL
+		// THE TWO SETTLEMENT REASONS ARE A SOURCE CONSUMER'S ONLY (issue #107 7f). The generation's PUBREL
 		// consumer is one stable name a successor reuses, so neither a successor's settlement nor a
 		// subscription repair ever decides it.
 		switch r.Disposal.Reason {
@@ -1134,7 +1134,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		}
 
 	case mqttTransitionAdvanceFloor:
-		// Retiring finished history behind the floor (F-112): any predecessor state, nothing
+		// Retiring finished history behind the floor (issue #114): any predecessor state, nothing
 		// moved, only the ledger and duty members. checkFloorAdvance decides every member.
 		if err := mqttCheckAdvanceFloorKind(t); err != nil {
 			return err
@@ -1311,7 +1311,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 		if len(t.Extra) == 0 {
 			return fmt.Errorf("an advance-exchange transition carries no exchange")
 		}
-		// IT CARRIES EXCHANGES IT ADVANCES, AND — as an acknowledgement (F-105 row 3) — THE
+		// IT CARRIES EXCHANGES IT ADVANCES, AND — as an acknowledgement (issue #107 row 3) — THE
 		// SLOT RE-PHASE THAT COMPLETES THE SAME EVENT, AND NOTHING ELSE. Without the "nothing
 		// else" the kind that is exempt from the serving requirement would be a route for
 		// admitting registers, actions or dependency counts under a closed authority; the
@@ -1324,7 +1324,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			// AND NOTHING IS CREATED. A create-only member here would install an obligation —
 			// an exchange or a register nothing admitted — through the one kind that does not
 			// need a serving authority.
-			// THE RETAINED PUBREC ADVANCE (F-105 7c) carries two more: its canonical PUBREL,
+			// THE RETAINED PUBREC ADVANCE (issue #107 7c) carries two more: its canonical PUBREL,
 			// create-only (the record the advance installs, bound to its arrow by
 			// checkRetainedRelMembers), and its copy's manifest, rewritten unchanged (the fence
 			// checkRetainedManifestArbitration admits on this kind only).
@@ -1342,7 +1342,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				exchanges++
 				continue
 			}
-			// A HOLD RELEASE (F-105 7c-lc): an ending releases its source and canonical-PUBREL
+			// A HOLD RELEASE (issue #107 7c-lc): an ending releases its source and canonical-PUBREL
 			// edges in its own batch. checkResourceOverwrites confines such a member to exactly the
 			// release this batch's endings justify.
 			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
@@ -1445,7 +1445,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				xchs++
 				continue
 			}
-			// The withdrawn obligation's hold releases (F-105 7c-lc), confined by
+			// The withdrawn obligation's hold releases (issue #107 7c-lc), confined by
 			// checkResourceOverwrites to exactly the edges this ending releases.
 			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
 				continue
@@ -1997,7 +1997,7 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 				a.Txn, e.subj, rec.PI)
 		}
 		// A CANCELLATION'S PROVENANCE IS MINTED BY ITS WRITE MODE, and only here can the mode be
-		// seen (F-088, consult C4). A pending fence is a CREATE-ONLY tombstone: the create is
+		// seen (issue #90, consult C4). A pending fence is a CREATE-ONLY tombstone: the create is
 		// what proves the subject was empty, so `pending-create` is legal only on a create-only
 		// member of a tombstone-register transition. Every cancellation written over an occupant
 		// is a CAS, so `occupant` is never legal on a create. A body that disagrees with its own
@@ -2162,7 +2162,7 @@ func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls
 		// there. A finalization that installs a successor may therefore enrol the predecessor's
 		// affine consumer, and may do nothing else across the boundary.
 		// AND AN ENDING KIND'S HOLD RELEASE names its obligation's own generation, which is an
-		// earlier one when a G1 obligation ends while G2 serves (F-105 7c-lc, P-4); what such a
+		// earlier one when a G1 obligation ends while G2 serves (issue #107 7c-lc, P-4); what such a
 		// member may change is confined by checkResourceOverwrites.
 		// And a release-holds batch, which releases finished history of any generation as
 		// dispose-resource disposes it (confined by checkResourceOverwrites to ended holds).
@@ -2287,7 +2287,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 		if next.Phase == mqttExchangeDiscarded {
 			// NOT a protocol advance and absent from the successor table. Only an obligation that
 			// has not released its holds is discarded: an ended one keeps its own ending, which is
-			// the evidence it already carries (F-105 7d).
+			// the evidence it already carries (issue #107 7d).
 			if mqttExchangeReleasesHolds(cur.Phase) {
 				return nil, fmt.Errorf("transition %q discards exchange %q from phase %d, which already "+
 					"released its holds: an ending is preserved, never rewritten", a.Txn, nonce, cur.Phase)
@@ -2316,7 +2316,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 			}
 		} else if next.Phase == mqttExchangeSupersededUnsent {
 			// A PROVEN-UNSENT SUPERSESSION is NOT a generic protocol advance — it is deliberately
-			// absent from the successor table (F-105 step 5, Codex consult 15). It ends a PUBLISH
+			// absent from the successor table (issue #107 step 5, Codex consult 15). It ends a PUBLISH
 			// obligation whose packet identifier a pair replacement is re-allocating to a fresh
 			// delivery. The only legal predecessor state is PUBLISH: nothing past it was ever
 			// unsent, so nothing past it may be superseded. That this ending is a REAL replacement
@@ -2341,7 +2341,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 	return pred, nil
 }
 
-// checkEndingBesideNoToken is the action-drain half of an ending (F-112): no batch moves an
+// checkEndingBesideNoToken is the action-drain half of an ending (issue #114): no batch moves an
 // exchange DIRECTLY into an identifier ending — from a phase that is not pending-drain — while the
 // standing register naming its lineage holds an output token.
 //
@@ -2671,7 +2671,7 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 		if replaces[gl] {
 			continue
 		}
-		// A CANCELLATION TOMBSTONE ALLOCATES NOTHING (F-105 7b). A tombstone-register
+		// A CANCELLATION TOMBSTONE ALLOCATES NOTHING (issue #107 7b). A tombstone-register
 		// transition's create-only member records that an allocation whose own store is still in
 		// flight was cancelled: it occupies the subject so that store's create-only CAS fails, and
 		// no obligation stands behind it by construction. Its kind arm admits exactly that shape.
@@ -2764,7 +2764,7 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 // holding the identifier, and treating it as absent is the inference this whole mechanism
 // exists to remove. So does an INCOMPLETE enumeration, for the same reason one step further
 // out — an obligation the walk never returned is one this claim never saw. The walk is the
-// generation's inventory [Lo, Hi] (F-112), fenced by the ledger CAS this same batch carries, and
+// generation's inventory [Lo, Hi] (issue #114), fenced by the ledger CAS this same batch carries, and
 // it reads the exchange of every duty that names a claimed identifier and no other: a walk that
 // read every exchange made each admission cost as much as the generation's unreclaimed history.
 func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
@@ -2800,7 +2800,7 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 
 	idHash := getHash(a.ID)
 	for gen, pis := range gens {
-		// THE ENUMERATION IS THE INVENTORY, read at the ledger sequence this batch CASes (F-112).
+		// THE ENUMERATION IS THE INVENTORY, read at the ledger sequence this batch CASes (issue #114).
 		// Every exchange's duty is allocated in the batch that creates it, so [Lo, Hi] covers every
 		// obligation the floor has not proven ended and reclaimed; and because this batch's own
 		// ledger member expects the sequence read here, an admission or a floor advance landing
@@ -2913,7 +2913,7 @@ func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, prev *mqttOu
 			return fmt.Errorf("transition %q provisions resource %q already carrying an "+
 				"authorization or an outcome", a.Txn, inc)
 		}
-		// NOR A DISPOSAL DECISION (F-105 7c-lc, holistic H-1). A decision is introduced on a LIVE
+		// NOR A DISPOSAL DECISION (issue #107 7c-lc, holistic H-1). A decision is introduced on a LIVE
 		// resource by a dispose transition under the serving entitlement it names; a resource
 		// CREATED carrying one would bypass both that licence and the step that admits it, and the
 		// authorization would then trust a decision no route took.
@@ -2922,7 +2922,7 @@ func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, prev *mqttOu
 				"decision: a consumer is disposed of by the route that ends it, never at its creation",
 				a.Txn, inc)
 		}
-		// THE PROVISIONING TENURE IS THE ONE THAT SERVES (F-105 7f). The schema requires a
+		// THE PROVISIONING TENURE IS THE ONE THAT SERVES (issue #107 7f). The schema requires a
 		// well-formed one on a logical-use consumer; this proves it is TRUE — the tenure of the
 		// serving authority the provisioning displaces — so a hand-built batch cannot stamp a
 		// foreign tenure that a later `tenure-superseded` decision would then accept against a
@@ -2966,7 +2966,7 @@ func (jsa *mqttJSA) checkProposedGenerationIsFresh(a *mqttTransitionAttempt, gen
 
 // checkNameOwnershipMembers re-derives every physical-name ownership member against the
 // standing record, so the logical-use fence is a boundary property and not a composer
-// convention (F-105 cutover, consult 4).
+// convention (issue #107 cutover, consult 4).
 //
 // KEYED ON THE MEMBER, like every rule in this file: an ownership write IS a claim or a
 // retirement whatever kind carries it, so a rule scoped to one kind would leave the identical
@@ -3022,7 +3022,7 @@ func (jsa *mqttJSA) checkNameOwnershipMembers(a *mqttTransitionAttempt, extra []
 }
 
 // mqttCheckRetirementPairing requires a logical-use consumer's deletion authorization and its
-// name's retirement to ride ONE batch, in both directions (F-105 7c-lc, Codex consult 14 finding 1).
+// name's retirement to ride ONE batch, in both directions (issue #107 7c-lc, Codex consult 14 finding 1).
 //
 // The two records state one fact — this physical name is spent, and this incarnation's deletion is
 // authorized — and the sweeps read the ownership half alone. A resource authorized without its
@@ -3280,7 +3280,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			createdX[toks[3]] = x
 			continue
 		}
-		// A HOLD-RELEASING move: an ending, or the generation's discard (F-105 7d), which releases
+		// A HOLD-RELEASING move: an ending, or the generation's discard (issue #107 7d), which releases
 		// holds without being an identifier ending.
 		if prev, known := xchPred[e.subj]; known && !mqttExchangeReleasesHolds(prev) && mqttExchangeReleasesHolds(x.Phase) {
 			// AN ACKNOWLEDGEMENT ENDING LEAVES ITS HOLDS RELEASE-OWED (mqttCompletionReleasesInBatch):
@@ -3292,7 +3292,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			endedHere[toks[2]+"."+toks[3]] = x
 		}
 	}
-	// A DISPOSE-RESOURCE BATCH OVERWRITES AT MOST ONE RESOURCE (F-105 7c-lc, closing the H-1..H-3
+	// A DISPOSE-RESOURCE BATCH OVERWRITES AT MOST ONE RESOURCE (issue #107 7c-lc, closing the H-1..H-3
 	// class; consult 112). It is the one kind licensed to seal, authorize, complete or dispose, so it
 	// is also the one kind in which an UNRELATED resource change could otherwise ride a legitimate
 	// step on another record. Every dispose composer carries at most one resource member (a duty's
@@ -3413,7 +3413,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			return fmt.Errorf("the material standing at %q belongs to materialization %q, so "+
 				"this resource's own material cannot be identified there", r.Name, m.Inc)
 		}
-		// CLOSED, AND ONLY CLOSED (F-105 7c). The recovery order is close the manifest, then seal
+		// CLOSED, AND ONLY CLOSED (issue #107 7c). The recovery order is close the manifest, then seal
 		// the resource; a seal over a READY copy would let an admission land against material
 		// whose owner already declared it would take nothing further.
 		if m.State != mqttManifestClosed {
@@ -3536,7 +3536,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 			}
 		}
 		// OUTSIDE A DISPOSE-RESOURCE TRANSITION, A RESOURCE OVERWRITE IS AN EDGE CHANGE AND NOTHING
-		// ELSE (F-105 7c-lc; P-4, holistic H-2 and H-3, closed as a property rather than per kind).
+		// ELSE (issue #107 7c-lc; P-4, holistic H-2 and H-3, closed as a property rather than per kind).
 		// Sealing, authorizing, completing and disposing are the dispose-resource kind's; every
 		// other kind that carries a resource member carries it to take the edges its own admissions
 		// create or to release the holds its own endings end, and the rules above judge those
@@ -3685,7 +3685,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		return fmt.Errorf("transition %q mutates resource %q's dependents illegitimately: %w",
 			a.Txn, cur.Inc, derr)
 	}
-	// A HOLD RELEASE IS ITS EXCHANGE'S ENDING'S, AND ONLY THAT (F-105 7c-lc). The source-replay and
+	// A HOLD RELEASE IS ITS EXCHANGE'S ENDING'S, AND ONLY THAT (issue #107 7c-lc). The source-replay and
 	// canonical-PUBREL edges of a name-owned consumer are released either IN THE BATCH that moves
 	// their exchange into an ending that releases there, or by a release-holds batch once the
 	// store shows the exchange ended (an acknowledgement ending leaves them release-owed,
@@ -3750,7 +3750,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 	if len(otherRemoved) == 1 {
 		removed = &otherRemoved[0]
 	}
-	// THE DISPOSAL FACT IS WRITTEN ONCE AND CARRIED (F-105 7c-lc). Introduced only on a LIVE
+	// THE DISPOSAL FACT IS WRITTEN ONCE AND CARRIED (issue #107 7c-lc). Introduced only on a LIVE
 	// resource, by a batch that changes nothing else about it, in this transition's own name (the
 	// entitlement licence is mqttCheckDisposalLicence's); never cleared, never rewritten.
 	switch {
@@ -3789,7 +3789,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 				a.Txn, cur.Inc, added.Nonce)
 		}
 		// AND, FOR A NAME-OWNED CONSUMER, THE NAME MUST BE LIVE AND OWNED BY THIS INCARNATION
-		// (F-105 §5.1 point 3, Codex consult 11). Admission takes a dependency edge; that edge
+		// (issue #107 §5.1 point 3, Codex consult 11). Admission takes a dependency edge; that edge
 		// is what stops a teardown deleting the consumer that carries this obligation's PUBREC
 		// evidence. But the edge alone says nothing about whether the NAME is still this
 		// resource's to depend on: a retirement may have already spent it. Retirement CASes
@@ -3809,7 +3809,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		// The floor is necessary for every role: a need of a LIVE obligation is not discharged.
 		// It is SUFFICIENT only for the roles the protocol itself concludes (the two hold roles
 		// of a name-owned consumer are judged above, against this batch's own endings).
-		// A RETAINED-MATERIAL edge has two further floors (F-105 7c): an exchange carrying the
+		// A RETAINED-MATERIAL edge has two further floors (issue #107 7c): an exchange carrying the
 		// retained abandonment fact for this payload never replays its PUBLISH again, whatever
 		// phase a late PUBREC moved it to, and a generation closed with Discard has no serving
 		// successor to replay anything. Neither licenses any other role.
@@ -3830,7 +3830,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 			// would reach zero edges and become deletable while its need still stood.
 			//
 			// Refusing costs reclamation. Permitting costs the obligation, which is the thing
-			// F-105 exists to protect.
+			// issue #107 exists to protect.
 			return fmt.Errorf("transition %q releases %s from resource %q on the strength of its "+
 				"obligation ending, which is PROTOCOL completion and not this role's discharge: "+
 				"that role ends on evidence this broker does not yet record durably, so the edge "+
@@ -3891,7 +3891,7 @@ func mqttCheckResourceStep(a *mqttTransitionAttempt, cur, next *mqttOutboundReso
 		// the LIVE -> RETIRED member, and checkNameOwnershipMembers enforces it): a delayed
 		// create landing after the name is RETIRED is a harmless orphan no obligation can adopt.
 		// Requiring a seal here would strand the name for ever. See mqttResourceLogicalUseKind.
-		// A LOGICAL-USE KIND IS AUTHORIZED ONLY ON A STANDING DISPOSAL DECISION (F-105 7c-lc): its
+		// A LOGICAL-USE KIND IS AUTHORIZED ONLY ON A STANDING DISPOSAL DECISION (issue #107 7c-lc): its
 		// zero edges are equally what an idle serving subscription looks like.
 		if mqttResourceLogicalUseKind(cur.Kind) && cur.Disposal == nil {
 			return fmt.Errorf("transition %q authorizes deleting %s consumer %q, which no route has "+

@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// T13 (F-088 WP2, plan rev 20): EVERY removal of a PUBLISH entry states why, and each class of
+// T13 (issue #90 WP2, plan rev 20): EVERY removal of a PUBLISH entry states why, and each class of
 // removal is backed by a behavioural test. Only one class — an UNANSWERED removal of an entry
 // whose transmission was attempted — installs an AckRoute, and it does so through the one sink,
 // untrackPublishEntry. A direct `delete(sess.pendingPublish, ...)` is a removal that installs

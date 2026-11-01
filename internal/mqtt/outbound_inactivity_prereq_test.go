@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// TestF105InactivityPrerequisite pins the F-105 §5.1 rule that a depended-on source/PUBREL
+// TestF105InactivityPrerequisite pins the issue #107 §5.1 rule that a depended-on source/PUBREL
 // consumer is safe only when its EFFECTIVE inactivity threshold is zero — both the stream's
 // substituted limit and the consumer's own request — and that an unverifiable stream is unsafe.
 // It exercises the pure decision core so no embedded JetStream is needed; the store wrapper is

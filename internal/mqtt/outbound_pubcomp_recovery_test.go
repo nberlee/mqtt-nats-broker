@@ -250,7 +250,7 @@ func TestF105RouteBRecordsTheRecoveredPubRec(t *testing.T) {
 		var stored atomic.Bool
 		e.asm.mu.Lock()
 		e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-			// Only the REGISTER batch: the inventory traversal's duty batches (F-105 7b) run
+			// Only the REGISTER batch: the inventory traversal's duty batches (issue #107 7b) run
 			// first and must not spend the one shot, or the record lands before the walk.
 			if !slices.Contains(subjects, subject) {
 				return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)

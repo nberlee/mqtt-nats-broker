@@ -85,7 +85,7 @@ func mqttBoundaryPrefetchSet(id string, extra []mqttTransitionMember) []string {
 	return set
 }
 
-// mqttIsInflightStreamSubject reports whether subject is one of $MQTT_inflight's: an F-105 record,
+// mqttIsInflightStreamSubject reports whether subject is one of $MQTT_inflight's: an issue #107 record,
 // a register or an unsent marker.
 func mqttIsInflightStreamSubject(subject string) bool {
 	if mqttIsF105Subject(subject) {

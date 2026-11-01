@@ -80,7 +80,7 @@ type mqttSub struct {
 	//
 	// Each frame carries the packet identifier it was framed under, because a QoS 1/2
 	// retained send reserves that identifier from allocation until the frame is written,
-	// and whoever writes it has to know which reservations it is discharging (F-091).
+	// and whoever writes it has to know which reservations it is discharging (issue #93).
 	//
 	// The slice is also the unit of DETACHMENT: whoever takes it under c.mu takes all of it
 	// and nils it, so each frame has exactly one disposition — written, or detached and then
@@ -88,7 +88,7 @@ type mqttSub struct {
 	// releasing: a same-sid replacement detaches and hands the frames and their reservations
 	// on intact, because a duplicate-filter SUBSCRIBE still owes that replay.
 	prm []mqttRetainedFrame
-	// replay is this subscription lineage's outstanding retained replay (F-105 7c): the items
+	// replay is this subscription lineage's outstanding retained replay (issue #107 7c): the items
 	// already published to the session's driver and the GATE live QoS 0 waits on. Inherited by a
 	// same-sid replacement, marked departed when the sid leaves. Guarded by the connection's c.mu.
 	replay *mqttRetainedReplay
@@ -216,7 +216,7 @@ type mqttFilter struct {
 // mqttToNATSSubjectConversion encodes a literal '.' as "//", so the ordinary plain filter
 // "$share.foo" has the sid "$share//foo" and satisfies HasPrefix(sid, "$share/"). The
 // authorities are f.shared, set at parse time, and cc.DeliverGroup on a resident config.
-// F-083.
+// issue #85.
 func (f *mqttFilter) sessionKey() string {
 	if f.shared {
 		return string(mqttSharedSubPrefix) + f.group + "/" + f.filter
@@ -266,7 +266,7 @@ func (sess *mqttSession) processSub(
 	// COMPLETION OWNERSHIP, installed here rather than at each registration: every
 	// session-scoped delivery callback in the package reaches the NATS subscription
 	// through this one wrapper, so the boundary covers the class by construction
-	// instead of by a list (F-036 unit 1). Only the QoS 1/2 handler owes the
+	// instead of by a list (issue #40 unit 1). Only the QoS 1/2 handler owes the
 	// withheld-delivery record on a refusal; the others simply skip without acking.
 	h = sess.leasedHandler(h, jsDurName != _EMPTY_)
 	sub, displacedFrames, err := c.processSub(subject, queue, sid, h, false)
@@ -309,8 +309,8 @@ func (sess *mqttSession) processSub(
 	// entirely: the identifiers stay reserved by the frames that still carry them, the
 	// written release discharges them when the flush happens, and the abandoned release
 	// discharges them if the replacement is torn down. FIRST, so the displaced frames
-	// precede any this packet is about to serialize, preserving arrival order (F-091).
-	// AND THE REPLAY LINEAGE (F-105 7c): a replacement INHERITS the displaced subscription's
+	// precede any this packet is about to serialize, preserving arrival order (issue #93).
+	// AND THE REPLAY LINEAGE (issue #107 7c): a replacement INHERITS the displaced subscription's
 	// outstanding replay object — the items the driver is executing and the gate its live
 	// callbacks wait on — so the replacement neither loses nor duplicates them, and this packet's
 	// own snapshot is staged after them.
@@ -545,7 +545,7 @@ func (dd *mqttDeferredDel) revokeLocked(c *client, sess *mqttSession,
 // sid, and nil on the SUBSCRIBE path. It is passed explicitly rather than parked on the
 // session so its lifetime is one restore and nothing can read a previous connection's
 // judgement. See shared_group_verify.go.
-// The second result is F-077's arbitration trigger: this operation installed, repaired,
+// The second result is issue #79's arbitration trigger: this operation installed, repaired,
 // adopted or refreshed shared group delivery interest. It is a RETURN VALUE rather than a
 // session field on purpose — see mqttSharedJoinResult.installed.
 //
@@ -555,7 +555,7 @@ func (dd *mqttDeferredDel) revokeLocked(c *client, sess *mqttSession,
 // transmission gate — which the CONNECT path needs no equivalent of, because its restore
 // gate is already withholding everything until the CONNACK.
 //
-// The paths were asymmetric until F-078: mqttProcessSubs used to DISCARD this fact, which is
+// The paths were asymmetric until issue #80: mqttProcessSubs used to DISCARD this fact, which is
 // what left live interest serving unarbitrated. See sub_operation_gate.go.
 func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, tok recordTx,
 	filters []*mqttFilter, fromSubProto, trace bool,
@@ -740,7 +740,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					// none of those except the save touches the session record at all.
 					// Marking the whole arm converted an ordinary per-filter failure
 					// into a connection-level refusal, which is a contract owned by the
-					// affine items rather than by F-078. The provisioning save's own CAS
+					// affine items rather than by issue #80. The provisioning save's own CAS
 					// rejection HAS its own narrower signal: the helper returns it
 					// separately, and it is ORed into the fact above.
 					c.Errorf("failed to initialize session-affine QoS 2 delivery: %v", err)
@@ -1857,7 +1857,7 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) (subs []*subscription, a
 	// reason: it must observe the packet transaction CLOSED (mqttConsumeWillUnderGate does
 	// JetStream work and the fence cannot be held across it) and the ownership gate STILL
 	// HELD (its own precondition). LIFO puts it after endRecordTx and before unlockSession.
-	// F-084.
+	// issue #86.
 	var willPhase func()
 	defer func() {
 		if willPhase != nil {
@@ -1881,7 +1881,7 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) (subs []*subscription, a
 
 	// ARBITRATE. Everything above may have installed or revived shared group delivery
 	// interest; nothing yet proved this broker still OWNS the membership it was keyed on
-	// (F-078). One classified record write does, and only a write can: a load cannot
+	// (issue #80). One classified record write does, and only a write can: a load cannot
 	// distinguish "the record did not move" from "a contender's proposal has not committed
 	// yet".
 	//
@@ -1904,7 +1904,7 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) (subs []*subscription, a
 		// write, and it would convert an ambiguous affine provisioning failure into a
 		// connection-level refusal — which is the contract the affine items own, the same
 		// one the wider trigger predicate already broke once. That population is the
-		// point-in-time-ownership convergence window in docs/CONFORMANCE.md, and F-078
+		// point-in-time-ownership convergence window in docs/CONFORMANCE.md, and issue #80
 		// makes no stronger guarantee for it. Mutating this order is M34.
 		gateState = mqttSubGateOpen
 		return subs, arb, nil
@@ -1932,7 +1932,7 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) (subs []*subscription, a
 		// may not serve this group and must not write again; it does NOT establish who took
 		// it, so the Will is CONSUMED here rather than discarded. Discarding was the old
 		// behavior and it suppressed a Will on evidence that demonstrated no successor —
-		// the same silent loss the Forked and Local arms below already refuse. F-084.
+		// the same silent loss the Forked and Local arms below already refuse. issue #86.
 		//
 		// Phase 1 prepares; the Will action runs in phase 2, after this packet's record
 		// transaction is closed by the caller's defer and while the ownership gate is still

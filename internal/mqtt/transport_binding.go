@@ -22,9 +22,9 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// The immutable connection binding (F-105).
+// The immutable connection binding (issue #107).
 //
-// THE SOCKET EFFECT CANNOT BE FENCED BY A JETSTREAM CAS. Everything else in F-105 is
+// THE SOCKET EFFECT CANNOT BE FENCED BY A JETSTREAM CAS. Everything else in issue #107 is
 // arbitrated durably, but bytes already handed to a transport are not: an action acquired
 // before a retirement may still be executing when the retirement wins, and no metadata
 // protocol can reach into another process and stop a write. The invariant is therefore
@@ -90,7 +90,7 @@ type mqttConnBinding struct {
 	// established is closed when cert is recorded, for an observer that selects on the fact.
 	// No certifier waits on it: completion is owner-free (completeCertification).
 	established chan struct{}
-	// persist is where this connection's certificate is made durable (F-105 8c): the client
+	// persist is where this connection's certificate is made durable (issue #107 8c): the client
 	// generation it first attempted an acquisition under, captured BEFORE that acquisition's
 	// batch was sent, so an acquisition whose answer was lost still has its certificate
 	// persisted. Nil for a connection that never attempted one — a refused CONNECT, a
@@ -118,7 +118,7 @@ type mqttCloseCert struct {
 // what keeps a restarted broker's certificate from being confusable with its predecessor's
 // for the same node and connection number.
 //
-// It names the run in a persisted certificate (F-105 8c) for diagnosis. It is NOT what makes the
+// It names the run in a persisted certificate (issue #107 8c) for diagnosis. It is NOT what makes the
 // certificate's connection unique: one process may construct several servers, each numbering
 // its connections from one, so the connection token is minted unique on its own
 // (mqttBindConnection).
@@ -132,7 +132,7 @@ func mqttNewConnBinding(run, conn string) *mqttConnBinding {
 // mqttBindConnection mints this run's binding for one accepted connection.
 //
 // THE CONNECTION TOKEN IS MINTED, NOT DERIVED. A persisted certificate ends the live token of
-// every action naming its connection (F-105 8c), so two sockets must never share a name: the
+// every action naming its connection (issue #107 8c), so two sockets must never share a name: the
 // connection number is unique only within one server, and a second server in the same process
 // — or a replacement server in a long-lived one — numbers its connections from one again. The
 // number is kept as a prefix for diagnosis; the minted suffix is what makes the name unique.
@@ -215,7 +215,7 @@ func (b *mqttConnBinding) claimPersistLocked() (ctx *mqttCertPersistCtx, joined 
 }
 
 // registerAcquisition records, BEFORE an acquisition's batch is sent, where this connection's
-// certificate is to be persisted (F-105 8c).
+// certificate is to be persisted (issue #107 8c).
 //
 // Before the send, not on its answer: an acquisition whose response is lost may have installed
 // its token, and that token needs the certificate exactly as much as one seen to land. ONE

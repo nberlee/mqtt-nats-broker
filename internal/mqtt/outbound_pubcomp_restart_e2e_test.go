@@ -360,7 +360,7 @@ func TestF105RecordedCleanupOwnedAtShutdownIsFinishedByRecovery(t *testing.T) {
 	}
 }
 
-// T7. The stated residual, NARROWED by F-105 8c to a holder whose connection left no usable
+// T7. The stated residual, NARROWED by issue #107 8c to a holder whose connection left no usable
 // durable certificate: a PUBREL holder that never drains (its process gone) leaves its exchange
 // terminal-pending-drain and its identifier held; recovery neither finishes nor steals it. The
 // certificate the restart's teardown would persist is suppressed, which is the crash before
@@ -411,7 +411,7 @@ func TestF105DeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
 
 // T7b. A dead PUBREL holder whose connection WAS certified, and whose certificate is durable,
 // leaves nothing owed: the successor's resume clears the token on the certificate's licence and
-// completes the pending drain in the same batch (F-105 8c).
+// completes the pending drain in the same batch (issue #107 8c).
 func TestF105CertifiedDeadPubRelHolderIsFinishedByRecovery(t *testing.T) {
 	w := testF105RestartWorldAtPubRelReady(t, "f105-dead-certified")
 	cur, smsg, _ := w.asm.loadInflightRecord(w.subject)

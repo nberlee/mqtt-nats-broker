@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// THE PUBLISH SEND BARRIER (F-098).
+// THE PUBLISH SEND BARRIER (issue #100).
 //
 // A QoS 1/2 PUBLISH send section takes a DURABLE action on its exchange's slot and ends it
 // by draining that action, which is a JetStream write. A graceful shutdown that tore
@@ -290,7 +290,7 @@ func TestMQTTPublishSendBarrierFinishesADrainTheTimerCouldNotRetry(t *testing.T)
 //
 // The pass re-attempts a drain by its own captured identity, and the drain re-reads and
 // re-proves that exact token before writing anything. A shutdown that cleared whatever it
-// found would be the steal F-098 exists to refuse — and it would do it at the one moment
+// found would be the steal issue #100 exists to refuse — and it would do it at the one moment
 // nobody is watching.
 //
 // Mutation M87: have finishOwedDrains clear the slot's action fields directly instead of

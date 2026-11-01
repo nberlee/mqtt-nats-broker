@@ -65,7 +65,7 @@ func TestF105RefusedPublishReceivedHasAnEndingOfItsOwn(t *testing.T) {
 	}
 
 	// AND IT IS AN ENDING: the resource it depends on is released over it, exactly as over a
-	// completion, because nothing further can be emitted for it (F-105 7c-lc: release-owed,
+	// completion, because nothing further can be emitted for it (issue #107 7c-lc: release-owed,
 	// then released by a release-holds batch over the stored ending).
 	testReleaseOwed(t, e, nonce)
 	res, _ := testF105LoadResource(t, e, "inc-src")
@@ -330,7 +330,7 @@ func TestF105ThereIsNoOneStepRouteToServing(t *testing.T) {
 	}
 }
 
-// TestF105MarkerMembersAreShapedAndCreateOnly is the half of finding 1 that is F-105's own.
+// TestF105MarkerMembersAreShapedAndCreateOnly is the half of finding 1 that is issue #107's own.
 //
 // The marker member was exempt from body validation here on the reasoning that its builder
 // validates it — the builder-only guarantee this boundary exists to replace — and it had no

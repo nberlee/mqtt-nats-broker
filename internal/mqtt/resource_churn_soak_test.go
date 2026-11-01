@@ -22,7 +22,7 @@ package mqtt
 // alone (`make resource-soak`): it counts goroutines across the process and reads process
 // descriptors, which neighbouring tests would disturb.
 //
-// What it does NOT measure is stated in docs/findings/resource-lifetime.md: per-CONNECT
+// What it does NOT measure is stated in https://github.com/nberlee/mqtt-nats-broker/issues/138: per-CONNECT
 // durable records are JetStream storage, not process memory, and are a stated residual.
 
 import (

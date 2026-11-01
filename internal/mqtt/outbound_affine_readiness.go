@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// The affine cleanup's readiness assertion (F-105, row 8).
+// The affine cleanup's readiness assertion (issue #107, row 8).
 //
 // # What this record is, and what it is NOT
 //
@@ -42,7 +42,7 @@ import (
 // fence: a creator that read it as absent and then paused can still land its create afterwards,
 // because a read cannot invalidate a request already in flight. The read is deliberately NOT
 // there. What a late create leaves is an affine consumer for an ENDED generation, which nothing
-// reaps — the same accumulation F-036 course E accepted, reached through a narrower window.
+// reaps — the same accumulation issue #40 course E accepted, reached through a narrower window.
 //
 // # Create-only, so a second writer converges rather than competing
 //

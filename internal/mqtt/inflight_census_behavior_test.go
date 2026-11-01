@@ -66,11 +66,11 @@ func TestMQTTGatedReapRefusesAnUnpermittedTransition(t *testing.T) {
 	}
 }
 
-// F-092 asked whether a source-side `Retired` fact is read as a slot PHASE. It is not, and
+// issue #94 asked whether a source-side `Retired` fact is read as a slot PHASE. It is not, and
 // that half of the question is answered at the phase layer, where it lives.
 //
 // The old end-to-end half — the same record deleted by the consolidated reaper — asserted an
-// outcome F-098 forbids, so it is REPLACED rather than adjusted (consult D-6, row (c)).
+// outcome issue #100 forbids, so it is REPLACED rather than adjusted (consult D-6, row (c)).
 // `Retired` is backed by the client's own PUBREC, so the PUBLISH provably transmitted and
 // the client may hold the identifier; under C-IV arm 4 retirement DOMINATES, defeating both
 // admissible proofs of non-transmission. No evidence makes this record releasable, which is
@@ -78,7 +78,7 @@ func TestMQTTGatedReapRefusesAnUnpermittedTransition(t *testing.T) {
 // it can rather than withholding evidence to reach the same answer cheaply.
 func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	t.Parallel()
-	// THE SURVIVING F-092 ASSERTION, at the layer that decides it. The PHASE says which
+	// THE SURVIVING issue #94 ASSERTION, at the layer that decides it. The PHASE says which
 	// transitions are legal; `Retired` is a source fact and is not consulted here at all.
 	if !mqttInflightTransitionAllowed(mqttSlotDeleteComplete, mqttInflightPublish) {
 		t.Fatal("the complete-delete must be legal FROM the publish phase, or the reaper below " +
@@ -92,7 +92,7 @@ func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	rec, subject := testCensusSlot(mqttInflightPublish)
 	rec.Retired = true
 	rec.Cancelled = true                        // a cancellation written over a delivery the client already PUBREC'd
-	rec.CancelOrigin = mqttCancelOriginOccupant // F-088: written over an occupant, by CAS
+	rec.CancelOrigin = mqttCancelOriginOccupant // issue #90: written over an occupant, by CAS
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
 	// ...and its marker still beside it, which is the other admissible proof. Retirement
 	// dominates BOTH: a record carrying a retirement and a cancellation is a known-false
@@ -392,7 +392,7 @@ func TestMQTTClearRetiredSourceDoesNotAuthorizeDeletion(t *testing.T) {
 // C09: retirement is a source fact and therefore preserves every supported phase while
 // setting exactly the Retired bit through the slot CAS — every supported phase but ONE: an
 // abandoned delivery's register (delivery_abandoned) is the durable disposal record, and the
-// gate admits nothing from it (F-105 row 5, consult 34). That exception is asserted here, so a
+// gate admits nothing from it (issue #107 row 5, consult 34). That exception is asserted here, so a
 // state added later cannot silently fall outside this census.
 func TestMQTTMarkRetiredIsLegalFromEveryKnownState(t *testing.T) {
 	t.Parallel()
@@ -467,7 +467,7 @@ func TestOrphanSweepCannotMutateAnActiveSessionSlot(t *testing.T) {
 // C22: a failed PUBREL census is an incomplete identifier-space observation, not an
 // empty one.
 //
-// The census runs AFTER the register enumeration (F-099), so the enumeration is stubbed
+// The census runs AFTER the register enumeration (issue #101), so the enumeration is stubbed
 // empty to keep the failure deterministic: with no subjects there are no batched reads,
 // and the scan's own failure is the only one this can observe. The assertion is unchanged —
 // what moved is where in the pass the failure is reached, not what it means.
@@ -649,7 +649,7 @@ func TestMQTTRecoverySecondRetirementDropIsGated(t *testing.T) {
 }
 
 // C19, OFF-SESSION: the non-resident arm applies the SHARED admission rule, so a remote
-// holder's live action token withholds the delete (F-098, holistic review round 4, finding 3).
+// holder's live action token withholds the delete (issue #100, holistic review round 4, finding 3).
 //
 // The absence of a LOCAL session is exactly why this matters: it does not prove the absence of
 // an exchange. A `publish` slot carrying a live token belongs to a broker that may still be

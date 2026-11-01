@@ -24,7 +24,7 @@ import (
 )
 
 // The DURABLE TEARDOWN RECEIPT is the create-only authorization a discarding close
-// reads (F-105, row 8, Gap 1).
+// reads (issue #107, row 8, Gap 1).
 //
 // Closing the socket does not close authority; discarding the session does — and a
 // discarding closure abandons a generation's outbound obligations, so it needs an
@@ -204,7 +204,7 @@ func (jsa *mqttJSA) storeTeardownClaimBatch(domainTk, cidHash string, seq uint64
 // before the batch is sent: the window a test displaces the marker in. nil in production.
 var mqttTestReceiptContinuationHookV atomic.Pointer[func(id string)]
 
-// claimTeardownReceipt is the RECEIPTLESS CONTINUATION of an adopted teardown (F-105 8b,
+// claimTeardownReceipt is the RECEIPTLESS CONTINUATION of an adopted teardown (issue #107 8b,
 // consult 121): a marker that carries no receipt, over an authority that — once every standing
 // proposal is settled — still SERVES the marker's generation. Withholding the closing there
 // forever would strand the record (an aborted preparation settles back to exactly that state),

@@ -1,6 +1,6 @@
 //go:build mqtt_fulltests && mqtt_experimental_shared_qos2
 
-// Retention proof for session-affine shared-subscription QoS 2 (F-063).
+// Retention proof for session-affine shared-subscription QoS 2 (issue #67).
 //
 // The property under test: the group source is released only against evidence — a
 // copy PROVEN PRESENT by a fresh lookup, a terminal fact on the claim, or a
@@ -203,7 +203,7 @@ func testQ2AffAwaitSeeded(t *testing.T, seeded func() (string, bool)) string {
 // unsubscribing its subs. With no client there is no teardown, and no racer.
 //
 // It is also a state a real deployment reaches, not a contrivance: a record plus a consumer
-// with no local client is F-064's stranded-owner shape — the winning session serving on
+// with no local client is issue #68's stranded-owner shape — the winning session serving on
 // another broker, or gone while its delivery was in flight.
 func testQ2AffSyntheticWinner(t *testing.T, b *testQ2AffBroker, id string) (idHash, gen string) {
 	t.Helper()
@@ -216,7 +216,7 @@ func testQ2AffSyntheticWinner(t *testing.T, b *testQ2AffBroker, id string) (idHa
 // adjusts the durable that is actually created. Either may be nil.
 //
 // They are separate on purpose. A record that no longer matches the durable is
-// precisely what several of F-064's refusals are about, so a helper that kept the
+// precisely what several of issue #68's refusals are about, so a helper that kept the
 // two in step could not stage them.
 func testQ2AffSyntheticWinnerWith(t *testing.T, b *testQ2AffBroker, id string,
 	record func(*mqttPersistedSession), consumer func(*ConsumerConfig)) (idHash, gen string) {
@@ -820,7 +820,7 @@ func TestQ2AffAcksOnAffineDone(t *testing.T) {
 // Discarded. The winner's session ended and the delivery dies with it
 // ([MQTT-4.8.2-5]). Required rather than merely permitted: reapable refuses without
 // SourceAcked, so withholding the ack here would make every discarded claim
-// permanently unreapable — the accumulation half of F-064, manufactured on purpose.
+// permanently unreapable — the accumulation half of issue #68, manufactured on purpose.
 //
 // Discriminating mutation: drop Discarded from the predicate (mutation 7). The claim
 // is then never source-acked, so it is never reaped and this fixture fails.
@@ -839,7 +839,7 @@ func TestQ2AffAcksOnDiscarded(t *testing.T) {
 // durable evidence that it happened.
 //
 // Not "never delivered": the client's PUBREC is answered before the affine side is
-// recorded, so a Lost claim can name a message that in fact arrived (F-064's
+// recorded, so a Lost claim can name a message that in fact arrived (issue #68's
 // residual 1). Nothing this fixture asserts depends on which it was — the release
 // and the retention are right either way — but the label is not proof of loss.
 //

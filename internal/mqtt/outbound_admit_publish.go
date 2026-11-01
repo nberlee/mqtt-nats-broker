@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// Admitting one outbound PUBLISH (F-105).
+// Admitting one outbound PUBLISH (issue #107).
 //
 // This is what the ordinary QoS 1/2 delivery route will call in place of the independent
 // register-and-marker write it performs today. It is deliberately ONE transition carrying
@@ -237,7 +237,7 @@ func mqttAdmitPublishesTransition(a *mqttPublishAdmission, entries []mqttPublish
 		}
 		// THE HOLDS INDEX IS DERIVED HERE, from the edges this entry adds, and from nothing the
 		// caller says: the ending that releases them reads it, and the write boundary refuses an
-		// admission whose index differs from its added edges in either direction (F-105 7c-lc).
+		// admission whose index differs from its added edges in either direction (issue #107 7c-lc).
 		e.Exchange.Holds = mqttHoldsForDeps(e.Deps)
 		xchBody, xerr := json.Marshal(e.Exchange)
 		if xerr != nil {

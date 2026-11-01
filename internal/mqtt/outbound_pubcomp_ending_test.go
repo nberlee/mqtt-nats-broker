@@ -27,7 +27,7 @@ import (
 	"time"
 )
 
-// The F-105 PUBCOMP arm: an ordinary QoS 2 exchange ends, durably, with the client's PUBCOMP —
+// The issue #107 PUBCOMP arm: an ordinary QoS 2 exchange ends, durably, with the client's PUBCOMP —
 // the exchange and its slot in one batch — and a live PUBREL action makes that ending
 // pending-drain until the holder's own drain completes both records.
 
@@ -492,7 +492,7 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-pubcomp-before-acq")
 		var pubcompRan, acqRefused atomic.Bool
 		asm := sess.asm
-		// THE ORDINARY ACQUISITION IS AN AUTHORITY BATCH (F-105 row 2), so the PUBCOMP is forced in
+		// THE ORDINARY ACQUISITION IS AN AUTHORITY BATCH (issue #107 row 2), so the PUBCOMP is forced in
 		// between that batch's composition and its send: the batch was composed against the
 		// pre-PUBCOMP register and must be refused once the PUBCOMP has landed.
 		hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {

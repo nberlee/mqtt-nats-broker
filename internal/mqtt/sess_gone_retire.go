@@ -1,7 +1,7 @@
 // Retiring a BOUND session whose record was deleted out from under it.
 //
 // The session-record watch converges every MOVED record, bound sessions included. A
-// DELETED one on a BOUND session was the shape it could not finish, and that is F-036's
+// DELETED one on a BOUND session was the shape it could not finish, and that is issue #40's
 // site 1. reconcileResidentOwnership already recognises it — a resident session holding a
 // non-zero sequence whose subject is authoritatively empty — and ARMS the ownership
 // marker, because absence IS an ownership fact: only a party that first CLAIMED the record
@@ -25,10 +25,10 @@
 // believed current; a failed recordGenRetirement aborts before any deletion and leaves the
 // record MARKED rather than absent; a landed local write moves sess.seq while an ambiguous
 // one arms seqUncertain; and an apply-time watermark regression can only cause a false
-// NEGATIVE. Absence ALONE is not the licence — that is the inference F-036's site 3 is a
+// NEGATIVE. Absence ALONE is not the licence — that is the inference issue #40's site 3 is a
 // finding about.
 //
-// WHY THE DISPOSAL CANNOT SIMPLY CALL clear(). Since F-036 unit 1 the re-mint requires a
+// WHY THE DISPOSAL CANNOT SIMPLY CALL clear(). Since issue #40 unit 1 the re-mint requires a
 // permit that only a closed, drained tracker over sess.c == nil can mint, so a bound
 // disposal goes through the retirement sequence — close admission, drain the incarnation's
 // owners, capture the Will fence, prepare, PROVE, detach, mint, destroy — and the proof
@@ -39,7 +39,7 @@
 // disconnect state untouched. The marker stays armed and a later pass asks again.
 //
 // THE WILL IS NOT SUPPRESSED. A retirement watermark proves a TEARDOWN, not a successor
-// connection, so the disposal is unlicensed (F-084): the remote teardown owned the durable
+// connection, so the disposal is unlicensed (issue #86): the remote teardown owned the durable
 // session retirement, not this broker's TCP connection or its connection-local Will.
 // Suppressing it here would report a takeover no record shape can demonstrate.
 //
@@ -49,7 +49,7 @@
 // until it sends traffic — which then drives the pre-dispatch settlement as before.
 //
 // See docs/ARCHITECTURE.md, "The incarnation completion lease" and "The
-// generation-retirement watermark", and docs/findings/ha-arbitration.md F-036.
+// generation-retirement watermark", and https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
 
 package mqtt
 
@@ -269,7 +269,7 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 			}
 		}
 		// Unlicensed: a watermark proves a teardown, never a successor, so the Will is
-		// discharged or consumed rather than discarded (F-084).
+		// discharged or consumed rather than discarded (issue #86).
 		d.applyWill(sess, as)
 		// Set AFTER the call, so a death inside it leaves the backstop armed.
 		willDone = true

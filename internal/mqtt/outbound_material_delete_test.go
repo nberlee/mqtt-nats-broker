@@ -376,7 +376,7 @@ func TestF105AnAnnouncementIsCheckedAtTheBoundaryToo(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 	testF105Materialize(t, e, 2)
 	testF105SealManifest(t, e, 2)
-	// THE OWNER IS PLANTED SEALED. Since F-105 7c the operations close a copy before they seal its
+	// THE OWNER IS PLANTED SEALED. Since issue #107 7c the operations close a copy before they seal its
 	// owner, so a deletion authorized over a READY copy is a state no operation produces: the
 	// boundary's own refusal below is what this reaches.
 	{

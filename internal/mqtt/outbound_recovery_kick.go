@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// The prompt drive of a discarded generation's recovery (F-105 7d).
+// The prompt drive of a discarded generation's recovery (issue #107 7d).
 //
 // A teardown hands its source, drain and PUBREL consumers to the generation's recovery root
 // instead of deleting them. The periodic recovery pass would retire them — eventually, at its own

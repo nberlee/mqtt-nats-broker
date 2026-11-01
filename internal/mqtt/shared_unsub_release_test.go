@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// F-083, and the shared-group lifecycle transfer. An UNSUBSCRIBE owes the same TWO different
+// issue #85, and the shared-group lifecycle transfer. An UNSUBSCRIBE owes the same TWO different
 // releases a failed shared SUBSCRIBE does, decided by two different instruments.
 //
 // Whether the GROUP consumer goes is the group record's arbitrated holder count, moved by the
@@ -15,7 +15,7 @@ import (
 // never license a local release: THIS session still reaches the durable through another of its
 // own keys.
 //
-// Two things make this caller different from F-082's, and both are re-derived here rather
+// Two things make this caller different from issue #84's, and both are re-derived here rather
 // than assumed:
 //
 //   - the COMMIT half runs after sess.update has already removed the filters from sharedSubs,
@@ -368,7 +368,7 @@ func TestUnsubStagesTheNoConsDurableFully(t *testing.T) {
 		// The VERDICT is what the void records for a transmitted registration, and the
 		// returned list alone does not prove it was written: voidRegistrationsLocked
 		// deliberately leaves cpending and the identifier alone here — the reap frees those,
-		// and since F-034 it may decline to. So the durable state is the oracle.
+		// and since issue #38 it may decline to. So the durable state is the oracle.
 		sess := x.e.sess
 		sess.mu.Lock()
 		_, voidedDurably := sess.voidedRegNonces[nonce]
@@ -527,7 +527,7 @@ func TestUnsubDischargesLocalStateWithoutACons(t *testing.T) {
 	x.assertConsumer(t, target.durable, true)
 }
 
-// TestSubscribeRollbackKeepsAnOverlappingOwnMembership is T8, the FOURTH site (F-083's D-d),
+// TestSubscribeRollbackKeepsAnOverlappingOwnMembership is T8, the FOURTH site (issue #85's D-d),
 // and it drives rollbackSubscribePacket itself so BOTH halves are exercised: the staging
 // barrier/void inline in that function, and the release in finishSubscribeRollback.
 //

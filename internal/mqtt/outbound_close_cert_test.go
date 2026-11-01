@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// F-105 8c: a closure certificate that outlives its process, and the clearance it licenses.
+// issue #107 8c: a closure certificate that outlives its process, and the clearance it licenses.
 //
 // None of these tests is parallel: the persistence observer is process-wide, because the
 // persister runs in its own goroutine with no account in reach.

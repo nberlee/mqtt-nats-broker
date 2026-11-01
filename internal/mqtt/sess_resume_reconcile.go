@@ -41,7 +41,7 @@
 //	          this phase runs BEFORE processSubs, so no general
 //	          subscription-processing write can observe a half-committed
 //	          replacement. Note what that does NOT say — processSubs itself is
-//	          also pre-CONNACK (F-050 moved restoration there), so a later
+//	          also pre-CONNACK (issue #54 moved restoration there), so a later
 //	          pre-CONNACK write can and does observe state it provisioned.
 //
 // Every phase-installed subscription carries a phase-owned marker and stays
@@ -97,7 +97,7 @@ const (
 	// was released, or sat at or below our base, none of which establishes another
 	// owner. The disposal's own claim is unchanged and still comes from the
 	// vocabulary; the CLIENT is told only that ownership could not be confirmed.
-	// See F-084 for the claim the vocabulary itself still over-states.
+	// See issue #86 for the claim the vocabulary itself still over-states.
 	mqttPreConnackDisposingNonForked
 	// mqttPreConnackDisposingForked: the authoritative body has a non-empty,
 	// distinct identity and claims the same parent as our acknowledged record.
@@ -194,7 +194,7 @@ const (
 	mqttRepairSaveLanded mqttRepairSaveVerdict = iota
 	// mqttRepairSaveForeign: the record moved to content that is not our write, or is
 	// gone. Deliberately NOT "another owner is authoritative": that is the inference
-	// F-084 rejects, and this arm is also reached by a gone, unreadable, undecodable or
+	// issue #86 rejects, and this arm is also reached by a gone, unreadable, undecodable or
 	// below-base record, none of which establishes a successor. What IS established is
 	// that our write did not land and this CONNECT cannot proceed.
 	mqttRepairSaveForeign
@@ -226,7 +226,7 @@ const (
 	// mqttRecordAttemptGone: the record is absent. A write of ours cannot have landed
 	// and then vanished on its own, so SOMETHING released this session — a teardown, an
 	// expiry, an operator. Which, and whether anyone succeeded us, is exactly what an
-	// absence cannot say (F-084).
+	// absence cannot say (issue #86).
 	mqttRecordAttemptGone
 	// mqttRecordAttemptAtBase: the record is still exactly the one we CAS'd against.
 	// This is CONTENTION, never ownership — JetStream returns 10164 while a write for
@@ -287,7 +287,7 @@ const (
 	mqttRejectionOurs
 	// mqttRejectionForeign: the probe definitively did not land and the record is not
 	// this attempt's. That is ALL it establishes — the subject moved past our base, and
-	// nothing about who moved it (F-084).
+	// nothing about who moved it (issue #86).
 	mqttRejectionForeign
 	// mqttRejectionUnresolved: the probe's own outcome is unknown. The uncertainty
 	// machinery owns the session until a readback classifies it.
@@ -339,7 +339,7 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 		// client whose session is resident.
 		//
 		// That reasoning establishes the record is not OURS. It does not establish
-		// that it SUCCEEDS ours — and since F-084 the foreign verdict no longer claims
+		// that it SUCCEEDS ours — and since issue #86 the foreign verdict no longer claims
 		// that either, which is why this test decides the MINT rather than the claim:
 		// an UNCONDITIONAL foreign write can erase us off our own base
 		// without succeeding us, and no CAS excludes one (the same-base boundary,
@@ -464,8 +464,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	//
 	// Plain filters only: shared subscriptions live in sharedSubs, and their group
 	// durables are verified by their own machinery — the two batched passes the CONNECT
-	// restore runs around processSubs (shared_group_verify.go, F-076). That comment used
-	// to name a mechanism that did not exist, which is the gap F-076 closed.
+	// restore runs around processSubs (shared_group_verify.go, issue #78). That comment used
+	// to name a mechanism that did not exist, which is the gap issue #78 closed.
 	//
 	// Drained sids are not in cons (stageDrain removed them). Their filters are absent
 	// from subs when an UNSUBSCRIBE drained them, and present AT QoS 0 when a downgrade
@@ -519,7 +519,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	mintedInbox := make(map[string]bool)
 	var created []*ConsumerConfig
 	// createdClaims names the claim behind each created durable: the undo disposes of exactly
-	// that incarnation, under the entitlement it was claimed with (F-105 7c-lc).
+	// that incarnation, under the entitlement it was claimed with (issue #107 7c-lc).
 	createdClaims := map[string]*mqttSourceClaim{}
 	type replacedCons struct {
 		sid    string
@@ -571,7 +571,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// authoritatively absent durable is PERMANENTLY retired and never re-added:
 	// consCharged holds only what this process charged for live consumers.
 	// Each created durable is refunded exactly once and its claimed incarnation disposed of
-	// (F-105 7c-lc: the retirement owner deletes it, never this undo). Safe after the
+	// (issue #107 7c-lc: the retirement owner deletes it, never this undo). Safe after the
 	// connection has closed too (the uncertain continuation runs it from a
 	// resolver): processUnsub on a closed client is a no-op.
 	undo := func() {
@@ -579,7 +579,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 			unsubscribePhase(deliver, mintedInbox[deliver])
 		}
 		// A CREATED durable is not deleted raw: its claimed incarnation is disposed of and the
-		// retirement owner retires it, its name with it (F-105 7c-lc).
+		// retirement owner retires it, its name with it (issue #107 7c-lc).
 		for _, cc := range created {
 			sess.mu.Lock()
 			sess.refundConsumerChargeLocked(cc.Durable)
@@ -756,7 +756,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		}
 		sess.mu.Unlock()
 
-		// CLAIM THE FRESH NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11/12). A repaired
+		// CLAIM THE FRESH NAME BEFORE THE CREATE (issue #107 §5.1, Codex consult 11/12). A repaired
 		// source consumer is minted under a fresh physical name, so it is an ENROLLED resource
 		// exactly like a first-subscribe source: admission validates LIVE ownership owned by the
 		// serving generation, so a repaired durable created without its ownership record would be
@@ -765,7 +765,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		// create. See outbound_ops.go opProvisionResource.
 		//
 		// UNDER THIS CONNECTION'S ENTITLEMENT, never under whatever authority stands when the claim
-		// reads it (F-105 7f): a claim a takeover's successor would own is not this connection's to
+		// reads it (issue #107 7f): a claim a takeover's successor would own is not this connection's to
 		// make, and opProvisionResource refuses an entitlement that moved.
 		repairEnt, entOK := c.outboundEntitlement()
 		if !entOK {
@@ -801,7 +801,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		}
 		fg.release()
 		if perr != nil {
-			// The claim may have landed: its handles go to arbitration (F-105 7c-lc).
+			// The claim may have landed: its handles go to arbitration (issue #107 7c-lc).
 			sess.custodyFailedClaim(repairClaim)
 			undo()
 			return mqttResumeReconcileResult{outcome: mqttPreConnackLocal,
@@ -826,7 +826,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
 			},
 		}
-		// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3): the repaired source is
+		// SAFE INACTIVITY CONFIG FROM THE OUTSET (issue #107 §5.1 step 3): the repaired source is
 		// enrolled, so it is created with NO inactivity threshold — its lifetime is its resource's.
 		// The definitive effective-config verify is at admission.
 		mqttClearConsumerInactivity(&ccr.Config)
@@ -842,7 +842,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		}
 		if cerr != nil {
 			// The claim landed and the create may yet: disposed of BEFORE any bookkeeping, so the
-			// created list's ordering never decides it (F-105 7c-lc, P-1 f2).
+			// created list's ordering never decides it (issue #107 7c-lc, P-1 f2).
 			sess.handSourceDisposal(repairClaim.gen, repairClaim.name, repairClaim.inc,
 				mqttDisposalRepairUndone, repairClaim.ent, "repair-create-failed")
 			undo()
@@ -899,7 +899,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	cs := sess.classifyGatedRecordSave(tok)
 	switch cs.outcome {
 	case mqttPreConnackProceed:
-		// THE REPAIR DECIDED ITS PREDECESSORS (F-105 7f). Once the confirmed save names the
+		// THE REPAIR DECIDED ITS PREDECESSORS (issue #107 7f). Once the confirmed save names the
 		// replacement, the durable it replaced is no subscription's again: the decision is this
 		// connection's, recorded under its entitlement like every route that ends a consumer, and
 		// handed to the retirement owner. An unresolved save decides nothing here; whichever record
@@ -965,8 +965,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 //
 // proveSharedMembershipOwnership deliberately keeps its own copy of this shape.
 // Unifying that third consumer is what let an unclassifiable rejection reach
-// F-078's live-SUBSCRIBE Foreign arm and change WILL DISPOSITION, which is a
-// different question from this one. See F-084.
+// issue #80's live-SUBSCRIBE Foreign arm and change WILL DISPOSITION, which is a
+// different question from this one. See issue #86.
 //
 // tok must be the CALLER'S OWN open transaction. No lock held on entry; performs
 // JetStream requests.
@@ -982,7 +982,7 @@ func (sess *mqttSession) classifyGatedRecordSave(tok recordTx) mqttClassifiedPre
 	// Definite. The CAS kinds are deliberately not equivalent: 10071 (the
 	// single-writer check) means THE SUBJECT MOVED after our accept save — not that
 	// another broker owns the session, which is a stronger claim the readback below
-	// often cannot support (F-084); 10164 signals clustered contention, not a lost
+	// often cannot support (issue #86); 10164 signals clustered contention, not a lost
 	// race, and gets the bounded re-read/retry treatment.
 	switch {
 	case IsNatsErr(detail.rawErr, JSStreamWrongLastSequenceErrF):
@@ -994,7 +994,7 @@ func (sess *mqttSession) classifyGatedRecordSave(tok recordTx) mqttClassifiedPre
 		//
 		// The outcome is keyed on the fork BIT the classification returned, never on the
 		// vocabulary's reason code: both 0x89 vocabularies share that code, so a code
-		// comparison would route an unsettled record to the forked outcome. F-084.
+		// comparison would route an unsettled record to the forked outcome. issue #86.
 		voc, forked := sess.disposalForDirectRejection(&detail)
 		out := mqttPreConnackDisposingNonForked
 		if forked {
@@ -1074,7 +1074,7 @@ func mqttVerifyConsumersBatched(durables []string, bound int,
 //
 //	readSeq == base                  -> nothing moved; retry the SAME bytes
 //	readSeq  > base && digest match  -> our write landed, response lost; adopt
-//	anything else (incl. gone)       -> not ours; refuse (NOT "another owner", F-084)
+//	anything else (incl. gone)       -> not ours; refuse (NOT "another owner", issue #86)
 //	the re-read/retry unclassifiable -> establish the pending-write state and
 //	                                    let the readback machinery decide later
 //
@@ -1173,7 +1173,7 @@ func (sess *mqttSession) resolveContendedRecordSave(d *mqttSessSaveDetail) mqttR
 	// Retries exhausted. The last rejection was never classified — a CAS
 	// rejection says the subject moved, not who moved it — so read once more
 	// rather than assuming the contention was ours to lose: a 10071 on the final
-	// attempt means the subject moved past our base (who moved it is F-084's
+	// attempt means the subject moved past our base (who moved it is issue #86's
 	// question), and returning local-definite there would undo our work while
 	// leaving a session we no
 	// longer own mapped and bound.
@@ -1346,7 +1346,7 @@ const (
 	// override. No refusal is possible and the client has already been told
 	// nothing further, so putting the old terms back on a definite failure would
 	// silently ignore the client's instruction -- which is the Spec5
-	// [3.1.2.11.2] violation F-041 exists to fix. The terms STAND and only the
+	// [3.1.2.11.2] violation issue #45 exists to fix. The terms STAND and only the
 	// durable backstop is lost.
 	mqttLifetimeFinal
 )
@@ -1390,7 +1390,7 @@ func (sess *mqttSession) applyRequestedLifetime(tok recordTx, expiry uint32,
 		// action was never built against the confirmed terms in the first place --
 		// and retargeting would rewrite a correct value with the same value. Left
 		// unguarded it would also falsify the claim that this helper's retarget
-		// keeps only its CONNECT caller. F-041.
+		// keeps only its CONNECT caller. issue #45.
 		if finality == mqttLifetimeSpeculative {
 			sess.retargetDeferredLifetime(priorDeferred, expiry)
 		}

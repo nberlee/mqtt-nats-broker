@@ -23,7 +23,7 @@ import (
 // reclassification — the three sites that share one classification of "is this delivery
 // still owed to the client under [MQTT-3.10.4-3]?".
 //
-// What licenses the floor is F-072's durable discriminator: a possibly-attempted entry may
+// What licenses the floor is issue #76's durable discriminator: a possibly-attempted entry may
 // have reached the client, so the delivery is owed, while a proven-unsent one demonstrably
 // was not. Without it a post-adoption delivery is acked away on the next resume AND its
 // identifier is held for the life of the session with no delivery that could discharge it.

@@ -43,7 +43,7 @@ func testReconcileSubscribe(t testing.TB, o *Options, cid, filter string, qos by
 //
 // Callers asserting on a just-completed CONNECT must fence first
 // (testMQTTFlush). Not because restoration follows the CONNACK — it precedes it
-// (F-050) — but because the CONNACK's arrival at the client says nothing about
+// (issue #54) — but because the CONNACK's arrival at the client says nothing about
 // the tail of the resume the broker is still running behind it, so reading the
 // session the instant it lands samples work in progress.
 func testReconcileConsDur(t testing.TB, s *Server, cid, sid string) string {
@@ -664,7 +664,7 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 // consumers requesting 0, so the broker's own opt-out does not protect them.
 // TestMQTTReconcileStreamForcedThresholdRefusesAdmission: a stream-level
 // ConsumerLimits.InactiveThreshold is the unsupported deployment config of
-// docs/CONFORMANCE.md's supported-config boundary. Under the F-105 cutover an
+// docs/CONFORMANCE.md's supported-config boundary. Under the issue #107 cutover an
 // ordinary QoS 1/2 delivery is admitted through the outbound obligation authority,
 // and admission proves the source READY for use first (readyForUse
 // -> the stream read). A stream-forced threshold reaches a consumer requesting
@@ -926,7 +926,7 @@ func TestMQTTReconcileInterestHeldBeforeLookup(t *testing.T) {
 	}
 	// The interest held the consumer through the resume — M14 — so the SAME durable survives.
 	// DELIVERY on it, however, is now refused at ADMISSION under the stream-forced threshold
-	// (the supported-config boundary, F-105 step 5): admission proves the source ready for use
+	// (the supported-config boundary, issue #107 step 5): admission proves the source ready for use
 	// first, streamInactivitySafe fails, and the message stays with JetStream rather than going
 	// out onto a consumer the stream timer could still reap. The M14 ordering keeps the consumer
 	// nameable for the eventual supported config; it does not license a delivery onto a reapable
@@ -1229,7 +1229,7 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 // only Origin and keeps our WID and PWID, so nothing establishes a successor: it is
 // the DisposingNonForked case, and the refusal says only that ownership could not be
 // confirmed. Reading a 10071 as proof another broker owns the record is the inference
-// F-084 exists to fix.
+// issue #86 exists to fix.
 //
 // M9 is pinned by IMMEDIATE-state assertions on a finite-expiry session, not by
 // the reconnect (a bare-removeSession mutant's next reconnect also succeeds by
@@ -1240,7 +1240,7 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 //
 // The phase's replacement consumer is LIVE and decided by nobody: the disposing arm
 // hands nothing to retirement, because the record is not this object's. The orphan
-// sweep must leave it alone (it deletes only a RETIRED name, F-105 §5.1 point 5), and
+// sweep must leave it alone (it deletes only a RETIRED name, issue #107 §5.1 point 5), and
 // what reclaims it is the next ACCEPTED tenure's settlement, which finds it provisioned
 // under another tenure and named by nothing and decides it tenure-superseded. So its
 // reclamation depends on a successor being accepted, not on any sweep.
@@ -1469,7 +1469,7 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	})
 	defer restoreResult()
 	defer mqttTestSessStoreSuppressV.Store(false)
-	// The CONNECT's accept save IS the outbound-ownership metadata commit (F-105 cutover), which
+	// The CONNECT's accept save IS the outbound-ownership metadata commit (issue #107 cutover), which
 	// commits through commitMetadataAttempt rather than storeSessionMsg, so the store-result hook
 	// above never sees it — it now sees only the repair save. Its landed record sequence is
 	// observed on the ownership seam instead (the ACKED phase carries the session record's
@@ -1589,7 +1589,7 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	// there is nothing else to write and nothing to put back.
 	//
 	// Counted in $MQTT_sess sequences. The CONNECT's accept save IS the outbound-ownership
-	// metadata commit (F-105 cutover), so it consumes mqttAcceptOwnershipBatchSize of them: the
+	// metadata commit (issue #107 cutover), so it consumes mqttAcceptOwnershipBatchSize of them: the
 	// permanent acceptance fact, the COMMITTED ownership receipt, and the session record, one
 	// atomic batch.
 	if recSeqAfter != recSeqBefore+mqttAcceptOwnershipBatchSize {
@@ -1836,7 +1836,7 @@ func TestMQTTReconcileAmbiguousRepairSaveIsSettledForward(t *testing.T) {
 // M8a (send the disposal vocabulary's Reason String instead of the projection) fails
 // the non-forked disposing rows, which is the whole point of the projection: that
 // vocabulary would tell this client "session taken over by a new connection" on
-// evidence that established no such thing (F-084).
+// evidence that established no such thing (issue #86).
 func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 	const willTopic = "will/t13"
 
@@ -2104,7 +2104,7 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 			// purpose.
 			//
 			// It would be FALSE to generalise that to "no pre-CONNACK write can produce a
-			// delta": processSubs runs BEFORE the CONNACK (F-050 moved it there), so a resume
+			// delta": processSubs runs BEFORE the CONNACK (issue #54 moved it there), so a resume
 			// restoring a QoS 2 or shared filter DOES provision grant-tracked state that a
 			// later pre-CONNACK save confirms. That route, and the caller-side double-mint
 			// mutation it makes detectable, is covered by
@@ -2165,16 +2165,16 @@ func TestMQTTReconcileRefusalDisciplineWithWill(t *testing.T) {
 // ---------------------------------------------------------------------------
 //
 // These two tests were deleted by accident while re-aiming the two neighbouring
-// fixtures for F-050, by a block replacement that swallowed them. Neither has
-// anything to do with F-050: the first pins the still-live 3.1.1 forced-leave
-// save-failure exit, which F-050 explicitly leaves out of scope, and the second
-// pins the stale-unmatched-Cons residual, which F-050 does not retire. Restored
+// fixtures for issue #54, by a block replacement that swallowed them. Neither has
+// anything to do with issue #54: the first pins the still-live 3.1.1 forced-leave
+// save-failure exit, which issue #54 explicitly leaves out of scope, and the second
+// pins the stale-unmatched-Cons residual, which issue #54 does not retire. Restored
 // verbatim from the commit the change was written against.
 
 // A post-CONNACK failure exit — the 3.1.1 forced-leave save failure — leaves the
 // deferred fallback to reclaim the phase's subscriptions, and the session
 // resumable. "Post-CONNACK" is about the forced leave's own position, not about
-// processSubs: restoration runs BEFORE the CONNACK (F-050), so what this exit
+// processSubs: restoration runs BEFORE the CONNACK (issue #54), so what this exit
 // misses is the sweep that follows processSubs, which is why the deferred
 // fallback is the thing that has to reclaim.
 func TestMQTTReconcileForcedLeaveFailureFallback(t *testing.T) {
@@ -2331,7 +2331,7 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 // the exhausted MaxAckPending budget after the PUBREL durable was reaped), so the
 // CONNECT is REFUSED under the pre-CONNACK abort discipline, and now with a reason.
 //
-// **This test was re-aimed by F-050.** It used to assert the opposite disposition:
+// **This test was re-aimed by issue #54.** It used to assert the opposite disposition:
 // the CONNECT was ACCEPTED with Session Present, the post-processSubs sweep removed
 // the phase's closed subscription, and the filter stayed silently dead until the
 // next CONNECT while the client held a connection that delivered nothing. That was
@@ -2344,7 +2344,7 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 // What this test no longer covers, deliberately: "a live re-SUBSCRIBE cannot
 // recover a skipped filter". There is no live connection to re-SUBSCRIBE on any
 // more. The neighbouring residual it shared that assertion with — a live
-// re-SUBSCRIBE matching a stale unmatched Cons entry — is untouched by F-050 and
+// re-SUBSCRIBE matching a stale unmatched Cons entry — is untouched by issue #54 and
 // keeps its own statement in docs/CONFORMANCE.md.
 func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
 	t.Parallel()
@@ -2901,7 +2901,7 @@ func TestMQTTReconcileUncertainRefusalStillRestoresLifetime(t *testing.T) {
 // Review finding: every CAS rejection inside the retry loop continued, and the
 // loop then returned local-definite without ever classifying the last one — so a
 // 10071 on the final attempt (the subject moved past our base; who moved it is
-// F-084's question) undid our
+// issue #86's question) undid our
 // work and left a session we no longer own mapped and bound.
 //
 // Mutation check: return mqttRepairSaveLocalDefinite at the end of the loop
@@ -2988,7 +2988,7 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 
 	// Disposing, not local: a session this broker can no longer confirm it owns is
 	// evicted rather than left mapped as ours. (What the record establishes about WHO
-	// owns it is F-084's question; the eviction does not depend on answering it.)
+	// owns it is issue #86's question; the eviction does not depend on answering it.)
 	asm.mu.RLock()
 	_, resident := asm.sessions[cid]
 	asm.mu.RUnlock()
@@ -3006,7 +3006,7 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 // its eventual redelivery reaches the client marked DUP on first sight —
 // contradicting [MQTT-3.3.1-1].
 //
-// **Re-aimed by F-050**, which moved that property from the swept-but-accepted
+// **Re-aimed by issue #54**, which moved that property from the swept-but-accepted
 // connection to the REFUSED one. The lever is unchanged (a PUBREL setup the budget
 // cannot complete), but it now refuses the resume instead of accepting it and
 // leaving the filter dead, so the delivery is woken by the refusal's abandon rather

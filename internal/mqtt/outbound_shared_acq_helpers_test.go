@@ -23,7 +23,7 @@ import "testing"
 func (e *testInflightEnv) joinSharedForTest(t *testing.T, key, group, subject string, up bool) mqttSharedAcqRef {
 	t.Helper()
 	// A unit env never accepted a CONNECT, so it installs a well-formed tenure the way every
-	// acceptance does before its first join (F-105 8b).
+	// acceptance does before its first join (issue #107 8b).
 	testInstallFixtureTenure(t, e.sess)
 	acq, out, err := e.sess.acquireShared(e.c, group, subject, 1024)
 	if err != nil || out != mqttSharedAcquired {

@@ -5,7 +5,7 @@
 // acting on — the staging void walked the membership keys while the commit's purge walked
 // `es.cons` — so a record-restored session, which has membership WITHOUT configs, had its
 // group durables released while its pending state was left holding packet identifiers and
-// Receive Maximum slots for the rest of the connection. That is F-045's forced-leave instance.
+// Receive Maximum slots for the rest of the connection. That is issue #49's forced-leave instance.
 //
 // The unit under test is `sharedPendingDurablesLocked`, the derivation both halves now share.
 // The end-to-end arms of the same change (which save outcome refuses, which continues, and the
@@ -23,7 +23,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// TestForcedLeavePendingDerivationSeesMembershipOnlyDurable is the F-045 population: a
+// TestForcedLeavePendingDerivationSeesMembershipOnlyDurable is the issue #49 population: a
 // record-restored session. Shared consumer configs are never persisted
 // (buildPersistedSessionLocked excludes them and only processSubs rebuilds them), while
 // recoverInflightRegisters HAS rebuilt the pending entries under the deterministic group
@@ -420,9 +420,9 @@ func TestVoidVerdictsDurableIgnoresRetirement(t *testing.T) {
 //
 //   - a membership with NO config — every record-restored resume, since shared configs are not
 //     persisted and only processSubs rebuilds them. The `cons` half is blind to it.
-//   - a config no surviving key names — the shape F-083 documents. The membership half is
+//   - a config no surviving key names — the shape issue #85 documents. The membership half is
 //     blind to it. This fixture is a SYNTHETIC BACKSTOP: the SUBSCRIBE rollback used to be
-//     its production producer and no longer is (F-039 restores the membership beside cons).
+//     its production producer and no longer is (issue #43 restores the membership beside cons).
 //     The population it seeds is not shown to be reachable by another production route at
 //     this operation's boundary, so the provenance is stated as synthetic rather than
 //     replaced with a route this test does not establish. The assertion stays: the union's

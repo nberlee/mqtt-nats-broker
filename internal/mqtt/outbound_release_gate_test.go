@@ -27,7 +27,7 @@ func testF105ReleaseFacts() mqttAdoptedReleaseFacts {
 		Ledger:       testF105SealedLedger(10),
 		RootEnrolled: true,
 		// POSITIVELY ESTABLISHED. The zero value is UNKNOWN and blocks, so a fixture that left
-		// it out would be testing the unknown rule in every case. DISCARDING since F-105 7d: a
+		// it out would be testing the unknown rule in every case. DISCARDING since issue #107 7d: a
 		// reachable root is recovery ownership only where an implemented executor owns what it
 		// leads to, and a preserving root without a certificate is refused
 		// (TestF105ReleaseGateRootArmNeedsADiscard).
@@ -215,7 +215,7 @@ func TestF105ReleaseGateIsVacuousForAnUnconvertedGeneration(t *testing.T) {
 // makes, which is a different thing from the verdict the tests above pin.
 //
 // It exists because the first wiring passed the BROKER'S RUN ID where the account's recovery
-// epoch belongs. Every F-105 record is stamped with the $MQTT_sess incarnation identity, and a
+// epoch belongs. Every issue #107 record is stamped with the $MQTT_sess incarnation identity, and a
 // record read under the wrong epoch is refused as unattributable — so that bug would have turned
 // every fact into an error rather than an answer, and gatherAdoptedReleaseFacts would have failed
 // the teardown instead of clearing it. Nothing caught it, because the gate is vacuous today
@@ -453,7 +453,7 @@ func TestF105TheDiscardDispositionIsReadFromTheClosure(t *testing.T) {
 // TestF105OnlyTheKindsThatAreAboutMembersMayCarryThem is consult 9's constraint 4.
 //
 // Five transition kinds enumerated what they may carry; five said NOTHING, so close-admission,
-// finalize, finalize-creation, prepare-intent and cancel-intent could carry any F-105 class the
+// finalize, finalize-creation, prepare-intent and cancel-intent could carry any issue #107 class the
 // generic member check allowed. That is a write no rule about those kinds has ever looked at —
 // and the two that write a PERMANENT closure record are the worst of them, because a resource or
 // an obligation riding on a closure lands in a generation that is ending.

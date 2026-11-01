@@ -25,7 +25,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// T36's LIFECYCLE rows (F-088 plan rev 20, consult C6 rows 1-17): every cancellation runs
+// T36's LIFECYCLE rows (issue #90 plan rev 20, consult C6 rows 1-17): every cancellation runs
 // through the production securing path (secureRegCancellationsClassified) inside its packet's
 // record transaction, with HEAD's verdict lifecycle unchanged — the early forgetVoidedReg after
 // the fence lands included; assertions are on durable state read back from the store, the custody
@@ -302,7 +302,7 @@ func t36Row02FenceWins(t *testing.T) {
 			if testCustodyHasAdmission(f.e.sess, f.nonce) {
 				t.Fatal("the refused admission must settle never-landed")
 			}
-			// F-119: the cancelling ladder's own disposal is refused while that ladder runs (its
+			// issue #121: the cancelling ladder's own disposal is refused while that ladder runs (its
 			// custody admission's ladder has not returned), so the fence OUTLIVES the admission ...
 			if ok, seq := f.fenceStands(t); !ok || seq != fseq {
 				t.Fatalf("the fence must outlive the live ladder at %d, stands=%v seq=%d", fseq, ok, seq)
@@ -947,12 +947,12 @@ func t36Row16UncancelledAdmission(t *testing.T) {
 	}
 }
 
-// Row 17 (F-119's schedule, through the production path): the cancellation's fence lands; the
+// Row 17 (issue #121's schedule, through the production path): the cancellation's fence lands; the
 // admission's next attempt reads the authority AFTER it and is held unsent and unsettled; the
 // cancelling ladder's own disposal is refused while it runs; once it has returned the fence is
 // disposed of through the one door, behind its authority advance; the held batch then reaches the
 // store and is REFUSED; the process stops. A cold resume with no surviving verdict finds nothing of
-// the cancelled allocation to restore. (Before F-119 this row injected the late landing with a FRESH
+// the cancelled allocation to restore. (Before issue #121 this row injected the late landing with a FRESH
 // authority read after the disposal and recorded it restored acting; that injection never witnessed
 // a previously prepared batch.)
 func t36Row17CrashAfterDisposalNoVerdict(t *testing.T) {

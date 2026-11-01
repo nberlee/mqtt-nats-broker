@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// F-041: a v5 DISCONNECT may replace the Session Expiry Interval (Spec5
+// issue #45: a v5 DISCONNECT may replace the Session Expiry Interval (Spec5
 // [3.14.2.2.2]), and until this change that replacement reached memory only.
 // Two defects followed from one cause, in OPPOSITE directions, which is why
 // nothing here is conditioned on the override being zero:
@@ -599,7 +599,7 @@ func TestMQTTv5DisconnectRaiseToNeverExpireStampsInMemory(t *testing.T) {
 	}
 }
 
-// F-040: a reconnect racing its own DISCONNECT's close. A v5 client ends its session
+// issue #44: a reconnect racing its own DISCONNECT's close. A v5 client ends its session
 // with DISCONNECT (Session Expiry Interval 0) and reconnects; if the reconnect takes the
 // ownership gate before the old connection's close does, the close later finds the
 // session rebound and does nothing, so the takeover is the only party that can honor

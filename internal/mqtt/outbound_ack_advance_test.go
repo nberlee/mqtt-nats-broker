@@ -547,7 +547,7 @@ func TestF105AckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
 				qos = 1
 			}
 			// The exchange-less ordinary register, deliberately, planted ALONE: e.track admits an
-			// ordinary obligation beside its exchange (F-105 7b), which is not this test's shape.
+			// ordinary obligation beside its exchange (issue #107 7b), which is not this test's shape.
 			e.sess.mu.Lock()
 			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 41, 1))
 			e.sess.mu.Unlock()

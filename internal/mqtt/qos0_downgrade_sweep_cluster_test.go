@@ -25,7 +25,7 @@ import (
 // record WRITES. So between the confirmed save and the teardown, a PEER broker sees a durable
 // named by neither its own residents nor the record.
 //
-// Since F-105 (§5.1 point 5) what licenses the sweep's delete is the durable name's RETIRED
+// Since issue #107 (§5.1 point 5) what licenses the sweep's delete is the durable name's RETIRED
 // ownership, never the absence of a reference, and the two arms are two halves of that rule:
 //
 //   - The RELEASED arm: inside the window the name is still LIVE — the packet has decided
@@ -33,7 +33,7 @@ import (
 //     disposal decision and the retirement owner retires the name and deletes the durable
 //     (the executor route). A delayed CREATE that resurrects it afterwards is an orphan
 //     under a RETIRED name, which the peer reaps in the same pass that withholds an
-//     MQTT-shaped durable no ownership record claims. Before F-105 the peer deleted the
+//     MQTT-shaped durable no ownership record claims. Before issue #107 the peer deleted the
 //     durable early, on absence alone; that premise is gone.
 //   - The ADOPTED arm: the same peer sweep must NOT delete a durable an adoption has moved
 //     into sess.cons while the membership is still at the pre-packet QoS 0. That durable
@@ -290,7 +290,7 @@ func TestMQTTQoS0DowngradeSweepReplicated(t *testing.T) {
 // separate top-level test because it stops a broker, which inside the previous test's
 // cluster would break its other arm.
 //
-// Since F-105 the peer's sweep is NOT the convergence point: on this route nothing decided
+// Since issue #107 the peer's sweep is NOT the convergence point: on this route nothing decided
 // the consumer's end, so its name stands LIVE and every peer pass WITHHOLDS it (a reference's
 // absence never licenses a delete; only a RETIRED name does). What converges it is the
 // session's next ACCEPTED tenure (outbound_tenure_settle.go): the client reconnects — here to

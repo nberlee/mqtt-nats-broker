@@ -15,7 +15,7 @@ package mqtt
 
 import "fmt"
 
-// Two validated tagged unions (F-105, row 7; design D4).
+// Two validated tagged unions (issue #107, row 7; design D4).
 //
 // # Why the source shape has to become one
 //

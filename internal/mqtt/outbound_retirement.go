@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// Resource retirement (F-105).
+// Resource retirement (issue #107).
 //
 // THE DEFECT THIS CLOSES, stated plainly: today a teardown deletes the ordinary source
 // consumers and then the PUBREL consumer, and `$MQTT_out` is interest-retained, so deleting
@@ -93,7 +93,7 @@ func mqttValidResourceKind(k mqttResourceKind) bool {
 }
 
 // mqttResourceLogicalUseKind reports whether a resource kind is arbitrated by the LOGICAL-USE
-// fence rather than by a provisioning SEAL (F-105 cutover, consult 4).
+// fence rather than by a provisioning SEAL (issue #107 cutover, consult 4).
 //
 // A source or PUBREL consumer's physical CONSUMER.CREATE is a queued request the broker can
 // neither fence nor retract, so it cannot honestly produce mqttProvisioningSealed's promise
@@ -131,7 +131,7 @@ func mqttValidProvisioningState(s mqttProvisioningState) bool {
 
 // mqttResourceState is where a resource stands in its retirement.
 //
-// From 1, as every F-105 enum is: a missing member must not decode as the permissive value,
+// From 1, as every issue #107 enum is: a missing member must not decode as the permissive value,
 // and here the permissive value would authorize a deletion. mqttProvisioningState above is
 // numbered from 1 for exactly the same reason.
 type mqttResourceState uint8
@@ -201,7 +201,7 @@ const (
 	// STATES of this one role, not two roles — the need is the same need either way.
 	mqttRoleCanonicalPubRel mqttResourceRole = "canonical-pubrel"
 	// mqttRoleRetainedMaterial: a retained exchange needs its payload's material to replay its
-	// PUBLISH (F-105 7c). Released when the exchange can no longer replay: ended, carrying the
+	// PUBLISH (issue #107 7c). Released when the exchange can no longer replay: ended, carrying the
 	// retained abandonment fact, or its generation closed with Discard (mqttCheckResourceStep).
 	mqttRoleRetainedMaterial mqttResourceRole = "retained-material"
 )
@@ -222,7 +222,7 @@ func mqttValidResourceRole(r mqttResourceRole) bool {
 // not a certificate that source settlement, a captured handler's duty or a shared/affine
 // disposition has finished. So an ended exchange could release its source-settlement edge, that
 // edge could be the last one, and a provisioning-sealed resource the unfinished duty still needs
-// became deletable. F-105's own defect, reached through the mechanism built to prevent it.
+// became deletable. issue #107's own defect, reached through the mechanism built to prevent it.
 //
 // The table below is therefore the point of the roles rather than a detail of them.
 type mqttRoleDischargeEvidence uint8
@@ -307,7 +307,7 @@ type mqttOutboundResource struct {
 	// Name is the durable name to act on — a consumer name, a payload manifest id.
 	Name  string            `json:"name"`
 	State mqttResourceState `json:"state"`
-	// Prov is whether this resource's PHYSICAL provisioning is settled (F-105, row 8; D5
+	// Prov is whether this resource's PHYSICAL provisioning is settled (issue #107, row 8; D5
 	// requires it and names it as a precondition of deletion authorization).
 	//
 	// It is not the same fact as State, and conflating them is the defect it exists to
@@ -340,7 +340,7 @@ type mqttOutboundResource struct {
 	// was mqttExchangePhaseEnded, and Terminal is PROTOCOL completion with no outstanding
 	// output: it is not a certificate that source settlement, captured-handler duties and
 	// shared/affine dispositions have finished. So a bare edge released on protocol terminality
-	// frees a resource a settlement duty still needs — F-105's own defect, one level down.
+	// frees a resource a settlement duty still needs — issue #107's own defect, one level down.
 	//
 	// Kept as a list rather than a record class of its own: the properties that matter — an
 	// edge is added only by the admission that creates its exchange, removed only on THAT
@@ -366,7 +366,7 @@ type mqttOutboundResource struct {
 	PubRelDur string `json:"pubrel_dur,omitempty"`
 
 	// Disposal is the positive decision that a logical-use consumer (source, PUBREL) is no longer
-	// serving anything and may be retired once nothing depends on it (F-105 7c-lc). Zero edges is
+	// serving anything and may be retired once nothing depends on it (issue #107 7c-lc). Zero edges is
 	// NOT that decision: an idle subscription between two messages has zero edges too, and
 	// retiring it would end a subscription nobody ended. So a logical-use resource is retired only
 	// with this fact standing, written by the route that decided — an UNSUBSCRIBE, a downgrade, a
@@ -377,7 +377,7 @@ type mqttOutboundResource struct {
 
 	// ProvTenure is the TENURE the logical-use consumer (source, PUBREL) was provisioned under:
 	// the serving entitlement whose claim created this record, proved equal to it at creation
-	// and never changed after (F-105 7f).
+	// and never changed after (issue #107 7f).
 	//
 	// It is what a successor tenure needs to settle a consumer whose deciding route lost its
 	// custody. A generation keeps serving across every resume, each under a fresh tenure, and a
@@ -410,16 +410,16 @@ const (
 	mqttDisposalProvisioningFailed = "provisioning-failed"
 	mqttDisposalRepairUndone       = "repair-undone"
 	// mqttDisposalRepairReplaced is the resume repair's decision about the consumer it replaced: the
-	// durable it found absent (or not serving) is never this subscription's again (F-105 7f).
+	// durable it found absent (or not serving) is never this subscription's again (issue #107 7f).
 	mqttDisposalRepairReplaced = "repair-replaced"
 	// mqttDisposalTenureSuperseded is a SUCCESSOR tenure's decision about a consumer a displaced
-	// tenure provisioned and nothing the successor holds names (F-105 7f). Licensed at the boundary
+	// tenure provisioned and nothing the successor holds names (issue #107 7f). Licensed at the boundary
 	// by the provisioning tenure differing from the deciding one, so no tenure can use it against a
 	// consumer it claimed itself.
 	mqttDisposalTenureSuperseded = "tenure-superseded"
 	// mqttDisposalGenerationDiscarded is the one decision no route takes: the generation's
 	// discard itself, recorded by its retirement under the committed discarding closure rather
-	// than an entitlement (F-105 7d). It is the only reason that carries no tenure.
+	// than an entitlement (issue #107 7d). It is the only reason that carries no tenure.
 	mqttDisposalGenerationDiscarded = "generation-discarded"
 )
 
@@ -446,7 +446,7 @@ func mqttValidateResourceDisposal(d *mqttResourceDisposal) error {
 		return fmt.Errorf("the disposal fact carries a malformed generation %q", d.Gen)
 	case d.Reason == mqttDisposalGenerationDiscarded:
 		// TAKEN UNDER NO ENTITLEMENT, so it names none: a tenure here would claim a serving
-		// connection decided what the generation's closure decided (F-105 7d).
+		// connection decided what the generation's closure decided (issue #107 7d).
 		if d.Tenure != _EMPTY_ {
 			return fmt.Errorf("the disposal fact records a generation's discard under tenure %q, but a "+
 				"discard is decided by the closure, not by a connection", d.Tenure)
@@ -573,7 +573,7 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 			return fmt.Errorf("outbound resource %q: %w", r.Inc, err)
 		}
 	}
-	// THE PROVISIONING TENURE BELONGS TO THE LOGICAL-USE KINDS, in both directions (F-105 7f). A
+	// THE PROVISIONING TENURE BELONGS TO THE LOGICAL-USE KINDS, in both directions (issue #107 7f). A
 	// source or PUBREL record without it could never be settled by a successor tenure, and is an
 	// unsupported shape rather than one to infer a tenure for; any other kind carrying it would
 	// claim a settlement nothing performs.
@@ -758,7 +758,7 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 			"authorizable: until nothing further can materialize it, its name is not free",
 			r.Inc, r.Prov)
 	}
-	// AND A LOGICAL-USE KIND IS RETIRED ONLY ON A DISPOSAL DECISION (F-105 7c-lc). Zero edges is
+	// AND A LOGICAL-USE KIND IS RETIRED ONLY ON A DISPOSAL DECISION (issue #107 7c-lc). Zero edges is
 	// also what an idle subscription between messages looks like; retiring it would end a
 	// subscription no route ended. Restated at the boundary for a batch assembled by anything.
 	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil {

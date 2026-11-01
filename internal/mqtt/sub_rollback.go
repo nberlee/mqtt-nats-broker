@@ -217,7 +217,7 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 		// The doomed key is EXCLUDED from the surviving membership: this runs before the
 		// removal below, so sharedSubs still names it, and counting it would make every
 		// closure suppress itself. A durable a REMAINING key still reaches keeps its
-		// delivery and its registrations — the overlapping level-up case. F-082.
+		// delivery and its registrations — the overlapping level-up case. issue #84.
 		surv := sess.survivingSharedLocked(map[string]bool{sid: true})
 		// The ATTEMPTED membership's targets: the acquisitions this packet minted are what
 		// name the incarnations it joined, and the live map still carries them here.
@@ -262,7 +262,7 @@ func (sess *mqttSession) rollbackSharedSub(c *client, tok recordTx, f *mqttFilte
 			// LIVE membership's group consumers, and only the own-hold fence inside it
 			// stands between that and a silently dead subscription. Same rule the early
 			// per-filter save states for its own ambiguous arm: nothing was deferred for
-			// want of proof, so there is no landed continuation to register. F-082.
+			// want of proof, so there is no landed continuation to register. issue #84.
 			if !priorExisted {
 				sess.retainOnLanded(func(rtok recordTx) { sess.releaseFailedSharedFilter(c, rtok, f) })
 			}
@@ -317,13 +317,13 @@ type addedCons struct {
 // It answers the one question about a group consumer that is THIS session's alone — does a
 // membership that SURVIVES this operation still reach it? — and it decides only LOCAL durable
 // state. Whether the consumer itself goes is the group record's arbitrated holder count, moved
-// by the release of each acquisition, which is unconditional (F-082, and the shared-group
+// by the release of each acquisition, which is unconditional (issue #84, and the shared-group
 // lifecycle transfer). Everything a whole-durable release does — the pending purge, the ack-budget
 // refund, the deliver-subject unsubscribe, the delivery barrier — belongs to every key that
 // reaches the durable, so a durable a SURVIVING key still reaches must not be touched.
 //
 // Each operation supplies its OWN set, because the surviving membership is not always the
-// live map (F-083):
+// live map (issue #85):
 //
 //   - an UNSUBSCRIBE's staging half runs BEFORE its removals are applied, so its set is the
 //     live map minus the PACKET's whole doomed set — one packet can leave both overlapping
@@ -413,7 +413,7 @@ func mqttSharedSurvivorsOf(membership map[string]mqttSharedMembership) mqttShare
 // this is what a landed readback resumes.
 //
 // TWO different targets with two different rules, because "this session still reaches the
-// consumer" and "this acquisition is released" are different facts (F-082, and the
+// consumer" and "this acquisition is released" are different facts (issue #84, and the
 // shared-group lifecycle transfer): every removed ACQUISITION gets a release verdict and
 // exactly one execution, unconditionally; the LOCAL durable state is released only when no
 // surviving key reaches the consumer:
@@ -462,7 +462,7 @@ func (sess *mqttSession) releaseFailedSharedFilter(c *client, tok recordTx, f *m
 		// membership to reach it by.
 		//
 		// The SUBSCRIBE rollback's definite arm is no longer one of the shapes that
-		// produces such an entry — it restores the shared membership beside cons (F-039) —
+		// produces such an entry — it restores the shared membership beside cons (issue #43) —
 		// but the sweep stays, because that closes one producer and does not establish
 		// that no stale entry can exist.
 		sess.mu.Lock()
@@ -638,7 +638,7 @@ func (sess *mqttSession) restoreSharedKeyInMemory(sid string, existed bool, m mq
 // rapSubs and subIDs are keyed by session key and carry PLAIN filters too, whose state
 // the pre-packet snapshot owns — so only the keys the membership names are carried,
 // never the whole map. Copying a whole option map here would let a plain filter's
-// identifier survive a rollback that removed its subscription. F-039.
+// identifier survive a rollback that removed its subscription. issue #43.
 type mqttAttemptedShared struct {
 	members map[string]mqttSharedMembership
 	rap     map[string]struct{}
@@ -694,7 +694,7 @@ func mqttCaptureAttemptedSharedLocked(sess *mqttSession) *mqttAttemptedShared {
 //
 // Each key is restored through the same two helpers restoreSharedKeyInMemory uses, which
 // CLEAR as well as set — so a restore to "no RAP" or "identifier 0" expresses itself
-// rather than only an addition. F-039.
+// rather than only an addition. issue #43.
 //
 // No lock held on entry.
 func (sess *mqttSession) restoreAttemptedShared(a *mqttAttemptedShared) {
@@ -798,12 +798,12 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 	// consumer this packet created can be the level-up companion of a filter the session
 	// already held ("$share/g/foo.>" joins the durable of "$share/g/foo"), and everything
 	// below is whole-durable, so acting on it would close a SURVIVING filter's delivery and
-	// withdraw its registrations. F-083.
+	// withdraw its registrations. issue #85.
 	rollbackSurv := mqttSharedSurvivorsOf(snap.shared)
 	// The shared membership as it stands NOW, before the reset below replaces it with the
 	// pre-packet snapshot. The definite-failure arm puts it back; nothing else in this
 	// function reads it. Taken AFTER rollbackSurv deliberately: that set is the PRE-PACKET
-	// membership and must stay so. See mqttCaptureAttemptedSharedLocked. F-039.
+	// membership and must stay so. See mqttCaptureAttemptedSharedLocked. issue #43.
 	attemptedShared := mqttCaptureAttemptedSharedLocked(sess)
 	// THE RELEASE VERDICTS ride this write. The record about to be stored names the
 	// pre-packet membership, so every acquisition the attempted membership holds outside it
@@ -914,7 +914,7 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 			// mqttValidateRecordAffinePair refuses, so this order keeps the in-memory
 			// pairing that shape rests on. Only on THIS arm: an ambiguous rollback may
 			// have stored exactly the rolled-back record, and the resolver settles it by
-			// re-attempting those bytes. See restoreAttemptedShared. F-039.
+			// re-attempting those bytes. See restoreAttemptedShared. issue #43.
 			sess.restoreAttemptedShared(attemptedShared)
 			// And with it the verdicts this write was to carry: the record still names
 			// the attempted acquisitions, so nothing authorizes their release.
@@ -966,7 +966,7 @@ func (sess *mqttSession) rollbackSubscribePacket(c *client, tok recordTx, subs [
 // halves must agree on one answer, and snap.shared is assigned BY REFERENCE into
 // sess.sharedSubs by the restoration, so on the landed-continuation route — which runs from
 // the resolver, arbitrarily later — rebuilding from it would read a map another packet may
-// since have mutated. mqttSharedSurvivorsOf copies, so the set here is immutable. F-083.
+// since have mutated. mqttSharedSurvivorsOf copies, so the set here is immutable. issue #85.
 //
 // No lock held on entry.
 func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs []*subscription, added []addedCons,
@@ -991,7 +991,7 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 	// its key up in snap.shared alone, found nothing, and unsubscribed a subscription that
 	// PREDATED the packet on a rollback that is supposed to restore it. The two keyspaces are
 	// disjoint by construction (a shared key is "$share/<group>/<subject>", a plain one is a
-	// NATS subject), so testing both is exact rather than merely safe. F-083.
+	// NATS subject), so testing both is exact rather than merely safe. issue #85.
 	existedBefore := func(sid string) bool {
 		key := sid
 		if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
@@ -1016,7 +1016,7 @@ func (sess *mqttSession) finishSubscribeRollback(c *client, tok recordTx, subs [
 			// release LOCALLY: the local release is whole-durable — the purge, the refund and
 			// the deliver-subject unsubscribe would all land on a live filter. The
 			// acquisitions this rollback removed are released by their verdicts regardless.
-			// F-083.
+			// issue #85.
 			if surv.ownsDurable(a.cc.Durable) {
 				continue
 			}

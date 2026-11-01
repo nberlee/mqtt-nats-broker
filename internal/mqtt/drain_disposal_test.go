@@ -30,7 +30,7 @@ import (
 //
 // These pin the four halves of the repair: the one critical section that drops the maps and
 // closes the delivery barrier together, the terminal per-object flag at each insertion
-// boundary, the hand-off of the consumer to the retirement owner (F-105 7c-lc: the classified
+// boundary, the hand-off of the consumer to the retirement owner (issue #107 7c-lc: the classified
 // delete is the owner's now), and the landed-only charge refund.
 //
 // SCOPE, so a later reader does not overread them: the guarantee is about this drain OBJECT

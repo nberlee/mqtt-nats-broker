@@ -21,7 +21,7 @@ import (
 	"strings"
 )
 
-// The outbound exchange and its actions (F-105).
+// The outbound exchange and its actions (issue #107).
 //
 // An EXCHANGE is the client-facing obligation: one outbound message this broker owes a
 // client an outcome for. Its identity is (account epoch, client, generation, exchange
@@ -41,7 +41,7 @@ import (
 // Both records live on $MQTT_inflight, and both are installed by the SAME atomic batch that
 // contends on the outbound authority. That is the admission boundary: an exchange that
 // existed without an authority transition admitting it would be an obligation nothing
-// authorized, which is precisely the state F-105 exists to make unreachable.
+// authorized, which is precisely the state issue #107 exists to make unreachable.
 
 // The record-class tokens for the two classes this file owns. As with the arbitration
 // records, a leading class token keeps them structurally out of the register machinery's
@@ -92,7 +92,7 @@ func mqttParseOrdinalToken(tk string) (uint64, error) {
 
 // mqttExchangePhase is where an exchange stands in its protocol.
 //
-// Numbered from 1 for the reason every other F-105 enum is: a missing or null member decodes
+// Numbered from 1 for the reason every other issue #107 enum is: a missing or null member decodes
 // to zero, and a zero naming a real phase would make an unsupported record read as the most
 // permissive one.
 type mqttExchangePhase uint8
@@ -109,7 +109,7 @@ const (
 	// not: every consumer treated the two alike, and the canonical PUBREL's identity is the
 	// SLOT's fact, bound by the rebind's readback proof. Nothing ever wrote it. A persisted 3
 	// is an unsupported shape and is REFUSED by mqttValidExchangePhase — never read as
-	// PUBREC-observed, and never renumbered away (F-105 PUBCOMP arm, consult 23).
+	// PUBREC-observed, and never renumbered away (issue #107 PUBCOMP arm, consult 23).
 	// mqttExchangeTerminalPendingDrain is terminal evidence observed while output is still
 	// outstanding.
 	//
@@ -135,7 +135,7 @@ const (
 	// message it refused, and would oblige a release nothing may emit.
 	mqttExchangeRejected mqttExchangePhase = 7
 	// mqttExchangeSupersededUnsent is a proven-unsent PUBLISH obligation ended because its
-	// packet identifier was re-allocated to a fresh delivery in a PAIR replacement (F-105 step
+	// packet identifier was re-allocated to a fresh delivery in a PAIR replacement (issue #107 step
 	// 5, Codex consult 15). It is its OWN absorbing ending, distinct from every acknowledgement
 	// phase: no PUBACK, PUBREC or refusal was ever observed — the marker naming the occupant
 	// proved the PUBLISH never left the broker — so recording completion (Terminal) or rejection
@@ -159,7 +159,7 @@ const (
 	mqttExchangeWithdrawnUnsent mqttExchangePhase = 9
 	// mqttExchangeDeliveryAbandoned records that the broker PERMANENTLY ABANDONED delivery of
 	// a PUBLISH obligation a previous connection may have transmitted and the client never
-	// acknowledged: a restored delivery denied by the authorization policy on re-offer (F-105
+	// acknowledged: a restored delivery denied by the authorization policy on re-offer (issue #107
 	// row 5, consult 34). Absorbing FOR DELIVERY — nothing may be acquired at it and it has no
 	// successor — but it is NOT an ending in mqttExchangePhaseEnded's sense: no client answer
 	// was observed, so the identifier the client may still hold under §4.3 is NOT released by
@@ -168,7 +168,7 @@ const (
 	// never send it. Reached ONLY by opAbandonDeniedDelivery.
 	mqttExchangeDeliveryAbandoned mqttExchangePhase = 10
 	// mqttExchangeDiscarded records that the obligation's GENERATION was discarded before the
-	// exchange ended (F-105 7d): a session ended, so nothing will ever deliver, release or
+	// exchange ended (issue #107 7d): a session ended, so nothing will ever deliver, release or
 	// drain it. Reached ONLY by a discard-exchange transition, licensed by the generation's
 	// committed DISCARDING closure, from any phase that does not already release its holds.
 	//
@@ -195,7 +195,7 @@ func mqttValidExchangePhase(p mqttExchangePhase) bool {
 }
 
 // mqttExchangeReleasesHolds reports whether a phase has released the obligation's holds on its
-// logical-use resources: an ending, or the generation's discard (F-105 7d). It answers the HOLD
+// logical-use resources: an ending, or the generation's discard (issue #107 7d). It answers the HOLD
 // question only — which consumers an obligation may still need — and is the predicate every
 // hold-release rule reads, so a discard releases holds without becoming an identifier ending.
 func mqttExchangeReleasesHolds(p mqttExchangePhase) bool {
@@ -215,7 +215,7 @@ func mqttExchangePhaseEnded(p mqttExchangePhase) bool {
 
 // mqttExchangeDeliveryDutyEnded reports whether an exchange owes no further DELIVERY: it ended
 // (mqttExchangePhaseEnded), the broker abandoned its delivery (DeliveryAbandoned), or its
-// generation was discarded (Discarded, F-105 7d). It answers
+// generation was discarded (Discarded, issue #107 7d). It answers
 // the DUTY question only — whether recovery owes this exchange anything further — and is
 // deliberately NOT the identifier question: identifier exclusivity, replacement and
 // mqttIdentifierReleaseAllowed keep reading mqttExchangePhaseEnded, so an abandoned exchange's
@@ -257,7 +257,7 @@ type mqttOutboundExchange struct {
 	Tenure string `json:"tenure"`
 
 	// Abandoned is the HISTORICAL fact that this broker abandoned the exchange's PUBLISH
-	// delivery (F-105 row 5, unit C1): written once, by the abandonment's own transition, and
+	// delivery (issue #107 row 5, unit C1): written once, by the abandonment's own transition, and
 	// carried unchanged through every later phase. The phase says where the protocol stands;
 	// this says the delivery was abandoned, which a later client acknowledgement advancing the
 	// phase must not erase — charge reconstruction reads it (a successful PUBREC after an
@@ -272,7 +272,7 @@ type mqttOutboundExchange struct {
 	SharedAcq *mqttSharedAcqRef `json:"shared_acq,omitempty"`
 
 	// Holds names the logical-use resources — the source consumer and, for QoS 2, the canonical
-	// PUBREL consumer — this obligation holds an edge on (F-105 7c-lc). It is the REVERSE INDEX of
+	// PUBREL consumer — this obligation holds an edge on (issue #107 7c-lc). It is the REVERSE INDEX of
 	// those resources' Deps: a resource is keyed (gen, inc) and names its dependents, so without
 	// this the batch that ENDS the obligation could not name the records it must release without
 	// walking the generation. Written once, by the admitting batch, equal to exactly the edges that
@@ -282,7 +282,7 @@ type mqttOutboundExchange struct {
 	Holds []mqttExchangeHold `json:"holds,omitempty"`
 
 	// RetainedOwner is a RETAINED copy's owner: the payload resource incarnation whose
-	// retained-material edge this obligation holds (F-112). Written once, by the retained
+	// retained-material edge this obligation holds (issue #114). Written once, by the retained
 	// admission batch, bound there to the admitted manifest's own `inc` in both directions
 	// (checkRetainedAdmission, checkRetainedAdmissionCoverage), carried unchanged through every
 	// later phase. It is the walk-free address the floor's reclamation predicate reads to prove
@@ -357,7 +357,7 @@ func mqttHoldsEqual(a, b []mqttExchangeHold) bool {
 // denial, so an owner reconstructed after a restart can settle a still-live source without
 // waiting for a redelivery (a durable and sequence alone are not an acknowledgement handle).
 //
-// The fact is a UNION by source, like the register (F-105 7c): an ORDINARY abandonment names the
+// The fact is a UNION by source, like the register (issue #107 7c): an ORDINARY abandonment names the
 // source delivery it disposes of (Dur, Seq, Reply); a RETAINED one names the materialization
 // (Payload) and FORBIDS the delivery coordinates, because a retained delivery was never a source
 // delivery and a fabricated one would be settled by a reader that believes it.
@@ -426,7 +426,7 @@ func mqttExchangeEqual(a, b *mqttOutboundExchange) bool {
 
 // mqttExchangeFactPhase reports whether an exchange may carry the abandonment fact in phase p:
 // the abandonment itself, exactly the phases a client acknowledgement advances it to, and the
-// generation's discard, which preserves the immutable fact through its ending (F-105 7d).
+// generation's discard, which preserves the immutable fact through its ending (issue #107 7d).
 func mqttExchangeFactPhase(p mqttExchangePhase) bool {
 	switch p {
 	case mqttExchangeDeliveryAbandoned, mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain,

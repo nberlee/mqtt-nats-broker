@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// F-035. Every MQTT application write is bounded by mqttWriteDeadline, installed
+// issue #39. Every MQTT application write is bounded by mqttWriteDeadline, installed
 // and cleared in writeSocket, which is the single socket writer and the only
 // production acquirer of c.wmu. These tests assert that property directly; the
 // courtesy-DISCONNECT sites the roadmap bullet names are consequences of it, not
@@ -609,7 +609,7 @@ func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 	})
 }
 
-// T5. The delivery section, which is the population the F-035 dossier did NOT name:
+// T5. The delivery section, which is the population the issue #39 dossier did NOT name:
 // it named `wmu` only. `mqttEnqueuePublishMsgTo` holds the RECEIVER's `c.mu` across
 // its `queueOutbound` calls, so before the bound an ordinary QoS 0 delivery to a
 // stalled subscriber blocked every path that needed that client's mutex — including,
@@ -890,7 +890,7 @@ func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 	// delayed one is still there for the disposal, which consumes it under its fence.
 	//
 	// This is the race section 3.5 names, and the write timeout is a new producer of
-	// it: before F-035 a still-connected peer could not cause this close at all.
+	// it: before issue #39 a still-connected peer could not cause this close at all.
 	t.Run("the teardown observes the close first, the disposal consumes under its fence", func(t *testing.T) {
 		testShortWriteDeadline(t, 8*time.Second)
 		e := testNewRejectionEnv(t, "f035willteardown")

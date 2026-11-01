@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// The acknowledgement-driven advance (F-105 row 3): one CLIENT ACKNOWLEDGEMENT moves the
+// The acknowledgement-driven advance (issue #107 row 3): one CLIENT ACKNOWLEDGEMENT moves the
 // exchange's phase AND re-phases the durable in-flight slot, in ONE atomic batch.
 //
 // # Two records, one fact, one batch
@@ -28,7 +28,7 @@ import (
 // emit or release its identifier, and an acknowledgement is one fact about both: the client
 // answered. Splitting the two writes leaves a durable disagreement — a slot past PUBREC beside
 // an exchange still at PUBLISH, or the reverse — that a peer or a restart must interpret, which
-// is exactly the read-then-act shape F-105 exists to remove. JetStream batches are per stream,
+// is exactly the read-then-act shape issue #107 exists to remove. JetStream batches are per stream,
 // and both records live on `$MQTT_inflight`, so the two members commit together or not at all.
 //
 // # It records evidence; it does not admit work or drain an action
@@ -83,7 +83,7 @@ type mqttAdvanceExchangeAckRequest struct {
 	RegisterSeq uint64
 
 	// RelID is the identity a RETAINED slot's canonical PUBREL is created with on its successful
-	// PUBREC (F-105 7c), minted by the caller once per decision so a retry of the same advance
+	// PUBREC (issue #107 7c), minted by the caller once per decision so a retry of the same advance
 	// names the same record. Manifest and ManifestSeq are that slot's copy as read for the
 	// Publish-origin arrow's fence; the op loads them when the caller did not.
 	RelID       string
@@ -111,7 +111,7 @@ type mqttAdvanceExchangeAckRequest struct {
 // (finalizeTerminalSlot refuses disposal while one stands), so PUBCOMP records completion on the
 // slot and the token keeps the cleanup waiting for its holder's drain.
 //
-// RETAINED SLOTS SKIP pubrel_intended (F-105 7c): a retained exchange's canonical PUBREL is created
+// RETAINED SLOTS SKIP pubrel_intended (issue #107 7c): a retained exchange's canonical PUBREL is created
 // on $MQTT_inflight in the SAME batch as the PUBREC advance, so there is no cross-stream store for
 // an intent phase to bridge and the arrow lands on pubrel_ready directly.
 func mqttAckSlotArrow(retained bool, from mqttInflightState, to mqttExchangePhase) (mqttInflightState, bool) {
@@ -204,7 +204,7 @@ func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
 	}
 	want := *cur
 	want.State = rec.State
-	// A KNOWN-FALSE CANCELLATION IS CLEARED by the client's answer (F-088): a `publish` occupant
+	// A KNOWN-FALSE CANCELLATION IS CLEARED by the client's answer (issue #90): a `publish` occupant
 	// carrying Cancelled whose client acknowledges it was transmitted, so the bit's "never sent"
 	// claim is refuted, and keeping it would build the publish_terminal/pubrel_intended shape the
 	// validator refuses. The recogniser admits the cleared body; the write boundary separately
@@ -231,7 +231,7 @@ func mqttIsAckPhaseAdvance(cur, rec *mqttInflightRecord) bool {
 // and the output-token acquisition); the evidence half is mqttRefutedCancellation's, at the write
 // boundary.
 //
-// ONLY AN OCCUPANT CANCELLATION IS EVER CLEARED, and both members go together (F-088, consult C4):
+// ONLY AN OCCUPANT CANCELLATION IS EVER CLEARED, and both members go together (issue #90, consult C4):
 // a pending fence is not an exchange's identity carrier, so nothing advances or acquires it, and
 // a cleared body carries neither Cancelled nor its provenance.
 func mqttClearsCancellation(cur, rec *mqttInflightRecord) bool {
@@ -239,7 +239,7 @@ func mqttClearsCancellation(cur, rec *mqttInflightRecord) bool {
 		cur.CancelOrigin == mqttCancelOriginOccupant && !rec.Cancelled && rec.CancelOrigin == _EMPTY_
 }
 
-// mqttRefutedCancellation is the ONE rule for clearing a cancellation bit on a register (F-088): a
+// mqttRefutedCancellation is the ONE rule for clearing a cancellation bit on a register (issue #90): a
 // member may clear it only where the cancellation is refuted, i.e. the shape is
 // mqttClearsCancellation's AND the unsent marker of this allocation reads AUTHORITATIVELY absent,
 // read by the write boundary in the same attempt. A standing marker means the cancellation is
@@ -334,12 +334,12 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	}
 	next := *reg
 	next.State = slotTo
-	// THE CLIENT'S ANSWER REFUTES A CANCELLATION (F-088): an acknowledged `publish` register was
+	// THE CLIENT'S ANSWER REFUTES A CANCELLATION (issue #90): an acknowledged `publish` register was
 	// transmitted, so a Cancelled bit on it is a known-false write and the acknowledged shape never
 	// carries it. The write boundary admits the cleared member only on the marker's authoritative
 	// absence (mqttRefutedCancellation).
 	if reg.CancelOrigin == mqttCancelOriginPendingCreate {
-		// A pending fence is never advanced: it is not an exchange's identity carrier (F-088).
+		// A pending fence is never advanced: it is not an exchange's identity carrier (issue #90).
 		return nil, fmt.Errorf("advancing exchange %q: the register it names is a pending cancellation "+
 			"fence, which no acknowledgement advances", cur.Nonce)
 	}
@@ -510,7 +510,7 @@ func (sess *mqttSession) advanceExchangeAck(r *mqttAdvanceExchangeAckRequest) (m
 	// its custody is observed. The hint never releases; the exchange's own phase does.
 	defer sess.hintCustody(r.Gen, r.Nonce)
 	// An abandoned delivery's ending releases its holds in its own batch, which is what a
-	// disposed consumer's retirement waits for: a hint, each step re-reads (F-105 7c-lc).
+	// disposed consumer's retirement waits for: a hint, each step re-reads (issue #107 7c-lc).
 	defer sess.wakeSourceRetirements()
 	write := func() (mqttOpOutcome, error) { return sess.jsa.opAdvanceExchangeAck(r) }
 	if as := sess.asm; as != nil {

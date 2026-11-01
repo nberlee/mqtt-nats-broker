@@ -286,7 +286,7 @@ type mqttAcceptAttempt struct {
 	ownProposal mqttOwnershipProposal
 	// ownJSA is the ownership protocol's deadline view, used for the metadata commit when
 	// ownProposal is set, so that commit honours the CONNECT's one deadline like every other
-	// request of the protocol (F-105 8a). nil means the session's own assistant.
+	// request of the protocol (issue #107 8a). nil means the session's own assistant.
 	ownJSA *mqttJSA
 }
 
@@ -304,7 +304,7 @@ func (sess *mqttSession) saveWithDetail(tok recordTx) (mqttSessSaveDetail, error
 // COMMITTED receipt (the metadata half of the outbound ownership protocol) and the session record
 // land as ONE atomic three-member batch, through the fenced boundary every session record write
 // uses, so the commit inherits record lineage (fork-repair), the void-register accounting
-// (F-098), the ambiguous-write refusal and the record-tx fence.
+// (issue #100), the ambiguous-write refusal and the record-tx fence.
 //
 // THE FACT RIDES IN THE SAME BATCH AS THE RECORD, so there is no interval in which the session
 // has been accepted and the evidence of that acceptance does not yet exist. That interval is why
@@ -457,7 +457,7 @@ func (sess *mqttSession) persistRecord(tok recordTx, accept *mqttAcceptAttempt) 
 			// returned with the frozen attempt for the ownership driver to classify from
 			// that slot: the accepting CONNECT's executor (resolveOrRetryMetadataCommit,
 			// settleFailedMetadataCommit), or, if this process never gets to, the next
-			// acceptance's settlement of the proposal left standing (F-105 8a).
+			// acceptance's settlement of the proposal left standing (issue #107 8a).
 			return detail, fmt.Errorf("unable to persist session %q ownership metadata (seq=%v): %w",
 				ps.ID, seq, cerr)
 		}

@@ -15,7 +15,7 @@ package mqtt
 
 import "time"
 
-// AN OWED WITHDRAWAL (F-088 / F-097, WP3 "withdrawOwed lifecycle").
+// AN OWED WITHDRAWAL (issue #90 / issue #99, WP3 "withdrawOwed lifecycle").
 //
 // A cancellation whose unsent marker still stands is a GENUINE never-transmitted decision, and
 // its withdrawal is what ends the obligation (WithdrawnUnsent) and releases its custody charge.

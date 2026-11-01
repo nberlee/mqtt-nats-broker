@@ -101,7 +101,7 @@ const (
 	// the message: one authenticated tag per filter of the publishing session that had
 	// No Local set and could receive the subject (see nolocal_stamp.go). The delivery
 	// callbacks decide No Local from it alone, so a later re-SUBSCRIBE never re-judges
-	// an owned message (F-117). Absent when no such filter existed or the publisher has no
+	// an owned message (issue #119). Absent when no such filter existed or the publisher has no
 	// session (e.g. an internal Will client). Spec5 [3.8.3.1],
 	// [MQTT-4.5.0-1].
 	mqttNatsHeaderNoLocal = "Nmqtt-NoLocal"
@@ -705,7 +705,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace, more bool) er
 		}
 	}
 
-	// No Local is decided at OWNERSHIP (F-117): the stamp is taken here, on the read loop,
+	// No Local is decided at OWNERSHIP (issue #119): the stamp is taken here, on the read loop,
 	// so it reflects every SUBSCRIBE this connection sent before this PUBLISH and none
 	// after it. QoS 0 and 1 are owned by this function; QoS 2 at PUBREC, whose hold
 	// carries the stamp to the release. Computed for every QoS, because this standalone
@@ -735,7 +735,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace, more bool) er
 	// after its publisher added No Local filters, must be answered from the hold rather
 	// than refused for a stamp it will never carry. So the forms are budgeted here
 	// without it, and mqttStoreQoS2MsgOnce applies the stamped budget on the new-hold
-	// path only — the placement F-079 chose for QoS 2 authorization, for the same reason.
+	// path only — the placement issue #81 chose for QoS 2 authorization, for the same reason.
 	var q2Stamped int
 	maxPayload := atomic.LoadInt32(&c.mpay)
 	if maxPayload != jwt.NoLimit {
@@ -791,7 +791,7 @@ func (s *Server) mqttProcessPub(c *client, pp *mqttPublish, trace, more bool) er
 	// second delivery, WHATEVER subject it names. Checking its subject here would
 	// let a deliberately-denied subject reject an exchange the broker already owns,
 	// so the QoS 2 gate lives inside mqttStoreQoS2MsgOnce, on the path that has
-	// established the hold is new. F-079.
+	// established the hold is new. issue #81.
 	// Test seam. Parks a PUBLISH that has been PARSED but not yet authorized, which
 	// is the only window in which "the snapshot was revoked while an operation was
 	// already in hand" can be observed. Without it, closing the socket and revoking
@@ -973,7 +973,7 @@ type mqttIssued struct {
 	// err is a failure decided at issuance: a QoS 0 fan-out that never left, a moved service
 	// epoch, or the connection's abort before the store.
 	err error
-	// retainErr is the retained update's outcome, joined with the store's (F-060).
+	// retainErr is the retained update's outcome, joined with the store's (issue #64).
 	retainErr error
 	// pending is the submitted store, valid when submitted is set; held by value, like the
 	// issuance itself, so a direct-path publication allocates neither.
@@ -1010,7 +1010,7 @@ func (is mqttIssued) complete() error {
 // inbound QoS 2 PUBREL release passes one (see mqttInitiateMsgDeliveryDedup); it
 // is NOT set on the live fan-out's behalf, which is at-least-once regardless.
 //
-// The retained update is part of the publication's outcome (F-060): an error from it is
+// The retained update is part of the publication's outcome (issue #64): an error from it is
 // returned even when the $MQTT_msgs store succeeded, so no caller gives final success to
 // a publication whose retained update the store did not confirm.
 //
@@ -1054,7 +1054,7 @@ func (s *Server) mqttIssuePublication(c *client, jsa *mqttJSA, pp *mqttPublish, 
 	// It runs whether or not the live publish left the socket for QoS 1/2: a failed
 	// core-NATS send says nothing about the retained stream, and the PUBACK or PUBCOMP
 	// that follows a successful $MQTT_msgs store must not cover a retained update that
-	// was never attempted. F-060.
+	// was never attempted. issue #64.
 	//
 	// pp is passed IN rather than read from c.mqtt.pp, and that is a fix, not a
 	// refactor. c.mqtt.pp is the shared PARSER object, overwritten by every packet
@@ -1071,7 +1071,7 @@ func (s *Server) mqttIssuePublication(c *client, jsa *mqttJSA, pp *mqttPublish, 
 	// mqttProcessPub (or, for QoS 2, in mqttStoreQoS2MsgOnce) covered this
 	// publication's FULL effective-subject set, derived certificate subject
 	// included. That is why there is no second check here, and why adding one
-	// would double-refuse a replayed Will. F-079.
+	// would double-refuse a replayed Will. issue #81.
 	is.retainErr = c.mqttHandlePubRetain(pp, origin)
 
 	// If QoS 0 messages don't need to be stored, other (1 and 2) do. Store them
@@ -1345,7 +1345,7 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 // generation: a teardown for THIS incarnation, won against a peer still serving it,
 // purges by subject and would reach a hold accepted meanwhile. What stops it is the bound
 // every hold purge now carries. Which bound each arm uses, and what that does and does not
-// license, are stated once in F-062 (docs/findings/ha-arbitration.md) — it is not one
+// license, are stated once in issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131) — it is not one
 // watermark for all four arms, so do not summarise it as one here.
 // Both callers run on the inbound QoS 2 path, well after processConnect installed
 // c.mqtt.sess (which the delivery path already dereferences unguarded), and a
@@ -1364,7 +1364,7 @@ func (c *client) mqttQoS2InternalSubject(pi uint16) string {
 // is delivered onward FIRST and only then replaced by a terminal tombstone, so no
 // window IN THIS EXCHANGE deletes the message and then fails to deliver it. (A
 // teardown running for an incarnation a peer still serves destroys only what it can
-// prove it was entitled to destroy: F-062.) The branch order is
+// prove it was entitled to destroy: issue #66.) The branch order is
 // load, corrupt, delivered, malformed, expired, claim, prove, store, commit; see
 // qos2_move.go for the state machine, the four design invariants it obeys, and the
 // honest guarantee (no silent loss on this exchange's own paths; exactly-once for
@@ -1582,8 +1582,8 @@ func (j *mqttInboundJob) releaseFences() bool {
 	//
 	// This fence decides only the occupancy it competed for. What that is worth is bounded
 	// by the marker's fence, which makes an occupancy the discard was never entitled to
-	// provable here (F-062), and by one open blocker that is not decidable here at all:
-	// F-036 (docs/findings/ha-arbitration.md). Do not restate their boundary in this file.
+	// provable here (issue #66), and by one open blocker that is not decidable here at all:
+	// issue #40 (https://github.com/nberlee/mqtt-nats-broker/issues/131). Do not restate their boundary in this file.
 	if r.sess != nil {
 		if !r.sess.beginQoS2ReleaseOp() {
 			// This session is being discarded on this broker. Deliver nothing and claim
@@ -1615,7 +1615,7 @@ func (j *mqttInboundJob) releaseFences() bool {
 		// attribute holds it. Nothing may be delivered here. A marker left for an EARLIER
 		// occupancy no longer reaches this branch: it records the fence its writer was
 		// entitled to destroy, so claimQoS2Release reaps it and retries the create when our
-		// hold sits above that fence (F-062 mechanism 2). The Unreadable arm shares this
+		// hold sits above that fence (issue #66 mechanism 2). The Unreadable arm shares this
 		// branch and is by definition not a legitimate marker, which is why the claim being
 		// made here is about the Discarded VERDICT and not about the branch.
 		// Release the hold record before answering
@@ -1645,7 +1645,7 @@ func (j *mqttInboundJob) releaseFences() bool {
 		// Our record, at our sequence. Holding the claim fences a discard that has not yet
 		// committed to this subject's purge, and a discard that already committed to one
 		// could not have covered this record anyway: its purge was bounded to what it
-		// enumerated (F-062). See verifyQoS2HoldForRelease.
+		// enumerated (issue #66). See verifyQoS2HoldForRelease.
 	case mqttQoS2VerifyDelivered:
 		// Our generation's own tombstone: a peer completed this exchange. Answer from
 		// it without re-delivering, exactly as branch T does, and reap both records
@@ -1666,7 +1666,7 @@ func (j *mqttInboundJob) releaseFences() bool {
 		// nothing is lost — only the reason code is more optimistic than the marker-backed
 		// 0x92. A LATER exchange's hold is not reachable this way: the sweep's purge is
 		// bounded to the exact record it observed and re-confirmed, so a hold accepted
-		// after that observation is spared rather than destroyed (F-062). See
+		// after that observation is spared rather than destroyed (issue #66). See
 		// orphan_qos2_sweep.go and the residual in docs/CONFORMANCE.md.
 		asm.reapQoS2RelClaim(claimSeq)
 		return answer(mqttReasonSuccess, _EMPTY_)
@@ -1681,10 +1681,10 @@ func (j *mqttInboundJob) releaseFences() bool {
 		return withhold(verr)
 	}
 
-	// W: the retirement classifier — F-036 unit 2, and the last fence before the
+	// W: the retirement classifier — issue #40 unit 2, and the last fence before the
 	// irreversible act. Neither the claim nor fence 2 can see the two populations it
 	// answers for: a hold a discard's one-shot enumeration never named, and one its
-	// F-062 cutoff SPARED above its own watermark. For both of those the session was
+	// issue #66 cutoff SPARED above its own watermark. For both of those the session was
 	// durably discarded and this broker was never told, so without this the release
 	// fans an acknowledged payload out for a session that no longer exists and answers
 	// the client 0x00.
@@ -1765,7 +1765,7 @@ func (r *mqttInboundRelease) complete(j *mqttInboundJob) {
 
 	// S: the onward store. A failure here means the exchange is unfinished and the record is
 	// still held: suppress the PUBCOMP so the client retries. The same holds for a retained
-	// update the store did not confirm (F-060): the error is returned even when the onward
+	// update the store did not confirm (issue #64): the error is returned even when the onward
 	// store succeeded, so the PUBCOMP is withheld and the re-sent PUBREL re-attempts the whole
 	// release.
 	//

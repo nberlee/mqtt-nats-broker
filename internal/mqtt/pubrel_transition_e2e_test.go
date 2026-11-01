@@ -68,7 +68,7 @@ func TestMQTTPubRelStoreFailureUnwedgesIdentifier(t *testing.T) {
 	_, backAsPublish := sess.pendingPublish[pi]
 	sess.mu.Unlock()
 
-	// THE EXCHANGE IS PAST PUBREC AND STAYS THERE (F-098). The intent is recorded durably
+	// THE EXCHANGE IS PAST PUBREC AND STAYS THERE (issue #100). The intent is recorded durably
 	// BEFORE the store — that is what stops a peer reaping an identifier whose PUBREL may
 	// be about to exist (R-a) — so the client's PUBREC is a fact this broker has already
 	// written down. Rolling the exchange back to PUBLISH, which is what this fixture used

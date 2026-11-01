@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// persistRecord's ownership metadata-commit path (F-105 cutover, Codex design steps 1-2). The
+// persistRecord's ownership metadata-commit path (issue #107 cutover, Codex design steps 1-2). The
 // metadata half of the ownership protocol is written THROUGH persistRecord, so it inherits the
 // four invariants a session record write carries: lineage, void-register accounting, the
 // ambiguous-write refusal and the record-tx fence. These fault tests exercise that path

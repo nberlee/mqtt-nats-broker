@@ -8,7 +8,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// TestSlotReleaseAuthorityPrecedence is C-IV's oracle (F-098).
+// TestSlotReleaseAuthorityPrecedence is C-IV's oracle (issue #100).
 //
 // The contract is a TOTAL FUNCTION with a fixed precedence and a RESERVING DEFAULT, and
 // the default is the part that makes it a property rather than the enumeration three
@@ -99,8 +99,8 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 			want:  mqttSlotProvenUnsentAuthority,
 		},
 		{
-			// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This case asserted that a
-			// Cancelled bit is proof of non-transmission; that premise is the defect F-088 owns
+			// RE-EXPRESSED by issue #99/issue #90 (plan rev 10, WP3 edit 1). This case asserted that a
+			// Cancelled bit is proof of non-transmission; that premise is the defect issue #90 owns
 			// (a cancellation is a local decision that cannot see a PUBLISH already on the wire),
 			// and the plan deletes it. With the marker authoritatively ABSENT the exchange is
 			// possibly-attempted, whatever the bit says.
@@ -120,7 +120,7 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 		},
 		{
 			// L3's crash survivor: publish + Cancelled + no marker + no token. RE-EXPRESSED by
-			// F-097/F-088 (plan rev 10, WP3): this shape was freed on the Cancelled bit alone,
+			// issue #99/issue #90 (plan rev 10, WP3): this shape was freed on the Cancelled bit alone,
 			// which is the deleted premise. It is now RESERVED and served instead: the register
 			// survives, a late acknowledgement completes the exchange through its ACK route,
 			// and the ledger holds identifier and charge until then or discard. (The case that
@@ -128,7 +128,7 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 			// evidence member it set; the verdict is no longer evidence at all.)
 			name: "L3's pure-cancellation survivor is reserved, not freed",
 			build: func(ev *mqttSlotEvidence) {
-				ev.rec.Cancelled, ev.rec.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance
+				ev.rec.Cancelled, ev.rec.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: provenance
 				ev.marker = mqttSlotMarkerAbsent
 			},
 			want: mqttSlotReservedAuthority,
@@ -142,7 +142,7 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 			name: "RETIRED DOMINATES a cancellation and reserves",
 			build: func(ev *mqttSlotEvidence) {
 				ev.rec.Retired, ev.rec.Cancelled = true, true
-				ev.rec.CancelOrigin = mqttCancelOriginOccupant // F-088: provenance
+				ev.rec.CancelOrigin = mqttCancelOriginOccupant // issue #90: provenance
 				ev.marker = mqttSlotMarkerAbsent
 			},
 			want: mqttSlotReservedAuthority,
@@ -195,7 +195,7 @@ func TestSlotReleaseAuthorityPrecedence(t *testing.T) {
 }
 
 // TestSlotEvidenceCannotIdentifyATokensOwner is how the "ANY live token, including the
-// caller's own" half of arm 2 is actually held (F-098), and it is structural rather than
+// caller's own" half of arm 2 is actually held (issue #100), and it is structural rather than
 // behavioural for a reason worth stating.
 //
 // THE SCHEDULE arm 2 exists to stop: this broker owns a PUBLISH action whose socket write
@@ -215,7 +215,7 @@ func TestSlotEvidenceCannotIdentifyATokensOwner(t *testing.T) {
 	t.Parallel()
 	typ := reflect.TypeOf(mqttSlotEvidence{})
 	want := map[string]struct{}{
-		// "verdict" is gone with F-088's WP3 edit 1: a void verdict is a decision, not
+		// "verdict" is gone with issue #90's WP3 edit 1: a void verdict is a decision, not
 		// evidence of non-transmission, so the evidence no longer carries it.
 		"readable": {}, "rec": {}, "bound": {}, "marker": {},
 	}
@@ -234,7 +234,7 @@ func TestSlotEvidenceCannotIdentifyATokensOwner(t *testing.T) {
 	}
 }
 
-// TestInflightSlotTransmissionCounterIsMonotone is C-I's monotonicity oracle (F-098).
+// TestInflightSlotTransmissionCounterIsMonotone is C-I's monotonicity oracle (issue #100).
 //
 // `Acq` is what makes an acknowledgement bound to one transmission undischargeable by a
 // later one, and that only holds if the counter NEVER GOES BACKWARDS. A drain in

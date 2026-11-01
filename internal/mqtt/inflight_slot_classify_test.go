@@ -21,7 +21,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// The slot classifier, arm by arm (F-105, row 1).
+// The slot classifier, arm by arm (issue #107, row 1).
 //
 // The classifier replaces the DECISION half of storeInflightRegister's ladder, so what these
 // tests have to pin is not only "each arm answers correctly" but the PRECEDENCE between arms —
@@ -103,7 +103,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			disp: mqttSlotDispAdoptLandedWrite,
 		},
 		{
-			// F-105 7b: the register's claim stamp decides nothing about an ordinary allocation;
+			// issue #107 7b: the register's claim stamp decides nothing about an ordinary allocation;
 			// a stamp another session object left is still our own landed write.
 			name: "our own nonce under another object's claim stamp is still our landed write",
 			obs: func() mqttSlotObservation {
@@ -115,13 +115,13 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			disp: mqttSlotDispAdoptLandedWrite,
 		},
 		{
-			// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 7): a pure cancellation was
+			// RE-EXPRESSED by issue #99/issue #90 (plan rev 10, WP3 edit 7): a pure cancellation was
 			// reaped on its Cancelled bit alone, the deleted premise. It is reaped only when its
 			// own marker STANDS (a genuine never-transmitted cancellation).
 			name: "a pure cancellation tombstone whose marker stands is reaped",
 			obs: func() mqttSlotObservation {
 				cur := testSlotOccupant()
-				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+				cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: provenance is written
 				o := testSlotPresent(cur)
 				o.cancelMarker = mqttSlotMarkerPresent
 				return o
@@ -152,7 +152,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			disp: mqttSlotDispAbandon,
 		},
 		{
-			// F-088, consult C4 item 3: a positively identified PENDING FENCE is decided by its
+			// issue #90, consult C4 item 3: a positively identified PENDING FENCE is decided by its
 			// written provenance alone, whatever its marker (it has none), and reaped through
 			// its own disposal rule before the create is retried.
 			name: "a pending cancellation fence is reaped by provenance",
@@ -210,7 +210,7 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 			disp: mqttSlotDispReplace,
 		},
 		{
-			// F-105 7b: whether this connection may still replace it is its accepted
+			// issue #107 7b: whether this connection may still replace it is its accepted
 			// entitlement's question, compared inside opReplacePublish — never the stamp's.
 			name: "a same-delivery occupant under another object's claim stamp is replaced",
 			obs: func() mqttSlotObservation {
@@ -289,10 +289,10 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 		// tombstone records a delivery that was never transmitted, so our allocation IS the
 		// first transmission its freeing licensed — where replacing it would OVERWRITE the
 		// tombstone and destroy that evidence without a confirmed delete. RE-EXPRESSED by
-		// F-097/F-088 (WP3 edit 7): "never transmitted" is established by the occupant's
+		// issue #99/issue #90 (WP3 edit 7): "never transmitted" is established by the occupant's
 		// STANDING marker, not by the bit, so the fixture supplies that evidence.
 		cur := testSlotOccupant()
-		cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+		cur.Cancelled, cur.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: provenance is written
 		obs := testSlotPresent(cur)
 		obs.cancelMarker = mqttSlotMarkerPresent
 		got := mqttClassifyInflightSlot(obs, want)

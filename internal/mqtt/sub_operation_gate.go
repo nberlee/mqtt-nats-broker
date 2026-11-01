@@ -20,14 +20,14 @@ import (
 
 // Withholding a live SUBSCRIBE's deliveries until its shared interest is arbitrated.
 //
-// THE FINDING (F-078). A live SUBSCRIBE that installs or revives shared group delivery
-// interest serves under a membership it never revalidated. The consequence is F-077's, and
+// THE FINDING (issue #80). A live SUBSCRIBE that installs or revives shared group delivery
+// interest serves under a membership it never revalidated. The consequence is issue #79's, and
 // "serves" includes ACKNOWLEDGING: the QoS 1/2 callback acks and drops on a reserved-subject
 // violation, on a subscribe deny, on No Local suppression, and delivers-and-acks a shared
 // QoS 0 member. Each destroys a group message for the members that legitimately hold the
 // membership.
 //
-// F-077 closed the CONNECT/resume path with one classified record write. That path needs no
+// issue #79 closed the CONNECT/resume path with one classified record write. That path needs no
 // transmission gate because the RESTORE gate already withholds everything until the CONNACK.
 // A live connection has no such window — its restore gate is already open — so the ownership
 // write needs a gate of its own, scoped to the packet that owes it.
@@ -35,7 +35,7 @@ import (
 // WHY NOT A PER-SUBSCRIPTION FLAG. A shared QoS 2 SUBSCRIBE provisions the PUBREL and affine
 // subscriptions BEFORE processSharedJSConsumer, and ensurePubRelConsumerSubscription installs
 // its delivery subscription with a bare c.processSub whose NATS handler goes live BEFORE
-// processSub returns. There is no subscription to hang a flag on. That is F-050's first
+// processSub returns. There is no subscription to hang a flag on. That is issue #54's first
 // refutation and it applies here unchanged; do not re-propose an mqttSub field.
 //
 // WHY NOT THE RESTORE GATE'S SHAPE. Two differences are load-bearing:
@@ -102,7 +102,7 @@ func mqttFiltersCarryShared(filters []*mqttFilter) bool {
 // stack and returned to it. Never a field on mqttSession: a fact parked there outlives the
 // operation that raised it and would govern the next one.
 type mqttSubPacketFacts struct {
-	// interestRestored is F-077's arbitration trigger, inherited unchanged: this packet
+	// interestRestored is issue #79's arbitration trigger, inherited unchanged: this packet
 	// installed, repaired, adopted or REFRESHED shared delivery interest. Every one of
 	// those re-authorises delivery under a membership the operation has not revalidated,
 	// which is why the trigger is "interest was touched" rather than "a durable was
@@ -126,7 +126,7 @@ type mqttSubPacketFacts struct {
 	// write", and that was wrong in a way only the full suite could show: it converted an
 	// ordinary per-filter failure — an affine provisioning save that could not persist —
 	// into a connection-level refusal, breaking contracts owned by the affine items rather
-	// than by F-078. The distinction is evidential:
+	// than by issue #80. The distinction is evidential:
 	//
 	//   - a CAS rejection means the expected-sequence write was REFUSED, which is positive
 	//     evidence that the subject moved;
@@ -186,7 +186,7 @@ type mqttSubPacketFacts struct {
 // packet installed nothing, so its open releases only traffic backed by interest predating
 // the packet, and withholding that would break the affine items' per-filter contract.
 //
-// LIVE SUBSCRIBE ONLY. The CONNECT restore path deliberately keeps F-077's narrower trigger
+// LIVE SUBSCRIBE ONLY. The CONNECT restore path deliberately keeps issue #79's narrower trigger
 // (interestRestored alone): a record write that fails there already refuses the CONNECT —
 // through the returned error, or through mqttFirstUnrestoredFilter for the arm that converts
 // it to a per-filter code — so nothing is served meanwhile and the wider predicate would only
@@ -322,8 +322,8 @@ func (sess *mqttSession) subGateFor(cc *client) *mqttSubGate {
 // is then descheduled before its irreversible send cannot observe a gate armed in between.
 // That escape is bounded to interest that PREDATES the packet — arming happens before the
 // packet installs anything — so it never covers interest the packet is about to install,
-// which is the only thing F-078 authorises. docs/CONFORMANCE.md carries it with a worked
-// interleaving. Closing it entirely needs a real callback-admission boundary, which F-050
+// which is the only thing issue #80 authorises. docs/CONFORMANCE.md carries it with a worked
+// interleaving. Closing it entirely needs a real callback-admission boundary, which issue #54
 // already declined to justify and whose cheap form it refuted outright.
 //
 // Callers must hold NO session lock: the packet's goroutine needs sess.mu to finish, and
@@ -352,7 +352,7 @@ func (sess *mqttSession) awaitTransmissionGatesThen(cc *client, beforeWait func(
 	// that has nothing to do with the contender. Closing is the incarnation this
 	// CONNECTION was admitted under, so the answer is the same one an armed gate
 	// gives: WITHHELD, which the caller records without acking, keeping the eventual
-	// redelivery a first transmission (F-036 unit 1).
+	// redelivery a first transmission (issue #40 unit 1).
 	var closing <-chan struct{}
 	if cc != nil && cc.mqtt != nil && cc.mqtt.tracker != nil {
 		closing = cc.mqtt.tracker.closingSignal()
@@ -496,7 +496,7 @@ func (sess *mqttSession) subGateBlocksQoS0(cc *client) bool {
 // no-op: it still detaches, clears or purges, saves the disconnect time and schedules
 // expiry.
 //
-// THE FOREIGN ARM USES THIS TOO, since F-084. It used to discard instead, on the reasoning
+// THE FOREIGN ARM USES THIS TOO, since issue #86. It used to discard instead, on the reasoning
 // that a takeover owns the Will's fate — but that arm demonstrates no takeover, only that
 // the record is not ours, so suppressing there was silent loss. The discard is now reached
 // only from a displacement this broker holds both ends of, and only for an armed Will
@@ -523,7 +523,7 @@ func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *
 	// so a value sampled here could be stale by the time the Will is claimed — and it
 	// decides whether the Will is due now or after a delay, and whether that delay is
 	// capped. Reading sess.expiryInterval was doubly wrong: a replacement connection may
-	// already have overwritten it (see mqttSessionExpiry). F-084.
+	// already have overwritten it (see mqttSessionExpiry). issue #86.
 	c.srv.mqttHandleWill(c, nil, sessGen, originSessionSeq, asm.sessStreamEpoch)
 }
 
@@ -536,7 +536,7 @@ func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *
 // enqueueDelayedWill a zero origin sequence, which its validation refuses — so the delay
 // would be sacrificed and the Will published immediately, for a session that had merely
 // failed to tear itself down. The fence carries the RETIRING incarnation's identity, which
-// is the one the Will actually belongs to. F-084.
+// is the one the Will actually belongs to. issue #86.
 //
 // It carries the IDENTITY only. The Session Expiry Interval is deliberately not part of it:
 // that is connection-owned and stays mutable, so it is read under the lock that consumes
@@ -622,7 +622,7 @@ func (c *client) mqttSettleLiveArbitration(asm *mqttAccountSessionManager, sess 
 		// The resolver found a record that is not ours. Same DISPOSITION as the direct arm
 		// and for the same reason — this object may not write and must not serve — but the
 		// Will is CONSUMED, not discarded: nothing here demonstrated a successor, which is
-		// exactly what the forked arm below already says of itself. F-084.
+		// exactly what the forked arm below already says of itself. issue #86.
 		//
 		// Phase 1, then the transaction, then the Will: the consume does JetStream work and
 		// the fence cannot be held across it, and the ownership gate is still held, which is

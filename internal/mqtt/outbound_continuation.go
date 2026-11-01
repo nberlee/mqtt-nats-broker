@@ -15,7 +15,7 @@ package mqtt
 
 import "fmt"
 
-// What a recovery pass owes an outstanding duty (F-105, row 6).
+// What a recovery pass owes an outstanding duty (issue #107, row 6).
 //
 // The sweep establishes WHICH ordinals are outstanding. This establishes WHAT each one owes, and
 // it is deliberately a classifier rather than an executor — the same split, and for the same
@@ -123,7 +123,7 @@ const (
 	// Owed: act on the EXACT incarnation and classify the result. An exact-sequence delete
 	// returning success is not a completed cleanup.
 	mqttDutyWorkCleanup
-	// The four kinds of a DISCARDED generation's retirement (F-105 7d), each licensed by the
+	// The four kinds of a DISCARDED generation's retirement (issue #107 7d), each licensed by the
 	// generation's committed discarding closure rather than by an entitlement:
 	//
 	// mqttDutyWorkDiscardEnd: an obligation that has not released its holds is ended
@@ -172,7 +172,7 @@ type mqttDutyVerdict struct {
 
 // classifyOutstandingDutyIn is the classification for a generation whose closure the caller read.
 //
-// discarded says that committed closure DISCARDS, read once per visit (F-105 7d): a discarded
+// discarded says that committed closure DISCARDS, read once per visit (issue #107 7d): a discarded
 // generation owes its retirement rather than its protocol, and a live or preserved one classifies
 // by its protocol.
 func (jsa *mqttJSA) classifyOutstandingDutyIn(id, epoch, gen string, discarded bool, d *mqttDutyEntry) mqttDutyVerdict {
@@ -310,7 +310,7 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, discarded bool, 
 	// LIVE. What is owed depends on whether the resource is authorizable at all, and the two
 	// answers are kept apart because only one of them is work.
 	if len(r.Deps) > 0 {
-		// In a DISCARDED generation too (F-105 7d): its holders are found and ended through their
+		// In a DISCARDED generation too (issue #107 7d): its holders are found and ended through their
 		// own exchange duties — every admitted obligation has one in its generation, which the
 		// boundary's coverage rule enforces, and the census reaches it even once resolved — so the
 		// resource waits for them rather than being a second route to them.
@@ -334,7 +334,7 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, discarded bool, 
 		}
 	}
 	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil && discarded {
-		// ENDED WITH ITS GENERATION (F-105 7d). The closure that discarded the generation is the
+		// ENDED WITH ITS GENERATION (issue #107 7d). The closure that discarded the generation is the
 		// decision no route of it can take any more; recording it is owed.
 		return mqttDutyVerdict{
 			Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDispose,
@@ -342,7 +342,7 @@ func (jsa *mqttJSA) classifyResourceDuty(id, epoch, gen string, discarded bool, 
 		}
 	}
 	if mqttResourceLogicalUseKind(r.Kind) && r.Disposal == nil {
-		// SERVING, NOT ABANDONED (F-105 7c-lc). Zero dependents is also what an idle subscription
+		// SERVING, NOT ABANDONED (issue #107 7c-lc). Zero dependents is also what an idle subscription
 		// looks like between two messages; nothing here may end a consumer no route ended. The
 		// disposal decision is the route's, and until it stands the cleanup is not actionable.
 		return mqttDutyVerdict{

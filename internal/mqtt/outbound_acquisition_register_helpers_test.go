@@ -8,7 +8,7 @@ import (
 )
 
 // testF105PrepareTokenBase readies the register an acquisition of act will install its token on,
-// in the state the protocol steps a fixture skipped would have left it (F-105 row 2: an acquisition
+// in the state the protocol steps a fixture skipped would have left it (issue #107 row 2: an acquisition
 // is the token AND the record, so a hand-built one needs the register too). It never writes through
 // the authority boundary: the fixture is standing in for the admission, the drain of an earlier
 // acquisition, or the PUBREC-and-rebind it did not run.

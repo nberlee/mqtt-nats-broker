@@ -27,7 +27,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-097 WP4 (plan rev 20): the autonomous custody reconciliation driver. T2 - T2i.
+// issue #99 WP4 (plan rev 20): the autonomous custody reconciliation driver. T2 - T2i.
 
 // testDriverRec records one session's dispatcher activity through its seams.
 type testDriverRec struct {
@@ -701,7 +701,7 @@ func TestF097DispatcherIsFairUnderContinuousHints(t *testing.T) {
 		defer rec.mu.Unlock()
 		return rec.iterations >= 2
 	})
-	// THE WINDOW IS MEASURED FROM WHAT RAN (F-123). The dispatcher is parked inside its iteration
+	// THE WINDOW IS MEASURED FROM WHAT RAN (issue #125). The dispatcher is parked inside its iteration
 	// seam, which it reaches after selecting that iteration's units and holding no lock; the item
 	// and the gate request are registered while it is parked, so the parked iteration is the last
 	// one whose units were chosen without them. Completion is then read from execution, not from
@@ -1275,7 +1275,7 @@ func testDriverTimerRegistered(srv *Server, key string) bool {
 	return ok
 }
 
-// W-tick (F-097, consult C8 (2)). A run the tick started that exits while the tick's callback is
+// W-tick (issue #99, consult C8 (2)). A run the tick started that exits while the tick's callback is
 // still inside it - the firing timer still registered under its key - re-arms a tick of its own
 // for its outstanding item, and that arm retries the item with no other trigger. Witness: the
 // tick's callback is held after it reached the start site until the run it spawned has exited
@@ -1367,7 +1367,7 @@ func TestF097DriverTickRearmsWhileItsCallbackRuns(t *testing.T) {
 	testDriverP2(t, sess, srv)
 }
 
-// H-3 (F-097 holistic round 3; lifecycle matrix E14). A census that observes an exchange ended
+// H-3 (issue #99 holistic round 3; lifecycle matrix E14). A census that observes an exchange ended
 // retires the exchange's read retry: A's failed observation installs its retry, the store
 // recovers, and the resume's census observes A ended and removes its holder while the retry still
 // stands, not yet due. The retry's next run finds nothing left to observe and ends it, and the
@@ -1435,7 +1435,7 @@ func TestF097DriverCensusEndedExchangeRetiresItsRetry(t *testing.T) {
 	testDriverP2(t, sess, f.e.s)
 }
 
-// H-4 (F-097 holistic round 4; lifecycle matrix RETIREMENT). An owed withdrawal whose own attempt
+// H-4 (issue #99 holistic round 4; lifecycle matrix RETIREMENT). An owed withdrawal whose own attempt
 // COMMITTED retires once its exchange reads ended. The door's withdrawal lands while its response
 // is lost and its resolve-abort-resolve cannot be read (Unresolved), so the withdrawal is owed;
 // the store then answers while the cancellation tombstone stands with the same allocation and
@@ -1584,7 +1584,7 @@ func TestF097ContinuityOfAnAbandonedDeliveryRetires(t *testing.T) {
 	testDriverP2(t, sess, f.e.s)
 }
 
-// C10 (F-097 holistic round 5, H-5; lifecycle matrix RETIREMENT, W row). An owed withdrawal whose
+// C10 (issue #99 holistic round 5, H-5; lifecycle matrix RETIREMENT, W row). An owed withdrawal whose
 // exchange's delivery was ABANDONED retires at its next unit, and only the item retires. The deny
 // of a restored entry (releaseTransmittedIdentifier) abandons the delivery while its register
 // stands as the disposal record, with the same allocation and lineage; a withdrawal owed over it
@@ -1752,7 +1752,7 @@ func testF097OwedWithdrawalDutyEnded(t *testing.T, clientID string, discard bool
 	}
 }
 
-// W-tick, generation discard (F-097, consult C8 (2)). Discarding the generation cancels the armed
+// W-tick, generation discard (issue #99, consult C8 (2)). Discarding the generation cancels the armed
 // tick by the arm's STORED key: a tick armed far in the future is unregistered by the clear, not
 // left to fire into a generation that no longer stands.
 //
@@ -1801,7 +1801,7 @@ func TestF097DriverGenerationDiscardCancelsTheArmedTick(t *testing.T) {
 	testDriverP2(t, sess, srv)
 }
 
-// W-demand (F-097, consult C8 (3)). A latched demand's deadline stands until it is consumed:
+// W-demand (issue #99, consult C8 (3)). A latched demand's deadline stands until it is consumed:
 // runs that hints start and that exit before it neither move it nor back the demand off, and the
 // demand's pass is requested AT that first deadline although hints keep arriving. The request is
 // observed where the deadline becomes a pass (the demandDue seam), so hint processing alone
@@ -1972,7 +1972,7 @@ func testF097ExitTakesItem(t *testing.T, clientID string, kind mqttCustodyUnitKi
 	testDriverP2(t, sess, f.e.s)
 }
 
-// W-exit, owed withdrawal (F-097, H-1). An owed withdrawal recorded after a run's last look and
+// W-exit, owed withdrawal (issue #99, H-1). An owed withdrawal recorded after a run's last look and
 // before its exit is taken by that run: the recorder starts nothing while the flag stands, so the
 // exit is the only thing that can.
 //
@@ -1995,7 +1995,7 @@ func TestF097DriverExitTakesARecordedWithdrawal(t *testing.T) {
 		})
 }
 
-// W-exit, a run that may not continue (F-097, H-1). A run whose captured identity no longer holds
+// W-exit, a run that may not continue (issue #99, H-1). A run whose captured identity no longer holds
 // exits without continuing; an owed withdrawal recorded while its flag stood (zero eligibility)
 // must still leave a tick armed, and that tick's run withdraws it. The run's flag is held by the
 // fixture and its exit is the one a nil-ledger iteration takes.
@@ -2039,7 +2039,7 @@ func TestF097DriverExitThatMayNotContinueArmsADueItem(t *testing.T) {
 	testDriverP2(t, sess, srv)
 }
 
-// W-exit, admission continuity (F-097, H-1). The same window for an admission continuity record.
+// W-exit, admission continuity (issue #99, H-1). The same window for an admission continuity record.
 //
 // Mutations: as TestF097DriverExitTakesARecordedWithdrawal.
 func TestF097DriverExitTakesARecordedContinuity(t *testing.T) {
@@ -2128,7 +2128,7 @@ func testDriverBusyRun(t *testing.T, clientID string) *testDriverBusy {
 	return b
 }
 
-// W-retire (F-097, holistic H-2). A run whose queue never empties does not hold its incarnation
+// W-retire (issue #99, holistic H-2). A run whose queue never empties does not hold its incarnation
 // against a retirement: once the incarnation is closing, the run stops between units, releases
 // its lease and leaves its work queued. Witness: the busy run's incarnation is closed; it drains
 // within the bound after at most the unit in flight, the hint is still queued, and no run starts
@@ -2163,7 +2163,7 @@ func TestF097DriverRetirementStopsABusyRun(t *testing.T) {
 	testDriverP2(t, sess, b.f.e.s)
 }
 
-// W-retire, the clean start (F-097, holistic H-2). The retirement the finding names completes: a
+// W-retire, the clean start (issue #99, holistic H-2). The retirement the finding names completes: a
 // Clean Start's discard of the busy run's session drains within its ceiling and re-mints the
 // generation, although the run's queue never empties.
 //
@@ -2198,7 +2198,7 @@ func TestF097DriverCleanStartRetiresABusyRun(t *testing.T) {
 	testDriverP2(t, sess, b.f.e.s)
 }
 
-// W-requeue (F-097, holistic H-2; lifecycle matrix G1). An ABORTED retirement loses nothing the
+// W-requeue (issue #99, holistic H-2; lifecycle matrix G1). An ABORTED retirement loses nothing the
 // stopped run had taken. The run's one iteration took two hints; the incarnation closed while the
 // first unit was in flight, and the run stopped before the second. That hint is back in its
 // queue, is not dispatched while the incarnation is closing, and is dispatched once the
@@ -2288,7 +2288,7 @@ func TestF097DriverAbortedRetirementRunsTheRequeuedUnit(t *testing.T) {
 	testDriverP2(t, sess, f.e.s)
 }
 
-// W-census (F-097, lifecycle matrix G2). A census owed ALONE survives an aborted retirement. Its
+// W-census (issue #99, lifecycle matrix G2). A census owed ALONE survives an aborted retirement. Its
 // only arm is the tick; that tick fires while the incarnation is closing and its start is refused
 // at the lease, so the reopen must count the census as owed work.
 //
@@ -2358,7 +2358,7 @@ func TestF097DriverReopenRearmsAnOwedCensus(t *testing.T) {
 	testDriverP2(t, sess, srv)
 }
 
-// W-exit, a hint (F-097, lifecycle matrix G3). A hint recorded while a run's flag stood, at an
+// W-exit, a hint (issue #99, lifecycle matrix G3). A hint recorded while a run's flag stood, at an
 // exit that may not continue (a nil-ledger exit: the run's epoch moved), is left armed: a hint has
 // no eligibility of its own, so the exit arms a tick for now and that tick's run observes it. The
 // run's flag is held by the fixture.

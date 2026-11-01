@@ -15,7 +15,7 @@ package mqtt
 
 import "fmt"
 
-// Exchange-owned custody and capacity (F-105, absorbing F-106).
+// Exchange-owned custody and capacity (issue #107, absorbing issue #108).
 //
 // THE DEFECT: capacity is derived from the scheduling maps. qos12InflightForCap counts
 // pendingPublish and, at Receive Maximum, pendingPubRel — so REMOVING A MAP ENTRY RELEASES
@@ -82,7 +82,7 @@ func mqttExchangeCharge(x *mqttOutboundExchange, outstanding bool) (mqttChargeDi
 		return mqttChargeHeldPendingDrain, nil
 	case mqttExchangeTerminal, mqttExchangeRejected, mqttExchangeSupersededUnsent,
 		mqttExchangeWithdrawnUnsent, mqttExchangeDeliveryAbandoned, mqttExchangeDiscarded:
-		// A DISCARDED generation's obligation (F-105 7d) releases its charge on the authorized
+		// A DISCARDED generation's obligation (issue #107 7d) releases its charge on the authorized
 		// discard ground — no connection of that generation will send it — and like every other
 		// arm here only once nothing can still emit. The IDENTIFIER does not follow: Discarded is
 		// not an ending (mqttCustodyDisposition reads mqttExchangePhaseEnded), so a discard

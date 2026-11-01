@@ -81,7 +81,7 @@ func TestInflightSlotShapeMatrix(t *testing.T) {
 		{"nonce of the wrong length", func(r *mqttInflightRecord) { r.Nonce = "short" }, false},
 		{"QoS neither 1 nor 2", func(r *mqttInflightRecord) { r.QoS = 3 }, false},
 		{"publish marked retired", func(r *mqttInflightRecord) { r.Retired = true }, true},
-		// F-088 (consult C4): a cancellation is supported only WITH its written provenance;
+		// issue #90 (consult C4): a cancellation is supported only WITH its written provenance;
 		// the provenance-less form is now an unsupported shape (refused, never migrated).
 		{"publish cancelled over an occupant", func(r *mqttInflightRecord) {
 			r.Cancelled, r.CancelOrigin = true, mqttCancelOriginOccupant
@@ -368,7 +368,7 @@ func TestInflightRecordKeySetIsDerivedFromTheStruct(t *testing.T) {
 		PI: 7, Dur: "d", Seq: 41, QoS: 2, Nonce: "xxxxxxxxxxxxxxxxxxxxxx",
 		State: mqttInflightPublish, Claim: "c", ClaimSeq: 3,
 		Q2AffClaim: "a", Q2AffCopy: "b", Retired: true, Cancelled: true,
-		CancelOrigin: mqttCancelOriginOccupant, // F-088: the provenance member marshals too
+		CancelOrigin: mqttCancelOriginOccupant, // issue #90: the provenance member marshals too
 		ActionToken:  "t", ActionClaim: "c", ActionClaimSeq: 3,
 		PubRelDurable: "pd", PubRelStreamSeq: 9,
 	}))
@@ -668,9 +668,9 @@ func TestMarkerLessDrainIntentQuarantineSurvivesSubscribeCycles(t *testing.T) {
 // direction: a drain carrying NO past-PUBREC intent must not be held, or an ordinary
 // re-SUBSCRIBE would be refused and the fix would be worse than the defect.
 //
-// The fixture's premise CHANGED with F-094 and the change is the point. It used to build
+// The fixture's premise CHANGED with issue #96 and the change is the point. It used to build
 // this "ordinary" drain with a claimed valid intent — {PubRel: true, PI: 7, OwnerNonce} —
-// and assert that it adopts. That is exactly the adoption F-094 says must not happen: it
+// and assert that it adopts. That is exactly the adoption issue #96 says must not happen: it
 // drops the drain and its whole seqs map, after which the unacknowledged source is re-offered
 // on the ordinary path as a fresh PUBLISH of an exchange the client has already answered.
 // So the intent case moved to TestAdoptionRefusedWhileADrainCarriesAPastPubRecIntent and
@@ -732,7 +732,7 @@ func TestQuarantineRefusesEverySidOfAWildcardFilter(t *testing.T) {
 		t.Fatalf("mqttUnsubSids(%q) = %v, want the main sid and its companion", mainSid, sids)
 	}
 
-	// A PUBLISH-phase claim, deliberately. Before F-094 this drain carried a valid claimed
+	// A PUBLISH-phase claim, deliberately. Before issue #96 this drain carried a valid claimed
 	// intent and the test asserted it was NOT quarantined; the widened hold makes every
 	// past-PUBREC intent hold its sid, so that fixture would now be held for its own reason
 	// and the companion would prove nothing. The subject here is wildcard ATOMICITY — a
@@ -1038,7 +1038,7 @@ func TestStoredPubRelConsumersAllConsultTheVerdict(t *testing.T) {
 	}
 }
 
-// A MANDATORY REGISTER MEMBER MAY NOT BE NULL (F-098 compatibility boundary, holistic review
+// A MANDATORY REGISTER MEMBER MAY NOT BE NULL (issue #100 compatibility boundary, holistic review
 // round 6, finding 5). The presence walk accepted `"acq":null`, and the typed decode then turns
 // it into the zero value — which for the transmission counter is a REAL value, the one a fresh
 // allocation carries. An unsupported record would be handed a new exchange's identity, and the

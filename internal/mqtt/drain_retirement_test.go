@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// F-094's release side. The hold is unqualified — every past-PUBREC intent owns its sid —
+// issue #96's release side. The hold is unqualified — every past-PUBREC intent owns its sid —
 // so the hold lasts exactly as long as the DRAIN OBJECT does, and these pin that the drain
 // can always be retired.
 //
@@ -29,7 +29,7 @@ import (
 // keyed on that entry, so nothing could ever retire such a drain.
 //
 // NOTE ON SCOPE, so a later reader does not mistake what these prove: these are about the
-// sid RELEASE, which is F-094's side. The disposal half — the delivery barrier applied with
+// sid RELEASE, which is issue #96's side. The disposal half — the delivery barrier applied with
 // the map drop, the terminal per-object flag, and the classified consumer delete — is pinned
 // by drain_disposal_test.go, and the guarantee it establishes is scoped to this drain object
 // within this resident session object's lifetime (docs/CONFORMANCE.md).
@@ -57,7 +57,7 @@ func realDrainConsumer(t *testing.T, sess *mqttSession, durable, filter string) 
 	return &cfg
 }
 
-// testProvisionDrainSourceOwnership claims the F-105 source name-ownership for a drain fixture's
+// testProvisionDrainSourceOwnership claims the issue #107 source name-ownership for a drain fixture's
 // durable, so that a delivery on it can be ADMITTED through the outbound obligation authority
 // (admitInflightPublish's readiness proves LIVE ownership before it admits). Best-effort: a
 // fixture with no serving authority does not exercise the converted admission path, and a name

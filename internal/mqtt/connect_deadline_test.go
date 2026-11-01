@@ -450,7 +450,7 @@ func TestMQTTConnectAdmissionArbitration(t *testing.T) {
 		}
 	})
 
-	// The clock arms (F-074). A deadline that was never armed has nothing to compare, so a
+	// The clock arms (issue #77). A deadline that was never armed has nothing to compare, so a
 	// bare fixture is admitted; a recorded deadline already passed refuses even though no
 	// callback ran, and makes the expiry transition itself; one still ahead admits.
 	t.Run("never armed is admitted", func(t *testing.T) {
@@ -589,7 +589,7 @@ func awaitNoClients(t testing.TB, s *Server) {
 	}
 }
 
-// TestMQTTConnectRefusedOnceTheWindowElapsedBeforeTheCallbackRan is F-074's witness: the
+// TestMQTTConnectRefusedOnceTheWindowElapsedBeforeTheCallbackRan is issue #77's witness: the
 // deadline's callback is LATE -- parked before it takes c.mu, so the CONNECT path cannot
 // know -- and a CONNECT arriving after the window must still be refused. Before the fix
 // admission only asked whether the callback had already run, so this CONNECT was served.

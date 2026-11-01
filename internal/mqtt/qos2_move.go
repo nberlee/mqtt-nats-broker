@@ -21,7 +21,7 @@
 // No silent loss on any PUBREL path **of a session whose ownership has not moved
 // under it**, and none inflicted from outside by a teardown of an incarnation a peer
 // is still serving either: every hold removal now carries a durable bound on what its
-// remover was entitled to destroy (F-062). Once the terminal state commits, suppression
+// remover was entitled to destroy (issue #66). Once the terminal state commits, suppression
 // of re-delivery is indefinite and independent of the deduplication window, the
 // broker's lifetime, and the nats-server's. Across the *unresolved* interval
 // between the onward store and that commit, the durable (QoS 1/2 subscriber) path
@@ -31,8 +31,8 @@
 //
 // A teardown running for an incarnation a peer is still serving could lose an
 // acknowledged PUBLISH from outside this exchange. It no longer can: the bound each
-// removal carries, and the fence a discard marker records, are stated once in F-062
-// (docs/findings/ha-arbitration.md).
+// removal carries, and the fence a discard marker records, are stated once in issue #66
+// (https://github.com/nberlee/mqtt-nats-broker/issues/131).
 //
 // Do not restate this as "exactly-once across nats-server restart". It is not.
 //
@@ -82,7 +82,7 @@
 // reported to the client until it is confirmed (invariant 3; terminal tombstone
 // cleanup stays asynchronous by invariant 4). Loss inflicted from OUTSIDE the
 // exchange, by a teardown for an incarnation a peer is still serving, is eliminated
-// too — F-062 bounded every hold removal to what its remover could prove it was
+// too — issue #66 bounded every hold removal to what its remover could prove it was
 // entitled to destroy, and put that bound in the marker a discard leaves behind.
 // What remains here:
 //
@@ -104,7 +104,7 @@
 //     completed. The delivery DECISION is now arbitrated against a session discard
 //     by a create-only claim taken before the onward store (qos2_release_claim.go),
 //     so a discard that observes no claim on a hold it ENUMERATED is not followed by a
-//     delivery of that hold. What the enumeration does not cover is F-036's; see the
+//     delivery of that hold. What the enumeration does not cover is issue #40's; see the
 //     dossier rather than a restatement here. The
 //     wire is not ordered by it: a releaser that claimed first is committed, and
 //     its live fan-out may land after the discard released the session record. A
@@ -703,7 +703,7 @@ func validateQoS2InStream(si *StreamInfo, wantReplicas int, bundleEpoch string) 
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
 	// what makes the ten broker-owned streams one recreation unit rather than ten
-	// independently recoverable stores (F-066).
+	// independently recoverable stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
 	}

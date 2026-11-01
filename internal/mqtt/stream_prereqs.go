@@ -214,7 +214,7 @@ func ensureBrokerStream(api brokerStreamAPI, cfg *StreamConfig,
 // ConsumerLimits.InactiveThreshold is deliberately NOT checked: it can be imposed AFTER
 // startup, so a startup check would cover nothing a runtime one does not, and the paths
 // that cannot tolerate it refuse it at runtime — admission against a source consumer
-// (readiness checks the stream limit and the consumer's effective threshold, F-105 7c-lc),
+// (readiness checks the stream limit and the consumer's effective threshold, issue #107 7c-lc),
 // a drain (whether an UNSUBSCRIBE or a QoS 0 downgrade created it) and the shared/affine
 // consumers (drainingAllowed in unsub_drain.go; the shared-subscription guard), with the
 // supported-configuration boundary recorded in docs/CONFORMANCE.md. The same field IS fatal on
@@ -277,7 +277,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleE
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
 	// what makes the ten broker-owned streams one recreation unit rather than ten
-	// independently recoverable stores (F-066).
+	// independently recoverable stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
 	}
@@ -352,7 +352,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
 	// what makes the ten broker-owned streams one recreation unit rather than ten
-	// independently recoverable stores (F-066).
+	// independently recoverable stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
 	}
@@ -368,7 +368,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 // different value belongs to a different incarnation of the bundle: its records
 // persist identities — sequences, consumer durables, subjects — that other
 // streams issued and that a recreation has since reissued to unrelated state
-// (docs/ARCHITECTURE.md, "Stream prerequisites"; F-066).
+// (docs/ARCHITECTURE.md, "Stream prerequisites"; issue #70).
 //
 // wantEpoch is checked FIRST and a malformed or empty one is itself the
 // refusal, never a wildcard that admits anything. That direction is the whole
@@ -396,7 +396,7 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // It exists because ensureBrokerStream cannot enforce this: that helper sees one
 // stream and CREATES it when the lookup says absent, so by the time any
 // validator runs the missing member has already been provisioned — silently
-// re-establishing the partial-recreation hazard F-066 records. The comparison
+// re-establishing the partial-recreation hazard issue #70 records. The comparison
 // has to happen where all ten are visible and nothing has been created yet.
 //
 // The names come from the SAME spec table the provisioning loop iterates, never
@@ -679,7 +679,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 	// the guidance here carries only the verdict and the recovery. The recovery is
 	// the WHOLE BUNDLE, never this stream alone: records on each of the ten
 	// persist identities the others issue, so recreating a proper subset leaves
-	// stale references matching new unrelated state (F-066). Startup refuses a
+	// stale references matching new unrelated state (issue #70). Startup refuses a
 	// proper subset outright (mqttPreflightBrokerStreamBundle), so guidance naming
 	// one stream would prescribe a procedure the next start rejects.
 	stopAll := func(verr error, stream, req string) error {
@@ -717,7 +717,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		Name: mqttSessStreamName,
 		// FOUR subject spaces, one stream: the session records, the permanent
 		// per-CONNECT acceptance facts an accepted CONNECT commits atomically WITH
-		// its record, the permanent handoff outcomes F-105's ownership handoff
+		// its record, the permanent handoff outcomes issue #107's ownership handoff
 		// commits in that same batch, and the per-generation teardown receipts a
 		// discarding teardown commits with its marker. All four are top-level rather than nested
 		// under "sess.", because every session walk filters "sess.<domainTk>>" and
@@ -994,7 +994,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		{
 			name: mqttSharedLifecycleStreamName,
 			txt:  "shared-group lifecycle",
-			// Shared-group lifecycle records (F-105 transfer): one group record per
+			// Shared-group lifecycle records (issue #107 transfer): one group record per
 			// group, CAS-arbitrated, and one acquisition ledger per session generation,
 			// sealed by the closing. Its own stream rather than $MQTT_inflight: a
 			// permanent record co-located with the in-flight registers keeps their
@@ -1052,7 +1052,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 // ordering; what it buys is that "no consumer is created until every stream has
 // validated" is checkable at one call site instead of by auditing ten table
 // entries, and that the provisioning table itself performs no durable mutation
-// beyond the stream creates ensureBrokerStream makes (F-066).
+// beyond the stream creates ensureBrokerStream makes (issue #70).
 //
 // What bounds the leak is no longer atomicity but the DERIVED name: both consumers
 // are named from this server run's identity, so an initialization retry asks for the

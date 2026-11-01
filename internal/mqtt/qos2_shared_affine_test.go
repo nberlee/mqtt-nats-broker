@@ -458,7 +458,7 @@ func TestValidateOutStream(t *testing.T) {
 		{"wrong replicas", func(c *StreamConfig) { c.Replicas = 1 }},
 		{"max msg size", func(c *StreamConfig) { c.MaxMsgSize = 1024 }},
 		{"no ack", func(c *StreamConfig) { c.NoAck = true }},
-		// Since F-065 this owner DELETES an exact sequence here, to withdraw a copy no
+		// Since issue #69 this owner DELETES an exact sequence here, to withdraw a copy no
 		// claim of its incarnation can authorize. DenyDelete is therefore a CHANGED
 		// PREREQUISITE, not a weakened test: the fact the accepted table above used to
 		// assert — "this owner issues no delete on $MQTT_out" — has stopped being true, so
@@ -556,7 +556,7 @@ func TestQ2AffineFormMaxBoundsEveryRealRecord(t *testing.T) {
 // It is budgeted for the same reason the copy is, and the wedge is the mirror image:
 // a PUBLISH admitted at PUBREC time whose CLAIM cannot be stored means no election
 // can ever be won, so the group delivery is never acked and AckWait retries forever.
-// Nothing checked this before F-065 widened the record.
+// Nothing checked this before issue #69 widened the record.
 //
 // Paired mutation M15: omit the nonce from mqttQ2AffMaxIdentityWidths, or drop the
 // terminal shapes and budget only the election form. Either makes the bound fall

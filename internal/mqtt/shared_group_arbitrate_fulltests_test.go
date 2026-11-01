@@ -1,6 +1,6 @@
 //go:build mqtt_fulltests
 
-// End-to-end coverage for F-077 on the CONNECT/resume path.
+// End-to-end coverage for issue #79 on the CONNECT/resume path.
 //
 // Every test here has to reach the RESIDENT arm, for the reason
 // shared_group_verify_fulltests_test.go gives: a fresh connect finds no cons entry, takes
@@ -49,7 +49,7 @@ import (
 // Reason String says which. Returning it is what lets the callers assert that a shared
 // refusal says "ownership could not be confirmed" and never "session taken over by a new
 // connection" — the disposal vocabulary's text, which this site used to have no way of
-// sending and must still never send. See F-084.
+// sending and must still never send. See issue #86.
 func testSharedRefusalReason(t *testing.T, b *testSharedBroker, id string, expiry uint32) (net.Conn, byte, string, bool) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
@@ -90,7 +90,7 @@ func testSharedRefusalReason(t *testing.T, b *testSharedBroker, id string, expir
 	if props != nil && props.reasonString == mqttReasonStrSessionTakenOver {
 		t.Fatalf("a pre-CONNACK shared refusal told the client %q; nothing on this path "+
 			"establishes a takeover, and the disposal vocabulary's text must never reach "+
-			"the wire here (F-084)", props.reasonString)
+			"the wire here (issue #86)", props.reasonString)
 	}
 	// A DISPOSING refusal carries one of the two projections exactly. A local or unresolved
 	// one carries its own diagnostic instead, so only the disposing codes are constrained —
@@ -192,7 +192,7 @@ func TestMQTTSharedGroupOwnershipWriteRunsOnASharedResume(t *testing.T) {
 // Every durable is present and canonical, so the resume ADOPTS and creates nothing. The
 // arbitration must still happen, because adopting a configuration is not the same as owning
 // the membership it belongs to — that sentence is the whole finding, and
-// docs/ARCHITECTURE.md assigns it to F-077 by name.
+// docs/ARCHITECTURE.md assigns it to issue #79 by name.
 //
 // Kills M2 (trigger the write only when a create happened).
 func TestMQTTSharedGroupOwnershipWriteRunsWithoutAnyCreate(t *testing.T) {
@@ -242,7 +242,7 @@ func TestMQTTSharedGroupOwnershipWriteRunsWithoutAnyCreate(t *testing.T) {
 // rejected 10071, so this broker cannot confirm it still owns the record and must not
 // serve. Deliberately NOT "another broker owns it" — the rejection says the subject moved,
 // and the record this fixture lands establishes no successor at all, which is why the
-// refusal says only that ownership could not be confirmed. That inference is F-084's.
+// refusal says only that ownership could not be confirmed. That inference is issue #86's.
 //
 // It is deliberately built on a CREATE (the durable is deleted out of band first, so the
 // resume repairs it) rather than on a healthy resume, and for two reasons:
@@ -326,7 +326,7 @@ func TestMQTTSharedGroupForeignOwnershipRefusesTheResume(t *testing.T) {
 	// CONNACK reason code ([3.2.2.2]) — and, on this fixture, because nothing established a
 	// successor to project from in the first place: the record it lands establishes no
 	// ownership at all, which is why the refusal says only that ownership could not be
-	// confirmed. See F-084.
+	// confirmed. See issue #86.
 	if reason != mqttReasonImplementationSpecificError {
 		t.Fatalf("the 10071 refusal answered with reason %#x, want %#x: a pre-CONNACK refusal "+
 			"tells a v5 client why instead of closing in silence", reason,
@@ -597,7 +597,7 @@ func TestMQTTSharedGroupTriggerRollsBackWithItsFilter(t *testing.T) {
 // tmaxack + maxAckPending, a session sitting near the limit would be refused the repair on
 // the strength of a charge already counted inside tmaxack — and that refusal is permanent
 // for as long as the session stays near capacity, turning a recoverable absent durable back
-// into the F-076 dead end this item exists to end.
+// into the issue #78 dead end this item exists to end.
 //
 // The session is put deliberately close to the ceiling: two consumers at 30000 leave 5535
 // of the 65535 budget, so any recharge of 30000 would exceed it.

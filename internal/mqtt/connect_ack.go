@@ -240,7 +240,7 @@ const mqttReasonStrOwnershipUnconfirmed = "session ownership could not be confir
 //
 // That bundle's contract governs the DISCONNECT, its Reason String, the log line and
 // the close state, and its takeover text asserts a successor that most arms reaching
-// it never established — the class F-084 owns. The CONNACK is a separate projection
+// it never established — the class issue #86 owns. The CONNACK is a separate projection
 // onto a code [3.2.2.2] permits, and this type is the whole of it: no disposal
 // vocabulary is ever read on the way to the wire.
 type mqttPreConnackRefusal struct {
@@ -304,7 +304,7 @@ func mqttConnAckReasonFromConnectErr(err error) byte {
 }
 
 // mqttConnectRefusal is what an authentication or authorization refusal of a CONNECT tells
-// the client before the close (F-061): MQTT 3.1.1 [3.1.4] says the Server SHOULD send a
+// the client before the close (issue #65): MQTT 3.1.1 [3.1.4] says the Server SHOULD send a
 // failure CONNACK, 5.0 [3.1.4] that it MAY. Both codes are carried because the two
 // versions do not map one to one: a credential the server does not accept is 0x86 in 5.0
 // ([3.2.2.2]), while 3.1.1's nearest code, 0x04, is defined as MALFORMED credentials, so a

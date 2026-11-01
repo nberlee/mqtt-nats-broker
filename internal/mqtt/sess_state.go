@@ -35,10 +35,10 @@ type mqttSession struct {
 	c      *client
 	jsa    *mqttJSA
 	// retiringOwnerCID is the connection a two-phase retirement DETACHED before the
-	// re-mint (F-036 unit 1). Its F-089 send-hold debts — an unanswerable PUBCOMP, an
+	// re-mint (issue #40 unit 1). Its issue #91 send-hold debts — an unanswerable PUBCOMP, an
 	// unwritten retained frame — are still owed and still hold their identifiers: the
 	// displaced connection is closed on another goroutine, so its write can outlive
-	// the discard, which is why sendsInFlight survives it at all (F-087 WP5). Without
+	// the discard, which is why sendsInFlight survives it at all (issue #89 WP5). Without
 	// this the predicates would compare against a nil sess.c, read every one of those
 	// debts as inert, and let the fresh incarnation mint the same identifier.
 	// Cleared when the retiring owner's last hold goes, and at the next bind.
@@ -47,7 +47,7 @@ type mqttSession struct {
 	// ACK-only allocations are independent of scheduling and Receive Maximum.
 	// Both the index and its immutable values are protected by mu.
 	abandonedAcks map[mqttAbandonedAckIndex]*mqttAllocationAckBinding
-	// withdrawOwed is the owed withdrawals of the CURRENT generation, keyed by lineage (F-088,
+	// withdrawOwed is the owed withdrawals of the CURRENT generation, keyed by lineage (issue #90,
 	// outbound_withdraw_owed.go). Owned by the custody dispatcher; protected by mu; replaced
 	// with the generation.
 	withdrawOwed map[string]*mqttWithdrawOwed
@@ -56,23 +56,23 @@ type mqttSession struct {
 	// (outbound_acquisition_batch.go).
 	acquireSettleOwed map[*mqttAcquireSettleOwed]struct{}
 	// admissionContinuity refuses the offers of a source delivery whose abandoned admission may
-	// have landed (F-097 WP5, outbound_admit_continuity.go), keyed by (durable, sequence). Owned by
+	// have landed (issue #99 WP5, outbound_admit_continuity.go), keyed by (durable, sequence). Owned by
 	// the custody dispatcher; protected by mu; replaced with the generation.
 	admissionContinuity map[mqttDeferredKey]*mqttAdmissionContinuity
 	// Observes the installation boundary under mu, before either scheduling link goes.
 	testAbandonedAckInstalled func()
 	// testRetainedAfterAdmit runs in the retained driver after an admission landed and before the
-	// departure check and the transmission (F-105 7c). Nil outside tests; read under mu.
+	// departure check and the transmission (issue #107 7c). Nil outside tests; read under mu.
 	testRetainedAfterAdmit func(pi uint16)
 
 	// leases is the completion-ownership ledger of the CURRENT incarnation
-	// (F-036 unit 1; see sess_lease.go). Written only by setIncarnationLocked —
+	// (issue #40 unit 1; see sess_lease.go). Written only by setIncarnationLocked —
 	// a fresh tracker per incarnation — and read under sess.mu. Owners acquired
 	// against a retired tracker are refused, which is what stops a displaced
 	// route serving under a re-minted generation.
 	leases *mqttIncarnationTracker
 	// retiredGenProven memoizes the ONE retirement observation that is monotone
-	// (F-036 unit 2): a valid watermark naming this session's own generation. Once a
+	// (issue #40 unit 2): a valid watermark naming this session's own generation. Once a
 	// generation is retired it never becomes rightful again, and the single-slot
 	// watermark can lose the fact's DISCOVERABILITY but not the fact — so remembering
 	// it costs a release nothing and survives the slot being replaced.
@@ -146,7 +146,7 @@ type mqttSession struct {
 	//
 	// Guarded by mu; validity is the predicate recordRejectionPendingLocked, not the
 	// field alone. recordRejectedArmed is whether there IS a marker, which the sequence
-	// can no longer stand in for: a base-0 CAS is real since F-029, so zero is a
+	// can no longer stand in for: a base-0 CAS is real since issue #31, so zero is a
 	// legitimate rejection base rather than "none". See sess_rejected_write.go.
 	recordRejectedSeq   uint64
 	recordRejectedArmed bool
@@ -191,7 +191,7 @@ type mqttSession struct {
 	grantBody, grantBodyParent []byte
 
 	// forkFence is the outbound authority sequence fork repair sampled BEFORE it read whether the
-	// consumers it reinstates still serve (F-105 7f); zero when this pass reinstated none. The
+	// consumers it reinstates still serve (issue #107 7f); zero when this pass reinstated none. The
 	// accepting CONNECT's own handoff preparation CASes exactly it, so a disposal landing after the
 	// read moves the authority and refuses the accept rather than letting a decided consumer into
 	// the record. forkNotServing names the consumers that read refused, for the merge alone. Both
@@ -199,7 +199,7 @@ type mqttSession struct {
 	forkFence      uint64
 	forkNotServing map[string]struct{}
 	// boundEnt is the accepted entitlement of the connection most recently ACCEPTED on this
-	// session object (F-105 7b): set in the accept loop beside the connection's own
+	// session object (issue #107 7b): set in the accept loop beside the connection's own
 	// setOutboundEntitlement, kept across a normal detach (a detached close still acts for the
 	// session until a successor accepts), replaced only by the next accept. It is what a NEW
 	// void verdict is staged against (stageVoidVerdictLocked): the verdict map is
@@ -215,7 +215,7 @@ type mqttSession struct {
 	regClaim string
 
 	// pubRelRedrive is the identity-bound WAITER set for stored PUBRELs that admission
-	// refused because a PUBLISH action was still live on their slot (F-098).
+	// refused because a PUBLISH action was still live on their slot (issue #100).
 	//
 	// It exists because exclusion without a continuation is indistinguishable from a
 	// stall. The schedule is ordinary, not exotic: the PUBLISH bytes reach the client,
@@ -288,7 +288,7 @@ type mqttSession struct {
 	sharedCharged map[string]int
 	// sharedTenure is WHICH CONNECT of this generation may acquire shared group durables: the
 	// stream sequence of this acceptance's own create-only fact, and the authority tenure the
-	// acceptance was finalized under — one tenure, named on both streams (F-105 8b). Fixed for
+	// acceptance was finalized under — one tenure, named on both streams (issue #107 8b). Fixed for
 	// the connection; every join and fence it composes names exactly this, and every acceptance
 	// installs it on the generation's acquisition ledger before it reconciles or serves. See
 	// mqttSharedTenure and mintAcceptanceTenure.
@@ -304,7 +304,7 @@ type mqttSession struct {
 	// write is confirmed, and dropped only once the ledger read back no longer lists the
 	// acquisition. Guarded by mu.
 	acqReleases map[string]mqttSharedAcqRef
-	// verdictKick is the owner's re-trigger of a WITHHELD release (F-105 7e): which generation's
+	// verdictKick is the owner's re-trigger of a WITHHELD release (issue #107 7e): which generation's
 	// run is active and whether another dependant left source delivery while it ran. See
 	// shared_verdict_kick.go. Guarded by mu.
 	verdictKick mqttVerdictKick
@@ -395,7 +395,7 @@ type mqttSession struct {
 	// messages pending delivery to the session's client. It is NOT the whole of a
 	// PUBREL's identifier reservation: a PUBCOMP untracks the entry while a duplicate
 	// copy may still be unanswered, and sendsInFlight is what holds the identifier
-	// across that (F-089).
+	// across that (issue #91).
 	pendingPubRel map[uint16]*mqttPending
 	// pubCompOwed holds every PUBCOMP completion or terminal cleanup of an ORDINARY exchange that
 	// is not yet settled, keyed by identifier and exchange nonce. Owned by its completion worker
@@ -432,7 +432,7 @@ type mqttSession struct {
 	// retainedCleanups owns every retained terminal slot's cleanup until it completes
 	// (retained_terminal_cleanup.go).
 	retainedCleanups map[mqttTerminalSourceKey]*mqttRetainedCleanup
-	// retainedDriver executes the retained replay queues SUBSCRIBE transfers (F-105 7c), and
+	// retainedDriver executes the retained replay queues SUBSCRIBE transfers (issue #107 7c), and
 	// retainedReclaim reclaims their copies; each guards itself.
 	retainedDriver  mqttRetainedDriver
 	retainedReclaim mqttRetainedReclaim
@@ -448,11 +448,11 @@ type mqttSession struct {
 	// outside tests.
 	testBackgroundWait atomic.Pointer[func()]
 	testClaimPinned    atomic.Pointer[func()]
-	// testRetainedVerdict replaces a retained PUBLISH's verdict before its send section (F-105 7c).
+	// testRetainedVerdict replaces a retained PUBLISH's verdict before its send section (issue #107 7c).
 	// Nil outside tests.
 	testRetainedVerdict atomic.Pointer[func(mqttRetainedReplayVerdict, string) (mqttRetainedReplayVerdict, string)]
 	// testRetainedInstallRefused, when it reports true, refuses one abandoned retained PUBREL
-	// installation as setPendingLocked would (F-105 7c). Nil outside tests.
+	// installation as setPendingLocked would (issue #107 7c). Nil outside tests.
 	testRetainedInstallRefused atomic.Pointer[func() bool]
 	// resumeRetainedInstalled: the running resume pass reached its retained installation, so its
 	// success owns what it restored (recoverInflightRegisters). Owned by the resume's goroutine.
@@ -464,27 +464,27 @@ type mqttSession struct {
 	// store answer, with their evidence (consult 107). Session lock.
 	retainedQuarantined []mqttRetainedQuarantined
 	// testRecoveredRetainedRefuse, when it reports true for a subject, refuses that retained
-	// restoration's installation as a conflicting resident would (F-105 7c). Nil outside tests.
+	// restoration's installation as a conflicting resident would (issue #107 7c). Nil outside tests.
 	testRecoveredRetainedRefuse atomic.Pointer[func(subject string) bool]
 	// testReclaimAfterStep runs after each reclamation step answers, before its result is applied
-	// (F-105 7c). Nil outside tests.
+	// (issue #107 7c). Nil outside tests.
 	testReclaimAfterStep atomic.Pointer[func(k mqttRetainedReclaimKey, step mqttReclaimStep, err error)]
 	// testRetiredConsumerDelete, when set, answers a retired source consumer's physical delete in
-	// place of JetStream (F-105 7c-lc): the crash-window and ambiguity tests. Nil in production.
+	// place of JetStream (issue #107 7c-lc): the crash-window and ambiguity tests. Nil in production.
 	testRetiredConsumerDelete atomic.Pointer[func(stream, name string) error]
 	// testSourceDisposalSite, when set, observes each route that hands a source consumer's
-	// disposal to the retirement owner (F-105 7c-lc), so a test proves the route it names was
+	// disposal to the retirement owner (issue #107 7c-lc), so a test proves the route it names was
 	// reached. Nil in production.
 	testSourceDisposalSite atomic.Pointer[func(site, name string)]
 	// testSettleClassified, when set, observes each classification a tenure settlement makes
-	// (F-105 7f): the consumer name and its class. Session-owned, so parallel tests never share it.
+	// (issue #107 7f): the consumer name and its class. Session-owned, so parallel tests never share it.
 	testSettleClassified atomic.Pointer[func(name, class string)]
 	// testSourceDisposalDrop, when set, drops every source disposal hand-off after the site seam
 	// observed it, so a test measuring a different background writer can keep this one out of its
 	// window. Never set in production.
 	testSourceDisposalDrop atomic.Bool
 	// testRetainedClassify runs in the resume's retained classification after its fresh exchange
-	// read, once per register per pass (F-105 7c). Nil outside tests.
+	// read, once per register per pass (issue #107 7c). Nil outside tests.
 	testRetainedClassify atomic.Pointer[func(subject string)]
 	// retainedDiscovery is the resume's census of resource incarnations, consumed after CONNACK.
 	retainedDiscovery mqttRetainedDiscovery
@@ -528,7 +528,7 @@ type mqttSession struct {
 	// Deliberately NOT nilled by clear(): clear() resets last_pi to zero and a reused
 	// session object can mint PI 1 for a new incarnation while the displaced
 	// connection's PI 1 write is still blocked in a synchronous socket write. The
-	// registry is what carries the reservation across the discard (F-087 WP5 class F2).
+	// registry is what carries the reservation across the discard (issue #89 WP5 class F2).
 	sendsInFlight map[uint16]*mqttSendHold
 
 	// inflightWalks counts this session object's register-recovery walks.
@@ -564,7 +564,7 @@ type mqttSession struct {
 	// voidRegNonceLocked and voidRegistrationsLocked.
 	// A verdict is SUPERSEDED when recovery restores its allocation as a possibly-attempted
 	// acting entry — marker absent, or a recovered output token beside a standing marker,
-	// fresh install or same-object resident alike (F-088): the restoration owes the exchange
+	// fresh install or same-object resident alike (issue #90): the restoration owes the exchange
 	// its retransmission, so the nonce is retired (retireSupersededVerdictLocked) and the
 	// revision moves for the persistence that records it.
 	// The VALUE is the voidedRegsRev at which the nonce was recorded, and it is what a
@@ -612,7 +612,7 @@ type mqttSession struct {
 	// Advanced from the last visited entry even when that entry was lifted, so a lift
 	// cannot rewind it. Guarded by mu. See exclusion_reclaim.go.
 	exclReclaimCursor uint16
-	// testExclReclaim instruments this session's reclaim passes (F-088 T36 rows 18-18d); nil
+	// testExclReclaim instruments this session's reclaim passes (issue #90 T36 rows 18-18d); nil
 	// in production. Read under mu at each pass's start.
 	testExclReclaim *mqttExclReclaimSeams
 
@@ -650,7 +650,7 @@ type mqttSession struct {
 	custodyHints      map[string]struct{}
 	custodyPassWanted bool
 	custodyObserving  bool
-	// The autonomous dispatcher's own state (F-097 WP4, outbound_custody_dispatcher.go), all
+	// The autonomous dispatcher's own state (issue #99 WP4, outbound_custody_dispatcher.go), all
 	// protected by mu and replaced with the generation:
 	//   - custodyDemand latches a withholding gate's demand until an allocation since succeeded
 	//     with nothing deferred, or until its own deadline finds nothing deferred, no identifier
@@ -673,7 +673,7 @@ type mqttSession struct {
 	custodyTickAt      time.Time
 	custodyTickKey     string
 	custodyTickArm     uint64
-	// The floor unit's state (F-112, outbound_floor_unit.go), protected by mu and replaced with the
+	// The floor unit's state (issue #114, outbound_floor_unit.go), protected by mu and replaced with the
 	// generation: floorWanted latches its demand until a run finds nothing to do; floorDueAt is
 	// when it is next due (zero: now) and floorDelay its no-progress backoff; floorHorizon is this
 	// broker's scan toward a qualifying advance (scan state only).
@@ -688,7 +688,7 @@ type mqttSession struct {
 	releaseOwed  map[string]struct{}
 	releaseDueAt time.Time
 	releaseDelay time.Duration
-	// testCustodyDriver instruments the dispatcher (F-097 T2*); nil in production, read under mu.
+	// testCustodyDriver instruments the dispatcher (issue #99 T2*); nil in production, read under mu.
 	testCustodyDriver *mqttCustodyDriverSeams
 	// resumeLineage carries, across the bounded re-runs of ONE recoverInflightRegisters
 	// invocation, every sequence a custody rewrite authoritatively moved each register
@@ -796,7 +796,7 @@ type mqttPersistedSession struct {
 	// resource named after idHash alone (the PUBREL path, the inbound QoS 2 hold
 	// subjects). It is mandatory. A record without one predates generations and is
 	// REFUSED rather than interpreted under the hash-only names it was written with
-	// (F-057): nothing reclaims such a record, so the recovery is recreating the
+	// (issue #61): nothing reclaims such a record, so the recovery is recreating the
 	// broker-owned streams. See sess_incarnation.go.
 	Gen string `json:"gen,omitempty"`
 	// WID is this record write's own identity, minted once per write; PWID is the
@@ -857,7 +857,7 @@ type mqttPersistedSession struct {
 	// register itself, the register is provably gone, a peer's claim on it means the
 	// durable decision is the peer's and a competing verdict must not be persisted, or
 	// recovery restored the allocation as a possibly-attempted acting entry, superseding the
-	// verdict's "never transmitted" (F-088; retireSupersededVerdictLocked). That
+	// verdict's "never transmitted" (issue #90; retireSupersededVerdictLocked). That
 	// list is illustrative, NOT a closed set — inflight_register.go's removal sites are
 	// the authority, and two review rounds faulted an earlier attempt here for asserting
 	// an exhaustive one. Absent such a fact the set is emptied when the generation retires
@@ -867,8 +867,8 @@ type mqttPersistedSession struct {
 	// may be part way through deleting the incarnation's resources. Nobody may
 	// resume that state: every reader that can INTERPRET the record finishes the
 	// teardown (the deletions are generation-scoped; repeating them is safe for names nothing
-	// can re-occupy, bounded per walk for the inbound QoS 2 hold walk — F-062 — and bounded
-	// by its own enumeration watermark for the `$MQTT_inflight` reap — F-034) and releases
+	// can re-occupy, bounded per walk for the inbound QoS 2 hold walk — issue #66 — and bounded
+	// by its own enumeration watermark for the `$MQTT_inflight` reap — issue #38) and releases
 	// the record before starting fresh. A reader that refuses the record's schema does not
 	// resume it either, but it does not finish it: the expiry path and the orphan
 	// sweep pick a reserved-namespace record up only while its GENERATION is valid,
@@ -937,7 +937,7 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, wid, pw
 		regClaim: mqttNewInflightNonce(),
 	}
 	// A not-yet-reachable object has no owners to drain, so the constructor is
-	// the one caller entitled to a trivial permit (F-036 unit 1, property P).
+	// the one caller entitled to a trivial permit (issue #40 unit 1, property P).
 	sess.setIncarnationLocked(gen, mqttRetirementPermit{})
 	return sess
 }
@@ -950,7 +950,7 @@ func mqttSessionCreate(jsa *mqttJSA, id, idHash, gen string, seq uint64, wid, pw
 // sess.mu must be held, or the session must not yet be reachable.
 //
 // The permit is what makes property P — the generation changes only while no
-// client is bound — mechanical (F-036 unit 1): it is mintable only by
+// client is bound — mechanical (issue #40 unit 1): it is mintable only by
 // retireIncarnationLocked, which asserts sess.c == nil over a closed, drained
 // tracker, or as the constructor's trivial permit for an object nothing else can
 // reach. A mismatched permit here is memory-protocol corruption, not a runtime
@@ -971,7 +971,7 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	// An ABORTED clear never reaches here, and an ordinary resident reconnect never calls
 	// this, so both correctly preserve the existing provenance.
 	sess.inflightApplyCompletedWalk = sess.inflightWalks
-	// The retiring generation's custody tick is CANCELLED (F-097 WP4): its work goes with the
+	// The retiring generation's custody tick is CANCELLED (issue #99 WP4): its work goes with the
 	// ledger below. The timer registry's lock is not taken under the session lock, so the
 	// cancellation of the arm's STORED key is handed off; a tick that fires first is inert (its
 	// callback starts nothing for a generation that no longer stands), and an arm not yet
@@ -990,7 +990,7 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	sess.custody = newMQTTCustodyLedger(gen)
 	sess.custodyHints = nil
 	sess.custodyPassWanted = false
-	// The dispatcher's queues and latch go with the ledger (F-097 WP4); the tick was cancelled
+	// The dispatcher's queues and latch go with the ledger (issue #99 WP4); the tick was cancelled
 	// above (outbound_custody_dispatcher.go).
 	sess.custodyDemand, sess.custodyDemandDelay, sess.custodyDemandDueAt = false, 0, time.Time{}
 	sess.custodyRetry, sess.custodyPassQueue, sess.custodyRR = nil, nil, 0
@@ -998,10 +998,10 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	sess.floorWanted, sess.floorDueAt, sess.floorDelay, sess.floorHorizon = false, time.Time{}, 0, nil
 	sess.releaseOwed, sess.releaseDueAt, sess.releaseDelay = nil, time.Time{}, 0
 	// Owed withdrawals name the retiring generation's obligations; its successor's recovery
-	// reconstructs any it still owes (F-088).
+	// reconstructs any it still owes (issue #90).
 	sess.withdrawOwed = nil
 	sess.dropAcquireSettleOwedLocked() // the retiring generation's owed acquisition settlements
-	sess.admissionContinuity = nil     // the retiring generation's admissions (F-097 WP5)
+	sess.admissionContinuity = nil     // the retiring generation's admissions (issue #99 WP5)
 	subject, deliver, _ := mqttPubRelNames(sess.idHash, gen)
 	sess.pubRelSubject = subject
 	sess.pubRelDeliverySubject = deliver

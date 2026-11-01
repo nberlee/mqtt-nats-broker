@@ -153,7 +153,7 @@ type mqttPersistedDrainSeq struct {
 	//
 	// MANDATORY wherever PubRel is set. A marker-less intent cannot have been written by
 	// this broker, so it is an unsupported persisted shape and REFUSES THE WHOLE SESSION
-	// RECORD, read-only, on F-057's precedent — never per entry, because this field is
+	// RECORD, read-only, on issue #61's precedent — never per entry, because this field is
 	// nested in the authoritative $MQTT_sess record and accepting it per entry would force
 	// a later save to reserialize an unsupported shape, normalize it (migration), or refuse
 	// the save.
@@ -164,7 +164,7 @@ type mqttPersistedDrainSeq struct {
 	OwnerNonce string `json:"owner,omitempty"`
 
 	// Rel is the POSITIVE record that this drained delivery has RELEASE WORK OUTSTANDING
-	// against one exact exchange (L4, F-098).
+	// against one exact exchange (L4, issue #100).
 	//
 	// Its absence means no release is pending. It NEVER means a release already happened,
 	// and that asymmetry is the whole reason it exists. The finalizer used to release the
@@ -189,11 +189,11 @@ type mqttPersistedDrainSeq struct {
 //
 // Every member is MANDATORY where the struct is present. A Rel missing one names no
 // exchange, so it is an unsupported persisted shape and REFUSES THE WHOLE SESSION
-// RECORD, read-only, on F-057's precedent and exactly as OwnerNonce does — never per
+// RECORD, read-only, on issue #61's precedent and exactly as OwnerNonce does — never per
 // entry, because accepting it per entry would force a later save to reserialize an
 // unsupported shape, normalize it (migration), or refuse the save.
 type mqttPersistedDrainRelease struct {
-	// Subject is the slot's own subject, which is the identity (F-034). It carries the
+	// Subject is the slot's own subject, which is the identity (issue #38). It carries the
 	// incarnation, so a Rel can never be applied across a generation discard.
 	Subject string `json:"subject"`
 	// Nonce is the ALLOCATION this release targets.
@@ -218,7 +218,7 @@ type mqttPersistedDrainRelease struct {
 // would also normalize the missing field, which is migration.
 //
 // Refusing here propagates through mqttDecodeSessionRecord, whose decode failure is the
-// record-level refusal F-057's precedent requires.
+// record-level refusal issue #61's precedent requires.
 func (r *mqttPersistedDrainRelease) UnmarshalJSON(b []byte) error {
 	var aux struct {
 		Subject *string `json:"subject"`
@@ -312,7 +312,7 @@ type drainSeq struct {
 	// outbound QoS 1/2 allocation withheld for the session. What this change stops is the
 	// drain FINALIZING over that state, not the state itself.
 	//
-	// It is a field rather than the absence of regSeq because F-034's review found the two
+	// It is a field rather than the absence of regSeq because issue #38's review found the two
 	// being conflated. The release used to run only when regSeq was nonzero, and recovery
 	// zeroes regSeq for exactly this ambiguous case — so the finalize skipped
 	// classification and went on to remove the claim and acknowledge the source while both
@@ -414,7 +414,7 @@ type mqttDrain struct {
 	removalMarked bool
 	// removalEnt is the serving entitlement of the connection whose transaction set the mark:
 	// the decision that this drain's consumer is ended is that connection's, and its disposal is
-	// recorded under it or not at all (F-105 7c-lc). Set and cleared with the mark.
+	// recorded under it or not at all (issue #107 7c-lc). Set and cleared with the mark.
 	removalEnt mqttOutboundEntitlement
 
 	// seqs is the ONE map of per-sequence state. There is deliberately no second
@@ -476,7 +476,7 @@ func (d *mqttDrain) persisted() *mqttPersistedDrain {
 // Such a record cannot have been written by this broker — recordPubRelIntent validates the
 // identity before it saves, and jsa.storeInflightCAS validates every register write — so it
 // only exists if something else produced it. The documented answer for an unsupported
-// persisted shape is a read-only refusal of the WHOLE session record (F-057's shape), and I
+// persisted shape is a read-only refusal of the WHOLE session record (issue #61's shape), and I
 // implemented it here by returning nil.
 //
 // A review caught that this does not refuse anything: restoreDrainsFromRecord passes the nil
@@ -660,7 +660,7 @@ const (
 	// What the cancellation says nothing about is an INHERITED occupant: a register-only
 	// replacement that lands for this allocation continues an exchange that may already be
 	// on the wire, and confirmInflightRegister preserves it rather than destroying it
-	// (F-088 WP3 edit 5, staged: its drain re-enrolment waits on W5c).
+	// (issue #90 WP3 edit 5, staged: its drain re-enrolment waits on W5c).
 	drainClaimCancel
 	// drainClaimWithdraw: confirmed and PROVABLY never transmitted — the unsent marker is
 	// still there and no intent is unresolved — so [MQTT-3.10.4-3] does not cover it.
@@ -713,7 +713,7 @@ func (sess *mqttSession) drainClaimEligibleLocked(pi uint16, recovery ...*mqttDi
 		return nil, false, false
 	}
 	if sess.disposalPILocked(pi) && !sess.disposalRecoveryFloorLocked(pi, recovery) {
-		// Its durable abandonment is in flight (F-105 row 5, consult 35): unresolved, never
+		// Its durable abandonment is in flight (issue #107 row 5, consult 35): unresolved, never
 		// claimed — a claim beside a landing abandonment would own a register its finalizer
 		// can never release.
 		return nil, false, false
@@ -821,7 +821,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// delivery was never transmitted. Being inside this packet's own record
 			// transaction is what makes it durable before that removal lands.
 			// See cancelRegPendingLocked. A refused staging is not this connection's decision
-			// any more (F-105 7b): nothing is cancelled and the entry stands.
+			// any more (issue #107 7b): nothing is cancelled and the entry stands.
 			if !sess.cancelRegPendingLocked(ack, lic) {
 				delete(cancelled, mqttDeferredKey{cc.Durable, sseq})
 				continue
@@ -831,7 +831,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// would otherwise admit the returning store on regPending and let the callback
 			// transmit a delivery this drain does not claim. What is handed off is the
 			// IDENTIFIER's exclusion: the store is in flight and its register may still land,
-			// so nothing may allocate here until that slot is confirmed gone (F-098).
+			// so nothing may allocate here until that slot is confirmed gone (issue #100).
 			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 			sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // a pending store: no binding
 		case drainClaimWithdraw:
@@ -847,7 +847,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// this packet's save is confirmed. An entry whose section is still writing is
 			// enrolled: the write may reach the client, and endPublishSend will say so.
 			if !sess.stageVoidVerdictLocked(lic, ack.regNonce) {
-				continue // not this connection's decision any more (F-105 7b): the entry stands
+				continue // not this connection's decision any more (issue #107 7b): the entry stands
 			}
 			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
 			d.withdrawn = append(d.withdrawn, mqttVoidedReg{
@@ -856,7 +856,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// Withdrawn on a LOCAL classification, which is an observation rather than
 			// exclusion against the next acquisition: the register survives until this
 			// packet's save is confirmed and its delete lands. The identifier is excluded
-			// until then (F-098); the entry's removal and its capacity release are unchanged.
+			// until then (issue #100); the entry's removal and its capacity release are unchanged.
 			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 			sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // marker standing: no binding
 		default:
@@ -979,7 +979,7 @@ func (sess *mqttSession) settleAdoptedRetentionsLocked() {
 // discharge it. The message is destroyed and the identifier is held for the life of the
 // session.
 //
-// What licenses adding a claim is F-072's durable discriminator, not an inference: a
+// What licenses adding a claim is issue #76's durable discriminator, not an inference: a
 // possibly-attempted entry may have reached the client, so the delivery is owed, while a
 // proven-unsent one demonstrably was not and adds nothing. That is the same classification
 // staging applies, through the same function — recovery only READS it, because it is
@@ -995,7 +995,7 @@ func (sess *mqttSession) settleAdoptedRetentionsLocked() {
 // TWO shapes are exceptions and both are deliberate. The LIVE resume reap reserves the
 // same classification but KEEPS the mapping, because unlike recovery it runs after source
 // interest exists, and a callback already holding that payload would otherwise be given a
-// SECOND identifier for one source (F-100). Recovery's own reservation over a source it
+// SECOND identifier for one source (issue #102). Recovery's own reservation over a source it
 // routed LOST keeps its mapping for the same reason: a completed consumer lookup does not
 // retract a payload already dispatched. So this pass can enrol a vanished source from
 // either. That
@@ -1084,11 +1084,11 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 			switch sess.drainClaimDispositionLocked(ack) {
 			case drainClaimCancel:
 				if !sess.cancelRegPendingLocked(ack, lic) {
-					continue // not this connection's decision any more (F-105 7b)
+					continue // not this connection's decision any more (issue #107 7b)
 				}
 				cancelled[mqttDeferredKey{dur, sseq}] = ack.jsAckSubject
 				// The adoption path's twin of the staging site above, and it owes the same
-				// handoff for the same reason (F-098).
+				// handoff for the same reason (issue #100).
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 				sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // a pending store: no binding
 			case drainClaimWithdraw:
@@ -1314,12 +1314,12 @@ func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {
 
 // recordDrainReleaseRequest persists the POSITIVE, identity-bound record that this
 // drained delivery has release work outstanding against one exact exchange, and CONFIRMS
-// the save before returning true (L4, F-098).
+// the save before returning true (L4, issue #100).
 //
 // It captures the target from the slot ITSELF rather than from anything remembered: the
 // subject the identifier names, and the nonce and transmission counter the occupant
 // currently carries. `RegSeq` is not consulted — it is a hint and may never select or
-// authorize a deletion (F-034).
+// authorize a deletion (issue #38).
 //
 // AN AMBIGUOUS SAVE RETAINS THE REQUEST, and the retry may never RECAPTURE the identity.
 // It re-attempts the originally captured target even if the slot has since moved, because
@@ -1617,7 +1617,7 @@ func (sess *mqttSession) drainForDurableLocked(jsDur string) *mqttDrain {
 	return nil
 }
 
-// enrolRecoveredDrainReleases gives every RECOVERED release request a clock (L4, F-098;
+// enrolRecoveredDrainReleases gives every RECOVERED release request a clock (L4, issue #100;
 // holistic review round 3, finding 2).
 //
 // A persisted request is an obligation to the CLIENT's identifier, which is why recovery counts
@@ -1677,7 +1677,7 @@ func (sess *mqttSession) drainSeqLocked(jsDur string, sseq uint64) *drainSeq {
 // No lock held on entry.
 func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uint64, ackSubject string) (handled bool) {
 	// The deciding connection's entitlement, read before any session lock: a removal this
-	// transaction marks is that connection's decision (F-105 7c-lc).
+	// transaction marks is that connection's decision (issue #107 7c-lc).
 	removalEnt, _ := c.outboundEntitlement()
 	sess.mu.Lock()
 	d := sess.drainForDurableLocked(jsDur)
@@ -1692,7 +1692,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		// destroy a message nothing claims (I1). Leave it pending instead; the
 		// readback resolves the sequence and AckWait re-offers it.
 		//
-		// AN OUTSTANDING RELEASE WITHHOLDS THE ACKNOWLEDGEMENT TOO (L4, F-098). An
+		// AN OUTSTANDING RELEASE WITHHOLDS THE ACKNOWLEDGEMENT TOO (L4, issue #100). An
 		// unclaimed entry reads as finalized here, and acknowledging on that basis
 		// destroys the delivery while this drain still owes release work against a
 		// named exchange — the obligation would survive only in a record nothing
@@ -1740,13 +1740,13 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	// ordering here has: an unconfirmed delete followed by a completed exchange is exactly
 	// the state that leaves a phantom behind. A failure withholds the whole finalize, so
 	// the next redelivery retries it — nothing is acked and nothing is lost.
-	// Addressed by SUBJECT, not by the recorded sequence (F-034).
+	// Addressed by SUBJECT, not by the recorded sequence (issue #38).
 	//
 	// `regSeq` used to address this delete directly, and that was the defect: the store
 	// path's replacement branch rewrites a register for the same (Dur, Seq) at a NEW
 	// sequence, and after $MQTT_inflight is recreated the recorded sequence names an
 	// unrelated register belonging to another session. Deleting there destroyed it —
-	// which F-066's table had already recorded, assigning the consequence to "that
+	// which issue #70's table had already recorded, assigning the consequence to "that
 	// mechanism's owner", i.e. here.
 	//
 	// The subject is derived from this delivery's own packet identifier, which the record
@@ -1758,7 +1758,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	// nothing to release. Only an unreadable or indeterminate occupant withholds the
 	// finalize, on the same reasoning every ordering here has: an unconfirmed disposal
 	// followed by a completed exchange is what leaves a phantom behind.
-	// The register release is NOT keyed on regSeq. F-034's review found that guard was
+	// The register release is NOT keyed on regSeq. issue #38's review found that guard was
 	// itself the defect: recovery zeroes regSeq for the AMBIGUOUS duplicate-register case,
 	// so `regSeq != 0` skipped classification entirely and the finalize went on to remove
 	// the claim and acknowledge the source while both registers survived behind a consumer
@@ -1843,7 +1843,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 			// by TestFinalizeDrainDeliveryAddressesByPacketIdentifier.
 			subject := mqttInflightSubject(idHash, gen, pi)
 			// THE POSITIVE RELEASE REQUEST is recorded INSIDE the release, from the
-			// record it has already loaded and matched (L4, F-098). Recording it here
+			// record it has already loaded and matched (L4, issue #100). Recording it here
 			// instead would cost a second read AND open a window between capturing the
 			// target's identity and acting on it — the release would then be bound to a
 			// transmission the slot may no longer carry, which is the staleness C-I
@@ -2033,7 +2033,7 @@ func (sess *mqttSession) retireDrainLocked(c *client, d *mqttDrain) (durable str
 	if !d.retirable() {
 		return _EMPTY_, false
 	}
-	// Ownership is proven through the SID, not through drainByDur, and that is F-094's
+	// Ownership is proven through the SID, not through drainByDur, and that is issue #96's
 	// repair rather than a simplification. restoreDrains deletes the drainByDur entry when a
 	// delivery subscription fails to restore while sess.drains[sid] survives, so a
 	// drainByDur-keyed guard could never retire such a drain — and with the hold widened to
@@ -2079,7 +2079,7 @@ func (sess *mqttSession) retireDrainLocked(c *client, d *mqttDrain) (durable str
 	return d.cc.Durable, true
 }
 
-// disposeRetiredDrainConsumer hands a retired drain's consumer to the retirement owner (F-105
+// disposeRetiredDrainConsumer hands a retired drain's consumer to the retirement owner (issue #107
 // 7c-lc): the drain's confirmed omission is the decision that its consumer is ended, taken under
 // ent, the entitlement of the connection whose transaction carried the omission. It is never
 // deleted here: an obligation the drain no longer claims may still hold it, and a delete that
@@ -2161,7 +2161,7 @@ func (sess *mqttSession) finishDrainIfEmpty(c *client, d *mqttDrain) {
 // No lock held on entry.
 func (sess *mqttSession) removeEmptyDrainReference(c *client, d *mqttDrain) bool {
 	// The deciding connection's entitlement, read before any session lock: a removal this
-	// transaction marks is that connection's decision (F-105 7c-lc).
+	// transaction marks is that connection's decision (issue #107 7c-lc).
 	removalEnt, _ := c.outboundEntitlement()
 	tok := sess.beginRecordTx()
 	sess.mu.Lock()
@@ -2554,7 +2554,7 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 // No lock held on entry.
 func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 	// The deciding connection's entitlement, read before any session lock: a removal this
-	// transaction marks is that connection's decision (F-105 7c-lc).
+	// transaction marks is that connection's decision (issue #107 7c-lc).
 	removalEnt, _ := c.outboundEntitlement()
 	sess.mu.Lock()
 	drains := make([]*mqttDrain, 0, len(sess.drains))
@@ -2609,7 +2609,7 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 				continue
 			}
 			if st.rel.valid() {
-				// AN OUTSTANDING RELEASE IS NOT SOURCE-PRUNABLE (L4, F-098). Its
+				// AN OUTSTANDING RELEASE IS NOT SOURCE-PRUNABLE (L4, issue #100). Its
 				// obligation is to the CLIENT's identifier, not to the source: whether
 				// the source can still be delivered says nothing about whether a
 				// register is still holding an identifier the receiver may own. Counted
@@ -2652,7 +2652,7 @@ func (sess *mqttSession) recoverDrains(c *client, skip map[string]bool) {
 	}
 	// The ALREADY-EMPTY sweep, and it runs before the early return below because that is
 	// the drain it exists for. A drain that owed nothing on entry produces no plan at all,
-	// so the post-save sweep at the end of this function never sees it — and since F-094
+	// so the post-save sweep at the end of this function never sees it — and since issue #96
 	// widened the hold to every past-PUBREC intent, such a drain refuses its filter until
 	// something retires it. The reachable shape is a restore whose delivery subscription
 	// failed: restoreDrains drops the drainByDur entry and keeps sess.drains[sid].
@@ -3247,7 +3247,7 @@ func (sess *mqttSession) scanPubRelRecordsCharged(pubRelSubject string,
 
 func (sess *mqttSession) recoverDrainPubRels(c *client) map[string]bool {
 	// The deciding connection's entitlement, read before any session lock: a removal this
-	// transaction marks is that connection's decision (F-105 7c-lc).
+	// transaction marks is that connection's decision (issue #107 7c-lc).
 	removalEnt, _ := c.outboundEntitlement()
 	sess.mu.Lock()
 	type claim struct {
@@ -3653,7 +3653,7 @@ const (
 )
 
 // reason renders the hold for the two refusal messages. It is load-bearing rather than
-// decoration: before F-094 both sites said "an unusable exchange identity ... remove that
+// decoration: before issue #96 both sites said "an unusable exchange identity ... remove that
 // record to restore the filter" for EVERY refusal, which for an ordinary past-PUBREC intent
 // is false twice over — the identity is usable, and the release is the drain's own
 // retirement rather than an operator.
@@ -3688,7 +3688,7 @@ func (h mqttDrainHold) reason() string {
 // did not OWN its sid exclusively. So it does now, and every path that would occupy or
 // provision under that sid asks this one question rather than re-deriving the condition.
 //
-// F-094 WIDENED it from the unusable-identity case to EVERY past-PUBREC intent, and the
+// issue #96 WIDENED it from the unusable-identity case to EVERY past-PUBREC intent, and the
 // predicate is deliberately unqualified — no claim flag joins it. Two narrower shapes were
 // tried and both were refuted, so neither may come back:
 //
@@ -3708,7 +3708,7 @@ func (h mqttDrainHold) reason() string {
 // adoption and no destructive fork-repair row can erase that intent. It is deliberately NOT
 // the claim that nothing can re-offer the source. What excludes a re-offer is retirement's
 // own delivery barrier and its classified disposal (see retireDrainLocked and
-// disposeRetiredDrainConsumer), which are a separate mechanism from this hold; F-094 does
+// disposeRetiredDrainConsumer), which are a separate mechanism from this hold; issue #96 does
 // not supply them. What remains is stated in docs/CONFORMANCE.md: disposal is confirmed for
 // this session object, but an indeterminate delete is reclaimed by the orphan sweep rather
 // than retried, and a fork sibling can rebuild the drain on a fresh object.
@@ -3773,7 +3773,7 @@ func (d *mqttDrain) retirableExcept(removing map[uint64]bool) bool {
 			continue
 		}
 		// AN OUTSTANDING RELEASE OVERRIDES THE REMOVAL DISCOUNT, and it is checked
-		// BEFORE the discount rather than after (L4, F-098).
+		// BEFORE the discount rather than after (L4, issue #100).
 		//
 		// The discount exists because the save clearing a claim is the same save being
 		// classified, so counting that claim would refuse every ordinary retirement. A
@@ -3890,7 +3890,7 @@ func (sess *mqttSession) reclaimDrainDeliveryLocked(c *client, subject, sid stri
 	}
 	// The helper's OWN refusal, not a copy of adoptDrainLocked's: it runs BEFORE that
 	// one, so nothing else covers it, and installing interest for a held drain would
-	// hand its filter delivery the hold exists to withhold (F-094).
+	// hand its filter delivery the hold exists to withhold (issue #96).
 	if sess.drainSidHoldLocked(sid) != mqttDrainNotHeld {
 		return nil, nil
 	}
@@ -3941,7 +3941,7 @@ func (sess *mqttSession) adoptDrainLocked(sid string) bool {
 	// erased the intent by routine client behaviour — a successful save then omits it
 	// entirely, so a stored PUBREL could take the ordinary non-drain path while the
 	// unacknowledged source, no longer suppressed by any drain, is re-offered at AckWait and
-	// sent as a FRESH PUBLISH of an exchange the client has already answered (F-094).
+	// sent as a FRESH PUBLISH of an exchange the client has already answered (issue #96).
 	//
 	// Refusing keeps the drain, its consumer and its persisted intent exactly where they
 	// are. The caller reads false as "no drain to adopt" and provisions afresh, which is

@@ -18,12 +18,12 @@ import (
 	"time"
 )
 
-// The inactivity prerequisite for F-105 source/PUBREL consumers (cutover, consult 4, §5.1).
+// The inactivity prerequisite for issue #107 source/PUBREL consumers (cutover, consult 4, §5.1).
 //
-// F-105's invariant is that a source ($MQTT_msgs) or PUBREL ($MQTT_out) consumer a live
+// issue #107's invariant is that a source ($MQTT_msgs) or PUBREL ($MQTT_out) consumer a live
 // obligation depends on is deleted by NOBODY — JetStream's autonomous inactivity timer
 // included. Deleting such a consumer drops its interest-retained records, and those records ARE
-// the obligation's completion evidence; a timer that reaps it is the original F-105 defect
+// the obligation's completion evidence; a timer that reaps it is the original issue #107 defect
 // reached without any broker acting.
 //
 // The pinned server SUBSTITUTES a stream-level ConsumerLimits.InactiveThreshold for a consumer
@@ -33,7 +33,7 @@ import (
 //
 // This is the same disqualification drainingAllowed already applies to drains — but the
 // response differs, and the difference is the point. drainingAllowed FALLS BACK to an immediate
-// teardown when a limit is present; F-105 has NO fallback. A source/PUBREL dependency that
+// teardown when a limit is present; issue #107 has NO fallback. A source/PUBREL dependency that
 // cannot establish preservation is REFUSED. "Cannot verify" is treated as unsafe on the same
 // ground drainingAllowed treats it so: an unread limit is not a proven-absent one, and admitting
 // a dependency against an unknown limit would rest preservation on an absence.
@@ -43,7 +43,7 @@ import (
 // is only the lookup drainingAllowed already models.
 
 // mqttInactivityUnsafe explains why preservation of a depended-on consumer cannot be
-// established, so the F-105 admission path may name the reason it refuses.
+// established, so the issue #107 admission path may name the reason it refuses.
 type mqttInactivityUnsafe struct{ Why string }
 
 func (u mqttInactivityUnsafe) Error() string { return u.Why }
@@ -64,7 +64,7 @@ func mqttEffectiveInactivitySafe(streamLimit, consumerReq time.Duration, streamV
 	}
 	if consumerReq != 0 {
 		return mqttInactivityUnsafe{Why: fmt.Sprintf("the consumer requests an inactivity threshold of %s, "+
-			"so it is autonomously reapable and may not carry an F-105 dependency", consumerReq)}
+			"so it is autonomously reapable and may not carry an issue #107 dependency", consumerReq)}
 	}
 	if streamLimit != 0 {
 		return mqttInactivityUnsafe{Why: fmt.Sprintf("the stream imposes a consumer inactivity limit of %s, "+

@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 )
 
-// The inventory floor (F-112): a live generation's history is retired behind a PROVEN contiguous
+// The inventory floor (issue #114): a live generation's history is retired behind a PROVEN contiguous
 // floor, and physically deleted behind a durable watermark.
 //
 // # What the floor proves
@@ -50,7 +50,7 @@ import (
 // it moves.
 
 // mqttTransitionAdvanceFloor retires inventory positions behind the floor and records physical
-// deletion behind the watermark (F-112). It carries the generation ledger and duty members and
+// deletion behind the watermark (issue #114). It carries the generation ledger and duty members and
 // nothing else. Like dispose-resource it is permitted under any authority state and moves no
 // ownership: retiring finished history is justified entirely by absorbing, record-bound evidence,
 // so it decides nothing for the session and needs no entitlement.
@@ -676,7 +676,7 @@ func (jsa *mqttJSA) deleteReclaimedExchange(id, epoch, gen, nonce string) error 
 }
 
 // ---------------------------------------------------------------------------
-// Absence below the floor (F-112)
+// Absence below the floor (issue #114)
 // ---------------------------------------------------------------------------
 
 // mqttLandingProof is how a reader knows the exchange it is asking about LANDED. A typed value,

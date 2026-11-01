@@ -213,7 +213,7 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 	// A competing write lands on the record in the resolver's own window, so the re-attempt
 	// is rejected and the classifying re-read finds content that is not this attempt's:
 	// FOREIGN. Foreign means the record is NOT OURS; it does not identify a holder, and
-	// this connection is displaced on that basis alone (F-084).
+	// this connection is displaced on that basis alone (issue #86).
 	var took atomicOnce
 	restoreSeam := setMQTTTestResolveReattemptHook(func(sp *mqttSession) {
 		if sp != sess || !took.fire() {
@@ -272,7 +272,7 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 // `processSessionPersist` holds neither, so in that interval it can notify and detach — and
 // an UNSUBACK appended after that DISCONNECT violates [MQTT-3.14.4-1]. Which reason code
 // that notification carries depends on what the observed record proved and is not this
-// fixture's question (F-084); the ORDERING is.
+// fixture's question (issue #86); the ORDERING is.
 // What closes the window is the second gate: the DISCONNECT claim is read inside the
 // enqueue's own c.mu critical section, so the refusal is atomic with the write.
 //
@@ -311,7 +311,7 @@ func TestMQTTUnsubAckSuppressedByADisplacementInTheWindow(t *testing.T) {
 		//
 		// The vocabulary is the one that leg actually passes. A persist observation
 		// shows the record is not ours and nothing more, so it is unsettled-ownership
-		// and not taken-over (F-084); calling mqttNotifyTakenOver here would model a
+		// and not taken-over (issue #86); calling mqttNotifyTakenOver here would model a
 		// route this seam does not stand for.
 		done := make(chan struct{})
 		go func() {

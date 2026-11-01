@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// A DRAINED SOURCE'S FINALIZE WAITS FOR ITS SECTION (F-098). The client can PUBACK a drained
+// A DRAINED SOURCE'S FINALIZE WAITS FOR ITS SECTION (issue #100). The client can PUBACK a drained
 // redelivery while the section that wrote it is still open. The register delete is parked on
 // that section already; the drain's finalize releases the same register, so it is parked too.
 // Run early, it would first PERSIST a release request for a register the writer still owns —

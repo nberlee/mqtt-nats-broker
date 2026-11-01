@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// End-to-end shared-group lifecycle tests (F-105), driven through real MQTT clients so that
+// End-to-end shared-group lifecycle tests (issue #107), driven through real MQTT clients so that
 // the whole join → serve → leave → retire protocol — J0/J1/J2/J3/J4 and the release ladder —
 // runs, and a mutation anywhere in processSubs, acquireSharedFilter or the release paths kills
 // the test. The oracle is the group record and the acquisition ledger, read back through the

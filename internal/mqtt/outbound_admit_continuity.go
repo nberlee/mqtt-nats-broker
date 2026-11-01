@@ -15,7 +15,7 @@ package mqtt
 
 import "time"
 
-// ADMISSION CONTINUITY (F-097 WP5, witnessed by W5b).
+// ADMISSION CONTINUITY (issue #99 WP5, witnessed by W5b).
 //
 // An admission can LAND while this broker cannot tell that it did: its response is lost, every
 // readback of its register fails, its custody resolution stays unresolved, and the ladder gives
@@ -66,7 +66,7 @@ type mqttAdmissionContinuity struct {
 	// withdrawDue: the last classification found W5b's population; the next unit withdraws.
 	withdrawDue bool
 	// attempts are the admission's attempts, captured at install with their frozen handles: the
-	// LANDING PROOF (F-112). An absent exchange is "nothing landed" only when none of them
+	// LANDING PROOF (issue #114). An absent exchange is "nothing landed" only when none of them
 	// resolves COMMITTED; one that did land may since have ended and been reclaimed behind the
 	// floor, and NAKing its source would redeliver a message the client already completed.
 	attempts []mqttCustodyAttempt
@@ -189,7 +189,7 @@ func (sess *mqttSession) runAdmissionContinuityUnit(gen string, c *mqttAdmission
 			retire = true
 		case x == nil && (smsg == nil || rec == nil || rec.Nonce != c.nonce):
 			// ABSENT, with the register gone. Before the floor this meant nothing landed. Since
-			// F-112 a landed exchange may have ended and been reclaimed: only an attempt that
+			// issue #114 a landed exchange may have ended and been reclaimed: only an attempt that
 			// resolves COMMITTED proves landing, and then a complete inventory without a
 			// representative naming the lineage is a positive ending — retire WITHOUT NAK. With no
 			// committed attempt nothing of this allocation landed, and its attempt is settled.

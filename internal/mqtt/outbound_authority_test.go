@@ -32,7 +32,7 @@ const (
 // TestF105SubjectsAreUnreachableByTheRegisterMachinery is the tripwire the class token
 // exists for.
 //
-// The F-105 record classes share $MQTT_inflight with the outbound registers, because
+// The issue #107 record classes share $MQTT_inflight with the outbound registers, because
 // JetStream's atomic batches are per stream and the authority has to commit with the
 // exchange mutation it authorizes. Sharing the stream means sharing the subject space with
 // a reap that deletes what its enumeration returns, so the separation is asserted here
@@ -532,7 +532,7 @@ func testF105Without(t *testing.T, body []byte, member string) string {
 // helper — which is the point: it refuses rather than quietly approximating.
 func testF105SubjectMatchesFilter(subject, filter string) bool {
 	if strings.Contains(filter, ">") {
-		panic("F-105 subject filters never use the multi-token wildcard")
+		panic("issue #107 subject filters never use the multi-token wildcard")
 	}
 	sTok := strings.Split(subject, ".")
 	fTok := strings.Split(filter, ".")

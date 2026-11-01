@@ -15,7 +15,7 @@ package mqtt
 
 import "sync/atomic"
 
-// A discarded generation's SHARED CLOSING belongs to its recovery owner (F-105 7e).
+// A discarded generation's SHARED CLOSING belongs to its recovery owner (issue #107 7e).
 //
 // The two teardown routes close a generation's acquisition ledger inline, but the clean-start
 // HANDOFF never did: its finalization writes the discarding closure and enrols the affine target,

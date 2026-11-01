@@ -61,7 +61,7 @@ func testMQTTSubV5NoSubAck(t *testing.T, c net.Conn, pi uint16, subID int, filte
 	}
 }
 
-// F-039. rollbackSubscribePacket's definite-failure arm restores sess.cons, the delivery
+// issue #43. rollbackSubscribePacket's definite-failure arm restores sess.cons, the delivery
 // subscriptions it closed, the register nonces it voided and the affine QoS 2 path it
 // unwound — and used to forget sess.sharedSubs / rapSubs / subIDs. A shared filter's
 // membership is persisted EAGERLY, per filter, before its group consumer exists, so the
@@ -113,7 +113,7 @@ func testObserveSharedAtRollback(t *testing.T, target **mqttSession, gate func()
 	restore := setMQTTTestRecordTxReleaseHook(func(s *mqttSession) {
 		// Only this test's session, only ONCE, and only the release that follows the
 		// ROLLBACK's own save. Gating on "first release" alone would depend on timing: a
-		// fixture with a preSub also runs F-078's post-packet ownership proof, which holds
+		// fixture with a preSub also runs issue #80's post-packet ownership proof, which holds
 		// a transaction of its own. gate() names the release we mean.
 		if *target == nil || s != *target || !gate() || !done.CompareAndSwap(false, true) {
 			return
@@ -241,9 +241,9 @@ func testRunSharedRollback(t *testing.T, o *Options, f testSharedRollbackFixture
 				break
 			}
 		}
-		t.Logf("F-039 fixture: session record write #%d from %s (failing=%v)", n, strings.Join(where, " <- "), f.saveFailAt[n])
+		t.Logf("issue #43 fixture: session record write #%d from %s (failing=%v)", n, strings.Join(where, " <- "), f.saveFailAt[n])
 		if f.saveFailAt[n] {
-			return errors.New("F-039 fixture: refusing this session record write")
+			return errors.New("issue #43 fixture: refusing this session record write")
 		}
 		return nil
 	})
@@ -256,7 +256,7 @@ func testRunSharedRollback(t *testing.T, o *Options, f testSharedRollbackFixture
 	// A v5 server sends a DISCONNECT before it closes, so the close is only observable
 	// after that packet has been read.
 	rc, _ := testMQTTReadDisconnectV5(t, r)
-	t.Logf("F-039 fixture: server DISCONNECT reason 0x%02x", rc)
+	t.Logf("issue #43 fixture: server DISCONNECT reason 0x%02x", rc)
 	testMQTTExpectDisconnect(t, c)
 
 	if !obs.sampled.Load() {
@@ -285,7 +285,7 @@ func TestMQTTSubscribeRollbackRestoresSharedMembership(t *testing.T) {
 		saveFailAt: map[int32]bool{2: true, 3: true},
 	})
 	if !obs.sharedFound {
-		t.Fatal("F-039: the shared membership was dropped by the rollback's definite arm")
+		t.Fatal("issue #43: the shared membership was dropped by the rollback's definite arm")
 	}
 	if obs.sharedQoS != 1 {
 		t.Fatalf("shared membership restored at QoS %d, want 1", obs.sharedQoS)
@@ -323,7 +323,7 @@ func TestMQTTSubscribeRollbackKeepsTheSharedMembershipInTheRecord(t *testing.T) 
 	probe, _ := testSharedRollbackProbeASM(t, s, o)
 	ps := testLoadPersistedSession(t, probe, "f039-t2")
 	if _, ok := ps.SharedSubs["$share/g2/foo"]; !ok {
-		t.Fatalf("F-039: the close save rewrote the record WITHOUT the shared membership while its group durable is live; record holds %v", ps.SharedSubs)
+		t.Fatalf("issue #43: the close save rewrote the record WITHOUT the shared membership while its group durable is live; record holds %v", ps.SharedSubs)
 	}
 }
 
@@ -367,7 +367,7 @@ func TestMQTTSubscribeRollbackReleasesTheSharedGroupDurable(t *testing.T) {
 		saveFailAt: map[int32]bool{2: true, 3: true},
 	})
 	if !obs.sharedFound {
-		t.Fatal("F-039: the shared membership was dropped by the rollback's definite arm")
+		t.Fatal("issue #43: the shared membership was dropped by the rollback's definite arm")
 	}
 	if !obs.consFound {
 		t.Fatal("control failed: no group consumer entry was resident at the rollback, so the durable may never have existed and a 'gone' assertion below would prove nothing")
@@ -415,10 +415,10 @@ func TestMQTTSubscribeRollbackCarriesSharedFilterOptions(t *testing.T) {
 		saveFailAt: map[int32]bool{2: true, 3: true},
 	})
 	if !obs.rapFound {
-		t.Fatal("F-039: Retain As Published was dropped for the restored shared key")
+		t.Fatal("issue #43: Retain As Published was dropped for the restored shared key")
 	}
 	if obs.subID != 7 {
-		t.Fatalf("F-039: the Subscription Identifier was dropped for the restored shared key: got %d, want 7", obs.subID)
+		t.Fatalf("issue #43: the Subscription Identifier was dropped for the restored shared key: got %d, want 7", obs.subID)
 	}
 	probe, _ := testSharedRollbackProbeASM(t, s, o)
 	ps := testLoadPersistedSession(t, probe, "f039-t4")
@@ -479,10 +479,10 @@ func TestMQTTSubscribeRollbackClearsSharedFilterOptions(t *testing.T) {
 		t.Fatal("precondition: the shared membership was dropped, so the option assertion would be vacuous")
 	}
 	if obs.rapFound {
-		t.Fatal("F-039 M5: Retain As Published was left SET for the restored shared key. The attempted state had it cleared, and a restoration that only ever adds cannot express that")
+		t.Fatal("issue #43 M5: Retain As Published was left SET for the restored shared key. The attempted state had it cleared, and a restoration that only ever adds cannot express that")
 	}
 	if obs.subID != 0 {
-		t.Fatalf("F-039 M5: the Subscription Identifier was left at %d for the restored shared key. The attempted state cleared it, and a restoration that only ever adds cannot express that", obs.subID)
+		t.Fatalf("issue #43 M5: the Subscription Identifier was left at %d for the restored shared key. The attempted state cleared it, and a restoration that only ever adds cannot express that", obs.subID)
 	}
 	probe, _ := testSharedRollbackProbeASM(t, s, o)
 	ps := testLoadPersistedSession(t, probe, "f039-t4b")
@@ -560,7 +560,7 @@ func TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership(t *testing.T
 		// fixture helper.
 		switch saves.Add(1) {
 		case 2:
-			return errors.New("F-039 T5: refusing the packet's final save")
+			return errors.New("issue #43 T5: refusing the packet's final save")
 		case 3:
 			// Let it through to the store, where the result hook makes it AMBIGUOUS.
 			reachedRollbackSave.Store(true)
@@ -580,7 +580,7 @@ func TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership(t *testing.T
 		// re-derive it from resp after this hook, and a plain error HERE is an ambiguity
 		// rather than a definite failure — which is exactly the arm under test, and is
 		// why the save hook cannot produce it.
-		return nil, errors.New("F-039 T5: the rollback's own write is unresolved")
+		return nil, errors.New("issue #43 T5: the rollback's own write is unresolved")
 	})
 	defer restoreResult()
 
@@ -589,7 +589,7 @@ func TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership(t *testing.T
 		{topic: "bar", opts: 1},
 	})
 	rc, _ := testMQTTReadDisconnectV5(t, r)
-	t.Logf("F-039 T5: server DISCONNECT reason 0x%02x, saves=%d", rc, saves.Load())
+	t.Logf("issue #43 T5: server DISCONNECT reason 0x%02x, saves=%d", rc, saves.Load())
 	testMQTTExpectDisconnect(t, c)
 
 	// Three route assertions BEFORE the behavioural one. Without them this test passes
@@ -608,7 +608,7 @@ func TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership(t *testing.T
 	}
 
 	if sharedAtRelease.Load() {
-		t.Fatal("F-039 M3: the shared membership was restored on the AMBIGUOUS arm. The rolled-back record may be exactly what landed, and the resolver settles it by re-attempting those bytes — so the rolled-back view must stand")
+		t.Fatal("issue #43 M3: the shared membership was restored on the AMBIGUOUS arm. The rolled-back record may be exactly what landed, and the resolver settles it by re-attempting those bytes — so the rolled-back view must stand")
 	}
 }
 
@@ -635,7 +635,7 @@ func TestMQTTSubscribeRollbackAmbiguousKeepsTheRolledBackMembership(t *testing.T
 //	CAS-rejected because sess.seq is now stale. Nothing is injected at all.
 //
 // A CAS rejection classifies as saveDefinitelyFailed, which is the arm that reaches
-// readd(). It does NOT assert that F-078 arbitration ran, because it does not: an error
+// readd(). It does NOT assert that issue #80 arbitration ran, because it does not: an error
 // from processSubs returns before it.
 func TestMQTTSubscribeRollbackPreservesASucceededJoinWhenALaterOneIsCASRejected(t *testing.T) {
 	// NOT t.Parallel(): see the note in T1.
@@ -707,7 +707,7 @@ func TestMQTTSubscribeRollbackPreservesASucceededJoinWhenALaterOneIsCASRejected(
 		{topic: "bar", opts: 1},
 	})
 	rc, _ := testMQTTReadDisconnectV5(t, r)
-	t.Logf("F-039 T6: server DISCONNECT reason 0x%02x, saves=%d", rc, saves.Load())
+	t.Logf("issue #43 T6: server DISCONNECT reason 0x%02x, saves=%d", rc, saves.Load())
 	testMQTTExpectDisconnect(t, c)
 
 	// Route assertions first: without them this test passes for a packet that never
@@ -723,7 +723,7 @@ func TestMQTTSubscribeRollbackPreservesASucceededJoinWhenALaterOneIsCASRejected(
 	}
 
 	if !aAtRelease.Load() {
-		t.Fatalf("F-039: filter A's membership (%q) was discarded by the rollback, even though its eager write SUCCEEDED and nothing local reverted it", keyA)
+		t.Fatalf("issue #43: filter A's membership (%q) was discarded by the rollback, even though its eager write SUCCEEDED and nothing local reverted it", keyA)
 	}
 	if bAtRelease.Load() {
 		t.Fatalf("filter B's membership (%q) is present, but its eager write was CAS-REJECTED and processSubs restored its prior value — the capture took a state that never existed", keyB)
@@ -754,10 +754,10 @@ func TestMQTTSubscribeRollbackRestoresAnUpgradedPreExistingSharedKey(t *testing.
 		saveFailAt: map[int32]bool{2: true, 3: true},
 	})
 	if !obs.sharedFound {
-		t.Fatal("F-039: the shared membership was dropped by the rollback's definite arm")
+		t.Fatal("issue #43: the shared membership was dropped by the rollback's definite arm")
 	}
 	if obs.sharedQoS != 1 {
-		t.Fatalf("F-039: the restored membership is at QoS %d, not the attempted 1 — the pre-packet snapshot was left in place", obs.sharedQoS)
+		t.Fatalf("issue #43: the restored membership is at QoS %d, not the attempted 1 — the pre-packet snapshot was left in place", obs.sharedQoS)
 	}
 	// The record is the durable evidence: assert the upgraded value survived into it, not
 	// just into memory. The durable's own fate on a finite-expiry session is the expiry
@@ -765,6 +765,6 @@ func TestMQTTSubscribeRollbackRestoresAnUpgradedPreExistingSharedKey(t *testing.
 	probe, _ := testSharedRollbackProbeASM(t, s, o)
 	ps := testLoadPersistedSession(t, probe, "f039-t7")
 	if m, ok := ps.SharedSubs["$share/g7/foo"]; !ok || m.QoS != 1 {
-		t.Fatalf("F-039: the record does not carry the upgraded shared membership; SharedSubs=%v (durable %q)", ps.SharedSubs, durable)
+		t.Fatalf("issue #43: the record does not carry the upgraded shared membership; SharedSubs=%v (durable %q)", ps.SharedSubs, durable)
 	}
 }

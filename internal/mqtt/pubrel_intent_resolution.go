@@ -79,7 +79,7 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 	sess.mu.Lock()
 	stale := sess.gen != r.key.name.gen
 	// A RETAINED exchange a resume quarantined is acted on by nothing — not even this intent's
-	// register CAS (F-105 7c, consult 107).
+	// register CAS (issue #107 7c, consult 107).
 	quarantined := sess.retainedQuarantinedLocked(r.ack.regNonce)
 	sess.mu.Unlock()
 	if stale || quarantined {
@@ -90,7 +90,7 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 	}
 	out := sess.resolvePubRelIntent(r.c, &r.ack)
 	if out == mqttPubRelIntentStillOwed {
-		// THE OWED SUCCESSFUL PUBREC'S CONTINUATION (F-088 WP2): a HandBack's or an AckRoute's bound
+		// THE OWED SUCCESSFUL PUBREC'S CONTINUATION (issue #90 WP2): a HandBack's or an AckRoute's bound
 		// allocation retries its intent arrow; intendPubRelSlot re-applies its own captured-acq
 		// check and the authority batch re-validates the register at its read sequence.
 		out = sess.intendPubRelSlot(r.c, &r.ack)
@@ -100,7 +100,7 @@ func (r *mqttIntentResolution) attempt(final bool) bool {
 		return false
 	case mqttPubRelIntentConfirmed:
 		if b := r.ack.slot.abandonedAck; b != nil && b.payload != _EMPTY_ {
-			// An ABANDONED RETAINED exchange (F-105 7c): no materializer owns its PUBREL — its
+			// An ABANDONED RETAINED exchange (issue #107 7c): no materializer owns its PUBREL — its
 			// advance created the canonical — so the confirmation installs and emits it here.
 			sess.continueAbandonedRetainedPubRel(r.c, r.key.name.pi, &r.ack)
 			return true

@@ -18,7 +18,7 @@ import (
 	"testing"
 )
 
-// F-094: a drain carrying a past-PUBREC intent owns its sid, so no subscription cycle may
+// issue #96: a drain carrying a past-PUBREC intent owns its sid, so no subscription cycle may
 // adopt it away.
 //
 // The defect these pin: adoptDrainLocked removes the drain from BOTH maps and hands its
@@ -194,7 +194,7 @@ func TestHoldReasonPrefersTheUnusableIdentity(t *testing.T) {
 	}
 
 	// The reasons are distinct and each names its own convergence, which is the false-claim
-	// this rename exists to stop: before F-094 both refusals told the operator to remove a
+	// this rename exists to stop: before issue #96 both refusals told the operator to remove a
 	// record that, for an ordinary intent, is doing nothing wrong.
 	unusable := mqttDrainHeldUnusableIdentity.reason()
 	intent := mqttDrainHeldPastPubRecIntent.reason()

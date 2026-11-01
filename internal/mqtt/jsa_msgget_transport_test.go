@@ -5,7 +5,7 @@
 // name. That enumeration is only complete if there is no other way to read a message: a
 // point read built through a new request kind, a second decoder, or a direct-get route
 // would be invisible to it. These tests are what keep the five methods the whole of the
-// route. They survived the retirement of F-109's point-read absence census because they
+// route. They survived the retirement of issue #111's point-read absence census because they
 // state a fact about the broker's transport, not about that census's bookkeeping.
 //
 // What they cannot do is prove there is no other route: they enforce that nothing new

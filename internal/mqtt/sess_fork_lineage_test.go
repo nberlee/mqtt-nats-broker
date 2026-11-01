@@ -69,7 +69,7 @@ func TestSessLineageRuleArms(t *testing.T) {
 		{"verbatim replay of the acknowledged record", testLineageRecord(ourGen, "a", "p"), mqttLineageNotForked},
 
 		// M6: a body claiming our parent written by ANOTHER incarnation is forked, and this row was
-		// deliberately INVERTED by F-029. It used to assert not-forked, on the reasoning
+		// deliberately INVERTED by issue #31. It used to assert not-forked, on the reasoning
 		// that a different incarnation restarts the lineage. That conceded the one fork
 		// the feature exists to catch: a clean-start sibling is written by a session
 		// clear() re-minted, so it always carries a different generation, and the
@@ -394,7 +394,7 @@ func testLandSibling(t *testing.T, e *testInflightEnv, mutate func(*mqttPersiste
 // record would pass the first and fail this.
 //
 // It is named for the SHAPE and not for a successor: child-shaped is a lineage fact, and
-// F-084 is the rule that no lineage fact licenses a claim about who holds the session.
+// issue #86 is the rule that no lineage fact licenses a claim about who holds the session.
 func testLandChildRecord(t *testing.T, e *testInflightEnv, mutate func(*mqttPersistedSession)) *mqttPersistedSession {
 	t.Helper()
 	e.sess.mu.Lock()

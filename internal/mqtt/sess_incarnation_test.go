@@ -10,7 +10,7 @@ import (
 // have: a generation makes the name distinct from every other INCARNATION's, so a
 // delete issued by a retired incarnation cannot name a fresh incarnation's resource.
 // It says nothing about a peer still serving the retiring generation, which a resume
-// preserves (F-062); this test pins the naming property only.
+// preserves (issue #66); this test pins the naming property only.
 //
 // There is no legacy counterpart to be compatible with. An absent generation is
 // rejected at the record boundary (mqttSessGenFromRecord), so no live session can

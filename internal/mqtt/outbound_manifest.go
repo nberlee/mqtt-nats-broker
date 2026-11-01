@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// Immutable retained replay material (F-105, row 7; design D4).
+// Immutable retained replay material (issue #107, row 7; design D4).
 //
 // # What retained QoS 1/2 loses
 //
@@ -662,7 +662,7 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mq
 				"payload's identity and cleanup ownership are reserved BEFORE any chunk is "+
 				"written", a.Txn, pay)
 		}
-		// THE PRODUCING TENURE IS THE BATCH'S OWN (F-105 7c). It is the fence every later
+		// THE PRODUCING TENURE IS THE BATCH'S OWN (issue #107 7c). It is the fence every later
 		// reclamation of unadmitted material decides against, so it is bound here to the serving
 		// authority this reservation CASes rather than taken from the caller.
 		if prev == nil || prev.State != mqttAuthorityServing || next.Tenure != prev.Tenure || next.Tenure != a.Tenure {
@@ -699,7 +699,7 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mq
 	if err := mqttCheckManifestStep(a, cur, next, chunksHere); err != nil {
 		return err
 	}
-	// AND THE COPY ARBITRATES admission, the retained PUBREC fence and closure (F-105 7c).
+	// AND THE COPY ARBITRATES admission, the retained PUBREC fence and closure (issue #107 7c).
 	if err := jsa.checkRetainedManifestArbitration(a, prev, extra, cur, next); err != nil {
 		return err
 	}

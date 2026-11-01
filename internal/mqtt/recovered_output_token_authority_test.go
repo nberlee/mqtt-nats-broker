@@ -19,13 +19,13 @@ import (
 	"testing"
 )
 
-// F-088 fix I and II on the in-process peer rig: a RECOVERED OUTPUT TOKEN beside a standing unsent
+// issue #90 fix I and II on the in-process peer rig: a RECOVERED OUTPUT TOKEN beside a standing unsent
 // marker is outstanding output authority, so recovery classifies the register POSSIBLY ATTEMPTED
 // and keeps the marker as deletion debt; and a successful acting restore supersedes the
 // allocation's void verdict. The token is a real acquisition (acquirePublishAction) by a
 // section left open on A's own connection — the holder that may still write — and B is a distinct
 // account session manager on the same JetStream (testF088ResumeOnPeer). These are ROUTING and
-// BOUNDARY witnesses: the cross-broker wire schedules are in f088_cross_tenure_witness_e2e_test.go.
+// BOUNDARY witnesses: the cross-broker wire schedules are in cancellation_cross_tenure_witness_e2e_test.go.
 
 // testF088AcquireLeaving opens a send section for f on A's own connection and ACQUIRES its output
 // token, leaving the section open and the marker standing: outstanding output authority for B's

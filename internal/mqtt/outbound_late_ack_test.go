@@ -28,7 +28,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-088 / F-097 WP2 (plan rev 20): a late acknowledgement is BOUND before it arrives. These tests
+// issue #90 / issue #99 WP2 (plan rev 20): a late acknowledgement is BOUND before it arrives. These tests
 // witness the AckRoute binding — installed only by an UNANSWERED removal of a transmitted entry —
 // routing the client's answer to the existing completion owners.
 
@@ -232,7 +232,7 @@ func TestF088EndedLineageIsNotReboundOnIdentifierReuse(t *testing.T) {
 func TestF088EndedLineageObservedWhileTrackedIsNotRebound(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t9-ledger", 1)
-	// THE FLOOR UNIT IS HELD (F-112): once L1's projection and register are both gone its
+	// THE FLOOR UNIT IS HELD (issue #114): once L1's projection and register are both gone its
 	// ended-lineage entry is legitimately pruned, and this test reads that entry as its proof that
 	// A observed the ending. The prune's own conditions are TestF112TheEndedLineageVetoExits...'s.
 	f.e.sess.mu.Lock()
@@ -1768,7 +1768,7 @@ func TestF088WithdrawalDebtAcrossSameObjectReconnect(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F-097 residual preservation (C2 requirement 5): a resume that leaves the identifier space
+// issue #99 residual preservation (C2 requirement 5): a resume that leaves the identifier space
 // INCOMPLETE stays conservative, and only the next complete resume decides the opaque register
 // ---------------------------------------------------------------------------
 
@@ -1892,7 +1892,7 @@ func (p *testF088Peer) requireStaysConservative(t *testing.T, subject string) {
 //
 // In both, a successful point read of q's marker and a full dispatcher pass leave
 // piSpaceIncomplete set (requireStaysConservative), and nothing disconnects. Backs T13's
-// recovery-reservation removal class (f088_entry_removal_census_test.go).
+// recovery-reservation removal class (publish_entry_removal_census_test.go).
 //
 // Mutation M34 (a dispatcher unit clears piSpaceIncomplete after a successful point read): the
 // flag is cleared by the pass -> fails.
@@ -2296,7 +2296,7 @@ func TestF088AffineCancelledOccupantMarkerBackedCleanup(t *testing.T) {
 	t.Logf("observed events: %v", events)
 }
 
-// T1 (F-097 takeover stranding, memory half). The client PUBACKs L on broker A; A's in-call
+// T1 (issue #99 takeover stranding, memory half). The client PUBACKs L on broker A; A's in-call
 // acknowledgement advances all fail and its terminal retry is held (barrier). The client resumes on peer
 // B, which takes a NEW tenure over the same generation: B's recovery restores L, its ledger holds
 // L's charge, and at Receive Maximum 1 B withholds a further delivery (the demand latch). After a B

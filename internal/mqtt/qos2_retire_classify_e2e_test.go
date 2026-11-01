@@ -8,7 +8,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// End-to-end coverage for the retirement classifier (qos2_retire_classify.go), F-036
+// End-to-end coverage for the retirement classifier (qos2_retire_classify.go), issue #40
 // site 2.
 //
 // These are behavioral pins for the same reason the release-claim e2e tests are: the
@@ -21,7 +21,7 @@ import (
 //
 // What the classifier catches that neither existing fence can: the discard's enumeration
 // is a one-shot snapshot, so a hold on a subject it never named is never competed for at
-// all, and F-062's cutoff deliberately SPARES a hold that landed above the watermark. In
+// all, and issue #66's cutoff deliberately SPARES a hold that landed above the watermark. In
 // both cases no claim is ever written for this exchange, so the claim succeeds, fence 2
 // finds our own record at our own sequence, and without this classifier the release fans
 // out and answers 0x00.

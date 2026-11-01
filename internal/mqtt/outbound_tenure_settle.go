@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// A serving generation settles its displaced tenures (F-105 7f).
+// A serving generation settles its displaced tenures (issue #107 7f).
 //
 // A generation keeps SERVING across every resume, each accepted CONNECT under a fresh tenure, and
 // only a session end discards it (7d). Every route that ends a subscription records its decision
@@ -252,7 +252,7 @@ func (sess *mqttSession) namesSourceConsumer(durable string) (named, ok bool) {
 // entries each page returned, duplicates across pages ignored. It never compares the collected
 // count with a total. Why this cannot skip a subject that existed when the walk began: the server
 // rebuilds and sorts the set on every request, and the one caller's subject space — a
-// generation's resource records — is never deleted from (F-112), so between two requests the
+// generation's resource records — is never deleted from (issue #114), so between two requests the
 // sorted list only GAINS entries. An insertion before the offset shifts later entries to higher
 // indices, which re-reads one (a duplicate) and never skips one. IF RESOURCE RECORDS ARE EVER
 // DELETED, this argument no longer holds and the walk must be revisited.

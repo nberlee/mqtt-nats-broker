@@ -23,7 +23,7 @@ import (
 )
 
 // TestF105PlainSweepDeletesOnlyARetiredName pins that the plain orphan sweep's DELETE is
-// authorized by a name's RETIRED ownership and by nothing else (F-105 §5.1 points 5 and 6, WP-F
+// authorized by a name's RETIRED ownership and by nothing else (issue #107 §5.1 points 5 and 6, WP-F
 // W2 row D3). Three consumers stand in ONE pass, each unreferenced by any session and aged past
 // the grace window, so the absence of a reference - the sweep's original, wrong authority - would
 // license all three:

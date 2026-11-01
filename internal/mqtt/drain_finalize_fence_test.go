@@ -20,7 +20,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// A FINALIZE THAT LOSES THE RECORD FENCE IS RETRIED (F-098). "Retried on redelivery" is not
+// A FINALIZE THAT LOSES THE RECORD FENCE IS RETRIED (issue #100). "Retried on redelivery" is not
 // true of every finalize: one driven by the client's acknowledgement — or by the send
 // settlement that acknowledgement parks — runs ONCE. Two drains settling on two delivery
 // goroutines contend for the fence, and the loser used to withhold with no clock at all, so

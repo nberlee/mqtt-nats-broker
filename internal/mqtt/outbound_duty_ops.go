@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// The transitions a recovery pass composes (F-105, row 6).
+// The transitions a recovery pass composes (issue #107, row 6).
 
 // mqttDutyOutcomeResolved is what a duty says when the thing it is about reached a durable ending
 // of its own — an obligation that terminated, or a resource whose provisioning sealed. A CLEANUP
@@ -117,7 +117,7 @@ func (jsa *mqttJSA) opResolveDuty(root *mqttRecoveryRoot, d mqttSweptDuty, txn s
 	return cerr
 }
 
-// opResolveDuties continues several duty entries to terminal in ONE batch (F-112: the floor unit
+// opResolveDuties continues several duty entries to terminal in ONE batch (issue #114: the floor unit
 // resolves a live generation's ended exchange duties in bulk, so its writes stay a small fraction
 // of the deliveries it trails). Each member is judged by the same boundary as opResolveDuty's
 // single one; one unearned ending refuses the whole batch, and the release composer leaves out
@@ -329,7 +329,7 @@ func (jsa *mqttJSA) publishGenCompletionCert(c *mqttGenCompletionCertificate) er
 // authorizes a teardown to STOP deleting something, so "I could not read it" must not read as
 // "it is enrolled".
 func (jsa *mqttJSA) cleanupDutyStandsFor(id, epoch, gen, inc string) (bool, error) {
-	// THE INVENTORY [Lo, Hi] (F-112): an enrolment allocates its entry inside the batch that
+	// THE INVENTORY [Lo, Hi] (issue #114): an enrolment allocates its entry inside the batch that
 	// seals, and a sealed floor never moves, so the entry is inside the range; a missing entry
 	// inside it is an inconsistency, and findDutyInInventory reports it as one.
 	_, found, err := jsa.findDutyInInventory(id, epoch, gen, func(d *mqttDutyEntry) bool {

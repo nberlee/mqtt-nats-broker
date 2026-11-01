@@ -13,7 +13,7 @@
 
 package mqtt
 
-// Test helpers for the shared-group lifecycle records (F-105, the shared-group lifecycle
+// Test helpers for the shared-group lifecycle records (issue #107, the shared-group lifecycle
 // transfer). Untagged, so every tag set compiles against them.
 
 // testSharedMembership builds the membership value a session record carries for one shared

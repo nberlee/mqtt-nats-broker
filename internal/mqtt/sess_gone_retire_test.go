@@ -10,7 +10,7 @@ import (
 )
 
 // The licensed retirement of a BOUND session whose record was deleted
-// (sess_gone_retire.go), F-036 site 1.
+// (sess_gone_retire.go), issue #40 site 1.
 //
 // The shape: a client negotiated Keep Alive 0 and went silent, and another broker's
 // teardown deleted its record. reconcileResidentOwnership recognises that and arms the
@@ -789,7 +789,7 @@ func TestF036GoneRetirementReopensAdmissionOnRefusal(t *testing.T) {
 }
 
 // TestF036GoneRetirementDischargesWillExactlyOnce pins the Will disposition, which is
-// where F-084 is easiest to break.
+// where issue #86 is easiest to break.
 //
 // `licensed=false` is the rule: a retirement watermark proves a TEARDOWN, not a successor
 // connection, so this route may not discard the Will — a disposal that suppressed it
@@ -839,7 +839,7 @@ func TestF036GoneRetirementDischargesWillExactlyOnce(t *testing.T) {
 	// the sentinel is proof it was published, and the sentinel arriving first is proof
 	// it never was.
 	if msg := e.deliveryBarrier(t, willWatch, "will/topic"); string(msg.Data) == "barrier" {
-		t.Fatal("the Will was never published: a retirement watermark proves a teardown, not a successor, so suppressing it is silent loss (F-084)")
+		t.Fatal("the Will was never published: a retirement watermark proves a teardown, not a successor, so suppressing it is silent loss (issue #86)")
 	}
 
 	// And exactly once: nothing may be left parked for a later path to publish again.

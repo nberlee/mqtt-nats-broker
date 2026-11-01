@@ -1,6 +1,6 @@
 // Reclamation of a held identifier exclusion: the fourth route that lifts one.
 //
-// F-098 made identifier EXCLUSION complete. Every site that removes local tracking while
+// issue #100 made identifier EXCLUSION complete. Every site that removes local tracking while
 // the durable slot's release is unconfirmed hands the IDENTIFIER's exclusion to `slotOwed`,
 // the sixth liveness term on the send hold, and all 27 of them reach one function. What it
 // left incomplete, deliberately, was RECLAMATION: three routes lift an exclusion —
@@ -65,11 +65,11 @@ const (
 	// mqttExclusionReclaimReadBudget bounds a pass in REQUESTS, not in identifiers. Distinct
 	// restrictions accumulate WITHIN one identifier, so an entry count bounds the wrong
 	// quantity: 64 identifiers holding four binds each is 256 reads, not 64. Every
-	// pending-fence step's requests are charged against it as issued (F-088 WP3 rule 6 (a)).
+	// pending-fence step's requests are charged against it as issued (issue #90 WP3 rule 6 (a)).
 	mqttExclusionReclaimReadBudget = 64
 )
 
-// mqttExclReclaimSeams instruments one session's exclusion-reclaim passes (F-088 T36 rows
+// mqttExclReclaimSeams instruments one session's exclusion-reclaim passes (issue #90 T36 rows
 // 18-18d). Nil in production; a fixture installs it before the session holds any exclusion.
 type mqttExclReclaimSeams struct {
 	// budget replaces the pass's request budget at the fence-step stop, given the pass's
@@ -106,7 +106,7 @@ type mqttExclusionReclaimCandidate struct {
 	binds []mqttSlotExclusionBind
 	// excl is the exclusion OBJECT the snapshot was taken from, by pointer: the pending-fence
 	// rotation's cursor is written back to it only while it is still the live exclusion, so a
-	// write-back never seeds a replacement (F-088 WP3 rule 6 (b)). fenceCursor is its value at
+	// write-back never seeds a replacement (issue #90 WP3 rule 6 (b)). fenceCursor is its value at
 	// the snapshot.
 	excl        *mqttSlotExclusion
 	fenceCursor string
@@ -115,7 +115,7 @@ type mqttExclusionReclaimCandidate struct {
 // mqttReclaimBindOrder is the order a candidate's binds are visited in: by subject VALUE, starting
 // at the strict successor of the exclusion's fenceCursor, with wrap (the first subject when the
 // cursor is empty). Value anchored, so a bind added or removed between visits cannot make the
-// rotation skip or repeat one (F-088 WP3 rule 6 (b)).
+// rotation skip or repeat one (issue #90 WP3 rule 6 (b)).
 func mqttReclaimBindOrder(binds []mqttSlotExclusionBind, cursor string) []mqttSlotExclusionBind {
 	out := make([]mqttSlotExclusionBind, len(binds))
 	copy(out, binds)
@@ -152,7 +152,7 @@ const (
 
 // advanceExclusionFenceCursorLocked moves pi's exclusion's fence cursor to subject, but only while
 // excl is still THE live exclusion object of pi (pointer identity, never the instance): a
-// write-back never seeds a replacement exclusion (F-088 WP3 rule 6 (b)). Scheduling state only.
+// write-back never seeds a replacement exclusion (issue #90 WP3 rule 6 (b)). Scheduling state only.
 //
 // Session lock held on entry.
 func (sess *mqttSession) advanceExclusionFenceCursorLocked(pi uint16, excl *mqttSlotExclusion, subject string) {
@@ -161,7 +161,7 @@ func (sess *mqttSession) advanceExclusionFenceCursorLocked(pi uint16, excl *mqtt
 	}
 }
 
-// reclaimPendingFenceStep is the exclusion-reclaim pass's ONE added step (F-088 WP3 rule 6): the
+// reclaimPendingFenceStep is the exclusion-reclaim pass's ONE added step (issue #90 WP3 rule 6): the
 // subject's base read found a positively identified pending cancellation fence, which is disposed
 // of THROUGH THE ONE DOOR under the dedicated rule — the fence authority, exactly the observed
 // sequence, a confirmed delete (and the door's own confirmed-absence retirement of a verdict that
@@ -185,7 +185,7 @@ func (sess *mqttSession) reclaimPendingFenceStep(subject string, seq uint64, cur
 	})
 	// A fence's disposal ends no obligation (endUnsentBeforeDestroy does not apply to
 	// mqttSlotDeletePendingFence), but a serving-generation fence goes only behind an authority advance
-	// under the serving connection's licence (F-119), whose every request the gate admits and charges.
+	// under the serving connection's licence (issue #121), whose every request the gate admits and charges.
 	out := sess.reapLoadedRegister(subject, seq, cur, mqttSlotDeletePendingFence, lic, gate)
 	switch {
 	case shut:
@@ -322,7 +322,7 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 		seams = &mqttExclReclaimSeams{}
 	}
 	cands, budgetMet := sess.snapshotExclusionReclaimLocked_()
-	// THE PASS'S REQUEST ACCOUNT (F-088 WP3 rule 6 (a)): the snapshot pre-charged one base read
+	// THE PASS'S REQUEST ACCOUNT (issue #90 WP3 rule 6 (a)): the snapshot pre-charged one base read
 	// per bind; every request a pending-fence step actually issues is added here as it is issued.
 	spent := 0
 	for _, cand := range cands {
@@ -346,7 +346,7 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 	}
 	open := srv.willDispatchOpen
 	// The serving connection's licence, captured once for the pass: a pending fence of the serving
-	// generation is disposed of only behind an authority advance under it (F-119), admitted as a
+	// generation is disposed of only behind an authority advance under it (issue #121), admitted as a
 	// background attempt so it yields to announced foreground operations.
 	sess.mu.Lock()
 	lic := mqttLicenceOf(sess.c).withAdmission(sess.admitBackgroundAuthority)
@@ -388,7 +388,7 @@ func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
 			// THE BASE READ, ABSENCE-ONLY: an empty subject read is an absence, exactly as
 			// confirmSlotReleased decides it BEFORE it compares anything; a load error or an
 			// unreadable record is not. Nothing else this read returns is evidence of a release
-			// — and IT MUST NEVER RETIRE A VERDICT on what it finds. What it adds (F-088 WP3
+			// — and IT MUST NEVER RETIRE A VERDICT on what it finds. What it adds (issue #90 WP3
 			// rule 6) is recognising a positively identified PENDING FENCE on the subject, which
 			// is disposed of by its own rule before the absence can hold.
 			cur, smsg, lerr := sess.asm.loadInflightRecord(b.subject)

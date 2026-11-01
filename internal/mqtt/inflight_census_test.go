@@ -2,7 +2,7 @@
 // delete, or free a QoS 1/2 in-flight identifier, and the linter that keeps it honest.
 //
 // WHY THIS FILE EXISTS, stated first because its history is the whole justification.
-// F-092's plan tried five times to enumerate this population in prose, and five review
+// issue #94's plan tried five times to enumerate this population in prose, and five review
 // rounds each found another omission: a cardinality claim that did not match the tree,
 // a rule excluding numeric leaves, an "exhaustive" list missing the landed gates, sub-IDs
 // with no parent, and a replacement list that violated the rule it introduced. Each fix
@@ -106,7 +106,7 @@ const (
 )
 
 // mqttCensusRow is one census entry. The SELECTOR is a function name plus the callee
-// spelling, deliberately not a line number: every line number in F-092's plan drifted at
+// spelling, deliberately not a line number: every line number in issue #94's plan drifted at
 // least once across ten review rounds.
 type mqttCensusRow struct {
 	id     string
@@ -177,7 +177,7 @@ var mqttProtectedSinks = map[string][]string{
 //
 // This family exists because a call-only scan proves "every call to a known helper is
 // inventoried" and NOT "every census-relevant mutation goes through one" — the exact
-// insufficiency F-092's second escalation consult identified. `delete(sess.srcAckOwed,
+// insufficiency issue #94's second escalation consult identified. `delete(sess.srcAckOwed,
 // key)` in resolveRetiredSource is the concrete case: a real census edge (C05a) that no
 // sink call reaches, and the linter found it by failing rather than by anyone noticing.
 //
@@ -203,7 +203,7 @@ var mqttProtectedMapMutators = map[string]struct{}{
 
 // mqttCensusManifest is the authoritative census.
 //
-// SEEDED from F-092's plan tables, which are explicitly NOT authoritative — this is. A
+// SEEDED from issue #94's plan tables, which are explicitly NOT authoritative — this is. A
 // row whose mechanism is unbuilt carries `censusPlanned`; the final mode forbids those,
 // so the census cannot ship half-written.
 //
@@ -228,7 +228,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "reapObservedRegister", status: censusLive,
 		test:     "TestMQTTInflightStoreReapsCancelledOccupant",
 		mutation: "M46", oracle: "slot presence at the observed sequence",
-		why: "F-088 (consult C4 item 3): another allocation's PENDING FENCE, identified by its written " +
+		why: "issue #90 (consult C4 item 3): another allocation's PENDING FENCE, identified by its written " +
 			"provenance alone, is disposed of through mqttSlotDeletePendingFence before the create is " +
 			"retried; an occupant cancellation with the same body is not a fence and is not reaped here",
 	},
@@ -319,7 +319,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: _EMPTY_, status: censusLive,
 		test:     "TestMQTTDeleteInflightRegisterForFailsClosedWithNoCapturedSlot",
 		mutation: "N21-C21a", oracle: "the deletion-attempt count",
-		why: "with no captured snapshot it must refuse rather than fall back to a sequence-addressed delete, which is the addressing F-034 forbids",
+		why: "with no captured snapshot it must refuse rather than fall back to a sequence-addressed delete, which is the addressing issue #38 forbids",
 	},
 	{
 		id: "C21b", kind: censusEdge, parent: "C21", fn: "deleteInflightRegisterFor",
@@ -370,7 +370,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "loadInflightRecordsMulti", status: censusLive,
 		test:     "TestMQTTInflightMarkerBatchReadFailureReservesTheIdentifierSpace",
 		mutation: "N21-C22c", oracle: "piSpaceIncomplete after a failed marker batch read",
-		why: "the marker walk's batched load (F-072): an enumerated marker whose read is indeterminate " +
+		why: "the marker walk's batched load (issue #76): an enumerated marker whose read is indeterminate " +
 			"leaves its register's transmission state unknown, so the identifier space is withheld",
 	},
 	{
@@ -378,7 +378,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "loadInflightRecordsMulti", status: censusLive,
 		test:     "TestMQTTInflightMarkerAbsenceIsNotInterpretedAgainstAStaleSnapshot",
 		mutation: "N21-C22d", oracle: "the reread replaces the walk snapshot (rows 5-9)",
-		why: "the per-record register reread for an absent marker (F-072, N-5.6): absence is never " +
+		why: "the per-record register reread for an absent marker (issue #76, N-5.6): absence is never " +
 			"interpreted against the cached snapshot, and a failed reread withholds rather than installs",
 	},
 	{
@@ -386,7 +386,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "loadInflightRecord", status: censusLive,
 		test:     "TestMQTTInflightRecoveryWalkRaceFailsClosed",
 		mutation: "N21-C22e", oracle: "reclassification or a withheld identifier space",
-		why: "the two-walk case (F-072, N-5.6): a marker whose register the snapshot did not see loads " +
+		why: "the two-walk case (issue #76, N-5.6): a marker whose register the snapshot did not see loads " +
 			"its sibling authoritatively — a present sibling reclassifies, an unresolved read fails closed",
 	},
 	{
@@ -415,7 +415,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "storeInflightCAS", status: censusLive,
 		test:     "TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister",
 		mutation: "N21-C16b", oracle: "the slot's Claim after resume",
-		why: "SLOT-ONLY since F-105 7b (an ordinary slot's ownership is its exchange's entitlement): " +
+		why: "SLOT-ONLY since issue #107 7b (an ordinary slot's ownership is its exchange's entitlement): " +
 			"the ordered PRE-CONNACK custody contest shared by the positive transferable " +
 			"publish and pubrel_ready sets. It covers every state admission can acquire from, " +
 			"including a ready slot with an in-memory entry and the narrow retired-ready set " +
@@ -468,7 +468,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "casInflightSlot", status: censusLive,
 		test:     "TestF092CompetingCustodyTransfersLandOnce",
 		mutation: "N-custody-transfer", oracle: "the slot's Claim/ClaimSeq after the competing transfers",
-		why: "SLOT-ONLY since F-105 7b: the inline custody repair: a quiescent slot whose ONLY failing admission check is " +
+		why: "SLOT-ONLY since issue #107 7b: the inline custody repair: a quiescent slot whose ONLY failing admission check is " +
 			"custody is moved to the proven-current incarnation, under the exact observed claim " +
 			"tuple and only when the standing claim is strictly older than the proven acceptance",
 	},
@@ -565,7 +565,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "M2", oracle: "slot presence and bumpPI's next identifier",
 		why: "PUBCOMP's ONE arrow to `pubrel_terminal`, after which cleanup may finish the " +
-			"exchange. It is one arrow rather than two because F-098 took the live action out " +
+			"exchange. It is one arrow rather than two because issue #100 took the live action out " +
 			"of the phase: a sibling row here carried the `pubrel_sending -> " +
 			"pubrel_terminal_draining` arrow, which existed only to keep a phase and a token in " +
 			"step, and PUBCOMP now takes this arrow whether or not a write is out. What that " +
@@ -587,13 +587,13 @@ var mqttCensusManifest = []mqttCensusRow{
 		test:     "TestF092TerminalReleaseFreesTheIdentifier",
 		mutation: "M2", oracle: "slot presence",
 		why: "the terminal EXACT deletion, which needs three things and not two: subject " +
-			"addressing (F-034), identity authorization, and a FRESHNESS FENCE on the observed " +
+			"addressing (issue #38), identity authorization, and a FRESHNESS FENCE on the observed " +
 			"sequence — plus the source-suppression obligation, which retains the slot while " +
 			"the source is live or its status is unknown",
 	},
 	{
 		id: "C29c", kind: censusParent, fn: "handOffPublishEntryLocked", status: censusLive,
-		why: "F-093's ordered handoff: two map edges, and the ORDER is the correctness property",
+		why: "issue #95's ordered handoff: two map edges, and the ORDER is the correctness property",
 	},
 	{
 		id: "C29c2", kind: censusEdge, parent: "C29c", fn: "handOffPublishEntryLocked",
@@ -780,7 +780,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		test:     "TestMQTTInflightSlotOnlyConsumedCloseRetiresLiveMemory",
 		mutation: "N21-C23", oracle: "pendingPublish membership",
 		why: "recovery's consumed-entry map removal, ahead of any source removal; its distinct " +
-			"input since F-105 7b is the slot-only contest's Closed outcome (the ordinary drops " +
+			"input since issue #107 7b is the slot-only contest's Closed outcome (the ordinary drops " +
 			"retire their entries through the drop loop's handoff)",
 	},
 	{
@@ -851,7 +851,7 @@ var mqttCensusManifest = []mqttCensusRow{
 		sink: "delete:pendingPublish", status: censusLive,
 		test:     "TestF088InheritedReplacementCancellationEnrolsTheDrain",
 		mutation: "N21-C55t", oracle: "pendingPublish membership and the identifier's exclusion",
-		why: "F-088 WP3 edit 5 (staged): a register-only replacement that landed over a cancelled " +
+		why: "issue #90 WP3 edit 5 (staged): a register-only replacement that landed over a cancelled " +
 			"allocation inherited a possibly-transmitted occupant, so nothing destroys or tombstones it; " +
 			"only OUR placeholder goes, with the identifier kept excluded",
 	},
@@ -1322,7 +1322,7 @@ func TestInflightCensusHasNoUnresolvedIndirection(t *testing.T) {
 
 // TestInflightCensusIsFinal is PROPERTY 7, and it is SKIPPED except in final mode.
 //
-// F-092's admission half is built incrementally, so a `planned` row is legitimate while
+// issue #94's admission half is built incrementally, so a `planned` row is legitimate while
 // the mechanism it describes is unbuilt. What must never happen is that convenience
 // surviving into the commit: this test is the gate that says the census is complete, and
 // Phase 7 runs it.

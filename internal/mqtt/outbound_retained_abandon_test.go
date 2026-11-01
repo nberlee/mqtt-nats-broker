@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-// T24 — a retained replay the resumed connection can no longer carry (F-105 7c, plan §3.6.1).
+// T24 — a retained replay the resumed connection can no longer carry (issue #107 7c, plan §3.6.1).
 
 // testRetainedAbandonRig is a v5 server with one retained message delivered once to a persistent
 // subscriber that never answered, and the subscriber then resumed with a Maximum Packet Size the
@@ -517,7 +517,7 @@ func TestF105RetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
 // an earlier generation (mqttKindEndsEarlierGeneration), so the route is real; the Discard is the
 // production discarding close (opCloseTeardownGenerationWith), applied in the window a teardown
 // leaves between its closure and its register reap. (A clean start over a QoS 2 session cannot
-// reach it: F-113.)
+// reach it: issue #115.)
 func TestF105RetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 	for _, order := range []string{"discard-before-read", "discard-in-presend"} {
 		t.Run(order, func(t *testing.T) {

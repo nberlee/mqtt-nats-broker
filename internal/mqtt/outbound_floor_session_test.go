@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// THE FLOOR, SESSION-SIDE (F-112): what a resident session reads, keeps and prunes once a live
+// THE FLOOR, SESSION-SIDE (issue #114): what a resident session reads, keeps and prunes once a live
 // generation's history is retired behind its floor.
 
 // T1. A resume reads [Lo, Hi] and nothing below it (M5): with the floor near the top of a long

@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// Driving the ownership protocol to a servable authority (F-105, row 9).
+// Driving the ownership protocol to a servable authority (issue #107, row 9).
 //
 // `mqttDecideConnectOwnership` says which transition a CONNECT must run NEXT. It is stateless
 // and decides from one read. What is missing — and what this is — is the thing that carries a
@@ -130,7 +130,7 @@ type mqttOwnObservation struct {
 }
 
 // forbidsRedrive reports whether this drive's own proposal forbids the CONNECT from driving
-// again with a fresh proposal (F-105 8a, consult 120). It is decided from what the drive
+// again with a fresh proposal (issue #107 8a, consult 120). It is decided from what the drive
 // ESTABLISHED, never from the identity of whatever error a handler returned: a re-drive is
 // licensed only when no own proposal may have landed, when the own proposal COMMITTED (the
 // next drive finalizes it exactly as proposed), or when this acceptance PROVABLY aborted it
@@ -392,7 +392,7 @@ func mqttDriveOwnershipRun(in mqttConnectOwnershipInput, ownTenure string,
 		// abort is known from the READ, and nothing says the close is still owed. An own
 		// aborted PREPARATION is not abandoned here: the executor's in-place cleanup cancels it,
 		// and a cancellation that did not confirm is owed to the abandonment worker the caller
-		// launches on the refusal (F-105 8a) — one path, never a second inline one.
+		// launches on the refusal (issue #107 8a) — one path, never a second inline one.
 		if ownProposalAborted && !(d.Action == mqttOwnershipCloseAbandoned && d.Recovery == nil) {
 			return mqttOwnershipResult{
 				Outcome: mqttOwnershipRefused, Obs: *obs, Steps: steps,

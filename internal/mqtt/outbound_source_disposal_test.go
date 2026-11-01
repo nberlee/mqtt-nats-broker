@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// F-105 7c-lc: a logical-use consumer is retired only on a route's disposal decision, taken under
+// issue #107 7c-lc: a logical-use consumer is retired only on a route's disposal decision, taken under
 // the entitlement that still serves, and its retirement retires its name in the same batch.
 
 func testDisposalEnt(auth *mqttOutboundAuthority) mqttOutboundEntitlement {

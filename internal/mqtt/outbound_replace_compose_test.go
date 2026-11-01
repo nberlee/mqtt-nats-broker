@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// Composing a replacing admission (F-105, row 1).
+// Composing a replacing admission (issue #107, row 1).
 //
 // These drive the composer through the REAL write boundary, because a composer whose output the
 // boundary refuses has composed nothing — and because the boundary re-derives everything, a

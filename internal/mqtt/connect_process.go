@@ -355,7 +355,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		c.closeTransport()
 		return errMQTTConnectDeadlineExpired
 	}
-	// The ownership budget is anchored HERE, at the moment F-051's deadline stopped
+	// The ownership budget is anchored HERE, at the moment issue #55's deadline stopped
 	// (mqttAdmitConnectLocked stopped the timer just above), so the whole interval between
 	// that stop and a servable authority — the reads, the recovery, and every re-drive — is
 	// bounded by one absolute allowance. Captured before the restoreSession label so a
@@ -364,7 +364,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// to prevent (Codex consult 10). See outbound_connect_budget.go.
 	ownBudgetAnchor := time.Now()
 	// THE OWED ABANDONMENT of this CONNECT's own aborted proposal, if a refusal leaves one
-	// (F-105 8a). Registered BEFORE the certifier below so it runs AFTER it — defers run last
+	// (issue #107 8a). Registered BEFORE the certifier below so it runs AFTER it — defers run last
 	// first — and therefore after the accept transaction's own deferred release as well: the
 	// worker starts only once this connection is certified and holds nothing.
 	var owedAbandon func()
@@ -375,7 +375,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 			owedAbandon()
 		}
 	}()
-	// A REFUSED ACCEPTANCE NEVER ACTIVATES, whatever lands afterwards (F-105 8a). Every refusal
+	// A REFUSED ACCEPTANCE NEVER ACTIVATES, whatever lands afterwards (issue #107 8a). Every refusal
 	// that wrote no success CONNACK certifies this connection closed through the external
 	// protocol — seal, close outside the writer lock, cross the barrier, record — so a
 	// finalization another acceptance completes later cannot make this socket emit. It runs at
@@ -402,7 +402,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		}
 	}()
 	if refusal, ok := s.authorizeClient(c); !ok {
-		// Tell the client which refusal it was before the close (F-061): 3.1.1 [3.1.4] says
+		// Tell the client which refusal it was before the close (issue #65): 3.1.1 [3.1.4] says
 		// the Server SHOULD, 5.0 [3.1.4] that it MAY. sendConnAck traces it only if written.
 		if h := mqttTestRefusalBeforeConnAckV.Load(); h != nil {
 			(*h)(c)
@@ -413,7 +413,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	}
 	// Authenticated AND account-bound: authorizeClient refused the CONNECT
 	// unless the identity's own NATS account is the service account, which is the
-	// v1 same-account constraint docs/ARCHITECTURE.md states. F-080.
+	// v1 same-account constraint docs/ARCHITECTURE.md states. issue #82.
 	//
 	// Capture the Will's authorization HERE, while the snapshot is provably valid
 	// and the connection still exists. Every site that discharges a Will -- the
@@ -548,7 +548,7 @@ CHECK:
 	// below so LIFO runs it LAST — after endAcceptTx, after the Will phase, and after the
 	// client-ID gate is released. Notifying or closing while the gate is held is what
 	// disposeForeignSessionLocked has to dodge by dispatching its close to another
-	// goroutine; here it simply runs at the end, on this readLoop. F-084.
+	// goroutine; here it simply runs at the end, on this readLoop. issue #86.
 	var connTail func()
 	defer func() {
 		if connTail != nil {
@@ -634,7 +634,7 @@ CHECK:
 	//
 	// which is the order the discharge needs: the accept transaction must be CLOSED (the
 	// fence cannot be acquired twice on one goroutine) and the ownership gate must still be
-	// HELD, so nothing rebinds between the disposal and the Will it owes. F-084.
+	// HELD, so nothing rebinds between the disposal and the Will it owes. issue #86.
 	var connWillPhase func()
 	defer func() {
 		if connWillPhase != nil {
@@ -655,7 +655,7 @@ CHECK:
 	// which is what the Will action requires: the accept transaction CLOSED, because
 	// mqttConsumeWillUnderGate does JetStream work and holding the record fence across an
 	// enqueue's retries would block every other writer on this subject; and the ownership
-	// gate STILL HELD, so nothing rebinds between the disposal and the Will it owes. F-084.
+	// gate STILL HELD, so nothing rebinds between the disposal and the Will it owes. issue #86.
 	//
 	// owner is the identity the disposal checks itself against, and it is a PARAMETER
 	// because one caller must waive it: the teardown-incomplete arm disposes an object this
@@ -667,7 +667,7 @@ CHECK:
 	// transaction is opened.
 	//
 	// The phases it hands off CHAIN rather than replace, through registerDisposalPhases: since
-	// F-105 8a a CONNECT can dispose a stale resident object at its top and go on to reach
+	// issue #107 8a a CONNECT can dispose a stale resident object at its top and go on to reach
 	// another disposing arm, and every disposal's Will and close are owed whatever happens
 	// after it.
 	//
@@ -708,7 +708,7 @@ CHECK:
 	// disposeCapturedThroughPhases is disposeThroughPhases for the retirement path,
 	// where the displaced client was detached (and its parked action taken) BEFORE the
 	// re-mint: the disposition is built from the capsule instead of from the session,
-	// which by now names a fresh incarnation. F-036 unit 1.
+	// which by now names a fresh incarnation. issue #40 unit 1.
 	disposeCapturedThroughPhases := func(capsule *mqttRetiredBinding, voc mqttDisposalVocabulary) {
 		target := es
 		d := asm.disposeCaptured(target, capsule, false)
@@ -725,7 +725,7 @@ CHECK:
 
 	defer endAcceptTx()
 
-	// One absolute ownership budget for this CONNECT, anchored at F-051's stop and constructed
+	// One absolute ownership budget for this CONNECT, anchored at issue #55's stop and constructed
 	// ABOVE the restoreSession label so it survives every re-drive unchanged: retries and cycles
 	// consume it, none resets it. See outbound_connect_budget.go and ownBudgetAnchor above.
 	ownBudgetTotal := mqttConnectOwnershipBudget
@@ -755,7 +755,7 @@ CHECK:
 		return nil
 	}
 	// The CONNECT's own ownership state across every drive and re-drive: the intents its drives
-	// proposed, and the ONE foreign proposal it settles (F-105 8a). Above the label for the same
+	// proposed, and the ONE foreign proposal it settles (issue #107 8a). Above the label for the same
 	// reason as the budget: a re-drive that reset it would be a fresh acceptance in all but name.
 	ownState := newMQTTConnectOwnershipState()
 
@@ -767,7 +767,7 @@ CHECK:
 	// pass discarded, and re-send deliveries belonging to a dead incarnation.
 restoreSession:
 	// SETTLE ANY STANDING OWNERSHIP PROPOSAL FIRST, before the restore, the uncertain-record
-	// resolution, the retirement and the clean-start block (F-105 8a). Each of those may destroy
+	// resolution, the retirement and the clean-start block (issue #107 8a). Each of those may destroy
 	// or re-propose over what a crashed or concurrent acceptance left mid-flight — a committed
 	// successor record, a predecessor a cancelled handoff would restore — and none of them reads
 	// the authority's proposal. Settling it here is the CONNECT's half; every discard settles at
@@ -786,7 +786,7 @@ restoreSession:
 		// generation other than the resident object's, a committed proposal moved the record
 		// past it — whoever finalized it, this CONNECT or another settler first. The object is
 		// stale, and the existing disposal for exactly that fact applies: the record moved and
-		// nothing establishes who holds it, so the Will stays ours to discharge (F-084). An
+		// nothing establishes who holds it, so the Will stays ours to discharge (issue #86). An
 		// object whose retirement is pending is left to the join below, which drains its owners
 		// and finishes its discard; nothing here may declare them drained.
 		if exists && es != nil && sload.status == mqttOutboundValid && sload.rec != nil &&
@@ -901,7 +901,7 @@ restoreSession:
 	// reaches both the discard branch (inside `if exists`) and the ownership drive (outside it),
 	// and re-zeroed on every re-drive because a goto restoreSession re-runs this declaration. A
 	// clean start over a LIVE serving authority does NOT destroy the record before acquiring
-	// ownership — that premature destruction is what F-105's row-9 ordering corrects (Codex
+	// ownership — that premature destruction is what issue #107's row-9 ordering corrects (Codex
 	// consult 6): the accepted batch displaces the predecessor record in place through a
 	// discarding handoff, so its identity (cshWID/cshSeq) is captured before the reset, its
 	// backing-resource targets ride the closing batch, and its held durables are cleaned only
@@ -919,7 +919,7 @@ restoreSession:
 
 	if exists {
 		// A RETIREMENT-PENDING session owes a clean-session discard whose drain
-		// ceiling fired ([MQTT-3.1.2-6]; F-036 unit 1). It is non-resumable, so
+		// ceiling fired ([MQTT-3.1.2-6]; issue #40 unit 1). It is non-resumable, so
 		// finish the discard before deciding anything about this CONNECT: JOIN the
 		// close cycle already in progress — do NOT close it again — and claim the
 		// parked obligation under the gate this CONNECT holds, which is what
@@ -961,7 +961,7 @@ restoreSession:
 			resumePubs, resumeRels = nil, nil
 			goto restoreSession
 		}
-		// A SESSION ITS BOUND CONNECTION HAS ALREADY ENDED (F-040). The connection still
+		// A SESSION ITS BOUND CONNECTION HAS ALREADY ENDED (issue #44). The connection still
 		// bound here may have sent a v5 DISCONNECT setting the Session Expiry Interval to
 		// 0 (Spec5 [3.14.2.2.2]), so the session ends when that connection closes
 		// ([3.1.2.11]) and must not be resumed. Applying that instruction is the close's
@@ -1045,7 +1045,7 @@ restoreSession:
 		// The retirement capsule of the clean-start path, if that is the path taken:
 		// it outlives the retirement because the SUCCESS arm still owes the displaced
 		// client its takeover tail and still owes its parked action a disposition, and
-		// by then es.c is nil (F-036 unit 1).
+		// by then es.c is nil (issue #40 unit 1).
 		var capsule *mqttRetiredBinding
 		// Clear the session if client wants a clean session.
 		// Also, Spec [MQTT-3.2.2-1]: don't report session present
@@ -1059,7 +1059,7 @@ restoreSession:
 			// and by then its generation is re-minted and its sequence 0 — so the Will
 			// baseline has to be taken here, while it still names the incarnation the Will
 			// was armed under. See mqttWillFence.
-			// THE TWO-PHASE RETIREMENT (F-036 unit 1). Today's single clear() call
+			// THE TWO-PHASE RETIREMENT (issue #40 unit 1). Today's single clear() call
 			// re-minted this object's generation while the displaced client was still
 			// bound and still admitted, so its in-flight routes derived subjects under
 			// the FRESH generation — losing an acknowledged QoS 2 message with one
@@ -1076,7 +1076,7 @@ restoreSession:
 				prepared *mqttPreparedClear
 				cerr     error
 			)
-			// P2 (F-105 8b): a clean start that will hand off from a SERVING predecessor names
+			// P2 (issue #107 8b): a clean start that will hand off from a SERVING predecessor names
 			// the retirement targets of the record the accepted batch DISPLACES, read here under
 			// the record fence and before the detach, never from this object's memory; and a
 			// clean start never discards where a marker built from memory could be continued into
@@ -1097,7 +1097,7 @@ restoreSession:
 				// retry, exactly as the unresolved-record refusal has always done.
 				// A drain ceiling means an admitted route or a queued effect of the
 				// incumbent is still outstanding: disposing under it is what every
-				// prior F-036 attempt died on.
+				// prior issue #40 attempt died on.
 				if errors.Is(cerr, errMQTTClearDrainTimeout) {
 					// Same as the JOIN arm above: the answer is RETRY, so a v5 client
 					// is told 0x89 instead of being left to infer it from a socket
@@ -1115,12 +1115,12 @@ restoreSession:
 			}
 			// The capsule carries the RETIRING incarnation's Will baseline, the
 			// displaced client and its parked disconnect action: after the detach
-			// nothing may rediscover them through es.c. See mqttWillFence, F-084.
+			// nothing may rediscover them through es.c. See mqttWillFence, issue #86.
 			//
 			// DISCARD versus HANDOFF. A clean start over a client with a LIVE serving outbound
 			// authority must NOT destroy its record and then acquire ownership — that premature
 			// destruction leaves the authority serving with no record to hand off from, and the
-			// next transition refuses (F-105 row-9 ordering, Codex consult 6). Instead the accepted
+			// next transition refuses (issue #107 row-9 ordering, Codex consult 6). Instead the accepted
 			// batch displaces the predecessor record IN PLACE through a discarding handoff: its
 			// identity (cshWID/cshSeq) and its backing-resource targets are captured HERE, before
 			// the reset, and its held durables are cleaned only AFTER the successor is serving.
@@ -1130,9 +1130,9 @@ restoreSession:
 			s1WID, s1Seq, s1Gen := es.wid, es.seq, es.gen
 			es.mu.Unlock()
 			// The choice was made ONCE, before the detach, from the discard boundary's own load
-			// (F-105 8a; see mqttPreparedClear.auth): the disposition proved this object's record
+			// (issue #107 8a; see mqttPreparedClear.auth): the disposition proved this object's record
 			// at s1Seq under an authority SERVING at s1Gen, or chose the discard arm, or refused
-			// (F-105 8b; displacedRetireTargets). Nothing here re-decides it.
+			// (issue #107 8b; displacedRetireTargets). Nothing here re-decides it.
 			if displaced != nil {
 				// Quiesce the QoS 2 move and release fences exactly as destroy does — a move or a
 				// release admitted before this point performs JetStream round trips, so draining
@@ -1148,7 +1148,7 @@ restoreSession:
 					delete(es.cons, sid)
 					// A shared group consumer is not this session's to delete; the generation's
 					// acquisitions of it are sealed and released by the recovery owner the
-					// finalization's discarding closure plants (F-105 7e).
+					// finalization's discarding closure plants (issue #107 7e).
 					if cc.DeliverGroup != _EMPTY_ {
 						continue
 					}
@@ -1188,7 +1188,7 @@ restoreSession:
 					// The capsule's client, not es.c: the detach already happened, so
 					// rediscovering the displaced connection through the session would
 					// find nil and silently drop its close, its notification, its Will,
-					// its disconnect stamp and its expiry (F-036 unit 1, and the fourth
+					// its disconnect stamp and its expiry (issue #40 unit 1, and the fourth
 					// attempt's finding 4).
 					asm.abandonReDrivenSessionCaptured(c, es, capsule)
 					if aerr := rd.admitCycle(); aerr != nil {
@@ -1198,7 +1198,7 @@ restoreSession:
 					resumePubs, resumeRels = nil, nil
 					goto restoreSession
 				}
-				// EVERY REMAINING ERROR IS POST-RESET, and since F-036 unit 1 that is
+				// EVERY REMAINING ERROR IS POST-RESET, and since issue #40 unit 1 that is
 				// structural rather than merely provable: BOTH uncertainty refusals live
 				// in prepareClear, which ran (and returned above) before this destroy
 				// could start, so no errMQTTClearRefusedUnresolved can arrive here at
@@ -1219,10 +1219,10 @@ restoreSession:
 				// enqueueDelayedWill a zero origin sequence, which its validation refuses —
 				// sacrificing the delay and publishing a delayed Will immediately for a
 				// session that only failed to tear itself down. willFence carries the
-				// RETIRING incarnation, which is the one the Will belongs to. F-084.
+				// RETIRING incarnation, which is the one the Will belongs to. issue #86.
 				// The capsule carries the displaced client, its parked action and the
 				// retiring incarnation's Will fence, so this arm discharges all five
-				// obligations without reading es.c — which the detach nilled. F-084: no
+				// obligations without reading es.c — which the detach nilled. issue #86: no
 				// successor is established here, so the Will is preserved or discharged
 				// deferred, never discarded.
 				disposeCapturedThroughPhases(capsule, mqttDisposalTeardownIncomplete)
@@ -1243,7 +1243,7 @@ restoreSession:
 		// the re-mint, so es.c is nil by now and the capsule is the only thing that
 		// still names it. The takeover tail below is owed to it either way — an
 		// ordinary resume takeover finds it here, a retirement finds it there
-		// (F-036 unit 1).
+		// (issue #40 unit 1).
 		if ec == nil && capsule != nil {
 			ec = capsule.client
 		}
@@ -1256,7 +1256,7 @@ restoreSession:
 		//
 		// HYGIENE, and nothing rests on it: an inert hold is invisible to
 		// sendReservedLocked, so it blocks no allocation and no transmission either way.
-		// It is also not the "dropped at a named transition site" F-089 forbids: that rule
+		// It is also not the "dropped at a named transition site" issue #91 forbids: that rule
 		// is about a LIVE debt, while this deletes only what the predicate has already
 		// proved reserves nothing — a write token is owner-independent and survives here.
 		es.sweepDeadSendHoldsLocked()
@@ -1267,7 +1267,7 @@ restoreSession:
 		// against THIS tracker for the rest of its life. Ordered after the sweep so the
 		// sweep stays the statement immediately following the ownership move, which is
 		// what the rebind guard requires; the capture only needs the same critical
-		// section, not a position within it (F-036 unit 1).
+		// section, not a position within it (issue #40 unit 1).
 		c.mqtt.tracker = es.leases
 		// The requested Session Expiry Interval and Clean flag are NOT applied
 		// here. This CONNECT has not been granted yet — the reconciliation phase
@@ -1309,7 +1309,7 @@ restoreSession:
 		// still be holding the identifier awaiting PUBREL. The release now happens at the one
 		// site that PROVES the frame was never written, its abandonment
 		// (releaseRetainedSendAbandonedLocked), so resume has nothing left to decide and reads
-		// no transmission state at all (F-101).
+		// no transmission state at all (issue #103).
 		// What this session already had in flight, captured before any subscription
 		// is restored — the only point at which "pending" unambiguously means
 		// "pending from before the disconnect". resendPendingRedelivery NAKs exactly
@@ -1323,7 +1323,7 @@ restoreSession:
 			// the deadline, generation, sequence and epoch it was parked with. The
 			// retirement took it into the capsule with the detach, so this is the one
 			// place the successful takeover can still discharge it — dropping it here
-			// would silently lose that Will (F-036 unit 1; F-084).
+			// would silently lose that Will (issue #40 unit 1; issue #86).
 			//
 			// A successor IS held in hand here, which is what licenses discarding a
 			// LIVE Will below; a parked action is discharged rather than discarded
@@ -1355,7 +1355,7 @@ restoreSession:
 		// it MUST set Session Present to 0 in the CONNACK packet.
 		es.mu.Lock()
 		es.c, es.clean = c, sessClean
-		// Same capture as the resident-session bind above (F-036 unit 1).
+		// Same capture as the resident-session bind above (issue #40 unit 1).
 		c.mqtt.tracker = es.leases
 		es.expiryInterval = expiry
 		es.disconnectedAt = 0
@@ -1394,7 +1394,7 @@ restoreSession:
 	//
 	// A repair that could not read whether a consumer it would reinstate still serves refuses
 	// the CONNECT before its accept, exactly as an unsettled ownership does: nothing has landed,
-	// the capsule is kept, and the client's retry reads again (F-105 7f).
+	// the capsule is kept, and the client's retry reads again (issue #107 7f).
 	if ferr := asm.reassertForkedGrantInto(es, acceptTok); ferr != nil {
 		asm.removeSession(es, true)
 		return fmt.Errorf("refusing CONNECT for %q: %v", cid, ferr)
@@ -1423,7 +1423,7 @@ restoreSession:
 	// on this CONNECT, the grant point's included, is an ordinary one. See
 	// sess_accept_fact.go.
 	//
-	// THE ACCEPTED CONNECT MINTS A SERVING OUTBOUND AUTHORITY (F-105 cutover, row 9). The
+	// THE ACCEPTED CONNECT MINTS A SERVING OUTBOUND AUTHORITY (issue #107 cutover, row 9). The
 	// ownership protocol drives
 	// reserve -> commit-metadata(fenced) -> finalize, and the metadata commit is
 	// saveAcceptWithOwnership, which writes the acceptance fact, the COMMITTED receipt AND the
@@ -1435,7 +1435,7 @@ restoreSession:
 	//
 	// The budget is one absolute allowance the whole protocol shares; retries below consume it
 	// rather than resetting it. It is constructed ABOVE the restoreSession label (ownBudget) and
-	// anchored at F-051's stop, so a re-drive never re-anchors it.
+	// anchored at issue #55's stop, so a re-drive never re-anchors it.
 	// retryOK admits ONE metadata-commit resend inside the ownership executor (Codex consult
 	// 10): a same-subject CAS contention (10164) on the metadata half decided nothing, so the
 	// SAME frozen attempt is re-sent rather than the whole drive re-run with a fresh proposal.
@@ -1453,7 +1453,7 @@ restoreSession:
 		var driveTargets mqttCleanStartRetireTargets
 		if cleanStartHandoff {
 			// The predecessor identity was captured BEFORE the reset zeroed es.wid, and its
-			// backing-resource targets ride the discarding handoff's closing batch (F-105 row 9).
+			// backing-resource targets ride the discarding handoff's closing batch (issue #107 row 9).
 			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
 		}
 		ogen, otenure, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
@@ -1461,14 +1461,14 @@ restoreSession:
 		// A REFUSAL THAT LEAVES THIS ACCEPTANCE'S OWN ABORTED PROPOSAL STANDING owes its
 		// abandonment, whatever arm below ends the CONNECT: the in-place cleanup may have failed,
 		// or the deadline may have cut it off. The worker runs once this connection is refused,
-		// certified and holding nothing, on exactly this proposal (F-105 8a).
+		// certified and holding nothing, on exactly this proposal (issue #107 8a).
 		if o := ores.Obs; o.Own != nil && o.Verdict == mqttMetadataAborted && !o.AbandonConfirmed {
 			owedAbandon = func() { asm.abandonOwnProposal(cid, o) }
 		} else {
 			owedAbandon = nil
 		}
 		// THE RE-DRIVE IS LICENSED BY WHAT THE DRIVE ESTABLISHED, never by the identity of its
-		// error (F-105 8a, consult 120). Checked before the success arm and every retry arm
+		// error (issue #107 8a, consult 120). Checked before the success arm and every retry arm
 		// below: an own proposal that is not COMMITTED and was not provably aborted and
 		// abandoned by this acceptance itself forbids a fresh proposal, so the CONNECT refuses —
 		// whatever error a handler returned. See mqttOwnObservation.forbidsRedrive.
@@ -1532,7 +1532,7 @@ restoreSession:
 			goto restoreSession
 		case oerr != nil && errors.Is(oerr, errMQTTForkFenceMoved):
 			// The handoff preparation found the authority past the sequence fork repair read its
-			// reinstated consumers under (F-105 7f): a write since — a disposal among the
+			// reinstated consumers under (issue #107 7f): a write since — a disposal among the
 			// possibilities — means the merge's reads no longer prove what it installed. Nothing
 			// landed. NOT the inner 10164 retry, which re-drives the protocol over the same merged
 			// state with the same fence and can only exhaust: the FULL re-drive discards the
@@ -1586,14 +1586,14 @@ restoreSession:
 	// its source and PUBREL consumers were enrolled when they were provisioned. Its SHARED
 	// acquisition ledger, on $MQTT_shared, is not in that batch: the recovery executor seals and
 	// releases it under the same closure and certifies only once it reads sealed and empty
-	// (F-105 7e). The classification transfers the rest to the recovery executor (F-105 7d) and what remains
+	// (issue #107 7e). The classification transfers the rest to the recovery executor (issue #107 7d) and what remains
 	// here is the generation's inbound QoS 2 holds and ordinary registers, best-effort: anything
 	// left is the enrolled recovery's to finish, so a cleanup error never fails a CONNECT whose
 	// successor is already serving. Cleanup ownership stays partitioned; classification runs before any
 	// physical delete (Codex consult 6). See sess_teardown_partition.go.
 	if cleanStartHandoff {
 		// The finalization committed the predecessor's discarding closure: its retirement is the
-		// recovery executor's, promptly (F-105 7d).
+		// recovery executor's, promptly (issue #107 7d).
 		asm.kickRecoveryRoot(cid, asm.sessStreamEpoch, cshRetiringGen)
 		target := &mqttTeardownTarget{
 			id: cid, idHash: es.idHash, gen: cshRetiringGen,
@@ -1610,7 +1610,7 @@ restoreSession:
 			}
 		}
 	}
-	// THE TENURE is this acceptance's ONE tenure (F-105 8b): the authority tenure it was just
+	// THE TENURE is this acceptance's ONE tenure (issue #107 8b): the authority tenure it was just
 	// finalized under, ordered by the stream sequence of its own acceptance fact, read back.
 	// Every shared acquisition this connection makes is composed under it, and nothing else
 	// ever borrows it.
@@ -1642,7 +1642,7 @@ restoreSession:
 	// and the two writes that used to be are both gone:
 	//
 	//   - the cancellation watermark, because a single-slot marker is regressible and
-	//     an erased acceptance is unrecoverable — F-031;
+	//     an erased acceptance is unrecoverable — issue #35;
 	//   - the direct outbox cancel, because it suppressed on reconnect ALONE, with no
 	//     term for whether the Will had already become due. A reconnect after the Will
 	//     Delay has elapsed does not suppress: the Will is owed ([MQTT-3.1.2-8]).
@@ -1675,7 +1675,7 @@ restoreSession:
 	// round trip the resume still owes at that moment widens the window in which a
 	// QoS 0 subscription does not yet exist and a message is simply dropped. Doing this
 	// work early shortens that window. (An earlier version of this comment described the
-	// window as "after the CONNACK but before processSubs", which F-050 made impossible:
+	// window as "after the CONNACK but before processSubs", which issue #54 made impossible:
 	// restoration now precedes the CONNACK.) It also reads better as a rule — the
 	// identifier space is reconstructed before the session is declared usable at all.
 	//
@@ -1715,7 +1715,7 @@ restoreSession:
 		c.mqttAbortAcceptedConnect()
 	}
 	// refusePreConnack tells a v5 client WHY a pre-CONNACK refusal happened, instead of
-	// closing in silence. F-050 did this for one site — a permanently unrestorable filter,
+	// closing in silence. issue #54 did this for one site — a permanently unrestorable filter,
 	// where an automatic client would otherwise see only an endless silent close with no hint
 	// that a clean start is the recovery — and the same argument covers every other refusal on
 	// this side of the acknowledgement.
@@ -1733,7 +1733,7 @@ restoreSession:
 	// pre-success-CONNACK window, which is where this closure is defined and where every
 	// call to it sits. Exits EARLIER in the CONNECT — an unresolved record state, a
 	// post-clear failure that disposes the old client — return without a signal and are
-	// deliberately out of scope, as they were for the F-050 half of this work.
+	// deliberately out of scope, as they were for the issue #54 half of this work.
 	//
 	// Within that window the ONE exit still silent is the failed success-CONNACK write,
 	// which has no channel left to explain itself on, because the channel is what just
@@ -1762,7 +1762,7 @@ restoreSession:
 	// vocabulary's own Reason String never reaches the client — that separation was
 	// introduced because the vocabulary then asserted a takeover the classifier never
 	// established, and it is KEPT because the two are different claims on different
-	// surfaces even now that F-084 has stopped every arm reaching here from asserting one.
+	// surfaces even now that issue #86 has stopped every arm reaching here from asserting one.
 	// See mqttPreConnackRefusal.
 	//
 	// mqttAbortAcceptedConnect touches only c.mqtt (the Will and connectReceived), never
@@ -1773,7 +1773,7 @@ restoreSession:
 	//
 	// The head is unchanged and load-bearing: abortAcceptedResume discards THIS (arriving)
 	// connection's Will, which is right because no session was ever granted to it, and it
-	// must precede any scheduled close; the signal must precede the disposal. What F-084
+	// must precede any scheduled close; the signal must precede the disposal. What issue #86
 	// adds is the DISPLACED session's Will, which this site used to drop. At this site that
 	// can only ever be a parked action's discharge — the bound client is the arriving
 	// connection whose Will the abort has already taken, and any previously bound client was
@@ -1805,7 +1805,7 @@ restoreSession:
 	// until the resume has actually succeeded. Recovery runs long before the success
 	// CONNACK and every refusal after it preserves the session object and its maps, so
 	// applying a release at the walk would free an identifier on a resume that never
-	// completed. Committed below, past every refusal return (F-087).
+	// completed. Committed below, past every refusal return (issue #89).
 	var stagedReleases []mqttStagedRelease
 	if sessp {
 		staged, err := es.recoverInflightRegisters(c)
@@ -1859,7 +1859,7 @@ restoreSession:
 	// per-filter restore failure used to be dropped in silence — no SUBACK exists
 	// on this path, sess.update is skipped, and the error never reached the caller
 	// — so the client got Session Present = 1 on a session whose membership was
-	// durable and whose delivery path was gone, forever (F-050). Restoration is
+	// durable and whose delivery path was gone, forever (issue #54). Restoration is
 	// therefore one more thing that can REFUSE the CONNECT, which puts it on this
 	// side of the acknowledgement.
 	//
@@ -1941,7 +1941,7 @@ restoreSession:
 		}
 		// PRE-PASS. Prove every group durable a RESIDENT shared membership is about to
 		// be restored into actually exists, and carries a configuration this broker
-		// recognises, before processSubs subscribes to its deliver subject (F-076).
+		// recognises, before processSubs subscribes to its deliver subject (issue #78).
 		//
 		// One batched lookup rather than one per filter: a session may hold thousands,
 		// and this runs before the CONNACK on every reconnect.
@@ -1965,7 +1965,7 @@ restoreSession:
 		// reclaims them. That is why this shares the refusal shape below rather than
 		// returning early on its own.
 		// The PRE-pass: a REPAIRABLE verdict — an authoritative absence — does not fail its
-		// filter and does not stop the restore, because F-077's resume repair recreates the
+		// filter and does not stop the restore, because issue #79's resume repair recreates the
 		// durable under a membership the ownership CAS then proves is still ours. Every
 		// other error is terminal exactly as before. See
 		// mqttSharedGroupVerdictIsTerminal.
@@ -2043,7 +2043,7 @@ restoreSession:
 			applySharedGroupPostPass(asm, es, filters, sharedTargets)
 		}
 		// ARBITRATE. Everything above proved the durables' CONFIGURATION; nothing proved
-		// this broker still OWNS the membership they were restored into (F-077). One
+		// this broker still OWNS the membership they were restored into (issue #79). One
 		// classified record write, CAS'd at sess.seq under the accept transaction, does —
 		// and only a write can, because a load cannot distinguish "the record did not move"
 		// from "a contender's proposal has not committed yet".
@@ -2075,9 +2075,9 @@ restoreSession:
 				// what carries the reason.
 				//
 				// Its own verdict is mapped rather than shared: mqttGroupOwnership stays the
-				// vocabulary of the shared-membership write, because F-078's live-SUBSCRIBE
+				// vocabulary of the shared-membership write, because issue #80's live-SUBSCRIBE
 				// consumer switches on it and its Foreign arm's Will handling is a different
-				// question. See F-084.
+				// question. See issue #86.
 				rerr := fmt.Errorf("shared subscription ownership could not be confirmed for session %q: %v", cid, v.err)
 				c.Errorf("MQTT: refusing to resume session %q: %v", cid, rerr)
 				outcome := mqttPreConnackDisposingNonForked
@@ -2595,7 +2595,7 @@ restoreSession:
 				// The record is not ours to write. NOT "owned elsewhere": the foreign arm found
 				// a record merely not ours, and the forked arm one claiming our parent — the
 				// verdict that establishes nobody demonstrably owns it. Neither names a
-				// successor. F-084. The Locked form, because this frame holds
+				// successor. issue #86. The Locked form, because this frame holds
 				// the ownership gate and the wrapper fails fast on a gate it finds held, which
 				// would silently skip the disposition.
 				es.abandonRestoreGate()
@@ -2651,7 +2651,7 @@ restoreSession:
 			// 10071: the subject MOVED. Classify the lineage so the client is disposed of with
 			// the right vocabulary — a sibling's fork, or ownership unsettled — rather than
 			// closed unclassified. Never a takeover: a moved subject says we may not write it
-			// and says nothing about who may. F-084.
+			// and says nothing about who may. issue #86.
 			undoLeave()
 			es.abandonRestoreGate()
 			dvoc, _ := es.disposalForDirectRejection(&detail)
@@ -2679,11 +2679,11 @@ restoreSession:
 	// Past every refusal this CONNECT can still make — the success CONNACK, the lifetime
 	// grant, the subscription and consumer work, the forced leave's own arms and its
 	// record-state check — so a recovery reservation released here is released on a resume
-	// that SUCCEEDED, which is what its release rule requires (F-087).
+	// that SUCCEEDED, which is what its release rule requires (issue #89).
 	es.commitStagedReleases(c, stagedReleases)
 	es.commitDisposalRecovery(c)
 
-	// Subscription restoration ran BEFORE the CONNACK above, which is F-050's fix:
+	// Subscription restoration ran BEFORE the CONNACK above, which is issue #54's fix:
 	// a filter whose delivery path could not be installed refuses the CONNECT
 	// rather than being dropped in silence behind a Session-Present acknowledgement.
 	//
@@ -2693,7 +2693,7 @@ restoreSession:
 	// one still held by this frame. Idempotent, so the deferred release is a no-op.
 	endAcceptTx()
 
-	// The restored RETAINED exchanges (F-105 7c) are re-sent BEFORE the restore verdict opens:
+	// The restored RETAINED exchanges (issue #107 7c) are re-sent BEFORE the restore verdict opens:
 	// they were transmitted before the disconnect, so a live delivery the restored interest
 	// already holds — a later publication on the same topic among them — must not reach the
 	// client ahead of them, or the client is left holding the older message as the newer one
@@ -2756,7 +2756,7 @@ restoreSession:
 	// session can carry unacknowledged PUBRELs with no active subscription.
 	es.resendPendingRedelivery(c, resumePubs, resumeRels)
 	// A RESUMED generation settles what its displaced tenures left undecided or unretired
-	// (F-105 7f): this accept is what fenced them out.
+	// (issue #107 7f): this accept is what fenced them out.
 	if sessp {
 		es.startTenureSettlement(c)
 	}

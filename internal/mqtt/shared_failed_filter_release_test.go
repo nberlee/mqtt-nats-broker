@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// F-082, and the shared-group lifecycle transfer. A live shared SUBSCRIBE whose filter failed
+// issue #84, and the shared-group lifecycle transfer. A live shared SUBSCRIBE whose filter failed
 // owes TWO different releases, decided by two different instruments.
 //
 // Whether the GROUP consumer goes is the group record's arbitrated holder count, moved by the
@@ -55,7 +55,7 @@ func testNewSharedReleaseEnv(t *testing.T, clientID, key string) *testSharedRele
 			t.Fatalf("creating the group consumer for %q: %v", s, err)
 		}
 	}
-	// The deciding connection is a client of its OWN, accepted as a CONNECT would be (F-105 7b):
+	// The deciding connection is a client of its OWN, accepted as a CONNECT would be (issue #107 7b):
 	// never the manager's request-loop client, whose fields that loop reads unlocked.
 	c := e.s.createInternalAccountClient()
 	testAcceptRigConnection(t, e.asm, e.sess, c)
@@ -311,14 +311,14 @@ func (x *testSharedReleaseEnv) seedJoin(t *testing.T, target mqttSharedGroupName
 		sess.pendingPublish = make(map[uint16]*mqttPending)
 	}
 	// PROVEN UNSENT, which is the population whose identifier the release is entitled to
-	// free and whose nonce the void verdict may name (F-101): the durable pair still holds
+	// free and whose nonce the void verdict may name (issue #103): the durable pair still holds
 	// its unsent marker, so nothing was ever put on the wire under this identifier. The
 	// marker sequence is what says so, exactly as a confirmed register store leaves it
 	// (storeInflightRegister's step-3 capture).
 	//
 	// It used to be built as {regNonce, regSeq: 0} under a comment calling it "transmitted",
 	// which set neither transmitted nor a marker sequence — a shape no production path
-	// produces, and one F-101's gate now reads as POSSIBLY ATTEMPTED and reserves. The
+	// produces, and one issue #103's gate now reads as POSSIBLY ATTEMPTED and reserves. The
 	// assertions below are about the release ladder discharging its own state, so the
 	// fixture is corrected to carry the evidence that ladder requires rather than the
 	// assertions being weakened to match a fixture that no longer reaches it. A transmitted
@@ -532,7 +532,7 @@ func TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal(t *testing.T) 
 }
 
 // The SAME release, over a POSSIBLY-ATTEMPTED delivery, must not free its identifier — the
-// F-101 property asserted at this site rather than only at the purge that implements it,
+// issue #103 property asserted at this site rather than only at the purge that implements it,
 // because a release edge is where the claim is consumed and a claim proved at one surface
 // says nothing about another (feedback_claim_fanout_across_tiers).
 //
@@ -697,7 +697,7 @@ func (x *testSharedReleaseEnv) testRollbackSharedFilter(t *testing.T, key string
 
 // TestSharedFailedFilterRollbackRegistersOnlyWhatIsOwed is T5.
 //
-// undo() is shared by both branches of rollbackSharedSub, so before F-082 the prior-existing
+// undo() is shared by both branches of rollbackSharedSub, so before issue #84 the prior-existing
 // branch — whose write is an ADD that KEEPS the membership — registered the same landed
 // release as the removal branch. Nothing was owed there, and the only thing standing between
 // that continuation and a live membership's group consumers is the own-hold fence inside it.
@@ -746,7 +746,7 @@ func TestSharedFailedFilterRollbackRegistersOnlyWhatIsOwed(t *testing.T) {
 //
 // The barrier has to be down before the register snapshot beside it, or that snapshot is only
 // a moment in time and a delivery arriving after it allocates an identifier whose cancellation
-// misses the membership-removal write. Before F-082 the barrier was lowered by walking
+// misses the membership-removal write. Before issue #84 the barrier was lowered by walking
 // sess.cons, so for the abandoned join of a FAILED filter — which the failing attempt has not
 // written there — it was never lowered at all.
 //

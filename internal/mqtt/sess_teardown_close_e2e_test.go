@@ -19,7 +19,7 @@ import (
 	"testing"
 )
 
-// The F-105 STANDALONE TEARDOWN authority close (row 8, Gap 1).
+// The issue #107 STANDALONE TEARDOWN authority close (row 8, Gap 1).
 //
 // A clean start displaces a predecessor through a handoff; a session that ENDS with no
 // displacing successor — a zero session-expiry disconnect, a clean-session close, an elapsed

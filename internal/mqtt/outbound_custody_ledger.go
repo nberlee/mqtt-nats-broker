@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// The custody ledger (F-105 cutover, row 5).
+// The custody ledger (issue #107 cutover, row 5).
 //
 // An ordinary QoS 1/2 exchange holds a Receive Maximum charge and its packet identifier from
 // the moment its admission is reserved until the EXCHANGE durably ends — not until some map
@@ -52,7 +52,7 @@ type mqttCustodyAttempt struct {
 	lin    string
 	// landed: this attempt is KNOWN to have committed without needing its handle resolved (the
 	// successful return, which records no handle). Positive evidence, kept as a landing proof
-	// (F-112).
+	// (issue #114).
 	landed bool
 }
 
@@ -72,7 +72,7 @@ type mqttCustodyAdmission struct {
 	lineageEnded bool
 	unsettled    []mqttCustodyAttempt
 	// committed keeps every attempt that settled LANDED, handle and lineage: the LANDING PROOF an
-	// admission continuity record carries past this reservation's removal (F-112, 3.6), so an
+	// admission continuity record carries past this reservation's removal (issue #114, 3.6), so an
 	// absence it reads later can be told apart from an admission that never landed.
 	committed    []mqttCustodyAttempt
 	lastObserved uint64
@@ -115,7 +115,7 @@ type mqttCustodyLedger struct {
 	// released collects the LINEAGES whose exchange entry an accepted ended observation removed,
 	// until the session drains it in the same critical section (acceptExchangeObservationLocked).
 	// A lineage is reported whether or not a charge went with it: an abandoned exchange's charge
-	// was released long before its ending, and its pending projection must still go (F-105 7b).
+	// was released long before its ending, and its pending projection must still go (issue #107 7b).
 	released []string
 	// resumeApplies counts the resumes in flight; while one is, endedDuringResume remembers every
 	// lineage an accepted ENDED observation reached, so a resume that captured the register
@@ -124,15 +124,15 @@ type mqttCustodyLedger struct {
 	resumeApplies     int
 	endedDuringResume map[string]struct{}
 	// endedLineages is every lineage this generation's ledger accepted an ENDED observation of
-	// (F-088 WP2, the ended-lineage veto N1): an AckRoute is never installed for one of them.
+	// (issue #90 WP2, the ended-lineage veto N1): an AckRoute is never installed for one of them.
 	//
-	// Each lineage records the identifier its exchange held: the veto's exit (F-112,
+	// Each lineage records the identifier its exchange held: the veto's exit (issue #114,
 	// pruneEndedLineagesStep) reads that register subject to prove no later resume can capture a
 	// register naming the lineage.
 	endedLineages map[string]uint16
 	// lastHeavyAt is when the census last ran, and censusWanted that one is owed: the census is
 	// the dispatcher's one heavy operation and runs at most once per cap interval across every
-	// trigger (F-097 WP4).
+	// trigger (issue #99 WP4).
 	lastHeavyAt  time.Time
 	censusWanted bool
 
@@ -309,7 +309,7 @@ func (l *mqttCustodyLedger) tryRemoveAdmission(nonce string) bool {
 }
 
 // admissionLadderLive reports whether an admission of nonce is held whose ladder has NOT returned,
-// so that ladder may still start an attempt (F-119's quiescence proof). Raw membership, deliberately
+// so that ladder may still start an attempt (issue #121's quiescence proof). Raw membership, deliberately
 // not holdsAdmission: a lineage-ended admission still runs its ladder. False for another generation's
 // ledger; the caller decides what a generation mismatch means.
 func (l *mqttCustodyLedger) admissionLadderLive(gen, nonce string) bool {
@@ -321,7 +321,7 @@ func (l *mqttCustodyLedger) admissionLadderLive(gen, nonce string) bool {
 }
 
 // admissionAttempts returns every attempt of the admission that is unsettled or settled LANDED:
-// the handles a continuity record keeps as its landing proof (F-112).
+// the handles a continuity record keeps as its landing proof (issue #114).
 func (l *mqttCustodyLedger) admissionAttempts(gen, nonce string) []mqttCustodyAttempt {
 	if !l.forGen(gen) {
 		return nil
@@ -455,7 +455,7 @@ func (l *mqttCustodyLedger) releaseExchange(lin string, e *mqttCustodyExchange) 
 	return !e.chargeReleased
 }
 
-// releaseReclaimed releases lin on a RECLAIMED absence (F-112): exactly what an accepted ENDED
+// releaseReclaimed releases lin on a RECLAIMED absence (issue #114): exactly what an accepted ENDED
 // observation of it would release, the holder and any admission whose attempt carries it.
 func (l *mqttCustodyLedger) releaseReclaimed(gen, lin string) bool {
 	if !l.forGen(gen) || lin == _EMPTY_ {
@@ -482,7 +482,7 @@ func (l *mqttCustodyLedger) drainReleased() []string {
 
 // adoptReadExchange installs what a census or an uncertain re-read found: a held exchange is
 // charged, an abandoned one holds its identifier only. An ENDED one adds nothing — and RELEASES
-// an entry that already holds it (F-105 7b): ended phases are absorbing and the exchange subject
+// an entry that already holds it (issue #107 7b): ended phases are absorbing and the exchange subject
 // is create-only per lineage, so an ended read is as final from a census as from an observation.
 // An entry whose charge was already released is never recharged.
 func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCustodyDisp {
@@ -513,15 +513,15 @@ func (l *mqttCustodyLedger) adoptReadExchange(x *mqttOutboundExchange) mqttCusto
 }
 
 // noteEnded records an accepted ENDED observation of lin: always in the generation's
-// ended-lineage set (F-088's veto, N1), and additionally while a resume is in flight.
+// ended-lineage set (issue #90's veto, N1), and additionally while a resume is in flight.
 func (l *mqttCustodyLedger) noteEnded(lin string, pi uint16) {
 	if lin == _EMPTY_ {
 		return
 	}
-	// THE ENDED-LINEAGE VETO (F-088 WP2, N1). Ended phases are absorbing and an exchange subject
+	// THE ENDED-LINEAGE VETO (issue #90 WP2, N1). Ended phases are absorbing and an exchange subject
 	// is create-only per lineage, so an ended lineage can never serve again: an AckRoute install
 	// for it is refused. One lineage string per ended exchange for the generation's life — the
-	// lineages whose register still stands or that this object still projects (F-112: the floor
+	// lineages whose register still stands or that this object still projects (issue #114: the floor
 	// unit prunes the rest) — replaced with the ledger.
 	if l.endedLineages == nil {
 		l.endedLineages = make(map[string]uint16)
@@ -688,7 +688,7 @@ func (l *mqttCustodyLedger) dischargeUncertain(gen, subject string) bool {
 }
 
 // dischargeRetiredDutyUncertainty drops every uncertain DUTY subject of generation gen whose
-// ordinal lies below floor: a complete census read past it (F-112). Exchange subjects and duty
+// ordinal lies below floor: a complete census read past it (issue #114). Exchange subjects and duty
 // subjects at or above the floor are untouched.
 func (l *mqttCustodyLedger) dischargeRetiredDutyUncertainty(gen, idHash string, floor uint64) {
 	if !l.forGen(gen) {
@@ -840,7 +840,7 @@ func (l *mqttCustodyLedger) holdsAdmission(gen, nonce string) bool {
 }
 
 // admissionMayHaveLanded reports whether the held admission of allocation nonce has an attempt
-// that LANDED or is still UNSETTLED (F-097 WP5): what an abandonment inside the ladder must not
+// that LANDED or is still UNSETTLED (issue #99 WP5): what an abandonment inside the ladder must not
 // forget. Every attempt settled never-landed answers false.
 func (l *mqttCustodyLedger) admissionMayHaveLanded(gen, nonce string) bool {
 	if !l.forGen(gen) || nonce == _EMPTY_ {

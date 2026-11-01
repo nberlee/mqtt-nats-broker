@@ -26,7 +26,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// T36 rows 18, 18b, 18c and 18d (F-088 plan rev 20, WP3 rule 6): the exclusion-reclaim
+// T36 rows 18, 18b, 18c and 18d (issue #90 plan rev 20, WP3 rule 6): the exclusion-reclaim
 // continuation disposes of a PENDING FENCE that a finite failure left standing, with no further
 // offer, allocation or resume, under its worker contract — every added request charged, a fair
 // traversal independent of deletion success, a per-exclusion fence cursor, and the dispatch gate
@@ -70,7 +70,7 @@ func t36Rows() []t36Row {
 	return append(t36LifecycleRows(), t36ReclaimRows()...)
 }
 
-// mqttExclusionReclaimFenceStepMax is one pending-fence step's request bound (F-088 WP3 rule 6
+// mqttExclusionReclaimFenceStepMax is one pending-fence step's request bound (issue #90 WP3 rule 6
 // (a)): the door's evidence marker probe, each confirmed delete attempt, the door's own
 // confirmation before it retires a verdict naming the fence (only when one does), and the step's
 // post-delete confirmation. The register load is the bind's own pre-charged base read. It is the
@@ -111,7 +111,7 @@ func newT36Reclaim(t *testing.T, clientID string) *t36Reclaim {
 	e := testNewInflightEnv(t, clientID)
 	e.acceptUnderServingAuthority(t)
 	// SERVED, on its connection: the pass disposes of a serving-generation fence only behind an
-	// authority advance under that connection's licence (F-119), and a connectionless object keeps it.
+	// authority advance under that connection's licence (issue #121), and a connectionless object keeps it.
 	e.sess.c = e.c
 	r := &t36Reclaim{t: t, e: e, dur: e.sess.idHash + "_" + nuid.Next(), sseq: 10,
 		failSeq: map[uint64]bool{}, failOnce: map[uint64]int{}, failLoad: map[string]bool{}, names: map[string]string{},
@@ -333,7 +333,7 @@ func t36Row18FiniteFailureFenceRetry(t *testing.T) {
 
 	restored := testF088ColdResume(t, e)
 	// Served on the resuming connection, as a resumed object is: its continuation disposes of the
-	// serving-generation fence under that connection's licence (F-119).
+	// serving-generation fence under that connection's licence (issue #121).
 	restored.mu.Lock()
 	restored.c = e.c
 	restored.mu.Unlock()

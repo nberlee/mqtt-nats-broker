@@ -20,7 +20,7 @@ package mqtt
 // successor's progress (outbound_disposal.go): this pins that, once the successor has ended
 // the exchange, the displaced object lets go — and, in the delayed subtest, what happens when
 // the displaced step first reads the pair only after the successor has ended and replaced it
-// (the witness docs/findings/resource-lifetime.md records).
+// (the witness https://github.com/nberlee/mqtt-nats-broker/issues/138 records).
 
 import (
 	"fmt"

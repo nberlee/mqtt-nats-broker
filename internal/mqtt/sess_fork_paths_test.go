@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// The four paths that reported a takeover on evidence that could not support one. F-084
+// The four paths that reported a takeover on evidence that could not support one. issue #86
 // has since withdrawn that claim from every record-derived route; what these paths now
 // separate is a proven SIBLING (which mints a repair grant) from everything else.
 //
@@ -65,7 +65,7 @@ func testMutateSibling(ps *mqttPersistedSession) {
 // The sibling row is the finding: the probe's CAS is rejected, the record moved, and until
 // now that alone was read as "another owner holds this session". The child-shaped row is
 // what stops the fix from being a blanket collapse — the two classes must stay
-// distinguishable, in the Reason String and in the mint (M5, M2b). Since F-084 they no
+// distinguishable, in the Reason String and in the mint (M5, M2b). Since issue #86 they no
 // longer differ in the reason CODE: neither proves a successor, so neither claims one.
 func TestSessRejectionProbeClassifiesLineage(t *testing.T) {
 	t.Parallel()
@@ -150,7 +150,7 @@ func TestSessForkedUnboundDisposesOrdinarily(t *testing.T) {
 // close bookkeeping still has something to do. Copying the foreign arm's shape — which
 // DISPOSES — would evict a session on evidence that established no other owner (M6).
 //
-// The Will half of this contract is gone, and that is F-084: the foreign arm used to call
+// The Will half of this contract is gone, and that is issue #86: the foreign arm used to call
 // mqttDiscardWillOnTakeover and now consumes, so "the Will must not have been discarded" no
 // longer distinguishes the arms. What distinguishes them is the disposal.
 func TestSessForkedBoundIsUnsettledNotDisposed(t *testing.T) {
@@ -507,7 +507,7 @@ func TestSessLowerSequenceSiblingAtEveryOtherGate(t *testing.T) {
 		// UNSETTLED, not taken-over. The gate refuses to read a below-base record's identity
 		// at all, so what survives is an unclassifiable observation — which says the subject
 		// is not ours and says nothing about who holds it. Asserting the takeover vocabulary
-		// here was asserting F-084's defect. The fork BIT must be false with it, because the
+		// here was asserting issue #86's defect. The fork BIT must be false with it, because the
 		// bit is what mints.
 		belowVoc, belowForked := e.sess.disposalForDirectRejection(&below)
 		testAssertVocabulary(t, "a sibling BELOW the base", belowVoc, mqttDisposalOwnershipUnsettled)

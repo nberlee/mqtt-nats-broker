@@ -24,7 +24,7 @@ import (
 	"testing"
 )
 
-// Same-identifier replacements through the production admission (F-105 WP-F W2, rows C7 and C8).
+// Same-identifier replacements through the production admission (issue #107 WP-F W2, rows C7 and C8).
 //
 // A same-delivery re-offer that finds its own earlier allocation on the identifier replaces it:
 // a PAIR replacement over a proven-unsent occupant admits a fresh obligation and supersedes the
@@ -518,7 +518,7 @@ func TestF105AReplacementRespectsAThirdStandingExchange(t *testing.T) {
 	if _, err := jsa.storeMsg(mqttExchangeSubject(sess.idHash, f.gen, cNonce), hdr, msg); err != nil {
 		t.Fatalf("planting the third exchange: %v", err)
 	}
-	// AND ITS DUTY, as an admission writes it: every exchange enumeration is the inventory (F-112).
+	// AND ITS DUTY, as an admission writes it: every exchange enumeration is the inventory (issue #114).
 	testF112PlantAdmittedDuty(t, jsa, sess.id, epoch, f.gen, cNonce)
 	xC0, xC0seq, err := jsa.loadOutboundExchange(sess.id, epoch, f.gen, cNonce)
 	if err != nil || xC0.Phase != mqttExchangePublish || xC0.PI != f.pi {

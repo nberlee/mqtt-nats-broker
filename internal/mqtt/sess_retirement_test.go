@@ -167,7 +167,7 @@ func TestRetirementCondemnsTheHollowSurvivor(t *testing.T) {
 // not repair.
 //
 // The claim is deliberately that narrow. Nothing here shows the fresh generation is held
-// by anyone (F-084), and nothing needs to: the conclusion is a refusal to destroy.
+// by anyone (issue #86), and nothing needs to: the conclusion is a refusal to destroy.
 func TestRetirementLeavesAFreshGenerationAlone(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 	const clientID = "fresh-successor"
@@ -921,7 +921,7 @@ func TestValidateTeardownStream(t *testing.T) {
 // pair was only ever one instance of the hazard, and its second subtest asserted
 // the OPPOSITE of what the contract now says: recreating $MQTT_teardown alone
 // used to be ADMITTED, silently losing every open fence. That admission is the
-// residual F-066 withdraws, so the assertion is inverted rather than deleted —
+// residual issue #70 withdraws, so the assertion is inverted rather than deleted —
 // and it is inverted for all ten positions, not just that one.
 func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 	for _, missing := range mqttTestBrokerStreamNames {

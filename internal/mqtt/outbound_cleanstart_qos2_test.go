@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// F-113: a clean start over a session that delivers ordinary QoS 2 — one that owns a PUBREL
+// issue #115: a clean start over a session that delivers ordinary QoS 2 — one that owns a PUBREL
 // consumer and no affine QoS 2 consumer — is ACCEPTED, and the predecessor generation is
 // discarded and retired.
 //
@@ -144,7 +144,7 @@ func TestF113CleanStartOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	}
 }
 
-// T2: the same refusal on a PEER broker, the route F-105 WP-F W2's discarded-generation witness
+// T2: the same refusal on a PEER broker, the route issue #107 WP-F W2's discarded-generation witness
 // found it on: a persistent 3.1.1 QoS 2 session past PUBREC on broker A, then a clean-session
 // CONNECT on broker B sharing A's JetStream. B's finalize must close A's generation with Discard.
 // Mutation M1.
@@ -209,7 +209,7 @@ func TestF113CleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) 
 
 // T3: the producers' projection names an affine target whole or not at all, and the validator it
 // feeds stays strict: a PUBREL durable named alone — the shape every ordinary QoS 2 session
-// produced before F-113 — is still REFUSED when it reaches the validator unprojected. Mutations M2,
+// produced before issue #115 — is still REFUSED when it reaches the validator unprojected. Mutations M2,
 // M3 (the projection drops a whole or partial affine target) and M4 (the validator accepts an empty
 // affine pair whatever the PUBREL name says).
 func TestF113AnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {

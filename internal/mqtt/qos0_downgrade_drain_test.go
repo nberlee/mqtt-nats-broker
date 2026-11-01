@@ -447,7 +447,7 @@ func TestCompletionReopensNothingForADetachedClient(t *testing.T) {
 //
 // The held drain keeps the slot and this consumer takes the ordinary destructive
 // teardown — the same disposition draining-not-allowed uses. Overwriting the held drain
-// would erase a past-PUBREC intent by routine client behaviour (F-094).
+// would erase a past-PUBREC intent by routine client behaviour (issue #96).
 //
 // A unit fixture, because the state has no client-reachable producer: it needs a
 // quarantined drain under a sid that also carries a live consumer. The consumer is given
@@ -475,7 +475,7 @@ func TestConversionRefusesWhenAHeldDrainOwnsTheSid(t *testing.T) {
 	sess.subs[sid] = 0
 	sess.cpending = map[string]map[uint64]uint16{dur: {51: 5}}
 	// regNonce AND markerSeq are both required, not decoration. voidRegistrationsLocked
-	// records a verdict only for an entry that HAS a nonce, and since F-101 only for one
+	// records a verdict only for an entry that HAS a nonce, and since issue #103 only for one
 	// that is PROVEN UNSENT — its durable pair still holding the unsent marker, which is
 	// what markerSeq says. Without either, the refusal's void would be vacuously empty and
 	// the assertion below would pass against a broker that voided nothing.
@@ -505,7 +505,7 @@ func TestConversionRefusesWhenAHeldDrainOwnsTheSid(t *testing.T) {
 	// absence would also hold if the conversion had done nothing at all.
 	if !stillHeld {
 		t.Fatal("the older HELD drain must keep the sid: overwriting it erases a " +
-			"past-PUBREC intent that routine client behaviour must not destroy (F-094)")
+			"past-PUBREC intent that routine client behaviour must not destroy (issue #96)")
 	}
 	// And the ordinary teardown's verdicts ride this record instead.
 	if len(conv.voided) == 0 {

@@ -18,9 +18,9 @@ import (
 	"strings"
 )
 
-// Destruction is authorized by the resource, not by the teardown (F-105, row 8).
+// Destruction is authorized by the resource, not by the teardown (issue #107, row 8).
 //
-// This is the defect F-105 was filed for, in its most direct form. deleteTeardownTargets
+// This is the defect issue #107 was filed for, in its most direct form. deleteTeardownTargets
 // removed the ordinary source consumers and then the PUBREL consumer, and because $MQTT_out is
 // interest-retained, deleting that consumer dropped the records it carried — which are the only
 // evidence the client answered PUBREC. The register may survive and prove nothing. A teardown

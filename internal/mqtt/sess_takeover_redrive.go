@@ -55,7 +55,7 @@
 // racing for one empty subject. Both need durable state this slice does
 // not introduce.
 //
-// See docs/ARCHITECTURE.md and docs/findings/ha-arbitration.md#f-029.
+// See docs/ARCHITECTURE.md and https://github.com/nberlee/mqtt-nats-broker/issues/31.
 
 package mqtt
 
@@ -251,7 +251,7 @@ func (asm *mqttAccountSessionManager) detachConnectingClientForReDrive(es *mqttS
 
 // abandonReDrivenSessionCaptured is transition T1: a PRE-BIND superseded discard on
 // a session object that is resident in the maps, taken after the two-phase
-// retirement has already detached its client and captured it (F-036 unit 1). It
+// retirement has already detached its client and captured it (issue #40 unit 1). It
 // replaced the sess.c-reading form outright, because since the retirement there is
 // no path that reaches T1 with the displaced client still attached — reading the
 // session there would find nil and silently drop everything the capsule holds.
@@ -278,7 +278,7 @@ func (asm *mqttAccountSessionManager) detachConnectingClientForReDrive(es *mqttS
 // licensed=true, and this is the ONE disposal that passes it: this CONNECT holds the
 // gate and IS the replacement, so a successor is held in hand rather than inferred
 // from a record — which is what entitles the disposition to DISCARD the Will.
-// discardTakenOverClient's own discard below is the idempotent second notice. F-084.
+// discardTakenOverClient's own discard below is the idempotent second notice. issue #86.
 //
 // No lock held on entry (other than the ownership gate).
 func (asm *mqttAccountSessionManager) abandonReDrivenSessionCaptured(c *client,

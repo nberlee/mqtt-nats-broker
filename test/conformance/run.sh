@@ -41,7 +41,7 @@ warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*"; }
 # the 2.15.0 line the server substitutes a 1000-consumer default for a zero value,
 # so an absent `default_max_consumers` is indistinguishable from an armed cap.
 # Asserting the version alone would leave every launch capped while reporting green,
-# which is the failure this check exists to prevent (F-095).
+# which is the failure this check exists to prevent (issue #97).
 #
 # Measured against the 2.15.0 GA binary and again against the 2.15.1 image: `-js` with
 # no config file and a config with no `limits` block both report 1000; only

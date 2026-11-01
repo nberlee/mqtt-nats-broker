@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// Replacing a register inside an authority transition (F-105, row 1).
+// Replacing a register inside an authority transition (issue #107, row 1).
 //
 // Every fixture here composes its members BY HAND and submits them at the occupant's real
 // sequence — the sequence the store itself would accept. That is deliberate: the store's CAS

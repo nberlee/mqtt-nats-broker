@@ -640,7 +640,7 @@ func TestQ2AffineReapRequiresBothSidesProven(t *testing.T) {
 	// The copy subject is DERIVED from the record's own identity, and nothing ever
 	// stores a message on it — so "copy absent" is still a real answer from the
 	// stream, and the record is now one a real election could have written. A
-	// hand-built subject is refused outright since F-065.
+	// hand-built subject is refused outright since issue #69.
 	testQ2AffSelfConsistent(base)
 
 	t.Run("discarded but source unproven survives", func(t *testing.T) {
@@ -1034,7 +1034,7 @@ func TestQ2AffineUnreadableClaimFailsScanClosed(t *testing.T) {
 // "Unproven", not "lost": the inference behind LOST is sound for the JetStream
 // copy ack, which is recorded before the copy is acked, but NOT for the client's
 // PUBREC, which is answered earlier still — so this shape can also be a message
-// that arrived (F-064's residual 1). Nothing this fixture asserts depends on which
+// that arrived (issue #68's residual 1). Nothing this fixture asserts depends on which
 // it was; the direction it pins is that recovery must not record COMPLETION it
 // cannot prove.
 func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
@@ -1060,7 +1060,7 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 	}
 	subject, _ := b.waitForClaim(t, "materialized", func(c *mqttQ2AffClaim) bool { return c.Phase == mqttQ2AffMaterialized })
 
-	// The consumer is destroyed out of band. Since F-036 course E no sweep route reclaims
+	// The consumer is destroyed out of band. Since issue #40 course E no sweep route reclaims
 	// one by ABSENCE, so this fixture stages the state by hand rather than reproducing that
 	// route. (An operator, or a lifecycle teardown, can still delete one — this fixture
 	// simply does not depend on either.) Its pending copy goes with it.
@@ -1121,7 +1121,7 @@ func TestQ2AffineConsumerLossIsRecordedAsLossNotCompletion(t *testing.T) {
 // record of a message the broker accepted and could not prove it delivered, and
 // it happens BEFORE the owner ever resumes to record it as lost. ("Could not
 // prove", not "never delivered": the client's PUBREC precedes the affine record,
-// so this shape can also be a message that arrived — F-064's residual 1. The
+// so this shape can also be a message that arrived — issue #68's residual 1. The
 // evidence is worth keeping either way, which is all this fixture asserts.)
 //
 // The reaper call below is not a stand-in: it is literally what the contender
@@ -1635,7 +1635,7 @@ func TestQ2AffClaimRecordRoundTrip(t *testing.T) {
 // persisted in a LATER loop, and every save is refused while the session is
 // unresolved. Nothing in the packet can reclaim it (the unused-path unwind's own
 // confirming save is refused for the same reason) and no sweep collects it either —
-// F-036 course E removed that route entirely. The settlement therefore owns
+// issue #40 course E removed that route entirely. The settlement therefore owns
 // the reclaim, and runs it under the resolver's token.
 //
 // What licenses that removal is the FAILED PACKET, not a claim that the
@@ -1745,7 +1745,7 @@ func testQ2AffArmAmbiguousProvisioning(t *testing.T, name string, expiry uint32,
 	// A confirmed PLAIN QoS 2 subscription first. It settles the record and
 	// provisions the PUBREL consumer, so the packet under test creates exactly one
 	// resource — the affine path — and every charge assertion is an affine delta
-	// rather than a bare total. No sweep judges an affine consumer at all since F-036
+	// rather than a bare total. No sweep judges an affine consumer at all since issue #40
 	// course E, and finishQ2AffineUnwind refunds only the affine increment, so a PUBREL
 	// consumer created INSIDE the ambiguous packet would be a second unaccounted resource.
 	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: name + "/plain", opts: 2}}); len(codes) != 1 || codes[0] != 2 {
@@ -2224,7 +2224,7 @@ func TestQ2AffineReclaimSaveAmbiguousDefersTheDelete(t *testing.T) {
 //
 // The AFFINE claim's owner is decided by the winning record, which is a durable
 // arbitration this test may rely on. The SESSION's successor is not: a moved record shows
-// only that the session is no longer ours (F-084), which is all the disposal acts on.
+// only that the session is no longer ours (issue #86), which is all the disposal acts on.
 func TestQ2AffineReclaimSaveRejectedIsSettledAsForeign(t *testing.T) {
 	var peer *mqttAccountSessionManager
 	a := testQ2AffArmAmbiguousProvisioning(t, "ambrej", 300, func(b *testQ2AffBroker) {
@@ -2284,7 +2284,7 @@ func TestQ2AffineReclaimSaveRejectedIsSettledAsForeign(t *testing.T) {
 	})
 	// Never deleted by us. The winning record decides the consumer's owner, and this
 	// one omits the affine fields — which used to make it the orphan sweep's work and now
-	// makes it a stated leak (F-036 course E), but either way not this path's to delete.
+	// makes it a stated leak (issue #40 course E), but either way not this path's to delete.
 	if durs := a.b.affineConsumers(t, a.idHash); len(durs) != 1 {
 		t.Fatalf("the disposal deleted an affine consumer it does not own, got %v", durs)
 	}
@@ -2543,7 +2543,7 @@ func TestQ2AffineReclaimIsNotBlockedByATerminalClaim(t *testing.T) {
 // case — the scan that terminates assignments is account-wide and fails closed, so
 // deleting an interest-retained consumer whose claims might be outstanding would
 // take their copies with it. A consumer no record names used to be the orphan sweep's;
-// since F-036 course E nothing collects it, so it is RETAINED and stated as a leak.
+// since issue #40 course E nothing collects it, so it is RETAINED and stated as a leak.
 // Everything LOCAL still converges: the delivery
 // subscription goes and the MaxAckPending charge comes back exactly, because
 // nothing else can ever reach them once the record stops naming the path — no sweep
@@ -2612,7 +2612,7 @@ func TestQ2AffineReclaimDiscardFailureStillReleasesTheLocalHalf(t *testing.T) {
 	}
 	// The consumer is deliberately NOT deleted: its claims could not be proven
 	// terminated. Two things this does NOT assert. It does not assert that the
-	// orphan sweep then reclaims it — it never does now (F-036 course E removed that
+	// orphan sweep then reclaims it — it never does now (issue #40 course E removed that
 	// route), and even before that the same undecodable record aborted the sweep's
 	// affine inventory, so the consumer is retained either way. And it does not assert that
 	// NO assignment was discarded: the discard streams, mutating each matching
@@ -2913,7 +2913,7 @@ func TestQ2AffineReclaimRunsFromAReconnectResolution(t *testing.T) {
 // foreign verdict is not ours to act on: the record is not this broker's to write, the
 // session is evicted, and the continuation never runs. The affine consumer must
 // survive that: whether it is the winner's is decided by the winning record, never by us
-// deleting it on the way out. (It is no longer "or the orphan sweep's" — F-036 course E
+// deleting it on the way out. (It is no longer "or the orphan sweep's" — issue #40 course E
 // removed that route, so an unclaimed consumer is retained rather than collected.)
 //
 // Mutation M7: delete the affine consumer at eviction in
@@ -3148,7 +3148,7 @@ func testQ2AffLoadRecord(t *testing.T, sess *mqttSession) *mqttPersistedSession 
 	return ps
 }
 
-// TestQ2AffEveryWriteCarriesItsExpectation pins the claim F-033's audit rests on:
+// TestQ2AffEveryWriteCarriesItsExpectation pins the claim issue #37's audit rests on:
 // EVERY write this protocol makes to $MQTT_qos2assign carries a per-subject
 // expectation, the election is create-only, and every later transition CASes at a
 // sequence that record actually held. The audit's clause (a)/(b) verdict is otherwise
@@ -3430,7 +3430,7 @@ func TestQ2AffEveryWriteCarriesItsExpectation(t *testing.T) {
 // derives CopySubject from the record's OWN winner, generation, claim hash and
 // nonce.
 //
-// It exists because several fixtures predate F-065 and built CopySubject from
+// It exists because several fixtures predate issue #69 and built CopySubject from
 // unrelated values — a fresh random generation, a hand-written claim hash — which no
 // election ever emits. q2AffClaimUsableForDecision now refuses such a record on every
 // direct decision path, correctly: a copy subject that does not follow from the
@@ -3488,14 +3488,14 @@ func affDurableFor(idHash, gen string) string {
 }
 
 // --------------------------------------------------------------------------
-// Fixtures for the three defects F-033's consequence audit found. Each pins the
+// Fixtures for the three defects issue #37's consequence audit found. Each pins the
 // DEFECTIVE behaviour, so each one's discriminating mutation is the candidate
 // remedy: apply the remedy named in the comment and the fixture must fail. That
 // is the inverse of the usual direction and it is deliberate — a finding's
 // fixture exists so the defect cannot be fixed silently or reintroduced quietly.
 // --------------------------------------------------------------------------
 
-// TestQ2AffReapRefusesACopyStoredDuringItsSourceAck is the regression test F-065's
+// TestQ2AffReapRefusesACopyStoredDuringItsSourceAck is the regression test issue #69's
 // defect fixture BECAME when the remedy landed. It used to assert the claim was
 // reaped and to instruct whoever fixed it to come back and invert it; this is that
 // inversion rather than a new fixture, so the interleaving it stages is exactly the
@@ -3527,7 +3527,7 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 	// The member's REAL affine generation, not a synthetic one. $MQTT_out is
 	// interest-retained, so a copy stored on a subject no live consumer filters is
 	// kept by nothing — the fixture would then assert on a copy that never existed
-	// and would prove F-063's mechanism instead of F-065's.
+	// and would prove issue #67's mechanism instead of issue #69's.
 	gen := testQ2AffAwaitStableRecord(t, b, idHash).Q2AffGen
 	if gen == _EMPTY_ {
 		t.Fatal("the member has no affine generation, so no consumer would retain the racing copy")
@@ -3562,7 +3562,7 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 	// The client leaves, keeping its session and its affine consumer. Without this the
 	// live delivery subscription consumes the racing copy the instant it lands — the
 	// gate finds the claim still present and Discarded, disposes of it, and the fixture
-	// would observe an absent copy for a reason that has nothing to do with F-065.
+	// would observe an absent copy for a reason that has nothing to do with issue #69.
 	testMQTTDisconnect(t, c, nil)
 	c.Close()
 
@@ -3601,7 +3601,7 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 		t.Fatalf("the racing copy is not on the stream (%v); the interleaving did not complete", st)
 	}
 	if gotClaim == nil {
-		t.Fatal("the claim was reaped out from under a copy that exists: reapable() consumed a copy reading older than the reap's own SourceAcked transition (F-065)")
+		t.Fatal("the claim was reaped out from under a copy that exists: reapable() consumed a copy reading older than the reap's own SourceAcked transition (issue #69)")
 	}
 	// Declining to reap must not mean declining to prove the source side, or the claim
 	// could never become reapable at all.
@@ -3610,7 +3610,7 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 	}
 }
 
-// TestQ2AffResumeAdoptsConsumerKeepingItsCreated pins the mechanism that was behind F-036's
+// TestQ2AffResumeAdoptsConsumerKeepingItsCreated pins the mechanism that was behind issue #40's
 // third manifestation, the "adoption blind spot" — DISSOLVED by course E, which removed the
 // delete rather than guarding it. The mechanism is still worth pinning, because it is the
 // argument that refused every guarded version.
@@ -3625,7 +3625,7 @@ func TestQ2AffReapRefusesACopyStoredDuringItsSourceAck(t *testing.T) {
 // This is MECHANISM EVIDENCE, not a defect pin, and the distinction matters. Reaching the
 // window the removed delete had between its record re-read and its instance re-lookup
 // additionally required a session resident with that generation while its record was
-// absent — F-036's premise, and not something this fixture stages. What this fixture owns is the half a fixer is most likely to get wrong: it proves
+// absent — issue #40's premise, and not something this fixture stages. What this fixture owns is the half a fixer is most likely to get wrong: it proves
 // the instance fingerprint is not the defense it reads as, so ANY future re-proposal of a
 // by-name affine consumer delete that leans on it would still destroy a live adopted
 // consumer. Course E's remedy was to remove the delete instead.
@@ -3679,15 +3679,15 @@ func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
 		"so an instance check cannot discriminate it")
 }
 
-// The split F-064 delivers, asserted from both sides.
+// The split issue #68 delivers, asserted from both sides.
 //
 // buildSessionRefs keys refs.affine on ps.Q2AffGen alone, so a live matching record
 // makes the sweep skip EVERY claim of that generation — reconciliation and the discard
-// alike. (It also skipped the consumer pass; F-036 course E removed that pass, so there
+// alike. (It also skipped the consumer pass; issue #40 course E removed that pass, so there
 // is no consumer decision left to skip.) That has NOT changed and is not a defect: the sweep
 // has no payload to materialize with, so it could only ever resolve such a claim by
 // erasing it, and reaping a claim of a live generation needs the reaper fence that
-// is F-065's remedy.
+// is issue #69's remedy.
 //
 // What has changed is that the stall no longer waits for the owner. A group
 // redelivery — which does have the payload — restores the destroyed consumer and
@@ -3695,11 +3695,11 @@ func TestQ2AffResumeAdoptsConsumerKeepingItsCreated(t *testing.T) {
 // forever against no MaxDeliver.
 //
 // Both halves are asserted here because either alone is misleading: the first would
-// read as F-064 still being open, and the second would not show that the sweep is
+// read as issue #68 still being open, and the second would not show that the sweep is
 // deliberately still passive.
 func TestQ2AffLiveRecordStrandedClaimIsResolvedByAContender(t *testing.T) {
 	t.Parallel()
-	t.Run("a sweep pass alone leaves it, which is F-065's half", func(t *testing.T) {
+	t.Run("a sweep pass alone leaves it, which is issue #69's half", func(t *testing.T) {
 		t.Parallel()
 		testQ2AffSweepLeavesAStrandedClaim(t)
 	})
@@ -3728,7 +3728,7 @@ func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 	gen := rec.Q2AffGen
 
 	// The affine consumer destroyed out of band — the route docs/CONFORMANCE.md already
-	// documents, and the one F-036's adoption blind spot also produces.
+	// documents, and the one issue #40's adoption blind spot also produces.
 	durable := affDurableFor(idHash, gen)
 	if _, err := b.asm.jsa.deleteConsumer(mqttOutStreamName, durable, false); err != nil {
 		t.Fatalf("deleting the affine consumer out of band: %v", err)
@@ -3758,7 +3758,7 @@ func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 	// Neutralise the quarantine grace, and sweep TWICE. Both are load-bearing:
 	// observedOrphanFor RECORDS an observation on its first call and only reports the
 	// resource settled on a later one, so a single pass at the default grace would leave
-	// this claim untouched for a reason that has nothing to do with F-064 — the fixture
+	// this claim untouched for a reason that has nothing to do with issue #68 — the fixture
 	// would pass against a fully reconciling sweep and prove nothing.
 	zero := time.Duration(0)
 	b.asm.mu.Lock()
@@ -3777,7 +3777,7 @@ func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 		t.Fatalf("loading the claim after the sweep: %v", err)
 	}
 	if got == nil {
-		t.Fatal("the sweep reaped a nonterminal claim; that would be a different (and worse) defect than F-064")
+		t.Fatal("the sweep reaped a nonterminal claim; that would be a different (and worse) defect than issue #68")
 	}
 	if got.Discarded || got.Lost || got.AffineDone {
 		// A failure, not a skip. The sweep has no payload, so the only way it could
@@ -3791,11 +3791,11 @@ func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 		t.Fatalf("the claim's phase moved to %v without a terminal fact", got.Phase)
 	}
 	// Pinned: the sweep stays passive under a live reference. Its reap half is
-	// F-065's, and the stall itself is closed by the redelivery route instead.
-	t.Log("the sweep left a nonterminal claim of a live generation untouched, which is F-065's half of F-064")
+	// issue #69's, and the stall itself is closed by the redelivery route instead.
+	t.Log("the sweep left a nonterminal claim of a live generation untouched, which is issue #69's half of issue #68")
 }
 
-// TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing is F-063's own-claim route,
+// TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing is issue #67's own-claim route,
 // as a regression test. It began life as that finding's defect pin, asserting the
 // released source; the remedy inverted it, which is what the pin was written to force.
 //
@@ -3812,11 +3812,11 @@ func testQ2AffSweepLeavesAStrandedClaim(t *testing.T) {
 //
 // Asserted: the claim stays at `claimed`, carries no terminal fact, is never source-acked,
 // and its source message is still on $MQTT_msgs — the accepted message is still owned by
-// somebody. What that refusal strands is F-064's to resolve, and its pin above reproduces
+// somebody. What that refusal strands is issue #68's to resolve, and its pin above reproduces
 // it; this fixture's business is only that nothing was released against a store response.
 //
 // Discriminating mutation: verify only on a REJECTED create-only CAS (mutation 1), which is
-// what the code did when F-063 was filed. The store then succeeds unverified, the claim
+// what the code did when issue #67 was filed. The store then succeeds unverified, the claim
 // advances to materialized, and the source is acknowledged — so this fixture fails on the
 // released source rather than on silence.
 func TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing(t *testing.T) {
@@ -3867,14 +3867,14 @@ func TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing(t *testing.T) {
 	testQ2AffAssertSourcePresent(t, b.asm, claim, "after the refusal")
 }
 
-// TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage pins F-066's flagship row.
+// TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage pins issue #70's flagship row.
 //
 // A claim is keyed `(group durable, source sequence)`. That identifies one source message
 // only within one incarnation of $MQTT_msgs, and a recreation of that stream leaves
 // $MQTT_qos2assign's claims behind with their sequence counter reset underneath them.
 //
 // Recreating it ALONE is what startup USED TO instruct, and that reachability is what
-// made this F-066's flagship row. F-066's enforcement (2026-09-01) withdrew it: the ten
+// made this issue #70's flagship row. issue #70's enforcement (2026-09-01) withdrew it: the ten
 // streams are one recreation unit and a proper subset is refused before anything is
 // provisioned, so the state below is now reachable only through an UNSUPPORTED operation
 // — administrative deletion or a partial restore. The behaviour this test pins is
@@ -3925,12 +3925,12 @@ func TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage(t *testing.T) {
 	// its group ack still UNPROVEN — the resting state the protocol requires, since a
 	// discarded claim must survive precisely until some contender proves that ack.
 	// The CLAIM SUBJECT above is what this fixture pins, and it stays literal. The COPY
-	// subject is derived from the record's own identity instead: since F-065 a record
+	// subject is derived from the record's own identity instead: since issue #69 a record
 	// whose copy subject does not follow from its own fields is refused on every direct
 	// decision path, so a hand-built one would make the mover decline before it ever
 	// reached the terminal arm this row asserts — the fixture would then fail for a
-	// reason that has nothing to do with F-066. Note what this does NOT change: the
-	// collision is on the claim subject, which carries no incarnation, so F-065's nonce
+	// reason that has nothing to do with issue #70. Note what this does NOT change: the
+	// collision is on the claim subject, which carries no incarnation, so issue #69's nonce
 	// does not close this row.
 	staleGen := mqttNewQ2AffGen()
 	stale := &mqttQ2AffClaim{
@@ -3970,7 +3970,7 @@ func TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage(t *testing.T) {
 
 	if _, _, ready := testMQTTReadPacketReady(r, 2*time.Second); ready {
 		// The remedy landing reaches exactly this branch.
-		t.Fatal("a PUBLISH arrived, so the stale claim did not capture the reused sequence: F-066's flagship row is closed — replace this defect fixture with a regression test for the incarnation-scoped key")
+		t.Fatal("a PUBLISH arrived, so the stale claim did not capture the reused sequence: issue #70's flagship row is closed — replace this defect fixture with a regression test for the incarnation-scoped key")
 	}
 
 	// Silence alone would not prove the message was RELEASED — a stall, a deferral or any
@@ -3995,8 +3995,8 @@ func TestQ2AffStaleClaimOnAReusedSourceSequenceEatsTheMessage(t *testing.T) {
 			t.Fatalf("loading the stale claim: %v", lerr)
 		}
 		if cl == nil {
-			// F-066, pinned: source released, nothing delivered, claim reaped.
-			t.Log("F-066 reproduced: a stale terminal claim on a reused source sequence swallowed an accepted message")
+			// issue #70, pinned: source released, nothing delivered, claim reaped.
+			t.Log("issue #70 reproduced: a stale terminal claim on a reused source sequence swallowed an accepted message")
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -4016,7 +4016,7 @@ func (b *testQ2AffBroker) lastSourceSeq(t *testing.T) uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// F-064 — the owner's provisioning path gains no new refusals
+// issue #68 — the owner's provisioning path gains no new refusals
 // ---------------------------------------------------------------------------
 
 // testQ2AffOwnerArm imposes one condition that on-behalf restoration teaches the
@@ -4282,7 +4282,7 @@ func testQ2AffAssertNoOwnerLookup(t *testing.T, lookups func() int32) {
 }
 
 // ---------------------------------------------------------------------------
-// F-064 — the canonical affine consumer configuration
+// issue #68 — the canonical affine consumer configuration
 // ---------------------------------------------------------------------------
 
 // testQ2AffFieldDisposition is one ConsumerConfig field's verdict in the audit
@@ -4581,7 +4581,7 @@ func TestQ2AffineConsumerConfigHasOneConstructor(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F-064 — the owner recovers from a storage conflict it did not cause
+// issue #68 — the owner recovers from a storage conflict it did not cause
 // ---------------------------------------------------------------------------
 
 // testQ2AffStrandAffinePathAcrossReload leaves a session with an undelivered
@@ -4728,7 +4728,7 @@ func (b *testQ2AffBroker) subSharedTolerant(t *testing.T, c net.Conn, r *mqttRea
 // why this fixture stages none. It is also what makes on-behalf restoration safe
 // to add: without the recovery, a contender that legitimately creates the durable
 // from the winner's persisted value would leave the owner in exactly this state,
-// and F-064 would have introduced the very thing it is here to prevent.
+// and issue #68 would have introduced the very thing it is here to prevent.
 func TestQ2AffOwnerRecoversFromAStorageConflictItDidNotCause(t *testing.T) {
 	t.Parallel()
 
@@ -4959,7 +4959,7 @@ func TestQ2AffOwnerRecoversFromAStorageConflictItDidNotCause(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F-064 — on-behalf restoration of a destroyed affine consumer
+// issue #68 — on-behalf restoration of a destroyed affine consumer
 // ---------------------------------------------------------------------------
 
 // testQ2AffContenderStage is a claimed assignment owned by an absent winner, with
@@ -5546,7 +5546,7 @@ func TestQ2AffOnBehalfRestorationIsNotChargedToTmaxack(t *testing.T) {
 }
 
 // deleteWinnerDurable destroys the winner's affine consumer out of band, which
-// is F-064's premise: CONSUMER.DELETE carries no precondition, and $MQTT_out is
+// is issue #68's premise: CONSUMER.DELETE carries no precondition, and $MQTT_out is
 // interest-retained, so this drops every copy the durable held.
 func (st *testQ2AffContenderStage) deleteWinnerDurable(t *testing.T) {
 	t.Helper()
@@ -5960,7 +5960,7 @@ func TestQ2AffRacingAbsenceConverge(t *testing.T) {
 // Residual 8, pinned: the stall is NOT closed for a MATERIALIZED assignment whose
 // copy is gone.
 //
-// This is the half of F-064's own title this item does not deliver, and it is the
+// This is the half of issue #68's own title this item does not deliver, and it is the
 // easiest thing in the change to gloss, so it is asserted rather than described.
 // D1 is the dispatcher's `default` arm, reached only for a claim that has not been
 // materialized. A foreign `materialized` claim with no copy takes the arm above
@@ -6041,7 +6041,7 @@ func TestQ2AffMaterializedClaimWithNoCopyStillWaitsForItsOwner(t *testing.T) {
 // PERSISTED storage type — the only value it may impose. If an operator has since
 // reloaded consumer_memory_storage, the owner then rebuilds its own request from
 // the CURRENT option, meets an immutable mismatch, and without the recovery could
-// never resume. Trading F-064's stall for a permanently unresumable session is not
+// never resume. Trading issue #68's stall for a permanently unresumable session is not
 // a trade this item may make, which is why decision 4 admits one post-failure
 // recovery on the owner's path.
 //
@@ -6106,7 +6106,7 @@ func TestQ2AffOwnerResumesAfterAContenderCreatedItsDurable(t *testing.T) {
 		}
 	}
 	if !ready {
-		t.Fatal("the owner could not re-establish its affine path against a durable a contender created for it: F-064 traded a stall for an unresumable session")
+		t.Fatal("the owner could not re-establish its affine path against a durable a contender created for it: issue #68 traded a stall for an unresumable session")
 	}
 	if n := lookups(); n != 1 {
 		t.Fatalf("the recovery performed %d affine consumer lookup(s), want exactly 1", n)
@@ -6130,7 +6130,7 @@ func TestQ2AffOwnerResumesAfterAContenderCreatedItsDurable(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// F-065: a claim incarnation has an identity, and a superseded incarnation can
+// issue #69: a claim incarnation has an identity, and a superseded incarnation can
 // neither be written to nor have its copy adopted.
 // --------------------------------------------------------------------------
 
@@ -6139,7 +6139,7 @@ func TestQ2AffOwnerResumesAfterAContenderCreatedItsDurable(t *testing.T) {
 //
 // A claim subject's election is create-only, so it can be won AGAIN after a reap —
 // by a group delivery callback that was already dispatched when the reap happened.
-// Before F-065 both incarnations derived the SAME copy subject, so the replacement
+// Before issue #69 both incarnations derived the SAME copy subject, so the replacement
 // adopted the copy a superseded materializer was about to withdraw, and that
 // materializer's advance (which asserted only Winner+Gen) mutated the REPLACEMENT's
 // record. Two things stop it now: the copy subject carries the incarnation, and
@@ -6214,7 +6214,7 @@ func TestQ2AffReplacementIncarnationKeepsItsOwnCopy(t *testing.T) {
 		Phase:      mqttQ2AffClaimed,
 	})
 	if c2.CopySubject == c1.CopySubject {
-		t.Fatal("two incarnations of one claim subject derived the SAME copy subject: the replacement can adopt the copy the superseded materializer is about to withdraw (F-065 route C)")
+		t.Fatal("two incarnations of one claim subject derived the SAME copy subject: the replacement can adopt the copy the superseded materializer is about to withdraw (issue #69 route C)")
 	}
 	if _, err := b.asm.storeQ2AffClaimCAS(subject, 0, c2); err != nil {
 		t.Fatalf("electing C2: %v", err)
@@ -6235,7 +6235,7 @@ func TestQ2AffReplacementIncarnationKeepsItsOwnCopy(t *testing.T) {
 	updated, _, aerr := b.asm.advanceQ2AffClaim(subject, c1.Winner, c1.Gen, c1.Nonce, _EMPTY_,
 		func(cl *mqttQ2AffClaim) { cl.Phase = mqttQ2AffMaterialized })
 	if aerr == nil {
-		t.Fatal("a superseded incarnation's transition was ACCEPTED: it has just written a fact about its own copy onto the replacement's record (F-065)")
+		t.Fatal("a superseded incarnation's transition was ACCEPTED: it has just written a fact about its own copy onto the replacement's record (issue #69)")
 	}
 	if !b.asm.q2AffCopyIsDisowned(subject, c1, updated, aerr) {
 		t.Fatal("the superseded copy was not recognised as disowned, so nothing will ever withdraw it")
@@ -6267,7 +6267,7 @@ func TestQ2AffReplacementIncarnationKeepsItsOwnCopy(t *testing.T) {
 // A materialization attempt that PROVED a copy present withdraws it once the same
 // attempt proves, authoritatively, that no claim of that copy's own incarnation
 // remains to authorize it. The rule is deliberately conditional: a copy no attempt is
-// currently examining is not collected by anything, which is the residual F-065's
+// currently examining is not collected by anything, which is the residual issue #69's
 // re-scoped guarantee states.
 //
 // Each subtest names the mutation it kills, because two prior review rounds struck
@@ -6487,7 +6487,7 @@ func TestQ2AffWithdrawsACopyNothingCanAuthorize(t *testing.T) {
 //     subject is silently discarded for the whole Duplicates window and that claim
 //     never materializes.
 //   - Within one incarnation it must be STABLE, or every retry stores a second copy —
-//     which is the attempt-scoped identity F-063 refuted.
+//     which is the attempt-scoped identity issue #67 refuted.
 //
 // The stability half is asserted the way round 4 required: by DELETING the copy and
 // retrying, so the dedupe entry is the only thing that can suppress the second store.
@@ -6554,7 +6554,7 @@ func TestQ2AffCopyDedupKeyIsScopedToTheIncarnation(t *testing.T) {
 
 	// Stability within ONE incarnation. This half has to be staged on a claim that is
 	// still `claimed`: once a claim is materialized, materializeQ2AffCopy refuses to
-	// re-store for it at all (F-063), so a retry there proves nothing about the dedup
+	// re-store for it at all (issue #67), so a retry there proves nothing about the dedup
 	// key — which is how the first version of this assertion passed against M10.
 	const staySeq = uint64(922002)
 	staySubject := mqttQ2AffClaimSubject(groupDur, staySeq)
@@ -6598,7 +6598,7 @@ func TestQ2AffCopyDedupKeyIsScopedToTheIncarnation(t *testing.T) {
 	}
 	b.asm.materializeQ2AffCopy(b.s, cur, staySubject, curSeq, retry)
 	if st, _ := b.asm.loadQ2AffCopy(stay.CopySubject); st != mqttQ2AffCopyAbsent {
-		t.Fatalf("a retry of the SAME incarnation stored a second copy (%v): its key came from the attempt rather than from the persisted claim, which is the identity F-063 refuted", st)
+		t.Fatalf("a retry of the SAME incarnation stored a second copy (%v): its key came from the attempt rather than from the persisted claim, which is the identity issue #67 refuted", st)
 	}
 }
 
@@ -6610,7 +6610,7 @@ func TestQ2AffCopyDedupKeyIsScopedToTheIncarnation(t *testing.T) {
 // not the same as an ABSENT claim, which stays fail-closed and NAKs — an absence is
 // never a positive fact, so it never licenses destroying an accepted message
 // (feedback_absence_is_not_a_fact). It used to be producible by a SUPPORTED operation,
-// F-066's single-stream recreation; that route is closed, and a whole-bundle reset
+// issue #70's single-stream recreation; that route is closed, and a whole-bundle reset
 // removes the copy along with the claim rather than leaving this state, so what
 // remains producible is administrative deletion or a partial restore. Both
 // halves are asserted here, because the arm is only safe if the boundary holds.
@@ -6834,7 +6834,7 @@ func TestQ2AffUnattributableClaimIsRefusedButDoesNotWedgeTheAccount(t *testing.T
 // affine side from there: the affine callback went straight to trackPublish, which
 // returns identifier zero because the restored PUBREL already reserves that source,
 // and returned without acknowledging the copy — so the copy NAK-looped and the claim
-// never completed. F-065's own harm, re-entered through recovery.
+// never completed. issue #69's own harm, re-entered through recovery.
 //
 // Two dispositions are asserted, because the incarnation is what distinguishes them:
 //
@@ -7227,7 +7227,7 @@ func TestQ2AffFinishRefusesAForeignIncarnation(t *testing.T) {
 		t.Fatalf("the replacement claim is gone: %v", err)
 	}
 	if after.AffineDone {
-		t.Fatal("a PUBREC belonging to a reaped incarnation recorded the affine side of the REPLACEMENT: that claim made no delivery, and its own copy would become reapable behind a completion it never earned (F-065)")
+		t.Fatal("a PUBREC belonging to a reaped incarnation recorded the affine side of the REPLACEMENT: that claim made no delivery, and its own copy would become reapable behind a completion it never earned (issue #69)")
 	}
 
 	// The matching incarnation DOES complete it, so the refusal is a fence rather than
@@ -7429,7 +7429,7 @@ func TestQ2AffRetiredAffineSourceRecoveredEndToEnd(t *testing.T) {
 // _EMPTY_ is the deliberate OPT-OUT value at advanceQ2AffClaim's incarnation fence, so
 // a restored register naming an affine claim with no valid incarnation would silently
 // disable the fence and let a stale exchange record AffineDone against a replacement
-// claim — the exact write F-065 exists to prevent. There are no releases, so that
+// claim — the exact write issue #69 exists to prevent. There are no releases, so that
 // shape does not exist; meeting one means the state is not interpretable.
 //
 // The register carries the COPY SUBJECT, so the incarnation is read back OUT of it,
@@ -7559,7 +7559,7 @@ func TestQ2AffRetirementSettlesFromItsDurableIdentity(t *testing.T) {
 // NEGATIVE PUBREC. That path creates no pendingPubRel entry and stores no PUBREL, so
 // there is no PUBCOMP — and therefore no event at which an unlanded durable retirement
 // mark could ever be retried. Retiring there would install machinery whose retry point
-// does not exist. A rejected delivery keeps its pre-F-065 behaviour instead: complete
+// does not exist. A rejected delivery keeps its pre-issue #69 behaviour instead: complete
 // the affine side if it can be, then release the register.
 //
 // The negative PUBREC is written on the WIRE with a reason code >= 0x80 and goes
@@ -7632,7 +7632,7 @@ func TestQ2AffNegativePubRecAcquiresNoRetirement(t *testing.T) {
 	if owed != 0 {
 		t.Fatalf("a retirement was installed for a rejected delivery (%d owed): there is no PUBCOMP on this path, so an unlanded durable mark could never be retried", owed)
 	}
-	// The register is RELEASED, as it was before F-065, and nothing rewrites it as
+	// The register is RELEASED, as it was before issue #69, and nothing rewrites it as
 	// Retired. Polled, because a register delete is deliberately asynchronous and
 	// ignores failure (R5) — so the claim pinned here is the narrower one review
 	// insisted on: this branch no longer deliberately retains or rewrites such a
@@ -7655,7 +7655,7 @@ func TestQ2AffNegativePubRecAcquiresNoRetirement(t *testing.T) {
 	// it. That re-publishing of a rejected message is the PRE-EXISTING negative-PUBREC
 	// behaviour this change restores rather than introduces, it converges as soon as the
 	// claim store heals, and it is named in the dossier's "what this does not close"
-	// list. Asserting silence here would assert something F-065 never promised.
+	// list. Asserting silence here would assert something issue #69 never promised.
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		pb, pl, ready := testMQTTReadPacketReady(r, 250*time.Millisecond)
@@ -7759,7 +7759,7 @@ func TestQ2AffRestoredPendingCarriesItsIncarnation(t *testing.T) {
 		t.Fatalf("the restored entry names claim %q", restored.q2AffClaim)
 	}
 	if restored.q2AffCopy != claim.CopySubject {
-		t.Fatalf("the restored entry carries copy %q, want %q: the terminal transition would then be handed the OPT-OUT value and could credit a replacement claim with this delivery (F-065)", restored.q2AffCopy, claim.CopySubject)
+		t.Fatalf("the restored entry carries copy %q, want %q: the terminal transition would then be handed the OPT-OUT value and could credit a replacement claim with this delivery (issue #69)", restored.q2AffCopy, claim.CopySubject)
 	}
 
 	// And the incarnation must reach the TRANSITION, not merely the map. Review found
@@ -7812,7 +7812,7 @@ func TestQ2AffRestoredPendingCarriesItsIncarnation(t *testing.T) {
 		t.Fatalf("loading the replacement claim: %v", err)
 	}
 	if final.AffineDone {
-		t.Fatal("a PUBREC answered from a RESTORED pending entry credited a REPLACEMENT claim with the delivery: the incarnation did not survive the journey from the register through recovery to the terminal transition, so the fence was handed its opt-out value (F-065)")
+		t.Fatal("a PUBREC answered from a RESTORED pending entry credited a REPLACEMENT claim with the delivery: the incarnation did not survive the journey from the register through recovery to the terminal transition, so the fence was handed its opt-out value (issue #69)")
 	}
 }
 
@@ -7825,7 +7825,7 @@ func TestQ2AffRestoredPendingCarriesItsIncarnation(t *testing.T) {
 // claim's copy — every field is well formed and mutually consistent, it is simply about a
 // different delivery. Interpreting one credits that claim with a delivery it never made,
 // and the gate's terminal branch then disposes of its copy on the next redelivery: the
-// message is lost, which is exactly the F-065 failure in a different disguise. The
+// message is lost, which is exactly the issue #69 failure in a different disguise. The
 // arbiter is the SOURCE, because for an affine delivery the source IS the copy.
 //
 // Both forgeries are staged on ONE session with TWO claims, which is what makes the
@@ -8308,7 +8308,7 @@ func TestQ2AffForgedRegisterAcknowledgesNoForeignCopy(t *testing.T) {
 	})
 
 	if state, _ := st.b.asm.loadQ2AffCopy(st.copySubject); state != mqttQ2AffCopyPresent {
-		t.Fatal("the answering delivery's OWN copy was acknowledged away by a retirement carrying a foreign claim: that claim never recorded AffineDone, so its message can never be delivered (F-065, H15)")
+		t.Fatal("the answering delivery's OWN copy was acknowledged away by a retirement carrying a foreign claim: that claim never recorded AffineDone, so its message can never be delivered (issue #69, H15)")
 	}
 	after, _, err := st.b.asm.loadQ2AffClaim(victimSubject)
 	if err != nil || after == nil {
@@ -8629,7 +8629,7 @@ func TestQ2AffGateRefusesACrossAssignmentCopy(t *testing.T) {
 	})
 
 	if state, _ := st.b.asm.loadQ2AffCopy(a.CopySubject); state != mqttQ2AffCopyPresent {
-		t.Fatal("the gate acknowledged away a copy of a DIFFERENT assignment than the claim its header named: that assignment's claim never records AffineDone, so its message is lost and its claim is stranded (F-065, round 17)")
+		t.Fatal("the gate acknowledged away a copy of a DIFFERENT assignment than the claim its header named: that assignment's claim never records AffineDone, so its message is lost and its claim is stranded (issue #69, round 17)")
 	}
 	for subject, claim := range map[string]*mqttQ2AffClaim{
 		mqttQ2AffClaimSubject(st.groupDur, 644001): a,
@@ -8997,7 +8997,7 @@ func TestQ2AffOversizeClaimIsDroppedBeforeElection(t *testing.T) {
 // moveStartedSharedQoS2 was unobservable and an unattributable claim could reach
 // materialization.
 //
-// The claim subject is predicted the way F-066's fixture predicts it — from the next
+// The claim subject is predicted the way issue #70's fixture predicts it — from the next
 // source sequence — because the mover derives it from the delivery's own reply subject,
 // so a synthetic input elects on a different subject entirely and proves nothing. A
 // prediction that misses SKIPS rather than passing: concurrent stream activity is not a
@@ -9341,10 +9341,10 @@ func TestQ2AffMaterializeRefusesAnUnattributablePostTransitionRecord(t *testing.
 // Acting on such a record materializes and then IRREVERSIBLY releases a source under a
 // claim hash belonging to some other (group, sequence); the delivery gate then reads the
 // real copy's subject as a superseded incarnation and acknowledges it away without
-// publishing. The message is lost, which is worse than the stranding F-065 set out to fix.
+// publishing. The message is lost, which is worse than the stranding issue #69 set out to fix.
 //
 // So a record must agree with the SUBJECT it was found on and with its own source, which
-// self-consistency does not give. Same discipline F-058 applies to Will records.
+// self-consistency does not give. Same discipline issue #62 applies to Will records.
 //
 // Paired mutation M26: drop the ClaimHash / subject binding from the validator.
 func TestQ2AffClaimMustAgreeWithItsOwnSubject(t *testing.T) {

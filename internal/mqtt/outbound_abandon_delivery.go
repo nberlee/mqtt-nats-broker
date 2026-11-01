@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// A restored delivery denied on resume is ABANDONED, durably (F-105 row 5, consult 34).
+// A restored delivery denied on resume is ABANDONED, durably (issue #107 row 5, consult 34).
 //
 // A PUBLISH a previous connection may have transmitted, which the client never acknowledged, is
 // restored on a same-generation resume and re-offered; if the delivery-time authorization guard
@@ -31,7 +31,7 @@ import (
 // under its authorization policy. Not a completion (no client answer), and not "never
 // transmitted" (it may have been).
 //
-// A RETAINED delivery (F-105 7c) is abandoned by the same op and the same fact, in its retained
+// A RETAINED delivery (issue #107 7c) is abandoned by the same op and the same fact, in its retained
 // arm: the fact names the copy instead of a source, no source is settled, and a second reason
 // exists — a possibly-sent replay that no longer fits the resumed connection's Maximum Packet
 // Size. The decision is made before any output is acquired (outbound_retained_abandon.go).
@@ -48,7 +48,7 @@ import (
 // restored delivery.
 const mqttAbandonReasonACLDeny = "acl-deny"
 
-// mqttAbandonReasonPacketTooLarge is the RETAINED arm's second reason (F-105 7c): a possibly
+// mqttAbandonReasonPacketTooLarge is the RETAINED arm's second reason (issue #107 7c): a possibly
 // sent retained replay that no longer fits the resumed connection's Maximum Packet Size. Spec5
 // [3.1.2.11.4]: the server "MUST discard it without sending it and then behave as if it had
 // completed sending that Application Message". Never valid on the ordinary arm.
@@ -111,7 +111,7 @@ type mqttDenyEvidence struct {
 	// written into the durable abandonment fact, so the source can be settled after a restart
 	// without waiting for a redelivery; it must bind to exactly Dur and Seq.
 	Reply string
-	// Payload is set on the RETAINED arm instead of Dur, Seq and Reply (F-105 7c): a retained
+	// Payload is set on the RETAINED arm instead of Dur, Seq and Reply (issue #107 7c): a retained
 	// delivery was never a source delivery, so its decision names the copy it would have sent.
 	Payload string
 }
@@ -143,7 +143,7 @@ type mqttAbandonDeliveryRequest struct {
 }
 
 // opAbandonDeniedDelivery abandons one restored delivery on a positive decision: an ordinary one
-// on a deny, a RETAINED one (F-105 7c) on a deny or on a replay that no longer fits the resumed
+// on a deny, a RETAINED one (issue #107 7c) on a deny or on a replay that no longer fits the resumed
 // connection's Maximum Packet Size. The retained arm names the copy instead of a source and
 // settles no source.
 //

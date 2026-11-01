@@ -510,7 +510,7 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	// The bundle is the fixture, not this stream alone: the ten broker-owned
 	// streams are one recreation unit and startup refuses a proper subset before
 	// any validator runs, so hand-creating $MQTT_qos2in by itself would exercise
-	// the count rule instead of the validator this test is about (F-066).
+	// the count rule instead of the validator this test is about (issue #70).
 	cfg := (*StreamConfig)(nil)
 	for _, bc := range testBundleConfigs(t, _EMPTY_, 1) {
 		if bc.Name == mqttQoS2IncomingMsgsStreamName {
@@ -1399,7 +1399,7 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 	}
 	pp := &mqttPublish{topic: []byte("mp"), subject: subj, msg: payload, sz: len(payload)}
 	// No No Local filter of this publisher reaches the subject, so production writes no
-	// Nmqtt-NoLocal stamp on any form (F-117).
+	// Nmqtt-NoLocal stamp on any form (issue #119).
 	origin := _EMPTY_
 
 	delivered := mqttComputeNatsMsgSize(pp, false, 0, origin, false, _EMPTY_, _EMPTY_)
@@ -1476,7 +1476,7 @@ func TestQoS2FormsRespectMaxPayload(t *testing.T) {
 				mqttQoS2GenHeaderMax + mqttQoS2HoldCASHeaderMax},
 			{"terminal", mqttQoS2TerminalRecordMax()},
 			{"affine", mqttQ2AffineFormMax(tiny, false)},
-			// The ASSIGNMENT CLAIM form, added by F-065. It is payload-independent, so
+			// The ASSIGNMENT CLAIM form, added by issue #69. It is payload-independent, so
 			// for a tiny payload it can dominate — and an admission budget that omits it
 			// admits a PUBLISH whose claim can never be stored, so no election can ever
 			// be won and the group delivery is re-offered forever. This row is what makes
@@ -1522,7 +1522,7 @@ func mqttTestTopicSubject(t *testing.T, topic string) []byte {
 	return subj
 }
 
-// TestQoS2InEveryWriteCarriesItsExpectation pins the claim F-032's audit rests on:
+// TestQoS2InEveryWriteCarriesItsExpectation pins the claim issue #36's audit rests on:
 // EVERY write this protocol makes to $MQTT_qos2in carries a per-subject expectation,
 // three of the four are create-only, and the fourth commits at the sequence its caller
 // loaded. $MQTT_willq's equivalent claim is four line numbers in a README, which nothing

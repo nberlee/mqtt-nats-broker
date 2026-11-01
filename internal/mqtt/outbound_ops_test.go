@@ -121,7 +121,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	}
 
 	// (4) ADVANCE, one step at a time, each reading the exchange as it stands. The terminal
-	// advance is the ending, and it leaves the hold release-owed (F-105 7c-lc).
+	// advance is the ending, and it leaves the hold release-owed (issue #107 7c-lc).
 	for _, to := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
@@ -156,7 +156,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 		mqttCleanupRemoved); err == nil {
 		t.Fatalf("a cleanup was completed that nothing had authorized")
 	}
-	// A served consumer is not authorizable until a route disposes of it (F-105 7c-lc).
+	// A served consumer is not authorizable until a route disposes of it (issue #107 7c-lc).
 	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-serving", "op-auth",
 		testF105Gen, "inc-src"); err == nil {
 		t.Fatalf("a consumer no route disposed of was authorized")

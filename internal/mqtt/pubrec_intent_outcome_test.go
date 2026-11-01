@@ -24,7 +24,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// THE PUBREC INTENT OUTCOME IS CLASSIFIED (F-098, holistic review round 1, finding 4; C13
+// THE PUBREC INTENT OUTCOME IS CLASSIFIED (issue #100, holistic review round 1, finding 4; C13
 // order 3). A slot's EXISTENCE proves nothing about whether the intent CAS landed, and the
 // pre-fix rollback gate read it as proof: a definitely-failed intent kept its empty
 // placeholder, rolled nothing back and enrolled nothing.

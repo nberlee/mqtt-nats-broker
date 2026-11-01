@@ -20,7 +20,7 @@ import (
 	"fmt"
 )
 
-// Verifying retained replay material (F-105, row 7; contract 4).
+// Verifying retained replay material (issue #107, row 7; contract 4).
 //
 // # The claim that was not authorized, and the design that did not deliver it
 //

@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// A PROJECTION LIVES ONLY WHILE CUSTODY HOLDS ITS LINEAGE (F-105 7b, plan-7b §3.7, T15). An
+// A PROJECTION LIVES ONLY WHILE CUSTODY HOLDS ITS LINEAGE (issue #107 7b, plan-7b §3.7, T15). An
 // ordinary pending projection that the resume installs, retains or reactivates exists only while
 // the custody ledger holds its lineage, and it is removed when the ledger releases that lineage.
 // Two points enforce it, both under the session lock, so for any install and any release one

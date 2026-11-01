@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// TestQ2AffineConsumerDeletesAreInventoried is F-036 course E's STRUCTURAL guard.
+// TestQ2AffineConsumerDeletesAreInventoried is issue #40 course E's STRUCTURAL guard.
 //
 // WHY IT IS PACKAGE-WIDE AND NOT REACHABILITY-BASED. It began as a call-graph guard rooted
 // at sweepOrphanedQoS2State, and four successive review rounds each found a narrower way to
@@ -57,7 +57,7 @@ import (
 // consumer metadata has the same mismatch; NumPending == 0 is an instantaneous observation
 // rather than a fence; a record re-read cannot tell "no session" from "a live session whose
 // record is absent"; and ConsumerInfo.Created cannot see an ADOPTION, because provisioning is
-// a create-or-update. See docs/findings/ha-arbitration.md and docs/CONFORMANCE.md.
+// a create-or-update. See https://github.com/nberlee/mqtt-nats-broker/issues/131 and docs/CONFORMANCE.md.
 func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 	t.Parallel()
 
@@ -77,12 +77,12 @@ func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 
 		// Lifecycle teardown. Reached both by ordinary teardown and by the sweep, which
 		// ADOPTS abandoned teardown markers and finishes them. Known pre-existing call
-		// site, outside course E's behavioral change and owned by open F-036, retained
+		// site, outside course E's behavioral change and owned by open issue #40, retained
 		// here WITHOUT any claim that it is race-free: a won claimTeardown authorizes
 		// proceeding with lifecycle teardown relative to the claimed record, but does NOT
 		// fence a stale same-affine-generation peer's beginQ2AffOp and create-only claim
-		// CAS, so discardQ2AffClaimsFor's scan can be outrun. F-036's fourth
-		// manifestation, with F-063's proof-to-ack residual behind its second half.
+		// CAS, so discardQ2AffClaimsFor's scan can be outrun. issue #40's fourth
+		// manifestation, with issue #67's proof-to-ack residual behind its second half.
 		{"mqttSession.deleteTeardownTargets", "t.pubRelDur"}: 1,
 		{"mqttSession.deleteTeardownTargets", "t.q2AffDur"}:  1,
 
@@ -235,7 +235,7 @@ func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 				}
 				sel, ok := call.Fun.(*ast.SelectorExpr)
 				// Only mqttJSA.deleteConsumer(stream, name, noWait). The package used to have
-				// mqttSession.deleteConsumer(cc *ConsumerConfig) too (deleted with F-105 7c-lc's
+				// mqttSession.deleteConsumer(cc *ConsumerConfig) too (deleted with issue #107 7c-lc's
 				// routes); the argument count still guards against any such method.
 				if !ok || sel.Sel.Name != "deleteConsumer" || len(call.Args) < 3 {
 					return true

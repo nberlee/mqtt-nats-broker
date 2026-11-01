@@ -15,7 +15,7 @@ package mqtt
 
 import "fmt"
 
-// The acknowledgement phase, DERIVED from the packet (F-105, row 4; contract 3).
+// The acknowledgement phase, DERIVED from the packet (issue #107, row 4; contract 3).
 //
 // # A check that was adjacent to the property, not the property
 //

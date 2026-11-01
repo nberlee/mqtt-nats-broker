@@ -19,7 +19,7 @@ import (
 	"fmt"
 )
 
-// The two acts a DISCARDED generation's retirement takes without an entitlement (F-105 7d).
+// The two acts a DISCARDED generation's retirement takes without an entitlement (issue #107 7d).
 //
 // A teardown closes its generation DISCARDING before it releases the session record, and from that
 // moment no connection of the generation exists to decide anything. What the retirement still has

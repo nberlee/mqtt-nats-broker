@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// T13c (F-088 WP2, plan rev 20, "Binding removal census"): EVERY removal of an ACK-only binding
+// T13c (issue #90 WP2, plan rev 20, "Binding removal census"): EVERY removal of an ACK-only binding
 // states the proof it rests on, and every reader that dispatches on the binding's ROLE is known.
 //
 // A binding is removed only through removeAbandonedAckBindingLocked, which dispatches the proof on
@@ -55,7 +55,7 @@ const (
 	f088BindingInstallOrReplaced f088BindingReason = "install-or-replaced"
 	// The generation was DISCARDED: its bindings are unreachable from the fresh generation.
 	f088BindingDiscard f088BindingReason = "discard"
-	// The binding's lineage was RECLAIMED behind the F-112 floor: ended AND its register positively
+	// The binding's lineage was RECLAIMED behind the issue #114 floor: ended AND its register positively
 	// gone, the strongest proof a binding has (classifyExchangeAbsence).
 	f088BindingReclaimed f088BindingReason = "reclaimed"
 )
@@ -82,7 +82,7 @@ type f088BindingSite struct {
 
 // f088FrozenBindingSites is the FROZEN census of every binding removal (by the proof argument
 // passed) and every direct write to sess.abandonedAcks, by enclosing function. Frozen against the
-// F-097/F-088 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted WP2/WP3 edits).
+// issue #99/issue #90 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted WP2/WP3 edits).
 var f088FrozenBindingSites = map[f088BindingSite]struct {
 	n      int
 	reason f088BindingReason
@@ -273,7 +273,7 @@ func TestF088EveryBindingRemovalHasAReason(t *testing.T) {
 		}
 	}
 
-	// observeAbandonedAckEndLocked dispatches through the role's matcher ALONE: the pre-F-088
+	// observeAbandonedAckEndLocked dispatches through the role's matcher ALONE: the pre-issue #90
 	// first-line `x.Abandoned == nil` guard made it HandBack-only and stranded every AckRoute.
 	if fd := f088FindFunc(files, "observeAbandonedAckEndLocked"); fd == nil {
 		t.Error("observeAbandonedAckEndLocked is gone from the source")

@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// F-105 7f over real connections: the resume repair's predecessor decision, and fork repair's
+// issue #107 7f over real connections: the resume repair's predecessor decision, and fork repair's
 // fence. Not parallel: they arm package-global seams.
 
 // testSuppressSettlement keeps the resumed CONNECT's settlement job from running, so what a test

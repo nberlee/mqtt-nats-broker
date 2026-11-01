@@ -228,7 +228,7 @@ func TestQoS2RelClaimIdentityValidation(t *testing.T) {
 		{"releasing with an out-of-alphabet generation", &mqttQoS2RelClaim{State: mqttQoS2RelStateReleasing, Gen: strings.Repeat("!", mqttQoS2GenLen)}, false},
 		{"discarded with a generation", &mqttQoS2RelClaim{State: mqttQoS2RelStateDiscarded, Gen: gen, Fence: 7}, false},
 		// The four Fence pairings. A fence-less discard marker is the unsupported
-		// persisted shape F-062 refuses: read as a claim it would fence NOTHING, so every
+		// persisted shape issue #66 refuses: read as a claim it would fence NOTHING, so every
 		// later exchange would reap it and the marker would stop proving that a late
 		// releaser must lose. A fenced `releasing` claim is the mirror fault — a releaser
 		// destroys nothing by filter, so a bound it never uses could only be misread.
@@ -915,7 +915,7 @@ func TestQoS2ClearPreservesAClaimedHold(t *testing.T) {
 // finishes inside the budget, the discard sees the claim vanish, COMPETES FOR IT AGAIN, and
 // completes the teardown under a marker of its own.
 //
-// It does not read the vacancy as its own entitlement — that inference is what F-062's A3
+// It does not read the vacancy as its own entitlement — that inference is what issue #66's A3
 // race disproved — so the outcome is the hold gone and a fenced marker standing, exactly as
 // on any other winning discard.
 func TestQoS2ClearWaitsOutACompletingRelease(t *testing.T) {
@@ -948,7 +948,7 @@ func TestQoS2ClearWaitsOutACompletingRelease(t *testing.T) {
 		t.Fatal("the hold survived a release that completed inside the discard's wait")
 	}
 	// This used to assert that NO claim was left behind. That expectation encoded the
-	// defect F-062 round 9 found: it was only true because an awaited release purged
+	// defect issue #66 round 9 found: it was only true because an awaited release purged
 	// directly, treating an empty claim subject as its own entitlement — which is unsound,
 	// since the claim waited on may belong to an earlier exchange and be reaped by the
 	// current one's releaser. The walk now re-competes and destroys under a marker it won,
@@ -1086,7 +1086,7 @@ func TestQoS2DiscardRunsNoBlindPurge(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F-062: the hold purge is bounded, and the marker it leaves carries that bound
+// issue #66: the hold purge is bounded, and the marker it leaves carries that bound
 // ---------------------------------------------------------------------------
 
 // vacate removes a hold record at its exact sequence, the way a completed exchange's
@@ -1126,7 +1126,7 @@ func (e *testRelClaimEnv) holdSeqOf(t *testing.T, holdSubject string) uint64 {
 
 // releaseDelivers drives the two fences a real PUBREL drives and requires both to
 // authorize the delivery. Asserting the hold record merely survived is not enough:
-// what F-062 protects is the EXCHANGE, and an exchange whose claim is refused or whose
+// what issue #66 protects is the EXCHANGE, and an exchange whose claim is refused or whose
 // re-read comes back Superseded delivers nothing however intact its record is.
 func (e *testRelClaimEnv) releaseDelivers(t *testing.T, holdSubject, gen string, holdSeq uint64) {
 	t.Helper()
@@ -1182,7 +1182,7 @@ func (e *testRelClaimEnv) setSubjectsSeam(t *testing.T, seq func(realLast uint64
 	}
 }
 
-// TestQoS2TeardownPurgeSparesAPostEnumerationHold is F-062 mechanism 1, asserted at
+// TestQoS2TeardownPurgeSparesAPostEnumerationHold is issue #66 mechanism 1, asserted at
 // the shared boundary: a teardown's purge never removes a hold record the teardown was
 // not entitled to destroy.
 //
@@ -1243,7 +1243,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 	})
 
 	// A3: the discard lost the claim to a releaser and is waiting it out. The vacancy that
-	// follows licenses NO purge — that inference is the race F-062 round 9 disproved — so the
+	// follows licenses NO purge — that inference is the race issue #66 round 9 disproved — so the
 	// walk re-competes, wins a marker of its own, and the hold accepted after enumeration is
 	// spared by that marker's cutoff. What this subtest measures is that chain.
 	t.Run("A3 awaited release completes", func(t *testing.T) {
@@ -1333,9 +1333,9 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 	// a separate store read, so a subject can appear in the map while its record sits ABOVE
 	// the returned last sequence. The marker's CAS is then won DURING that hold's occupancy
 	// and the hold is SPARED anyway — which is why winning the CAS is not on its own what makes
-	// an occupancy discardable. What does is stated per arm in F-062; this fixture measures the
+	// an occupancy discardable. What does is stated per arm in issue #66; this fixture measures the
 	// consequence rather than restating the rule. Direction is a leak, and the exchange stays
-	// serviceable, so it belongs to F-036 rather than to any loss claim.
+	// serviceable, so it belongs to issue #40 rather than to any loss claim.
 	t.Run("A1 spares a hold above a stale watermark", func(t *testing.T) {
 		t.Parallel()
 		e := testNewRelClaimEnv(t, "spare-a1-stale")
@@ -1416,7 +1416,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 // non-empty subject map with a zero last sequence. Acting on it would write a marker
 // fenced at 0; the identity rule then classifies that marker unreadable, and the
 // unreadable disposition on the PUBREL path deletes the acknowledged hold and answers
-// 0x92 — manufacturing the exact loss F-062 closes.
+// 0x92 — manufacturing the exact loss issue #66 closes.
 func TestQoS2DiscardZeroWatermarkWritesNoMarker(t *testing.T) {
 	t.Parallel()
 
@@ -1511,7 +1511,7 @@ func TestQoS2DiscardZeroWatermarkWritesNoMarker(t *testing.T) {
 	})
 }
 
-// TestQoS2TeardownStaleDiscardedClaimDoesNotPoisonReuse is F-062 mechanism 2, stated as
+// TestQoS2TeardownStaleDiscardedClaimDoesNotPoisonReuse is issue #66 mechanism 2, stated as
 // the failure it WAS: a `discarded` marker was reaped by no teardown and no releaser path,
 // so a LATER exchange on the same packet identifier read it, was answered 0x92 and had its
 // hold released — losing an acknowledged message that the marker's writer never had any
@@ -1593,7 +1593,7 @@ func TestQoS2TeardownStaleDiscardedClaimDoesNotPoisonReuse(t *testing.T) {
 	}
 }
 
-// TestQoS2AwaitedReleaseDoesNotInheritAStaleClaimsEntitlement is the F-062 round-9 race, and
+// TestQoS2AwaitedReleaseDoesNotInheritAStaleClaimsEntitlement is the issue #66 round-9 race, and
 // the property it pins is the RELEASER'S VERDICT rather than the hold's survival.
 //
 // The interleaving: E1 completes and vacates the hold subject, leaving its `releasing` claim

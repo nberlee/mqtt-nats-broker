@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// A DELETION AUTHORIZATION IS CONDITIONED ON THE RECORDS IT READ (F-105 WP-F W2, row M12).
+// A DELETION AUTHORIZATION IS CONDITIONED ON THE RECORDS IT READ (issue #107 WP-F W2, row M12).
 //
 // Authorizing a retained payload's deletion rests on "nothing depends on it" as of the resource
 // sequence and the authority revision the authorization was composed against. If an edge lands on

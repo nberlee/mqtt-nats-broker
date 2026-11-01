@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 )
 
-// The shared acquisition release fence (F-105 7e; designed at 7a, consult 82).
+// The shared acquisition release fence (issue #107 7e; designed at 7a, consult 82).
 //
 // A shared-group QoS 1 exchange depends on the EXACT acquisition its admission recorded
 // (SharedAcq), because the group consumer's re-offer of the source is how an unacknowledged

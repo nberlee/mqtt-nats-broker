@@ -13,7 +13,7 @@
 
 // Proving this broker still owns a shared membership before it serves the group.
 //
-// THE FINDING (F-077). No route that restores shared group delivery interest revalidates
+// THE FINDING (issue #79). No route that restores shared group delivery interest revalidates
 // that this broker still owns the record the membership was read from. Broker A holds a
 // resident session; B accepts a newer CONNECT for the same client ID and its path removes
 // the membership and releases its acquisitions, retiring the group's incarnation and
@@ -23,7 +23,7 @@
 // delivers-and-acks a shared QoS 0 member. Each of those destroys a group message for the
 // members that legitimately hold the membership.
 //
-// F-076 proved the durable's CONFIGURATION on resume. This proves OWNERSHIP, which is a
+// issue #78 proved the durable's CONFIGURATION on resume. This proves OWNERSHIP, which is a
 // different fact and needs a different instrument.
 //
 // WHY A WRITE AND NOT A READ. A read cannot arbitrate. JetStream returns 10164 from the
@@ -36,11 +36,11 @@
 // WHAT THIS DOES NOT PROVE. Ownership of the RECORD, never presence of the CONSUMER.
 // CONSUMER.DELETE carries no precondition field at all, so no finite check binds the
 // durable's existence to the record's ownership: the durable may vanish at any point after
-// the last verification or write, this CAS included. That is F-076's stated residual and
+// the last verification or write, this CAS included. That is issue #78's stated residual and
 // docs/CONFORMANCE.md carries it.
 //
 // SCOPE. This file is the CONNECT/resume half. A live SUBSCRIBE installs and revives the
-// same interest, and it USED to do so with no arbitration at all; that was F-078, and it
+// same interest, and it USED to do so with no arbitration at all; that was issue #80, and it
 // now runs this same classified write as the packet's last record write, behind a
 // packet-scoped transmission gate this path does not need because the restore gate already
 // withholds everything until the CONNACK. See sub_operation_gate.go. The trigger differs:
@@ -64,7 +64,7 @@ import "sync/atomic"
 //     for exactly the population that just recreated a durable.
 //   - `created` in turn cannot stand in for the arbitration trigger. A resume that finds
 //     every durable present-and-canonical creates nothing and still installs delivery
-//     interest under a membership it has not revalidated — that is F-077's R1.
+//     interest under a membership it has not revalidated — that is issue #79's R1.
 //   - and `charged` must remain the refund's fact alone, because processSharedJSConsumer
 //     returns cc whether or not THIS call charged, so refunding by durable would erase an
 //     earlier connection's charge and leave tmaxack permanently short.
@@ -86,7 +86,7 @@ type mqttSharedJoinResult struct {
 	//
 	// It is aggregated on the CALLER'S STACK, never on the session: a fact parked on
 	// mqttSession outlives the operation that raised it and would govern the next one,
-	// which is exactly the stale-generation defect F-078 solved for its packet gate, by
+	// which is exactly the stale-generation defect issue #80 solved for its packet gate, by
 	// scoping the gate to the connection AND a per-session generation.
 	installed bool
 }
@@ -106,12 +106,12 @@ const (
 	mqttGroupOwnershipOurs mqttGroupOwnership = iota
 	// mqttGroupOwnershipForeign: the record is NOT OURS. Emphatically not "a demonstrated
 	// takeover", which is what this used to say: a rejected CAS establishes that the
-	// subject moved past our base and nothing about who moved it. F-084.
+	// subject moved past our base and nothing about who moved it. issue #86.
 	mqttGroupOwnershipForeign
 	// mqttGroupOwnershipForked: the record claims our parent — our write was erased by
 	// something not demonstrably a successor of ours, and NOBODY was demonstrated to own
 	// the session. Distinct from Foreign in what it licenses, though no longer in the
-	// reason CODE: both say 0x89 "reconnect" since F-084, and only this one may MINT a
+	// reason CODE: both say 0x89 "reconnect" since issue #86, and only this one may MINT a
 	// repair grant, because only this one is anchored to a record proven to claim our
 	// parent.
 	mqttGroupOwnershipForked
@@ -151,7 +151,7 @@ type mqttGroupOwnershipVerdict struct {
 // sess_resume_reconcile.go, and the two rules it inherits are not re-derived here:
 //
 //   - 10071 (the single-writer check) means the SUBJECT MOVED after our accept save. Not
-//     that another broker wrote it: the rejection names no writer (F-084). It disposes
+//     that another broker wrote it: the rejection names no writer (issue #86). It disposes
 //     without ever consulting the resolver, so this is the ONLY place a sibling lineage can
 //     be recognised on that arm — disposalForDirectRejection reads the record once,
 //     classifies it, and MINTS THE FORK GRANT. Collapsing it to one undifferentiated
@@ -187,7 +187,7 @@ func (sess *mqttSession) proveSharedMembershipOwnership(tok recordTx) mqttGroupO
 		// is a sibling rather than a successor.
 		// Keyed on the fork BIT, never on the vocabulary's reason code: the forked and
 		// unsettled vocabularies share 0x89, so a code comparison would call an unsettled
-		// record a fork. F-084.
+		// record a fork. issue #86.
 		voc, forked := sess.disposalForDirectRejection(&detail)
 		out := mqttGroupOwnershipForeign
 		if forked {

@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// THE FLOOR UNIT (F-112): the custody dispatcher's item that advances a live generation's floor,
+// THE FLOOR UNIT (issue #114): the custody dispatcher's item that advances a live generation's floor,
 // deletes what the floor retired, resolves the exchange duties a live generation never resolved
 // before, and gives the ended-lineage veto its exit.
 //
@@ -305,7 +305,7 @@ func (sess *mqttSession) floorHorizonStep(gen, epoch string, led *mqttGenLedger)
 	return true, true
 }
 
-// pruneEndedLineagesStep is the ended-lineage veto's EXIT (F-112), at most mqttFloorPruneBatch
+// pruneEndedLineagesStep is the ended-lineage veto's EXIT (issue #114), at most mqttFloorPruneBatch
 // register reads. An entry for lineage L may go only when nothing can ever again install an
 // AckRoute for L on this session object, which needs all three, re-checked under the lock after
 // the register read:

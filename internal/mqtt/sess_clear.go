@@ -68,10 +68,10 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // resource named here is generation-scoped. Generation scoping protects the next
 // incarnation; a resume preserves the generation, so it never protected a peer still
 // serving the retiring one. What protects that peer's inbound QoS 2 state is the bound
-// each hold removal carries (F-062); $MQTT_inflight now carries the same kind of bound,
-// its reap's own enumeration watermark (F-034). What neither bound does is arbitrate a
+// each hold removal carries (issue #66); $MQTT_inflight now carries the same kind of bound,
+// its reap's own enumeration watermark (issue #38). What neither bound does is arbitrate a
 // peer that is genuinely still serving the retiring incarnation — that needs an ownership
-// predicate, which is F-036's. See sess_teardown.go.
+// predicate, which is issue #40's. See sess_teardown.go.
 //
 // It runs in a record transaction of the OLD generation — its record removal must
 // validate against the epoch it opened with — and ends that generation as it
@@ -96,7 +96,7 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // Runs from the client's readLoop.
 // Lock not held on entry, but session is in the locked map.
 //
-// Since F-036 unit 1 this is a COMPOSITION: prepareClear (the non-mutating
+// Since issue #40 unit 1 this is a COMPOSITION: prepareClear (the non-mutating
 // refusals and the record fence), the retirement-permit mint, and destroy (the
 // destructive half). The caller must have CLOSED the incarnation tracker and
 // drained it — the mint fails otherwise, which is the mechanical enforcement —
@@ -112,7 +112,7 @@ func (sess *mqttSession) clear(noWait bool) error {
 // drain within the ceiling: an admitted route or a queued effect of the retiring
 // incarnation is still outstanding. Nothing was mutated. Each caller applies its
 // own ceiling disposition (leave resident and retry, re-arm the timer, re-park),
-// per F-036 unit 1 §3.7.
+// per issue #40 unit 1 §3.7.
 var errMQTTClearDrainTimeout = errors.New("incarnation did not drain before the discard ceiling")
 
 // mqttExpiryRetryAfterRetiring is how soon a session-expiry fire re-arms when it
@@ -198,7 +198,7 @@ func (sess *mqttSession) clearInner(noWait bool, selfLease *mqttLease,
 // cannot drift: destroy re-mints at newSeq == 0, because the record it just deleted
 // leaves nothing to displace; the clean-start HANDOFF re-mints at newSeq == the
 // predecessor record's sequence, because its accepted batch DISPLACES that record in
-// place rather than deleting it (F-105 row-9 ordering, Codex consult 6). The lineage is
+// place rather than deleting it (issue #107 row-9 ordering, Codex consult 6). The lineage is
 // broken either way (wid/pwid zeroed), so the first post-re-mint write is a parentless
 // create-shaped body whatever base it lands at.
 //
@@ -237,7 +237,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// ended exchange — is not something a discard establishes: kept, they would accumulate
 	// across every abandonment and clean start (checkpoint review WIP-2).
 	sess.abandonedAcks = nil
-	sess.withdrawOwed = nil // the discarded generation's owed withdrawals (F-088)
+	sess.withdrawOwed = nil // the discarded generation's owed withdrawals (issue #90)
 	sess.dropAcquireSettleOwedLocked()
 	sess.admissionContinuity = nil
 	sess.discardDisposalsLocked()
@@ -246,7 +246,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// and a discard DELETES that record — so no later reader can obtain a retired
 	// generation's verdicts, whatever survives on $MQTT_inflight. That is the reason, and
 	// it deliberately does NOT rest on the teardown having removed every register: since
-	// F-034 the reap spares anything above its enumeration watermark and refuses outright
+	// issue #38 the reap spares anything above its enumeration watermark and refuses outright
 	// on an unreadable one, and clear()'s no-record branch has no marker to re-drive it,
 	// so survivors are possible. They are the orphan sweep's, and the sweep reads durable
 	// state rather than this object.
@@ -264,7 +264,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// arithmetic. See sess_rejected_write.go.
 	//
 	// DISARMING is the load-bearing half now, not the sequence reset: this re-mints at
-	// seq = 0, and a base-0 rejection is a real one since F-029, so a marker left armed
+	// seq = 0, and a base-0 rejection is a real one since issue #31, so a marker left armed
 	// here would match the fresh session's own sequence and gate its serving forever.
 	sess.recordRejectedSeq, sess.recordRejectedArmed = 0, false
 	// The identifier space of the RETIRING incarnation is gone with the maps above, so
@@ -316,7 +316,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// late delete harmless TO THE NEXT INCARNATION by construction rather than merely
 	// unlikely. Naming alone does not make one harmless to a peer still serving the
 	// RETIRING generation, which a resume preserves; for the inbound QoS 2 holds the
-	// purge bound does, and it is what a late walk is limited by: see F-062. A legacy
+	// purge bound does, and it is what a late walk is limited by: see issue #66. A legacy
 	// session with no generation is re-minted here too, which is the only way it
 	// leaves the exposed hash-only naming. See sess_incarnation.go.
 	sess.setIncarnationLocked(freshGen, permit)
@@ -342,7 +342,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// Discarded session: reset the PI counter too so a reused session object
 	// does not inherit the previous session's identifiers. Spec [MQTT-3.1.2-6].
 	sess.last_pi = 0
-	// sendsInFlight deliberately SURVIVES the discard (F-087 WP5, class F2). With the
+	// sendsInFlight deliberately SURVIVES the discard (issue #89 WP5, class F2). With the
 	// counter back at zero a reused session object can mint PI 1 for the new incarnation
 	// while the displaced connection's PI 1 write is still blocked in a synchronous
 	// socket write — the displaced connection is closed on another goroutine, so the
@@ -354,10 +354,10 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// bounded; the ones that still reserve something are left exactly as they are. This
 	// deliberately does NOT retire a PUBREL's acknowledgement debt: sess.c is untouched
 	// here, so on the clean-start path the displaced client is still bound and its debt
-	// is still holding an identifier the client itself still holds (F-089).
+	// is still holding an identifier the client itself still holds (issue #91).
 	// The predicate consults sess.retiringOwnerCID as well as the bound client, so a
 	// retirement that detached before this ran still reads the displaced connection's
-	// debts as LIVE and does not free an identifier it still holds (F-089).
+	// debts as LIVE and does not free an identifier it still holds (issue #91).
 	sess.sweepDeadSendHoldsLocked()
 }
 
@@ -365,7 +365,7 @@ type mqttPreparedClear struct {
 	sess *mqttSession
 	tok  recordTx
 	// auth is the authority as the discard boundary LAST read it, after settling any proposal
-	// that stood (F-105 8a). Every later decision of this discard — destroy's retirement
+	// that stood (issue #107 8a). Every later decision of this discard — destroy's retirement
 	// receipt, the clean-start handoff-versus-destroy choice — reads THIS load and never a
 	// fresher one: a later read could see a proposal that appeared after the boundary and
 	// build the receipt from a state the claim did not see. authRead is false when no read
@@ -409,7 +409,7 @@ func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
 }
 
 // settleDiscardAuthority is the discard boundary's ONE authority read, and it SETTLES rather
-// than refuses (F-105 8a, consult 119). A discard that meets a reservation or preparation some
+// than refuses (issue #107 8a, consult 119). A discard that meets a reservation or preparation some
 // acceptance left standing settles it first — finalize, cancel or close as its verdict licenses
 // — so the discard then sees only states every caller already handles: SERVING at this
 // generation (a receipted discard), ABSENT or CLOSED (receiptless, as always), or a record a
@@ -477,15 +477,15 @@ func (p *mqttPreparedClear) abort() {
 // old tracker's resolution is armed by defer ON ENTRY, so success, a superseded
 // claim, an incomplete teardown and every post-reset error all resolve parked
 // ingress exactly once — a displaced connection parked at the packet gate is never
-// stranded by a failure arm (F-036 unit 1).
+// stranded by a failure arm (issue #40 unit 1).
 //
 // EVERY destroy CLOSES the retiring generation's authority with an authorized discarding
 // closure before it deletes the record when the boundary's load reads it SERVING at that exact
-// generation — the standalone-teardown half of F-105 row 8, Gap 1: a session that ends with no
+// generation — the standalone-teardown half of issue #107 row 8, Gap 1: a session that ends with no
 // displacing successor still has to close its own authority, or a reconnect finds SERVING with
 // no record and cannot reserve over it. (The Clean-Start handoff, whose closure the
 // finalization writes, does not destroy at all.) Over any other load there is no receipt, and
-// the closing driver's licence decides whether the shared closing may run (F-105 8b).
+// the closing driver's licence decides whether the shared closing may run (issue #107 8b).
 func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) error {
 	sess, tok := p.sess, p.tok
 	defer permit.tr.resolveRetired()
@@ -574,7 +574,7 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	}
 
 	// THE DISCARD AUTHORIZATION, captured while the record still stands and the authority
-	// still serves this generation (F-105, row 8, Gap 1). When present, the claim below
+	// still serves this generation (issue #107, row 8, Gap 1). When present, the claim below
 	// commits a durable teardown receipt in the same atomic batch as the marker, and the
 	// close after it ends this generation's authority discarding — so a reconnect finds
 	// CLOSED and reserves over it rather than SERVING with a deleted record and no way in.
@@ -657,7 +657,7 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 		return err
 	}
 	// CLOSE THE AUTHORITY, discarding, BEFORE the record is deleted and before the shared
-	// acquisitions are released (F-105, row 8, Gap 1). The receipt committed with the marker
+	// acquisitions are released (issue #107, row 8, Gap 1). The receipt committed with the marker
 	// authorizes it; the close ends this generation with a permanent discarding closure that
 	// seals the inventory, enrols the affine consumer for its recovery owner and roots the
 	// recovery pass. A failure leaves the record MARKED with the receipt beside it, which is
@@ -670,12 +670,12 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 			return fmt.Errorf("discarding session %q: %w", id, err)
 		}
 		// THE DISCARDED GENERATION'S RETIREMENT STARTS HERE, before the shared closing and
-		// independently of it (F-105 7d): the closure just committed is the licence of every
+		// independently of it (issue #107 7d): the closure just committed is the licence of every
 		// step, and the prompt drive visits its root with the recovery executor itself.
 		sess.asm.kickRecoveryRoot(id, sess.asm.sessStreamEpoch, retiringGen)
 	}
 	// CLOSE THE SHARED ACQUISITIONS of the RETIRING generation, before the first deletion and
-	// before the record is released, through the ONE closing driver (F-105 8b): only once the
+	// before the record is released, through the ONE closing driver (issue #107 8b): only once the
 	// generation's closure record — or an authority read proving it never served — proves nothing
 	// can be admitted under it any more, seal its acquisition ledger (from here no join of this
 	// generation can land), release every acquisition it lists (one arbitrated ledger+group
@@ -698,14 +698,14 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	// delete cannot be atomic. Generation-scoped naming is what keeps these deletes off
 	// the NEXT incarnation's resources; it does not establish that no peer is still
 	// serving this one. For the inbound QoS 2 holds that is covered by the bound each
-	// removal carries (F-062); for $MQTT_inflight it is the bound F-034 added, its reap's
+	// removal carries (issue #66); for $MQTT_inflight it is the bound issue #38 added, its reap's
 	// own enumeration watermark. Neither bound arbitrates a genuinely live owner of the
-	// same record — that is F-036's predicate. The hook here is how a test parks a broker
+	// same record — that is issue #40's predicate. The hook here is how a test parks a broker
 	// in exactly that window.
 	if h := mqttTestTeardownClaimedHookV.Load(); h != nil {
 		(*h)(sess, nonce, markerSeq)
 	}
-	// WHO OWNS THIS GENERATION'S CLEANUP, decided before the first deletion (F-105, row 8), on
+	// WHO OWNS THIS GENERATION'S CLEANUP, decided before the first deletion (issue #107, row 8), on
 	// the owner's own path exactly as on the adopted one. An indeterminate reading refuses with
 	// nothing deleted.
 	var own mqttTeardownOwnership
@@ -727,7 +727,7 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 	}
 
 	// THE METADATA RELEASE IS GATED ON DURABLE FACTS ABOUT THE CLOSED GENERATION, on the
-	// owner's own path exactly as on the adopted one (F-105, row 8). Releasing the record is
+	// owner's own path exactly as on the adopted one (issue #107, row 8). Releasing the record is
 	// what lets a fresh acceptance in; if the old generation still has duties nothing will
 	// traverse, this release makes that permanent. The gate is VACUOUS for a generation with
 	// neither ledger nor closure — the unconverted paths that write no receipt — and it

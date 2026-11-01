@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// F-105 8b through actual CONNECTs and teardowns: one tenure per acceptance, installation on
+// issue #107 8b through actual CONNECTs and teardowns: one tenure per acceptance, installation on
 // every acceptance, the closing driver's order and withhold, the adoption's settlement and its
 // receiptless continuation, and P2. Mutation ledger: mutation-ledger-8b.md.
 

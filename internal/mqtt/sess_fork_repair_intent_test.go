@@ -18,7 +18,7 @@ import (
 	"testing"
 )
 
-// F-094 at fork repair's preflight, which is the SECOND caller of adoptDrainLocked.
+// issue #96 at fork repair's preflight, which is the SECOND caller of adoptDrainLocked.
 //
 // THE TWO HOLDS REFUSE DIFFERENT ROWS, and these three tests pin the split in both
 // directions, because getting it wrong in either direction is a real defect that a plan

@@ -15,7 +15,7 @@ package mqtt
 
 import "testing"
 
-// The REAL-STORE PUBREL fixture (F-105 PUBCOMP arm, consult 26).
+// The REAL-STORE PUBREL fixture (issue #107 PUBCOMP arm, consult 26).
 //
 // testReadyForPubRelDelivery's world keeps the register in an in-memory map, which was enough
 // while PUBCOMP moved only the slot. An ORDINARY exchange's completion is now one authority batch

@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-// F-105 8a unit properties: own versus foreign identity, the settlement continuation, the
+// issue #107 8a unit properties: own versus foreign identity, the settlement continuation, the
 // verdict latch, and the writer-lock rule certification rests on.
 
 // TestF105DecisionSettlesAForeignProposalByItsVerdict: a standing proposal that is not this
@@ -214,11 +214,11 @@ func TestCloseConnectionNeverRunsUnderWriteLock(t *testing.T) {
 }
 
 // TestF105DisposalPhasesOnlyAppend: every disposing arm of mqttProcessConnect hands its Will
-// and its close to the CONNECT's defers, and since F-105 8a one CONNECT can run more than one
+// and its close to the CONNECT's defers, and since issue #107 8a one CONNECT can run more than one
 // disposal (a stale resident at its top, then a disposing arm later). So the deferred phases
 // may only be APPENDED to, never replaced — a replaced phase is a Will that is never
 // discharged, already extracted from an object no teardown will find again (H-5). The one
-// writer is registerDisposalPhases; a SOURCE guard, as for F-084, because the property is
+// writer is registerDisposalPhases; a SOURCE guard, as for issue #86, because the property is
 // where the assignments sit, not what any single run observes. Mutation M35.
 func TestF105DisposalPhasesOnlyAppend(t *testing.T) {
 	file, lines, start, end := censusFuncSource(t, "Server", "mqttProcessConnect")

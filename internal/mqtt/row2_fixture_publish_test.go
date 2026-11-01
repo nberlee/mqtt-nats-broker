@@ -21,7 +21,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// Fixtures for the ORDINARY PUBLISH acquisition on the real store (F-105 row 2, consult 29).
+// Fixtures for the ORDINARY PUBLISH acquisition on the real store (issue #107 row 2, consult 29).
 //
 // An ordinary acquisition is ONE authority batch — the register's token and the action record
 // together — so a fixture that wants to intercept it intercepts that batch

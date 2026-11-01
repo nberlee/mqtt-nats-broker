@@ -25,7 +25,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// A RECOVERED RELEASE REQUEST SETTLES WITHOUT A DELIVERY (F-098 L4, holistic review round 3,
+// A RECOVERED RELEASE REQUEST SETTLES WITHOUT A DELIVERY (issue #100 L4, holistic review round 3,
 // finding 2). A drained PUBACK persists the request and the process stops before the claim
 // removal lands. On the next resume the record still carries the claim and the request — and
 // every event that drives a finalize is SOURCE-side: a redelivery, a PUBREL correlation, or an
@@ -126,7 +126,7 @@ func TestResumeEnrolsRecoveredDrainReleases(t *testing.T) {
 	}
 }
 
-// A WITHHELD CLAIM REMOVAL KEEPS THE REQUEST'S IDENTITY (F-098 L4, holistic review round 4,
+// A WITHHELD CLAIM REMOVAL KEEPS THE REQUEST'S IDENTITY (issue #100 L4, holistic review round 4,
 // finding 1). The release settles Rel(k) against a successor at k+1: the successor is PRESERVED
 // and the request is discharged. But the claim removal that consumes it can still fail — a fence
 // refusal, or a definitely-failed save — and if the request were cleared before that, the retry
@@ -216,7 +216,7 @@ func TestMQTTDrainFinalizeKeepsItsRequestAcrossAFailedClaimRemoval(t *testing.T)
 	}
 }
 
-// A DEFINITELY-FAILED CLAIM REMOVAL SETTLES ITSELF (F-098 L4, holistic review round 5,
+// A DEFINITELY-FAILED CLAIM REMOVAL SETTLES ITSELF (issue #100 L4, holistic review round 5,
 // finding 2). The finalize released its register, took the record fence, and its claim-removal
 // save definitely failed: claim and request are restored. "The message stays pending and is
 // redelivered" is the recovery route — but only while the source can still be delivered. With

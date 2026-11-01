@@ -22,7 +22,7 @@
 //     still reach one a peer created under the retiring generation, which a resume
 //     preserves — which is why naming is not a substitute for arbitration on a subject
 //     a live peer can still write. On the inbound QoS 2 holds what supplies the rest is
-//     F-062's purge bound: a removal names a subject but destroys only up to the
+//     issue #66's purge bound: a removal names a subject but destroys only up to the
 //     sequence its remover could prove it was entitled to.
 //
 //  2. This claim. Its remaining job is narrower but still necessary: keep two
@@ -37,8 +37,8 @@
 // generation, releases the record, and only then starts a fresh session with a fresh
 // generation and Session Present false. (Repeating them is safe for names nothing can
 // re-occupy; for the inbound QoS 2 hold walk it is bounded per walk, and for the
-// `$MQTT_inflight` reap it is bounded by that pass's own enumeration watermark — F-034
-// replaced the unbounded purge that used to sit there. F-062 and F-034 state those two; do
+// `$MQTT_inflight` reap it is bounded by that pass's own enumeration watermark — issue #38
+// replaced the unbounded purge that used to sit there. issue #66 and issue #38 state those two; do
 // not restate them here.) That also makes a crashed teardown
 // self-healing, which today leaks until the orphan sweep. A record the restore
 // boundary refuses is never adopted by the CONNECT: a reserved-namespace record whose
@@ -79,11 +79,11 @@ type mqttSessTeardown struct {
 // The inbound QoS 2 hold walk is the one target here that a repeat can re-reach on a subject
 // a live peer re-occupied, and it is bounded PER WALK rather than frozen at the first walk's
 // watermark. What that bounds, what it deliberately does not, and why freezing it would be
-// unsafe are stated once in F-062 (docs/findings/ha-arbitration.md); do not re-derive them
+// unsafe are stated once in issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131); do not re-derive them
 // here, and do not paraphrase the entitlement criterion — three review rounds were spent on
 // restatements of it that were a shade too strong.
 //
-// It extends to `$MQTT_inflight` too, since F-034: the blind filter purge there was
+// It extends to `$MQTT_inflight` too, since issue #38: the blind filter purge there was
 // replaced by an enumerate-load-classify-delete pass whose entitlement is its own
 // enumeration watermark, so a subject re-occupied since the enumeration is SPARED rather
 // than destroyed.
@@ -101,7 +101,7 @@ type mqttTeardownTarget struct {
 	q2AffGen  string
 	q2AffDur  string
 	// deferAffineDelete transfers this generation's affine consumer to the recovery pass
-	// (F-105, row 8). Set ONLY by the teardown's own classification, and only where that
+	// (issue #107, row 8). Set ONLY by the teardown's own classification, and only where that
 	// generation's closure DISCARDS and its affine target is enrolled with both a resource
 	// record and a cleanup duty — the durable facts that say the duty exists and someone will
 	// come back for it.
@@ -111,7 +111,7 @@ type mqttTeardownTarget struct {
 	// not discard enrols no affine target, so its consumer stays this teardown's to remove.
 	deferAffineDelete bool
 	// transferLogical transfers this generation's SOURCE, drain and PUBREL consumers, and its
-	// retained registers, to the recovery executor (F-105 7d). Set ONLY by the teardown's own
+	// retained registers, to the recovery executor (issue #107 7d). Set ONLY by the teardown's own
 	// classification, and only where that generation's committed closure DISCARDS: from then the
 	// consumers are retired through their resources — disposal, the name's retirement, a
 	// classified delete — and never deleted here, because a delete issued before the authorization
@@ -473,7 +473,7 @@ func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, b
 	// the set — a MarkerSeq is a $MQTT_sess SEQUENCE, comparable only within the
 	// incarnation that issued it — but the check itself is the one every
 	// broker-owned stream now runs, so it is the shared helper rather than a
-	// second mechanism stating the same fact (F-066).
+	// second mechanism stating the same fact (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
 	}
@@ -725,7 +725,7 @@ func (sess *mqttSession) retirementFenced(idHash string, markerSeq uint64) bool 
 // reconnect adopts the marker and starts fresh with Session Present false, and with
 // no client the expiry path or the sweep's marker-adoption class finishes it.
 // Deleting or releasing here instead would remove the record before the survivor's
-// broker could observe the move, which is the F-036 shape rather than a repair.
+// broker could observe the move, which is the issue #40 shape rather than a repair.
 func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTarget,
 	cur *mqttPersistedSession, curSeq uint64) {
 
@@ -735,7 +735,7 @@ func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTar
 	if cur.Gen != t.gen {
 		// A DIFFERENT generation, so this teardown - which retires one generation, not a
 		// client ID - has no business with it. That is a lineage fact and not a claim that
-		// anyone holds the session (F-084); it does not need to be one, because the
+		// anyone holds the session (issue #86); it does not need to be one, because the
 		// conclusion drawn is the negative one: do not condemn. This comparison is what
 		// keeps the repair from being collateral damage, so it is the one the mutation
 		// matrix removes.
@@ -892,8 +892,8 @@ func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, c
 //
 // Tolerating "already gone" is not by itself what makes this repeatable. For the
 // inbound QoS 2 hold walk, which purges by subject and so can name a subject re-occupied
-// since the first run, what makes a second run safe is the bound each call carries (F-062).
-// The `$MQTT_inflight` reap below carries the same kind of bound, since F-034: its
+// since the first run, what makes a second run safe is the bound each call carries (issue #66).
+// The `$MQTT_inflight` reap below carries the same kind of bound, since issue #38: its
 // entitlement is the watermark its own enumeration returned, and it deletes only records
 // at or below that, at exact sequences, after checking each occupant's identity.
 //
@@ -903,7 +903,7 @@ func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, c
 func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait bool) error {
 	for _, dur := range t.durs {
 		if t.transferLogical {
-			break // retired by the recovery executor through its resource (F-105 7d)
+			break // retired by the recovery executor through its resource (issue #107 7d)
 		}
 		if _, err := sess.jsa.deleteConsumer(mqttStreamName, dur, noWait); isErrorOtherThan(err, JSConsumerNotFoundErr) {
 			return fmt.Errorf("unable to delete consumer %q for session %q: %v", dur, t.id, err)
@@ -923,7 +923,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 		if err := sess.secureQ2AffPubRelProofs(t); err != nil {
 			return err
 		}
-		// TRANSFERRED in a discarding generation (F-105 7d): the executor disposes of it only once
+		// TRANSFERRED in a discarding generation (issue #107 7d): the executor disposes of it only once
 		// the affine readiness — the assertion these proofs are secured — stands.
 		if !t.transferLogical {
 			_, err := sess.jsa.deleteConsumer(mqttOutStreamName, t.pubRelDur, noWait)
@@ -984,7 +984,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// The enumeration is a one-shot snapshot, and a peer still serving this incarnation can
 	// write after it: a subject the walk never enumerated is never arbitrated, while one it
 	// did enumerate can be re-occupied before the purge lands. Which finding owns which
-	// direction is stated once, in F-036 and F-062 (docs/findings/ha-arbitration.md); this
+	// direction is stated once, in issue #40 and issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131); this
 	// paragraph covers neither.
 	if sess.asm != nil {
 		if err := sess.asm.arbitrateQoS2ReleaseClaims(sess.asm.server(), t.idHash, t.gen); err != nil {
@@ -1003,7 +1003,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// record, no marker — whereas a hold record is a payload another broker's releaser may
 	// still be committed to delivering. (A register is not inert even so: a resuming
 	// session reads one as durable authority, and the slot-only custody contest rewrites it
-	// to take ownership, see claimRecoveredInflight.) Until F-034 this was a blind FILTER PURGE; it is now
+	// to take ownership, see claimRecoveredInflight.) Until issue #38 this was a blind FILTER PURGE; it is now
 	// reapIncarnationRegisters, which enumerates, loads, checks each occupant's identity
 	// and deletes at exact sequences at or below its own enumeration watermark. The
 	// enumeration filter names the RETIRING generation, which clear() re-mints before this
@@ -1012,14 +1012,14 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// That is the whole of what is established, and it is deliberately NOT a correctness
 	// verdict. A resume preserves the generation, so a peer may still be serving this
 	// incarnation and holding registers under these very subjects; "no second party" is a
-	// statement about this broker, not about the cluster. F-034 AUDITED what that costs:
+	// statement about this broker, not about the cluster. issue #38 AUDITED what that costs:
 	// the destruction itself is now bounded and identity-checked (below), so a register
 	// this pass was not entitled to is spared rather than destroyed. What remains is
 	// contention with a genuinely LIVE owner of the same register, which naming cannot
-	// arbitrate and which is F-036's predicate, not this pass's. The same premise's cost
-	// on $MQTT_qos2in is F-062.
+	// arbitrate and which is issue #40's predicate, not this pass's. The same premise's cost
+	// on $MQTT_qos2in is issue #66.
 	//
-	// F-034 REPLACED the blind filter purge here. It used to be
+	// issue #38 REPLACED the blind filter purge here. It used to be
 	// purgeStream(filter, upToSeq 0), which read nothing, and the two things wrong with
 	// that needed two different mechanisms: it could not NAME what it destroyed, and it
 	// had nothing to BOUND itself by because it enumerated nothing. The replacement
@@ -1151,9 +1151,9 @@ func (sess *mqttSession) releaseTeardown(tok recordTx, t *mqttTeardownTarget, no
 //
 // The inbound QoS 2 hold walk carries a bound of its own, per walk, which is what makes a
 // repeat of it safe where naming alone would not have. The `$MQTT_inflight` reap beside it
-// carries the same kind of bound since F-034. "Idempotent" is still not claimed for either:
-// a repeat is SAFE, which is a weaker and sufficient statement. F-062 states the first and
-// F-034 the second; neither is restated here.
+// carries the same kind of bound since issue #38. "Idempotent" is still not claimed for either:
+// a repeat is SAFE, which is a weaker and sufficient statement. issue #66 states the first and
+// issue #38 the second; neither is restated here.
 //
 // This is also what makes a CRASHED teardown self-healing, which previously leaked
 // until the orphan sweep.
@@ -1198,7 +1198,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// marker's own identity would satisfy it for a claimed record that has none. An empty
 	// value is refused there, which is how a record carrying no lineage fails its
 	// adoption closed. See recordGenRetirement.
-	// SETTLE FIRST, on EVERY adoption (F-105 8b). A proposal standing over a marked record can
+	// SETTLE FIRST, on EVERY adoption (issue #107 8b). A proposal standing over a marked record can
 	// only be ABORTED — its metadata commit CASes the record at a sequence the marker claimed
 	// past — so settlement cancels a preparation back to its serving predecessor or closes an
 	// aborted reservation. Without it a receipted close meets PREPARING and refuses forever, and
@@ -1216,7 +1216,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	default:
 		return fmt.Errorf("adopting the teardown of session %q: its teardown receipt reads %v, which licenses nothing", ps.ID, rst)
 	}
-	// THE RECEIPTLESS CONTINUATION (F-105 8b, consult 121): no receipt, and the settled authority
+	// THE RECEIPTLESS CONTINUATION (issue #107 8b, consult 121): no receipt, and the settled authority
 	// still serves this generation. The receipt is committed with the marker itself, CAS'd at
 	// the sequence this adoption holds; the adoption continues from where the marker now stands.
 	if rst == mqttOutboundAbsent && auth.status == mqttOutboundValid && auth.rec != nil &&
@@ -1230,7 +1230,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
 		return err
 	}
-	// COMPLETE THE AUTHORIZED DISCARDING CLOSE the owner may not have finished (F-105, row 8,
+	// COMPLETE THE AUTHORIZED DISCARDING CLOSE the owner may not have finished (issue #107, row 8,
 	// Gap 1). A teardown marker that carries a durable receipt is a standalone discard: the
 	// owner committed the receipt with the marker, then may have crashed before or after
 	// closing the authority. The adopter loads the SAME receipt and drives the SAME close,
@@ -1243,18 +1243,18 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
 		}
 		// The discarding closure stands: its retirement is the recovery executor's, promptly and
-		// independently of the shared closing below (F-105 7d).
+		// independently of the shared closing below (issue #107 7d).
 		as.kickRecoveryRoot(ps.ID, as.sessStreamEpoch, ps.Gen)
 	}
 	// CLOSE THE SHARED ACQUISITIONS of the adopted generation through the ONE closing driver
-	// (F-105 8b), exactly as on the owner's path and before its first deletion: licensed by the
+	// (issue #107 8b), exactly as on the owner's path and before its first deletion: licensed by the
 	// generation's closure record or a settled authority proving it never served, seal, release
 	// everything the sealed ledger lists, and refuse to release the record until it reads
 	// sealed and empty. Repeat-safe from the durable ledger.
 	if err := as.jsa.closeRetiringGeneration(ps.ID, as.sessStreamEpoch, ps.Gen, mqttAuthorityNeverServed(auth, ps.Gen)); err != nil {
 		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
 	}
-	// WHO OWNS THIS GENERATION'S CLEANUP, decided BEFORE the first deletion (F-105, row 8).
+	// WHO OWNS THIS GENERATION'S CLEANUP, decided BEFORE the first deletion (issue #107, row 8).
 	//
 	// The release gate below asks its own question after the deletions have run, which is right
 	// for a RELEASE decision and useless for a DELETION one: by then the affine consumer would be
@@ -1282,7 +1282,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if h := mqttTestTeardownAdoptionWindowHookV.Load(); h != nil {
 		(*h)(ps.ID, idHash, seq)
 	}
-	// THE METADATA RELEASE IS GATED ON DURABLE FACTS ABOUT THE OLD GENERATION (F-105, row 8).
+	// THE METADATA RELEASE IS GATED ON DURABLE FACTS ABOUT THE OLD GENERATION (issue #107, row 8).
 	//
 	// Releasing here is what lets a fresh acceptance in. If the old generation still has duties
 	// that nothing will traverse, this release makes that permanent — so the gate asks whether
@@ -1299,12 +1299,12 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// moment the protocol event is true, rather than re-derived here by a teardown that no
 	// longer has it in front of it.
 	//
-	// WHAT THIS TEARDOWN NO LONGER WAITS FOR is the physical cleanup (F-105 7d). In a discarding
+	// WHAT THIS TEARDOWN NO LONGER WAITS FOR is the physical cleanup (issue #107 7d). In a discarding
 	// generation the source, drain, PUBREL and affine consumers were TRANSFERRED to the recovery
 	// executor above, so the gate asks only whether that owner is durable — a reachable root
 	// under the discarding closure, or a certificate — never whether the deletes happened. The
 	// shared group durables were released by the shared closing above, which is its own gate.
-	// THE ACCOUNT'S RECOVERY EPOCH, not the broker's run id. Every F-105 record is stamped with
+	// THE ACCOUNT'S RECOVERY EPOCH, not the broker's run id. Every issue #107 record is stamped with
 	// the $MQTT_sess incarnation identity, and reading a record under the wrong epoch refuses it
 	// as unattributable — which here would turn every read into an error rather than an answer.
 	if facts, ferr := as.gatherAdoptedReleaseFacts(ps.ID, as.sessStreamEpoch, ps.Gen); ferr != nil {
@@ -1372,7 +1372,7 @@ func mqttTeardownTargetFromRecord(ps *mqttPersistedSession, idHash string) *mqtt
 }
 
 // settleAdoptedAuthority settles whatever ownership proposal stands for an adopted teardown's
-// client and returns the authority as the settlement last read it (F-105 8b). The same
+// client and returns the authority as the settlement last read it (issue #107 8b). The same
 // settlement-arms-only run the discard boundary uses (settleStandingProposal), bounded by one
 // request timeout. A proposal it could not settle is an error: the adoption withholds.
 func (as *mqttAccountSessionManager) settleAdoptedAuthority(id string) (mqttAuthorityLoad, error) {

@@ -18,7 +18,7 @@ import (
 // digest that identifies a late-committing proposal as OURS, so the same proposal was
 // later read as NOT OURS and the session was disposed of as FOREIGN —
 // evicted, and on a bound settlement closed with 0x8E and its Will discarded, with no
-// takeover anywhere — and since F-084 nothing on this path claims one at all.
+// takeover anywhere — and since issue #86 nothing on this path claims one at all.
 
 // testUncertainEnv is one broker with a provisioned, saved session and its record's
 // base sequence — the state every arm of the contract starts from.
@@ -524,7 +524,7 @@ func TestUncertainDuplicateCommitCollapses(t *testing.T) {
 }
 
 // TestUncertainBaseZeroIsReAttempted replaces TestUncertainBaseZeroNeverReAttempts,
-// which asserted the exclusion F-029 removed (test 11, mutation M10).
+// which asserted the exclusion issue #31 removed (test 11, mutation M10).
 //
 // The old test pinned a real property of the old framing: a first-ever write carried no
 // CAS header, so re-sending it would have been an unconditional store that could
@@ -545,7 +545,7 @@ func TestUncertainBaseZeroIsReAttempted(t *testing.T) {
 	hdr := sess.pendingWrite.hdr
 	sess.mu.Unlock()
 	if hdr == 0 {
-		t.Fatal("a base-0 attempt must carry a CAS header: an unconditional create is what F-029 closed")
+		t.Fatal("a base-0 attempt must carry a CAS header: an unconditional create is what issue #31 closed")
 	}
 
 	// The subject must be EMPTY for the "gone" readback to be what the resolver sees.
@@ -624,7 +624,7 @@ func TestClassifyAttemptReadbackShapes(t *testing.T) {
 		})
 	}
 
-	// Gone at a base of ZERO reaches the ordinary gone arm since F-029 (M10). The
+	// Gone at a base of ZERO reaches the ordinary gone arm since issue #31 (M10). The
 	// special case that returned foreign here existed because an unconditional create
 	// could not be re-attempted; the create is conditional now, so the absent subject is
 	// arbitrated by re-sending it rather than guessed at from a read.

@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// Retained replay, executed by the session's driver (F-105 7c).
+// Retained replay, executed by the session's driver (issue #107 7c).
 //
 // SUBSCRIBE takes a SNAPSHOT of each matched retained message under its locks — the material, the
 // effective QoS, the allocated identifier and its nonce, the subscription identifier — and STAGES it
@@ -143,7 +143,7 @@ func (d *mqttRetainedDriver) startContinuationLocked() bool {
 	return true
 }
 
-// THE OWNERSHIP PROPERTY (F-105 7c, consult 106). Every retained obligation this connection has
+// THE OWNERSHIP PROPERTY (issue #107 7c, consult 106). Every retained obligation this connection has
 // created, observed or possibly landed stays OWNED, its captured identity kept, until (i) its own
 // durable settlement is confirmed, (ii) its entitlement has positively passed — the session serves
 // another connection, whose resume restores it from the records — or (iii) its connection is

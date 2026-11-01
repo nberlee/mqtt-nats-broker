@@ -8,7 +8,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// Coverage for the orphan sweep's retirement proof (orphan_retire_proof.go), F-036
+// Coverage for the orphan sweep's retirement proof (orphan_retire_proof.go), issue #40
 // site 3.
 //
 // The property under test is one rule, not three site behaviors: any arm that can still
@@ -18,7 +18,7 @@ import (
 // because "the pass did not crash" and "the record is still there for some other reason"
 // are both things a weaker assertion would accept.
 //
-// The PUBREL consumer arm is the exception, and the tests over it say so: since F-105 7c-lc its
+// The PUBREL consumer arm is the exception, and the tests over it say so: since issue #107 7c-lc its
 // licence is the consumer name's RETIRED ownership alone (Codex consult 14 finding 2), written
 // by opAuthorizeDeletion in the batch that authorizes the resource's deletion. The watermark
 // licenses nothing there, so those negatives plant one beside a missing ownership record and
@@ -38,7 +38,7 @@ import (
 // forgetWithoutLicence drops the record and the resident object WITHOUT planting a
 // retirement watermark — the state a session live on ANOTHER broker leaves behind. It is
 // the whole point of the negatives: absence of a record and of a local resident is
-// precisely what F-036 says does not prove a generation dead.
+// precisely what issue #40 says does not prove a generation dead.
 func (e *testOrphanEnv) forgetWithoutLicence(t *testing.T) {
 	t.Helper()
 	e.dropLocalSession()
@@ -220,7 +220,7 @@ func TestF036OrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 // rather than by refs.hasInbound. Deleting the consumer drops every interest-retained PUBREL
 // it holds.
 //
-// This arm's licence is no longer the watermark: since F-105 7c-lc it is the name's RETIRED
+// This arm's licence is no longer the watermark: since issue #107 7c-lc it is the name's RETIRED
 // ownership alone (Codex consult 14 finding 2), which opAuthorizeDeletion writes in the batch
 // that authorizes the resource's deletion. So the negative is a consumer whose name no
 // ownership record claims, and it CARRIES a matching watermark: that is what separates the

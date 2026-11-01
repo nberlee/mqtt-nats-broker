@@ -29,7 +29,7 @@ import (
 	"testing"
 )
 
-// An unsent obligation is ended, not forgotten (F-105, the prerequisite of row 5; plan-withdraw.md
+// An unsent obligation is ended, not forgotten (issue #107, the prerequisite of row 5; plan-withdraw.md
 // rev 6 §6). Every test below starts from an ordinary obligation ADMITTED through the authority —
 // an exchange at Publish beside its register and unsent marker — so the route under test is
 // reached with the population it exists for.
@@ -372,7 +372,7 @@ func TestF105WithdrawRequiresTheMarkerOfThisAllocation(t *testing.T) {
 	testRequireRefusal(t, f.commitWithdrawal(t, nil), "no unsent marker naming")
 }
 
-// T8a/T8b/T8c. The withdrawal is the SERVING connection's decision (F-105 7b, plan-7b §3.3: an
+// T8a/T8b/T8c. The withdrawal is the SERVING connection's decision (issue #107 7b, plan-7b §3.3: an
 // owner-dependent mutation, converted in 7b), and it keeps the generation exception: an earlier
 // generation's unsent obligation is withdrawn by the connection the later generation serves,
 // changing nothing on the authority but its revision. Under a CLOSED authority no connection's
@@ -450,7 +450,7 @@ func TestF105WithdrawDestructionHasOneDoor(t *testing.T) {
 		// registers of generations no session references, and the settled affine register is
 		// slot-only (7a).
 		"deleteInflightRegister": {"disposeSettledAffineRegister", "reapRegisterWithVerdict", "reconcileOrphanInflight"},
-		// The door's confirmed delete (gated or not: F-088 WP3 rule 6 (c) threads the
+		// The door's confirmed delete (gated or not: issue #90 WP3 rule 6 (c) threads the
 		// exclusion-reclaim continuation's dispatch gate THROUGH the door, never beside it), and the
 		// incarnation reap's pipelined delete of a discarded generation.
 		"deleteInflightRegisterConfirmed":  {"deleteInflightRegistersPipelined", "reapRegisterWithVerdict"},
@@ -635,7 +635,7 @@ func TestF105WithdrawSupersededIsReobservedByIdentity(t *testing.T) {
 				tomb, seq := f.register(t)
 				succ := *tomb
 				succ.Cancelled, succ.Nonce, succ.Lin = false, successorNonce, successorNonce
-				succ.CancelOrigin = _EMPTY_ // F-088: an uncancelled successor carries no provenance
+				succ.CancelOrigin = _EMPTY_ // issue #90: an uncancelled successor carries no provenance
 				if _, serr := f.e.asm.storeInflightCAS(f.subject, seq, &succ); serr != nil {
 					t.Errorf("installing the successor: %v", serr)
 				}
@@ -712,7 +712,7 @@ func TestF105WithdrawAPreexistingCancellationTombstone(t *testing.T) {
 	f := testWithdrawAdmitted(t, "withdraw-pre-tomb", 1)
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("writing the pre-existing tombstone: %v", err)
@@ -752,7 +752,7 @@ func TestF105AdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
 	}
 }
 
-// T16 (consult 32's seam; re-expressed by F-088). A cancellation tombstone WITHOUT the marker
+// T16 (consult 32's seam; re-expressed by issue #90). A cancellation tombstone WITHOUT the marker
 // evidence is no destruction licence: the door preserves the register and the exchange stays at
 // Publish, which still refuses a competing durable admission on its identifier, and no withdrawal
 // is manufactured.
@@ -768,12 +768,12 @@ func TestF105WithdrawNeverManufacturedWithoutEvidence(t *testing.T) {
 	}
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("writing the tombstone: %v", err)
 	}
-	// RE-EXPRESSED by F-097/F-088 (plan rev 20, seven-red-tests table). This test asserted that the
+	// RE-EXPRESSED by issue #99/issue #90 (plan rev 20, seven-red-tests table). This test asserted that the
 	// door destroys the register "on the tombstone's own proof", the deleted premise: a cancellation
 	// bit is a decision, not a proof of non-transmission, and with the marker gone the PUBLISH may
 	// be on the wire. What it pinned and still pins is the other half: no withdrawal is ever

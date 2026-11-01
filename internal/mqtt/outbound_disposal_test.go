@@ -548,7 +548,7 @@ func TestUnitCDisposalDisplacedRecovery(t *testing.T) {
 		t.Fatalf("successor tenure was not established: gen=%s tenure=%s", gen, tenure)
 	}
 	// B's accept on this connection object: its entitlement, and the session bound to it, as the
-	// accept loop records (F-105 7b) — B's recovery runs under B's entitlement.
+	// accept loop records (issue #107 7b) — B's recovery runs under B's entitlement.
 	f.e.c.mu.Lock()
 	f.e.c.mqtt.outEnt = mqttOutboundEntitlement{}
 	f.e.c.mu.Unlock()

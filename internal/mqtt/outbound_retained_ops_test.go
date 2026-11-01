@@ -23,7 +23,7 @@ import (
 )
 
 // The retained materialization substrate, through the operations and the real write boundary
-// (F-105 7c). These are the boundary-level oracles; the SUBSCRIBE-route tests exercise the same
+// (issue #107 7c). These are the boundary-level oracles; the SUBSCRIBE-route tests exercise the same
 // operations through production.
 
 // testRetainedMaterialize reserves, chunks and seals one copy, returning the READY manifest and

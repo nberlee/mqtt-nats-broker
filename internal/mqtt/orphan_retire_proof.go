@@ -4,7 +4,7 @@
 // A session live on ANOTHER broker whose record is absent still uses these names — a
 // resume PRESERVES the generation — so every destructive arm keyed on that absence can
 // destroy an acknowledged QoS 2 payload belonging to a generation that is still serving.
-// That is F-036's site 3, and it is a LOSS rather than a leak, which is why it blocks the
+// That is issue #40's site 3, and it is a LOSS rather than a leak, which is why it blocks the
 // alpha.
 //
 // THE PROPERTY, and it is one rule rather than three site fixes:
@@ -14,7 +14,7 @@
 //	proof, RETAIN.
 //
 // Everything the arms already required is KEPT — the complete reference walk, the
-// quarantine grace, the exact identity revalidation, F-062's cutoff, the claim-before-hold
+// quarantine grace, the exact identity revalidation, issue #66's cutoff, the claim-before-hold
 // ordering, the consumer-instance relookup. The watermark is an ADDITIONAL licence, never
 // a replacement for any of them.
 //
@@ -49,10 +49,10 @@
 //     purge. Keyed on refs.hasInbound.
 //   - reconcileOrphanInflight: the absent-generation register delete. Also
 //     refs.hasInbound.
-//   - (deleteOrphanPubRelConsumers is no longer an arm of this premise: since F-105 7c-lc its
+//   - (deleteOrphanPubRelConsumers is no longer an arm of this premise: since issue #107 7c-lc its
 //     licence is the name's RETIRED ownership alone, consult 14 finding 2.)
 //   - discardAbsentWinnerClaim: commits Discarded for an affine winner. DELIBERATELY
-//     UNGATED and out of scope: it is affine assignment mutation, and F-036's
+//     UNGATED and out of scope: it is affine assignment mutation, and issue #40's
 //     supported-scope ruling of 2026-09-02 says a closure need not preserve the
 //     experimental session-affine shared-QoS-2 branch, with affine-only regressions
 //     accumulating under ROADMAP chapter P.
@@ -66,7 +66,7 @@
 // their positive controls.
 //
 // See docs/ARCHITECTURE.md, "Orphan reconciliation", and
-// docs/findings/ha-arbitration.md F-036.
+// https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
 
 package mqtt
 

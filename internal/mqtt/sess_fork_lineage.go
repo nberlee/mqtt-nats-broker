@@ -12,7 +12,7 @@
 // This machinery was designed against the reading that a proposal accepted under one
 // leader could therefore survive the election unapplied while the NEW leader admitted a
 // second write against the SAME base. **That reading is retired on the supported floor**
-// by F-030's combined dependency-canary, pinned-source and maintainer-confirmed evidence.
+// by issue #34's combined dependency-canary, pinned-source and maintainer-confirmed evidence.
 // test/depproof enumerates every route for a conditional write on a conforming stream:
 // it fixtures the two live ones, refutes seven, and scopes post-start mirror/source drift
 // outside the claim. It exercises $MQTT_willq's single-message CAS shape and, since the
@@ -69,7 +69,7 @@
 // can reach that conclusion about each other from the same event.
 //
 // It USED to report "the session was taken over" there, evicting its own rightful client
-// with 0x8E and telling it to stop reconnecting. F-084 withdrew that: the eviction still
+// with 0x8E and telling it to stop reconnecting. issue #86 withdrew that: the eviction still
 // happens — the record is not ours — but the claim is now 0x89 ownership-unsettled, which
 // is what a rejected CAS actually supports.
 //
@@ -167,7 +167,7 @@ func (l mqttRecordLineage) String() string {
 //     Compared against the attempt {c,a} it would look unrelated and be missed entirely.
 //   - survivor {d,a} is CHILD-SHAPED against a: whoever wrote it read our acknowledged
 //     record first. That is a lost race, not a fork. Not-forked — and NOT a statement that
-//     anyone holds the session now, which this classifier never makes (F-084). Lineage is
+//     anyone holds the session now, which this classifier never makes (issue #86). Lineage is
 //     the only question it answers; a child-shaped body is as consistent with a writer that
 //     has since gone as with one still holding it.
 //   - survivor {c,a} is our own attempt landing late; the digest branch classifies it
@@ -231,8 +231,8 @@ func classifyRecordLineage(found *mqttPersistedSession, ackWID, ackPWID string) 
 // regressed register, separated from its admission by a complete remote lifecycle,
 // resurrected by a regressed teardown slot, or left standing by an out-of-band deletion.
 // A parentless create concedes at classifyRecordLineage's ackPWID conjunct from either
-// orientation — the pre-F-029b RECOGNITION, restated as a residual. What conceding SAYS is
-// no longer the takeover vocabulary: F-084 made it ownership-unsettled, because failing to
+// orientation — the pre-issue #33 RECOGNITION, restated as a residual. What conceding SAYS is
+// no longer the takeover vocabulary: issue #86 made it ownership-unsettled, because failing to
 // recognise sibling-hood leaves this broker knowing less, not more.
 //
 // What that gives up is the CLEAN-START fork, and what it does not give up is the
@@ -307,7 +307,7 @@ var (
 	// under this session. Spec5 [3.14.2.1] 0x8E.
 	//
 	// NOT "an authoritative record exists that is a successor of ours", which is what this
-	// said before F-084 and which no record can establish: restore adopts WID/PWID without
+	// said before issue #86 and which no record can establish: restore adopts WID/PWID without
 	// validating provenance, valid-shaped bodies arrive through unconditional publication,
 	// and acknowledged bytes are replayed verbatim. Its only licence is
 	// discardTakenOverClient, and the single-reader property is asserted by
@@ -329,7 +329,7 @@ var (
 		closeReason: StaleConnection,
 	}
 	// mqttDisposalOwnershipUnsettled is what a RECORD-DERIVED displacement is licensed to
-	// say, and it is the answer to the question F-084 asked: this broker may no longer
+	// say, and it is the answer to the question issue #86 asked: this broker may no longer
 	// write the record, and nothing established WHO may.
 	//
 	// It is reached wherever the evidence is an absence or a stranger — the record could
@@ -374,7 +374,7 @@ var (
 //
 // It replaced three — one per verdict enum, for the uncertainty resolver, the rejection
 // probe and the CONNECT-time classified save — which had become three statements of one
-// fact once F-084 removed the takeover claim from their default arms. Each took a
+// fact once issue #86 removed the takeover claim from their default arms. Each took a
 // different enum and asked the same question, so each caller now answers it and this
 // answers what the answer means.
 //
@@ -383,7 +383,7 @@ var (
 // unreadable or undecodable record — is UNSETTLED: the record is not ours to write and
 // nothing says whose it is. Neither arm claims a takeover, because no record shape proves
 // a successor; that claim is licensed only by an in-process same-client-ID replacement
-// this broker holds both ends of. See discardTakenOverClient, and F-084.
+// this broker holds both ends of. See discardTakenOverClient, and issue #86.
 func mqttDisposalForLineage(forked bool) mqttDisposalVocabulary {
 	if forked {
 		return mqttDisposalForked
@@ -399,7 +399,7 @@ func mqttDisposalForLineage(forked bool) mqttDisposalVocabulary {
 //
 // It returns the fork BIT alongside the vocabulary because the caller mints on it, and the
 // two must not be re-derived from each other. Recovering the bit from the reason code was
-// what the caller used to do, and F-084 made that unsound: the unsettled vocabulary carries
+// what the caller used to do, and issue #86 made that unsound: the unsettled vocabulary carries
 // 0x89 too, so a reason-code test would mint a grant for a record that proved nothing.
 func disposalForRemotePersist(ps *mqttPersistedSession, ackWID, ackPWID string) (mqttDisposalVocabulary, bool) {
 	forked := classifyRecordLineage(ps, ackWID, ackPWID) == mqttLineageForked
@@ -417,7 +417,7 @@ func disposalForRemotePersist(ps *mqttPersistedSession, ackWID, ackPWID string) 
 // Unreadable, undecodable, absent or at/below the base all CONCEDE — but conceding is now
 // the UNSETTLED vocabulary, not the takeover one. Each of those is an absence, and an
 // absence is not a successor: the subject moved past our base, which says we may not write
-// it and says nothing about who may. F-084.
+// it and says nothing about who may. issue #86.
 //
 // It returns the fork bit for the same reason disposalForRemotePersist does.
 //

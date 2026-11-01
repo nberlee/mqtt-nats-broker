@@ -1,7 +1,7 @@
 // The NEUTRAL scanner: parsing and site discovery, with no census policy in it.
 //
 // Two checks read this package's own source and each asserts something different about it.
-// F-034's persisted-identity census asks which functions interpret a JetStream observation
+// issue #38's persisted-identity census asks which functions interpret a JetStream observation
 // (persisted_identity_ingress_test.go). The message-GET transport tests ask whether every
 // point read still enters through the five mqttJSA load methods
 // (jsa_msgget_transport_test.go). They must not each grow a walker, so the walk lives here

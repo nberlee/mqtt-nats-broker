@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// THE SEAL ENDS ADMISSION UNDER THE GENERATION (F-105 WP-F W2, row S2, the effect form).
+// THE SEAL ENDS ADMISSION UNDER THE GENERATION (issue #107 WP-F W2, row S2, the effect form).
 //
 // The owner's teardown of a serving generation commits the generation's discarding closure FIRST
 // and only then seals its shared acquisition ledger: the admission fence lands before the join
@@ -109,7 +109,7 @@ func TestF105AnAdmissionCannotLandAfterTheSeal(t *testing.T) {
 	}
 }
 
-// ONE TENURE WINS, AND IT IS THE LATER ACCEPTANCE'S (F-105 WP-F W2, row S1).
+// ONE TENURE WINS, AND IT IS THE LATER ACCEPTANCE'S (issue #107 WP-F W2, row S1).
 //
 // Two MQTT frontends serve one JetStream. Broker A accepts a client's CONNECT, landing its accept
 // save, and is delayed just before it installs its tenure on the generation's shared ledger. The

@@ -24,7 +24,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// AN ACKNOWLEDGEMENT'S TERMINAL CLEANUP IS NEVER DROPPED (F-098, holistic review round 1,
+// AN ACKNOWLEDGEMENT'S TERMINAL CLEANUP IS NEVER DROPPED (issue #100, holistic review round 1,
 // finding 5; C13 order 5). Before the fix a failed `publish -> publish_terminal` advance only
 // logged and a failed delete was ignored — after the entry had already been untracked — so a
 // connected, idle session had no continuation at all and the identifier's fate was left to a
@@ -93,7 +93,7 @@ func testNewTerminalEnv(t *testing.T, clientID string) *testTerminalEnv {
 	e.sess.c = e.c
 	e.sess.mu.Unlock()
 	// The replaced connection state carries no accepted entitlement, and an ordinary acquisition
-	// names the connection's own (F-105 row 2): accept it under the serving authority again.
+	// names the connection's own (issue #107 row 2): accept it under the serving authority again.
 	testStampAcceptedConnection(t, e)
 	t.Cleanup(func() {
 		e.sess.mu.Lock()
@@ -344,7 +344,7 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor(t *testing.T) {
 	te.failing.Store(false)
 	te.waitSourceOwnerGone(t) // M-C55-survivor: done must not strand suppression.
 
-	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
+	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (issue #100, plan revision 16
 	// D11, holistic review round 7). The continuation stops retrying — the record is a
 	// SUCCESSOR and is not this obligation's to touch — but a successor's identifier is not
 	// ours to free either, so the exclusion is handed off with the hold. Waiting for the
@@ -368,7 +368,7 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessor(t *testing.T) {
 	}
 }
 
-// A SUCCESSOR AT THE SAME ALLOCATION IS STILL ANOTHER EXCHANGE (F-105 WP-F W2, row C5/M8).
+// A SUCCESSOR AT THE SAME ALLOCATION IS STILL ANOTHER EXCHANGE (issue #107 WP-F W2, row C5/M8).
 // The continuation's identity is the whole transmission - exchange nonce, lineage AND
 // allocation - so a register on this identifier whose Acq happens to equal the answered one but
 // whose nonce and lineage differ is not this acknowledgement's to terminalize: its exchange is
@@ -509,7 +509,7 @@ func TestMQTTTerminalCleanupNeverTerminalizesWithoutEvidence(t *testing.T) {
 }
 
 // A RECOVERED TERMINAL RECORD RESERVES ONLY ITS OWN IDENTIFIER, AND ITS CLEANUP RELEASES IT
-// (F-098, holistic review round 2, finding 3). Recovery meets a `publish_terminal` register whose
+// (issue #100, holistic review round 2, finding 3). Recovery meets a `publish_terminal` register whose
 // delete fails. It used to reserve the identifier OPAQUE, which marks the whole identifier space
 // incomplete — and the continuation that later confirmed the delete had nothing to undo that
 // with, so a finite storage fault withheld every new outbound QoS 1/2 allocation until the next
@@ -580,7 +580,7 @@ func TestMQTTRecoveredTerminalRecordReleasesItsReservation(t *testing.T) {
 	}
 }
 
-// A SUCCESSOR THAT ARRIVES INSIDE THE CAS IS NOT TERMINALIZED (F-098, holistic review round 3,
+// A SUCCESSOR THAT ARRIVES INSIDE THE CAS IS NOT TERMINALIZED (issue #100, holistic review round 3,
 // finding 1). The acknowledgement's continuation checks the transmission identity on its own
 // read, but casInflightSlot refreshes its base on every internal attempt: the caller reads
 // transmission k, a peer acquires k+1, and the CAS's own load returns that successor — whose
@@ -626,7 +626,7 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessorRacingTheCAS(t *testi
 
 	te.acknowledge(t, false)
 
-	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
+	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (issue #100, plan revision 16
 	// D11, holistic review round 7). The continuation stops retrying — the record is a
 	// SUCCESSOR and is not this obligation's to touch — but a successor's identifier is not
 	// ours to free either, so the exclusion is handed off with the hold. Waiting for the
@@ -665,7 +665,7 @@ func TestMQTTAcknowledgementTerminalCleanupLeavesASuccessorRacingTheCAS(t *testi
 	te.waitSourceOwnerGone(t) // M-C55-survivor-CAS: the racing exit owes the same discharge.
 }
 
-// AN ACKNOWLEDGEMENT AFTER AN ADOPTED RETRANSMISSION STILL CLEANS UP (F-098 C-I, holistic
+// AN ACKNOWLEDGEMENT AFTER AN ADOPTED RETRANSMISSION STILL CLEANS UP (issue #100 C-I, holistic
 // review round 5, finding 1). A retransmission acquires the action again — the counter advances
 // on the record — and its CAS response is lost. The section adopts the landed token for
 // cleanup, but if the ENTRY keeps the pre-acquisition counter, the PUBACK for the outstanding
@@ -724,7 +724,7 @@ func TestMQTTAcknowledgementAfterAnAdoptedRetransmissionStillCleansUp(t *testing
 	te.waitDischarged(t, "acknowledgement after an adopted retransmission")
 }
 
-// THE DRAIN RECONCILES WHAT THE ADOPTION COULD NOT (F-098 C-I, holistic review round 5,
+// THE DRAIN RECONCILES WHAT THE ADOPTION COULD NOT (issue #100 C-I, holistic review round 5,
 // finding 1, second half). When the resolving read is unavailable, the adoption keeps its
 // cleanup mark but learns nothing: the section and its entry still name the pre-acquisition
 // counter. The section's own drain is then the first reader of the landed one, and it owes the
@@ -795,7 +795,7 @@ func TestMQTTDrainReconcilesAnUnresolvedAcquisitionsCounter(t *testing.T) {
 	te.waitDischarged(t, "acknowledgement after a drain-reconciled acquisition")
 }
 
-// AN ACKNOWLEDGEMENT PARKED ON AN UNRESOLVED SECTION BINDS LATER, NOT WRONGLY (F-098, holistic
+// AN ACKNOWLEDGEMENT PARKED ON AN UNRESOLVED SECTION BINDS LATER, NOT WRONGLY (issue #100, holistic
 // review round 6, finding 1). A retransmission's acquisition lands and loses its response, and
 // reads stay unavailable through the section's end: the drain cannot resolve, so the entry the
 // settlement untracks may already be one counter behind the record. Binding the acknowledged
@@ -853,7 +853,7 @@ func TestMQTTParkedAcknowledgementBindsWhenTheActionResolves(t *testing.T) {
 	te.waitDischarged(t, "acknowledgement parked on an unresolved section")
 }
 
-// A PRESERVED REWRITE IS NOT A CONFIRMED RELEASE (F-098, holistic review round 6, finding 4).
+// A PRESERVED REWRITE IS NOT A CONFIRMED RELEASE (issue #100, holistic review round 6, finding 4).
 // recoverPublishTerminalSlot used the BOOLEAN reap wrapper, which reports success for a
 // same-identity rewrite — and an exact-sequence delete reads an ALREADY-ABSENT sequence as
 // success too, so a rewrite that outran the delete looked identical to a clean one. Reporting
@@ -934,7 +934,7 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAPreservedRewrite(t *testing.T) {
 	}
 }
 
-// AN UNREADABLE OCCUPANT IS NOT A CLEARED SUBJECT (F-098, holistic review round 7, finding 4).
+// AN UNREADABLE OCCUPANT IS NOT A CLEARED SUBJECT (issue #100, holistic review round 7, finding 4).
 // The loader reports a present-but-unattributable record as a nil record with a non-nil stored
 // message, and the post-delete confirmation read treated that as proof the subject was clear:
 // the identifier hold was released and no continuation was scheduled, over a record a rewrite
@@ -1006,7 +1006,7 @@ func testUnresolvedSection(t *testing.T, te *testTerminalEnv) (mqttSendToken, fu
 	return tok, func() { reading.Store(false) }
 }
 
-// AN ACKNOWLEDGEMENT ARRIVING AFTER THE SECTION CLOSED IS BOUND BY THE SAME CELL (F-098,
+// AN ACKNOWLEDGEMENT ARRIVING AFTER THE SECTION CLOSED IS BOUND BY THE SAME CELL (issue #100,
 // holistic review round 7, finding 1). The token-keyed hand-off covered only acknowledgements
 // parked inside an open section; one arriving afterwards took the immediate path and captured
 // the entry's stale counter.
@@ -1030,7 +1030,7 @@ func TestMQTTAcknowledgementAfterSectionEndBindsThroughTheCell(t *testing.T) {
 	te.waitDischarged(t, "acknowledgement after section end")
 }
 
-// A RESOLUTION THAT COMPLETES FIRST IS NOT LOST (F-098, holistic review round 7, finding 2).
+// A RESOLUTION THAT COMPLETES FIRST IS NOT LOST (issue #100, holistic review round 7, finding 2).
 // The hand-off had a lost wakeup: the resolver could finish between the failed section-end
 // drain and the registration, leaving the registration with nothing to consume it. The cell
 // retains the result instead, so the LATE registrant claims the continuation.
@@ -1068,7 +1068,7 @@ func TestMQTTResolutionBeforeRegistrationStillRunsTheCleanup(t *testing.T) {
 	}
 }
 
-// THE CONTINUATION IS CLAIMED EXACTLY ONCE (F-098, Codex's design ruling). Both publishers
+// THE CONTINUATION IS CLAIMED EXACTLY ONCE (issue #100, Codex's design ruling). Both publishers
 // write to the same cell, and either order completes the pair — but only one of them may run
 // the cleanup, or an acknowledged exchange gets two continuations racing the same delete.
 //
@@ -1115,7 +1115,7 @@ func TestAckResolutionClaimsTheContinuationExactlyOnce(t *testing.T) {
 	}
 }
 
-// A FOREIGN SUCCESSOR IS NEVER TERMINALIZED ON OUR ACKNOWLEDGEMENT (F-098 C-I, holistic review
+// A FOREIGN SUCCESSOR IS NEVER TERMINALIZED ON OUR ACKNOWLEDGEMENT (issue #100 C-I, holistic review
 // round 7, finding 3). The drain can find a DIFFERENT token on the slot — a peer acquired it —
 // and that observation says nothing about which acquisition we owned. Adopting its counter let
 // a predecessor's acknowledgement terminalize the successor; the cleanup must instead discharge
@@ -1179,7 +1179,7 @@ func testForeignSuccessorSurvives(t *testing.T, peerDrained bool) {
 	restoreReads()
 	te.s.finishOwedDrains() // our drain observes a FOREIGN token and publishes nothing
 
-	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (F-098, plan revision 16
+	// THE OBLIGATION IS DISCHARGED; THE IDENTIFIER IS NOT RELEASED (issue #100, plan revision 16
 	// D11, holistic review round 7). This assertion is a CONTRACT CORRECTION, not a loosened
 	// one: the earlier version waited for the identifier to become unreserved and so required
 	// the very state C-IV exists to prevent — a peer is transmitting under that identifier
@@ -1224,7 +1224,7 @@ func testForeignSuccessorSurvives(t *testing.T, peerDrained bool) {
 	te.waitSourceOwnerGone(t) // M-C55-foreign: live and drained foreign actions.
 }
 
-// A DRAIN PUBLISHES THE IDENTITY IT OBSERVED, NOT ONLY THE ONE IT WROTE (F-098, holistic review
+// A DRAIN PUBLISHES THE IDENTITY IT OBSERVED, NOT ONLY THE ONE IT WROTE (issue #100, holistic review
 // round 8). Observing our own token on the slot is itself proof of which acquisition we owned.
 // If the publication waits for the clearing CAS, a CAS that LANDS and loses its response throws
 // that proof away: the next pass sees a cleared token — indistinguishable from a foreign one —
@@ -1264,7 +1264,7 @@ func TestMQTTDrainPublishesTheIdentityItObserved(t *testing.T) {
 	te.waitDischarged(t, "drain whose clearing CAS response was lost")
 }
 
-// A STALE RESOLVER MAY NOT SETTLE A NEWER ATTEMPT (F-098, holistic review round 9, finding 1).
+// A STALE RESOLVER MAY NOT SETTLE A NEWER ATTEMPT (issue #100, holistic review round 9, finding 1).
 // The cell is shared across sections, so an older section's drain can resume long after a NEW
 // section has marked the cell pending for its own acquisition. Clearing `pending` on that older
 // proof lets an acknowledgement bind to an identity the newer acquisition has already moved
@@ -1313,7 +1313,7 @@ func TestAckResolutionIgnoresAStaleResolver(t *testing.T) {
 	}
 }
 
-// A PROVEN ABSENCE RESOLVES THE CELL (F-098, holistic review round 9, finding 2). When the
+// A PROVEN ABSENCE RESOLVES THE CELL (issue #100, holistic review round 9, finding 2). When the
 // register disappears between the acquisition's read and its CAS, the resolving read proves
 // absence — sufficient resolution evidence. The arm used to clear the section's cleanup mark and
 // return, which ALSO stopped the section's drain (it refuses an unheld token), so nothing was
@@ -1330,7 +1330,7 @@ func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 	tok := te.openSection(t, te.pi, te.dur, te.sseq)
 
 	// The register disappears between the acquisition's read and its batch — the authority commit
-	// now, since an ordinary acquisition does not go through the register store (F-105 row 2).
+	// now, since an ordinary acquisition does not go through the register store (issue #107 row 2).
 	var vanished atomic.Bool
 	testSetTransitionCommit(t, te.testInflightEnv, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		if testAcquisitionTokenOf(tr) != tok.token || !vanished.CompareAndSwap(false, true) {

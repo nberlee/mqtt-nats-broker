@@ -17,11 +17,11 @@
 package mqtt
 
 type mqttPending struct {
-	// retainedInc is a RETAINED exchange's payload owner (F-105 7c): the incarnation whose copy
+	// retainedInc is a RETAINED exchange's payload owner (issue #107 7c): the incarnation whose copy
 	// the exchange depends on, carried so its terminal observations wake that copy's
 	// reclamation. Set by mqttPromoteRetainedLanded and nothing else.
 	retainedInc string
-	// retainedReplay is a RESTORED retained PUBLISH's verified material (F-105 7c): read and
+	// retainedReplay is a RESTORED retained PUBLISH's verified material (issue #107 7c): read and
 	// verified by the resume before any acquisition, so the replay never reads payload material.
 	// Set by mqttRecoveredRetainedPending and mqttWithRetainedReplay, and nothing else.
 	retainedReplay *mqttRetainedReplayMaterial
@@ -43,7 +43,7 @@ type mqttPending struct {
 	// replacement election with a delivery it never made, and a bare incarnation
 	// cannot say WHICH copy a claim reference is for — so a reference naming another
 	// claim's valid subject would let that claim's own copy be acknowledged away
-	// unpublished (F-065).
+	// unpublished (issue #69).
 	q2AffCopy string
 	// pubRelAffRef is the affine assignment reference carried by the STORED PUBREL
 	// this entry tracks, read back off the record by mqttDeliverPubRelCb rather than
@@ -60,7 +60,7 @@ type mqttPending struct {
 	// admitted replacement donates the occupant's QoS to an allocation that may never
 	// have been transmitted (storeInflightRegister's same-source arm). This broker has no
 	// durable "was transmitted" fact: its one durable transmission fact is the opposite one,
-	// the allocation's unsent marker, which proves the PUBLISH never went out (F-072, F-088).
+	// the allocation's unsent marker, which proves the PUBLISH never went out (issue #76, issue #90).
 	//
 	// It is NOT recomputed from the subscription. A re-SUBSCRIBE may replace the
 	// filter's maximum QoS at any time ([MQTT-3.8.4-3]) and must not interrupt a
@@ -216,11 +216,11 @@ type mqttPending struct {
 	// is held by the session's sendsInFlight registry, because a successful PUBREC
 	// REPLACES this entry with a PUBREL one while the write may still be blocked, and
 	// per-entry state alone would strand the identifier. What this half is for is
-	// fencing the condemnation and the settle execution to one section (F-087 WP5).
+	// fencing the condemnation and the settle execution to one section (issue #89 WP5).
 	sendNonce string
 	// res is this exchange's acknowledgement-resolution cell, shared with whatever send
 	// section is transmitting it. It is what an acknowledgement registers against, and it
-	// outlives both the section and this entry's own untracking (F-098, round 7).
+	// outlives both the section and this entry's own untracking (issue #100, round 7).
 	res *mqttAckResolution
 	// slot is the CAPTURED durable identity of this delivery's owner slot: its subject and
 	// name, the sequence it was observed at, the exchange nonce, the source and the custody.
@@ -257,20 +257,20 @@ type mqttPending struct {
 // consumePubRelAckLocked was the one that had to change — it switched to the shared
 // predicate, so a PUBCOMP can no longer delete a hold carrying a live retained reservation.
 // beginPubRelSendLocked was ALSO given a retained-term refusal and it was DELETED again;
-// that opener's comment records why, and it must not be reinstated (F-091, D4).
+// that opener's comment records why, and it must not be reinstated (issue #93, D4).
 type mqttSendHold struct {
 	// token names the transmission whose write has not returned, empty when none is
 	// out. It drains at endSend, on the transmitting goroutine, so it SURVIVES every
-	// connection transition including a discard (F-087 WP5, class F2).
+	// connection transition including a discard (issue #89 WP5, class F2).
 	token string
 	// pubCompOwed counts PUBRELs POSSIBLY transmitted under this identifier whose PUBCOMP
 	// has not arrived, plus the one attempt whose section is open. [MQTT-2.3.1-4] frees a
 	// PUBREL's identifier when its acknowledgement is processed, and for a PUBREL that
 	// acknowledgement is the PUBCOMP — not the write's return, which is only the proxy the
-	// PUBLISH side must use because no acknowledgement has been asked for yet (F-089).
+	// PUBLISH side must use because no acknowledgement has been asked for yet (issue #91).
 	//
 	// The open attempt's unit is taken before the write (beginPubRelSendLocked) and given
-	// back at the section's end only when its frame was PROVABLY not emitted (F-116): the
+	// back at the section's end only when its frame was PROVABLY not emitted (issue #118): the
 	// client answers exactly the PUBRELs it received, so a unit for one it never received
 	// could never be answered and would hold the identifier for the connection's life.
 	pubCompOwed int
@@ -279,7 +279,7 @@ type mqttSendHold struct {
 	// write entry succeeds while the token is still that attempt's, cleared with the token.
 	// Read only by pubCompEmittableOwnerLocked: an attempt not entered when a lineage
 	// release converts its entry can never emit, because write entry refuses the converted
-	// entry (F-116).
+	// entry (issue #118).
 	relEntered bool
 	// owner is the CONNECTION IDENTITY those PUBRELs went out on — c.cid, minted by
 	// srv.gcid.Add(1), so it is monotonic, never reused and never zero for an accepted
@@ -309,7 +309,7 @@ type mqttSendHold struct {
 	// serializeRetainedMsgsForSub, is buffered on sub.mqtt.prm, and is written by a
 	// LATER queueOutbound. Across that span its only other reservation is the
 	// pendingPublish entry, which clear() destroys — so this is what carries the
-	// identifier through the discard (F-091).
+	// identifier through the discard (issue #93).
 	//
 	// The INCARNATION rather than a bool, and that is the whole subtlety. Written
 	// completion ends the reservation only while the allocating generation is still
@@ -357,16 +357,16 @@ type mqttSendHold struct {
 	// a successful PUBREC removes pendingPublish[pi] while its PUBLISH send token is still
 	// live here, so the entry-side half of that pair is gone at exactly the moment the
 	// check must refuse. This registry is already the thing designed to outlive its entry
-	// (F-087 class F2, F-089), so the fact belongs here rather than in a map the PUBREC
+	// (issue #89 class F2, issue #91), so the fact belongs here rather than in a map the PUBREC
 	// path is entitled to mutate.
 	pubIdent string
 	// pubOut is the OUTPUT of the PUBLISH section pubIdent names, set and cleared with it. It is
 	// how the client's acknowledgement reaches a transmission that has not begun writing: the
 	// acknowledgement is processed on the read loop while the section is still spending its
-	// round trips, and a PUBLISH the client has acknowledged must not then be written (F-115).
+	// round trips, and a PUBLISH the client has acknowledged must not then be written (issue #117).
 	pubOut *mqttPublishOutput
 	// terminalOwed names the ACKNOWLEDGED PUBLISH exchange (its nonce) whose durable
-	// terminal cleanup has not been confirmed (F-098, holistic review round 1, finding 5).
+	// terminal cleanup has not been confirmed (issue #100, holistic review round 1, finding 5).
 	//
 	// The client's PUBACK — or a failed PUBREC — ends the exchange for the CLIENT, so its
 	// Receive Maximum capacity is legitimately free and is freed at once. The IDENTIFIER is
@@ -376,7 +376,7 @@ type mqttSendHold struct {
 	// releases it when the delete is confirmed.
 	terminalOwed string
 	// slotOwed is the IDENTIFIER EXCLUSION a removal site hands off when it cannot
-	// confirm the durable slot released (F-098). It is the sixth liveness term.
+	// confirm the durable slot released (issue #100). It is the sixth liveness term.
 	//
 	// It exists because preserving identifier EXCLUSION is a different operation from
 	// preserving the original actionable, capacity-charging ENTRY. Every removal site
@@ -421,7 +421,7 @@ type mqttSlotExclusion struct {
 	// lifts it, a new hold starts at 1, and the second reader lifts the NEW exclusion.
 	inst uint64
 	// fenceCursor is the subject of the last PENDING-FENCE step the exclusion-reclaim pass
-	// attempted on THIS exclusion (F-088 WP3 rule 6 (b)). Scheduling state only: never absence
+	// attempted on THIS exclusion (issue #90 WP3 rule 6 (b)). Scheduling state only: never absence
 	// evidence and never read by the lift. It lives as long as this object — install and
 	// reassertion mutate the object in place, so it survives bind additions and instance
 	// advances — and goes with it when the exclusion is lifted or adopted.
@@ -480,7 +480,7 @@ type mqttSendAction struct {
 	// [MQTT-4.3.3]. A write already entered is the stated retransmission.
 	pubCompAnswered bool
 
-	// THE ACQUISITION'S F-105 IDENTITY (row 2), in two tiers. exec (the acquisition's execution
+	// THE ACQUISITION'S issue #107 IDENTITY (row 2), in two tiers. exec (the acquisition's execution
 	// cell, bound to the ORIGINAL connection) and lin (the obligation lineage, from the fresh read) are fixed when the holder
 	// is created, before any store I/O, so a drain that later proves the token ours — with or
 	// without a client, as the shutdown pass is — can still record its abandonment on the
@@ -542,11 +542,11 @@ type mqttRetainedFrame struct {
 	// disposition is what releases the entry, and by then a packet identifier is not
 	// enough to name the exchange: clear() removes the entry and re-mints last_pi, so a
 	// disposition arriving afterwards would otherwise untrack whatever exchange now holds
-	// the identifier. That is the race F-091's reservation exists for, and the nonce is
-	// what makes the release identity-keyed rather than identifier-keyed (F-101).
+	// the identifier. That is the race issue #93's reservation exists for, and the nonce is
+	// what makes the release identity-keyed rather than identifier-keyed (issue #103).
 	nonce string
 	// qos is the effective QoS; for QoS 1/2, mat is the immutable SNAPSHOT the driver
-	// materializes and transmits (F-105 7c), and ent the entitlement the SUBSCRIBE was
+	// materializes and transmits (issue #107 7c), and ent the entitlement the SUBSCRIBE was
 	// accepted under, compared with — never adopted from — the standing authority.
 	qos byte
 	mat *mqttRetainedMaterial
@@ -582,7 +582,7 @@ const (
 )
 
 // mqttSendSettleOwesExclusion says whether a deferred settlement must hand the
-// IDENTIFIER's exclusion to the hold before its entry is untracked (F-098, C-IV).
+// IDENTIFIER's exclusion to the hold before its entry is untracked (issue #100, C-IV).
 //
 // The split is between settlements whose durable half is CONFIRMED by the time the entry
 // goes and settlements whose durable half may outlive it. The two acknowledgement kinds
@@ -623,7 +623,7 @@ type mqttSendSettle struct {
 //   - regForeign: a recovery reservation whose record this object may not interpret,
 //     which nothing here may transmit or settle;
 //   - an active send section: the payload is already on its way out on a write that has
-//     not returned (F-087 WP5, class E).
+//     not returned (issue #89 WP5, class E).
 func mqttPendingRedeliverable(ack *mqttPending) bool {
 	return ack.acts() && !ack.regPending && !ack.regForeign && !ack.markerOpaque && ack.sendNonce == _EMPTY_
 }

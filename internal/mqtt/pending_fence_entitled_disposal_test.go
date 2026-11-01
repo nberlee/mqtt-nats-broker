@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// F-119: a pending cancellation fence is disposed of only behind a confirmed, entitlement-fenced
+// issue #121: a pending cancellation fence is disposed of only behind a confirmed, entitlement-fenced
 // authority advance, and only once no ladder of its nonce can still prepare an attempt. These
 // witnesses drive the production admission, cancellation and disposal routes; see
 // pending_fence_disposal.go for the rule.

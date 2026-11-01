@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-// F-105 7f: a serving generation settles its displaced tenures.
+// issue #107 7f: a serving generation settles its displaced tenures.
 
 // testResumeUnderNewTenure is a successor tenure's accept on the rig: the authority moves to a
 // fresh tenure of the SAME generation, and the rig's connection now holds it, as the accepted

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// F-091: a retained QoS 1/2 send reserves its packet identifier.
+// issue #93: a retained QoS 1/2 send reserves its packet identifier.
 //
 // A retained send is the one identifier-bearing transmission with no JetStream backing
 // and therefore no in-flight register (R6): it allocates in serializeRetainedMsgsForSub,
@@ -71,7 +71,7 @@ func (e *testRetainedEnv) buffer(t *testing.T, topic string, qos byte) (*subscri
 		t.Fatalf("a QoS %d retained frame must carry an allocated identifier", qos)
 	}
 	// Without this the nonce gate in releaseRetainedSendAbandonedLocked could never match
-	// and every release assertion below it would pass for the wrong reason (F-101).
+	// and every release assertion below it would pass for the wrong reason (issue #103).
 	e.sess.mu.Lock()
 	entryNonce := _EMPTY_
 	if ack := e.sess.pendingPublish[frames[0].pi]; ack != nil {
@@ -210,7 +210,7 @@ func TestMQTTRetainedSendHoldsItsIdentifierAcrossADiscard(t *testing.T) {
 	}
 }
 
-// The SUBACK-tail flusher WRITES NOTHING (F-105 7c, replacing TestMQTTRetainedFlushSeamPrecedesEveryWrite):
+// The SUBACK-tail flusher WRITES NOTHING (issue #107 7c, replacing TestMQTTRetainedFlushSeamPrecedesEveryWrite):
 // retained replay is the session driver's, so the flusher only consults its seam and transfers the
 // staged items. Asserted over the syntax tree: a raw write reappearing here would put retained bytes
 // on the socket outside both output boundaries.
@@ -399,12 +399,12 @@ func TestMQTTRetainedReleaseRespectsTheOwner(t *testing.T) {
 		name    string
 		release func(e *testRetainedEnv, a *client, pi uint16)
 	}{
-		// The WRITTEN verb is gone (F-105 7c): a written retained frame's reservation is handed to
+		// The WRITTEN verb is gone (issue #107 7c): a written retained frame's reservation is handed to
 		// the send section and then held by its exchange, so only the abandoned verb remains.
 		{"abandoned", func(e *testRetainedEnv, a *client, pi uint16) {
 			// The nonce is deliberately EMPTY here: this case is about the OWNER guard, and
 			// an empty nonce cannot match any entry, so the entry-release half is inert and
-			// the assertions below are about the hold alone (F-101).
+			// the assertions below are about the hold alone (issue #103).
 			e.sess.abandonRetainedSends(a, []mqttRetainedRef{{pi: pi}})
 		}},
 	} {
@@ -480,7 +480,7 @@ func TestMQTTRetainedSendTakesOverAnInertHoldExactly(t *testing.T) {
 //
 // The other half of round 1's finding — a retained-term REFUSAL in beginPubRelSendLocked —
 // was implemented, then REFUTED across holistic rounds 8, 9 and 10 and DELETED (lane
-// DECISIONS.md, D4). F-092 later put durable admission in the delivery callback rather than
+// DECISIONS.md, D4). issue #94 later put durable admission in the delivery callback rather than
 // this primitive, so a PUBREL token/action and PUBCOMP debt may still legitimately sit
 // beside a retained term on one hold; what this test asserts is that discharging one does
 // not discharge the other.
@@ -550,17 +550,17 @@ func TestMQTTAbandonedRetainedFrameReleasesItsHold(t *testing.T) {
 
 	// Nothing is asserted about PUBREL admission here, and that is deliberate: the
 	// retained-term refusal this test used to exercise was REFUTED and deleted (D4), so a
-	// PUBREL under this identifier is admitted exactly as it was before F-091. What
+	// PUBREL under this identifier is admitted exactly as it was before issue #93. What
 	// abandonment is FOR is that the identifier stops being reserved against reallocation
 	// once nothing will ever write the frame.
 	//
-	// INVERTED BY F-101, deliberately, and this is the assertion that changed. It used to
+	// INVERTED BY issue #103, deliberately, and this is the assertion that changed. It used to
 	// require the pendingPublish entry to SURVIVE the abandonment, so that the assertion
 	// above was about the hold alone and the identifier was only freed by a hand-written
 	// dropEntry. The entry is now released here too, because abandonment is the one fact
 	// that PROVES a retained frame was never written and this is the site that holds it —
 	// the resume-time drop that used to do it inferred "never sent" from having no way to
-	// redeliver, which is a fact about the broker (F-101). So the identifier is allocatable
+	// redeliver, which is a fact about the broker (issue #103). So the identifier is allocatable
 	// with no hand-drop at all, and the capacity charge goes with it, which the old
 	// assertion never measured.
 	if _, live := func() (*mqttPending, bool) {
@@ -826,12 +826,12 @@ func TestMQTTRetainedFramesSurviveNoMQTTClient(t *testing.T) {
 // production path that loses or abandons owed retained frames. It may NOT require this guard
 // to grow merely by exhibiting source code outside the frozen predicate that could evade it.
 // Such an evasion is a settled limitation of this regression tripwire, not a reopening of
-// F-091's mechanism.
+// issue #93's mechanism.
 func TestMQTTDirectClientSubsMutationsDetachRetainedFramesUnderLock(t *testing.T) {
 	t.Parallel()
 	// Either detach: a departure (detachRetainedFramesLocked, which also marks the replay object
 	// departed) or a same-sid replacement (detachDisplacedRetainedLocked, which hands the replay
-	// object on). Both take the staged frames under the same c.mu (F-105 7c).
+	// object on). Both take the staged frames under the same c.mu (issue #107 7c).
 	detaches := map[string]bool{"detachRetainedFramesLocked": true, "detachDisplacedRetainedLocked": true}
 	want := map[string]string{
 		"client.processUnsub":    "the delete, followed by abandonment",

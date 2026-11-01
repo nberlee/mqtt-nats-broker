@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// The whole claim of F-105, exercised end to end against a real store.
+// The whole claim of issue #107, exercised end to end against a real store.
 //
 // Every other test here proves one rule. This one proves they COMPOSE, which is the only
 // thing that matters to a client: an obligation admitted before a retirement survives the
@@ -77,7 +77,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	}
 
 	_ = acqSeq
-	// (3b) THE ROUTES THAT END BOTH CONSUMERS DECIDE, while the generation still serves (F-105
+	// (3b) THE ROUTES THAT END BOTH CONSUMERS DECIDE, while the generation still serves (issue #107
 	// 7c-lc): a consumer is retired only on such a decision, and the decision is taken under the
 	// serving entitlement. Retirement then continues under whatever authority stands — here the
 	// CLOSED one.
@@ -242,7 +242,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	}
 	drained = testWithSlotMember(t, &e.asm.jsa, drained, testF105Gen, cur.Nonce, mqttExchangeTerminal)
 	// The drain completion is the ending; it leaves both holds release-owed, and a release-holds
-	// batch over the stored ending releases them under the CLOSED authority (F-105 7c-lc).
+	// batch over the stored ending releases them under the CLOSED authority (issue #107 7c-lc).
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, drained)); cerr != nil {
 		t.Fatalf("recording the completed drain was refused: %v", cerr)
 	}
@@ -258,7 +258,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 			t.Fatalf("resource %q is still needed by %v after its only obligation ended", inc, cleared.Deps)
 		}
 		// Through the paired production operation: the authorization retires the name in the
-		// same batch (F-105 7c-lc).
+		// same batch (issue #107 7c-lc).
 		if _, cerr := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-disp-"+inc, "op-disp-"+inc,
 			testF105Gen, inc); cerr != nil {
 			t.Fatalf("authorizing %q's deletion after completion was refused: %v", inc, cerr)
@@ -357,7 +357,7 @@ func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqt
 // Capacity counts custody from this enumeration. A census that stops where it cannot read
 // UNDER-counts, and an under-count admits a delivery past Receive Maximum while the client still
 // holds the exchange this broker never saw — the fail-open direction of reading part of the
-// answer as the whole of it. Since F-112 the census is the generation's inventory [Lo, Hi], so the
+// answer as the whole of it. Since issue #114 the census is the generation's inventory [Lo, Hi], so the
 // unreadable part is the inventory's root, the ledger.
 func TestF105ATruncatedCensusIsNotACensus(t *testing.T) {
 	e, done := testF105NewEnv(t, "f105-census-truncated")

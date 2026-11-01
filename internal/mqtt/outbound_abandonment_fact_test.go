@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// F-105 row 5, unit C1: the durable abandonment fact on the exchange (plan-unitC rev 3 §3).
+// issue #107 row 5, unit C1: the durable abandonment fact on the exchange (plan-unitC rev 3 §3).
 
 const testFactDur, testFactSeq = "SRC", uint64(41)
 
@@ -91,7 +91,7 @@ func TestUnitCAbandonmentFactShape(t *testing.T) {
 		{"unknown reason", func(f *mqttExchangeAbandonment) { f.Reason = "whim" }, "does not abandon for"},
 		{"malformed tenure", func(f *mqttExchangeAbandonment) { f.Tenure = "" }, "malformed tenure"},
 		{"malformed allocation", func(f *mqttExchangeAbandonment) { f.Alloc = "" }, "malformed allocation"},
-		// The ordinary arm's source members are omitted when zero since F-105 7c (the retained arm
+		// The ordinary arm's source members are omitted when zero since issue #107 7c (the retained arm
 		// carries none), so a zero source is an ABSENT member: the closed schema refuses it before
 		// the semantic check, naming the member.
 		{"no source", func(f *mqttExchangeAbandonment) { f.Seq = 0 }, "member seq is mandatory and absent"},

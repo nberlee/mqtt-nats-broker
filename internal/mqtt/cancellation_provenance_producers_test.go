@@ -23,11 +23,11 @@ import (
 	"testing"
 )
 
-// F-088 / F-097, consult C4: a cancellation's provenance is WRITTEN, never inferred, and the
+// issue #90 / issue #99, consult C4: a cancellation's provenance is WRITTEN, never inferred, and the
 // pending cancellation fence is the one record disposed of by provenance alone. This file holds
 // the structural census of every site that constructs or persists a cancellation (T32).
 
-// testUntrackNoBinding is the removal reason fixtures written before F-088 WP2 use when they remove
+// testUntrackNoBinding is the removal reason fixtures written before issue #90 WP2 use when they remove
 // a PUBLISH entry directly: it installs nothing, which is exactly the removal those fixtures were
 // written against (an untrack had no binding consequence then). A fixture that tests the AckRoute
 // itself names mqttUntrackUnanswered explicitly.

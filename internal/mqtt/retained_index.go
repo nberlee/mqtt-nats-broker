@@ -13,7 +13,7 @@ import (
 // serves retained replay from. It is fed by three writers that observe the same durable
 // authority — $MQTT_rmsgs, one record per topic — at different times: the retained
 // observer (this broker's ephemeral AckNone push consumer), the publishing broker's own
-// synchronous local seed, and the authoritative loads a SUBSCRIBE issues. F-059.
+// synchronous local seed, and the authoritative loads a SUBSCRIBE issues. issue #63.
 //
 // Two mechanisms, and neither subsumes the other.
 //

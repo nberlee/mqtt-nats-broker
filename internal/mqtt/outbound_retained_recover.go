@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// Restoring a retained exchange on resume (F-105 7c).
+// Restoring a retained exchange on resume (issue #107 7c).
 //
 // A retained register is dispatched by the resume's walk BEFORE every ordinary-source route: the
 // source cache, the source grouping, the drain grouping and the source mappings never see it. The

@@ -15,7 +15,7 @@ package mqtt
 
 import "fmt"
 
-// What a CONNECT must do about outbound ownership (F-105).
+// What a CONNECT must do about outbound ownership (issue #107).
 //
 // This is the decision CONNECT makes before it composes anything: given what the authority
 // record currently says, which transition does this acceptance run first? Kept as a pure
@@ -106,7 +106,7 @@ type mqttConnectOwnershipInput struct {
 	// IntentID names THIS acceptance's own current proposal, once its reservation or
 	// preparation has landed, and nothing else. It is set from the acceptance's own record of
 	// what it proposed — never from what the authority happens to carry — so a proposal some
-	// other acceptance left standing is never mistaken for this one's (F-105 8a). Empty before
+	// other acceptance left standing is never mistaken for this one's (issue #107 8a). Empty before
 	// the acceptance has proposed.
 	IntentID string
 	// Metadata is the verdict of the own proposal's metadata half, read from its permanent
@@ -284,7 +284,7 @@ func mqttDecideForeignRecovery(in mqttConnectOwnershipInput, p mqttOwnershipProp
 	}
 	// THE TARGET IS BOUND AND ITS SLOT HAS A VERDICT: continue from the verdict. Without this
 	// the decision would keep offering the settlement itself — whose abort a decided slot
-	// necessarily refuses — and never reach the act the verdict licenses (F-105 8a).
+	// necessarily refuses — and never reach the act the verdict licenses (issue #107 8a).
 	if in.Recovering != nil && in.StandingVerdict != mqttMetadataUnresolved {
 		action, why := mqttForeignRecoveryContinuation(in.Recovering, in.StandingVerdict)
 		d := mqttConnectOwnershipDecision{Action: action, Reason: why}

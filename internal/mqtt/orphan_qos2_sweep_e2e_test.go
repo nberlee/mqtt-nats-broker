@@ -60,7 +60,7 @@ func testOrphanDropSession(t *testing.T, asm *mqttAccountSessionManager, idHash 
 	// teardown uses: recordGenRetirement writes the watermark first, and a write it
 	// cannot confirm aborts the teardown with nothing deleted.
 	//
-	// Since F-036 unit 2 this is not optional dressing — it is the LICENCE every
+	// Since issue #40 unit 2 this is not optional dressing — it is the LICENCE every
 	// destructive sweep arm now requires. Deleting the record alone establishes only
 	// that nothing this broker can see names the generation, which a session live on
 	// ANOTHER broker with no record satisfies equally, so an unlicensed pass RETAINS.
@@ -454,7 +454,7 @@ func TestOrphanSweepTwoSweepersConverge(t *testing.T) {
 	if _, err := asmA.storeQoS2HoldCAS(holdSubject, 0, hdrLen, msg); err != nil {
 		t.Fatalf("storing the orphan hold: %v", err)
 	}
-	// The RECLAMATION LICENCE for that generation (F-036 unit 2). This fixture writes
+	// The RECLAMATION LICENCE for that generation (issue #40 unit 2). This fixture writes
 	// its durable state directly and never had a record to delete, so nothing else
 	// supplies the retirement fact — and without it BOTH sweepers correctly retain, which
 	// would make this a test about the leak rather than about convergence.

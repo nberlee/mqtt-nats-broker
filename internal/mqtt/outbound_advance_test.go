@@ -310,7 +310,7 @@ func TestF105ClosedGenerationsObligationStillEnds(t *testing.T) {
 			testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, cur.Nonce)
 		}
 		adv = testWithSlotMember(t, &e.asm.jsa, adv, cur.Gen, cur.Nonce, to)
-		// The acknowledgement ending leaves G1's source hold release-owed (F-105 7c-lc).
+		// The acknowledgement ending leaves G1's source hold release-owed (issue #107 7c-lc).
 		adv = testF105WithHoldReleases(t, e, adv, cur, to)
 		if _, ccerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); ccerr != nil {
 			t.Fatalf("a closed generation's obligation could not advance to %d: %v", to, ccerr)

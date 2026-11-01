@@ -147,7 +147,7 @@ func (e *testForkRepairEnv) reconnect(t *testing.T) *mqttSession {
 }
 
 // testClaimCapsuleDurables gives every consumer our branch names what production gives it: a LIVE
-// name-ownership and a LIVE, undecided source resource of the generation (F-105 7f). Every source
+// name-ownership and a LIVE, undecided source resource of the generation (issue #107 7f). Every source
 // consumer is claimed before it is created, and fork repair reinstates only a consumer that still
 // serves; these fixtures predate the claim and name bare durables. A name that already stands is
 // left as it is, so a test that decided a consumer keeps its decision.
@@ -1664,7 +1664,7 @@ func TestForkRepairCarriesNoWill(t *testing.T) {
 //
 // A per-filter shared restore can fail while the membership stays durable, so a re-asserted
 // SharedSubs membership would be durable while that failure leaves no group join and no
-// consumer — the accepted-but-dead state F-050 already records. Repairing into that ordering
+// consumer — the accepted-but-dead state issue #54 already records. Repairing into that ordering
 // would extend an open finding rather than respect it.
 func TestForkRepairSharedMembershipIsNeverCarried(t *testing.T) {
 	t.Parallel()
@@ -2113,7 +2113,7 @@ func TestForkRepairRefusesAFilterWithAQuarantinedSid(t *testing.T) {
 	// Built by hand rather than through the fork fixture, because the state under test is
 	// one the fixture's own reconnect cannot leave behind: our record has to describe the
 	// filter as LIVE (the adopt row) while the session still HOLDS both drains in memory.
-	// A PUBLISH-phase claim, deliberately: F-094's widened hold makes every past-PUBREC
+	// A PUBLISH-phase claim, deliberately: issue #96's widened hold makes every past-PUBREC
 	// intent hold its sid, so the valid claimed intent this fixture used to carry would now
 	// be held for its OWN reason and the companion would prove nothing. The subject is
 	// wildcard atomicity, so the main drain must be genuinely unheld.

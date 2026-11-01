@@ -1,6 +1,6 @@
 // Unit-level proofs for the restore gate (sess_restore_gate.go).
 //
-// These are the parts of F-050's mechanism that are decidable without a broker:
+// These are the parts of issue #54's mechanism that are decidable without a broker:
 // the verdict's three transitions and what each one says to a waiter, the failure
 // aggregation, and the invocation-scoped charge refund. The end-to-end properties
 // — nothing precedes the CONNACK, the refusal preserves the session, the Will is

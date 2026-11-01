@@ -17,7 +17,7 @@ package mqtt
 
 import "testing"
 
-// Fixtures for the row-2 PUBLISH output tests (F-105 row 2): an ORDINARY send section opened the
+// Fixtures for the row-2 PUBLISH output tests (issue #107 row 2): an ORDINARY send section opened the
 // way the delivery callback opens it, on a connection whose transport records every byte.
 
 // testRow2PubSection is one ordinary send section on the real store.

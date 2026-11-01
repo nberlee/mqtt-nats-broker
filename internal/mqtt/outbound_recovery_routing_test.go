@@ -370,7 +370,7 @@ func TestUnitCRecoveryCensusDoesNotOwnOrdinaryWalk(t *testing.T) {
 				t.Fatal("ordinary fixture lacks its register/marker pair")
 			}
 			if mode == "missing-slot" {
-				// The census is the generation's inventory (F-105 7b), read as the resume reads
+				// The census is the generation's inventory (issue #107 7b), read as the resume reads
 				// it: the no-fact exchange AND the ordinary pair's, never a hand-built subset.
 				var cerr error
 				if census, cerr = e.sess.traverseGenerationInventory(e.sess.gen); cerr != nil || census == nil {

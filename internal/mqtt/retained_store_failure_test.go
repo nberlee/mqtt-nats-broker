@@ -16,13 +16,13 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// F-060: a publication whose retained update the store did not confirm is never given
+// issue #64: a publication whose retained update the store did not confirm is never given
 // final success. QoS 0 closes the connection, QoS 1 withholds PUBACK, QoS 2 withholds
 // PUBCOMP, and a delayed Will stays `publishing` for its lease to re-fire. The
 // $MQTT_msgs store is still attempted for QoS 1/2, and its success never erases the
 // retained error.
 //
-// None of these tests is parallel: the store hooks and the F-060 seams are process
+// None of these tests is parallel: the store hooks and the issue #64 seams are process
 // globals. Each hook filters on THIS test's subject before doing anything, so tests
 // running beside them (other files' parallel tests) are untouched.
 

@@ -3,7 +3,7 @@
 // no longer defined.
 //
 // The pairing across this file is deliberate and is the discrimination the whole change
-// rests on. CONCEDING is the DEFAULT verdict — ownership-unsettled since F-084, the
+// rests on. CONCEDING is the DEFAULT verdict — ownership-unsettled since issue #86, the
 // takeover vocabulary before it — so a test that only asserts a create concedes would pass
 // equally against a classifier that had been deleted or bypassed
 // (feedback_mutation_checks_must_discriminate). Every parentlessness assertion here is
@@ -94,7 +94,7 @@ func TestMQTTParentlessCreateConcedesFromBothOrientations(t *testing.T) {
 // inherit.
 //
 // Unsettled, not taken-over: a sibling establishes no successor, so nothing here licenses
-// a takeover claim (F-084). The behavioural half is
+// a takeover claim (issue #86). The behavioural half is
 // TestMQTTParentlessCreateSettlesToUnsettledBothOrientations, whose name says the same.
 //
 // available is the non-empty identity that WAS reachable at the create — the marker's
@@ -223,7 +223,7 @@ func testAssertSettlesToUnsettled(t *testing.T, e *testRejectionEnv) {
 	// The conceding verdict maps to OWNERSHIP UNSETTLED, not to a takeover. "No shared
 	// parent" is the absence of sibling evidence, and an absence is not a successor: the
 	// probe established that this record is not ours and nothing whatever about who holds
-	// it. Asserting 0x8E here was asserting F-084's defect.
+	// it. Asserting 0x8E here was asserting issue #86's defect.
 	if v := mqttDisposalForLineage(got == mqttRejectionForked); v != mqttDisposalOwnershipUnsettled {
 		t.Fatalf("the conceding verdict must map to 0x89 'ownership unsettled': got %#v", v)
 	}
@@ -246,7 +246,7 @@ func testAssertSettlesToUnsettled(t *testing.T, e *testRejectionEnv) {
 // classifyRecordLineage directly, so it would keep passing even if no live route could
 // produce the pair — it is NOT evidence that the machinery is still needed, and its
 // commentary used to claim exactly that, on the since-closed grounds that the accepted
-// CONNECT's batch writer lay outside F-030's inventory.
+// CONNECT's batch writer lay outside issue #34's inventory.
 //
 // The retention evidence is TestMQTTForkedRecordE2EAnswers0x89AndPublishesTheWill, which
 // lands a valid-shaped record with an UNCONDITIONAL store and drives the live connection
@@ -289,7 +289,7 @@ func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 	// And a CHILD-SHAPED body still concedes, so the arm above is not simply reporting
 	// "foreign".
 	//
-	// It is not called a "legitimate successor" any more, and that is F-084's correction
+	// It is not called a "legitimate successor" any more, and that is issue #86's correction
 	// rather than a wording change: createOrRestoreSession adopts WID/PWID WITHOUT
 	// validating provenance, and valid-shaped bodies arrive through unconditional
 	// publication, so this shape is a claim of descent and not proof of one. Conceding

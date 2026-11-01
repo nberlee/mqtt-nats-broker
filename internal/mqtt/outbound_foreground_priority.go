@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 )
 
-// FOREGROUND PRIORITY over this broker's background authority writers (F-105 7c, consult 105).
+// FOREGROUND PRIORITY over this broker's background authority writers (issue #107 7c, consult 105).
 //
 // Every outbound authority transition of a client but the authority-free completions
 // (mqttAttemptAuthorityFree) CASes the one authority record, so this broker's own writers
@@ -76,9 +76,9 @@ import (
 // the allowance the base had over the five session workers. bounded_reattempt_census_test.go
 // classifies every loop on either budget.
 //
-// Foreground since F-112: the ordinary and shared delivery admission ladder
+// Foreground since issue #114: the ordinary and shared delivery admission ladder
 // (admitThroughAuthority), against the floor unit's background writes as well as the retained
-// ones (F-114). The attempts the ladder spends classifying and cleaning up an occupied identifier
+// ones (issue #116). The attempts the ladder spends classifying and cleaning up an occupied identifier
 // are not covered (docs/CONFORMANCE.md). Foreground too: a delivery's send-section acquisition
 // (acquirePublishAction), unless the section is the retained driver's own; and, with the same
 // budget and the contention wait after an attempt whose batch reached its commit (a handle): the

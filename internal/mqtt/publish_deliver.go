@@ -94,7 +94,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// reason. PLAIN QoS 0 is deliberately ungated: it acknowledges nothing on the group's
 	// behalf, so gating it would lose messages while protecting nobody. This check sits
 	// AFTER the metadata read because `shared` is not knowable before it. See
-	// sub_operation_gate.go (F-078).
+	// sub_operation_gate.go (issue #80).
 	if shared && sess.subGateBlocksQoS0(cc) {
 		mqttTestRestoreGateBlockedHook("qos0")
 		return
@@ -185,7 +185,7 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 		}
 	}
 
-	// RETAINED REPLAY PRECEDES LIVE TRAFFIC on this subscription (F-105 7c): wait for its replay
+	// RETAINED REPLAY PRECEDES LIVE TRAFFIC on this subscription (issue #107 7c): wait for its replay
 	// gate, locks released, until the driver has exhausted the replay or the connection closes.
 	if !cc.awaitRetainedReplayGate(sub) {
 		return
@@ -298,7 +298,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		// well past the incarnation drain ceiling, so waiting it out would make a
 		// clean-start takeover refuse for a reason unrelated to the contender. The
 		// re-checks below then take the ordinary withheld path — recorded, not acked —
-		// because sub.mqtt.closed or the ownership term will have moved (F-036 unit 1).
+		// because sub.mqtt.closed or the ownership term will have moved (issue #40 unit 1).
 		// The callback's own closing cycle, captured at its entry: a close and reopen during the
 		// flush must not leave this wait on the new cycle.
 		if h := mqttTestPhaseGateWaitHook.Get(); h != nil {
@@ -519,7 +519,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 
 	// A broad wildcard subscription can overlap a subscribe deny clause, and QoS
 	// 1/2 delivery rides the SERVICE connection, so NATS does not filter it --
-	// this guard is the only thing that does. F-081.
+	// this guard is the only thing that does. issue #83.
 	//
 	// The two non-allow verdicts are disposed of DIFFERENTLY, and that asymmetry is
 	// the point. A proven deny is a fact about the message: it will never become
@@ -600,7 +600,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// delivered to it. Ack it so the JS consumer does not redeliver it.
 	//
 	// WHETHER it was excluded was decided when the server took OWNERSHIP of the message, and
-	// is read from the stamp the message carries — never from sub.mqtt.noLocal (F-117).
+	// is read from the stamp the message carries — never from sub.mqtt.noLocal (issue #119).
 	// [MQTT-4.5.0-1] puts an owned message into the Session State of the subscriptions that
 	// match at that moment, and [MQTT-3.8.4-3] makes a re-SUBSCRIBE a NEW subscription for
 	// messages owned after it. Reading the live option instead re-judged an owned message
@@ -937,7 +937,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// pay a round trip for one. Still strictly BEFORE the enqueue below, which is the
 	// send.
 	if isNew {
-		// EVERY SUPPORTED DELIVERY IS ADMITTED THROUGH THE OUTBOUND OBLIGATION AUTHORITY (F-105).
+		// EVERY SUPPORTED DELIVERY IS ADMITTED THROUGH THE OUTBOUND OBLIGATION AUTHORITY (issue #107).
 		// An ordinary QoS 1/2 delivery carries the exchange and the source/PUBREL resource edges
 		// beside the register (admitInflightPublish); a shared-group delivery — QoS 1 only, a QoS 2
 		// one was diverted to the affine move above — carries the exact acquisition its source
@@ -979,7 +979,7 @@ func (sess *mqttSession) sendAdmittedPublish(pc, cc *client, sub *subscription, 
 	if life.over() {
 		return
 	}
-	// THE DURABLE HALF OF THE EXCLUSION, and it comes first. Before F-098 this section's
+	// THE DURABLE HALF OF THE EXCLUSION, and it comes first. Before issue #100 this section's
 	// only hold was process memory, which fences no peer: two brokers may legitimately
 	// serve one incarnation. Taking it here rather than after admission fences the SIZE
 	// REFUSAL too, which is why that path's disposal now waits for the drain.
@@ -1024,7 +1024,7 @@ func (sess *mqttSession) openPublishSection(pc, cc *client, sub *subscription, p
 	// between here and its return a teardown, a denial, a recovery pass or a terminal
 	// acknowledgement can free this identifier and bumpPI can re-mint it — two PUBLISHes
 	// under one identifier, in order, on one socket. Reserved, those paths condemn the
-	// entry instead of removing it and the continuation runs at endSend (F-087 WP5).
+	// entry instead of removing it and the continuation runs at endSend (issue #89 WP5).
 	//
 	// The deferred call is armed IMMEDIATELY, before the enqueue: the registry's "only
 	// endSend removes" invariant must not depend on no early return and no recovered
@@ -1148,7 +1148,7 @@ func (sess *mqttSession) transmitAcquired(sec *mqttPublishSection) {
 		sec.tok.actionHeld = false
 		// Through the same removal as the expiry drop above: the identifier's exclusion is
 		// handed off before the untrack, because this delete can be refused or fail just as
-		// that one can (F-098, holistic review round 3, swept round 4).
+		// that one can (issue #100, holistic review round 3, swept round 4).
 		removed := sess.dropProvenUnsentPublishEntry(pi, sec.lic)
 		if !sess.finalizeDrainSource(cc, removed) {
 			_, _ = sess.submitSourceAck(sec.reply, false, nil)
@@ -1319,7 +1319,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		}
 	}
 
-	// THE DURABLE ADMISSION, and this is F-092's actual fix.
+	// THE DURABLE ADMISSION, and this is issue #94's actual fix.
 	//
 	// Nothing below may run — not the opener, not a map mutation, not a duplicate
 	// acknowledgement, and above all not the transmission — until this broker holds a
@@ -1368,7 +1368,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	//
 	// Placed before the send section deliberately. Run after it — as an earlier revision
 	// had it — a refusal would already have opened a send token, filled the entry's
-	// acknowledgement subject and performed F-093's handoff, leaving an entry that claims
+	// acknowledgement subject and performed issue #95's handoff, leaving an entry that claims
 	// a delivery this broker never transmitted. Here none of that has happened: the drain
 	// armed just above returns the action to `pubrel_ready`, no send token exists so no
 	// endSend is owed, and AckWait re-offers the record to whoever is current.
@@ -1376,7 +1376,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// It NARROWS the acquisition-to-write window; it does not close it, and the
 	// documentation says so. A successor accepting between this proof and the socket write
 	// still transmits this exchange's own PUBREL under its own identifier, which is a
-	// retransmission the client resolves with PUBCOMP — not F-092's hazard of a PUBREL
+	// retransmission the client resolves with PUBCOMP — not issue #94's hazard of a PUBREL
 	// under an identifier a DIFFERENT exchange owns.
 	//
 	// A retained exchange has no slot and therefore no action (R6); it is authorized by
@@ -1440,7 +1440,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// same PUBREL can free the identifier and bumpPI can re-mint it — a new PUBLISH
 	// queued under an identifier whose PUBREL bytes are still going out. Opened in the
 	// SAME critical section as the tracking below, so nothing can free the identifier
-	// between deciding to transmit and reserving it (F-089).
+	// between deciding to transmit and reserving it (issue #91).
 	// A PUBREL THIS CONNECTION MAY ALREADY HOLD IS NOT WRITTEN TO IT AGAIN ([MQTT-4.4.0-1]): this
 	// offer is the record's AckWait re-offer, and a PUBREL is resent only on a reconnect with a
 	// session — a new connection, whose debt is not this one's. The one exception is the client's
@@ -1469,7 +1469,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		// WHICH POPULATION STILL REACHES THIS. A slot-backed exchange no longer does for a
 		// live PUBLISH: admission refuses that upstream, on the durable action token or on
 		// the hold's pubIdent, and leaves a redrive waiter the transmission's end wakes
-		// (F-098). What is left here is the RETAINED exchange, which has no slot (R6) and
+		// (issue #100). What is left here is the RETAINED exchange, which has no slot (R6) and
 		// so no admission to refuse it, and the opener's refusal is not specific to a
 		// PUBLISH — it fires for any live transmission under the identifier, a PUBREL's
 		// included. A continuation here would need a predicate recognising both kinds, so
@@ -1482,7 +1482,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// return. It was registered after the admission-time action drain, so LIFO execution
 	// clears the socket token first and then drains the durable action.
 	//
-	// THE ATTEMPT'S PUBCOMP UNIT IS GIVEN BACK UNLESS ITS FRAME MAY HAVE LEFT (F-116), stated
+	// THE ATTEMPT'S PUBCOMP UNIT IS GIVEN BACK UNLESS ITS FRAME MAY HAVE LEFT (issue #118), stated
 	// as a property rather than at each return: possiblyEmitted turns true on the line before
 	// a writer is called and back to false only on the writer's own proof that nothing was
 	// emitted. Every return before a writer — this function's refusals and any added later —
@@ -1497,14 +1497,14 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		// from the resident's (possibly lineage-less) evidence rather than the action's. The
 		// stored record's affine reference goes on with it — read off the RECORD, because the
 		// connection completing this exchange is usually not the one that stored the PUBREL —
-		// and so do the acquired slot and the F-093 handoff. A refusal changes nothing; the
+		// and so do the acquired slot and the issue #95 handoff. A refusal changes nothing; the
 		// defers above end the send token and drain the action, and AckWait re-offers.
 		if !sess.bindActionToPubRelLocked(pi, act, reply, affRef) {
 			sess.mu.Unlock()
 			return
 		}
 	} else {
-		// No acquired action and no slot: nothing may be written (F-105 7c deleted the slot-less
+		// No acquired action and no slot: nothing may be written (issue #107 7c deleted the slot-less
 		// retained exchange this branch used to serve).
 		sess.mu.Unlock()
 		return
@@ -1524,7 +1524,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// bind to (R6) — so both the drain and the write-entry transition are skipped, and its
 	// identifier is held by the retained reservation instead.
 	//
-	// WRITE ENTRY IS CONDITIONAL (F-105 row 2, consult 28), for both classes: the holder must still
+	// WRITE ENTRY IS CONDITIONAL (issue #107 row 2, consult 28), for both classes: the holder must still
 	// be the live, un-released, un-drained holder of its token, and an ordinary one must hold the
 	// exact acquisition it landed through the authority. Entry is the atomicity against the drain,
 	// taken under the session lock BEFORE the writer's own lock; the writer then checks only the
@@ -1571,7 +1571,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	case act != nil:
 		// A slot-only holder (experimental affine, chapter P) keeps the raw emitter. It reports
 		// no result, so its attempt keeps its PUBCOMP unit whatever happened: the conservative
-		// side, a reservation rather than a freed identifier (F-116).
+		// side, a reservation rather than a freed identifier (issue #118).
 		possiblyEmitted = true
 		cc.mqttEnqueuePubResponse(mqttPacketPubRel, pi, trace)
 	}
@@ -1580,7 +1580,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 // mqttWriteAuthorizedPubRel writes one ordinary PUBREL as the execution of its acquisition, and
 // reports the writer's three-way result. A frame the client's Maximum Packet Size refuses is
 // never handed to the writer, so it is PREVENTED like any other frame no byte of which left —
-// which is what lets its caller give back the attempt's PUBCOMP unit (F-116).
+// which is what lets its caller give back the attempt's PUBCOMP unit (issue #118).
 func (c *client) mqttWriteAuthorizedPubRel(pi uint16, ticket *mqttWriteEntry, trace bool) mqttOutputResult {
 	buf := c.mqttPubResponseFrame(mqttPacketPubRel, pi, mqttReasonSuccess, _EMPTY_)
 	if !c.mqttFitsClientMax(len(buf)) {
@@ -1706,7 +1706,7 @@ type mqttPreparedPublish struct {
 	// an aliasing receiver is framed at transmission, under the lock.
 	flags  byte
 	header []byte
-	// out and requireAction bind the frame to its send section's acquisition (F-105 row 2):
+	// out and requireAction bind the frame to its send section's acquisition (issue #107 row 2):
 	// requireAction marks every QoS 1/2 frame that is not on a slot-only (experimental affine,
 	// chapter P) slot, which is written only through the authorized boundary and only for out's
 	// clean acquisition. Unset for QoS 0 and for slot-only QoS 1/2.
@@ -1718,7 +1718,7 @@ type mqttPreparedPublish struct {
 // frame must consume an acquisition is the slot's CLASS, the one statement every acquisition and
 // acknowledgement arrow asks, never a caller's flag.
 //
-// The class is the WHOLE condition (F-105 WP-F). A QoS 1/2 frame reaches the raw branch of
+// The class is the WHOLE condition (issue #107 WP-F). A QoS 1/2 frame reaches the raw branch of
 // mqttEnqueuePreparedPublishMsgTo only on a slot-only slot; any other one with no acquisition,
 // including one whose slot was never named, is refused there rather than written raw.
 func (p *mqttPreparedPublish) bindSection(tok mqttSendToken) {
@@ -1828,7 +1828,7 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 			cc.mqtt.outTopicAliases[string(p.topic)] = alias
 		}
 	}
-	// No retained flush here any more (F-105 7c): retained replay is the session driver's, and live
+	// No retained flush here any more (issue #107 7c): retained replay is the session driver's, and live
 	// traffic on a raw subscription waits on its replay gate BEFORE it reaches this writer.
 	if p.requireAction {
 		// THE AUTHORIZED BOUNDARY: header and payload are ONE execution of the section's clean

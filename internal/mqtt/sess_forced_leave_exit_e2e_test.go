@@ -277,7 +277,7 @@ func TestForcedLeaveDoesNotPublishTheWillWhileTheConnectionLives(t *testing.T) {
 // out to be VACUOUS on this path — recorded as a test rather than deleted, so a later change
 // that makes it reachable fails here instead of passing quietly.
 //
-// The bullet inherited "and can delete a zero-expiry session" from F-064's general review of
+// The bullet inherited "and can delete a zero-expiry session" from issue #68's general review of
 // post-CONNACK failure. It cannot happen here: a non-clean 3.1.1 CONNECT maps to
 // mqttSessionNeverExpire, and a clean start has no persisted membership to leave — so
 // len(sharedSubs) > 0 and expiry == 0 cannot co-occur.
@@ -1097,7 +1097,7 @@ func TestPreConnackRefusalSignalAtTheLifetimeGrantDisposingArms(t *testing.T) {
 			// purpose.
 			//
 			// It would be FALSE to generalise that to "no pre-CONNACK write can produce a
-			// delta": processSubs runs BEFORE the CONNACK (F-050 moved it there), so a resume
+			// delta": processSubs runs BEFORE the CONNACK (issue #54 moved it there), so a resume
 			// restoring a QoS 2 or shared filter DOES provision grant-tracked state that a
 			// later pre-CONNACK save confirms. That route, and the caller-side double-mint
 			// mutation it makes detectable, is covered by
@@ -1117,7 +1117,7 @@ func TestPreConnackRefusalSignalAtTheLifetimeGrantDisposingArms(t *testing.T) {
 //
 // I claimed a pre-CONNACK write could never produce a non-empty candidate delta, because
 // registers and the PUBREL consumer are provisioned "after the CONNACK". **That is false, and
-// this project's own design is why:** F-050 moved subscription restoration BEFORE the CONNACK,
+// this project's own design is why:** issue #54 moved subscription restoration BEFORE the CONNACK,
 // so `processSubs` provisions the PUBREL consumer a QoS 2 filter needs while the CONNACK is
 // still unwritten. A later pre-CONNACK save then confirms a body carrying `PubRel` against an
 // accept body that lacked it — and `buildForkedGrantLocked` reads exactly that as a delta.

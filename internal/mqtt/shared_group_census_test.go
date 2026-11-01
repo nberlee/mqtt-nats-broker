@@ -2,7 +2,7 @@
 //
 // It answers one question about the production sources: which functions call
 // createDurableConsumer, and which of those construct a ConsumerConfig carrying a
-// DeliverGroup inline. That is the class F-077 arbitrates, and a create outside
+// DeliverGroup inline. That is the class issue #79 arbitrates, and a create outside
 // processSharedJSConsumer would be unarbitrated.
 //
 // WHAT THIS CANNOT SEE, stated here rather than left for a reader to assume. The scan

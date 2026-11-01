@@ -18,14 +18,14 @@ import (
 	"strings"
 )
 
-// Completion of an admitted obligation (F-105).
+// Completion of an admitted obligation (issue #107).
 //
 // THE CENTRAL RULE OF THIS FILE: completing an obligation that was already admitted does NOT
 // require current serving authority. Beginning new work does.
 //
 // That split is what makes retirement survivable. If completion needed the serving tenure,
 // then transfer and closure would themselves destroy the completion route of every
-// obligation admitted before them — which is exactly the defect F-105 names. So a preparing
+// obligation admitted before them — which is exactly the defect issue #107 names. So a preparing
 // authority, a transferred one and a closed one all still permit an admitted exchange to
 // finish; what they withhold is permission to admit another.
 //
@@ -134,7 +134,7 @@ func mqttCompletionAllowed(in mqttCompletionInput) (mqttCompletionVerdict, error
 		}
 		// An ENDED exchange acquires nothing further, and a refused one least of all: the
 		// client said it will not take this message.
-		// Nor does a DISCARDED one (F-105 7d): its generation ended, so nothing will ever owe it
+		// Nor does a DISCARDED one (issue #107 7d): its generation ended, so nothing will ever owe it
 		// output again, though it is not an ending.
 		if mqttExchangePhaseEnded(in.Exchange.Phase) ||
 			mqttExchangePhaseEndedPendingDrain(in.Exchange.Phase) ||
@@ -185,7 +185,7 @@ type mqttGenerationObligations struct {
 
 // enumerateGenerationObligations reads one generation's exchanges and their actions.
 //
-// The exchanges are the generation's INVENTORY [Lo, Hi] (F-112): every exchange the floor has not
+// The exchanges are the generation's INVENTORY [Lo, Hi] (issue #114): every exchange the floor has not
 // proven ended and reclaimed, Terminal-duty ones included, read through the one traversal every
 // census uses. A subject walk is unsound here now that exchange records are deleted behind the
 // floor: its pages shift under a deletion. A position or exchange the traversal could not read is

@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-// F-077's arbitration against a REAL second broker on replicated JetStream.
+// issue #79's arbitration against a REAL second broker on replicated JetStream.
 //
-// Every other F-077 fixture injects the rejection. That proves the verdict handling but not
+// Every other issue #79 fixture injects the rejection. That proves the verdict handling but not
 // the thing the finding is about: whether a genuine cross-broker takeover is actually
 // observed by the restore. On a replicated `$MQTT_sess` the expected-last-subject-sequence
 // check runs in the clustered pre-proposal path rather than as a single-writer store check,
@@ -26,9 +26,9 @@ import (
 // discriminate anything:
 //
 //   - If B takes over BEFORE A's restore reaches its ownership write, A's accept save is
-//     itself rejected and the fixture only re-proves F-029. The takeover therefore has to
+//     itself rejected and the fixture only re-proves issue #31. The takeover therefore has to
 //     land while A is mid-restore, which is what the create boundary is for.
-//   - If B's takeover DELETES the group durable, A's F-076 post-pass observes the absence
+//   - If B's takeover DELETES the group durable, A's issue #78 post-pass observes the absence
 //     and refuses before the ownership write ever runs — in a build with the write moved
 //     or removed too, so the fixture passes for a reason that has nothing to do with this
 //     change. So a SECOND, different-client member holds the group, and the durable stays

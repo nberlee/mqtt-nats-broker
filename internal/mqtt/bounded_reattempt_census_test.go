@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// THE BOUNDED RE-ATTEMPT FAMILY, classified (F-114).
+// THE BOUNDED RE-ATTEMPT FAMILY, classified (issue #116).
 //
 // mqttInflightStoreAttempts is three attempts with no spacing; mqttForegroundAcquireAttempts and
 // mqttSubscribeClaimAttempts are an announced foreground operation's BASE budgets, spaced by the
@@ -121,11 +121,11 @@ var reattemptCensus = map[string]reattemptRow{
 	"outbound_admit_orchestrate.go:(mqttSession).admitThroughAuthority": {store: 0, fg: 0, fors: nil, budgets: nil,
 		class:     "the delivery admission's custody reservation; the ladder runs in admitUnderReservation",
 		exhausted: "see admitUnderReservation",
-		done:      "CONVERTED (F-114), via admitUnderReservation"},
+		done:      "CONVERTED (issue #116), via admitUnderReservation"},
 	"outbound_admit_orchestrate.go:(mqttSession).admitUnderReservation": {store: 0, fg: 1, fors: nil, budgets: nil,
 		class:     "FG-AUTHORITY: the ordinary and shared delivery admission, announced for the whole ladder, under a reservation its caller holds (admitThroughAuthority, or a batch handing one delivery to the single ladder)",
 		exhausted: "the admitted background writers cannot exhaust an admission to an empty identifier; classification and cleanup attempts on an occupied one are not covered, nor are other brokers, the adopted teardown's completion, unadmitted writes, foreground contention or store failures; an admission whose every attempt lost to a stale expectation is EXTENDED while its connection serves (mqttDeliveryContentionExtension), so a re-offer cannot overtake the subscription's order; any other exhaustion re-offers at AckWait",
-		done:      "CONVERTED (F-114)"},
+		done:      "CONVERTED (issue #116)"},
 	"outbound_close_cert.go:(mqttSession).clearCertifiedRegister": {store: 1, fg: 0, fors: []string{"attempt := 0; attempt < mqttInflightStoreAttempts; attempt++"}, budgets: nil,
 		class:     "REGISTER-CAS, with a rare authority arm (pubrel_terminal, mostly the resume pre-pass)",
 		exhausted: "the authority arm can be moved by any same-session writer; exhaustion leaves the token standing, the acquisition refuses and the next redelivery re-attempts (one AckWait), or the pre-pass skips the subject",

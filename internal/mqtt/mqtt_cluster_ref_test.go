@@ -1284,7 +1284,7 @@ func TestMQTTDecodeRetainedMessage(t *testing.T) {
 
 	// Store a second retained message directly into the stream. Upstream wrote a
 	// JSON-encoded body here to exercise the legacy reader; this broker accepts
-	// only the header format (F-056 removed the JSON fallback), so the reference
+	// only the header format (issue #60 removed the JSON fallback), so the reference
 	// injects the current format instead. Reference-only: this file is build
 	// tagged mqtt_cluster_reference and never runs — see CONTRIBUTING.md.
 	nc, js := jsClientConnect(t, s)
@@ -2138,7 +2138,7 @@ func TestMQTTRetainedMessageWithDelSubjectIsNotRestored(t *testing.T) {
 	// contains DEL. That subject can no longer be indexed after restore. It is
 	// written in the current header format so that the DEL check is what rejects
 	// it — upstream injected a JSON body, and this broker no longer reads that
-	// format at all (F-056), which would make the record fail earlier for an
+	// format at all (issue #60), which would make the record fail earlier for an
 	// unrelated reason.
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()

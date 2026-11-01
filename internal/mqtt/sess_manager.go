@@ -89,7 +89,7 @@ type mqttSessionManager struct {
 	// whether it is a tombstone, immediately BEFORE the record is applied to the
 	// index. Holding one application there lets a test run the other index writer
 	// — mqttHandlePubRetain's synchronous local seed — ahead of it, which is the
-	// reordering F-059 describes and the window that made the removed compaction
+	// reordering issue #63 describes and the window that made the removed compaction
 	// delete destructive. See processRetainedMsg.
 	testRetainedApplyGate func(subject string, tombstone bool)
 
@@ -133,14 +133,14 @@ type mqttAccountSessionManager struct {
 	// session once its MQTT 5.0 Session Expiry Interval elapses after the
 	// connection closes. A local reconnect cancels them, and so does an observed
 	// remote record write — which shows the record moved, not that a peer holds the
-	// session (F-084); cancelling is correct either way, because this broker may no
+	// session (issue #86); cancelling is correct either way, because this broker may no
 	// longer write that record and so its timer must not fire against it.
 	// Spec5 [3.1.2.11.2]. Guarded by mu.
 	pendingExpiries map[string]mqttPendingExpiry
 	// expiryTokens mints mqttPendingExpiry install tokens under as.mu.
 	expiryTokens uint64
 	// recoveryShardCursor is where the next outbound-recovery pass starts its shard walk,
-	// retained across passes and guarded by mu (F-105, row 6).
+	// retained across passes and guarded by mu (issue #107, row 6).
 	//
 	// A per-pass shard budget with a walk that always began at shard 0 would never reach the
 	// later shards at all — starvation by construction rather than by load — so the position
@@ -346,7 +346,7 @@ type mqttAccountSessionManager struct {
 	testResumeReconcilePreCreate func(sess *mqttSession, deliver string) error
 
 	// testSourcePreCreate, when non-nil, answers a SUBSCRIBE's source CONSUMER.CREATE in place of
-	// issuing it (F-105 7c-lc): a non-nil error is the create failing after its name was claimed.
+	// issuing it (issue #107 7c-lc): a non-nil error is the create failing after its name was claimed.
 	// Set/read under mu. Nil in production.
 	testSourcePreCreate func(sess *mqttSession, durable string) error
 
@@ -457,7 +457,7 @@ type mqttAccountSessionManager struct {
 	// also the only way to stage the ONE response shape the walk must refuse — a
 	// non-empty subject map with a zero last sequence, which the server can legitimately
 	// return once because State and State.Subjects are separate reads, and which a
-	// bounded purge cannot act on (F-062). Nil in production.
+	// bounded purge cannot act on (issue #66). Nil in production.
 	testQoS2Subjects func(filter string) (map[string]uint64, uint64, error)
 
 	// testQoS2ClaimDone, when non-nil, is invoked with the RESOLVED status of every
@@ -552,7 +552,7 @@ type mqttAccountSessionManager struct {
 	// refused for a storage-type conflict. It exists to prove a negative — the
 	// owner's PROVISIONING path performs no lookup at all, so a lookup forced to
 	// fail must leave every owner-side shape working exactly as it does today
-	// (F-064). A lookup added outside lookupQ2AffineConsumer is invisible here,
+	// (issue #68). A lookup added outside lookupQ2AffineConsumer is invisible here,
 	// which is why that helper is the single route. Nil in production.
 	testQ2AffConsumerLookup func(durable string) (*ConsumerInfo, error)
 
@@ -589,21 +589,21 @@ type mqttAccountSessionManager struct {
 	// resolves. Nil in production.
 	testInflightStore func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error)
 	testInflightLoad  func(subject string) (*mqttInflightRecord, *StoredMsg, error)
-	// testRecoverCancellation observes recovery's cancellation classification (F-088 WP3 edit 4):
+	// testRecoverCancellation observes recovery's cancellation classification (issue #90 WP3 edit 4):
 	// it fires for every decided, unretired register that carries a cancellation (its own
 	// Cancelled bit, or a verdict naming its nonce) BEFORE the genuine-cancellation arm tests the
 	// marker, with the marker evidence the walk established (markerSeq 0: authoritatively absent).
 	// markerSeq is marker PRESENCE, kept as deletion debt even on a possibly-attempted register
-	// (a recovered output token beside a standing marker, F-088): nonzero does not by itself mean
+	// (a recovered output token beside a standing marker, issue #90): nonzero does not by itself mean
 	// proven-unsent. Observation only. Nil in production.
 	testRecoverCancellation func(pi uint16, nonce string, recCancelled, verdict bool, markerSeq uint64)
-	// testRecoverDropCondemn observes recovery's RecoveryDrop over a consumed reservation (F-088
+	// testRecoverDropCondemn observes recovery's RecoveryDrop over a consumed reservation (issue #90
 	// W6a): it fires at the apply loop's condemnSendLocked(..., mqttSendSettleRecoveryDrop) with
 	// the entry's send nonce as it stood and whether the call PARKED the drop on an open section
 	// (true) rather than leaving the entry to be deleted. Session lock held when it fires.
 	// Observation only. Nil in production.
 	testRecoverDropCondemn func(pi uint16, sendNonce string, parked bool)
-	// testResumeAuthorityLoad replaces the resume's durable authority read (F-105 7b,
+	// testResumeAuthorityLoad replaces the resume's durable authority read (issue #107 7b,
 	// resumeEntitlementServes), for rigs that drive the whole store through these hooks.
 	testResumeAuthorityLoad func(id string) mqttAuthorityLoad
 	// testAckAdvance wraps the atomic acknowledgement advance (advanceExchangeAck), the write
@@ -662,7 +662,7 @@ type mqttAccountSessionManager struct {
 	// metadata commit, so a test can prove the commit was never attempted for a proposal that is
 	// not this acceptance's. Nil in production.
 	testOwnershipMetadataEntry func()
-	// testAbandonOwn intercepts the owed-abandonment worker (F-105 8a) before it acts: it
+	// testAbandonOwn intercepts the owed-abandonment worker (issue #107 8a) before it acts: it
 	// returns false to suppress the attempt, so a test can prove the next acceptance settles a
 	// proposal the worker never reached. Nil in production.
 	testAbandonOwn func(id string, target mqttOwnershipProposal) bool
@@ -686,12 +686,12 @@ type mqttAccountSessionManager struct {
 	// testCertified observes every connection this account's CONNECT path certifies closed on a
 	// refusal, with the certificate. Nil in production.
 	testCertified func(c *client, cert *mqttCloseCert)
-	// testCertifiedClearSubmit observes every certified token clearance (F-105 8c) after its
+	// testCertifiedClearSubmit observes every certified token clearance (issue #107 8c) after its
 	// licence is proven and before its write is submitted, with the sequence the write expects.
 	// Nil in production.
 	testCertifiedClearSubmit func(subject string, seq uint64, pre *mqttInflightRecord)
 	// testResumeWalkEntry runs as a resume's register walk is about to start, after the
-	// certified-clearance pre-pass (F-105 8c). Nil in production.
+	// certified-clearance pre-pass (issue #107 8c). Nil in production.
 	testResumeWalkEntry func(id string)
 	// testAuthorityContentionWait replaces the authority-contention wait (the successful-PUBREC
 	// advance's and the SUBSCRIBE name claim's backoff sleep), receiving
@@ -770,7 +770,7 @@ type mqttAccountSessionManager struct {
 
 	// testRestoreFilterFail fails exactly ONE named exit of the CONNECT restore, for
 	// exactly one sid. Per-exit rather than a blanket failure because a fixture has
-	// to prove WHICH route it took: F-050 has five reachable exits and a remedy
+	// to prove WHICH route it took: issue #54 has five reachable exits and a remedy
 	// demonstrated on one says nothing about the others. Consulted only when
 	// fromSubProto is false, and only AFTER the real call has run, so the fixture
 	// reaches the production path and then fails it rather than replacing it.
@@ -795,7 +795,7 @@ type mqttAccountSessionManager struct {
 	qos2SweepCursor uint64
 	qos2SweepSeeded bool
 	// retirementMemo is the orphan sweep's POSITIVE-ONLY memo of proven retirements
-	// (F-036 unit 2): client-ID hash -> the one generation a valid watermark was
+	// (issue #40 unit 2): client-ID hash -> the one generation a valid watermark was
 	// observed naming. It holds one generation per client because the durable
 	// watermark does; remembering more would claim a history the single slot never
 	// had. Only the monotone matching-generation observation is admitted — losing it
@@ -834,7 +834,7 @@ type mqttAccountSessionManager struct {
 	// that purpose.
 	sweepQuarantine *mqttSweepQuarantine
 
-	// recoveryKick is the prompt drive of discarded generations' recovery roots (F-105 7d): a
+	// recoveryKick is the prompt drive of discarded generations' recovery roots (issue #107 7d): a
 	// bounded caller of the recovery pass's own visit, so a teardown's consumers are retired
 	// promptly rather than at the next pass. See outbound_recovery_kick.go.
 	recoveryKick mqttRecoveryKick
@@ -1196,7 +1196,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 
 	// The session-record watch's delivery subject. Every session-record write in the
 	// account arrives here, which is how this broker learns that one of its sessions'
-	// records MOVED — not who moved it, which no observation shows (F-084). The
+	// records MOVED — not who moved it, which no observation shows (issue #86). The
 	// at-most-once `$MQTT.JSA.*.SP.*.*` notification this replaces could simply be
 	// lost, stranding a displaced client indefinitely.
 	// Under "$MQTT.sub." and on the SERVICE connection, like the retained consumer,
@@ -1253,7 +1253,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// outright. Second: an account holding a PROPER SUBSET of the ten broker-owned
 	// streams is refused rather than silently completed — those ten are one
 	// recreation unit, and recreating a subset leaves records referencing identities
-	// the other streams have since reissued (F-066). Both take
+	// the other streams have since reissued (issue #70). Both take
 	// brokerStreamLookupAPI, so neither can create what it is deciding about.
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
@@ -1329,7 +1329,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 				as.sweepSharedGroupRetirements(s)
 				as.sweepAcqReleaseVerdicts(s)
 				as.sweepOrphanedQoS2State(s)
-				// The outbound recovery pass rides the same cadence (F-105, row 6). It is
+				// The outbound recovery pass rides the same cadence (issue #107, row 6). It is
 				// deliberately NOT run at startup beside the three above: those reconcile state
 				// this broker may have left behind, while this one walks a durable directory
 				// that any broker may walk at any time, so there is nothing about a fresh start
@@ -1593,7 +1593,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cut
 	}
 	for dur := range candidates {
 		// A physical name's DELETE is authorized by its OWNERSHIP record, never by the mere
-		// absence of a session reference (F-105 §5.1 point 5). This sweep's original defect was
+		// absence of a session reference (issue #107 §5.1 point 5). This sweep's original defect was
 		// exactly that: a source consumer LIVE with an outstanding outbound obligation, aged past
 		// the grace window and no longer referenced by a local session or a record, was deleted
 		// out from under the obligation. Consult the name's ownership on $MQTT_msgs before deleting:
@@ -2112,7 +2112,7 @@ RESTORE:
 		// the inherited identity outlived the interval it named. A create carrying no
 		// PWID concedes at classifyRecordLineage's second conjunct from either
 		// orientation. That unrecognisability is the stated residual; what it concedes TO
-		// is the UNSETTLED vocabulary, not a takeover claim (F-084). See
+		// is the UNSETTLED vocabulary, not a takeover claim (issue #86). See
 		// sess_fork_lineage.go and docs/CONFORMANCE.md.
 		//
 		// The watermark is still READ here, and its unreadable arm is a refusal in its
@@ -2188,9 +2188,9 @@ RESTORE:
 	// The generation is validated BEFORE anything derives a name from it — the adopted
 	// teardown below deletes by generation-scoped name, and it WALKS by generation-scoped
 	// filter (the inbound QoS 2 holds; $MQTT_inflight's own filter purge is gone since
-	// F-034, replaced by a bounded reap whose enumeration uses the same kind of filter).
+	// issue #38, replaced by a bounded reap whose enumeration uses the same kind of filter).
 	// A malformed stored value would widen those walks across other incarnations, and
-	// what each pass then destroys is bounded per F-062 and F-034 rather than blind — but
+	// what each pass then destroys is bounded per issue #66 and issue #38 rather than blind — but
 	// a walk that names the wrong incarnation is still the wrong inventory. Fails closed.
 	// See mqttSessGenFromRecord.
 	recGen, err := mqttSessGenFromRecord(ps.Gen)
@@ -2282,8 +2282,8 @@ RESTORE:
 	// A retired generation takes the SAME route rather than a second discard shape of
 	// its own: build the transient session, clear() it (which re-marks the record,
 	// finds the retirement already recorded, repeats the deletions — the inbound QoS 2 hold
-	// walk bounded per walk, F-062; the `$MQTT_inflight` reap beside it bounded by its own
-	// enumeration watermark, F-034 — and releases the record) and hand back the reset
+	// walk bounded per walk, issue #66; the `$MQTT_inflight` reap beside it bounded by its own
+	// enumeration watermark, issue #38 — and releases the record) and hand back the reset
 	// object as a fresh session, with
 	// Session Present false — which is the truthful answer in both cases.
 	overdue := mqttSessionOverdue(ps.DisconnectedAt, ps.ExpiryInterval, time.Now())

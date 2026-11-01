@@ -151,7 +151,7 @@ func TestMQTTSessionDeleteAlreadyDeletedReplicated(t *testing.T) {
 	// bare clear(), which property P now refuses. What is asserted below is unchanged.
 	err = mqttTestRetireBound(t, asm, sess, false)
 	asm.unlockSession(sess)
-	// ACCEPTANCE is the assertion, and since F-029 it has two shapes rather than one.
+	// ACCEPTANCE is the assertion, and since issue #31 it has two shapes rather than one.
 	// claimTeardown has always reported an absent record as SUPERSEDED — "the record is
 	// gone, so somebody else already released this session" — and clear() used to
 	// flatten that to nil. It now returns errMQTTClearSuperseded, which says the same

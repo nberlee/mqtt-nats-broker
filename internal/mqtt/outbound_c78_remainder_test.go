@@ -284,7 +284,7 @@ func TestConsult78Generation(t *testing.T) {
 	if status != mqttRetirementValid || watermark.Gen != f.gen || sess.gen == f.gen {
 		t.Fatal("clear did not durably retire the old generation")
 	}
-	// RETIRED THROUGH ITS RESOURCE since F-105 7d: the teardown transfers the source consumer to
+	// RETIRED THROUGH ITS RESOURCE since issue #107 7d: the teardown transfers the source consumer to
 	// the discarded generation's recovery executor rather than deleting it, so it goes once that
 	// executor — kicked by the teardown — has ended its holder and authorized its deletion.
 	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
@@ -312,7 +312,7 @@ func TestConsult78Generation(t *testing.T) {
 		t.Fatal("queued old resolver vanished before its generation classification")
 	}
 	// THE DISCARDED GENERATION'S RETIREMENT is the recovery executor's, kicked by the teardown, and
-	// its transitions CAS the same authority record (F-105 7d): the raw rewrite below models the
+	// its transitions CAS the same authority record (issue #107 7d): the raw rewrite below models the
 	// next accept, so it waits for that background owner to go idle rather than racing it.
 	checkFor(t, 10*time.Second, 20*time.Millisecond, func() error {
 		e.asm.recoveryKick.mu.Lock()

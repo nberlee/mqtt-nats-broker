@@ -496,7 +496,7 @@ func TestF105ForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
 		// departure at admission and CLOSES the never-admitted copy — a gated attempt of its own.
 		rig, c, r := testForegroundServer(t, "fg-depart", map[string][]byte{"lv/big": big})
 		// The UNSUBSCRIBE below also hands the subscription's SOURCE consumer to the retirement
-		// owner (F-105 7c-lc): a background writer this schedule neither parks nor accounts for,
+		// owner (issue #107 7c-lc): a background writer this schedule neither parks nor accounts for,
 		// whose authority writes would also stale the parked seal's read. It is kept out of this
 		// window; its own admission at the gate is TestF105SourceRetirementWaitsForTheForeground's.
 		rig.sess.testSourceDisposalDrop.Store(true)

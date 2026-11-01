@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// T13d (F-088 WP3, plan rev 20, N3): EVERY production reader of a register's `Cancelled` bit has
+// T13d (issue #90 WP3, plan rev 20, N3): EVERY production reader of a register's `Cancelled` bit has
 // an EVIDENCE DISPOSITION. The bit is no longer evidence that a PUBLISH was never sent (arm 4 is
 // marker-only, WP3 edit 1): a reader may treat it as a shape constraint, a provenance check, a
 // trigger for a MARKER probe, the recogniser of a refuted (marker-absent) clearance, its own
@@ -79,7 +79,7 @@ var f088CancelledBacking = map[f088CancelledDisposition][]string{
 
 // f088FrozenCancelledReaders is the FROZEN census: every production function reading `.Cancelled`
 // (outside an assignment's left-hand side), the number of reads, its disposition, and why. Frozen
-// against the F-097/F-088 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted
+// against the issue #99/issue #90 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted
 // WP2/WP3 edits).
 var f088FrozenCancelledReaders = map[string]struct {
 	n    int

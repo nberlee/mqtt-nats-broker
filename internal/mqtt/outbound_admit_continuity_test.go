@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// F-097 WP5 (plan rev 20): admission continuity, WITNESS FIRST. These are the W5 witnesses: each
+// issue #99 WP5 (plan rev 20): admission continuity, WITNESS FIRST. These are the W5 witnesses: each
 // drives a controlled in-process schedule on the real store and checks the committed-state
 // invariant "at most one un-ended exchange per source delivery (dur, seq)".
 

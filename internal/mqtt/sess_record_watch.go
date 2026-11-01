@@ -7,7 +7,7 @@
 //
 // What an observation establishes is that the record MOVED, which makes the resident
 // object no longer ours. It does not establish who wrote it or that anyone holds the
-// session now, and nothing downstream of here may claim that it does (F-084): the
+// session now, and nothing downstream of here may claim that it does (issue #86): the
 // displaced client is told the ownership-unsettled 0x89 unless a route that HOLDS the
 // successor disposes of it.
 //

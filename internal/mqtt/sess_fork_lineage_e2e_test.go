@@ -14,7 +14,7 @@ import (
 // FORKED under the connection, and a real client left publishing into it.
 //
 // The companion is TestMQTTBoundRejectionE2EForeignClosesConnection, which stages a
-// child-SHAPED record through the same machinery. Both now get 0x89 — F-084 withdrew the
+// child-SHAPED record through the same machinery. Both now get 0x89 — issue #86 withdrew the
 // takeover claim from every record-derived route, a child-shaped body proving no successor
 // — so the DISCRIMINATOR moved: the two are separated by the Reason String and by whether a
 // fork grant is minted, not by the reason code. A change that collapsed the two classes
@@ -332,7 +332,7 @@ func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 // That the competitor is genuine here is precisely what makes this the residual rather
 // than a defect: nothing durable distinguishes this from a replay or a stranger, so the
 // broker must answer the same way in all three, and the price is a Will published where a
-// provable takeover would have suppressed it (F-084).
+// provable takeover would have suppressed it (issue #86).
 //
 // This asserts the residual, so it FAILS if the behavior is ever changed. That is
 // deliberate: docs/CONFORMANCE.md states it and the plan approved it, and pinning it is
@@ -465,7 +465,7 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 // the create is parentless and a sibling of it can no longer be proven.
 //
 // The RESIDUAL is that unprovability. What the displaced client is TOLD is no longer part
-// of it: F-084 replaced the old 0x8E "session taken over" — a claim that somebody
+// of it: issue #86 replaced the old 0x8E "session taken over" — a claim that somebody
 // legitimately owns the session, when the two creates arbitrated nothing — with 0x89
 // "ownership unsettled", which is what the evidence actually supports.
 //
@@ -475,7 +475,7 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 //
 // No Will assertion here, unlike the rejection-settlement e2e above, and the reason is no
 // longer a residual: this verdict is reached by the eviction route, whose Will behaviour
-// F-084 fixed and whose fixtures live with it
+// issue #86 fixed and whose fixtures live with it
 // (TestF084RemotePersistEvictionDischargesWill for a live Will,
 // TestF084RemotePersistEvictionEnqueuesDelayedWill for a delayed one, and
 // TestF084RemotePersistEvictionDischargesParkedAction for a parked action). Asserting
@@ -571,7 +571,7 @@ func TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient(t *testing.T) {
 	// 0x89 ownership-unsettled. The write-lineage audit made a parentless create concede
 	// here, because two unrelated first creates are indistinguishable and calling them
 	// siblings would manufacture a FALSE fork — that part is unchanged and is still the
-	// residual. What changed is what conceding SAYS: F-084 stopped it claiming a takeover,
+	// residual. What changed is what conceding SAYS: issue #86 stopped it claiming a takeover,
 	// since failing to recognise sibling-hood leaves this broker knowing LESS about who
 	// holds the session, and less knowledge cannot license a stronger claim.
 	//

@@ -23,7 +23,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-029 (Slice B): the re-drive's BINDING transitions, which need a live CONNECT.
+// issue #31 (Slice B): the re-drive's BINDING transitions, which need a live CONNECT.
 // The record-level half is in sess_takeover_arbitration_test.go.
 
 // testReDriveTrace records what a CONNECT's record work actually did: the base of every
@@ -226,23 +226,23 @@ func TestSessSupersededDiscardReDrivesTheCleanStart(t *testing.T) {
 			"winner was %q)", ps.PWID, winner)
 	}
 
-	// (a) NO save happened at base 0. F-105's clean start over a live predecessor displaces
+	// (a) NO save happened at base 0. issue #107's clean start over a live predecessor displaces
 	// the record IN PLACE through a discarding handoff conditioned on the predecessor's own
 	// sequence (Codex consult 6); it never tears the record down and re-creates it at base 0.
-	// A base-0 save anywhere would be the pre-F-105 clear-then-create stomp this item closed.
+	// A base-0 save anywhere would be the pre-issue #107 clear-then-create stomp this item closed.
 	bases := tr.saveBases()
 	if len(bases) == 0 {
 		t.Fatal("the CONNECT made no record write at all")
 	}
 	for i, b := range bases {
 		if b == 0 {
-			t.Fatalf("a base-0 store ran (attempt %d of %v): F-105 displaces the winner in "+
+			t.Fatalf("a base-0 store ran (attempt %d of %v): issue #107 displaces the winner in "+
 				"place at its own sequence and never creates at base 0", i, bases)
 		}
 	}
 	// (b) and the final save DISPLACES THE WINNER IN PLACE: its CAS base is the sequence the
 	// arbitration winner landed at, so the re-drive re-read the record that won and handed the
-	// clean start off from it rather than stomping the base clear() reset. This is the F-105
+	// clean start off from it rather than stomping the base clear() reset. This is the issue #107
 	// form of the pre-cutover "final create at base 0" assertion: the winner's sequence is now
 	// carried by the accept handoff rather than consumed by a separate teardown claim.
 	if got, want := bases[len(bases)-1], tr.winnerSequence(); got != want {
@@ -281,7 +281,7 @@ func testRejectAcceptSave(t *testing.T, asm *mqttAccountSessionManager, clientID
 		mu sync.Mutex
 		n  int
 	)
-	// F-105 cutover: the accepting CONNECT's save is the ownership metadata commit — a
+	// issue #107 cutover: the accepting CONNECT's save is the ownership metadata commit — a
 	// three-member atomic batch (fact + COMMITTED receipt + record) — not the two-member
 	// store the removed result hook rewrote. Its interception point is the ISSUING phase of
 	// that batch, fired before the send, which reproduces the two-member path's CERTAIN
@@ -310,12 +310,12 @@ func testRejectAcceptSave(t *testing.T, asm *mqttAccountSessionManager, clientID
 }
 
 // testClosePredecessorAuthority moves a client's SERVING outbound authority to CLOSED — the
-// state an F-105 discarding teardown leaves behind (destroy closes the authority, writes the
+// state an issue #107 discarding teardown leaves behind (destroy closes the authority, writes the
 // receipt and deletes the record). The redrive fixtures stage THIS rather than a bare record
-// change because in F-105 a completed takeover or clean-start release closes the authority; a
+// change because in issue #107 a completed takeover or clean-start release closes the authority; a
 // record mutated under a still-SERVING authority is a shape production never produces, so a
 // re-drive meeting it can neither hand off (no predecessor) nor create (authority serving).
-// See the Gap-2 finding: cancel-restore is correct, the fixture shape was pre-F-105.
+// See the Gap-2 finding: cancel-restore is correct, the fixture shape was pre-issue #107.
 func testClosePredecessorAuthority(t *testing.T, asm *mqttAccountSessionManager, cid string) {
 	t.Helper()
 	epoch := asm.sessStreamEpoch
@@ -565,7 +565,7 @@ func TestReDriveLeavesNoResidentAtBaseZero(t *testing.T) {
 			asm.mu.Unlock()
 		}()
 
-		// F-105 cutover: the accept save is the ownership metadata commit, intercepted at its
+		// issue #107 cutover: the accept save is the ownership metadata commit, intercepted at its
 		// ISSUING phase (before the send). The observer identifies the batch by the record
 		// member's subject rather than by a session pointer, so the T2 object — the connecting
 		// session, resident under its client ID at the save — is looked up here.
@@ -816,7 +816,7 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 }
 
 // TestAcceptAmbiguousMetadataCommitAdoptsByReadback covers the resolved-COMMITTED adoption
-// path (F-105 cutover, Codex consult 10): a metadata commit whose three-member batch LANDED
+// path (issue #107 cutover, Codex consult 10): a metadata commit whose three-member batch LANDED
 // but whose acknowledgement this broker never saw. The accept executor resolves the permanent
 // receipt slot to COMMITTED and adopts the landed record sequence by READBACK — matched by
 // write identity — rather than leaving sess.seq at the stale base. Leaving it stale was the
@@ -1056,24 +1056,24 @@ func TestReDriveT2HandsOverTheAcceptTransaction(t *testing.T) {
 //
 // "Superseded" is a fact about the marker, not about who holds the session: a rival write
 // landed after our claim, and nothing here demonstrates that its author still holds
-// anything (F-084). What the re-drive rests on is our own claim's sequence no longer being
+// anything (issue #86). What the re-drive rests on is our own claim's sequence no longer being
 // current, which is enough on its own.
 //
 // It matters separately because the two arms say different things about what happened.
 // The claim arm deleted nothing; this one ran the deletions first — legitimately, since
 // the claim was won — so the sentinel must not promise "nothing was deleted", and the
 // CONNECT must still re-drive rather than create at the base clear() reset.
-// TestSupersededReleaseReDrivesTheCleanStart was RETIRED in the F-105 cutover (Codex
-// consult 10). It staged the pre-F-105 claim-then-release flow: a teardown WON its marker
+// TestSupersededReleaseReDrivesTheCleanStart was RETIRED in the issue #107 cutover (Codex
+// consult 10). It staged the pre-issue #107 claim-then-release flow: a teardown WON its marker
 // (mqttTestTeardownClaimedHookV), a rival then replaced the marker, and the separate
-// exact-sequence RELEASE removed nothing, so the clean start re-drove. Under F-105 a clean
+// exact-sequence RELEASE removed nothing, so the clean start re-drove. Under issue #107 a clean
 // start over a SERVING authority takes the ATOMIC discarding handoff (opFinalizeHandoff) —
 // there is no separate claim then release, so the teardown-claimed hook never fires on this
 // path and the window it tested is unreachable. The surviving assertion — a superseded
 // clean start re-evaluates its decision and displaces at the winner's sequence rather than
 // writing at the base-0 reset — is covered by TestSessSupersededDiscardReDrivesTheCleanStart
 // (the converted base-0 -> displace-in-place test). NOTE: finalization-loss recovery (a
-// crash after the metadata committed but before finalize) is a DISTINCT F-105 scenario, owed
+// crash after the metadata committed but before finalize) is a DISTINCT issue #107 scenario, owed
 // separately; it must finalize the committed proposal without repeating metadata or
 // restarting clean start, and is NOT what this retired fixture covered.
 
@@ -1466,7 +1466,7 @@ func TestReDriveReReadsAfterASupersededDeferredDiscard(t *testing.T) {
 			t.Error("the discharged discard must hold a record sequence to claim")
 			return
 		}
-		// F-105 shape of the rival's completed clean-start release: the authority is CLOSED and
+		// issue #107 shape of the rival's completed clean-start release: the authority is CLOSED and
 		// the record is gone, so the re-drive's authoritative read finds an absent subject over a
 		// CLOSED generation and makes a genuine first create.
 		testClosePredecessorAuthority(t, asm, cid)
@@ -1625,7 +1625,7 @@ func TestSessSupersededByAnotherMarkerAdoptsIt(t *testing.T) {
 			t.Errorf("landing the teardown marker: %v", err)
 			return
 		}
-		// The F-105 shape of a rival's claimed teardown: the marker stands on the record AND the
+		// The issue #107 shape of a rival's claimed teardown: the marker stands on the record AND the
 		// authority the rival was discarding is CLOSED. Closing it here is what lets the re-drive
 		// adopt the standing teardown and create fresh over a CLOSED generation, rather than meet
 		// a serving authority whose record now carries somebody else's marker.
@@ -1721,7 +1721,7 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 			t.Error("the discard must hold a record sequence to claim")
 			return
 		}
-		// The F-105 shape of "another broker's completed clean-start release": the authority is
+		// The issue #107 shape of "another broker's completed clean-start release": the authority is
 		// CLOSED and the record is gone. Closing the authority is what makes the re-drive create
 		// fresh over a CLOSED generation rather than meet a serving one with no record.
 		testClosePredecessorAuthority(t, asm, cid)
@@ -1966,7 +1966,7 @@ func TestSupersededDiscardIsTerminalForTheConnectionCallers(t *testing.T) {
 			if seq == 0 {
 				return
 			}
-			// F-105 shape of a rival's completed release: CLOSED authority and an absent record.
+			// issue #107 shape of a rival's completed release: CLOSED authority and an absent record.
 			testClosePredecessorAuthority(t, asm, cid)
 			if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
 				t.Errorf("removing the record the discharge is about to claim: %v", derr)
@@ -2031,7 +2031,7 @@ func TestReDriveBudgetsAreIndependentThroughAConnect(t *testing.T) {
 	// that is admissible and the CONNECT is accepted; under one shared counter the cycles
 	// are already spent and the first or second retry is refused.
 	cycles, retries := mqttRecordReDriveCycles-1, mqttRecordCreateRetries
-	// F-105 cutover (Codex consult 10): the accepting CONNECT's save is the ownership metadata
+	// issue #107 cutover (Codex consult 10): the accepting CONNECT's save is the ownership metadata
 	// commit — a three-member atomic batch — which returns BEFORE the removed two-member store
 	// result hook, so the old hook fired zero times and the test proved nothing. The reachable
 	// interception is the ISSUING phase of the metadata batch (fired before the send), matched by

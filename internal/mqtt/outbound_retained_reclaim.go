@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// Reclaiming one retained copy (F-105 7c).
+// Reclaiming one retained copy (issue #107 7c).
 //
 // ONE protocol, re-entrant from any landed predecessor, every fact read from the store:
 //
@@ -137,7 +137,7 @@ func (jsa *mqttJSA) resolveRetainedPayloadDuties(id, epoch, gen, inc string) (mq
 	for _, kind := range []mqttDutyKind{mqttDutyCleanup, mqttDutyProvision} {
 		ord, oerr := jsa.resourceDutyOrdinal(id, epoch, gen, inc, kind)
 		if errors.Is(oerr, errMQTTDutyRetired) {
-			// RECLAIMED BEHIND THE FLOOR (F-112): this runs only at CleanupComplete, where a duty
+			// RECLAIMED BEHIND THE FLOOR (issue #114): this runs only at CleanupComplete, where a duty
 			// no position of a complete scan names was Terminal when the floor retired it.
 			continue
 		}
@@ -160,7 +160,7 @@ func (jsa *mqttJSA) resolveRetainedPayloadDuties(id, epoch, gen, inc string) (mq
 }
 
 // errMQTTDutyRetired reports that no position inside a COMPLETE read of [Lo, Hi] names the duty:
-// the floor retired it (F-112). For a resource at CleanupComplete that means it was RECLAIMED, the
+// the floor retired it (issue #114). For a resource at CleanupComplete that means it was RECLAIMED, the
 // duty having been Terminal; for any other resource it is an inconsistency the caller reports.
 var errMQTTDutyRetired = errors.New("no position inside the inventory names the duty")
 
@@ -183,7 +183,7 @@ func (jsa *mqttJSA) resourceDutyOrdinal(id, epoch, gen, inc string, kind mqttDut
 // findDutyInInventory scans one generation's inventory [Lo, Hi] for the duty match selects.
 //
 // INSIDE THE RANGE a missing or undecodable entry is an inconsistency, exactly as before the floor
-// existed — unless the floor crossed that position while this scan ran (F-112), in which case the
+// existed — unless the floor crossed that position while this scan ran (issue #114), in which case the
 // scan restarts from the new floor; restarts are bounded and each is caused by a floor advance.
 // found is false only after a COMPLETE scan: an error never reads as "not here". A generation with
 // no ledger carries no duty.
@@ -231,10 +231,10 @@ func (jsa *mqttJSA) findDutyInInventory(id, epoch, gen string, match func(*mqttD
 }
 
 // mqttRetainedReclaimKey names one retirement the owner drives: a retained copy's reclamation, or
-// (src) a source consumer's retirement (F-105 7c-lc). A source item whose incarnation is not yet
+// (src) a source consumer's retirement (issue #107 7c-lc). A source item whose incarnation is not yet
 // known — a claim still being arbitrated — is keyed by its claim transaction in inc.
 //
-// A source item is also keyed by the TENURE it decides under (F-105 7f). A decision is recorded
+// A source item is also keyed by the TENURE it decides under (issue #107 7f). A decision is recorded
 // under its own entitlement or not at all, so two items about one consumer decided under different
 // tenures are different work: the displaced one fails on its moved entitlement and is dropped, the
 // serving one proceeds. Keyed on the consumer alone, whichever arrived first swallowed the other —

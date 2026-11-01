@@ -32,7 +32,7 @@ import (
 	"testing"
 )
 
-// The structural half of the pending-entry closure (F-105 cutover checkpoint; plan §5).
+// The structural half of the pending-entry closure (issue #107 cutover checkpoint; plan §5).
 //
 // The property: an entry in pendingPublish or pendingPubRel may ACT only if its kind says so, its
 // kind and evidence are set only by a constructor, and both maps are written only by
@@ -630,7 +630,7 @@ var pendingStructureActs = map[string]int{
 	"trackPublish":               1,
 	"mqttPendingRedeliverable":   1,
 	"resendPendingRedelivery":    1,
-	"mqttProcessPublishReceived": 6, // the duplicate-PUBREC NAK (and its retained re-emission), the resident-inferred ACK guard, and the retained exchange's ACK (F-105 7c)
+	"mqttProcessPublishReceived": 6, // the duplicate-PUBREC NAK (and its retained re-emission), the resident-inferred ACK guard, and the retained exchange's ACK (issue #107 7c)
 	"drainClaimEligibleLocked":   1,
 	"pubRelWriteKindLocked":      3, // the PUBREL callback's exact-kind check at write entry
 }
@@ -943,7 +943,7 @@ var pendingStructureFieldWrites = map[string]int{
 	"recoverInflightRegistersOnce|slot.claim|RESIDENT":              1,
 	"recoverInflightRegistersOnce|slot.seq|RESIDENT":                1,
 	"recoverInflightRegistersOnce|slot.state|RESIDENT":              1,
-	"recoverInflightRegistersOnce|transmitted|RESIDENT":             1, // F-088 Site 4 (ii): a send outcome — same-allocation resident (recoveredResidentEligibleLocked), monotone false->true, under sess.mu; marker debt untouched
+	"recoverInflightRegistersOnce|transmitted|RESIDENT":             1, // issue #90 Site 4 (ii): a send outcome — same-allocation resident (recoveredResidentEligibleLocked), monotone false->true, under sess.mu; marker debt untouched
 	"resolvePubRelIntent|slot.acq|RESIDENT":                         1,
 	"resolvePubRelIntent|slot.seq|RESIDENT":                         1,
 	"resolvePubRelIntent|slot.state|RESIDENT":                       1,
@@ -987,7 +987,7 @@ var pendingStructureEscapes = map[string]int{
 	"captureRecoveryReservationsLocked|ARG mqttRecoveryReservation": 2,
 	"captureRecoveryReservationsLocked|INLIT":                       2,
 	"commitRecoveryReleaseLocked|ARG delete":                        2,
-	// TWO since F-088 WP3 edit 5: the cancelled arm's register-only landing removes only our
+	// TWO since issue #90 WP3 edit 5: the cancelled arm's register-only landing removes only our
 	// placeholder (identifier kept excluded), beside the arm's original removal.
 	"confirmInflightRegister|ARG delete":                                 2,
 	"confirmInflightRegister|ARG mqttExpectExactly":                      1,
@@ -1011,7 +1011,7 @@ var pendingStructureEscapes = map[string]int{
 	"handOffPublishEntryLocked|ARG delete":                               1,
 	"handOffRecoveryPublishLocked|ARG delete":                            1,
 	"handOffRecoveryPublishLocked|ARG mqttRecoveryReservation":           1,
-	// F-088 WP2: an UNANSWERED removal reads the entry's send evidence and builds its AckRoute
+	// issue #90 WP2: an UNANSWERED removal reads the entry's send evidence and builds its AckRoute
 	// from the entry (never from a record read), inside untrackPublishEntry.
 	"installAckRouteForRemovalLocked|ARG mqttEntrySendEvidence":         1,
 	"installAckRouteForRemovalLocked|ARG newMQTTAckRouteBinding":        1,
@@ -1117,7 +1117,7 @@ var pendingStructureEscapes = map[string]int{
 	"recoverInflightRegistersOnce|ARG mqttRecoveryPendingMatches":       1,
 	"recoverInflightRegistersOnce|ARG mqttRecoveryReplaceable":          1,
 	"recoverInflightRegistersOnce|ARG reactivateDemotedLocked":          1,
-	"recoverInflightRegistersOnce|ARG recoveredResidentEligibleLocked":  1, // F-088 Site 4 (i): READ-ONLY eligibility (same allocation, ordinary acting, custody-held, lineage not ended) under sess.mu; writes nothing, no escapes of its own
+	"recoverInflightRegistersOnce|ARG recoveredResidentEligibleLocked":  1, // issue #90 Site 4 (i): READ-ONLY eligibility (same allocation, ordinary acting, custody-held, lineage not ended) under sess.mu; writes nothing, no escapes of its own
 	"recoverInflightRegistersOnce|ARG recoveryInstallRefusedLocked":     1,
 	"recoverInflightRegistersOnce|ARG recoveryRestoreRefusedLocked":     3,
 	"recoverInflightRegistersOnce|ARG setPendingLocked":                 11,

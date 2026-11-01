@@ -23,11 +23,11 @@ import (
 )
 
 // The name matches `make cluster-failover-tests`' regex (TestMQTTSharedGroup.*Replicated),
-// which F-077 extended for exactly this reason: a replicated test the target does not run is
+// which issue #79 extended for exactly this reason: a replicated test the target does not run is
 // a test nobody runs.
 
-// TestMQTTSharedGroupLiveSubscribeArbitratedReplicated is F-078's case, and the counterpart
-// to F-077's resume fixture.
+// TestMQTTSharedGroupLiveSubscribeArbitratedReplicated is issue #80's case, and the counterpart
+// to issue #79's resume fixture.
 //
 // It drives the REAL production order — a live SUBSCRIBE through mqttProcessSubs, the
 // ownership CAS, and its disposition tail — rather than installing a gate state by hand. A
@@ -37,7 +37,7 @@ import (
 // The ordering is load-bearing, and the same two dead ends apply as on the resume side:
 //
 //   - a takeover BEFORE the SUBSCRIBE's own writes would be arbitrated by the packet's
-//     ordinary record save, so the fixture would re-prove F-029 rather than this item;
+//     ordinary record save, so the fixture would re-prove issue #31 rather than this item;
 //   - a takeover that DELETES the group durable would be caught by an earlier verdict, in a
 //     build with the ownership write removed too. So a SECOND, different-client member holds
 //     the group throughout: the durable stays present and canonical, and A is refused by the
@@ -46,7 +46,7 @@ import (
 // It kills two mutations. M1 — discard the trigger and skip the proof, which is what `main`
 // does. And M33 — collapse the Foreign arm into a non-disposing refusal, which the earlier
 // "first packet is not a SUBACK" oracle PASSED, because every other refusal in the tail is
-// also not a SUBACK. The oracle below therefore asserts the DISPOSAL positively: F-084 gave
+// also not a SUBACK. The oracle below therefore asserts the DISPOSAL positively: issue #86 gave
 // Foreign the same 0x89 and Reason String as Forked, so no byte on the wire separates them
 // any more, and the disposal is the fact the old 0x8E assertion stood proxy for.
 //
@@ -151,11 +151,11 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 	if !arbitrated.Load() {
 		t.Fatal("the live SUBSCRIBE never reached the ownership write: without it there is " +
 			"nothing for B's takeover to be observed by, and this fixture proves nothing " +
-			"about F-078")
+			"about issue #80")
 	}
 
 	// A's FIRST packet must be a DISCONNECT, and the DISPOSAL must have happened. Both,
-	// because F-084 took away the observable this fixture used to lean on.
+	// because issue #86 took away the observable this fixture used to lean on.
 	//
 	// It used to require 0x8E, on the reasoning that the code was reachable only from the
 	// Foreign arm after disposeForeignStateLocked, while Forked, Local and an unresolvable
@@ -187,7 +187,7 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 		t.Fatalf("broker A got packet %#x reason %#x after a record CAS its own takeover "+
 			"caused; want DISCONNECT %#x with 0x89 ownership-unsettled. A takeover is NOT "+
 			"claimed here: A observed a moved record, which establishes that the session is "+
-			"no longer A's and nothing about who holds it (F-084)",
+			"no longer A's and nothing about who holds it (issue #86)",
 			pt&mqttPacketMask, reason, mqttPacketDisconnect)
 	}
 
@@ -216,7 +216,7 @@ func TestMQTTSharedGroupLiveSubscribeArbitratedReplicated(t *testing.T) {
 			t.Fatal("broker A's packet was refused but its session was NOT disposed: the " +
 				"Foreign arm must detach and evict it, or A keeps serving a group the " +
 				"record no longer carries for it. Forked and Local refuse WITHOUT " +
-				"disposing, and since F-084 they are indistinguishable from Foreign on " +
+				"disposing, and since issue #86 they are indistinguishable from Foreign on " +
 				"the wire, so this is the assertion that separates them")
 		}
 		time.Sleep(20 * time.Millisecond)

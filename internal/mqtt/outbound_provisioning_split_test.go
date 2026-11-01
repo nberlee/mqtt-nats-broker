@@ -18,7 +18,7 @@ package mqtt
 import "testing"
 
 // TestF105LogicalUseKindAbandonsWithoutASeal pins the source/PUBREL half of the provisioning
-// split (F-105 cutover, consult 4). A source or PUBREL consumer's create is an unfenceable
+// split (issue #107 cutover, consult 4). A source or PUBREL consumer's create is an unfenceable
 // queued request, so it never produces a provisioning SEAL; its lifecycle is arbitrated by the
 // name-ownership record instead. So its provisioning duty resolves on the claim, its cleanup is
 // authorizable with nothing depending on it though unsealed, authorizing deletion retires the
@@ -57,7 +57,7 @@ func TestF105LogicalUseKindAbandonsWithoutASeal(t *testing.T) {
 
 	// Its CLEANUP with nothing depending on it is WITHHELD while it serves — an idle consumer is
 	// not an ended one — and OWES the authorizing CAS once a route disposes of it, though it is
-	// unsealed: a delayed create is fenced by name ownership, not by a seal (F-105 7c-lc).
+	// unsealed: a delayed create is fenced by name ownership, not by a seal (issue #107 7c-lc).
 	cleanup := &mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 2,
 		Kind: mqttDutyCleanup, Ref: "inc-lu", State: mqttDutyNotYetActionable}
 	if v := jsa.classifyOutstandingDuty(e.id, e.epoch, testF105Gen, cleanup); v.Disposition != mqttDutyWithheld {

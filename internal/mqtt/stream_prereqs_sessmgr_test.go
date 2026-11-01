@@ -243,7 +243,7 @@ func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
 //
 // This replaces the per-stream "recovery" subtests that used to delete ONE
 // stream and expect success — the procedure they proved is the one this change
-// withdraws (F-066).
+// withdraws (issue #70).
 func TestBrokerStreamBundleResetRecovers(t *testing.T) {
 	t.Parallel()
 	s, c, nc := newBringUpServer(t)

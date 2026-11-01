@@ -15,7 +15,7 @@ package mqtt
 
 import "testing"
 
-// T15 — THE ORDINARY-SOURCE SINKS REFUSE A RETAINED REGISTER fed to them directly (F-105 7c): each
+// T15 — THE ORDINARY-SOURCE SINKS REFUSE A RETAINED REGISTER fed to them directly (issue #107 7c): each
 // answers its fail-closed value — Unknown, no completion, no settlement, no restoration match, not
 // cached — and counts the refusal. The behavioural tests assert the count stays zero on every
 // assembled route; this pins that each sink would refuse were the routing ever wrong.

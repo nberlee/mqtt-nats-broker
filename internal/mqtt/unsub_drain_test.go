@@ -410,9 +410,9 @@ func TestMQTTDrainRefusedUnderStreamConsumerLimit(t *testing.T) {
 		t.Fatal("refusing to drain must warn that started QoS 1/2 deliveries are being dropped and [MQTT-3.10.4-3] is not honored")
 	}
 
-	// And the fallback is NO LONGER a destructive teardown (F-105 7c-lc). The started delivery's
+	// And the fallback is NO LONGER a destructive teardown (issue #107 7c-lc). The started delivery's
 	// obligation holds its source consumer, so the UNSUBSCRIBE's disposal decision waits for that
-	// obligation's ending: deleting the consumer under it is the defect F-105 removes. The consumer
+	// obligation's ending: deleting the consumer under it is the defect issue #107 removes. The consumer
 	// survives while the delivery is outstanding...
 	time.Sleep(time.Second)
 	if ci, err := sess.jsa.lookupConsumer(mqttStreamName, subDur); err != nil || ci == nil {
@@ -800,7 +800,7 @@ func TestMQTTDrainLevelUpCoversBothConsumers(t *testing.T) {
 // TestMQTTDrainSurvivesConsumerInactivityThreshold is test 25: a drain must outlive an
 // offline period.
 //
-// Under the F-105 cutover the enrolled source consumer is created with NO inactivity
+// Under the issue #107 cutover the enrolled source consumer is created with NO inactivity
 // threshold (mqttClearConsumerInactivity), because its lifetime is its resource's, not a
 // timer's; the broker has no per-consumer inactivity option at all. So there is no
 // per-consumer timer for the drain to shed: it is SAFE FROM BIRTH, and it survives the
@@ -861,7 +861,7 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 // TestMQTTDrainInactivityClearRetriedOnResume was RETIRED with the mechanism it tested.
 //
 // It pinned the best-effort per-consumer inactivity-timer clear and its retry on resume
-// (clearDrainInactivityTimers). The F-105 cutover deleted that mechanism: an enrolled
+// (clearDrainInactivityTimers). The issue #107 cutover deleted that mechanism: an enrolled
 // source consumer is created with NO inactivity threshold from the outset, so there is
 // no timer to clear at commit and no un-cleared-drain state to retry — the scenario this
 // test simulated by re-imposing the timer out of band is unreachable through the
@@ -1521,7 +1521,7 @@ func TestMQTTForcedSharedLeaveAmbiguousSaveKeepsTheRemoval(t *testing.T) {
 	defer restoreRead()
 	// The readback suppression is armed ONLY once the forced-leave write is intercepted, not
 	// before the CONNECT. The accepting CONNECT's own save is now the outbound-ownership metadata
-	// commit (F-105 cutover), and its handoff predecessor check READS $MQTT_sess; arming the
+	// commit (issue #107 cutover), and its handoff predecessor check READS $MQTT_sess; arming the
 	// suppression up front would fail that read and refuse the accept before the forced-leave
 	// write ever runs. Suppressing it at the moment the forced-leave response is lost keeps the
 	// resolver from settling that specific ambiguous write, which is the whole point.
@@ -1914,7 +1914,7 @@ func TestQuarantinedCompanionDrainRefusesTheWholeFilterOverSubscribe(t *testing.
 		}
 	}
 	// The main sid keeps its plain PUBLISH-phase claim above, so it stays UNHELD even after
-	// F-094 widened the predicate to every past-PUBREC intent — which is the precondition
+	// issue #96 widened the predicate to every past-PUBREC intent — which is the precondition
 	// for the partial adoption this test exists to prevent.
 	usable := sess.drainSidHoldLocked(mainSid) == mqttDrainNotHeld
 	sess.mu.Unlock()

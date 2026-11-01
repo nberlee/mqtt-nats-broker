@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// The incarnation completion lease (F-036 unit 1). These are the mechanism's own
+// The incarnation completion lease (issue #40 unit 1). These are the mechanism's own
 // tests: the ledger's semantics, the permit that makes property P mechanical, and the
 // structural guards that keep the acquisition boundaries boundaries rather than lists.
 //
@@ -192,7 +192,7 @@ func TestMQTTTrackerPendingInstallOnAnAlreadyDrainedCycle(t *testing.T) {
 }
 
 // The permit is what makes property P mechanical. It refuses while a client is bound —
-// which is the exact violation F-036's clean-start arm committed for years — and while
+// which is the exact violation issue #40's clean-start arm committed for years — and while
 // any owner remains.
 func TestMQTTRetirementPermitEnforcesPropertyP(t *testing.T) {
 	t.Parallel()
@@ -458,7 +458,7 @@ func TestMQTTDisposeCapturedUsesTheCapsuleNotTheSession(t *testing.T) {
 		t.Fatal("the disposition must carry the RETIRING incarnation's Will fence")
 	}
 	// A successor is held in hand, which is the only thing that licenses discarding a
-	// live Will (F-084).
+	// live Will (issue #86).
 	if d.will != mqttWillActionSettleOnTakeover {
 		t.Fatalf("a licensed capture with a live connection discards the Will, got %v", d.will)
 	}
@@ -525,7 +525,7 @@ func TestMQTTLeasedHandlerRefusalDoesNotWriteTheFreshIncarnation(t *testing.T) {
 // this mechanism is bookkeeping around this one property — an already-admitted route
 // of the displaced incarnation completes before the generation is re-minted, so it can
 // never derive a subject, answer a packet, or mutate a map under the fresh incarnation.
-// That is the property F-036's clean-start arm violated, and losing an acknowledged
+// That is the property issue #40's clean-start arm violated, and losing an acknowledged
 // QoS 2 message was the observable cost.
 func TestMQTTRetirementWaitsForAnAdmittedRoute(t *testing.T) {
 	e := testNewInflightEnv(t, "lease-drain-waits")
@@ -618,7 +618,7 @@ func TestMQTTRetirementCeilingRefusesAndPreservesTheIncumbent(t *testing.T) {
 	if boundAfter != e.c {
 		t.Fatal("the ceiling must leave the INCUMBENT bound: detaching it here would " +
 			"strand its close, notification, Will, disconnect stamp and expiry with no " +
-			"successor established (F-084)")
+			"successor established (issue #86)")
 	}
 	if genAfter != gen {
 		t.Fatal("the ceiling must not re-mint: that is disposal under a live owner")

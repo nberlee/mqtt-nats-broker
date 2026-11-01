@@ -1,6 +1,6 @@
 //go:build mqtt_fulltests
 
-// End-to-end coverage for F-076: a resume must PROVE its shared group durable exists and
+// End-to-end coverage for issue #78: a resume must PROVE its shared group durable exists and
 // is usable before it restores the membership into it.
 //
 // Every test here has to reach the RESIDENT arm, and that is the hard part. A fresh
@@ -56,13 +56,13 @@ func testSharedResidentSession(t *testing.T, b *testSharedBroker, id, durable st
 }
 
 // T1. The defect itself: a group durable deleted out of band between a disconnect and a
-// resume. Before F-076 the reconnect was ACCEPTED with Session Present = 1 and the client
+// resume. Before issue #78 the reconnect was ACCEPTED with Session Present = 1 and the client
 // held a subscription on a subject nothing publishes to, forever and silently.
 //
-// F-076 REFUSED that resume. F-077 REPAIRS it, and this fixture was rewritten rather than
+// issue #78 REFUSED that resume. issue #79 REPAIRS it, and this fixture was rewritten rather than
 // relaxed: the assertion it used to make — CONNACK 0x83, reason "does not exist" — pinned a
-// behaviour F-076's own docs/CONFORMANCE.md entry called a residual and assigned to F-077
-// ("Making recovery the broker's own job is F-077"). What it asserts now is strictly MORE
+// behaviour issue #78's own docs/CONFORMANCE.md entry called a residual and assigned to issue #79
+// ("Making recovery the broker's own job is issue #79"). What it asserts now is strictly MORE
 // than before: the resume succeeds, the durable exists again carrying the canonical
 // configuration, and the ownership CAS that licenses serving it actually ran.
 //
@@ -85,13 +85,13 @@ func TestMQTTSharedGroupAbsentDurableRepairsTheResume(t *testing.T) {
 	c, _, reason, _ := testSharedResidentReconnect(t, b, "absentA", 300)
 	defer c.Close()
 	if reason != mqttConnAckRCConnectionAccepted {
-		t.Fatalf("resume with an absent group durable got CONNACK reason 0x%x, want 0x%x: F-077 "+
+		t.Fatalf("resume with an absent group durable got CONNACK reason 0x%x, want 0x%x: issue #79 "+
 			"recreates the durable rather than refusing the session",
 			reason, mqttConnAckRCConnectionAccepted)
 	}
 	// The repair is the point, so the durable's EXISTENCE is the oracle — an accepted
 	// CONNACK alone would also be produced by a build that skipped the verification
-	// entirely, which is the F-076 defect this file exists to hold down.
+	// entirely, which is the issue #78 defect this file exists to hold down.
 	ci, lerr := b.jsa.lookupConsumer(mqttStreamName, durable)
 	if lerr != nil || ci == nil {
 		t.Fatalf("the resume was accepted but the group durable %q was not recreated: %v", durable, lerr)
@@ -380,7 +380,7 @@ func TestMQTTSharedGroupLevelUpCompanionIsRepairedToo(t *testing.T) {
 			defer c2.Close()
 			_, reason, _ := testMQTTReadConnAckV5(t, r2)
 			if reason != mqttConnAckRCConnectionAccepted {
-				t.Fatalf("deleting %s left the resume REFUSED (0x%x): F-077 repairs an "+
+				t.Fatalf("deleting %s left the resume REFUSED (0x%x): issue #79 repairs an "+
 					"authoritatively absent group durable", tc.name, reason)
 			}
 			// The companion is verified — and now repaired — ON ITS OWN ACCOUNT. Asserting

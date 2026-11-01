@@ -23,7 +23,7 @@ import (
 // subscriptions, so every per-filter restore failure was silently dropped: the
 // record kept the membership, no queue subscription and no group consumer
 // existed, and the client — which is not required to re-subscribe — held a
-// Session-Present connection whose subscription delivered nothing (F-050).
+// Session-Present connection whose subscription delivered nothing (issue #54).
 //
 // The fix moves restoration to the other side of the CONNACK, which makes it one
 // more thing that can refuse the CONNECT through the pre-CONNACK abort
@@ -198,7 +198,7 @@ const (
 
 // A delivery callback does NOT consult this gate on its own. It calls
 // awaitTransmissionGates, which waits on this verdict and the live SUBSCRIBE packet's
-// together under one absolute deadline (F-078). Two sequential waits would permit nearly
+// together under one absolute deadline (issue #80). Two sequential waits would permit nearly
 // twice the intended cap, and a callback that satisfied only one of them could transmit
 // under interest the other had not authorised.
 //
@@ -285,7 +285,7 @@ func mqttSharedNamesDurable(group, subject string, inc uint64) string {
 // attempt has not written to yet, so it refunded nothing and the charge outlived its membership for the
 // life of the resident session — not as a double count (processSharedJSConsumer does not
 // re-charge a durable already in sharedCharged) but as budget permanently spent, which the
-// MaxAckPending ceiling then refuses later joins against. F-082 keyed that release on the
+// MaxAckPending ceiling then refuses later joins against. issue #84 keyed that release on the
 // filter's own names instead; see releaseSharedGroupTarget.
 //
 // No lock held on entry.
@@ -356,9 +356,9 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 // So the guarantee is withdrawn rather than approximated a third time. HEAD already
 // treats this boundary as "defensive breadth rather than a pinned behavior" and
 // names the same consequence, the population that reaches it through a REFUSED
-// resume is new to this change, and the DUP derivation itself is F-072's — an open
+// resume is new to this change, and the DUP derivation itself is issue #76's — an open
 // alpha blocker for deriving the MQTT flag from the JetStream delivery count. The
-// lost prompt NAK is not F-072's, so it is stated as this change's own residual in
+// lost prompt NAK is not issue #76's, so it is stated as this change's own residual in
 // `docs/CONFORMANCE.md`. Closing it needs a real admission boundary, which is a
 // mechanism this item does not justify.
 //
@@ -391,7 +391,7 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 //     marker it would write cannot survive to be consumed, because deferredNaksLocked
 //     DELETES the sess.deferred key before NAKing it and any acknowledgement in the
 //     interval consumes the very fact that would clear DUP. Such a delivery is
-//     re-offered by AckWait and carries DUP=1 until F-072 moves the derivation off
+//     re-offered by AckWait and carries DUP=1 until issue #76 moves the derivation off
 //     the JetStream delivery count. Stated in docs/CONFORMANCE.md.
 //
 // The doomed case is not hypothetical, and it is why the rule lives here rather

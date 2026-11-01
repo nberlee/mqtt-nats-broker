@@ -8,7 +8,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// The matcher decides every authorization outcome in F-079 and F-081, and it is
+// The matcher decides every authorization outcome in issue #81 and issue #83, and it is
 // the one part with no broker in the loop, so it is tested here rather than
 // inferred from an end-to-end fixture. Each case names the rule it encodes; a
 // row whose expected value is the type's zero value is called out, because such

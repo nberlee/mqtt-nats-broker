@@ -17,7 +17,7 @@ package mqtt
 
 import "testing"
 
-// F-116: a PUBREL attempt's PUBCOMP unit is taken before its write and given back only when its
+// issue #118: a PUBREL attempt's PUBCOMP unit is taken before its write and given back only when its
 // frame was provably not emitted. The client answers exactly the PUBRELs it received, so a unit
 // kept for one it never received holds the identifier for the connection's life.
 //

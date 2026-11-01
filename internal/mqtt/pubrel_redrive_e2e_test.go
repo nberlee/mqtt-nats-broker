@@ -27,7 +27,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// THE REDRIVE WAITER ON THE WIRE (F-098).
+// THE REDRIVE WAITER ON THE WIRE (issue #100).
 //
 // The unit gates in pubrel_redrive_test.go prove what the waiter does with each blocker.
 // These prove the windows are REACHED by an ordinary client, that nothing escapes while a

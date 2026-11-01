@@ -27,7 +27,7 @@ var mqttTestSameConnectionResendRefusedHook = new(mqttKnob[func(packet byte, pi 
 
 // pubRelHeldOnLocked is the send hold under pi when a PUBREL under it possibly reached cc and is
 // unanswered: the hold's PUBCOMP debt stands and is owed by cc. Nil otherwise. Units for provably
-// unemitted frames are given back (F-116), and the identifier cannot change exchange while the
+// unemitted frames are given back (issue #118), and the identifier cannot change exchange while the
 // debt stands, so this is a fact about THIS exchange's PUBREL on THIS connection. A predecessor's
 // debt is not cc's: the opener resets it. The one reader of the registry for this fact.
 //

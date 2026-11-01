@@ -18,7 +18,7 @@ import (
 // the header-encoded record is the value, an empty body is the deletion, and
 // each broker's own consumer applies both to its volatile index. These tests
 // exercise that path across two brokers and against records the broker cannot
-// decode, which is the coverage F-056 needed before the development-era
+// decode, which is the coverage issue #60 needed before the development-era
 // compatibility readers (JSON fallback, tombstone delete marker, the "RD"
 // delete notification) could be removed.
 
@@ -271,7 +271,7 @@ func TestRetainedCrossBrokerConvergence(t *testing.T) {
 	// The durable residue of the deletion: the tombstone is the subject's last
 	// record, and it is the ONLY record for that subject — MaxMsgsPer=1 evicted
 	// the message it replaced when it was stored, empty body or not. This is the
-	// premise the removal of the compaction delete rests on (F-056), so it is
+	// premise the removal of the compaction delete rests on (issue #60), so it is
 	// asserted rather than assumed. A failure would not by itself resurrect the
 	// predecessor — an ordered replay and a last-per-subject read both still land
 	// on the tombstone — but it would mean the stream retains superseded records
@@ -393,7 +393,7 @@ func TestRetainedCorruptReplacementEvictsCachedPredecessor(t *testing.T) {
 // TestRetainedEvictionClearsCacheWithoutIndexEntry covers the state in which the
 // cached copy outlives the index entry. An exact-filter subscription caches
 // unconditionally while only the consumer callback and the local seed ever
-// index, so cache-present with index-absent is reachable — F-059's first arm.
+// index, so cache-present with index-absent is reachable — issue #63's first arm.
 // A decode-failure eviction that gave up as soon as the index had no entry
 // would leave the predecessor cached, and a later valid add re-indexes the
 // subject without refreshing the cache, making that predecessor servable again.
@@ -440,11 +440,11 @@ func TestRetainedEvictionClearsCacheWithoutIndexEntry(t *testing.T) {
 
 // TestRetainedDelayedTombstoneKeepsNewerRecord pins the reason the compaction
 // delete beside the removed RD notification had to go, rather than being carried
-// forward as harmless. Before F-059 the index writers were unarbitrated: when a tombstone's
+// forward as harmless. Before issue #63 the index writers were unarbitrated: when a tombstone's
 // consumer callback is delayed past a newer live publish, the sequence it reads
 // back out of the index is the NEWER record's. Acting on that observation with an
 // explicit stream delete destroys the authoritative current record — durable data
-// loss. With the delete gone, and the index ordered by stream sequence (F-059),
+// loss. With the delete gone, and the index ordered by stream sequence (issue #63),
 // the same reordering costs nothing at all: the older tombstone is refused.
 func TestRetainedDelayedTombstoneKeepsNewerRecord(t *testing.T) {
 	t.Parallel()
@@ -514,7 +514,7 @@ func TestRetainedDelayedTombstoneKeepsNewerRecord(t *testing.T) {
 
 	// The newer record's callback announcing itself proves the tombstone
 	// callback has already RETURNED, since one subscription's callbacks are
-	// serialized. The index is ordered by stream sequence (F-059), so the delayed
+	// serialized. The index is ordered by stream sequence (issue #63), so the delayed
 	// tombstone, OLDER than the seeded v2, removed nothing: the entry must be live
 	// at this moment, before the v2 callback is applied, not merely restored by it.
 	requireEntered(false)

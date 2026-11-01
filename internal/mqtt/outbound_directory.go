@@ -20,7 +20,7 @@ import (
 	"strings"
 )
 
-// The recovery directory and its sweep cursor (F-105, row 6).
+// The recovery directory and its sweep cursor (issue #107, row 6).
 //
 // # Who resumes work after a restart: nobody in particular
 //
@@ -208,7 +208,7 @@ func mqttValidateDirShard(s *mqttDirShard, wantShard uint64) error {
 //
 // # Why this rides the closing batch and not a write of its own
 //
-// Every F-105 class lives on $MQTT_inflight, and a JetStream atomic batch is per stream, so the
+// Every issue #107 class lives on $MQTT_inflight, and a JetStream atomic batch is per stream, so the
 // closure, the enrolment, the sealed ledger, the header and the root commit together or not at
 // all. A second write after the closure would leave a crash window in which a sealed, enrolled,
 // CLOSED generation has no root — which the release gate refuses for ever, and which could only
@@ -610,7 +610,7 @@ func mqttRollSweep(cur *mqttRecoveryRoot, newBound uint64) (*mqttRecoveryRoot, e
 //  2. this sweep examined every ordinal from SweepStart through Bound;
 //  3. its accumulator is empty;
 //  4. the authoritative ledger is SEALED with SealedHi == Bound;
-//  5. every position the floor retired is physically deleted, Del == Lo (F-112). Recovery is the
+//  5. every position the floor retired is physically deleted, Del == Lo (issue #114). Recovery is the
 //     named discovery owner of deletions already authorized below a sealed floor, so the root
 //     may not go while any remain: a retired root would leave them nobody's.
 //
@@ -654,7 +654,7 @@ type mqttSweptDuty struct {
 	// for a resolved one.
 	Why string
 	// Census marks a RESOLVED exchange duty of a DISCARDED generation, returned so its discard
-	// work can be judged (F-105 7d): it is unresolved only if that work remains, which the visit
+	// work can be judged (issue #107 7d): it is unresolved only if that work remains, which the visit
 	// decides when it classifies the entry, never the batch read.
 	Census bool
 }
@@ -670,7 +670,7 @@ type mqttSweptDuty struct {
 //
 // nil means uncharged, which is every caller that is not the recovery pass.
 //
-// census is set for a root whose generation's closure DISCARDS (F-105 7d): a RESOLVED exchange
+// census is set for a root whose generation's closure DISCARDS (issue #107 7d): a RESOLVED exchange
 // duty is then returned too, flagged Census and kept OUT of LowestUnresolved — whether its
 // obligation still owes discard work is the visit's classification to decide, at its own charge,
 // and an entry the visit never classifies is never advanced past (visitRecoveryRoot).
@@ -684,7 +684,7 @@ func (jsa *mqttJSA) sweepOneBatchCharged(r *mqttRecoveryRoot,
 		return nil, mqttSweepOutcome{}, nil
 	}
 	idHash := getHash(r.ID)
-	// THE FLOOR (F-112): every position below it is RETIRED, its duty reclaimed or carried to a
+	// THE FLOOR (issue #114): every position below it is RETIRED, its duty reclaimed or carried to a
 	// representative inside [Lo, Hi], so the sweep accounts the whole retired prefix examined and
 	// resolved in CONSTANT time, without a read or a charge, and its bounded batch starts at
 	// max(Resume, Lo). A sealed generation's floor is frozen, so this is read once per batch.

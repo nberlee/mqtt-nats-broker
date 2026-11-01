@@ -6,7 +6,7 @@
 // Broker A reads the slot, pauses before transmitting; broker B performs the peer terminal
 // release; a later exchange installs a new slot under that identifier; A resumes and
 // transmits the stale PUBREL under an identifier another exchange now owns. That is
-// F-092's whole population. `sendsInFlight` is process-local and fences nothing across
+// issue #94's whole population. `sendsInFlight` is process-local and fences nothing across
 // brokers, so moving the read closer to the write only narrows the window.
 //
 // A successful CAS is different in kind: it establishes an invariant that REMAINS TRUE
@@ -50,7 +50,7 @@ var errMQTTPubRelIntentNotRecorded = errors.New(
 // intendPubRelSlot records, DURABLY AND BEFORE THE STORE, that this exchange is past
 // PUBREC and owes a canonical PUBREL record.
 //
-// This is F-098's R-a: the handoff used to store the PUBREL on `$MQTT_out` and re-phase
+// This is issue #100's R-a: the handoff used to store the PUBREL on `$MQTT_out` and re-phase
 // the register only afterwards, and JetStream batches are PER STREAM, so nothing made the
 // pair atomic. A crash in between left an ordinary `publish` slot — indistinguishable
 // from a delivery that never reached PUBREC — which a peer may legitimately reap, freeing
@@ -94,7 +94,7 @@ func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqtt
 	if sess.asm == nil {
 		return mqttPubRelIntentUnresolved // nothing durable can be read or written
 	}
-	// A RETAINED exchange's canonical PUBREL is created by this advance (F-105 7c), under an
+	// A RETAINED exchange's canonical PUBREL is created by this advance (issue #107 7c), under an
 	// identity minted ONCE per decision so a re-attempt names the same record. Retained is the
 	// RECORD's arm, never the entry's kind: an abandoned exchange answers through the ACK-only
 	// snapshot, which is a Hold.
@@ -191,7 +191,7 @@ const mqttPubRecAdvanceAttempts = 8
 
 // The AUTHORITY-CONTENTION WAIT, one definition shared by the foreground writers that re-attempt an
 // authority transition against a burst of same-session writes (the PUBREC advance; the SUBSCRIBE
-// name claim against the retained driver, F-105 7c consult 104). Each writer keeps its own budget.
+// name claim against the retained driver, issue #107 7c consult 104). Each writer keeps its own budget.
 const (
 	mqttAuthorityContentionWaitMin    = 10 * time.Millisecond
 	mqttAuthorityContentionWaitJitter = 15 * time.Millisecond
@@ -286,7 +286,7 @@ const (
 	// identity-bound resolver decides later (scheduleIntentResolution).
 	mqttPubRelIntentUnresolved
 	// mqttPubRelIntentStillOwed: the successful PUBREC is STILL OWED for this bound allocation,
-	// and the resolution worker retries intendPubRelSlot for it (F-088 WP2, R6-F1; renamed from
+	// and the resolution worker retries intendPubRelSlot for it (issue #90 WP2, R6-F1; renamed from
 	// "Abandoned"). Two bound allocations reach it: a HandBack whose register is
 	// delivery_abandoned (an abandonment is not a rollback to PUBLISH), and an AckRoute whose
 	// register still reads `publish` at the binding's own acquisition — exactly where a failed
@@ -306,7 +306,7 @@ func (o mqttPubRelIntentOutcome) intentRecorded() bool {
 }
 
 // mqttTestResolverAckRoutePublish fires at ENTRY to the resolver's ordinary-publish AckRoute
-// decision, before the acquisition comparison (F-097 T29/M37/M38 witness): the allocation, the
+// decision, before the acquisition comparison (issue #99 T29/M37/M38 witness): the allocation, the
 // register's acquisition and the binding's. Nil in production.
 var mqttTestResolverAckRoutePublish = new(mqttKnob[func(alloc string, curAcq, bindingAcq uint64)])
 
@@ -364,7 +364,7 @@ func (sess *mqttSession) resolvePubRelIntent(c *client, ack *mqttPending) (out m
 	case cur.State == mqttInflightPublish:
 		if b := ack.slot.abandonedAck; b != nil {
 			if b.role == mqttAckRoleAckRoute {
-				// AN ACKROUTE'S REGISTER WAS NEVER RE-PHASED (F-088 WP2, R6-F1): `publish` is exactly
+				// AN ACKROUTE'S REGISTER WAS NEVER RE-PHASED (issue #90 WP2, R6-F1): `publish` is exactly
 				// where a failed first intent attempt leaves it, so the client's successful PUBREC
 				// is still owed — for THIS transmission only. The allocation matched above
 				// (subject, PI, nonce, lineage, source, QoS) and the binding belongs to this
@@ -437,7 +437,7 @@ func (sess *mqttSession) scheduleIntentResolution(c *client, pi uint16, removed 
 // `publish -> pubrel_ready` arrow, writing the canonical PUBREL record's identity.
 //
 // This REPLACES the register deletion that used to end a register's life at PUBREC. The
-// difference is the whole point of F-092: before, the identifier's authority moved from
+// difference is the whole point of issue #94: before, the identifier's authority moved from
 // the register to the correlated PUBREL record on $MQTT_out, leaving it described by two
 // independently changing durable sets read by two non-transactional scans, with nothing
 // able to arbitrate between them. Now one record owns the exchange for its whole life.
@@ -765,7 +765,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 
 	// ARM FIRST. The holder is installed tentative and its abort armed before the request
 	// goes out, so a CAS that lands while this goroutine is unwinding still has an owner
-	// that will drain it. Its pre-submit F-105 identity is fixed here too, before any I/O.
+	// that will drain it. Its pre-submit issue #107 identity is fixed here too, before any I/O.
 	act = &mqttSendAction{
 		token: token,
 		state: mqttSendActionTentative,
@@ -850,7 +850,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 }
 
 // acquirePubRelThroughAuthority takes an ORDINARY PUBREL acquisition as ONE authority batch
-// (F-105 row 2, §4.3 point 1): the output-custody token installed on the register at its exact
+// (issue #107 row 2, §4.3 point 1): the output-custody token installed on the register at its exact
 // read sequence BESIDE the create-only action record, arbitrated by the serving authority — in
 // place of the standalone slot CAS, never beside it. rebind, for the direct arrow, also moves the
 // slot `pubrel_intended -> pubrel_ready` and installs the canonical PUBREL the delivery proved.
@@ -865,7 +865,7 @@ func (sess *mqttSession) mqttAcquirePubRelAction(c *client, ref mqttInflightSlot
 //
 // Session lock NOT held on entry.
 // wantCanonical is the canonical PUBREL sequence the caller validated its delivered record against,
-// for a READY acquisition (F-105 7b): the helper refreshes its base on every attempt, and neither
+// for a READY acquisition (issue #107 7b): the helper refreshes its base on every attempt, and neither
 // matchesRecord nor the acquisition-base check compares the canonical tuple, so a callback that
 // validated record S and paused could otherwise acquire against a slot rebound to a new record N.
 // Zero for the intended->ready direct arrow, which INSTALLS the tuple it carries in rebind.
@@ -908,7 +908,7 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 		cur, smsg, lerr := as.loadInflightRecord(ref.name.subject)
 		if lerr == nil && cur != nil && cur.ActionToken != _EMPTY_ && ref.matchesRecord(cur) &&
 			sess.clearCertifiedBeforeAcquire(c, ref.name.subject) {
-			// A token its holder's durably certified connection left standing (F-105 8c), just
+			// A token its holder's durably certified connection left standing (issue #107 8c), just
 			// cleared under that licence: read the register again and prove everything below anew.
 			continue
 		}
@@ -948,7 +948,7 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 	return 0, nil, false, false
 }
 
-// enterPubRelWriteLocked is the PUBREL write ENTRY (F-105 row 2, consult 28): the one place a
+// enterPubRelWriteLocked is the PUBREL write ENTRY (issue #107 row 2, consult 28): the one place a
 // holder moves acquired -> writing, and it refuses unless this exact holder may still emit.
 //
 // All of it, under the session lock, for BOTH classes: the holder is acquired, not released, not
@@ -998,7 +998,7 @@ func (sess *mqttSession) enterPubRelWriteLocked(act *mqttSendAction, cc *client)
 // silently erase acknowledgement debt and the connection identity that owns it. A retained
 // term is preserved for the same reason.
 //
-// Inert FOREIGN debt keeps today's replacement semantics (F-089's inert-hold takeover):
+// Inert FOREIGN debt keeps today's replacement semantics (issue #91's inert-hold takeover):
 // a debt owed to a connection that is no longer ours can never be answered, so it must not
 // block an action this connection is entitled to take.
 //
@@ -1104,7 +1104,7 @@ func (sess *mqttSession) finishActionAndWake(act *mqttSendAction, completed bool
 // reservation is removed, and A then retires. A observed `pubrel_ready`, so it ran no
 // terminal finalization and no exchange-mismatch handoff fires — the identifier would be
 // free while B may still transmit. A REPLACEMENT and an ABSENCE are the same interval:
-// absence of OUR slot is not proof that no successor exists (F-098).
+// absence of OUR slot is not proof that no successor exists (issue #100).
 func (sess *mqttSession) retireActionLocked_(act *mqttSendAction, completed bool) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -1216,7 +1216,7 @@ func (sess *mqttSession) startActionDrain(c *client, act *mqttSendAction) {
 		// OUR EXACT TOKEN, PROVEN. If this holder never entered its write, the acquisition the
 		// token belongs to will never execute: recorded ABANDONED on the connection it was
 		// acquired for, keyed by the counter READ beside the token, and BEFORE any clearing while
-		// this read still proves it (F-105 row 2). A holder that entered is the write entry's to
+		// this read still proves it (issue #107 row 2). A holder that entered is the write entry's to
 		// settle (its ticket's relinquish), so a drain never backfills that case.
 		if ordinary {
 			sess.mu.Lock()
@@ -1331,7 +1331,7 @@ func (sess *mqttSession) settleDrainedTerminal(c *client, ref mqttInflightSlotRe
 		}
 	case mqttTerminalRetainedReoffer:
 		// The retained slot outlives this drain, so the identifier stays excluded
-		// until something confirms the subject empty (F-098, round 5), and its cleanup
+		// until something confirms the subject empty (issue #100, round 5), and its cleanup
 		// owner is installed in the same critical section as that exclusion.
 		sess.mu.Lock()
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, ref.nonce)
@@ -1563,7 +1563,7 @@ func (sess *mqttSession) attemptOwedMaterialization(c *client, owed *mqttOwedMat
 	// CUSTODY, for the SLOT-ONLY (experimental affine) class: a slot this session object does
 	// not hold cannot be materialized by it, and the transfer's own tri-state proof decides
 	// whether that is a transient condition or a settled displacement. An ORDINARY slot carries
-	// no custody claim that decides anything (F-105 7b): materializing its canonical record is
+	// no custody claim that decides anything (issue #107 7b): materializing its canonical record is
 	// the client's own PUBREC answer being completed, which any broker may finish, and the
 	// binding CAS below is exact.
 	if mqttDurIsSlotOnlyClass(cur.Dur) && cur.Claim != sess.regClaim {
@@ -1771,7 +1771,7 @@ func (sess *mqttSession) releaseTerminalReservation(ref mqttInflightSlotRef) {
 
 // releaseRetainedTerminalReservation frees the terminal reservation of a slot that
 // finalizeTerminalSlot deliberately KEPT — mqttTerminalRetainedReoffer, where the source may
-// still re-offer — and hands off the identifier's EXCLUSION as it does (F-098, holistic
+// still re-offer — and hands off the identifier's EXCLUSION as it does (issue #100, holistic
 // review round 5).
 //
 // The reservation genuinely must go: the client already completed this exchange, so holding
@@ -1895,7 +1895,7 @@ func (sess *mqttSession) retainAndReconcileTerminal(c *client, ref mqttInflightS
 			return
 		}
 		// DISPATCHED EXPLICITLY, because `settled()` is TRUE for a retained slot and so
-		// cannot gate a release (F-098, holistic review round 6). This worker is scheduled
+		// cannot gate a release (issue #100, holistic review round 6). This worker is scheduled
 		// by an INDETERMINATE cleanup, so a cold recovery reaches it with no send hold at
 		// all; if the retry then reads the register successfully while its source is Live
 		// or Unknown, finalization deliberately KEEPS that register — and a bare release
@@ -2072,7 +2072,7 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 			// live PUBREL token is the outstanding output that makes the ending pending-drain.
 			// The dispatch site has no reason code (mqttProcessPubComp(pi)); success is the
 			// honest translation mqttAckArrival.Reason documents. The token is the only output
-			// carrier a PUBREL has at this checkpoint — PUBREL acquisition writes no F-105
+			// carrier a PUBREL has at this checkpoint — PUBREL acquisition writes no issue #107
 			// action record until row 2 converts it, and no PUBLISH action can be live at
 			// pubrel_ready because every PUBREL acquisition requires an empty token.
 			to, perr := mqttPhaseForAck(mqttAckArrival{
@@ -2123,9 +2123,9 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 }
 
 // pubCompOverSuccessor is PUBCOMP meeting another exchange on its identifier. PRESERVE it:
-// rewriting the current occupant is the cross-exchange mutation F-092 exists to stop. Done
+// rewriting the current occupant is the cross-exchange mutation issue #94 exists to stop. Done
 // discharges THIS PUBCOMP's obligation and nothing more; the successor's identifier stays
-// excluded, because the caller frees the terminal reservation on this answer (F-098).
+// excluded, because the caller frees the terminal reservation on this answer (issue #100).
 func (sess *mqttSession) pubCompOverSuccessor(ref mqttInflightSlotRef) mqttPubCompResult {
 	sess.mu.Lock()
 	sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
@@ -2173,7 +2173,7 @@ func (sess *mqttSession) finalizeTerminalObservedPubComp(c *client, ref mqttInfl
 // finalizeTerminalSlot completes a terminal exchange and exact-deletes its slot.
 //
 // THREE things are required for the deletion, not two, and the third is the one an
-// implementation forgets: subject addressing (F-034), identity authorization, and a
+// implementation forgets: subject addressing (issue #38), identity authorization, and a
 // FRESHNESS FENCE on the observed sequence. A rewrite between the observation and the
 // delete means a concurrent operation re-targeted the exchange and reinstalled memory
 // around it, so a stale terminal continuation must PRESERVE the record rather than delete
@@ -2221,7 +2221,7 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 		// which is why Done stays the answer — but a successor occupies the subject and its
 		// identifier is not ours to free. The caller releases the terminal reservation on
 		// Done, so the exclusion is handed off first, nonce-less because the occupant is not
-		// ours to name (F-098).
+		// ours to name (issue #100).
 		sess.mu.Lock()
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
 		sess.mu.Unlock()
@@ -2259,7 +2259,7 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 	// finished that exchange. Here PUBCOMP already supplies that proof, and Lost's positive
 	// meaning is that nothing can ever re-offer this source. This is the completed-drain
 	// case: its claim was durably removed and its consumer was then deleted before PUBCOMP.
-	// A RETAINED exchange has no source to re-offer and no $MQTT_out record (F-105 7c): its
+	// A RETAINED exchange has no source to re-offer and no $MQTT_out record (issue #107 7c): its
 	// canonical PUBREL is the in-flight record its PUBREC created, removed by exact identity.
 	retainedSlot := cur.retainedSource()
 	if retainedSlot && !sess.disposeRetainedRel(cur) {
@@ -2334,7 +2334,7 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 		// the early mismatch above: the exact-sequence delete can succeed against the
 		// already-absent old sequence while a peer's replacement survives. This obligation
 		// is discharged — hence Done — but the caller frees the terminal reservation on
-		// that answer, and the successor's identifier is not ours to free (F-098).
+		// that answer, and the successor's identifier is not ours to free (issue #100).
 		sess.mu.Lock()
 		sess.excludeIdentifierLocked(ref.name.pi, ref.name.subject, _EMPTY_)
 		sess.mu.Unlock()
@@ -2433,7 +2433,7 @@ const (
 // This is the missing arrow, not a relaxation of the gate, and the distinction is the
 // whole point. `mqttSlotDeleteComplete` is refused from `pubrel_ready` deliberately: a
 // ready slot is the identifier's live durable claimant, and letting an ordinary reap vacate
-// one is precisely the hazard F-092 exists to close. For a SHARED or AFFINE slot recovery can
+// one is precisely the hazard issue #94 exists to close. For a SHARED or AFFINE slot recovery can
 // hold a proof the exchange is over — the source is provably complete and no PUBREL record
 // names it — and there the exchange did finish: either the client's PUBCOMP acknowledged the
 // record away, or the record was never stored, and nothing can transmit it either way.
@@ -2642,7 +2642,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	// exchange — R6 — authorized by its in-memory owner, which a drained exchange is not).
 	// Forwarding without an action contradicts the callback's "nothing below without an
 	// action" rule for a slot-backed record and leaves the no-deadline write unfenced — the
-	// F-092 hazard the whole item closes.
+	// issue #94 hazard the whole item closes.
 	//
 	// The intent-vs-slot nonce "disagreement" the old shortcut existed for does not occur:
 	// recordPubRelIntent and the stored PUBREL both carry the register's own regNonce
@@ -2657,7 +2657,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	// evidence. But holistic round 2 refuted it, and the refutation is the same one the
 	// whole item rests on: the reservation is PROCESS-LOCAL, so during a takeover two
 	// brokers can hold matching ones, and a lagging predecessor would transmit without
-	// observing that a successor changed, completed or replaced the slot. That is F-092
+	// observing that a successor changed, completed or replaced the slot. That is issue #94
 	// recreated by its own fix.
 	//
 	// So recovered slot-backed deliveries go through a FRESH slot load and an atomic
@@ -2723,7 +2723,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			// already-stated residual R3, and it is the right way round — R3 costs stream
 			// space, and the alternative costs a message.
 			//
-			// AND NO SLOT-LESS RETAINED SHAPE REMAINS (F-105 7c): a retained exchange is
+			// AND NO SLOT-LESS RETAINED SHAPE REMAINS (issue #107 7c): a retained exchange is
 			// register-backed and its PUBREL is never stored on $MQTT_out, so a record with no
 			// slot is refused for every shape — a pre-7c retained record is an unsupported one.
 			c.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: no owner "+
@@ -2736,7 +2736,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			return nil, false
 		}
 		if cur.Nonce != owner.Nonce {
-			// A DIFFERENT EXCHANGE holds this identifier. This is F-092's population, and
+			// A DIFFERENT EXCHANGE holds this identifier. This is issue #94's population, and
 			// the refusal is the fix: unacknowledged and untransmitted.
 			c.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: it "+
 				"names exchange %q but the identifier's owner slot names %q, so transmitting it "+
@@ -2847,7 +2847,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			sess.registerPubRelRedrive(c, pi, reply, subject, dur)
 			return nil, false
 		case mqttAdmissionCustodyOnly:
-			// THE CUSTODY REPAIR, and this is what closes F-092's last open item.
+			// THE CUSTODY REPAIR, and this is what closes issue #94's last open item.
 			//
 			// The slot is quiescent and everything except its custody admits this
 			// delivery. That is exactly what a predecessor's drained action leaves: the
@@ -2936,7 +2936,7 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			// window in which the slot is past PUBREC with nobody owning it.
 			//
 			// `pubrel_intended` IS AN ORIGIN HERE, and it has to be: the intent CAS runs
-			// before the PUBREL store (F-098's R-a), so a slot that owes a canonical
+			// before the PUBREL store (issue #100's R-a), so a slot that owes a canonical
 			// record is exactly the shape a RECREATED PUBREL arrives at. Omitting it
 			// stranded every exchange whose record had to be rebuilt — admission refused,
 			// the recreated PUBREL was never transmitted, and the client waited for a
@@ -3306,7 +3306,7 @@ func (sess *mqttSession) pubRelAdmissionContext(c *client, pi uint16, cur *mqttI
 	//
 	// `pubrel_intended` is past PUBREC and deliberately names NO canonical record: the
 	// phase is written before the store precisely so a crash between them leaves a slot
-	// no peer may reap (F-098's R-a). Comparing a canonical durable it cannot have
+	// no peer may reap (issue #100's R-a). Comparing a canonical durable it cannot have
 	// refused every such slot unconditionally — before the direct arrow that exists to
 	// bind it — so a recreated PUBREL could never be admitted and the client waited for
 	// a PUBREL that never came. That refusal was reached whatever the delivered record
@@ -3412,7 +3412,7 @@ func (sess *mqttSession) pubRelAdmissionContext(c *client, pi uint16, cur *mqttI
 	// legitimately repair, and it may only attempt the repair when nothing else objects.
 	// Custody transfer is the SLOT-ONLY (experimental affine) class's alone. An ordinary slot's
 	// ownership is its exchange's, arbitrated by the connection's accepted entitlement inside the
-	// acquisition batch (F-105 7b): a valid claim stamp left by another session object never
+	// acquisition batch (issue #107 7b): a valid claim stamp left by another session object never
 	// obstructs it.
 	if mqttDurIsSlotOnlyClass(cur.Dur) && (cur.Claim == _EMPTY_ || cur.Claim != sess.regClaim) {
 		return mqttAdmissionCustodyOnly
@@ -3450,7 +3450,7 @@ func mqttStoredPubRelMatchesSlot(rel mqttStoredPubRel, slot *mqttInflightRecord)
 	}, slot)
 }
 
-// handOffPublishEntryLocked is F-093's correction: the ordered handoff from the PUBLISH
+// handOffPublishEntryLocked is issue #95's correction: the ordered handoff from the PUBLISH
 // entry to the PUBREL entry, performed under ONE session-lock section.
 //
 // THE FINDING it closes: the drain released the recovered in-flight register but never
@@ -3552,7 +3552,7 @@ type mqttAcceptanceProof struct {
 // on doubt, so it refuses on anything but Current. The custody transfer must not read one
 // failed read as "you have been superseded" — a boolean folded those together, and a
 // single transient failure would then abandon the repair and leave the exchange stalled
-// exactly as F-092's open item described.
+// exactly as issue #94's open item described.
 type mqttAcceptanceOutcome int
 
 const (

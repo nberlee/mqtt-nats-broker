@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// F-115: a QoS 2 PUBLISH was re-sent after the client's PUBREC, in two shapes with one root,
+// issue #117: a QoS 2 PUBLISH was re-sent after the client's PUBREC, in two shapes with one root,
 // a source re-offer racing the acknowledgement of its exchange.
 //
 //   - Shape A: the re-offer opened a send section on the SAME identifier before the PUBREC was

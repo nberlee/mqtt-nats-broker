@@ -12,7 +12,7 @@
 // recorded, and an erased acceptance can never be recovered because nothing else
 // ever knew about it. A fact's subject carries its own acceptID, so a fact is
 // never overwritten by anything, and the set of acceptances is therefore
-// monotone. That is the whole of F-031.
+// monotone. That is the whole of issue #35.
 //
 // The fact is DATED (At, sampled by the accepting broker when it composes the
 // attempt) because a delayed Will must be suppressed only by an acceptance that
@@ -507,7 +507,7 @@ type mqttAcceptFactRef struct {
 // meaningful only with mqttAcceptFactLanded. The fact is
 // create-only under a subject no other acceptance writes, so that sequence is fixed at write
 // and a later acceptance's fact lands higher on the same stream — the order the shared
-// ledger's tenure needs (F-105 8b). It is read back, never derived from a batch ack.
+// ledger's tenure needs (issue #107 8b). It is read back, never derived from a batch ack.
 func (jsa *mqttJSA) readAcceptFactSeq(subject string, want [32]byte) (uint64, mqttAcceptFactReadback) {
 	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil {

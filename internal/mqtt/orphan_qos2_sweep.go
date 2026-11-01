@@ -14,16 +14,16 @@
 // authorize the delete: the retirement watermark records the SESSION generation while
 // the consumer is keyed by an AFFINE generation that outlives incarnations, and
 // $MQTT_out is interest-retained, so a wrong delete destroys acknowledged QoS 2
-// payloads. F-036 course E removed that route rather than patching it; the leak is a
+// payloads. issue #40 course E removed that route rather than patching it; the leak is a
 // stated residual in docs/CONFORMANCE.md.
 //
 // None of them loses a message BY ACCUMULATING — a stalled claim is honored, never
 // released. A stale `discarded` marker among them no longer fences a LATER exchange's
 // hold either: the marker records the fence its writer was entitled to destroy, so a
-// PUBREL whose hold sits above it reaps the marker and proceeds (F-062). This file's own
+// PUBREL whose hold sits above it reaps the marker and proceeds (issue #66). This file's own
 // retirement of a marker (hold first, then the marker) is likewise bounded to the exact
 // record it observed. What follows converges the accumulation; the one direction it still
-// does not cover is a live remote generation whose record this pass never sees (F-036).
+// does not cover is a live remote generation whose record this pass never sees (issue #40).
 // All three accumulate. This file converges them, and it converges the fourth
 // thing that would otherwise pin the other three in place: a teardown marker whose
 // broker died after claiming the record. sess_teardown.go promises such a marker is
@@ -47,13 +47,13 @@
 // what removed its record. Absence from the reference set is therefore not proof that a
 // generation is dead; it is proof that this broker cannot see an owner.
 //
-// That gap is **F-036**'s open false-absence inference, whose scope was widened for it by
-// F-032's audit (docs/findings/ha-arbitration.md). It is not restated at each site below:
+// That gap is **issue #40**'s open false-absence inference, whose scope was widened for it by
+// issue #36's audit (https://github.com/nberlee/mqtt-nats-broker/issues/131). It is not restated at each site below:
 // the word "authoritative" throughout this file carries exactly the bound stated here, and
 // the consequences per resource class belong to the findings that own those classes —
-// F-034 and F-036 — not to this comment. ($MQTT_qos2assign's class was F-033, whose audit
-// closed on 2026-08-18. What it found in THIS file is F-064, named at its site below
-// because it is a defect of ours rather than F-036's premise restated. F-033's other
+// issue #38 and issue #40 — not to this comment. ($MQTT_qos2assign's class was issue #37, whose audit
+// closed on 2026-08-18. What it found in THIS file is issue #68, named at its site below
+// because it is a defect of ours rather than issue #40's premise restated. issue #37's other
 // addition — that the affine consumer delete's instance fingerprint does not discriminate
 // a session that ADOPTS the consumer — is HISTORICAL: that delete no longer exists, so the
 // bound stated here no longer has an affine-consumer consumer at all.)
@@ -113,7 +113,7 @@
 // only AFTER its hold record is confirmed gone (invariant 10). A `discarded` marker
 // is reaped by no discard — it is the only durable proof that a late releaser must lose —
 // and destroying the hold first is the sole thing that licenses THIS path retiring it. (A
-// releaser reaps one only where its hold proves the marker never fenced its exchange: F-062.
+// releaser reaps one only where its hold proves the marker never fenced its exchange: issue #66.
 // That is a different licence from this one and does not weaken the ordering below.) A releaser that preloaded the payload and resumes afterwards creates
 // a fresh `releasing` claim against an empty subject, then performs its mandatory
 // authoritative re-read (verifyQoS2HoldForRelease) and gets mqttQoS2VerifyGone, so
@@ -123,7 +123,7 @@
 //
 // The affine side has NO mirror-image rule, and that is the point. Invariant 5 used to
 // be "an assignment is committed Discarded BEFORE its consumer is deleted", ordering two
-// steps of a delete this pass no longer performs: F-036 course E removed the affine
+// steps of a delete this pass no longer performs: issue #40 course E removed the affine
 // consumer delete outright, so the invariant it needed is GONE rather than reordered.
 // $MQTT_out is interest-retained, which is why: deleting a consumer drops the copies it
 // holds, and no positive fact available here can authorize that — the retirement
@@ -281,7 +281,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	// affineUsable suppresses exactly ONE pass, reconcileOrphanQ2AffClaims, on either
 	// of two causes: a malformed claim that aborted the assignment INVENTORY, or a
 	// session record whose affine pair cannot be interpreted. It is a conservative
-	// suppression rather than a positive authorization — since F-036 course E removed
+	// suppression rather than a positive authorization — since issue #40 course E removed
 	// the affine consumer delete, no complete inventory is needed to license anything,
 	// and what the gate buys is that a per-claim transition is never written from a
 	// partial view. Note the scope precisely: the retired affine REGISTER arm in
@@ -537,9 +537,9 @@ func (as *mqttAccountSessionManager) forgetIfQ2AffClaimGone(subject string) {
 // sweeper, or by a CONNECT — converges on the RECORD under the existing teardown release
 // (the inbound hold walk included: a second run that meets the first adopter's
 // `discarded` marker purges to the fence THAT marker recorded, so a later exchange is
-// spared rather than destroyed — F-062 arm A2, which also states what a subject the first
+// spared rather than destroyed — issue #66 arm A2, which also states what a subject the first
 // run never reached does instead. The `$MQTT_inflight` purge in the same teardown stays
-// bounded since F-034 by the enumeration watermark of the pass that removes it)
+// bounded since issue #38 by the enumeration watermark of the pass that removes it)
 // reconciliation: both delete the same retired, generation-scoped names, one wins
 // the record delete, and the loser's classifying re-read reports released or
 // superseded.
@@ -638,11 +638,11 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 //   - The finish belongs to the marker-adoption class on a LATER pass. Releasing the
 //     record in the same pass would remove it moments after the marker landed, and a
 //     survivor broker whose lossy record watch dropped that brief observation would
-//     face an ABSENT record — the documented F-036 shape, where a bound Keep Alive 0
+//     face an ABSENT record — the documented issue #40 shape, where a bound Keep Alive 0
 //     client strands. Deferring narrows that route to the case where the survivor's
 //     committed-read backstop does not reach the record in time; it does not close it,
 //     and a CONNECT that adopts the marker immediately does not wait at all
-//     (docs/findings/ha-arbitration.md#f-036).
+//     (https://github.com/nberlee/mqtt-nats-broker/issues/40).
 //   - A watermark is permanent, so there is no reap step, no reap fingerprint, and no
 //     GC choice that could widen the escape it fences. An older-than-latest retirement
 //     is the stated residual instead.
@@ -947,7 +947,7 @@ func mqttValidateRecordAffinePair(ps *mqttPersistedSession, idHash string) error
 // hash back to its subject, or whose affine pair is inconsistent, would then take
 // the "valid record for a different generation" path and be read as PROOF OF
 // ABSENCE, and a live assignment would be discarded on it. (It could once also delete a
-// referenced consumer with its interest-retained copies; F-036 course E removed that
+// referenced consumer with its interest-retained copies; issue #40 course E removed that
 // route.) Uninterpretable must mean indeterminate everywhere.
 func mqttValidateSessionRecord(ps *mqttPersistedSession, idHash string) error {
 	if getHash(ps.ID) != idHash {
@@ -1354,9 +1354,9 @@ const (
 //     removal is deliberately different: purgeQoS2Hold purges by SUBJECT, because it
 //     must remove whatever occupies it including a record it cannot read. It is still
 //     bounded to the sequence this pass loaded and re-confirmed, so a delayed pass
-//     spares a later exchange's hold rather than destroying it (F-062). What that
+//     spares a later exchange's hold rather than destroying it (issue #66). What that
 //     bound does NOT close is the case where a live remote generation's record is
-//     absent from this pass's view altogether (F-036).
+//     absent from this pass's view altogether (issue #40).
 func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQoS2InName,
 	q *mqttSweepQuarantine, holdGrace, claimGrace time.Duration) mqttQoS2SweepOutcome {
 	rec, holdSeq, herr := as.loadQoS2Record(n.hold)
@@ -1383,7 +1383,7 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 		if !q.observedOrphanFor(mqttQuarantineHoldKey(n.hold), mqttQuarantineSeqFP(holdSeq), holdGrace) {
 			return mqttQoS2SweepNothing
 		}
-		// THE RETIREMENT PROOF (F-036 site 3). Writing the `discarded` marker is
+		// THE RETIREMENT PROOF (issue #40 site 3). Writing the `discarded` marker is
 		// destructive in itself — it is the fence a later releaser must lose to — and
 		// the purge behind it destroys the payload. Absence establishes that no record
 		// and no LOCAL resident names this generation; it cannot distinguish that from
@@ -1440,7 +1440,7 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 				return mqttQoS2SweepNothing
 			}
 			// THE RETIREMENT PROOF, and the split that keeps this from being a blanket
-			// retain (F-036 site 3). What needs a licence is destroying a NONTERMINAL
+			// retain (issue #40 site 3). What needs a licence is destroying a NONTERMINAL
 			// hold — a payload some session may still be entitled to release. A
 			// terminal tombstone is not that: the exchange it belongs to already
 			// delivered onward and committed, so removing it destroys nothing, and the
@@ -1571,11 +1571,11 @@ func mqttQ2AffSettleableRegister(rec *mqttInflightRecord, name *mqttInflightName
 		return fmt.Errorf("retired affine register carries QoS %d", rec.QoS)
 	}
 	// Cancelled ALONGSIDE Retired is a supported shape, not a contradiction, and the
-	// precedence rule decides it: Retired dominates (F-087 WP3). A cancellation racing a
+	// precedence rule decides it: Retired dominates (issue #89 WP3). A cancellation racing a
 	// retirement leaves both bits durably, and refusing here would retain such a register
 	// unsettled for the life of a long-lived generation. The retirement is backed by the
 	// register's own PUBREC evidence — which is exactly what this settle consumes — while
-	// the cancellation over a transmitted delivery is F-088's known-false write.
+	// the cancellation over a transmitted delivery is issue #90's known-false write.
 	if mqttInflightSourceStream(rec.Dur) != mqttOutStreamName {
 		// An affine pair on a non-affine durable names a source on the wrong stream.
 		return fmt.Errorf("affine register names non-affine durable %q", rec.Dur)
@@ -1646,7 +1646,7 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			records++
 
 			if mqttIsF105Subject(smsg.Subject) {
-				// F-105's ARBITRATION RECORDS, which share this stream with the registers
+				// issue #107's ARBITRATION RECORDS, which share this stream with the registers
 				// because a JetStream atomic batch is per stream and the authority must
 				// commit with the exchange mutation it authorizes. They are a different
 				// record class with their own permanence: the authority, the permanent
@@ -1836,7 +1836,7 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // say and which the code contradicts: recovery reads registers as durable authority, and the
 // slot-only custody contest (claimRecoveredInflight) REWRITES one to make the recovery-versus-
 // close decision durable, invalidating every sequence an older session object held (an ordinary
-// register's ownership is its exchange's entitlement since F-105 7b, and nothing rewrites it to
+// register's ownership is its exchange's entitlement since issue #107 7b, and nothing rewrites it to
 // claim it). A register is a takeover fence for whoever is resuming. The actor doing that is exactly what the header
 // says this sweep cannot observe when its record is absent.
 //
@@ -1845,13 +1845,13 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // consult that identifier space again. Absence here means absent from the complete
 // session walk and this broker's residents, in the bounded sense the file header defines
 // — which does not observe a session live on another broker whose record was removed, a
-// resume having preserved its generation. F-034 AUDITED what deleting a register in that
+// resume having preserved its generation. issue #38 AUDITED what deleting a register in that
 // state costs, and the answer splits: the deletion here is already conditioned on a
-// re-read at the exact candidate sequence, so it cannot destroy a REPLACEMENT — and F-034
+// re-read at the exact candidate sequence, so it cannot destroy a REPLACEMENT — and issue #38
 // refuted adding an identity comparison on top, because within one stream incarnation no
 // mismatching record can occupy the sequence being deleted, so the comparison could not be
 // mutation-proved. What remains is contention with a genuinely LIVE owner of the same
-// register, which naming cannot arbitrate: that is F-036's predicate, and this sweep's
+// register, which naming cannot arbitrate: that is issue #40's predicate, and this sweep's
 // share of it is recorded there rather than assumed away here.
 //
 // What it does share with every other class: absence is established by the complete
@@ -1866,7 +1866,7 @@ func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64
 // passes the manager's own (orphanGrace, quarantine). They are parameters so that a caller
 // can own its sightings outright — a pass driven with its own table cannot be handed a
 // sighting by the manager's background sweep, which is what made "the first pass never
-// deletes" depend on when that sweep last ran (F-069).
+// deletes" depend on when that sweep last ran (issue #73).
 func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace time.Duration, q *mqttSweepQuarantine,
 	candidates []*mqttInflightCandidate, refs *mqttSessRefs, budget *int) {
 	var deleted int
@@ -1899,7 +1899,7 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace ti
 			// A live record protects a register through the INBOUND key, which is a
 			// different key from the claim's affine one — so a remedy written for claims
 			// alone leaves retired affine registers accumulating here forever for a
-			// session that never resumes. That is F-064's accumulation half, and this is
+			// session that never resumes. That is issue #68's accumulation half, and this is
 			// the arm that collects them together with the copy and the claim they name.
 			serr := mqttQ2AffSettleableRegister(cand.rec, n)
 			switch {
@@ -1930,7 +1930,7 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace ti
 		if !q.observedOrphanFor(mqttQuarantineInflightKey(n.subject), mqttQuarantineSeqFP(cand.seq), grace) {
 			continue
 		}
-		// THE RETIREMENT PROOF (F-036 site 3). This arm is reached because no record and
+		// THE RETIREMENT PROOF (issue #40 site 3). This arm is reached because no record and
 		// no local resident names the register's generation — which does not distinguish
 		// a session that ended from one live on ANOTHER broker whose record is absent,
 		// and such a session still holds this identifier and its Receive Maximum slot.
@@ -1967,7 +1967,7 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace ti
 // settleRetiredAffineRegister collects a RETIRED affine in-flight register of a LIVE
 // session generation, together with the copy and the assignment claim it names.
 //
-// This is F-064's accumulation half for the register class. On the successful-PUBREC
+// This is issue #68's accumulation half for the register class. On the successful-PUBREC
 // path, if the incarnation-fenced AffineDone write fails, the copy stays unacknowledged
 // and the register is durably rewritten retired; the immediate source probe sees the
 // copy still live and removes neither. A live record then preserves the claim through
@@ -2135,7 +2135,7 @@ func (as *mqttAccountSessionManager) settleRetiredAffineRegister(s *Server, cand
 // The verdict rule: a register carrying a cancellation is deleted through the session's
 // own verdict property, which releases the verdict against the PROOF of the deletion.
 // The Retired-dominates precedence is what makes such a register reachable here at all
-// (F-087 WP3), and deleting it fire-and-forget would leave the verdict naming a register
+// (issue #89 WP3), and deleting it fire-and-forget would leave the verdict naming a register
 // that no longer exists — an unmatchable entry for the life of the session.
 //
 // The retention rule: when NO resident, identity-fenced session can durably forget that
@@ -2175,7 +2175,7 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// A verdict that exists ONLY in a non-resident session's persisted VoidedRegs
 		// is invisible from here — this arm reads the register, not the record — so such
 		// a register is still deleted and its verdict stranded. Pre-existing (the sweep
-		// deleted unconditionally before) and filed as F-090, docs/ROADMAP.md §P.
+		// deleted unconditionally before) and filed as issue #92, docs/ROADMAP.md §P.
 		//
 		// NOT "bounded stale metadata", which this comment used to claim and which is
 		// false: the residue is one nonce per occurrence and CUMULATIVE over a generation,
@@ -2186,7 +2186,7 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// LOCAL session is exactly why. It does not prove the absence of an exchange: a
 		// legal retired slot in an active PUBREL state can be owned by a session live on
 		// ANOTHER BROKER, and deleting it here would vacate that exchange's only durable
-		// claimant from underneath it. F-090's stranded verdict is a separate concern and
+		// claimant from underneath it. issue #92's stranded verdict is a separate concern and
 		// does not license bypassing the fence.
 		//
 		// The gate is applied against the record this sweep has already read, so it costs
@@ -2199,7 +2199,7 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 		// in process memory, and one this sweep would have deleted out from under the broker
 		// still writing it. The shared rule is also what makes the documented claim true for
 		// every destructive edge, resident or not.
-		// THE ONE ENUMERATED EXCEPTION TO C-IV (F-098, consult D-2's Option A). This arm
+		// THE ONE ENUMERATED EXCEPTION TO C-IV (issue #100, consult D-2's Option A). This arm
 		// keeps HEAD's behaviour deliberately: it applies the phase, counter and
 		// live-action guards, and it does NOT spend a release authority, so the affine
 		// disposer still decides its own release.
@@ -2337,7 +2337,7 @@ func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 	// some OTHER incarnation is refused rather than acted on: the reaper and the
 	// recovery arms read CopySubject to decide, and a subject that does not follow
 	// from this record's own fields makes them inspect a copy the record does not own
-	// (F-065).
+	// (issue #69).
 	if want := mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash, c.Nonce); c.CopySubject != want {
 		return fmt.Errorf("claim on %q names copy subject %q (want %q)", subject, c.CopySubject, want)
 	}
@@ -2372,7 +2372,7 @@ func validateOrphanQ2AffClaim(subject string, c *mqttQ2AffClaim) error {
 
 // collectQ2AffInventory returns EVERY assignment claim in the account, or an error.
 // Never partial and never capped: absence taken from a capped view is not absence
-// (invariant 13). It no longer authorizes a consumer deletion — F-036 course E removed
+// (invariant 13). It no longer authorizes a consumer deletion — issue #40 course E removed
 // that route — but a per-claim transition must still not be written from a partial view.
 func (as *mqttAccountSessionManager) collectQ2AffInventory() ([]*mqttQ2AffInvEntry, error) {
 	var out []*mqttQ2AffInvEntry
@@ -2414,10 +2414,10 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 		// owner-independently: a group redelivery does carry the payload, so a
 		// contender restores the winner's destroyed consumer and materializes onto it
 		// (materializeQ2AffOnBehalf). The materialized-copy-gone population is still
-		// owner-dependent (F-064's residual 8). See docs/findings/ha-arbitration.md.
+		// owner-dependent (issue #68's residual 8). See https://github.com/nberlee/mqtt-nats-broker/issues/131.
 		//
 		// What this pass DOES now do under a live reference is reap the claims that are
-		// already durably TERMINAL, which is the accumulation half of F-064.
+		// already durably TERMINAL, which is the accumulation half of issue #68.
 		if refs.hasAffine(e.claim.Winner, e.claim.Gen) {
 			q.forget(mqttQuarantineAssignKey(e.subject))
 			switch {
@@ -2446,7 +2446,7 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 			// NONTERMINAL population is deliberate rather than an omission: no fact this
 			// pass could write is both true and terminal for it. See
 			// settleSourcelessQ2AffClaim's own comment for why the sweep does not call
-			// that rule, and F-064's bullet for the population it leaves open.
+			// that rule, and issue #68's bullet for the population it leaves open.
 			continue
 		}
 		// Terminal and retained claims are resolved BEFORE any quarantine observation,
@@ -2461,7 +2461,7 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 			// The only durable evidence that a QoS 2 message the broker accepted could
 			// not be proven delivered. Surface it; never reap it (reapable() refuses
 			// it unconditionally, so there is nothing to attempt either). The label is
-			// not proof of loss — see F-064's residual 1 — but it is the only record
+			// not proof of loss — see issue #68's residual 1 — but it is the only record
 			// that anything happened at all.
 			q.forget(mqttQuarantineAssignKey(e.subject))
 			lost++
@@ -2518,19 +2518,19 @@ func (as *mqttAccountSessionManager) reconcileOrphanQ2AffClaims(s *Server, inv [
 // gone, and neither of the two ways past it is. "Authoritatively absent" carries the
 // bound the file header states — persisted records and this broker's residents — so a
 // winner still serving on another broker with no record passes it. A valid record for a
-// DIFFERENT generation establishes that ownership MOVED, which is not the same fact: F-036
-// is precisely a previous owner continuing to serve after that. F-033's audit has since
+// DIFFERENT generation establishes that ownership MOVED, which is not the same fact: issue #40
+// is precisely a previous owner continuing to serve after that. issue #37's audit has since
 // answered what committing Discarded costs, and the two readings do NOT get the same
-// answer. Discarding on an ABSENT record rests on F-036's own falsified premise and is
-// recorded as F-036 population. The DIFFERENT-generation reading is settled on the
+// answer. Discarding on an ABSENT record rests on issue #40's own falsified premise and is
+// recorded as issue #40 population. The DIFFERENT-generation reading is settled on the
 // clean-start route and rests on no false premise: teardown marks every assignment of the
 // retiring generation Discarded before deleting its consumer, so the session really has
 // ended and [MQTT-4.8.2-5] permits the delivery to die with it. Only an obsolete previous
-// owner still serving after ownership moved belongs to F-036. Either way this function is
+// owner still serving after ownership moved belongs to issue #40. Either way this function is
 // not where it is fixed. Note what the audit did NOT find here — the transition itself is
 // CAS-conditioned at a base read in the same attempt and asserts the winner's identity, so
-// no lineage is owed. See F-033, "What the audit established", in
-// docs/findings/ha-arbitration.md; that section is authoritative.
+// no lineage is owed. See issue #37, "What the audit established", in
+// https://github.com/nberlee/mqtt-nats-broker/issues/131; that section is authoritative.
 func (as *mqttAccountSessionManager) discardAbsentWinnerClaim(s *Server, e *mqttQ2AffInvEntry) mqttQoS2SweepOutcome {
 	ps, _, err := as.loadFenceSession(e.claim.Winner)
 	if err != nil {
@@ -2620,7 +2620,7 @@ func (as *mqttAccountSessionManager) pubRelCandidateFromOwnership(s *Server, sms
 
 // deleteOrphanPubRelConsumers deletes the consumers standing under RETIRED PUBREL names.
 //
-// THE RETIRED OWNERSHIP RECORD IS THE LICENCE, and it alone (F-105 §5.1 point 5, Codex
+// THE RETIRED OWNERSHIP RECORD IS THE LICENCE, and it alone (issue #107 §5.1 point 5, Codex
 // consults 12 and 14 finding 2). RETIRED is reached SOLELY through opAuthorizeDeletion's
 // atomic batch, which in the same commit authorizes the resource's deletion, which requires
 // every hold released and a route's disposal decision; and it is irreversible for the
@@ -2636,7 +2636,7 @@ func (as *mqttAccountSessionManager) pubRelCandidateFromOwnership(s *Server, sms
 // name, and a later one on a later rotation.
 //
 // LIVE-owned and ownerless PUBREL consumers are never candidates: LIVE means an obligation
-// may still depend on the name (F-036 lets a previous owner keep serving), and a MISSING
+// may still depend on the name (issue #40 lets a previous owner keep serving), and a MISSING
 // record is withheld, never read as permission.
 func (as *mqttAccountSessionManager) deleteOrphanPubRelConsumers(s *Server, candidates []*mqttPubRelCandidate) {
 	for _, cand := range candidates {

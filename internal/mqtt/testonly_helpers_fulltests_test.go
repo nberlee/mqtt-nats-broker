@@ -24,7 +24,7 @@ func mqttHandoffClientFilter(domainTk, cidHash string) string {
 //
 // Only the replacement arm does: reading the marker for an arm that does not need it is a
 // wasted round trip, and failing to read it for the arm that does is the defect where a
-// batch's shape gets taken for the store's answer. Test vocabulary (F-054): no production code
+// batch's shape gets taken for the store's answer. Test vocabulary (issue #58): no production code
 // calls it; the tests state the rule with it.
 func mqttSlotDispositionNeedsMarker(d mqttSlotDisposition) bool {
 	return d == mqttSlotDispReplace
@@ -139,7 +139,7 @@ func (jsa *mqttJSA) resolveTransition(t *mqttAuthorityTransition) mqttTransition
 // ---- from sess_persist.go ----
 
 // mqttAcceptOwnershipBatchSize is how many $MQTT_sess messages an accepted CONNECT commits
-// once its accept save IS the outbound-ownership metadata commit (F-105 cutover): the permanent
+// once its accept save IS the outbound-ownership metadata commit (issue #107 cutover): the permanent
 // acceptance fact, the COMMITTED ownership receipt, and the session record, committed as ONE
 // atomic three-member batch (handoff_metadata.go compose). A caller counting the record advance
 // across a CONNECT accept observes this, not mqttAcceptBatchSize.

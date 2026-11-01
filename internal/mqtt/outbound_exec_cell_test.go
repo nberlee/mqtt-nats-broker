@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// The consume-once fact lives on the acquisition's holder (F-105 integrated gate, round 1): these
+// The consume-once fact lives on the acquisition's holder (issue #107 integrated gate, round 1): these
 // pin the refusals that moved off the connection with it.
 
 // An acquisition recorded ABANDONED is refused by its own execution cell. The section's output is

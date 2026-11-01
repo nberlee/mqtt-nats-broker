@@ -23,9 +23,9 @@ import (
 	"testing"
 )
 
-// F-105 8b, the unit-level half: the one creator of a ledger, the installation order at both
+// issue #107 8b, the unit-level half: the one creator of a ledger, the installation order at both
 // layers, the closing driver's licence, and the close-optimization audit. The CONNECT-level half
-// is outbound_tenure_close_8b_e2e_test.go. Mutation ledger: mutation-ledger-8b.md.
+// is outbound_tenure_per_acceptance_e2e_test.go. Mutation ledger: mutation-ledger-8b.md.
 
 // T4u: the composer refuses to install an OLDER tenure over a newer one. Mutation M-comp-order.
 func TestF105_8bComposerRefusesAnOlderInstallation(t *testing.T) {

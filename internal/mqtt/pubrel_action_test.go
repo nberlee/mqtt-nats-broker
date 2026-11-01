@@ -1,4 +1,4 @@
-// The acceptance conditions for F-092 and F-093.
+// The acceptance conditions for issue #94 and issue #95.
 //
 // A green suite is not evidence that either is fixed — it is evidence that nothing
 // regressed. These tests are the positive half: each drives the production route and
@@ -612,7 +612,7 @@ func TestF093HandoffRefusesAConflictingPublishExchange(t *testing.T) {
 	}
 }
 
-// TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused is F-092's acceptance.
+// TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused is issue #94's acceptance.
 //
 // THE FINDING: a stale stored PUBREL whose acknowledgement was lost stays AckWait-eligible
 // while nothing names its identifier. After the identifier is reused, its redelivery used
@@ -649,7 +649,7 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 	})
 	if writes != 0 {
 		t.Errorf("a stale PUBREL naming exchange %q was transmitted under an identifier whose slot "+
-			"names %q: %d write(s). That is F-092 itself", foreign, before.Nonce, writes)
+			"names %q: %d write(s). That is issue #94 itself", foreign, before.Nonce, writes)
 	}
 
 	// The slot is untouched: no action was acquired and no phase moved.
@@ -834,7 +834,7 @@ func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
 	e.sess.startActionDrain(e.c, act)
 }
 
-// TestF092DurableCanonicalOutranksStaleInMemorySequence ensures the pre-F-092 duplicate
+// TestF092DurableCanonicalOutranksStaleInMemorySequence ensures the pre-issue #94 duplicate
 // check cannot override the owner slot after admission has selected its canonical record.
 // The stale entry is memory only; acknowledging the slot's canonical because of it would
 // leave the exchange permanently naming a deleted record.
@@ -977,7 +977,7 @@ func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
 	// A completed unsubscribe drain removes its source consumer before the client can
 	// answer PUBCOMP. Lost is not Complete and may never reap a POSSIBLY-ATTEMPTED
 	// PUBLISH-phase slot — a proven-unsent one it may, on the marker's evidence rather
-	// than the source's (F-102) — but at terminal it positively means the source cannot be
+	// than the source's (issue #104) — but at terminal it positively means the source cannot be
 	// re-offered and must not make the drained identifier immortal.
 	if _, err := e.sess.jsa.deleteConsumer(mqttStreamName, "SRC", true); err != nil {
 		t.Fatalf("deleting the completed drain's source consumer: %v", err)
@@ -1199,7 +1199,7 @@ func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 	}
 }
 
-// TestF093CompletedExchangeLeavesNoPublishEntryOrMapping is F-093's acceptance.
+// TestF093CompletedExchangeLeavesNoPublishEntryOrMapping is issue #95's acceptance.
 //
 // THE FINDING: `finalizeDrainDelivery` released the recovered in-flight register but never
 // removed the recovered `pendingPublish` entry or its `cpending` mapping. `trackAsPubRel`
@@ -1271,7 +1271,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 
 	if pubLeft {
 		t.Error("the completed exchange left its PUBLISH entry behind: that entry reserves the " +
-			"identifier and a Receive Maximum slot for the life of the session — F-093 itself")
+			"identifier and a Receive Maximum slot for the life of the session — issue #95 itself")
 	}
 	if relLeft {
 		t.Error("the completed exchange left its PUBREL entry behind")
@@ -1299,7 +1299,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 // admission altogether: the drain check used `drainIntentOwnedBy`, which returns true when
 // the durable is not draining at all — "nothing to contradict" — so every ordinary
 // correlated PUBREL was admitted as drain-owned without the slot being loaded, its nonce
-// compared, or an action acquired. F-092 was reproduced in full on the commonest path while
+// compared, or an action acquired. issue #94 was reproduced in full on the commonest path while
 // four green acceptance tests said otherwise.
 //
 // So this drives a record that is correlated to a real source, on a session with NO drain
@@ -1333,7 +1333,7 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 	})
 	if writes != 0 {
 		t.Errorf("an ordinary CORRELATED stale PUBREL naming exchange %q was transmitted under an "+
-			"identifier whose slot names %q: %d write(s). That is F-092 on the commonest path",
+			"identifier whose slot names %q: %d write(s). That is issue #94 on the commonest path",
 			foreign, slot.Nonce, writes)
 	}
 	// And nothing was handed off: a bypassing admission would have let the handoff delete
@@ -1355,7 +1355,7 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 	}
 }
 
-// TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt discriminates the F-093 crash
+// TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt discriminates the issue #95 crash
 // cut a holistic re-review found: recovery installs a surviving PUBREL as a nonce-bound empty
 // placeholder (installPubRelLocked). Terminal cleanup of a finished slot must ADOPT that
 // placeholder (installTerminalReservationLocked) and later RELEASE it (releaseTerminalReservation)
@@ -1386,7 +1386,7 @@ func TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T)
 	sess.mu.Unlock()
 	if !adopted {
 		t.Fatal("terminal cleanup could not adopt the recovered PUBREL placeholder; a nonce-less " +
-			"placeholder leaks the identifier (F-093 crash cut)")
+			"placeholder leaks the identifier (issue #95 crash cut)")
 	}
 
 	sess.releaseTerminalReservation(ref)
@@ -1396,7 +1396,7 @@ func TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T)
 	sess.mu.Unlock()
 	if leaked {
 		t.Fatal("the recovered PUBREL placeholder was not released after terminal cleanup: its " +
-			"identifier and Receive Maximum charge leak for the life of the session (F-093)")
+			"identifier and Receive Maximum charge leak for the life of the session (issue #95)")
 	}
 }
 
@@ -1406,7 +1406,7 @@ func TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T)
 // jsDur = the SOURCE consumer durable (or empty when the record has no source). Neither shape
 // names THIS generation's PUBREL consumer, so neither is a live retained exchange, and admitting
 // either through the slot-less retained path transmits a PUBREL with no durable action, recreating
-// F-092 across brokers. jsDur — not sseq — is the discriminator: a genuine retained exchange
+// issue #94 across brokers. jsDur — not sseq — is the discriminator: a genuine retained exchange
 // carries jsDur = pubRelDurable() and a NON-ZERO sseq on every AckWait redelivery after the first,
 // so an sseq test refused legitimate retained redeliveries. The sibling redelivery test covers
 // the admitted side.
@@ -1439,7 +1439,7 @@ func TestF092RecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
 			})
 			if writes != 0 {
 				t.Errorf("a recovered %s PUBREL whose slot is absent was transmitted via the retained "+
-					"path (%d write(s)): no durable action fenced it, recreating F-092", arm.name, writes)
+					"path (%d write(s)): no durable action fenced it, recreating issue #94", arm.name, writes)
 			}
 		})
 	}
@@ -1450,7 +1450,7 @@ func TestF092RecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
 //
 // Custody is durable state shared by every broker serving the session. A broker that has
 // been superseded must not move it: it would take an exchange away from the incarnation
-// that legitimately owns it, which is F-092's hazard arriving through the repair meant to
+// that legitimately owns it, which is issue #94's hazard arriving through the repair meant to
 // close it. The refusal is silent and unacknowledged, so the record is simply re-offered to
 // whoever is current.
 func TestF092AdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
@@ -2001,7 +2001,7 @@ func TestF092CompetingCustodyTransfersLandOnce(t *testing.T) {
 	}
 }
 
-// AN UNRESOLVED PUBREL ACTION REACHES THE SHUTDOWN'S FINAL PASS (F-098, holistic review round 5,
+// AN UNRESOLVED PUBREL ACTION REACHES THE SHUTDOWN'S FINAL PASS (issue #100, holistic review round 5,
 // finding 3). A drain that cannot resolve hands off to the reconciler, and the reconciler's own
 // admission can be refused because shutdown has begun. Before the fix it returned there with no
 // timer and no registry entry, so the token survived a shutdown that could still have ended it —
@@ -2064,7 +2064,7 @@ func TestMQTTPubRelActionUnresolvedAfterAdmissionClosesReachesTheFinalPass(t *te
 	}
 }
 
-// PUBREC ENROLS MATERIALIZATION UNDER THE IDENTITY ITS CAS WROTE (F-098 L1, holistic review
+// PUBREC ENROLS MATERIALIZATION UNDER THE IDENTITY ITS CAS WROTE (issue #100 L1, holistic review
 // round 6, finding 3). The intent arrow is deliberately NOT counter-bound — a PUBREC may
 // legitimately land on a retransmission — so the record it advances can carry a counter this
 // handler never read: a retransmission's acquisition can land between the entry's capture and

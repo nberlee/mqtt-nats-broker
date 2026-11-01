@@ -16,7 +16,7 @@ import (
 //
 // "Takeover" is not the word for it. The fixture knows a peer wrote the record; the broker
 // under test knows only that its CAS was rejected and the content is not its own, which
-// licenses eviction and the ownership-unsettled 0x89, never a takeover claim (F-084).
+// licenses eviction and the ownership-unsettled 0x89, never a takeover claim (issue #86).
 //
 // Two prerequisites make it the production shape rather than a seam. The record must be
 // moved by ANOTHER account session manager over the same JetStream — the cross-broker
@@ -54,7 +54,7 @@ func testBoundE2EMoveRecord(t *testing.T, s *Server, node, clientID string) {
 // the persist notification lost, must be told and closed BEFORE its next packet takes
 // effect — [MQTT-3.1.4-3]. Its Will is PUBLISHED: the probe found a record that is not ours
 // and identified no successor, and only a displacement this broker holds both ends of may
-// suppress a Will (F-084). This contract used to read "its Will must go the way a
+// suppress a Will (issue #86). This contract used to read "its Will must go the way a
 // takeover's does", which was the defect.
 func TestMQTTBoundRejectionE2EForeignClosesConnection(t *testing.T) {
 	t.Parallel()
@@ -123,7 +123,7 @@ func TestMQTTBoundRejectionE2EForeignClosesConnection(t *testing.T) {
 	}
 	// 0x89 ownership-unsettled: the bound settlement's probe found a record that is not
 	// ours, which establishes that this session may no longer be written and nothing about
-	// who holds it. F-084.
+	// who holds it. issue #86.
 	if reason != mqttReasonServerBusy {
 		t.Fatalf("expected 0x89 ownership unsettled, got %x", reason)
 	}
@@ -142,7 +142,7 @@ func TestMQTTBoundRejectionE2EForeignClosesConnection(t *testing.T) {
 		t.Fatalf("the connection must be CLOSED after the DISCONNECT, not merely idle: %v", rerr)
 	}
 
-	// The Will IS PUBLISHED, and this is F-084's correction rather than a relaxed
+	// The Will IS PUBLISHED, and this is issue #86's correction rather than a relaxed
 	// assertion. This connection was displaced by a RECORD probe, which establishes that
 	// the session is no longer ours and NOT that anybody took it over — and only a
 	// demonstrated takeover owns a Will's fate. Suppressing it here was silent loss on

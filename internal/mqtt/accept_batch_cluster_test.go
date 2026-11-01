@@ -142,7 +142,7 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 			// And the COMMITTED ownership receipt, the batch's THIRD member: it commits
 			// with the fact and the record or not at all. That third member is what makes
 			// the accepted CONNECT's metadata batch indivisible rather than a fact and a
-			// record that happened to land beside a receipt -- the property F-105's cutover
+			// record that happened to land beside a receipt -- the property issue #107's cutover
 			// rests on, because a receipt without its record would be a permanent claim to
 			// an ownership the record never took.
 			switch obs.RecptSubj {

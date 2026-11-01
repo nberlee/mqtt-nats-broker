@@ -20,7 +20,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// RECOVERY ENROLS AN OWED RECORD (F-098 L1, holistic review round 1, finding 3; C13 order 4).
+// RECOVERY ENROLS AN OWED RECORD (issue #100 L1, holistic review round 1, finding 3; C13 order 4).
 //
 // The crash cut: the intent CAS landed, the PUBREL store did not, and the process died
 // before — or with — the live path's own materialization timer. After the restart nothing is
@@ -34,7 +34,7 @@ func testSeedOwedSlot(t *testing.T, e *testInflightEnv, token string) (pi uint16
 	t.Helper()
 	// AN ACCEPTED RECORD. The predecessor's stamp is kept OLDER than this session's acceptance
 	// so the fixture also stands for the slot-only contest's ordering; on this ORDINARY slot the
-	// stamp decides nothing (F-105 7b) and the connection's accepted entitlement does. Established
+	// stamp decides nothing (issue #107 7b) and the connection's accepted entitlement does. Established
 	// the way testReadyForPubRelDelivery does it, minus that helper's in-memory slot store —
 	// these gates run against real JetStream.
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
@@ -109,7 +109,7 @@ func TestMQTTRecoveryMaterializesAnOwedPubRelRecord(t *testing.T) {
 	for {
 		cur, _, _ := e.asm.jsa.loadInflightRecord(subject)
 		if testPubRelRecordStored(e) && cur != nil && cur.State == mqttInflightPubRelReady {
-			// THE CLAIM STAMP DECIDES NOTHING ON AN ORDINARY SLOT (F-105 7b, T12's owed route):
+			// THE CLAIM STAMP DECIDES NOTHING ON AN ORDINARY SLOT (issue #107 7b, T12's owed route):
 			// ownership is the connection's accepted entitlement, compared inside the batch, so
 			// the materialization succeeds under the predecessor's stamp and PRESERVES it. A
 			// custody transfer (the deleted transferCustodyForAdmission arm) would rewrite it,

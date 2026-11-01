@@ -186,7 +186,7 @@ func TestSessTeardownLostClaimDeletesNothing(t *testing.T) {
 	}
 
 	// A now tears down against its stale view. Losing the claim is a COMPLETE
-	// outcome — there is nothing left for A to do — and since F-029 it is REPORTED as
+	// outcome — there is nothing left for A to do — and since issue #31 it is REPORTED as
 	// such rather than as success: a caller that read it as success went on to write
 	// at the sequence clear() had just reset to 0, erasing B's record. What still
 	// matters just as much is that A touched nothing.
@@ -293,7 +293,7 @@ func TestSessTeardownLateDeleteIsHarmless(t *testing.T) {
 
 	// A resumes: its deletions and its release now land after everything above. Its
 	// release re-read finds B's record, so the outcome is superseded — a complete one,
-	// reported as errMQTTClearSuperseded since F-029.
+	// reported as errMQTTClearSuperseded since issue #31.
 	if err := sessA.clear(false); !errors.Is(err, errMQTTClearSuperseded) {
 		t.Fatalf("A's late teardown must report the superseded outcome, got %v", err)
 	}
@@ -407,7 +407,7 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 	// 0c: the original owner wakes up. Its deletions name the retired generation
 	// only, and its release must classify as superseded/released, never as license
 	// to keep deleting. Superseded is now reported as errMQTTClearSuperseded rather
-	// than as success (F-029); anything else is a real failure.
+	// than as success (issue #31); anything else is a real failure.
 	if err := sessA.clear(false); err != nil && !errors.Is(err, errMQTTClearSuperseded) {
 		t.Fatalf("the paused owner's teardown reported an error after the handover: %v", err)
 	}

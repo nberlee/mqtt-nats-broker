@@ -15,7 +15,7 @@ package mqtt
 
 import "fmt"
 
-// Who owns a retiring generation's cleanup: the teardown, or recovery (F-105, row 8).
+// Who owns a retiring generation's cleanup: the teardown, or recovery (issue #107, row 8).
 //
 // # Exactly one mechanism owns each durable, and a DURABLE FACT selects which
 //
@@ -79,14 +79,14 @@ type mqttTeardownOwnership struct {
 	// Affine is the enrolled affine resource, present only for the discarding class.
 	Affine *mqttOutboundResource
 	// Unenrolled names the source, drain or PUBREL durables of a DISCARDING generation that no
-	// resource of the generation names (F-105 7d). Production claims every such name before its
+	// resource of the generation names (issue #107 7d). Production claims every such name before its
 	// CREATE, so this is a shape it does not write: the durable is left standing and reported,
 	// never deleted on the strength of a missing record.
 	Unenrolled []string
 }
 
 // transfers applies the classification to the target: a discarding generation's source, drain and
-// PUBREL consumers and its retained registers go to the recovery executor (F-105 7d), and its
+// PUBREL consumers and its retained registers go to the recovery executor (issue #107 7d), and its
 // enrolled affine consumer as before.
 func (o mqttTeardownOwnership) transfers(t *mqttTeardownTarget) {
 	t.deferAffineDelete = o.Class == mqttTeardownOwnerDiscarding && o.Affine != nil
@@ -147,7 +147,7 @@ func (as *mqttAccountSessionManager) classifyTeardownGeneration(id, epoch, gen s
 			"and one of them may be an enrolment this teardown is asking about",
 			unreadable, gen)
 	}
-	// EVERY LOGICAL-USE TARGET IS RETIRED THROUGH ITS RESOURCE (F-105 7d), so each must have one.
+	// EVERY LOGICAL-USE TARGET IS RETIRED THROUGH ITS RESOURCE (issue #107 7d), so each must have one.
 	if t != nil {
 		named := map[string]bool{}
 		for i := range res {

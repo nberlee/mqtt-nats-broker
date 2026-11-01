@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// A retained replay this connection can no longer serve (F-105 7c).
+// A retained replay this connection can no longer serve (issue #107 7c).
 //
 // A retained PUBLISH is re-checked against the connection that will carry it BEFORE its output
 // is acquired: an acquisition under this connection's tenure makes the delivery this connection's

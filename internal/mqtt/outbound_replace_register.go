@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// Replacing an in-flight register inside an authority transition (F-105, row 1).
+// Replacing an in-flight register inside an authority transition (issue #107, row 1).
 //
 // Until the ordinary PUBLISH path was converted, this mechanism CREATED a register and never
 // replaced one, and the write boundary refused a nonzero register expectation outright. That
@@ -210,7 +210,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 		}
 		// A CANONICAL RE-BIND, recognised by its own kind and judged only by its own rule: the exact
 		// untokened pubrel_ready occupant with ONLY its canonical sequence moved, beside an exchange
-		// that stands at PubRecObserved (F-105 7b).
+		// that stands at PubRecObserved (issue #107 7b).
 		if a.Kind == mqttTransitionRebindCanonical {
 			if err := jsa.checkCanonicalRebindRegister(a, name.gen, e.subj, cur, rec); err != nil {
 				return err
@@ -234,7 +234,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				a.Txn, a.Kind, e.subj)
 		}
 
-		// A TOKEN ACQUISITION IS NOT A REPLACEMENT (F-105 row 2, §4.3 point 1). An acquire-action
+		// A TOKEN ACQUISITION IS NOT A REPLACEMENT (issue #107 row 2, §4.3 point 1). An acquire-action
 		// transition may CAS the register to install an output-custody token: the occupant's
 		// identity, delivery, lineage and QoS are all PRESERVED, and only the token, the custody it
 		// is bound to, and the acquisition counter change (plus, for the PUBREL direct arrow, the
@@ -281,7 +281,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 			return err
 		}
 
-		// AN ACKNOWLEDGEMENT RE-PHASE IS NOT A REPLACEMENT EITHER (F-105 row 3). An
+		// AN ACKNOWLEDGEMENT RE-PHASE IS NOT A REPLACEMENT EITHER (issue #107 row 3). An
 		// advance-exchange transition may CAS the register to publish_terminal or
 		// pubrel_intended to record a client acknowledgement beside the exchange advance: the
 		// occupant's identity, delivery, lineage and QoS are PRESERVED and only its state moves.
@@ -304,7 +304,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				a.Txn, e.subj, cur.Dur, cur.Seq, rec.Dur, rec.Seq)
 		}
 
-		// A PENDING FENCE IS NEVER REPLACED (F-088, consult C4): it is not an exchange's identity
+		// A PENDING FENCE IS NEVER REPLACED (issue #90, consult C4): it is not an exchange's identity
 		// carrier, and its only exit is the dedicated disposal rule (mqttSlotDeletePendingFence),
 		// after which the allocation creates on an empty subject. An OCCUPANT cancellation, by
 		// contrast, may be replaced register-only under every check below, and the replacing body
@@ -425,7 +425,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 // lineage, phase, QoS, custody — is the occupant's, unchanged. This is what distinguishes a token
 // acquisition (§4.3 point 1) from a same-delivery replacement, which re-mints the allocation.
 //
-// ONE further arm, for the PUBREL direct arrow (F-105 row 2): from `pubrel_intended` the member may
+// ONE further arm, for the PUBREL direct arrow (issue #107 row 2): from `pubrel_intended` the member may
 // ALSO move the slot to `pubrel_ready` and install the canonical PUBREL tuple the delivered record
 // proved, exactly the mutation that arrow performed as a standalone CAS before it moved into the
 // authority batch. Only that pair of fields and that state move; an occupant already naming a
@@ -442,7 +442,7 @@ func mqttIsActionTokenAcquisition(cur, rec *mqttInflightRecord) bool {
 	want.ActionClaim = cur.Claim
 	want.ActionClaimSeq = cur.ClaimSeq
 	want.Acq = cur.Acq + 1
-	// A retransmission's acquisition may clear a KNOWN-FALSE cancellation (F-088): the shape is
+	// A retransmission's acquisition may clear a KNOWN-FALSE cancellation (issue #90): the shape is
 	// recognised here, and the write boundary admits it only on the marker's authoritative absence
 	// (mqttRefutedCancellation) — a standing marker means a genuine cancellation, and that
 	// acquisition is refused.
@@ -461,7 +461,7 @@ func mqttIsActionTokenAcquisition(cur, rec *mqttInflightRecord) bool {
 }
 
 // mqttActionKindRegisterState is the one statement of which register step an acquisition of each
-// packet may ride on (F-105 row 2): a PUBLISH action on a slot still at `publish`, a PUBREL action
+// packet may ride on (issue #107 row 2): a PUBLISH action on a slot still at `publish`, a PUBREL action
 // on a `pubrel_ready` slot or — the direct arrow — a `pubrel_intended` slot it moves to
 // `pubrel_ready`. The composer asks it before building the token member and the write boundary asks
 // it again of the member it is handed, so a PUBREL lease cannot be installed on a PUBLISH slot, nor
@@ -540,7 +540,7 @@ func mqttAcquiredActionsIn(a *mqttTransitionAttempt, extra []mqttTransitionMembe
 }
 
 // checkActionTokenMembers validates every register token-acquisition member an acquire-action
-// transition carries, and binds it to the action RECORD acquired in the same batch (F-105 row 2,
+// transition carries, and binds it to the action RECORD acquired in the same batch (issue #107 row 2,
 // §4.3 point 1): the two must describe the SAME acquisition, so the token member's obligation
 // (its lineage), identifier and advanced counter agree with an action record the batch creates.
 // A token installed beside an action for a different exchange, identifier or counter is refused,
@@ -564,7 +564,7 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 			continue // not a token member (a replacement is checked elsewhere)
 		}
 		// AN ACKNOWLEDGEMENT RE-PHASE PRESERVES the occupant's token, it does not install one
-		// (F-105 row 3). checkAckPhaseAdvanceMembers proves rec is the occupant with only its
+		// (issue #107 row 3). checkAckPhaseAdvanceMembers proves rec is the occupant with only its
 		// state moved, so the token in a pubrel_intended body is the lease already acquired,
 		// not a new one — this rule is about INSTALLATION and must not fire on it.
 		if a.Kind == mqttTransitionAdvanceExchange && mqttAdvanceKindSlotState(rec) {
@@ -627,7 +627,7 @@ func (jsa *mqttJSA) checkRetainedAckPredecessor(a *mqttTransitionAttempt, cur, r
 }
 
 // checkAckPhaseAdvanceMembers validates every in-flight slot member an advance-exchange
-// transition carries, and binds it to the exchange member acquired in the same batch (F-105
+// transition carries, and binds it to the exchange member acquired in the same batch (issue #107
 // row 3): the slot re-phase and the phase move are ONE acknowledgement, so a slot advancing to
 // publish_terminal can never ride beside an exchange moving to PUBREC-observed, and a re-phase
 // can never name a different obligation, identifier or generation than the exchange member.
@@ -658,7 +658,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 			}
 			// The STATE-ONLY test here: a retained slot's pubrel_ready is an advance's destination
 			// AND the state its PUBREL acquisitions write their token at, so it is not by itself a
-			// re-phase on a non-advance kind (F-105 7c).
+			// re-phase on a non-advance kind (issue #107 7c).
 			if mqttAckRephaseState(rec.State) {
 				return fmt.Errorf("transition %q of kind %q re-phases a slot to %q on %q: an acknowledgement "+
 					"re-phase rides only on an advance-exchange transition, beside the phase move it completes",

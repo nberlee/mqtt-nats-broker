@@ -36,7 +36,7 @@ var (
 
 // TestMQTTMarkerObservationMatrix is the decision table, one subtest per row, written out
 // as LITERALS rather than derived from the code's own table: a test that iterates the
-// production rows proves nothing against a wrong row. Every row of the F-072 contract is
+// production rows proves nothing against a wrong row. Every row of the issue #76 contract is
 // here, including the ones a shortcut would fold — 24a (absence completes a reap under any
 // acquisition), 29 (a reload-acquired present marker is never reaped), 20a (a sender that
 // wrote nothing and holds nothing owes nothing) — and the type rejections: "record a

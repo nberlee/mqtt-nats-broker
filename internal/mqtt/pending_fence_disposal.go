@@ -15,7 +15,7 @@ package mqtt
 
 import "sync/atomic"
 
-// A pending cancellation fence is disposed of only behind a confirmed authority advance (F-119).
+// A pending cancellation fence is disposed of only behind a confirmed authority advance (issue #121).
 //
 // A teardown that cancels an allocation whose admission store is still in flight writes the
 // create-only PENDING FENCE on the empty subject and forgets the nonce verdict at once. The fence

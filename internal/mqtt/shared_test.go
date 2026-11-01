@@ -86,5 +86,5 @@ func TestV5SharedSubscription(t *testing.T) {
 // incarnations. Exactly 22 characters of the NUID alphabet, so it satisfies
 // q2AffClaimUsableForDecision the way a real election's minted nonce does. A test
 // that stages TWO incarnations of one claim subject must use distinct values instead
-// — that distinction is the whole of F-065.
+// — that distinction is the whole of issue #69.
 const testQ2AffFixtureNonce = "F065fixtureNonce000001"

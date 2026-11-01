@@ -198,8 +198,8 @@ func (e *mqttGrantEntry) sidState(sid string) mqttSidState {
 // Shared-subscription membership is deliberately absent. A per-filter shared restore can
 // fail while the membership stays durable, so a re-asserted SharedSubs membership would be
 // while a per-filter restore failure leaves no group join and no consumer — the
-// accepted-but-dead state F-050 already records. Repairing into that ordering would extend
-// an open finding rather than respect it; shared membership becomes repairable when F-050
+// accepted-but-dead state issue #54 already records. Repairing into that ordering would extend
+// an open finding rather than respect it; shared membership becomes repairable when issue #54
 // closes. See docs/CONFORMANCE.md.
 type mqttGrantSnap struct {
 	filters   map[string]mqttGrantEntry
@@ -800,7 +800,7 @@ func (as *mqttAccountSessionManager) reassertForkedGrantInto(sess *mqttSession, 
 		(*h)(sess)
 	}
 
-	// NO DECIDED CONSUMER IS REINSTATED (F-105 7f). The capsule is this broker's own erased
+	// NO DECIDED CONSUMER IS REINSTATED (issue #107 7f). The capsule is this broker's own erased
 	// branch, and a consumer it names may since have been decided by another broker's tenure —
 	// the survivor's settlement disposes of a consumer the survivor's record does not name. A
 	// decided consumer reinstated into the accepted record would then need a lifecycle of its
@@ -976,7 +976,7 @@ func mqttForkReinstatedDurable(survivor, ours mqttSidState) []string {
 // ownership is LIVE, held by this client at gen, and the resource it names is a source consumer,
 // LIVE, with no disposal decision. An absent ownership is not serving — every source consumer is
 // claimed before it is created, and nothing may be admitted against an unclaimed one. A read that
-// cannot be answered is an error, never an answer (F-105 7f).
+// cannot be answered is an error, never an answer (issue #107 7f).
 func (jsa *mqttJSA) sourceConsumerServing(id, epoch, gen, name string) (bool, error) {
 	own, _, oerr := jsa.loadNameOwnershipPhysical(epoch, mqttOwnedStreamMsgs, name)
 	if oerr != nil {
@@ -1125,7 +1125,7 @@ func (sess *mqttSession) applyGrantChangeLocked(ch mqttGrantChange, survivor *mq
 	// the partial adoption the processSubs preflight exists to prevent, reached through the
 	// other door.
 	//
-	// THE TWO HOLDS REFUSE DIFFERENT ROWS, and F-094's review rounds cost two revisions to
+	// THE TWO HOLDS REFUSE DIFFERENT ROWS, and issue #96's review rounds cost two revisions to
 	// get this right. An unusable identity refuses EVERY row, unchanged: nothing may act on
 	// it and nothing may take its place, so even a drop is refused. A past-PUBREC intent
 	// refuses only the rows that DESTROY the drain, which against the transition table below
@@ -1196,7 +1196,7 @@ func (sess *mqttSession) applyGrantChangeLocked(ch mqttGrantChange, survivor *mq
 //
 // sess.mu must be held.
 func (sess *mqttSession) applyGrantSidLocked(sid string, survivor, ours mqttSidState) bool {
-	// A CONSUMER OF OURS THAT NO LONGER SERVES IS NEVER REINSTATED (F-105 7f; read by
+	// A CONSUMER OF OURS THAT NO LONGER SERVES IS NEVER REINSTATED (issue #107 7f; read by
 	// forkRepairPreflight before this merge, fenced by the accept's preparation). A membership
 	// keeps its grant WITHOUT the consumer — the KEY is omitted, never a nil value — and the resume
 	// reconcile provisions a fresh one, exactly as for a membership with no consumer identity. A

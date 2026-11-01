@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// THE INVENTORY FLOOR (F-112). A live generation's history is retired behind a proven contiguous
+// THE INVENTORY FLOOR (issue #114). A live generation's history is retired behind a proven contiguous
 // floor: every position below Lo is reclaimed or relocated, every duty that still has work keeps
 // exactly one representative inside [Lo, Hi], and every reader reads [Lo, Hi] only.
 
@@ -616,7 +616,7 @@ func TestF112ARootRetiresOnlyWithItsRetiredPositionsDeleted(t *testing.T) {
 
 // testF112PlantAdmittedDuty writes the duty entry an admission writes for exchange nonce — at the
 // next ordinal, with the ledger's high-water moved to it — for a fixture that plants an exchange
-// record directly. Since F-112 every exchange enumeration is the inventory, so a planted
+// record directly. Since issue #114 every exchange enumeration is the inventory, so a planted
 // obligation the inventory does not name is a shape no admission writes (the coverage rule) and
 // no reader enumerates.
 func testF112PlantAdmittedDuty(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string) {

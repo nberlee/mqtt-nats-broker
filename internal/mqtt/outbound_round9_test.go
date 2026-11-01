@@ -571,7 +571,7 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
 
-	// withToken puts the register token member production composes beside the record (F-105 row 2).
+	// withToken puts the register token member production composes beside the record (issue #107 row 2).
 	// The refusals below leave it off: each is refused by the exchange check, which runs first.
 	handWith := func(txn string, act *mqttOutboundAction, withToken bool) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -627,7 +627,7 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	}
 
 	// AND AN ENDED EXCHANGE ACQUIRES NOTHING, through the boundary as through the surface. The
-	// action above holds its token, and no batch ends an exchange beside a live holder (F-112):
+	// action above holds its token, and no batch ends an exchange beside a live holder (issue #114):
 	// the refusal waits for the drain, then lands as Rejected beside its slot.
 	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangeRejected); err == nil {
 		t.Fatalf("a refusal was recorded beside a live transmission")
@@ -1479,7 +1479,7 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
-	// The register token member production composes beside the one acquisition (F-105 row 2).
+	// The register token member production composes beside the one acquisition (issue #107 row 2).
 	token := func(acq uint64) mqttTransitionMember {
 		return testF105TokenMember(t, e, auth.Gen, &mqttOutboundAction{Nonce: nonce, Acq: acq, Kind: mqttActionPublish, PI: 7})
 	}
@@ -1811,7 +1811,7 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 	// AND AN UNREADABLE OBLIGATION REFUSES THE IDENTIFIER ITS DUTY NAMES. A record this broker
 	// cannot interpret may be the one holding the identifier, so treating it as absent is the
 	// inference the whole mechanism exists to remove. The enumeration is the generation's
-	// INVENTORY (F-112): every exchange is admitted with its duty in the same batch, and that
+	// INVENTORY (issue #114): every exchange is admitted with its duty in the same batch, and that
 	// duty names the identifier the exchange holds, bound at admission and never moved — so the
 	// obligation made unreadable here is one the inventory names as standing on identifier 11.
 	corrupt := mqttExchangeSubject(getHash(e.id), testF105Gen, standing)
@@ -1839,7 +1839,7 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 // that replaced the walk it was first stated about.
 //
 // The exclusivity check asks whether anything still holds an identifier. It used to page a
-// stream-info subject list; since F-112 it reads the generation's INVENTORY [Lo, Hi] at the ledger
+// stream-info subject list; since issue #114 it reads the generation's INVENTORY [Lo, Hi] at the ledger
 // sequence its own batch CASes, because exchange records are now deleted behind the floor and a
 // paged subject list shifts under a deletion. The property is unchanged: an answer this broker
 // could not read completely is not an answer, and absence is exactly what the claim rests on. The

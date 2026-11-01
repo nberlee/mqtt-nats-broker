@@ -279,7 +279,7 @@ func TestWillEarlyCancelUsesTheSamePredicate(t *testing.T) {
 
 // TestWillClaimantSeesAnEarlierAcceptanceAfterALaterOne is T4.
 //
-// This is F-031 itself. A single-slot watermark is overwritten by the next
+// This is issue #35 itself. A single-slot watermark is overwritten by the next
 // acceptance, so an earlier entitled one is erased and unrecoverable. Facts have
 // unique subjects, so the set only grows — and the SCAN must therefore keep looking
 // past a non-qualifying fact rather than stopping at the newest.
@@ -862,7 +862,7 @@ func TestWillFinalizeRequiresTheSameLicence(t *testing.T) {
 // They are NOT evidence that the supported server admits either state. It does not: the
 // routes by which a write conditioned on a superseded base could reach the stream across
 // a leader transition are enumerated, fixtured and mutation-checked in `test/depproof/`,
-// and every run measured refused the write. F-030 is closed by that evidence together
+// and every run measured refused the write. issue #34 is closed by that evidence together
 // with the pinned source mechanisms and the maintainer-confirmed leader-only contract;
 // neither synthetic test reproduces an election window, and neither is cited as though
 // it independently proves the server property.
@@ -1418,7 +1418,7 @@ func TestWillLicensingIsRefusedPastTheBudget(t *testing.T) {
 // nothing.
 //
 // This USED TO be reachable through an operation the documentation supported, because
-// $MQTT_willq sat outside the coupled recreation unit. F-066 made all ten streams one
+// $MQTT_willq sat outside the coupled recreation unit. issue #70 made all ten streams one
 // recreation unit, so it is now reachable only through administrative deletion or a
 // partial restore — unsupported, not impossible. The behaviour is still pinned: a test
 // is not weakened because the route to its state got narrower.
@@ -1995,7 +1995,7 @@ func TestWillScanProgressPersistsDespiteAStaleForeignFloor(t *testing.T) {
 	// A floor from an incarnation that no longer exists, numerically far above anything
 	// the current stream will reach: what a surviving $MQTT_willq record carries when
 	// $MQTT_sess has been replaced under it. No SUPPORTED operation produces that any
-	// more (F-066 made the ten streams one recreation unit); an administrative
+	// more (issue #70 made the ten streams one recreation unit); an administrative
 	// deletion or a partial restore still can.
 	//
 	// Seeded PUBLISHING with an expired lease, because that is the only shape that can

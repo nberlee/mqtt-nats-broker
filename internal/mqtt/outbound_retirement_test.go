@@ -265,7 +265,7 @@ func TestF105CleanupSurvivesClosure(t *testing.T) {
 	res.ID, res.Epoch = e.id, e.epoch
 	// A SEALABLE kind: this is the generic resource state machine, and a source or PUBREL
 	// consumer is retired only on a route's disposal decision with its name in the same batch
-	// (F-105 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
+	// (issue #107 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
 	res.Kind, res.Name, res.ProvTenure = mqttResourceRetainedPayload, testF105Payload, _EMPTY_
 	body, _ := json.Marshal(res)
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
@@ -379,7 +379,7 @@ func TestF105CleanupOfAnOldGenerationWhileANewOneServes(t *testing.T) {
 	res.ID, res.Epoch = e.id, e.epoch
 	// A SEALABLE kind: this is the generic resource state machine, and a source or PUBREL
 	// consumer is retired only on a route's disposal decision with its name in the same batch
-	// (F-105 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
+	// (issue #107 7c-lc), which TestF105DisposalPairIsEnforced and the disposal tests cover.
 	res.Kind, res.Name, res.ProvTenure = mqttResourceRetainedPayload, testF105Payload, _EMPTY_
 	body, _ := json.Marshal(res)
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
@@ -824,7 +824,7 @@ func TestF105ProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 	defer done2()
 	e2.bootstrap(t, "txn-1")
 	// A SEALABLE kind, deliberately: a source or PUBREL consumer is never sealed, and its hold is
-	// released by its obligation's ending rather than by a later act (F-105 7c-lc), so it could not
+	// released by its obligation's ending rather than by a later act (issue #107 7c-lc), so it could not
 	// offer the edge this rule needs to see beside a seal.
 	testF105PlantUnsealedResource(t, e2, "inc-2", mqttResourceRetainedPayload)
 	nonce := testF105AdmitOn(t, e2, "txn-adm", 7, "inc-2")

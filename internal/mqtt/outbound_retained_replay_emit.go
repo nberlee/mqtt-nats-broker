@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// The durable half of a retained replay item (F-105 7c): materialize, admit, then transmit through
+// The durable half of a retained replay item (issue #107 7c): materialize, admit, then transmit through
 // the same send section an ordinary delivery uses.
 
 // mqttRetainedStep is what one durable step established.
@@ -555,7 +555,7 @@ func (sess *mqttSession) wakeRetainedReclaim(gen, inc string) {
 }
 
 // continueAbandonedRetainedPubRel hands an ABANDONED retained exchange's confirmed PUBREC intent to
-// its PUBREL (F-105 7c): its advance created the canonical, nothing is materialized, so the PUBREL
+// its PUBREL (issue #107 7c): its advance created the canonical, nothing is materialized, so the PUBREL
 // entry is installed from the ACK-only snapshot and emitted. Shared by the PUBREC handler and the
 // asynchronous intent resolver, so a confirmation reached either way owes the same continuation.
 // An installation that is refused is OWNED, never dropped: a refusal proves nothing about the
@@ -602,7 +602,7 @@ func (sess *mqttSession) installAbandonedRetainedPubRel(c *client, pi uint16, ac
 }
 
 // emitRetainedPubRel transmits a retained exchange's PUBREL DIRECTLY, after its PUBREC advance
-// created the canonical record on $MQTT_inflight (F-105 7c): there is no $MQTT_out delivery to
+// created the canonical record on $MQTT_inflight (issue #107 7c): there is no $MQTT_out delivery to
 // carry it, so this is the delivery callback's acquire, bind, enter and write, from the register.
 // An emission that could not complete is OWNED by the continuation worker while this connection
 // lives; an ended entitlement writes nothing, and the successor's resume replays the PUBREL from
@@ -666,7 +666,7 @@ func (sess *mqttSession) emitRetainedPubRelOnce(c *client, pi uint16, nonce stri
 		sess.mu.Unlock()
 		return false
 	}
-	// The attempt's PUBCOMP unit is given back unless its frame may have left (F-116); see
+	// The attempt's PUBCOMP unit is given back unless its frame may have left (issue #118); see
 	// mqttDeliverPubRelCb, which states the property this follows.
 	possiblyEmitted := false
 	defer func() { sess.endPubRelSend(c, pi, sendTok, possiblyEmitted) }()

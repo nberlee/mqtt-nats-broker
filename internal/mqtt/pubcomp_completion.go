@@ -15,7 +15,7 @@ package mqtt
 
 import "time"
 
-// The PUBCOMP completion worker (F-105, the PUBCOMP arm).
+// The PUBCOMP completion worker (issue #107, the PUBCOMP arm).
 //
 // # Why PUBCOMP needs an owner of its own
 //

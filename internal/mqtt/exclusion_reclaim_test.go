@@ -779,7 +779,7 @@ func TestMQTTMarkInflightRegisterCancelledClassifiesEveryArm(t *testing.T) {
 				return nil, &StoredMsg{Sequence: 5, Subject: sub}, nil
 			},
 			want: mqttRegCancelRefused,
-			why:  "a positive claim drawn from a read that failed is what F-034 found here",
+			why:  "a positive claim drawn from a read that failed is what issue #38 found here",
 		},
 	} {
 		tc := tc

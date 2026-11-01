@@ -90,7 +90,7 @@ func runAffineFlow(t *testing.T, f affineFlow) affineOutcome {
 	addr := srv.Addr().(*net.TCPAddr)
 	host, port := addr.IP.String(), addr.Port
 
-	// The WILDCARD is the point. F-081 is about a filter that OVERLAPS a narrower
+	// The WILDCARD is the point. issue #83 is about a filter that OVERLAPS a narrower
 	// deny, not one that matches it: bob is denied "aff.topic" but "aff/#" is
 	// admissible, so his resume SUCCEEDS and the moved copy reaches the affine
 	// delivery path with his snapshot. Subscribing to the exact denied subject
@@ -287,7 +287,7 @@ func assertAffineNothingRecorded(t *testing.T, asm *mqttAccountSessionManager, c
 // TestAffineSharedQoS2HonoursASubscribeDenyOnResume drives the third delivery
 // guard's DENY arm end to end.
 //
-// F-081 is about a filter that OVERLAPS a narrower deny, and that is what makes
+// issue #83 is about a filter that OVERLAPS a narrower deny, and that is what makes
 // this arm reachable at all. `bob` is denied `aff.topic` but `$share/g/aff/#` is
 // admissible, so he CAN resume a session `alice` created - the principal is
 // account plus client ID - and the copy already moved to that session's affine

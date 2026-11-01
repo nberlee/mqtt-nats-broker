@@ -358,7 +358,7 @@ func TestF105AnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
 // testF105EnrolClosing completes a hand-built closing transition so it satisfies the enrolment
 // rules, deriving the same members the production composer derives.
 //
-// Every closure seals and roots (F-105, row 6), so a fixture that hand-wrote only the closure is
+// Every closure seals and roots (issue #107, row 6), so a fixture that hand-wrote only the closure is
 // no longer building a legal batch. This fills in the address and appends the enrolment rather
 // than having each fixture restate it: a test that spelled the members out would be asserting the
 // shape of the enrolment while trying to test something else, and would drift from the composer

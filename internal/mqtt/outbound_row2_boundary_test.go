@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// The write boundary's statement of one acquisition (F-105 row 2): the register token and the action
+// The write boundary's statement of one acquisition (issue #107 row 2): the register token and the action
 // record are one acquisition in one batch, an acquisition is recognised or refused, and only the
 // lease's holder ends live custody. Each case is submitted directly to commitAuthorityTransition, so
 // the refusal asserted is the boundary's own and not a composer's.

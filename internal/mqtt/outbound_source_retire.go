@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// Retiring a source consumer (F-105 7c-lc).
+// Retiring a source consumer (issue #107 7c-lc).
 //
 // A route that ends a subscription — an UNSUBSCRIBE, a QoS 0 downgrade, a rolled-back SUBSCRIBE,
 // a drain's retirement, a failed provisioning, a resume repair's undo — no longer deletes the
@@ -42,7 +42,7 @@ import (
 // is no longer resident; an unfinished retirement of a DISCARDED generation is then the recovery
 // executor's, which acts from the resource record (outbound_discard_exec.go). One whose generation
 // still serves — the route crashed, or its entitlement moved — is settled by the next accepted
-// tenure of that generation (outbound_tenure_settle.go, F-105 7f).
+// tenure of that generation (outbound_tenure_settle.go, issue #107 7f).
 
 // mqttSourceRetirement is one route's decision, in custody until the consumer is retired.
 type mqttSourceRetirement struct {
@@ -50,7 +50,7 @@ type mqttSourceRetirement struct {
 	gen, name, inc string
 	reason         string
 	// stream is the stream whose name ownership names the consumer: the source stream when
-	// empty. A PUBREL consumer's is $MQTT_out (F-105 7d); its only producer is its generation's
+	// empty. A PUBREL consumer's is $MQTT_out (issue #107 7d); its only producer is its generation's
 	// discard, which the recovery executor retires, so no live route sets it today.
 	stream mqttOwnedStream
 	// ent is the serving entitlement the route decided under.
@@ -126,7 +126,7 @@ func (sess *mqttSession) handSourceRetirement(it *mqttSourceRetirement) {
 }
 
 // disposeSourceConsumer is what a route that ends a subscription does with its source consumer,
-// in place of deleting it (F-105 7c-lc): the local charge is refunded as before, and the decision
+// in place of deleting it (issue #107 7c-lc): the local charge is refunded as before, and the decision
 // is handed to the retirement owner under the entitlement of the connection that decided. A route
 // with no accepted entitlement has decided nothing this broker may record: the consumer is left,
 // for the recovery executor (7d), and never deleted raw.
@@ -255,14 +255,14 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 			it.disposed = true
 			return mqttReclaimProgress, nil
 		case errors.Is(derr, errMQTTDisposalEntitlementPreparing):
-			// A HANDOFF IS PREPARING over this decision's tenure (F-105 7f): withheld, not dropped. A
+			// A HANDOFF IS PREPARING over this decision's tenure (issue #107 7f): withheld, not dropped. A
 			// cancellation restores the tenure and the decision lands; a finalization moves it, and
 			// the next attempt drops the item to the successor's settlement.
 			return mqttReclaimWithheld, derr
 		case errors.Is(derr, errMQTTDisposalEntitlementMoved):
 			// THE ENTITLEMENT MOVED ON: the decision is never re-made under the successor. The
 			// successor's own settlement decides the consumer under ITS entitlement if nothing it
-			// holds names it (F-105 7f), and a discarded generation's recovery executor does (7d).
+			// holds names it (issue #107 7f), and a discarded generation's recovery executor does (7d).
 			if sess.jsa.c != nil {
 				sess.jsa.c.Debugf("MQTT: disposal of consumer %q of %q dropped: %v", it.name, id, derr)
 			}

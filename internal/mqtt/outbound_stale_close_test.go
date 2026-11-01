@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// A STALE CLOSE DECIDES NOTHING FOR ITS SUCCESSOR (F-105 7b, plan-7b §3.4, T10/T10b/T10d).
+// A STALE CLOSE DECIDES NOTHING FOR ITS SUCCESSOR (issue #107 7b, plan-7b §3.4, T10/T10b/T10d).
 // Every cancellation a close decides — the void, the withdrawal, the fallback tombstone — is
 // owner-dependent, so it commits only under the entitlement the deciding connection was accepted
 // with, compared inside the committing batch. A close whose connection was superseded is refused

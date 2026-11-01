@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// The ownership protocol's absolute deadline, carried by every request it makes (F-105 8a).
+// The ownership protocol's absolute deadline, carried by every request it makes (issue #107 8a).
 //
 // A budget checked only before each step bounds when a step STARTS, never how long its
 // requests run: one step is several requests, each waiting up to the per-request timeout, and
@@ -51,7 +51,7 @@ func (jsa *mqttJSA) withDeadline(t time.Time) *mqttJSA {
 
 // withRequestGate returns a view of jsa whose every request is admitted by gate first, keeping
 // jsa's deadline: a background caller that owes per-request shutdown admission and accounting
-// (the exclusion-reclaim pass, F-119) runs its multi-request operations — commit, resolve, abort
+// (the exclusion-reclaim pass, issue #121) runs its multi-request operations — commit, resolve, abort
 // — on this view, so no request inside them escapes the gate.
 func (jsa *mqttJSA) withRequestGate(gate func() bool) *mqttJSA {
 	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: jsa.deadline, gate: gate}

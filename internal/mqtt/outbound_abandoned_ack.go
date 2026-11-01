@@ -13,7 +13,7 @@
 
 package mqtt
 
-// mqttAllocationAckBindingRole is WHY an ACK-only binding exists (F-088 WP2, R2-F1), and every reader of a
+// mqttAllocationAckBindingRole is WHY an ACK-only binding exists (issue #90 WP2, R2-F1), and every reader of a
 // binding dispatches on it: the two roles share the ACK routing and nothing else.
 type mqttAllocationAckBindingRole uint8
 
@@ -49,7 +49,7 @@ type mqttAllocationAckBinding struct {
 	seq uint64
 	qos byte
 	acq uint64
-	// payload names a RETAINED delivery's copy (F-105 7c), which has no source.
+	// payload names a RETAINED delivery's copy (issue #107 7c), which has no source.
 	payload string
 }
 
@@ -127,7 +127,7 @@ func newMQTTAbandonedAckBindingFromTerminal(sess *mqttSession, epoch, subject st
 }
 
 // newMQTTAckRouteBinding constructs the AckRoute of a TRANSMITTED entry that is being removed
-// unanswered (F-088 WP2). It is built from the ENTRY — its captured slot reference, allocation
+// unanswered (issue #90 WP2). It is built from the ENTRY — its captured slot reference, allocation
 // nonce, evidence and acquisition — never from a record read, so it names exactly the
 // transmission this connection made: a later acquisition (k+1) is not this binding's, and the
 // existing acquisition checks refuse it.
@@ -166,7 +166,7 @@ func (b *mqttAllocationAckBinding) belongsTo(sess *mqttSession) bool {
 // installAbandonedAckLocked never overwrites another allocation. No scheduling map, identifier
 // allocation, charge or output permission is created by this operation.
 //
-// THE ROLES' INSTALL RULES (F-088 WP2):
+// THE ROLES' INSTALL RULES (issue #90 WP2):
 //   - a HandBack replaces an AckRoute of the SAME allocation (the abandonment upgrades the
 //     routing binding it found; reason REPLACED); nothing else is ever overwritten;
 //   - an AckRoute never replaces anything, and is REFUSED for a lineage the custody ledger has
@@ -219,7 +219,7 @@ const (
 	// mqttBindingReleaseDiscard: the generation was discarded by authority.
 	mqttBindingReleaseDiscard
 	// mqttBindingReleaseHandoff: recovery restored an ACTING entry for this same allocation, which
-	// now owns its acknowledgement (F-088 WP2, AckRoute only).
+	// now owns its acknowledgement (issue #90 WP2, AckRoute only).
 	mqttBindingReleaseHandoff
 )
 

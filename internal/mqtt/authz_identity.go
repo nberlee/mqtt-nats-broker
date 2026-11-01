@@ -25,7 +25,7 @@ import (
 // those itself, and to enforce anything it first has to know who the client is.
 //
 // $SYS.REQ.USER.INFO answers exactly that, on the client's own connection: the
-// bound account (F-080) and both permission sets (F-079 publish, F-081
+// bound account (issue #82) and both permission sets (issue #81 publish, issue #83
 // subscribe). One request per CONNECT, before the CONNECT is accepted.
 //
 // Every unknown refuses. A snapshot is only ever a POSITIVE statement about an
@@ -108,7 +108,7 @@ type mqttUserInfoResponse struct {
 
 // errMQTTIdentityUnavailable marks an identity request that got no answer: no
 // connection to ask on, or the request or its reply could not travel. It is the one
-// distinction a refused CONNECT reports (F-061): without it the broker could not tell
+// distinction a refused CONNECT reports (issue #65): without it the broker could not tell
 // the client "the server is unavailable" from "you are not authorized", and every other
 // mqttFetchIdentity failure is an ANSWER the broker refuses.
 var errMQTTIdentityUnavailable = errors.New("identity request unanswered")
@@ -608,7 +608,7 @@ func (c *client) mqttPublicationAuthorizedLocked(pp *mqttPublish) bool {
 // MQTT 5 has a reason code for exactly this and uses it. MQTT 3.1.1 has none, and
 // [3.3.5.2] offers two lawful outcomes: a positive acknowledgement, or closing the
 // network connection. This takes the close. The acknowledgement is legal but it
-// is the defect restated -- F-079's measured symptom was precisely that a denied
+// is the defect restated -- issue #81's measured symptom was precisely that a denied
 // QoS 1 publish came back PUBACK and a denied QoS 2 came back PUBREC/PUBCOMP, so
 // answering "success" to a message we refused would leave the publisher exactly as
 // misinformed as before.

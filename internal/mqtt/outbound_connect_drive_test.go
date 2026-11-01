@@ -254,7 +254,7 @@ func TestF105OwnershipRequiresItsClockAndExecutor(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipDeadlineViewCapsEveryRequest is consult 6's first WP-E.2 concern, as F-105 8a
+// TestF105OwnershipDeadlineViewCapsEveryRequest is consult 6's first WP-E.2 concern, as issue #107 8a
 // answers it.
 //
 // Checking a deadline BEFORE starting a step does not bound a step that then BLOCKS, and neither

@@ -9,7 +9,7 @@ package mqtt
 // derived from exactly that ([MQTT-3.3.1-1]: DUP is set on a RE-delivery and MUST be 0 on a
 // first delivery). Deriving it from the source consumer's delivery count is wrong — the
 // count rises on every offer the broker declined before tracking — and an in-memory bit
-// does not survive the restart that makes the question hard (F-072).
+// does not survive the restart that makes the question hard (issue #76).
 //
 // So the register's PUBLISH phase is a PAIR. The same atomic batch that creates the register
 // also creates a sibling record on
@@ -302,7 +302,7 @@ const (
 	// first transmission may follow. The classifier has no token input, so this is what the
 	// MARKER proves and no more: recovery's send-state derivation overrides it for an ordinary
 	// register carrying an output token, which it installs possibly attempted (transmitted=true)
-	// while keeping this marker sequence as the debt its next send confirms deleted (F-088).
+	// while keeping this marker sequence as the debt its next send confirms deleted (issue #90).
 	mqttMarkerInstallUnsent
 	// mqttMarkerInstallTransmitted: install with transmitted=true and no marker sequence
 	// (none held); any send is a retransmission, DUP=1.
@@ -376,7 +376,7 @@ func mqttMarkerIll(format string, args ...any) error {
 
 // mqttDecideMarker is THE marker-observation boundary: the decision table, keyed by
 // operation. Its counterpart on the register side is mqttValidateInflightShape plus
-// mqttSlotAdmitsDisposition. Row numbers follow the F-072 contract (docs/ARCHITECTURE.md,
+// mqttSlotAdmitsDisposition. Row numbers follow the issue #76 contract (docs/ARCHITECTURE.md,
 // "Outbound in-flight registers", the unsent marker).
 //
 // Pure: no I/O, no lock, no state. The test hook fires on the way out with the verdict and
@@ -705,7 +705,7 @@ func (jsa *mqttJSA) storeInflightPair(subject string, regExpect, markerExpect ui
 // observes the pair its hooked write claims to have landed. Cleared by the marker's delete,
 // which is what makes a hooked exchange read as transmitted afterwards.
 func (as *mqttAccountSessionManager) storeInflightPair(subject string, regExpect, markerExpect uint64, r *mqttInflightRecord) (uint64, error) {
-	// A PAIR IS AN ADMISSION, never a cancellation fence (F-088): the generic refusal applies.
+	// A PAIR IS AN ADMISSION, never a cancellation fence (issue #90): the generic refusal applies.
 	if err := mqttRefuseGenericFenceWrite(subject, r); err != nil {
 		return 0, err
 	}

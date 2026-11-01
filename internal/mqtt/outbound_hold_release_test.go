@@ -21,7 +21,7 @@ import (
 	"testing"
 )
 
-// F-105 7c-lc: an ending other than an acknowledgement's releases its holds in its own batch; an
+// issue #107 7c-lc: an ending other than an acknowledgement's releases its holds in its own batch; an
 // acknowledgement ending leaves them release-owed to a release-holds batch over its stored ending
 // (outbound_release_holds.go); nothing else releases them.
 

@@ -19,7 +19,7 @@ import (
 	"fmt"
 )
 
-// An unsent obligation is ENDED, not forgotten (F-105, the prerequisite of row 5).
+// An unsent obligation is ENDED, not forgotten (issue #107, the prerequisite of row 5).
 //
 // Every route that destroys an ordinary register because its delivery was never transmitted —
 // Message Expiry, the oversize disposal, a cancelled allocation, a drain, recovery's
@@ -52,7 +52,7 @@ var errMQTTWithdrawNoMarker = fmt.Errorf("%w: no unsent marker naming the alloca
 var errMQTTNoDestroyLicence = errors.New("no licence to end an unsent obligation")
 
 // mqttDestroyLicence is what AUTHORIZES ending an ordinary obligation that was never transmitted
-// (F-105 7b). Choosing to withdraw a delivery is owner-dependent — it is the serving connection's
+// (issue #107 7b). Choosing to withdraw a delivery is owner-dependent — it is the serving connection's
 // decision for the session — so the licence is the ENTITLEMENT of the connection whose decision
 // this is, compared with the serving authority inside the committing batch: a displaced
 // connection's withdrawal fails there, and never falls back to a destruction. The zero value
@@ -135,7 +135,7 @@ func (jsa *mqttJSA) checkDestroyLicence(r *mqttWithdrawUnsentRequest, auth *mqtt
 // register read rewrote it, so the batch fails and nothing is concluded from the stale marker.
 // The write boundary re-checks every clause itself (checkWithdrawalRegister).
 //
-// THE LICENCE (F-105 7b). Choosing to withdraw is owner-dependent, so the request's licence is
+// THE LICENCE (issue #107 7b). Choosing to withdraw is owner-dependent, so the request's licence is
 // checked against the authority read here and the batch CASes that authority: a displaced
 // connection's entitlement fails. The authority changes nothing but its revision.
 func (jsa *mqttJSA) opWithdrawUnsent(r *mqttWithdrawUnsentRequest) (mqttOpOutcome, error) {
@@ -200,7 +200,7 @@ func mqttWithdrawUnsentTransition(prev *mqttOutboundAuthority, prevSeq uint64, t
 		return nil, fmt.Errorf("a withdrawal requires the authority, the register and the exchange as read")
 	}
 	if reg.CancelOrigin == mqttCancelOriginPendingCreate {
-		// A pending fence carries no obligation to withdraw (F-088): it is disposed by its own rule.
+		// A pending fence carries no obligation to withdraw (issue #90): it is disposed by its own rule.
 		return nil, fmt.Errorf("withdrawing %q: the register is a pending cancellation fence, not an obligation", subject)
 	}
 	tomb := *reg
@@ -261,7 +261,7 @@ const (
 )
 
 // withdrawUnsent runs one withdrawal of the register on subject and classifies its outcome with
-// the resolve-abort-resolve settlement every F-105 attempt uses: a lost response is not a
+// the resolve-abort-resolve settlement every issue #107 attempt uses: a lost response is not a
 // refusal, and the re-read — never the abort's own result — decides.
 //
 // Session lock NOT held on entry.
@@ -348,7 +348,7 @@ func (sess *mqttSession) withdrawUnsentHandled(gen, subject, nonce, lin string, 
 //   - the exchange at Publish with the marker of this allocation standing: withdraw, then proceed
 //     against the TOMBSTONE's sequence — which must be OUR tombstone, re-read by identity, so a
 //     superseded or lost-response landing never licenses deleting a successor;
-//   - no marker evidence, or an exchange that is MISSING: REFUSE (F-088). The door admits a
+//   - no marker evidence, or an exchange that is MISSING: REFUSE (issue #90). The door admits a
 //     never-transmitted destruction only on the standing marker (arm 4), so reaching here without
 //     it means the marker vanished between the door's probe and the op's read — a sender's intent
 //     consumed it, or something else removed it — and destroying the register then would be the
@@ -392,7 +392,7 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 	for attempt := 0; attempt < 2; attempt++ {
 		x, _, xerr := jsa.loadOutboundExchange(sess.id, as.sessStreamEpoch, name.gen, cur.Lin)
 		if xerr != nil && !mqttExchangeReadAbsent(xerr) {
-			// UNREADABLE is not missing (F-105 7b): nothing here has read whether this
+			// UNREADABLE is not missing (issue #107 7b): nothing here has read whether this
 			// obligation is still owed, and the destruction would skip the only step that
 			// fences it by the deciding connection's entitlement. Refused: a void falls to its
 			// entitlement-fenced tombstone rung, recovery keeps the pair for its next pass.
@@ -422,11 +422,11 @@ func (sess *mqttSession) endUnsentBeforeDestroy(subject string, seq uint64, cur 
 		switch sess.withdrawUnsent(name.gen, subject, cur.Nonce, cur.Lin, lic, seam) {
 		case mqttWithdrawUnresolved:
 			// Landing unknown: the door refuses, and the withdrawal is OWED to the custody
-			// dispatcher under the deciding licence (F-088, WP3 "withdrawOwed lifecycle").
+			// dispatcher under the deciding licence (issue #90, WP3 "withdrawOwed lifecycle").
 			sess.recordWithdrawOwed(name.gen, subject, cur.Nonce, cur.Lin, seq, lic)
 			return 0, nil, false
 		case mqttWithdrawNoMarker:
-			// The marker the door admitted on is gone (F-088): the PUBLISH may now be on the wire,
+			// The marker the door admitted on is gone (issue #90): the PUBLISH may now be on the wire,
 			// so this register is possibly-attempted and is the only durable carrier of what a
 			// late acknowledgement completes. Refused; the exchange stays at Publish and its owner
 			// (the acquiring section, or the client's acknowledgement) settles it.
@@ -486,7 +486,7 @@ func (sess *mqttSession) withdrawIfEvidenced(gen, subject string, cur *mqttInfli
 	return 0, false
 }
 
-// A cancellation WITHOUT whole-exchange evidence is still a DECISION (F-105 7b).
+// A cancellation WITHOUT whole-exchange evidence is still a DECISION (issue #107 7b).
 //
 // Where no unsent marker proves the PUBLISH was never written, a cancelled ordinary allocation is
 // recorded by a tombstone on its register alone and its exchange is left where it stands (row 5's
@@ -545,7 +545,7 @@ func (jsa *mqttJSA) opTombstoneRegister(r *mqttTombstoneRegisterRequest) (mqttOp
 
 // storeCancellationTombstone writes a cancellation tombstone at expect (0: create-only). An
 // ordinary register goes through opTombstoneRegister under lic's entitlement, settled with the
-// resolve-abort-resolve every F-105 attempt uses; a slot-only register keeps its plain CAS. An
+// resolve-abort-resolve every issue #107 attempt uses; a slot-only register keeps its plain CAS. An
 // entitlement that is not the serving one, or no entitlement at all, is returned wrapping
 // errMQTTEntitlementEnded / errMQTTNoDestroyLicence: TERMINAL for the caller, never a fallback.
 // handled reports whether an ordinary tombstone's batch carried a HANDLE (withdrawUnsentHandled's

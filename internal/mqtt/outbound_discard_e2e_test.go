@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// F-105 7d end to end: a clean-session client disconnects with an unacknowledged delivery; the
+// issue #107 7d end to end: a clean-session client disconnects with an unacknowledged delivery; the
 // teardown transfers its consumers to the generation's recovery root, and the recovery executor
 // retires them through their resources (plan-7d T1, T2, T11).
 

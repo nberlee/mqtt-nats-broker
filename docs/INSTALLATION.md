@@ -20,7 +20,8 @@ version bump has to re-verify.
 every peer, or give the account tier an explicit positive `max_consumers` above your
 working set. From 2.15.0 the server otherwise caps each stream at 1000 consumers, and
 asking for unlimited arms that cap rather than opting out of it. The broker cannot detect
-the setting and cannot refuse early (F-095); the symptom is in
+the setting and cannot refuse early
+([issue #97](https://github.com/nberlee/mqtt-nats-broker/issues/97)); the symptom is in
 [Troubleshooting](TROUBLESHOOTING.md#subscribe-fails-once-a-stream-has-1000-consumers).
 The embedded topology sets it for you.
 

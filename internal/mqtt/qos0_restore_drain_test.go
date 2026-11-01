@@ -419,7 +419,7 @@ func TestMQTTRestoreQoS0NothingOwedPersistsTheReferenceRemovalBeforeDeleting(t *
 // A stream-imposed ConsumerLimits.InactiveThreshold gives every consumer a delete timer it
 // cannot opt out of, so a drain would be reaped with its started messages. The restore must
 // then refuse the conversion — with a STARTED claim present, so that the eligibility guard is
-// what is being tested rather than stageDrain's emptiness. Until F-105 7c-lc the fallback was the
+// what is being tested rather than stageDrain's emptiness. Until issue #107 7c-lc the fallback was the
 // destructive teardown; it is now the downgrade's disposal decision, which waits for the
 // obligation holding the consumer (renamed from ...StillTearsDown).
 func TestMQTTRestoreDrainingNotAllowedRetainsAHeldConsumer(t *testing.T) {
@@ -460,12 +460,12 @@ func TestMQTTRestoreDrainingNotAllowedRetainsAHeldConsumer(t *testing.T) {
 		t.Fatal("a stream inactivity limit forbids draining, so the restore must tear the consumer down " +
 			"rather than convert it: a drain reaped with its messages is worse than the teardown")
 	}
-	// NOT TORN DOWN UNDER ITS STARTED DELIVERY (F-105 7c-lc). The restore still refuses to convert
+	// NOT TORN DOWN UNDER ITS STARTED DELIVERY (issue #107 7c-lc). The restore still refuses to convert
 	// to a drain, and the downgrade's disposal decision stands; but the started claim's obligation
 	// holds the source consumer, and deleting a consumer an admitted obligation holds is the defect
-	// F-105 removes. The downgrade's purge cancelled that obligation's register WITHOUT unsent
+	// issue #107 removes. The downgrade's purge cancelled that obligation's register WITHOUT unsent
 	// evidence (it was transmitted), so its exchange stays at Publish until the generation is
-	// discarded — F-106's accepted cost — and its hold retains the consumer for as long. The
+	// discarded — issue #108's accepted cost — and its hold retains the consumer for as long. The
 	// client-visible outcome is the baseline's (the started delivery is not redelivered); the
 	// added cost is the retained consumer, stated in docs/CONFORMANCE.md.
 	time.Sleep(2 * time.Second)
@@ -904,10 +904,10 @@ func TestMQTTRestoreLaterFailureDoesNotRollBackAConfirmedConversion(t *testing.T
 // Fixing only the restore-converted drain's field would leave exactly this standing.
 //
 // WHAT IT DETECTS, exactly. Two guards keep this exchange: the claimed-sequence exemption
-// (`!drainClaimed` in the delivery callback) and, since F-117, the ownership-time No Local
+// (`!drainClaimed` in the delivery callback) and, since issue #119, the ownership-time No Local
 // stamp, which is EMPTY here because the message was owned and delivered before No Local was
 // turned on. The fixture detects the COMBINED regression (mutation: delete the exemption AND
-// judge by the live option `sub.mqtt.noLocal`, the pre-F-117 rule), not the removal of either
+// judge by the live option `sub.mqtt.noLocal`, the pre-issue #119 rule), not the removal of either
 // guard alone. On this fixture's production path a message carrying a matching exclusion stamp
 // is filtered before delivery and so can never become the claimed exchange; that bounds what it
 // can reach, and is not a claim about every recovery path.
@@ -1474,7 +1474,7 @@ func TestMQTTRestoreAmbiguousLandedSaveKeepsTheStagedDrain(t *testing.T) {
 	s = testRestartPreservingStore(t, s, o)
 
 	// Lose the response to the boundary's session-record write. The accepting CONNECT's own
-	// save is now the outbound-ownership metadata commit (F-105 cutover), which commits through
+	// save is now the outbound-ownership metadata commit (issue #107 cutover), which commits through
 	// commitMetadataAttempt and never reaches this store-result seam, so the boundary save is
 	// the FIRST (and only) write this hook sees. The write itself lands, which is what makes the
 	// outcome ambiguous rather than failed.
@@ -1706,7 +1706,7 @@ func TestMQTTRestoreAmbiguousSettlesOnTheResidentObject(t *testing.T) {
 	s = testRestartPreservingStore(t, s, o)
 
 	// Lose the response to the boundary's session-record write. As in T8, the accepting CONNECT's
-	// own save is the outbound-ownership metadata commit (F-105 cutover), which never reaches this
+	// own save is the outbound-ownership metadata commit (issue #107 cutover), which never reaches this
 	// store-result seam, so the boundary save is the FIRST write this hook sees. Sampled INSIDE the
 	// hook, the restore's drain for sid must be staged: that is what proves the lost write is the
 	// boundary's and not some other save.

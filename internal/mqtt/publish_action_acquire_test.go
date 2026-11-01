@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// A LOST ACQUISITION RESPONSE MUST NOT ORPHAN THE TOKEN (F-098, holistic review round 1,
+// A LOST ACQUISITION RESPONSE MUST NOT ORPHAN THE TOKEN (issue #100, holistic review round 1,
 // finding 2; C13 order 2).
 //
 // The acquisition CAS can land and lose its response. casInflightSlot then rereads, finds a
@@ -30,7 +30,7 @@ import (
 // and every later acquisition refused the survivor for the life of the session.
 
 // testAcquireEnv admits an ORDINARY QoS 2 delivery through the outbound authority on the real
-// store (F-105 row 2, consult 29) and returns the send token a section would carry for it: the
+// store (issue #107 row 2, consult 29) and returns the send token a section would carry for it: the
 // register at `publish` beside its exchange, no token on it, the connection accepted under the
 // serving entitlement. Pass-through load and store seams stand so a test can chain faults onto
 // them; an ACQUISITION is intercepted at the authority commit instead, since it no longer goes
@@ -194,7 +194,7 @@ func TestMQTTPublishActionRefusedAcquisitionLeavesAPeersToken(t *testing.T) {
 	}
 }
 
-// AN ACQUISITION RECORDS THE COUNTER IT ACTUALLY WROTE (F-098 C-I, holistic review round 4,
+// AN ACQUISITION RECORDS THE COUNTER IT ACTUALLY WROTE (issue #100 C-I, holistic review round 4,
 // finding 2). casInflightSlot refreshes its CAS base on every internal attempt, and a peer that
 // acquired and DRAINED in between leaves custody unchanged and the token clear — so the token
 // and custody predicates both pass while the counter has moved. The caller derived its expected
@@ -255,7 +255,7 @@ func TestMQTTPublishActionRefusesACounterItDidNotRead(t *testing.T) {
 	}
 }
 
-// THE SAME WINDOW ON AN ORDINARY SLOT (F-105 row 2). An ordinary acquisition is an authority
+// THE SAME WINDOW ON AN ORDINARY SLOT (issue #107 row 2). An ordinary acquisition is an authority
 // batch, and a peer acquiring and draining between its composition and its send makes the store
 // refuse it; the bounded re-attempt (consult 22) then reads the moved register and acquires at
 // the NEXT counter. What C-I requires survives that: whatever this call reports, the counter it
@@ -309,7 +309,7 @@ func TestMQTTPublishActionRecordsTheCounterItLandedOnAnOrdinarySlot(t *testing.T
 	}
 }
 
-// A DELAYED DRAIN MAY NOT LOWER A NEWER TRANSMISSION'S COUNTER (F-098 C-I, holistic review
+// A DELAYED DRAIN MAY NOT LOWER A NEWER TRANSMISSION'S COUNTER (issue #100 C-I, holistic review
 // round 6, finding 2). Successive transmissions of one allocation deliberately share nonce and
 // subject, so those two do not separate an older drain from a newer one. An older drain can
 // clear its token, pause before its write-back, and resume after an AckWait delivery has

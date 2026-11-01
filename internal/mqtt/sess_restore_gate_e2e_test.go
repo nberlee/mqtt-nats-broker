@@ -1,7 +1,7 @@
 //go:build mqtt_fulltests
 
 // End-to-end proofs that the success CONNACK follows a COMPLETE restoration, or
-// the CONNECT is refused (F-050, sess_restore_gate.go).
+// the CONNECT is refused (issue #54, sess_restore_gate.go).
 //
 // The defect these are written against: a resuming CONNECT acknowledged the
 // session with Session Present = 1 and only THEN restored its subscriptions, so
@@ -11,7 +11,7 @@
 // that path to carry the failure and no channel to report it, so the only truthful
 // disposition is not to acknowledge at all.
 //
-// Each fixture names the EXIT it fails. F-050 has five reachable exits and a
+// Each fixture names the EXIT it fails. issue #54 has five reachable exits and a
 // remedy demonstrated on one says nothing about the others, so the injection is
 // per exit (asm.testRestoreFilterFail) and runs AFTER the real call, which is what
 // makes each test evidence that the production route was reached.
@@ -345,7 +345,7 @@ func testRestoreAwaitPublish(t *testing.T, r *mqttReader, want string) uint16 {
 // ---------------------------------------------------------------------------
 
 // The two consequences that made "fail the CONNECT" the wrong answer when the
-// F-064 review looked at it, and that refusing BEFORE the CONNACK avoids.
+// issue #68 review looked at it, and that refusing BEFORE the CONNACK avoids.
 //
 // A refusal after the CONNACK would go through ordinary close bookkeeping, which
 // marks this connection's Will owed and publishes it; and the requested Session
@@ -1120,7 +1120,7 @@ func TestRefusedRestoreRefundsTheSharedChargeItAdded(t *testing.T) {
 // VERDICT (positively, through the block counter) and that it then arrives promptly
 // after the open rather than after an AckWait stall.
 //
-// Given F-072 — the affine path derives DUP from the JetStream delivery count — the
+// Given issue #76 — the affine path derives DUP from the JetStream delivery count — the
 // DUP expectation on the post-open delivery is deliberately not asserted here; a
 // copy that was offered and refused before trackPublish is exactly that finding's
 // population.
@@ -1185,7 +1185,7 @@ func TestNoAffineCopyPrecedesTheConnAck(t *testing.T) {
 // A malformed persisted shared key refuses, rather than being skipped
 // ---------------------------------------------------------------------------
 
-// Found by holistic round 4, and it is F-050's own defect in miniature. The restore
+// Found by holistic round 4, and it is issue #54's own defect in miniature. The restore
 // counted every SharedSubs entry but appended a filter only for keys
 // mqttParseSharedKey accepted, so a malformed one produced no failed filter — the
 // aggregation saw nothing wrong and the client was told Session Present for a
@@ -1267,7 +1267,7 @@ func TestMalformedSharedKeyRefusesTheResume(t *testing.T) {
 //
 // Both are asserted on a PLAIN filter, which also closes the other half of that
 // finding: every other refusal fixture here uses a shared QoS 2 filter, so the
-// non-shared path — which F-050 covers by the same mechanism — had no refusal test
+// non-shared path — which issue #54 covers by the same mechanism — had no refusal test
 // at all.
 //
 // Mutation check: M25 removes the raw exit consultation and the resume is accepted.
@@ -1614,7 +1614,7 @@ func TestGateTimeoutNaksAnAffineCopy(t *testing.T) {
 	// timeout still arrives.
 	//
 	// The DUP flag is deliberately not asserted: the affine path derives it from the
-	// JetStream delivery count, which is F-072's open defect, and a NAK increments
+	// JetStream delivery count, which is issue #76's open defect, and a NAK increments
 	// that count.
 	deadline := time.Now().Add(1200 * time.Millisecond)
 	pi := testRestoreAwaitPublish(t, r2, "affto")

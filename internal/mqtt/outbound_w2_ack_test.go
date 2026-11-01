@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// A RESUMED CLIENT MAY ACKNOWLEDGE BEFORE THE BROKER RETRANSMITS (F-105 WP-F W2, row C5b).
+// A RESUMED CLIENT MAY ACKNOWLEDGE BEFORE THE BROKER RETRANSMITS (issue #107 WP-F W2, row C5b).
 //
 // [MQTT-4.4.0-1] obliges the broker to resend unacknowledged PUBLISH and PUBREL packets when a
 // session resumes, but nothing obliges the client to wait for them: a client that persisted the

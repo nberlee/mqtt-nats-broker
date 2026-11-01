@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-// F-041's deferred half. A deferred discharge IS the close it stands in for, so
+// issue #45's deferred half. A deferred discharge IS the close it stands in for, so
 // on every branch it must apply the action's lifetime, derive clean from it, and
 // make the pair durable before doing anything fallible.
 //
@@ -506,7 +506,7 @@ func TestMQTTDeferredDischargeLeavesASyntheticDiscardsLifetimeAlone(t *testing.T
 // Widening matters for two reasons beyond the wasted write. Every parked close
 // would pay it, and an AMBIGUOUS backstop store reparks a discard that is
 // otherwise simply attempted -- so the widened form changes the outcome of a
-// path F-041 does not own.
+// path issue #45 does not own.
 //
 // NOT parallel: setMQTTTestSessStoreResultHook and setMQTTTestClearWindowHook
 // are process-global setters.

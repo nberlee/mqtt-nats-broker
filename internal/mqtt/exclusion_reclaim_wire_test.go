@@ -118,7 +118,7 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 					})
 					store := as.storeInflightCAS
 					if tc.cancelled {
-						// F-088 (consult C4): the displaced cancellation create is a PENDING
+						// issue #90 (consult C4): the displaced cancellation create is a PENDING
 						// FENCE and carries its written provenance. The generic sink refuses
 						// that provenance by design, so the create-only write goes to the raw
 						// JSA boundary, which validates it as the fence form.
@@ -186,7 +186,7 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 				// OBSERVE, do not fabricate: the seam records that an admission batch carrying a
 				// member on the contested subject was attempted and then performs the REAL commit,
 				// so the refusal below is the production create-only CAS refusing, not the fixture
-				// standing in for it. Since F-105 the register is created only inside the
+				// standing in for it. Since issue #107 the register is created only inside the
 				// admission's authority batch, so that batch is where the attempt shows. Installed
 				// only on this arm, because the delivering arm needs the untouched admission.
 				commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
@@ -222,7 +222,7 @@ func TestMQTTExclusionReclaimWireSafetyUnderADisplacedWriterCreate(t *testing.T)
 					t.Fatalf("no allocation was attempted against the contested subject, so what follows "+
 						"would prove nothing: %s", tc.why)
 				}
-				// The refused allocation moves on (F-105's admission ladder): the delivery arrives
+				// The refused allocation moves on (issue #107's admission ladder): the delivery arrives
 				// once, and NOT under the identifier the displaced record holds.
 				otherPI := testMQTTCheckPubMsg(t, sub, subr, "excl/wire", mqttPubQos1, []byte("second"))
 				if otherPI == 0 || otherPI == strandedPI {

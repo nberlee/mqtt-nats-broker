@@ -4,7 +4,7 @@ import "testing"
 
 // mqttTestRetireBound discards a session that still has a client BOUND, by the same
 // two-phase retirement mqttProcessConnect's clean-start arm performs: close
-// admission, drain, capture, prepare, detach, mint, destroy (F-036 unit 1).
+// admission, drain, capture, prepare, detach, mint, destroy (issue #40 unit 1).
 //
 // It exists because sess.clear() on a bound object is no longer a legal sequence —
 // property P forbids re-minting an incarnation while a client is attached, and the
@@ -17,14 +17,14 @@ func mqttTestRetireBound(t *testing.T, asm *mqttAccountSessionManager, sess *mqt
 	if err != nil {
 		return err
 	}
-	// Every destroy now takes the production receipt rule (F-105 8b): a SERVING authority at the
+	// Every destroy now takes the production receipt rule (issue #107 8b): a SERVING authority at the
 	// retiring generation is closed discarding, anything else follows the closing licence.
 	return prepared.destroy(capsule.permit, noWait)
 }
 
 // testInstallFixtureTenure gives a fixture session that never went through a CONNECT the
 // tenure an acceptance would have, and INSTALLS it on the generation's ledger — the production
-// shape since F-105 8b, where only an installation creates a ledger and a join never does. A
+// shape since issue #107 8b, where only an installation creates a ledger and a join never does. A
 // session that adopted an acceptance fact mints exactly as the CONNECT does; one that did not
 // gets a well-formed synthetic tenure.
 func testInstallFixtureTenure(t *testing.T, sess *mqttSession) mqttSharedTenure {

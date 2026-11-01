@@ -64,7 +64,7 @@ import (
 // transaction cannot write into, close, or signal a waiter into somebody else's
 // newer transaction, because the id no longer names the open one. Copies of the
 // CURRENT token are interchangeable - production passes the opener's token down to
-// its callees, and any of them may close the transaction it names (F-054).
+// its callees, and any of them may close the transaction it names (issue #58).
 type recordTx struct {
 	epoch uint64
 	id    uint64
@@ -356,7 +356,7 @@ func (sess *mqttSession) endRecordTxLocked(tok recordTx, newGeneration bool) err
 	for _, d := range disposals {
 		// No client here: the fence is released by paths with and without one. The decision
 		// carries the entitlement its omission was taken under, never the one serving now
-		// (F-105 7c-lc).
+		// (issue #107 7c-lc).
 		sess.disposeRetiredDrainConsumer(nil, d.durable, d.ent)
 	}
 	return nil
@@ -440,7 +440,7 @@ var mqttTestRecordTxWithdrawGuardHookV atomic.Pointer[func(sess *mqttSession)]
 // MaxConsumers IS a prerequisite now, and it was not before: this owner creates
 // a consumer. Every broker runs its own ephemeral session-record watch over this
 // stream (sess_record_watch.go), which is how a resident session learns that its
-// record MOVED — not who moved it, which the watch cannot say (F-084) — so a
+// record MOVED — not who moved it, which the watch cannot say (issue #86) — so a
 // finite cap eventually rejects a legitimate broker
 // start — the same reasoning, and the same check, as $MQTT_rmsgs. Note that a
 // configured 0 means UNLIMITED once nats-server normalizes the config, so only a
@@ -479,7 +479,7 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 	}, wantReplicas); err != nil {
 		return err
 	}
-	// The permanent CONNECT acceptance facts, and F-105's permanent handoff outcomes,
+	// The permanent CONNECT acceptance facts, and issue #107's permanent handoff outcomes,
 	// live on this stream so that an accepted CONNECT commits its record and both
 	// facts in one atomic batch. Without
 	// the capability the server rejects the batch headers outright, which would

@@ -23,7 +23,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// The PUBREL REDRIVE WAITER (F-098): a stored PUBREL that admission refused because a
+// The PUBREL REDRIVE WAITER (issue #100): a stored PUBREL that admission refused because a
 // PUBLISH transmission was still live on its slot must be woken by that transmission's own
 // end, not left to AckWait.
 //

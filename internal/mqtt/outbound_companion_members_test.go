@@ -27,7 +27,7 @@ import (
 // own refusal, and lands the companion-carrying batch as the positive control.
 
 // testWithoutSlotMembers drops every in-flight register and unsent-marker member from a
-// batch, leaving its F-105 members (exchange, ledger, duties, resources) untouched.
+// batch, leaving its issue #107 members (exchange, ledger, duties, resources) untouched.
 func testWithoutSlotMembers(tr *mqttAuthorityTransition) *mqttAuthorityTransition {
 	out := *tr
 	out.Extra = nil

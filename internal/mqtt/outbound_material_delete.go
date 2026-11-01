@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// Removing replay material (F-105, row 7; contract 6).
+// Removing replay material (issue #107, row 7; contract 6).
 //
 // # A classification of mine that contradicted itself
 //

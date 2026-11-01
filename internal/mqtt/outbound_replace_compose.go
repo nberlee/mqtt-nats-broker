@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// Composing a REPLACING admission (F-105, row 1).
+// Composing a REPLACING admission (issue #107, row 1).
 //
 // mqttAdmitPublishTransition composes the create-only case: a free identifier, a fresh
 // obligation, a pair written create-only. This composes the other one — an identifier an
@@ -190,7 +190,7 @@ func mqttReplacePublishTransition(r *mqttReplacingAdmission) (*mqttAuthorityTran
 		// it, AND ITS ACQUISITION HISTORY: Acq is the obligation's transmission counter, never
 		// reset; a continued lineage whose counter restarted at 0 would re-use ordinal 1 against
 		// an action record that already exists, and would hide from every reader that asks
-		// "which acquisition was last" the one the occupant took (F-105 row 5, P-8 f1).
+		// "which acquisition was last" the one the occupant took (issue #107 row 5, P-8 f1).
 	}
 
 	if verr := mqttValidateInflightShape(&rec); verr != nil {

@@ -35,7 +35,7 @@ func TestValidateSessStream(t *testing.T) {
 			Name: mqttSessStreamName,
 			// FOUR subject spaces: the session records, the permanent CONNECT
 			// acceptance facts an accepted CONNECT commits atomically with its
-			// record, F-105's permanent handoff outcomes, which the same batch
+			// record, issue #107's permanent handoff outcomes, which the same batch
 			// carries because a handoff's metadata half must be decidable from a
 			// record that exists rather than from the record's absence, and the
 			// per-generation teardown receipts.
@@ -630,7 +630,7 @@ func TestBrokerStreamSpecTable(t *testing.T) {
 		//
 		// This asserts where the callback IS, not what it may do: callback purity is
 		// a fact of the current code, read and not guarded, and no safety claim in
-		// docs/ARCHITECTURE.md rests on it (F-066).
+		// docs/ARCHITECTURE.md rests on it (issue #70).
 		if spec.post != nil && spec.name != mqttSessStreamName {
 			t.Fatalf("entry %q carries a post step; only %s may, and only to adopt the "+
 				"recovery epoch in memory — a durable step here would run before the "+
@@ -783,7 +783,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		"Duplicates":         {kind: dispWaived, reason: "this owner sets no Nats-Msg-Id, so a deduplication window is inert"},
 		// REJECTED for every validator, not waived: the account's recovery epoch
 		// lives in this map, and it is what makes the ten broker-owned streams one
-		// recreation unit (F-066). This row is also the mechanical guard that no
+		// recreation unit (issue #70). This row is also the mechanical guard that no
 		// validator FORGOT the stamp check — the mutator writes a malformed epoch, so
 		// a validator missing validateBundleEpochStamp fails the bijection here rather
 		// than silently admitting a stream from another incarnation. Unrelated keys
@@ -878,22 +878,22 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject; a group record is CAS-rewritten and a ledger is sealed, and neither is ever deleted or purged"}
 	case mqttInflightStreamName:
 		register()
-		// Overrides the commons waiver: since F-072 this owner DOES emit batch headers —
+		// Overrides the commons waiver: since issue #76 this owner DOES emit batch headers —
 		// the PUBLISH-phase register and its unsent marker are one atomic batch — so the
 		// capability is a prerequisite, exactly as it is for $MQTT_sess's accept batch.
 		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject SINCE F-034: the teardown's per-incarnation filter purge was replaced by reapIncarnationRegisters, which enumerates, loads, classifies and deletes at exact sequences, so the DenyDelete rejection above is the whole of this owner's need. Same shape as $MQTT_qos2assign's waiver directly above"}
+		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject SINCE issue #38: the teardown's per-incarnation filter purge was replaced by reapIncarnationRegisters, which enumerates, loads, classifies and deletes at exact sequences, so the DenyDelete rejection above is the whole of this owner's need. Same shape as $MQTT_qos2assign's waiver directly above"}
 	case mqttStreamName:
 		interest()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispRejected, errWant: "allow_msg_ttl"}
-		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispWaived, reason: "the limit can be imposed after startup, so the authority is at runtime: admission against a source consumer refuses a stream limit and the consumer's effective threshold (F-105 7c-lc), and the drain and shared/affine paths refuse a stream-forced limit (docs/CONFORMANCE.md, the supported-configuration boundary); a startup check would cover nothing those do not"}
+		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispWaived, reason: "the limit can be imposed after startup, so the authority is at runtime: admission against a source consumer refuses a stream limit and the consumer's effective threshold (issue #107 7c-lc), and the drain and shared/affine paths refuse a stream-forced limit (docs/CONFORMANCE.md, the supported-configuration boundary); a startup check would cover nothing those do not"}
 		d["Duplicates"] = fieldDisposition{kind: dispWaived, reason: "the release msgId is best-effort narrowing of the move protocol's unresolved interval only; ownership never rests on the window (qos2_move.go)"}
 	case mqttOutStreamName:
 		interest()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispWaived, reason: "this owner sends no Nats-TTL header, so the capability is inert if enabled"}
 		d["ConsumerLimits.InactiveThreshold"] = fieldDisposition{kind: dispRejected, errWant: "inactivity"}
-		// Overrides the interest-commons waiver above: since F-065 this owner DOES
+		// Overrides the interest-commons waiver above: since issue #69 this owner DOES
 		// delete a message here — a materialization attempt withdraws the exact
 		// sequence of a copy no claim of its incarnation can authorize, and denied,
 		// that copy NAK-loops behind the fail-closed delivery gate for the session's

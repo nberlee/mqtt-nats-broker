@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 )
 
-// Closing a generation: one batch that ends it, enrols it and makes it discoverable (F-105).
+// Closing a generation: one batch that ends it, enrols it and makes it discoverable (issue #107).
 //
 // # What one closing batch contains
 //
@@ -39,7 +39,7 @@ import (
 // The AFFINE consumer is enrolled ONLY when the closure DISCARDS. A closure that preserves the
 // session's obligations leaves its affine consumer to the incarnation that continues — the affine
 // generation outlives incarnations, which is exactly why no session-generation fact could ever
-// authorize deleting one (F-036 course E). `close-admit` cannot carry a discard at all, so a
+// authorize deleting one (issue #40 course E). `close-admit` cannot carry a discard at all, so a
 // non-discarding closed generation is an ordinary population rather than an edge case, and its
 // affine consumer stays the TEARDOWN's to delete synchronously, as it is today.
 //
@@ -52,7 +52,7 @@ import (
 // Securing the PUBREC proofs reads the records the PUBREL consumer carries, so the readiness work
 // needs that NAME after every transient teardown object is gone. The PUBREL consumer is not
 // enrolled here because it already is: it was provisioned as a resource of its generation, with
-// its provisioning and cleanup duties, before its CREATE, and since F-105 7d the recovery executor
+// its provisioning and cleanup duties, before its CREATE, and since issue #107 7d the recovery executor
 // retires it from that record once the generation is discarded. A name is data; nothing has to
 // finish a field.
 
@@ -218,7 +218,7 @@ func mqttSealedHiOf(members []mqttTransitionMember, id, epoch, gen string) (uint
 const mqttCloseEpisodeAttempts = 4
 
 // opCloseTeardownGeneration commits the AUTHORIZED discarding closure of one generation, on
-// the authority of its durable teardown receipt (F-105, row 8, Gap 1).
+// the authority of its durable teardown receipt (issue #107, row 8, Gap 1).
 //
 // It is opCloseGeneration's discarding sibling, and the difference is where the
 // discard's authority comes from. That operation is only ever composed non-discarding by its
@@ -427,7 +427,7 @@ func (jsa *mqttJSA) closeTeardownGenerationFast(id, epoch, domainTk, gen string,
 	// committed. Landed or superseded is done; never-landed hands over to the full episode;
 	// anything else is settled with an abort so two attempts can never both be in flight — and
 	// an attempt the abort could not settle STOPS here rather than letting the episode compose
-	// a second close beside it (F-105 8b, the close-optimization audit).
+	// a second close beside it (issue #107 8b, the close-optimization audit).
 	if out.Handle != nil {
 		if done, serr := jsa.settleCloseAttempt(gen, out.Handle, cerr); serr != nil {
 			return fmt.Errorf("tearing down generation %q: %w", gen, serr)
@@ -449,7 +449,7 @@ var errMQTTClosingUnlicensed = errors.New("the retiring generation's shared clos
 // seal, naming the generation: the interval a test holds a closer in. nil in production.
 var mqttTestClosingFenceHookV atomic.Pointer[func(gen string)]
 
-// closeRetiringGeneration is the ONE closing driver of a teardown (F-105 8b), on the owner's
+// closeRetiringGeneration is the ONE closing driver of a teardown (issue #107 8b), on the owner's
 // path and on the adoption: the generation closure on $MQTT_inflight is the ADMISSION fence and
 // the ledger seal on $MQTT_shared is the JOIN fence, and the seal is followed by T3, whose
 // releases skip the release fence (7e). So T3 may only run where nothing can depend on an
@@ -513,7 +513,7 @@ func mqttSharedLedgerLen(l mqttSharedLedgerLoad) int {
 }
 
 // settleCloseAttempt decides a sent close attempt whose send failed, before anything is
-// recomposed (consult 9's criterion, enforced since F-105 8b): landed or superseded is done;
+// recomposed (consult 9's criterion, enforced since issue #107 8b): landed or superseded is done;
 // never-landed leaves nothing in flight, so the caller may compose again; anything else is
 // aborted and resolved again, and an attempt that is STILL not decisive — the abort failed, or
 // the second resolution is unresolved — is returned as an error. Composing a fresh close then

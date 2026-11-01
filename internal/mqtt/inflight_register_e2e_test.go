@@ -859,7 +859,7 @@ func TestMQTTInflightDrainedQoS2ReleasesRegister(t *testing.T) {
 // A retained-message delivery has no JetStream backing and therefore no register,
 // which is R6's second half. It must not leave one behind, and must not be recovered.
 // TestMQTTInflightRetainedSendIsRegistered REPLACES TestMQTTInflightRetainedSendNotRegistered by
-// name, with its assertion reversed (F-105 7c): a retained QoS 1 send is no longer an unregistered
+// name, with its assertion reversed (issue #107 7c): a retained QoS 1 send is no longer an unregistered
 // write from the live retained slot. Its delivery stands as a register-backed exchange — the
 // retained register (payload arm, no source coordinates), the exchange at Publish, and a READY copy
 // naming that exchange as admitted — before and while the PUBLISH is unacknowledged. The PI and
@@ -929,7 +929,7 @@ func TestMQTTInflightRetainedSendIsRegistered(t *testing.T) {
 // would be durable while the identifier and its Receive Maximum slot stayed reserved in memory
 // for the life of the session.
 //
-// SINCE F-101 the verdict has to come from a PROVEN-UNSENT delivery, and the fixture says so
+// SINCE issue #103 the verdict has to come from a PROVEN-UNSENT delivery, and the fixture says so
 // positively. The real group delivery below is TRANSMITTED — the client received it — so the
 // close reserves its identifier and stages NO verdict for it, which this test now asserts
 // rather than assuming the old behaviour. A second entry is injected for the credit subject:
@@ -972,7 +972,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 		t.Fatal("the subscriber's session must be resident")
 	}
 
-	// The delivery above is TRANSMITTED, so since F-101 the close stages no verdict for it and
+	// The delivery above is TRANSMITTED, so since issue #103 the close stages no verdict for it and
 	// keeps its identifier reserved. Capture its identity now, to assert exactly that below.
 	// Then inject the PROVEN-UNSENT entry the credit subject needs, on the SAME group durable
 	// so the same purge reaches it: a confirmed register whose PUBLISH has not gone out, which
@@ -1039,7 +1039,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	// The record AS THE ACCEPT SAVE LEFT IT, captured the moment that write lands.
 	//
 	// It has to be captured rather than loaded afterwards. A resumed SHARED membership is
-	// arbitrated by a further record write before the CONNACK (F-077), and `$MQTT_sess`
+	// arbitrated by a further record write before the CONNACK (issue #79), and `$MQTT_sess`
 	// keeps one message per subject — so that second write DELETES the accept save's
 	// record, and "load the record after the reconnect" cannot see it at all. Between the
 	// two writes is the only moment it exists, which is exactly where this hook runs.
@@ -1080,7 +1080,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	// The two halves, asserted separately. The proven-unsent delivery's verdict is what the
 	// credit machinery below inherits; the TRANSMITTED delivery must have none, because a
 	// teardown never establishes that the client completed and recovery reads a verdict as
-	// licence to free the identifier (F-101).
+	// licence to free the identifier (issue #103).
 	sess.mu.Lock()
 	_, sentVerdicted := sess.voidedRegNonces[sentNonce]
 	_, unsentVerdicted := sess.voidedRegNonces[unsentNonce]
@@ -1154,7 +1154,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	})
 }
 
-// TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire is F-092's open item #2 as a
+// TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire is issue #94's open item #2 as a
 // client sees it, over a real connection, a real PUBREL consumer and real AckWait.
 //
 // The stall: a successor resumes while a predecessor holds a live action on the slot, so
@@ -1177,7 +1177,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 // request is what drives it: this MQTT 5.0 connection already holds the PUBREL, so a bare
 // AckWait re-offer is not resent to it ([MQTT-4.4.0-1]).
 //
-// Mutation check (F-105 7b, M16): re-add claim equality to the ordinary PUBREL admission and the
+// Mutation check (issue #107 7b, M16): re-add claim equality to the ordinary PUBREL admission and the
 // PUBREL never arrives — the read below times out, which is precisely the stall. (Before 7b this
 // was the custody repair; an ordinary slot's stamp now decides nothing and needs no repair.)
 func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
@@ -1314,7 +1314,7 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
 
-	// The durable proof, since F-105 7b: the foreign stamp DECIDES NOTHING on an ordinary slot
+	// The durable proof, since issue #107 7b: the foreign stamp DECIDES NOTHING on an ordinary slot
 	// (ownership is the connection's accepted entitlement), so the exchange was served under it
 	// and nothing had to rewrite custody. The slot still names this exchange, or it completed.
 	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
@@ -1345,7 +1345,7 @@ func TestMQTTQoS2ExchangeRecoversFromForeignCustodyOnTheWire(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// F-072 acceptance tests: DUP is derived from the durable pair, never from the
+// issue #76 acceptance tests: DUP is derived from the durable pair, never from the
 // JetStream delivery count. Both are deterministic and not load-sensitive (N-1.3, N-1.4).
 // ---------------------------------------------------------------------------
 
@@ -1498,7 +1498,7 @@ func TestMQTTInflightUnsentMarkerRedeliversWithoutDup(t *testing.T) {
 // reaches admission after their suppression lifts and is delivered again — the QoS 1
 // residual docs/CONFORMANCE.md states. Under CPU starvation a 500 ms budget did not hold
 // (a 590-680 ms release; 8 of 8 at the baseline, 7 of 8 after the parked-release handoff),
-// so it is 2 s, as F-115 set for its own fixture; every assertion is unchanged.
+// so it is 2 s, as issue #117 set for its own fixture; every assertion is unchanged.
 // TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed keeps 500 ms and its controlled
 // overlap for the mechanism the broker does close.
 func TestMQTTInflightTransmittedRedeliversWithDup(t *testing.T) {
@@ -1549,7 +1549,7 @@ func TestMQTTInflightTransmittedRedeliversWithDup(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The crash matrix around durable send intent (F-072 redesign, contract S-5). Intent is the
+// The crash matrix around durable send intent (issue #76 redesign, contract S-5). Intent is the
 // marker's CONFIRMED delete, issued after admission and before the socket write. The two
 // windows it splits have different, deliberate answers on recovery: before intent the pair
 // is intact and the re-offer is a first transmission (DUP=0, T2 = X1); after it the marker is
@@ -2228,7 +2228,7 @@ func TestQ2AffExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 	b.completeExchange(t, c, r, gotPI)
 }
 
-// T2 (F-099, arm A, on the wire). The message must not be lost.
+// T2 (issue #101, arm A, on the wire). The message must not be lost.
 //
 // The unit test proves the durable slot survives; only this proves the client is still
 // served. A peer stores the PUBREL and re-phases the slot between the resumed pass's
@@ -2343,7 +2343,7 @@ func f099RealPubRelScan(asm *mqttAccountSessionManager, subject string) ([]mqttS
 	}
 }
 
-// T3 (F-099), re-expressed for the F-105 PUBCOMP arm (consult 25). The protection is the same —
+// T3 (issue #101), re-expressed for the issue #107 PUBCOMP arm (consult 25). The protection is the same —
 // a PUBCOMP whose durable half fails must not cost a Receive Maximum 1 client its only in-flight
 // slot for the life of the session — and the contract that delivers it has changed.
 //
@@ -2381,7 +2381,7 @@ func TestMQTTInflightFailedPubCompKeepsItsPubRelAndCompletesAfterRestart(t *test
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
 	// The STORED subject is the first return; the second is the delivery subject, where
-	// nothing is ever stored (the F-099 original read that one, so its "the ack removed the
+	// nothing is ever stored (the issue #101 original read that one, so its "the ack removed the
 	// record" check held vacuously).
 	pubRelSubject, _, _ := mqttPubRelNames(idHash, gen)
 

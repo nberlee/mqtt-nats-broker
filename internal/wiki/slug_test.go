@@ -63,8 +63,8 @@ func TestSlugOfRealHeadings(t *testing.T) {
 		{"Reserved $MQTT.> namespace", "reserved-mqtt-namespace"},
 		{"Eclipse Paho interoperability suite ✅ runs; 26/27 pass, 1 baselined",
 			"eclipse-paho-interoperability-suite--runs-2627-pass-1-baselined"},
-		{"The outbound obligation authority (F-105, integrated and accepted)",
-			"the-outbound-obligation-authority-f-105-integrated-and-accepted"},
+		{"The outbound obligation authority (issue #107, integrated and accepted)",
+			"the-outbound-obligation-authority-issue-107-integrated-and-accepted"},
 		{"été", "été"}, // combining marks are kept
 	} {
 		if got := slugOf(c.text); got != c.want {

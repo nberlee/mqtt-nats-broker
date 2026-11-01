@@ -131,7 +131,7 @@ func TestEverySourceAckIsGated(t *testing.T) {
 	}
 }
 
-// TestNoSupportedRouteCallsStoreInflightRegister (T15): the pre-F-105 writer's only production
+// TestNoSupportedRouteCallsStoreInflightRegister (T15): the pre-issue #107 writer's only production
 // caller is the experimental affine route (chapter P's to convert).
 func TestNoSupportedRouteCallsStoreInflightRegister(t *testing.T) {
 	entries, err := os.ReadDir(".")

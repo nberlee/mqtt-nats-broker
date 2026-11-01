@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// A retained exchange's CANONICAL PUBREL (F-105 7c).
+// A retained exchange's CANONICAL PUBREL (issue #107 7c).
 //
 // An ordinary QoS 2 exchange's release is a record on $MQTT_out delivered by the PUBREL consumer;
 // storing it there and re-phasing the slot on $MQTT_inflight can never be one write, which is why

@@ -83,7 +83,7 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 		// NOT "legitimate successor" any more, and not a takeover. Restore adopts WID/PWID
 		// without validating provenance and valid-shaped bodies arrive through unconditional
 		// publication, so a child-SHAPED body is a claim of descent, not proof of one.
-		// F-084: it concedes to the unsettled vocabulary, which asserts only what is true.
+		// issue #86: it concedes to the unsettled vocabulary, which asserts only what is true.
 		{"child-shaped body", func(t *testing.T, e *testInflightEnv) *mqttPersistedSession {
 			return testLandChildRecord(t, e, testMutateSibling)
 		}, mqttDisposalOwnershipUnsettled},
@@ -109,7 +109,7 @@ func TestSessForkedAtConnectTimeDirectRejection(t *testing.T) {
 			if g.outcome != wantOutcome {
 				t.Fatalf("outcome %v, want %v", g.outcome, wantOutcome)
 			}
-			// The WHOLE vocabulary. Both of these carry 0x89 since F-084, so a reason-code
+			// The WHOLE vocabulary. Both of these carry 0x89 since issue #86, so a reason-code
 			// assertion would pass against a broker that mixed them up — and mixing them up
 			// is precisely a false fork claim or a lost mint.
 			testAssertVocabulary(t, tc.name, g.voc, tc.want)
@@ -160,7 +160,7 @@ func TestSessUnrelatedLineageAtConnectTimeStaysForeign(t *testing.T) {
 	// An unrelated lineage concedes to UNSETTLED. It used to concede to the takeover
 	// vocabulary, which claimed a successor the record positively contradicts: this body
 	// shares neither our identity nor our parent, so it establishes nothing about who holds
-	// the session. F-084.
+	// the session. issue #86.
 	claims := b.disconnectClaims(t)
 	if len(claims) != 1 || !claims[0].matches(mqttDisposalOwnershipUnsettled) {
 		t.Fatalf("an UNRELATED lineage concedes to ownership-unsettled: got %+v (wire %x)",
@@ -538,7 +538,7 @@ func TestSessForkedAtReconcileDirectRejection(t *testing.T) {
 			if r.outcome != wantOutcome {
 				t.Fatalf("outcome %v, want %v", r.outcome, wantOutcome)
 			}
-			// The WHOLE vocabulary: both arms carry 0x89 since F-084, so the reason code no
+			// The WHOLE vocabulary: both arms carry 0x89 since issue #86, so the reason code no
 			// longer separates them and the Reason String is what does.
 			testAssertVocabulary(t, tc.name, r.voc, tc.want)
 			// The disposal happened, at the CALLER, and the session is gone from the maps.

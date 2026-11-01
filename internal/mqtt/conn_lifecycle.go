@@ -321,7 +321,7 @@ func (s *Server) createMQTTClient(conn net.Conn, plain bool, ws *wsListenerConfi
 // not duplicate the backend's validation or arithmetic on a value forwarded to it: those limits are
 // stated in docs/CONFORMANCE.md ("Programmatic AckWait near the duration limit"). Upstream's checks
 // about an embedded server - its JetStream flag, its cluster and gateway ports, its users and
-// nkeys - describe a process this is not, and are gone (F-052).
+// nkeys - describe a process this is not, and are gone (issue #56).
 func ValidateOptions(o *Options) error {
 	mo := &o.MQTT
 	if mo.AckWait < 0 {
@@ -568,7 +568,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 
 	// THE DISCONNECT OVERRIDE, made durable before any teardown decision reads the
 	// lifetime. A v5 DISCONNECT may replace the Session Expiry Interval (Spec5
-	// [3.14.2.2.2]), and until F-041 that replacement reached memory only: the
+	// [3.14.2.2.2]), and until issue #45 that replacement reached memory only: the
 	// record kept the pre-override interval AND its old Clean, so a discard that
 	// did not complete left a record a later CONNECT resumes -- reporting Session
 	// Present true for a session the DISCONNECT ended -- while an override RAISING
@@ -626,7 +626,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 			// that is no longer ours. Terminate through the existing disposal, which
 			// discharges the owed Will, and keep the classifier's minted grant and
 			// vocabulary on the forked arm. Nonforked does NOT prove a successor
-			// exists (F-084).
+			// exists (issue #86).
 			sess.disposeForeignSessionLocked(asm, c, g.voc)
 			return
 		default: // mqttPreConnackLocal
@@ -801,7 +801,7 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 		// Session survives the disconnect: drop pending QoS 1/2 state for shared
 		// group consumers without acking, so a resume does not NAK-steal messages
 		// that AckWait redelivers to other members (and so PIs are freed). Spec5 [4.8.2].
-		// Under the CLOSING connection's licence (F-105 7b): sess.c is already cleared, but c's
+		// Under the CLOSING connection's licence (issue #107 7b): sess.c is already cleared, but c's
 		// accepted entitlement is immutable, so a successor that has since accepted makes every
 		// owner-dependent write of this purge fail rather than borrow the successor's.
 		sess.purgeSharedPending(mqttLicenceOf(c))

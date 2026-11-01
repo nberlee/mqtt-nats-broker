@@ -12,7 +12,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// The F-052 boundary: every Options check runs through Start, the production entry point,
+// The issue #56 boundary: every Options check runs through Start, the production entry point,
 // against a real backend, so a mutant that skips or reorders validation starts a broker and
 // fails the assertion instead of crashing on a missing connection.
 

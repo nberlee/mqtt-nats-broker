@@ -127,13 +127,13 @@ const (
 	// mqttUncertainForeign: a record exists that is NOT OURS. Detach and evict — this
 	// object may not write it and must stop serving — but do not infer an owner from it:
 	// the record establishes that the subject moved past our base and nothing about who
-	// moved it. So the WILL stays ours to discharge, not an owner's to inherit. F-084.
+	// moved it. So the WILL stays ours to discharge, not an owner's to inherit. issue #86.
 	mqttUncertainForeign
 	// mqttUncertainForked: a record exists that provably CLAIMS the parent of the one this
 	// broker was acknowledged for, so our write's base was erased by something not
 	// demonstrably a successor of ours. Disposed exactly as foreign — the session is not
 	// ours to write and the surviving record is what the subject now holds, whoever wrote
-	// it — and reported differently only in the Reason String and the mint, since F-084
+	// it — and reported differently only in the Reason String and the mint, since issue #86
 	// gave both classes the same reason code: neither demonstrates a takeover.
 	// See sess_fork_lineage.go.
 	mqttUncertainForked
@@ -156,7 +156,7 @@ func (r mqttUncertainResolution) String() string {
 // session's record state was unresolved. Every deadline in it is ABSOLUTE, so
 // resolution arms the remaining time rather than starting the interval again.
 type mqttDeferredDisconnect struct {
-	// lic is the CLOSING connection's licence (F-105 7b), captured at park: the deferred close's
+	// lic is the CLOSING connection's licence (issue #107 7b), captured at park: the deferred close's
 	// owner-dependent writes (the shared purge's voids and tombstones) execute that connection's
 	// decision, so they carry its accepted entitlement and fail once a successor serves — never the
 	// session's current one. Memory only, like the rest of the parked action. Zero for a synthetic
@@ -174,7 +174,7 @@ type mqttDeferredDisconnect struct {
 	// override -- the client's explicit, unrefusable instruction -- rather than from
 	// the session's own confirmed terms or from a synthetic discard.
 	//
-	// It gates the only writes F-041 adds to the discharge, and the gate is this
+	// It gates the only writes issue #45 adds to the discharge, and the gate is this
 	// narrow for two separate reasons.
 	//
 	// A SYNTHETIC action is not a lifetime at all: reparkRefusedDiscard builds
@@ -192,7 +192,7 @@ type mqttDeferredDisconnect struct {
 	// behaviour change on a path this item does not own.
 	//
 	// So: only an OVERRIDE creates an obligation, and only an obligation is written.
-	// F-041.
+	// issue #45.
 	lifetimeOverridden bool
 	// willDeadline is the absolute Unix time the Will becomes due (0 when there is
 	// no Will pending). A reconnect BEFORE it cancels the Will; a reconnect after
@@ -213,7 +213,7 @@ type mqttDeferredDisconnect struct {
 	// Publish permission is not evaluated here and must not be: it was decided at
 	// CONNECT, while the connection's identity snapshot was valid, and this runs on
 	// the teardown path where that snapshot has already been invalidated. A denied
-	// Will is therefore never captured, so it can never be replayed. F-079.
+	// Will is therefore never captured, so it can never be replayed. issue #81.
 	will      *mqttWill
 	willProps []byte
 	willUser  string
@@ -402,7 +402,7 @@ func (sess *mqttSession) resolveUncertainWriteInTx(tok recordTx) (mqttUncertainR
 		// A newer record with different content, or a sequence below our base. Either
 		// way it is not the write we attempted, so it is NOT OURS — which is a weaker
 		// statement than "it belongs to another owner", and deliberately so: nothing here
-		// identifies a writer (F-084). Do NOT adopt its sequence: doing so would turn our
+		// identifies a writer (issue #86). Do NOT adopt its sequence: doing so would turn our
 		// stale snapshot into a valid CAS and overwrite whatever has since been
 		// persisted.
 		return mqttUncertainForeign, nil
@@ -441,7 +441,7 @@ const (
 	mqttAttemptForeign
 	// mqttAttemptGone: the subject is EMPTY. Something released this session — a teardown,
 	// an expiry, an operator; nothing here names WHICH, and it is not evidence of a
-	// successor (F-084) — and the attempt's CAS can no longer be accepted — but that is not the same as saying an
+	// successor (issue #86) — and the attempt's CAS can no longer be accepted — but that is not the same as saying an
 	// already-accepted proposal of ours cannot still land, so it is not foreign on its
 	// own. Only reported for a non-zero base; see classifyAttemptReadback.
 	mqttAttemptGone
@@ -489,13 +489,13 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.5
 		// server/stream.go:6247), so a proposal already accepted into the log applies
 		// whatever happened to the subject meanwhile — including an exact-sequence
-		// delete, which only clear() now issues. F-030's conditional-write closure does
+		// delete, which only clear() now issues. issue #34's conditional-write closure does
 		// not reach this:
 		// it is about a write conditioned on a superseded base, and a delete carries
 		// no expectation at all. Reported as its own verdict so the
 		// resolver ARBITRATES rather than disposing on a read.
 		//
-		// Base 0 reaches this arm like any other base, and that is F-029's doing. The
+		// Base 0 reaches this arm like any other base, and that is issue #31's doing. The
 		// exclusion here existed because a first-ever create carried no header and could
 		// therefore never be re-attempted — an unconditional write arbitrates nothing,
 		// so the only safe reading of an absent subject was "somebody else's". Now the
@@ -531,7 +531,7 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 //
 // It is an arbitration, not a repair. A success proves the attempt's CONTENT durable at
 // the sequence it reports; a rejection proves the subject moved, and one further read
-// classifies WHAT is there — never by whom, which no record can say (F-084).
+// classifies WHAT is there — never by whom, which no record can say (issue #86).
 //
 // This comment used to argue that the original attempt and this re-attempt — two
 // BROKER-AUTHORED CONDITIONAL writes off one base — could both commit across a leader
@@ -763,7 +763,7 @@ func (sess *mqttSession) resolveUncertainNow(c *client) mqttUncertainResolution 
 	}
 	if res == mqttUncertainForeign || res == mqttUncertainForked {
 		// The record is not ours, on either arm, and on NEITHER does anything establish
-		// who holds it (F-084). The DISPOSITION is identical either way and deliberately
+		// who holds it (issue #86). The DISPOSITION is identical either way and deliberately
 		// so: the surviving record is what the subject holds, this object may not write,
 		// and every
 		// protocol the eviction satisfies (the retained continuations, the parked
@@ -836,7 +836,7 @@ func (sess *mqttSession) dischargeDeferredIfUnbound(c *client) {
 // so this object may not write it and must stop serving.
 //
 // It does NOT say another owner holds the session, and that distinction is the whole of
-// F-084: a record-derived verdict establishes that the subject moved past our base and
+// issue #86: a record-derived verdict establishes that the subject moved past our base and
 // nothing about who moved it. So the expiry and the durables go, and the WILL DOES NOT —
 // it is consumed or discharged by the prepared disposition, because only a displacement
 // this broker holds both ends of may suppress one.
@@ -880,7 +880,7 @@ func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionMana
 	voc mqttDisposalVocabulary) {
 
 	// licensed=false: every caller of this wrapper reached its verdict from a RECORD, and a
-	// record establishes at most that the subject is no longer ours. F-084.
+	// record establishes at most that the subject is no longer ours. issue #86.
 	d := sess.disposeForeignStateLocked(asm, c, false)
 	// PHASE 2. The Will action first, then the report: consuming is irreversible, so it
 	// must not run before phase 1's identity check has said this disposal is ours, and it
@@ -901,7 +901,7 @@ func (sess *mqttSession) disposeForeignSessionLocked(asm *mqttAccountSessionMana
 // in-process same-client-ID replacement this broker holds both ends of may discard a Will
 // as a takeover, because only that establishes a successor. Every record-derived disposal
 // — unsettled, forked, teardown-incomplete — consumes normally, and suppressing there would
-// be silent loss on evidence that established nothing. F-084.
+// be silent loss on evidence that established nothing. issue #86.
 type mqttWillAction uint8
 
 const (
@@ -1000,7 +1000,7 @@ func (d mqttForeignDisposition) applyWill(sess *mqttSession, asm *mqttAccountSes
 // holds both ends of. Only that may discard the Will, and only an armed one
 // (mqttSettleWillOnTakeover). Every record-derived caller passes false
 // and the Will is consumed or discharged instead: those verdicts establish that the record
-// is not ours, never who took it, and suppressing a Will on them is silent loss. F-084.
+// is not ours, never who took it, and suppressing a Will on them is silent loss. issue #86.
 //
 // No lock held on entry (other than the ownership gate).
 func (sess *mqttSession) disposeForeignStateLocked(asm *mqttAccountSessionManager, c *client,
@@ -1047,7 +1047,7 @@ func (sess *mqttSession) disposeForeignStateFenced(asm *mqttAccountSessionManage
 	switch {
 	case licensed && stale != nil:
 		// A demonstrated takeover. It owns the Will's fate, and the parked action goes
-		// with it — exactly as before F-084, because here a successor really does exist.
+		// with it — exactly as before issue #86, because here a successor really does exist.
 		d.will = mqttWillActionSettleOnTakeover
 	case action != nil:
 		// A parked action outranks a live Will because they cannot both exist: parking is
@@ -1068,7 +1068,7 @@ func (sess *mqttSession) disposeForeignStateFenced(asm *mqttAccountSessionManage
 // shares: the CONNACK gate that used to be checked here lives there now, alongside the
 // claim that keeps this from being the second DISCONNECT on the socket. (Its takeover-
 // claiming sibling, mqttNotifyTakenOver, is NOT reachable from here — that wording is
-// licensed only by an in-process replacement held in hand. F-084.)
+// licensed only by an in-process replacement held in hand. issue #86.)
 //
 // No lock held on entry.
 // The vocabulary decides what is CLAIMED, and no caller of THIS helper may claim a
@@ -1077,7 +1077,7 @@ func (sess *mqttSession) disposeForeignStateFenced(asm *mqttAccountSessionManage
 // write; anything else says only that ownership could not be established. Both carry 0x89,
 // so the client is invited to reconnect instead of being told to stop, and what separates
 // them is the Reason String and whether a repair grant is minted. See sess_fork_lineage.go
-// and F-084.
+// and issue #86.
 func (c *client) mqttNotifyForeignDisposal(id string, voc mqttDisposalVocabulary) {
 	c.Warnf("MQTT: session %q %s", id, voc.logReason)
 	c.mqttNotifyDisplaced(voc)
@@ -1270,7 +1270,7 @@ func (sess *mqttSession) parkClose(c *client, action *mqttDeferredDisconnect, un
 // action: from here the action owns it, and no other teardown path may publish it as
 // well (see mqttTakeWillLocked). The publish authorization is a separate fact,
 // decided at CONNECT and merely READ here: a denied Will is not captured, so it is
-// never replayed. F-079.
+// never replayed. issue #81.
 //
 // Lock held on entry (c.mu).
 func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, now time.Time) {
@@ -1290,7 +1290,7 @@ func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, no
 		// The decision is the one taken at CONNECT and READ here: this runs on the
 		// teardown path, where the connection's snapshot has already been
 		// invalidated, so asking again would drop every Will rather than the denied
-		// ones. F-079.
+		// ones. issue #81.
 		return
 	}
 	action.will = will
@@ -1362,7 +1362,7 @@ func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, no
 // that override rather than from the confirmed terms, so there is nothing stale
 // to retarget and a retarget would rewrite a correct value with the same one.
 // That is why applyRequestedLifetime calls this under mqttLifetimeSpeculative
-// only. F-041.
+// only. issue #45.
 //
 // No lock held on entry.
 func (sess *mqttSession) retargetDeferredLifetime(prior *mqttDeferredDisconnect, expiry uint32) {
@@ -1421,7 +1421,7 @@ func (a *mqttDeferredDisconnect) expiredBy(now time.Time) bool {
 // The Will is captured HERE rather than re-derived on resolution, because the
 // closing client's CONNECT packet is about to become unreachable. Its publish
 // authorization is a separate fact, decided at CONNECT and merely READ here: a
-// denied Will is not captured, so it is never replayed. F-079.
+// denied Will is not captured, so it is never replayed. issue #81.
 //
 // OWNED is a precondition, not a description: the caller holds the session
 // ownership gate. That is what entitles the park to clear this client ID from the
@@ -1464,7 +1464,7 @@ func (s *Server) mqttDeferDisconnectEx(c *client, asm *mqttAccountSessionManager
 	// case applyRequestedLifetime's comment warns about: there the broker had
 	// refused the CONNECT, so its requested interval was never owed. Without this,
 	// the three early-park exits silently retain a session the client ended, or
-	// delete one it asked to keep forever. F-041.
+	// delete one it asked to keep forever. issue #45.
 	//
 	// It also decides the Will, at no extra cost: the cap inside mqttWillFireAt and
 	// the armed-Will classification through mqttWillIsDelayed both read
@@ -1569,7 +1569,7 @@ func (s *Server) resolveUncertainSession(asm *mqttAccountSessionManager, sess *m
 		return res
 	case mqttUncertainForeign, mqttUncertainForked:
 		// The record is not ours, on either arm, and on neither does anything establish an
-		// owner (F-084). One disposition path for both resolvers,
+		// owner (issue #86). One disposition path for both resolvers,
 		// so a session found foreign by the periodic pass has its stale connection
 		// CLOSED too — this pass now examines bound sessions, and detaching one
 		// without closing it leaves a live client acting on an evicted session. The
@@ -1664,11 +1664,11 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// ONLY for an action carrying a DISCONNECT override -- see
 		// lifetimeOverridden, which records why the gate is this narrow. A synthetic
 		// discard and an ordinary no-override park both keep their historical
-		// behaviour here: neither has an F-041 obligation to make durable.
+		// behaviour here: neither has an issue #45 obligation to make durable.
 		//
 		// Its own transaction, opened and closed before clear() opens the one it
 		// owns: the fence is not re-entrant and clear() ends the record generation.
-		// F-041.
+		// issue #45.
 		if action.lifetimeOverridden {
 			tok := sess.beginRecordTx()
 			if sess.isSeqUncertain() {
@@ -1719,7 +1719,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 				// An admitted route or a queued effect of this incarnation is still
 				// outstanding, so nothing was deleted and the tracker was reopened. The
 				// obligation is still owed: re-park it exactly as the unresolved refusal
-				// does, and let a later resolution re-drive the discard (F-036 unit 1).
+				// does, and let a later resolution re-drive the discard (issue #40 unit 1).
 				s.reparkDeferredDisconnect(sess, action)
 				return
 			case errors.Is(err, errMQTTClearSuperseded):
@@ -1793,7 +1793,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 		// deletes a session the client asked to keep forever), a 3600 -> 60 override
 		// armed an early timer that expireSessionFired's own recheck then REFUSED against
 		// the retained 3600, and a 60 -> 3600 override left the record eligible for
-		// the earlier expiry. F-041.
+		// the earlier expiry. issue #45.
 		if action.lifetimeOverridden {
 			sess.expiryInterval = action.expiryInterval
 			sess.clean = mqttSessionIsCleanForExpiry(action.expiryInterval)
@@ -1852,7 +1852,7 @@ func (s *Server) applyDeferredDisconnect(asm *mqttAccountSessionManager, sess *m
 //     this goroutine, so acquiring the fence would be a self-deadlock rather than a race.
 //
 // Extracted rather than copied so the two paths cannot drift: this is the ONE place a
-// parked action's Will is discharged. F-084.
+// parked action's Will is discharged. issue #86.
 //
 // It deliberately takes NO client. A deferred action is client-free by construction — it
 // captures the Will precisely because the connection that owed it may already be gone — so
@@ -2010,7 +2010,7 @@ func (s *Server) reparkDeferredDisconnect(sess *mqttSession, action *mqttDeferre
 // discharged by the close that started the deadline.
 //
 // A remote takeover is no longer part of that argument: it used to evict the action under
-// as.mu alone with nothing publishing it, and since F-084 the eviction EXTRACTS the action
+// as.mu alone with nothing publishing it, and since issue #86 the eviction EXTRACTS the action
 // and discharges its Will against the original deadline. The crash window is what remains.
 //
 // The caller must hold the ownership gate, and must key this on errMQTTClearRefusedUnresolved
@@ -2142,7 +2142,7 @@ func (as *mqttAccountSessionManager) reconcileResidentRecordState(s *Server) {
 			// converge: its gate claim is unbound-only, so it is refused for as long as
 			// the client stays attached — and a Keep Alive 0 client that goes silent
 			// never sends the packet that would drive the pre-dispatch settlement
-			// either. F-036 site 1.
+			// either. issue #40 site 1.
 			//
 			// It goes to the OWNERSHIP backstop instead, which re-reads the record and,
 			// for a GONE one, retries the licensed retirement. That retry is what makes
@@ -2262,7 +2262,7 @@ func (as *mqttAccountSessionManager) reconcileResidentOwnership(s *Server, sess 
 		// And then CONSUME it for a bound session, which the settlement cannot: its
 		// bound half runs pre-dispatch on the connection's own readLoop and its unbound
 		// half claims the gate as nobody, so a Keep Alive 0 client that goes silent
-		// drives neither and strands. F-036 site 1. The retirement is licensed by this
+		// drives neither and strands. issue #40 site 1. The retirement is licensed by this
 		// absence PLUS a valid watermark whose marker landed past our own record, never
 		// by the absence alone, and it refuses rather than disposing under a live owner.
 		// An unbound session is left to settleRejectionFromSweep exactly as before.
@@ -2485,7 +2485,7 @@ func (sess *mqttSession) recordStateBlocksServing() bool {
 // There are SEVERAL such callers, not one: the pre-CONNACK classification shared
 // by the reconciliation phase and the lifetime grant, the shared-membership
 // ownership write, and the 3.1.1 forced leave. And 10071 says the subject moved,
-// which is weaker than "taken over" — see F-084. See
+// which is weaker than "taken over" — see issue #86. See
 // classifyGatedRecordSave in sess_resume_reconcile.go.
 func (sess *mqttSession) saveClassifiedDetail(tok recordTx) (saveOutcome, mqttSessSaveDetail, error) {
 	wasUncertain := sess.isSeqUncertain()

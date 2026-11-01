@@ -44,7 +44,7 @@ func (c *client) mqttSessionExpiry() uint32 {
 // Interval ends at connection close. It is the ONE definition of the derivation
 // Spec5 [3.1.2.11.2] fixes: clean and the interval are one fact, not two, and a
 // writer that moves one without the other leaves a record whose resume decision
-// and whose expiry sweep disagree (F-041).
+// and whose expiry sweep disagree (issue #45).
 func mqttSessionIsCleanForExpiry(expiry uint32) bool { return expiry == 0 }
 
 // mqttLifetimeOverride reads the lifetime a v5 DISCONNECT on THIS connection
@@ -218,7 +218,7 @@ func (as *mqttAccountSessionManager) scheduleSessionExpiryLocked(s *Server, idHa
 	// it is servicing is the one still installed. Without that, a callback that already
 	// fired and then lost as.mu to a cancel-and-re-arm would consume the REPLACEMENT's
 	// entry and act on whatever session is current by then — a stale expiry aliased
-	// onto a fresh incarnation (F-036 unit 1).
+	// onto a fresh incarnation (issue #40 unit 1).
 	//
 	// A token rather than the *time.Timer the closure would otherwise have to read:
 	// AfterFunc can fire before its own assignment completes, so capturing the timer
@@ -235,7 +235,7 @@ func (as *mqttAccountSessionManager) scheduleSessionExpiryLocked(s *Server, idHa
 // finds under its client ID hash is its own: the map is keyed by hash, and a
 // reconnect-and-redisconnect replaces the entry, so presence alone would let a
 // stale callback consume the replacement's and expire a session it never named
-// (F-036 unit 1).
+// (issue #40 unit 1).
 type mqttPendingExpiry struct {
 	timer *time.Timer
 	token uint64
@@ -279,7 +279,7 @@ func (as *mqttAccountSessionManager) cancelSessionExpiryLocked(idHash string) bo
 // shutting down, through the same removeSession + clear path as a clean disconnect;
 // a session not in the in-memory maps is re-verified against the persisted record
 // first. Spec5 [3.1.2.11.2]. It carries the install token of the timer that fired so
-// the identity check can prove it is still the installed one (F-036 unit 1). A zero
+// the identity check can prove it is still the installed one (issue #40 unit 1). A zero
 // token is a direct caller and skips the check.
 func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string, fired uint64) {
 	as.mu.Lock()
@@ -297,7 +297,7 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 	// IDENTITY, not just presence: the map is keyed by client ID hash and a
 	// reconnect-and-redisconnect replaces the entry, so an already-fired callback
 	// that lost this lock would otherwise consume the REPLACEMENT's entry. Compared
-	// and deleted in one critical section (F-036 unit 1). A zero token is a direct
+	// and deleted in one critical section (issue #40 unit 1). A zero token is a direct
 	// caller and keeps the presence-only behaviour.
 	//
 	// This is a narrowing, NOT the whole guard: a callback that passes here can still
@@ -318,7 +318,7 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 		return
 	}
 
-	// ACQUIRE BEFORE THE GATE (F-036 unit 1). The lease proves this fire is acting
+	// ACQUIRE BEFORE THE GATE (issue #40 unit 1). The lease proves this fire is acting
 	// for the incarnation it resolved, and taking it first is what keeps a fire
 	// against a RETIRING incarnation from holding the client-ID gate while a
 	// retirement waits: a refused acquisition re-arms and returns without ever
@@ -438,7 +438,7 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 	// the deadline from the one this fire was armed for. Expiring it then would
 	// destroy a session whose lifetime has not elapsed, its subscriptions and queued
 	// QoS state with it. The token identity narrows that window; the re-read closes it
-	// (F-036 unit 1).
+	// (issue #40 unit 1).
 	sess.mu.Lock()
 	notDue := sess.expiryInterval > 0 && sess.expiryInterval != mqttSessionNeverExpire &&
 		sess.disconnectedAt > 0 &&
@@ -460,7 +460,7 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 	as.removeSession(sess, true)
 	// This fire's own lease is PROMOTED by the retirement below, so the drain does
 	// not wait on the caller performing it; the deferred release above then becomes
-	// an idempotent no-op (F-036 unit 1).
+	// an idempotent no-op (issue #40 unit 1).
 	if err := sess.clearInner(true, selfLease, nil, nil); err != nil {
 		if errors.Is(err, errMQTTClearDrainTimeout) {
 			// An admitted route or a queued effect of this incarnation is still
@@ -503,7 +503,7 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 }
 
 // pendingDiscardFinisher builds the finisher for a clean-session discard whose drain
-// ceiling fired (F-036 unit 1). It is invoked by the eagerly-admitted worker once the
+// ceiling fired (issue #40 unit 1). It is invoked by the eagerly-admitted worker once the
 // captured close cycle has drained.
 //
 // It RETRIES the client-ID gate until it claims the obligation or sees another
@@ -575,7 +575,7 @@ func (s *Server) finishPendingDiscard(asm *mqttAccountSessionManager, sess *mqtt
 			s.Debugf("MQTT: the parked discard of session %q is superseded: the object "+
 				"is no longer resident", sess.id)
 			// THE EVICTED OBJECT'S RETIREMENT IS DECIDED, and nothing else will decide it
-			// (F-105 8a). It was evicted — a foreign record found by the uncertainty resolution
+			// (issue #107 8a). It was evicted — a foreign record found by the uncertainty resolution
 			// before this CONNECT's join could run — and will never reach destroy, whose defer
 			// is the only other resolution, so a handler parked on the tracker's decision would
 			// wait forever. Resolving here declares no owner drained: every path into this
@@ -832,7 +832,7 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 		idHash := getHash(ps.ID)
 		// A record this broker has said it cannot interpret is not one it may
 		// REWRITE. The stamp below is a full record write, and arming a timer on it
-		// schedules a claim and a delete of the same record — F-058's rule is that a
+		// schedules a claim and a delete of the same record — issue #62's rule is that a
 		// refused record is never claimed, published, cancelled or deleted. Skip it
 		// whole: nothing reclaims it until the streams are recreated.
 		// See mqttValidateRecordAffinePair.
@@ -902,7 +902,7 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 }
 
 // armPendingDiscardWorker arms a retirement-pending discard and starts the ONE
-// tracked worker that will complete it (F-036 unit 1).
+// tracked worker that will complete it (issue #40 unit 1).
 //
 // Admission is EAGER — taken here, in the goroutine that arms the obligation, before
 // this returns — so the worker is inside the server's shutdown lifecycle by
@@ -947,7 +947,7 @@ func (s *Server) armPendingDiscardWorker(t *mqttIncarnationTracker, finisher fun
 // the tracker the caller captured, and with no timer already installed. Any of those
 // failing means somebody else owns this client ID's deadline now — a re-minted
 // incarnation, or a fresh timer armed by a newer close — and overwriting it would
-// hand a new session a deadline it never asked for (F-036 unit 1).
+// hand a new session a deadline it never asked for (issue #40 unit 1).
 func (as *mqttAccountSessionManager) rearmExpiryIfViewCurrent(s *Server, idHash string,
 	sess *mqttSession, captured *mqttIncarnationTracker) {
 

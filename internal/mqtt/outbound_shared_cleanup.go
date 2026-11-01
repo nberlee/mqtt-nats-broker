@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// The generation-ledger SEAL a closing batch carries (F-105).
+// The generation-ledger SEAL a closing batch carries (issue #107).
 //
 // This file used to enrol a retiring generation's shared group durables as per-generation
 // cleanup resources, and to answer the deferred last-holder question for them with an
@@ -45,7 +45,7 @@ func mqttSealGenLedgerMember(id, epoch, gen string, cur *mqttGenLedger, curSeq u
 	if !mqttValidSessGen(gen) {
 		return mqttTransitionMember{}, fmt.Errorf("sealing the inventory of malformed generation %q", gen)
 	}
-	// THE SEAL CARRIES THE FLOOR AND THE WATERMARK UNCHANGED (F-112): the floor freezes with the
+	// THE SEAL CARRIES THE FLOOR AND THE WATERMARK UNCHANGED (issue #114): the floor freezes with the
 	// shape, and deletions already authorized below it still finish.
 	hi, lo, del := uint64(0), uint64(1), uint64(1)
 	if cur != nil {

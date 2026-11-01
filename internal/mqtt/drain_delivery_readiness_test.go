@@ -285,7 +285,7 @@ func TestAFailedReclaimAdoptsNothingAndLeavesNoRegistration(t *testing.T) {
 	}
 }
 
-// TestAHeldDrainIsNeitherReclaimedNorAdopted is F-094's guard against this change, and
+// TestAHeldDrainIsNeitherReclaimedNorAdopted is issue #96's guard against this change, and
 // it is entered directly at the helper for the reason
 // TestAdoptionRefusalIsReachedBelowTheProcessSubsPreflight records: processSubs refuses
 // a held filter before the helper is called, so a mutation removing the helper's own
@@ -333,7 +333,7 @@ func TestAHeldDrainIsNeitherReclaimedNorAdopted(t *testing.T) {
 		t.Fatal("the held drain must survive untouched")
 	}
 	if live != nil {
-		t.Fatal("a held drain must never be adopted (F-094)")
+		t.Fatal("a held drain must never be adopted (issue #96)")
 	}
 }
 

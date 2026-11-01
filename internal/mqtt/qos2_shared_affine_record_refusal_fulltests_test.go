@@ -120,7 +120,7 @@ func TestQ2AffOrphanedSharedQoS2RecordRefusesRestore(t *testing.T) {
 // TestQ2AffOrphanedSharedQoS2RecordSurvivesTheExpirySweep pins the STARTUP sweep
 // half. The sweep stamps DisconnectedAt on a record whose client it believes it
 // owned, which is a full record WRITE, and it arms a timer that would go on to
-// claim and delete the same record — F-058's rule is that a refused record is
+// claim and delete the same record — issue #62's rule is that a refused record is
 // never claimed, published, cancelled or deleted, so this one is skipped whole.
 //
 // Mutation M-C1: remove the validation before the startup-sweep rewrite and the

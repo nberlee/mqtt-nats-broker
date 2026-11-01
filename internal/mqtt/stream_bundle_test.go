@@ -1,7 +1,7 @@
 // Shared fixtures for the broker-owned stream BUNDLE, and the unit tests for the
 // preflight that enforces it.
 //
-// Untagged on purpose: the ten streams are one recreation unit (F-066), so
+// Untagged on purpose: the ten streams are one recreation unit (issue #70), so
 // every fixture that hand-builds broker-owned streams now needs these helpers,
 // and several of those fixtures live outside the mqtt_fulltests build.
 

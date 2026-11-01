@@ -238,7 +238,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		t.Fatalf("a dependency was asserted for an obligation this transition does not admit")
 	}
 
-	// (4) FINISH ONE OBLIGATION, and only its edge goes (F-105 7c-lc): the terminal advance leaves
+	// (4) FINISH ONE OBLIGATION, and only its edge goes (issue #107 7c-lc): the terminal advance leaves
 	// a's hold release-owed, and a release-holds batch over a's stored ending releases it and
 	// nothing else.
 	testF105FinishExchange(t, e, a)
@@ -267,7 +267,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	}
 
 	// (6) Finish the second: its ending leaves the last edge release-owed, the release-holds batch
-	// releases it (F-105 7c-lc), and only then does the authorization win.
+	// releases it (issue #107 7c-lc), and only then does the authorization win.
 	testF105FinishExchange(t, e, b)
 	testReleaseOwed(t, e, b)
 	last, curSeq := testF105LoadResource(t, e, "inc-rel")
@@ -276,7 +276,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	}
 	_ = curSeq
 	// A PUBREL consumer is retired on a route's disposal decision, and its authorization retires
-	// its name in the same batch: through the paired production operation (F-105 7c-lc).
+	// its name in the same batch: through the paired production operation (issue #107 7c-lc).
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if _, derr := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testF105Gen, Inc: "inc-rel",
@@ -350,7 +350,7 @@ func testF105LoadResource(t *testing.T, e *testF105Env, inc string) (*mqttOutbou
 	return r, msg.Sequence
 }
 
-// TestF105AdmissionRequiresLiveOwnedName is the step-1 illegal boundary (F-105 §5.1 point 3,
+// TestF105AdmissionRequiresLiveOwnedName is the step-1 illegal boundary (issue #107 §5.1 point 3,
 // Codex consult 11): admitting a dependency on a name-governed consumer (source/PUBREL)
 // requires its name-ownership record to stand LIVE and be owned by exactly this incarnation.
 // A missing, RETIRED, or foreign-owned name refuses the admission. The dependency edge alone

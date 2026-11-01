@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// The action-consuming output boundary (F-105, row 2).
+// The action-consuming output boundary (issue #107, row 2).
 //
 // Every case here pairs a VALID POSITIVE CONTROL with the illegal variation it is testing, and
 // asserts what actually reached the transport rather than only that an error came back — the

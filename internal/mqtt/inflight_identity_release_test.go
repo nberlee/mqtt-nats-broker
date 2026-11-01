@@ -1,10 +1,10 @@
-// The identity-conditioned, subject-addressed register release (F-034).
+// The identity-conditioned, subject-addressed register release (issue #38).
 //
-// These tests pin the contract that closed F-034's independently reachable defect: a
+// These tests pin the contract that closed issue #38's independently reachable defect: a
 // register delete is addressed by SUBJECT and removes only the exact sequence that
 // subject currently holds, and only when the occupant's identity matches.
 //
-// The defect the contract replaces, from F-066's own table: `RegSeq` is an absolute
+// The defect the contract replaces, from issue #70's own table: `RegSeq` is an absolute
 // $MQTT_inflight sequence persisted in the session record, and the drain's release used
 // to delete it directly "with no subject or record identity check at all". After that
 // stream is recreated the sequence names an unrelated register — another session's — and
@@ -101,7 +101,7 @@ func testPlantInflight(t *testing.T, as *mqttAccountSessionManager,
 // left, and is deliberately NOT a proof of anything.
 //
 // A present marker naming the record's OWN nonce is the only proof of non-transmission a
-// fixture may supply for an exchange that never transmitted (C-IV arm 4, F-098). It is
+// fixture may supply for an exchange that never transmitted (C-IV arm 4, issue #100). It is
 // declared per subject AND per nonce rather than as a blanket "grant authority" switch,
 // because that is the shape of the real evidence: a predecessor's marker on the same
 // subject names a different exchange and licenses nothing, and a fixture whose exchange
@@ -175,7 +175,7 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 			// FREEING THE IDENTIFIER. The occupant is ours by identity, so the caller's
 			// request is discharged and its drain may proceed — but with no marker and no
 			// cancellation nothing proves the PUBLISH never left, so the slot is PRESERVED
-			// and the identifier stays reserved. The pre-F-098 contract deleted here, which
+			// and the identifier stays reserved. The pre-issue #100 contract deleted here, which
 			// is the second opinion about a live generation's identifier that C-IV removes.
 			name:      "an identity match with NO proof of non-transmission is released WITHOUT deletion",
 			occupants: map[string]testInflightOccupant{subject: {rec: ours(), seq: 904}},
@@ -1331,7 +1331,7 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 	e.sess.last_pi = 41
 	e.sess.mu.Unlock()
 	mismatched := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 43, Dur: dur, Seq: 999, QoS: 2,
-		// F-088: a cancellation carries its written provenance; this one is an occupant CAS.
+		// issue #90: a cancellation carries its written provenance; this one is an occupant CAS.
 		Nonce: mqttNewInflightNonce(), Cancelled: true, CancelOrigin: mqttCancelOriginOccupant})
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, 42)
 	if _, err := e.asm.jsa.storeInflightCAS(subject, 0, mismatched); err != nil {
@@ -1359,17 +1359,17 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The F-036 necessity result, as a shippable reproducer
+// The issue #40 necessity result, as a shippable reproducer
 // ---------------------------------------------------------------------------
 
 // TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate is the artifact plan stopping
-// rule 5 requires before F-034 may route its residual contention to F-036: a **passing**
+// rule 5 requires before issue #38 may route its residual contention to issue #40: a **passing**
 // reproducer that positively asserts the open precondition, rather than a failing test that
 // cannot ship.
 //
 // # Why the first version of this test did not count
 //
-// It labelled a synthetic record as a live peer's and asserted that F-034's guards accepted
+// It labelled a synthetic record as a live peer's and asserted that issue #38's guards accepted
 // it. Review rejected that, correctly: it built no peer, no ownership transition and no
 // active exchange, so every assertion passed for an ordinary uncontended record too. It
 // proved that matching fields satisfy the guards, which is not the precondition — and it
@@ -1386,10 +1386,10 @@ func TestStoreInflightRegisterRefusesAMismatchedOccupant(t *testing.T) {
 // Then it asserts, positively, that **both actors present identical naming evidence over the
 // same register**: A's own authority matches it, and B — now the durable owner — enumerates
 // it with an entitlement watermark that covers it. Neither side is distinguishable from a
-// legitimate operation by anything F-034 added, because the two actors do not disagree about
+// legitimate operation by anything issue #38 added, because the two actors do not disagree about
 // identity. They disagree about who owns the session, and no amount of naming answers that.
 //
-// That is the necessity result: what is needed is an ownership predicate, which is F-036's —
+// That is the necessity result: what is needed is an ownership predicate, which is issue #40's —
 // a resident session object can run register recovery against a generation whose durable
 // ownership has moved, because a resident object never reads the retirement watermark that
 // the record-restoring CONNECT path does (createOrRestoreSessionWithin, sess_manager.go).
@@ -1460,7 +1460,7 @@ func TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate(t *testing.T) {
 
 	// ---- The precondition, asserted positively ----------------------------------
 	//
-	// 1. A's own authority still matches the register exactly, so every check F-034 added
+	// 1. A's own authority still matches the register exactly, so every check issue #38 added
 	//    passes on A's side: nothing stops A from continuing to use it.
 	if !mqttInflightRecordMatchesSubject(rec2, subject) {
 		t.Error("the PI-to-subject binding rejects A's own register: not the contended shape")
@@ -1489,11 +1489,11 @@ func TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate(t *testing.T) {
 
 	// 3. THE RESULT: two reachable actors, identical naming evidence over one register, one
 	//    still live, and nothing in identity or entitlement separating them. Every guard
-	//    F-034 added is satisfied on BOTH sides, which is why naming cannot resolve this and
-	//    an ownership predicate — F-036's — is what is required.
+	//    issue #38 added is satisfied on BOTH sides, which is why naming cannot resolve this and
+	//    an ownership predicate — issue #40's — is what is required.
 	//
 	//    If a future change makes any assertion above fail, this residual has been closed by
-	//    something other than F-036 and the routing must be re-derived.
+	//    something other than issue #40 and the routing must be re-derived.
 	t.Logf("contended: register %q at sequence %d is durably owned by B and still live on A "+
 		"(generation %q); B's entitlement watermark is %d", subject, smsg2.Sequence, gen, watermark)
 }
@@ -1629,7 +1629,7 @@ func testPlantMismatchedRegister(t *testing.T, e *testInflightEnv, pi uint16, du
 		Claim: e.sess.regClaim, Retired: retired, Cancelled: cancelled,
 	})
 	if cancelled {
-		plant.CancelOrigin = mqttCancelOriginOccupant // F-088: a cancellation carries its provenance
+		plant.CancelOrigin = mqttCancelOriginOccupant // issue #90: a cancellation carries its provenance
 	}
 	seq, err := e.asm.jsa.storeInflightCAS(subject, 0, plant)
 	if err != nil {
@@ -1697,7 +1697,7 @@ func TestMarkInflightRegisterRetiredRefusesAMismatchedOccupant(t *testing.T) {
 // TestMarkInflightRegisterCancelledRefusesAMismatchedOccupant covers site 2.
 //
 // A cancellation tombstone is one of two facts that let a resume FREE an identifier rather
-// than reserve it — the other is an unsent marker over a non-reofferable source (F-102),
+// than reserve it — the other is an unsent marker over a non-reofferable source (issue #104),
 // which this test does not exercise. What it pins is the tombstone route, and that
 // hold it, so writing one over a mismatched body is the most direct form of this defect:
 // it frees this subject's identifier on evidence about another one. An error rather than the

@@ -13,7 +13,7 @@
 
 package mqtt
 
-// Classifying what a fresh allocation meets on its identifier's subject (F-105, row 1).
+// Classifying what a fresh allocation meets on its identifier's subject (issue #107, row 1).
 //
 // storeInflightRegister's retry loop interleaves three things: reading the subject, DECIDING
 // what the occupant is, and CARRYING OUT the side effects that decision implies — a source
@@ -74,7 +74,7 @@ type mqttSlotObservation struct {
 	// occupant. Both are required before a stale foreign register may be reaped.
 	provenUnsent bool
 	// cancelMarker is the unsent marker of a CANCELLED occupant's own allocation, probed by the
-	// caller BEFORE classification (F-088, WP3 edit 7): a cancellation is a decision, not a
+	// caller BEFORE classification (issue #90, WP3 edit 7): a cancellation is a decision, not a
 	// proof, so only the marker says whether the cancelled occupant was never sent. The zero
 	// value is Indeterminate, so a caller that did not probe fails closed.
 	cancelMarker mqttSlotMarkerProof
@@ -157,7 +157,7 @@ const (
 	mqttSlotDispAbandonedHeld
 
 	// mqttSlotDispReapPendingFenceThenRetry: the occupant is a PENDING CANCELLATION FENCE of
-	// another allocation, positively identified by its written provenance (F-088, consult C4).
+	// another allocation, positively identified by its written provenance (issue #90, consult C4).
 	// Dispose of exactly that fence through mqttSlotDeletePendingFence — confirmed, at the
 	// observed sequence, preserving any successor — then retry the create. The fence ends no
 	// exchange and frees no independently held reservation.
@@ -215,14 +215,14 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 
 	// OUR OWN NONCE, before anything else looks at the body's contents: it is the only fact
 	// that identifies this ALLOCATION, and the subject is reused so the sequence cannot.
-	// NO CLAIM COMPARISON (F-105 7b): the register's claim stamp decides nothing about an
+	// NO CLAIM COMPARISON (issue #107 7b): the register's claim stamp decides nothing about an
 	// ordinary allocation. Whether this connection may still act for the session is its accepted
 	// entitlement's question, compared inside every owner-dependent authority batch that follows.
 	if cur.Nonce == want.nonce {
 		return v(mqttSlotDispAdoptLandedWrite, "our own write, whose response was lost")
 	}
 
-	// A PURE cancellation tombstone, ABOVE the same-delivery arms, decided by its MARKER (F-088).
+	// A PURE cancellation tombstone, ABOVE the same-delivery arms, decided by its MARKER (issue #90).
 	// Retired is excluded by the precedence rule: a record carrying both was transmitted.
 	//   - marker STANDING for its allocation: a genuine never-transmitted cancellation; reaped
 	//     through the gated door, which withdraws its obligation on that same marker;
@@ -231,7 +231,7 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 	//     delivery: the lineage-preserving register-only replacement; another delivery: reserve);
 	//   - INDETERMINATE (or not probed): nothing is established; abandon with the identifier
 	//     excluded, and the source re-offers later.
-	// A PENDING CANCELLATION FENCE, identified by its written provenance (F-088, consult C4 item
+	// A PENDING CANCELLATION FENCE, identified by its written provenance (issue #90, consult C4 item
 	// 3): a create-only tombstone another allocation wrote on an empty subject before any
 	// admission landed. It is no exchange's identity carrier and has no marker, so it is decided
 	// by provenance alone, never by the cancelled-occupant probe below: reap exactly it through
@@ -266,7 +266,7 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 			return v(mqttSlotDispAdoptRetirement, "a retirement recorded for this source")
 		default:
 			// The replacement is opReplacePublish, which compares this connection's accepted
-			// entitlement: a displaced connection's replacement cannot land (F-105 7b).
+			// entitlement: a displaced connection's replacement cannot land (issue #107 7b).
 			return v(mqttSlotDispReplace, "a same-delivery occupant this session may rewrite")
 		}
 	}

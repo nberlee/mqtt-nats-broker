@@ -32,7 +32,7 @@ import (
 	"time"
 )
 
-// F-105 7e: the shared acquisition release fence (plan-7e T2-T11). The tests that drive a schedule
+// issue #107 7e: the shared acquisition release fence (plan-7e T2-T11). The tests that drive a schedule
 // install the process-wide shared pause hook and so are not parallel.
 
 // testSharedGates parks named mqttTestSharedPause points, each on its FIRST arrival only (a ladder
@@ -815,7 +815,7 @@ func TestSharedVerdictKickCoalescesWithoutLosingAWakeup(t *testing.T) {
 	})
 }
 
-// testPlantSharedAcq gives generation gen of the F-105 env one listed acquisition of a group, as a
+// testPlantSharedAcq gives generation gen of the issue #107 env one listed acquisition of a group, as a
 // join would, and returns it.
 func testPlantSharedAcq(t *testing.T, e *testF105Env, gen, group string) mqttSharedAcqRef {
 	t.Helper()
@@ -827,7 +827,7 @@ func testPlantSharedAcq(t *testing.T, e *testF105Env, gen, group string) mqttSha
 	if l.status == mqttOutboundValid {
 		tenure = l.rec.Tenure
 	} else {
-		// Only an installation creates a ledger (F-105 8b): install the planted tenure first.
+		// Only an installation creates a ledger (issue #107 8b): install the planted tenure first.
 		if _, err := jsa.installSharedTenure(e.id, e.epoch, gen, tenure); err != nil {
 			t.Fatalf("installing the planted tenure: %v", err)
 		}

@@ -41,10 +41,10 @@ was not repeated.
 
 | ID | One line | Upstream | Blocks | Status |
 |---|---|---|---|---|
-| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since F-105 the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
-| F-108 | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and F-105 affine cleanup | Filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
-| F-109 | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
-| F-110 | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | F-105 substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| [issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) affine cleanup | Filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
 | CALLOUT-CONN-TYPES | A user an auth callout issues is admitted on any connection type, whatever its `allowed_connection_types` | Not filed; no existing report found (searched 2026-10-25; [#5786](https://github.com/nats-io/nats-server/issues/5786) is the scoped-signing-key case, without a callout) | nothing the broker relies on; an operator following the callout pattern in `docs/AUTHENTICATION.md` who restricts connection types | **Fixed in v2.15.2** (the callout reply now calls `connectionTypeAllowed`); the witness fails on v2.15.1 and passes on v2.15.2 (2026-10-27); closed by the 2.15.2 pin and floor, never filed |
 
@@ -73,18 +73,23 @@ stale or missing `index.db`. The earlier "a clean shutdown recovers correctly" i
 withdrawn: the second witness below reproduces the revival after a clean shutdown,
 and no index or rebuild cause is inferred from it.
 
-**Exposure.** Present independently of F-105: a clean tree fails
+**Exposure.** Present independently of
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107): a clean tree fails
 `TestMQTTMaxAckPending` when a single inert permanent record is added to
 `$MQTT_inflight`, so any account whose inflight stream is non-empty at a crash
-restart is exposed. Since F-105 that stream is non-empty for every account from its
+restart is exposed. Since
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) that stream
+is non-empty for every account from its
 first accepted CONNECT, so the population is any account with an admitted register,
 no longer only multi-session accounts. Not claimed for every restart, and not claimed
 universal (below).
 
-**F-105 widens the potential exposure.** An earlier form of the shared-group
+**[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) widens
+the potential exposure.** An earlier form of the shared-group
 transfer wrote its per-generation ledger to `$MQTT_inflight` on every resume; those
 records moved to the dedicated `$MQTT_shared` stream (`DenyDelete`, so no tombstone
-and no revival shape), and that history stands. The F-105 cutover itself keeps
+and no revival shape), and that history stands. The
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover itself keeps
 permanent records ON `$MQTT_inflight`: every accepted CONNECT CASes the per-client
 authority and leaves at least two permanent transition outcomes, and every admitted
 QoS 1/2 register is written in one batch with its permanent exchange, outcome and
@@ -112,7 +117,8 @@ absence durable: `removeMsgFromBlock` returns early for a sequence below the
 block's first sequence or already in the deleted map, before the explicit-delete
 tombstone is written (`server/filestore.go` near L6097 on v2.15.0). Only the
 shared-group lifecycle records moved off `$MQTT_inflight` (to `$MQTT_shared`). The
-F-105 authority classes cannot move: an atomic batch is per stream, and the authority
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) authority
+classes cannot move: an atomic batch is per stream, and the authority
 commits with the register it authorizes. So the single-session exposure returns by
 design and is accepted as a disposition, and the register path on `$MQTT_inflight`
 remains subject to this defect until upstream corrects it.
@@ -125,7 +131,8 @@ That witness's clean-shutdown control is clean. Confirmed on `v2.15.0` and
 `v2.16.0-dev`. A draft report is prepared but not posted.
 
 **A second witness reproduces it after a CLEAN shutdown (2026-09-24).** Through the
-broker's own harness on the pinned `v2.15.0` GA (the F-105 PUBCOMP lane,
+broker's own harness on the pinned `v2.15.0` GA (the
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) PUBCOMP lane,
 `revival-witness_test.go.txt`, kept outside the tree): a `MaxMsgsPer:1` register on
 `$MQTT_inflight` written, a neighbour record written, the register rewritten once — by a
 plain CAS, and separately by an atomic batch — the survivor exact-deleted and the subject
@@ -146,19 +153,25 @@ version revives after a clean restart. None of the 2.15.1 compaction or recovery
 (#8623, #8629, #8710) touches the per-subject limit, the tombstones or the index rebuild.
 
 **Unblock.** An upstream correction plus a reviewed pin bump closes this defect and
-the register path is no longer exposed. Neither F-105 unit waits on it. The
+the register path is no longer exposed. Neither
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) unit waits on it. The
 shared-group transfer's own records are on `$MQTT_shared` and add no revival shape;
-the F-105 cutover WIDENS the potential exposure as stated above, which is a disclosed
+the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover
+WIDENS the potential exposure as stated above, which is a disclosed
 disposition, not a repair this repository owes.
 
-## F-108: a failed read reads as an empty suffix
+## issue #110: a failed read reads as an empty suffix
+
+Tracked in [issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110).
 
 Every error from `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` in the message-GET
 handler becomes `NewJSNoMessageFoundError()`, so an enumeration reads a read
 failure as its own end. The supported suffix enumerations it reaches (with
 `scanPubRelRecordsCharged` among them) are listed by file and line in
 `docs/CONFORMANCE.md`, "The storage this design keeps on `$MQTT_inflight`", beside
-the F-109 and F-110 exposure. Receiver is `msgBlock`: `firstMatching` returns early only
+the [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) and
+[issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) exposure.
+Receiver is `msgBlock`: `firstMatching` returns early only
 on `errPartialCache`/`errNoCache`, and `firstMatchingMulti`'s three `cacheLookup`
 sites do not propagate the error (one discards it and reports success). Filed as
 [nats-server#8632](https://github.com/nats-io/nats-server/issues/8632). Reproduced
@@ -174,11 +187,13 @@ error and no gap; the undamaged control delivers both. Upstream status on that d
 is open, and the latest maintainer comment there (2026-09-22) treats a checksum failure as
 lost data.
 
-## F-109: a point-read failure reads as absence
+## issue #111: a point-read failure reads as absence
 
 The broker-side face of the same store conflation: an individual subject's read
 failure is classified as "the subject is empty", which is what a release or
-ownership decision then acts on. Same root cause as F-108, different question (is
+ownership decision then acts on. Same root cause as
+[issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110), different
+question (is
 an individual subject empty, versus did an enumeration reach its end) and
 different repair. Tracked under #8632 rather than filed separately.
 
@@ -193,7 +208,8 @@ enters through the five `mqttJSA` message-GET methods and one decode arm, no sec
 of their replies exists, and no direct-get route exists. The record below is why it was
 already not a completeness gate.
 
-**The census was historical, not a current completeness gate** (decided with F-105 7b,
+**The census was historical, not a current completeness gate** (decided with
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7b,
 2026-09-30). Its tests were already failing before 7b (122 diagnostics at `3e937fd`,
 including unaccounted edges and stale evidence fingerprints in functions 7b does not
 touch), and 7b's reads are not entered in it (186 diagnostics on the 7b tree; three more
@@ -205,15 +221,20 @@ decoded by `decodeDutyResponse`, and the `loadGenLedger` read), `readCustodySubj
 `loadDutyEntryAt`, `readCustodyExchange`, `rematerializeOnce` and `canonicalPubRelProven`
 (`loadMsg`), `pubRelResourceHoldsExchange`, `checkCanonicalRebindRegister`,
 `disposeRematerializeCandidate`, `opWithdrawUnsent` / `opTombstoneRegister`, and
-`resumeEntitlementServes`. Accepting these failures neither fixes nor closes F-109, which
+`resumeEntitlementServes`. Accepting these failures neither fixes nor closes
+[issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111), which
 stays tracked under #8632.
 
-## F-110: a create-only CAS does not prove the subject was empty
+## issue #112: a create-only CAS does not prove the subject was empty
+
+Tracked in [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112).
 
 A `Nats-Expected-Last-Subject-Sequence: 0` publish is admitted at a new sequence
 even when the subject holds a record the server could not read (a damaged occupant
 that reads back `message not found`), so a create-only CAS does not establish that
-the subject was empty. This refuted F-105's original substrate premise. Reproduced
+the subject was empty. This refuted
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)'s original
+substrate premise. Reproduced
 against `v2.15.0` on 2026-09-21. Fact sheet at
 `~/.claude/lanes/f-109-remainder/ISSUE-2-facts-for-defect-template.md`, witness in
 `issue2/`. Upstream issue to be filed after alpha; the fact sheet and witness in the

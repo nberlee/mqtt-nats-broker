@@ -28,7 +28,7 @@ import (
 	"time"
 )
 
-// Retained QoS 1/2 through the manifest, end to end through real clients (F-105 7c).
+// Retained QoS 1/2 through the manifest, end to end through real clients (issue #107 7c).
 
 // testRetainedSubscriber publishes one retained message, connects a persistent subscriber and
 // returns everything a test needs to inspect its retained exchange.
@@ -206,7 +206,7 @@ func testAwaitNoSourceOwner(t *testing.T, sess *mqttSession, subject string, pi 
 }
 
 // TestF105RetainedPubAckInstallsNoSourceOwner: a retained QoS 1 exchange's PUBACK settles no
-// source (F-105 7c), so it installs no ordinary source owner. One that it did install asked a
+// source (issue #107 7c), so it installs no ordinary source owner. One that it did install asked a
 // consumer lookup with an empty name, which a server with permissions never answers: the owner
 // never settled, its retry announced foreground authority for the full API timeout on every
 // attempt, the identifier stayed held, and the session's retained replay starved behind it — the
@@ -1274,7 +1274,7 @@ func TestF105RetainedReplaySurvivesARestart(t *testing.T) {
 	testMQTTFlush(t, c, nil, r)
 }
 
-// TestMQTTRetainedSendReleasesOnTheWriteWithoutADiscard, REWRITTEN for F-105 7c with its guarantee
+// TestMQTTRetainedSendReleasesOnTheWriteWithoutADiscard, REWRITTEN for issue #107 7c with its guarantee
 // kept: a written retained frame's identifier stays reserved until the client acknowledges it, and
 // is allocatable afterwards. Since 7c the reservation after the write is the EXCHANGE's — the
 // ledger's charge and the register-backed entry — not a retained hold released on the write.

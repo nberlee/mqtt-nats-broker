@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// THE POSITIVE SOURCE-ACK GATE (F-105 cutover, unit 7a; consult 83).
+// THE POSITIVE SOURCE-ACK GATE (issue #107 cutover, unit 7a; consult 83).
 //
 // Invariant: for a valid $MQTT_msgs source reply naming a shared-group durable and stream
 // sequence, this session never SUBMITS a positive acknowledgement while it holds a HandBack for
@@ -87,7 +87,7 @@ func (sess *mqttSession) sourceHandBackHeldLocked(dur string, seq uint64) bool {
 		return false
 	}
 	for _, b := range sess.abandonedAcks {
-		// HandBack ONLY (F-088 WP2): an AckRoute routes a late acknowledgement and holds no
+		// HandBack ONLY (issue #90 WP2): an AckRoute routes a late acknowledgement and holds no
 		// source gate — its source is acknowledged by its own completion like any delivery's.
 		if b.handBack() && b.belongsTo(sess) && b.dur == dur && b.seq == seq {
 			return true

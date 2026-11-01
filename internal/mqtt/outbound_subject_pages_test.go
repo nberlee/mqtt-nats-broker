@@ -30,7 +30,7 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// The exchange enumeration reads every page (F-105 integrated gate, round 2). A generation keeps
+// The exchange enumeration reads every page (issue #107 integrated gate, round 2). A generation keeps
 // every exchange it ever admitted, so its history passes the server's subject-page size while its
 // identifier space does not: the walk that decides whether an identifier is free must read the
 // whole answer, page by page, and refuse any page it cannot vouch for.
@@ -190,7 +190,7 @@ func testPagesExchangePresent(t *testing.T, e *testF105Env, gen, nonce string) b
 
 // U-PAGE. Each case scripts the exchange walk page by page and asserts the offsets it requested.
 // The walk-shape cases are asked of the walk itself (streamSubjectsComplete still serves the
-// resource and certificate enumerations, whose records are never deleted). Since F-112 an
+// resource and certificate enumerations, whose records are never deleted). Since issue #114 an
 // admission's identifier-exclusivity check reads the generation's INVENTORY, not this walk —
 // exchange records are now deleted behind the floor, and a paged walk shifts under a deletion — so
 // each case also asserts that an admission requests NO exchange page and is decided by the
@@ -237,7 +237,7 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 		s.requireAsked(t, what+" (admission)")
 	}
 	// admitIgnoresPages: whatever the scripted pages say, an admission on a free identifier is
-	// decided by the inventory and requests no exchange page (F-112).
+	// decided by the inventory and requests no exchange page (issue #114).
 	admitIgnoresPages := func(t *testing.T, s *testPageScript, what string, pi uint16) {
 		t.Helper()
 		nonce, err := testPagesAdmit(t, e, "txn-"+strings.ReplaceAll(what, " ", "-"), pi)
@@ -523,7 +523,7 @@ func TestF105ExchangeWalkPastTheServerPageSize(t *testing.T) {
 		testPagesExchangeBody(t, e, gen, late, k, mqttExchangePublish)); err != nil {
 		t.Fatalf("storing the outstanding exchange: %v", err)
 	}
-	// The outstanding exchange is planted WITH its duty, as an admission writes it: since F-112 the
+	// The outstanding exchange is planted WITH its duty, as an admission writes it: since issue #114 the
 	// admission's enumeration is the inventory, and the subject pages below pin only that the
 	// planted record sits past the server's page boundary, where a subject walk would have had to
 	// reach it.

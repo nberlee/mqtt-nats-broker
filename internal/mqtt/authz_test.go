@@ -48,7 +48,7 @@ accounts {
 `
 
 // authzConfTwoAccounts gives "mallory" credentials in an account the broker's
-// streams do not live in - F-080's whole subject.
+// streams do not live in - issue #82's whole subject.
 const authzConfTwoAccounts = `
 port: -1
 host: "127.0.0.1"
@@ -111,7 +111,7 @@ func authzClient(t *testing.T, broker, id, user string, proto uint) (pmqtt.Clien
 // storedOnStream reports whether a message exists on subject in streamName.
 //
 // The assertions below need it because "the subscriber saw nothing" is only half
-// of what F-079 is about: the other half is data at rest. A broker whose delivery
+// of what issue #81 is about: the other half is data at rest. A broker whose delivery
 // broke while its store still ran would satisfy a delivery-only assertion.
 func storedOnStream(t *testing.T, s *Server, streamName, subject string) bool {
 	t.Helper()
@@ -183,7 +183,7 @@ func authzBroker(t *testing.T, conf string) (broker string, s *Server) {
 	return fmt.Sprintf("tcp://%s", s.Addr().String()), s
 }
 
-// TestDeniedPublishQoS1NotStoredOrDelivered is F-079's QoS 1 row.
+// TestDeniedPublishQoS1NotStoredOrDelivered is issue #81's QoS 1 row.
 //
 // The measured defect was not merely that a denied message was delivered: it was
 // that the publisher was told PUBACK, i.e. success. So this asserts three
@@ -242,7 +242,7 @@ func TestDeniedPublishQoS1NotStoredOrDelivered(t *testing.T) {
 	}
 }
 
-// TestDeniedRetainedPublishNotPersisted is F-079's retained row, and it is the
+// TestDeniedRetainedPublishNotPersisted is issue #81's retained row, and it is the
 // one QoS 0 case that still matters: the live fan-out rides the client's own
 // connection and NATS already drops it, so the retained STORE on the service
 // connection is the entire observable.
@@ -291,7 +291,7 @@ func TestDeniedRetainedPublishNotPersisted(t *testing.T) {
 	}
 }
 
-// TestCrossAccountCredentialsRefused is F-080.
+// TestCrossAccountCredentialsRefused is issue #82.
 //
 // Measured before the fix: "mallory", whose credentials live in account OTHER,
 // authenticated against a broker whose streams live in APP, and its QoS 1 publish
@@ -322,7 +322,7 @@ func TestUserInfoUnavailableRefusesConnect(t *testing.T) {
 	}
 }
 
-// TestWildcardOverlappingSubscribeDenyNotDelivered is F-081.
+// TestWildcardOverlappingSubscribeDenyNotDelivered is issue #83.
 //
 // Measured before the fix: with foo.secret denied for subscribe and the client
 // subscribed to the overlapping wildcard foo/#, QoS 1, QoS 2 and retained replay
@@ -610,7 +610,7 @@ func TestIdentityShapesThatMustRefuseConnect(t *testing.T) {
 	})
 }
 
-// TestRetainedReplayHonoursASubscribeDeny is F-081's retained arm, and it is a
+// TestRetainedReplayHonoursASubscribeDeny is issue #83's retained arm, and it is a
 // different route from the QoS 1/2 one: retained replay builds its packet
 // directly and never reaches the delivery funnel, so it carries its own guard.
 //
@@ -680,7 +680,7 @@ func TestRetainedReplayHonoursASubscribeDeny(t *testing.T) {
 	}
 }
 
-// TestDeniedPublishQoS2NotHeldOrDelivered is F-079's QoS 2 row.
+// TestDeniedPublishQoS2NotHeldOrDelivered is issue #81's QoS 2 row.
 //
 // QoS 2 has its own gate, inside the hold store rather than in mqttProcessPub,
 // because an occupied packet identifier must be answered from the existing
@@ -691,7 +691,7 @@ func TestRetainedReplayHonoursASubscribeDeny(t *testing.T) {
 // The observable for 3.1.1 is the connection closing, which is what [3.3.5.2]
 // offers in place of a reason code and what this broker takes -- answering PUBREC
 // would tell the publisher its denied message was accepted, which is the measured
-// symptom F-079 reported.
+// symptom issue #81 reported.
 func TestDeniedPublishQoS2NotHeldOrDelivered(t *testing.T) {
 	t.Parallel()
 	broker, _ := authzBroker(t, authzConfOneAccount)
@@ -1329,7 +1329,7 @@ func v5AuthzClient(t *testing.T, brokerTCP, id string) *paho.Client {
 // TestDeniedPublishTellsAnMQTT5PublisherWhy is the half of the refusal that
 // MQTT 3.1.1 cannot express.
 //
-// F-079's measured symptom was not only that the message got through: it was that
+// issue #81's measured symptom was not only that the message got through: it was that
 // the publisher was told PUBACK, i.e. success. MQTT 5 has a reason code for
 // exactly this, so a v5 client must receive 0x87 and stay connected. Without this
 // arm every authorization test here speaks 3.1.1, and restoring a success-shaped

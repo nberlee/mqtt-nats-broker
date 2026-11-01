@@ -23,7 +23,7 @@ import (
 )
 
 // The shared-group lifecycle: a group durable is HELD BY ARBITRATION, not counted by a scan
-// (F-105, the shared-group lifecycle transfer).
+// (issue #107, the shared-group lifecycle transfer).
 //
 // # What this replaces
 //
@@ -56,7 +56,7 @@ import (
 // Settlement of a release is the ledger, read after the writer's own batch or its refusal, no
 // longer listing the acquisition. Neither record is ever deleted within the recovery epoch: a
 // sealed ledger is the permanent fence that excludes a stale actor's late write, on the same
-// ground the F-105 closure records rest on (docs/ARCHITECTURE.md, "Storage this mechanism
+// ground the issue #107 closure records rest on (docs/ARCHITECTURE.md, "Storage this mechanism
 // accepts").
 
 const (
@@ -157,7 +157,7 @@ func validateSharedLifecycleStream(si *StreamInfo, wantReplicas int, bundleEpoch
 	if !cfg.AllowAtomicPublish {
 		// A join commits the group record and the acquisition ledger as one atomic batch,
 		// which a stream without this rejects. Refused here, never patched: the broker-owned
-		// streams are one recreation unit (F-066).
+		// streams are one recreation unit (issue #70).
 		return fmt.Errorf("allow_atomic is not set: a shared-group join commits its group record and acquisition ledger in one atomic batch, which the stream would reject")
 	}
 	if cfg.Retention != LimitsPolicy {
@@ -199,7 +199,7 @@ func validateSharedLifecycleStream(si *StreamInfo, wantReplicas int, bundleEpoch
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is what makes
 	// the broker-owned streams one recreation unit rather than independently recoverable
-	// stores (F-066).
+	// stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
 	}
@@ -399,7 +399,7 @@ func (g *mqttSharedGroupRecord) classifyInc(inc uint64) mqttSharedIncDisposition
 
 // mqttSharedLedgerState is whether a generation is still open to acquisitions.
 //
-// From 1, as every F-105 enum is: a missing member must not decode as the permissive value.
+// From 1, as every issue #107 enum is: a missing member must not decode as the permissive value.
 type mqttSharedLedgerState uint8
 
 const (
@@ -438,7 +438,7 @@ type mqttSharedAcqRef struct {
 // appends one and a release removes one, each in the batch that moves the group count, which
 // is what makes the group's holder count exact by construction (count discipline).
 //
-// Closed names the listed acquisitions CLOSED TO NEW DEPENDENCIES (F-105 7e): the first step of
+// Closed names the listed acquisitions CLOSED TO NEW DEPENDENCIES (issue #107 7e): the first step of
 // an open ledger's release, monotone until the release removes the entry, and what a shared
 // admission's readiness refuses. A sealed ledger is closed generation-wide and needs no entry.
 type mqttSharedLedger struct {
@@ -685,7 +685,7 @@ type mqttSharedAcquisition struct {
 //
 // The pre-transfer shape — a bare QoS byte per key — does not decode into this struct, so a
 // record carrying it is REFUSED at every ingress rather than interpreted: an unsupported
-// persisted shape is never migrated (F-056, F-057, F-058).
+// persisted shape is never migrated (issue #60, issue #61, issue #62).
 type mqttSharedMembership struct {
 	QoS  byte                   `json:"qos"`
 	Main mqttSharedAcquisition  `json:"main"`
@@ -820,7 +820,7 @@ const (
 	// tenure: the body is byte-identical and only the sequence moves.
 	mqttSharedShapeBump
 	// mqttSharedShapeClose: ledger alone, ANY tenure. The first step of an open ledger's release
-	// (F-105 7e), authorized by the verdict the caller executes: exactly one listed acquisition
+	// (issue #107 7e), authorized by the verdict the caller executes: exactly one listed acquisition
 	// becomes closed to new dependencies, and nothing else moves.
 	mqttSharedShapeClose
 )
@@ -1138,7 +1138,7 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		if b.Acq.Group == _EMPTY_ || b.Acq.Acq == _EMPTY_ || b.Acq.Inc == 0 {
 			return fmt.Errorf("a join names the acquisition it adds")
 		}
-		// A JOIN NEVER CREATES A LEDGER (F-105 8b): its prior is the ledger an installed tenure
+		// A JOIN NEVER CREATES A LEDGER (issue #107 8b): its prior is the ledger an installed tenure
 		// created, whatever the composer did.
 		if prior == nil {
 			return fmt.Errorf("a join composed against an absent ledger: only a tenure installation creates one")
@@ -1184,7 +1184,7 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		if entry, _ := prior.lists(b.Acq.Acq); entry != b.Acq {
 			return fmt.Errorf("a release names %+v but the ledger lists %+v", b.Acq, entry)
 		}
-		// THE FENCE'S FIRST STEP PRECEDES L1 (F-105 7e): an open ledger releases only an
+		// THE FENCE'S FIRST STEP PRECEDES L1 (issue #107 7e): an open ledger releases only an
 		// acquisition it already lists as closed to new dependencies; a sealed one is closed
 		// generation-wide. The rest of the fence lives on $MQTT_inflight, where this boundary
 		// cannot see it; executeSharedRelease is its one route.
@@ -1422,7 +1422,7 @@ func mqttComposeSharedJoin(epoch, id, gen, qkey, acq string, tenure mqttSharedTe
 	b.Acq = mqttSharedAcqRef{Group: qkey, Inc: b.GroupNext.Live.Inc, Acq: acq}
 	switch l.status {
 	case mqttOutboundAbsent:
-		// A JOIN NEVER CREATES A LEDGER (F-105 8b). Every acceptance installs its tenure before it
+		// A JOIN NEVER CREATES A LEDGER (issue #107 8b). Every acceptance installs its tenure before it
 		// activates, and that installation over absence is the one creator; a join meeting an
 		// absent ledger was composed by a connection that never installed — a stale or crashed
 		// acceptance — and creating the ledger here would bypass exactly that prerequisite.
@@ -1574,7 +1574,7 @@ func mqttComposeSharedBump(epoch, id, gen string, tenure mqttSharedTenure, l mqt
 }
 
 // mqttComposeSharedClose builds the close of acq over an OPEN ledger: the first step of its release
-// (F-105 7e). ANY tenure may compose it, as for a release: its authority is the verdict the caller
+// (issue #107 7e). ANY tenure may compose it, as for a release: its authority is the verdict the caller
 // executes. It returns (nil, nil) when the acquisition is already closed or the ledger sealed.
 func mqttComposeSharedClose(epoch, id, gen string, acq mqttSharedAcqRef, l mqttSharedLedgerLoad) (*mqttSharedBatch, error) {
 	if l.status != mqttOutboundValid {

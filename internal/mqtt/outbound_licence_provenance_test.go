@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// T18: THE ENTITLEMENT A DESTRUCTIVE DECISION CARRIES IS THE DECIDING CONNECTION'S (F-105 7b,
+// T18: THE ENTITLEMENT A DESTRUCTIVE DECISION CARRIES IS THE DECIDING CONNECTION'S (issue #107 7b,
 // plan-7b §3.3-§3.4). Every licence that production code PASSES or STORES — an argument of type
 // mqttDestroyLicence, a field of that type in a composite literal (keyed or positional), or an
 // assignment to such a field — is one of: mqttLicenceOf(x) where x is a *client parameter or
@@ -35,10 +35,10 @@ import (
 // sess.boundEnt — the session's CURRENT connection, which after a rebind is the successor — and
 // never a licence minted from an entitlement read afresh (mqttEntitlementLicence has no production
 // caller outside its definition). A stored licence is checked where it is stored, because the
-// record outlives the call that built it (F-097 batch 3, R1/R4: a continuity or withdrawOwed record
+// record outlives the call that built it (issue #99 batch 3, R1/R4: a continuity or withdrawOwed record
 // holding the session's bound entitlement was invisible to an argument-only scan).
 //
-// THE ONE CURRENT-BINDING EXCEPTION (F-119, lane f-119 DECISIONS D2): runExclusionReclaim captures
+// THE ONE CURRENT-BINDING EXCEPTION (issue #121, lane f-119 DECISIONS D2): runExclusionReclaim captures
 // `lic := mqttLicenceOf(sess.c).withAdmission(sess.admitBackgroundAuthority)` once and passes it
 // to its receiver's reclaimPendingFenceStep and nowhere else. The pass makes a FRESH decision to
 // dispose of a positively identified pending fence — it replays no installer's decision and ends no
@@ -202,7 +202,7 @@ func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 					return licFields[a.Sel.Name]
 				case *ast.CallExpr:
 					if sel, ok := a.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "withAdmission" {
-						// withAdmission only adds the background admission (F-105 7c, consult
+						// withAdmission only adds the background admission (issue #107 7c, consult
 						// 105); the provenance is the licence it is called on.
 						return deciding(sel.X)
 					}

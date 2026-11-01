@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 )
 
-// A discarded generation's retirement, as the recovery executor performs it (F-105 7d).
+// A discarded generation's retirement, as the recovery executor performs it (issue #107 7d).
 //
 // A teardown closes its generation DISCARDING and transfers what it held to the generation's
 // recovery root. From there ONE executor — the recovery pass, and the prompt drive that calls the

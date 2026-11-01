@@ -37,7 +37,7 @@ vet: ## go vet the default tree
 
 lint: lint-go lint-md ## Run all linters (Go and Markdown)
 
-# Four passes, one configuration, each must be clean (F-055):
+# Four passes, one configuration, each must be clean (issue #59):
 #   1. production only: the one pass that sees a declaration only tests still reach. Every
 #      pass that compiles tests counts a test caller as a use.
 #   2. the default build with its tests.

@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-// An ordinary QoS 1 PUBACK advances the durable F-105 EXCHANGE to terminal, not just its slot.
+// An ordinary QoS 1 PUBACK advances the durable issue #107 EXCHANGE to terminal, not just its slot.
 //
 // This is the row-3 completion flip reaching production: an ordinary obligation carries a
 // durable exchange, so the client's acknowledgement must move the exchange off PUBLISH — a
@@ -257,7 +257,7 @@ func TestF105OrdinaryPubRecReattemptsALostBatch(t *testing.T) {
 
 // A SHARED slot's acknowledgement completes slot-only, without an exchange lookup.
 //
-// A shared-group delivery is admitted by the pre-F-105 writer until 7a, so it has no exchange;
+// A shared-group delivery is admitted by the pre-issue #107 writer until 7a, so it has no exchange;
 // the class gate recognises it by its durable's prefix, BEFORE any read, and ends it on the slot
 // alone. Without that prefix answer the gate would look the exchange up, find none, and refuse —
 // and a refused terminal cleanup writes nothing and parks on its continuation, so the register

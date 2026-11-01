@@ -16,7 +16,7 @@ package mqtt
 import "sync/atomic"
 
 // ---------------------------------------------------------------------------
-// A pending entry's authority is its kind (F-105 cutover, pending-entry structural closure)
+// A pending entry's authority is its kind (issue #107 cutover, pending-entry structural closure)
 // ---------------------------------------------------------------------------
 //
 // An entry in pendingPublish or pendingPubRel either ACTS for an exchange — it may be
@@ -47,7 +47,7 @@ const (
 	// mqttPendingOrdinary is an ordinary exchange's projection. It exists only while the
 	// custody ledger holds its lineage (ev.lin) in this generation.
 	mqttPendingOrdinary
-	// mqttPendingRetained is a RETAINED exchange's projection (F-105 7c): register-backed like an
+	// mqttPendingRetained is a RETAINED exchange's projection (issue #107 7c): register-backed like an
 	// ordinary one, custody-gated exactly as Ordinary, and a DISTINCT kind so every selector whose
 	// question is about a source delivery — a source ACK, a cpending mapping, a drain, a source
 	// settlement — is closed to it by kind rather than by a guard at each site. Before admission
@@ -323,7 +323,7 @@ func mqttPendingExchangeSource(ack *mqttPending) (dur string, sseq uint64, ok bo
 
 // sourcePendingPubRelLocked reports whether the source delivery (jsDur, sseq) is represented by an
 // in-memory PUBREL-phase entry: its exchange is past PUBREC on this session, so the source's
-// payload must not be admitted again (F-115). One source delivery has at most one un-ended
+// payload must not be admitted again (issue #117). One source delivery has at most one un-ended
 // exchange, and the PUBREC handoff removes the source's cpending link in the same critical section
 // that installs this entry, so a re-offer of the source meets one or the other.
 //
@@ -424,7 +424,7 @@ func mqttReactivate(prev *mqttPending, gen string, rec *mqttInflightRecord) *mqt
 }
 
 // mqttNewRetainedAllocation is a retained delivery's identifier from its snapshot to its admission
-// (F-105 7c): a Hold, held while the materialization and the admission are in flight, acting for
+// (issue #107 7c): a Hold, held while the materialization and the admission are in flight, acting for
 // nothing until the landing promotes it. The nonce is the allocation's and becomes the register's.
 func mqttNewRetainedAllocation(nonce string, qos byte, fence mqttAllocationFence) *mqttPending {
 	return &mqttPending{regPending: true, regNonce: nonce, qos: qos, allocFence: fence}
@@ -482,7 +482,7 @@ func mqttPromotePubRelAction(prev *mqttPending, act *mqttSendAction, jsDur strin
 	return next
 }
 
-// mqttRecoveredRetainedPending is a retained exchange restored by the resume (F-105 7c): kind
+// mqttRecoveredRetainedPending is a retained exchange restored by the resume (issue #107 7c): kind
 // Retained with the register's evidence and slot, the send state the marker licensed, and — for a
 // PUBLISH — the verified material its replay emits. setPendingLocked's custody gate then requires
 // the ledger to hold its lineage.
@@ -509,7 +509,7 @@ func mqttWithRetainedReplay(prev *mqttPending, rr *mqttRecoveredRetained) *mqttP
 }
 
 // mqttPromoteRetainedPubRelAction is the entry a retained exchange's acquired PUBREL action
-// writes through (F-105 7c): the resident Retained entry with the action's evidence and slot, and
+// writes through (issue #107 7c): the resident Retained entry with the action's evidence and slot, and
 // nothing source-shaped — no delivery reply, no consumer sequence.
 func mqttPromoteRetainedPubRelAction(prev *mqttPending, act *mqttSendAction) *mqttPending {
 	next := *prev
@@ -519,7 +519,7 @@ func mqttPromoteRetainedPubRelAction(prev *mqttPending, act *mqttSendAction) *mq
 }
 
 // mqttNewAbandonedRetainedPubRel is the PUBREL-phase entry of an ABANDONED retained exchange
-// whose late PUBREC advanced it (F-105 7c): the ACK-only snapshot's evidence and slot, now at
+// whose late PUBREC advanced it (issue #107 7c): the ACK-only snapshot's evidence and slot, now at
 // pubrel_ready with its canonical created by that advance. Kind Retained, so the PUBREL is emitted
 // from the canonical and PUBCOMP terminalizes it; the ledger still holds the lineage (an abandoned
 // exchange keeps its identifier), which is what the custody gate requires.
@@ -562,7 +562,7 @@ func mqttAckSnapshot(b *mqttAllocationAckBinding) *mqttPending {
 // bindActionToPubRelLocked is the ONE place an acquired PUBREL action becomes a pending entry,
 // and it VALIDATES EVERYTHING BEFORE IT MUTATES ANYTHING: the resident PUBREL entry must be this
 // exchange's (absent, or carrying the action's nonce — the scan's placeholder, the PUBREC
-// successor, an earlier delivery), the resident PUBLISH entry must pass the F-093 handoff's own
+// successor, an earlier delivery), the resident PUBLISH entry must pass the issue #95 handoff's own
 // ownership test, and the action must be one the session may act on — an ORDINARY action while
 // custody holds its lineage, an AFFINE one (no exchange, no custody) in this generation, its
 // authority being the slot CAS it already won. Only then is the entry built, from the action's
@@ -606,7 +606,7 @@ func (sess *mqttSession) bindActionToPubRelLocked(pi uint16, act *mqttSendAction
 		return false
 	}
 	sess.cpending.put(jsDur, sseq, pi)
-	// F-093's ordered handoff, now that this exchange's PUBREL-side owner is installed. Its
+	// issue #95's ordered handoff, now that this exchange's PUBREL-side owner is installed. Its
 	// ownership test passed above, so it cannot refuse here.
 	sess.handOffPublishEntryLocked(pi, act)
 	return true
@@ -635,7 +635,7 @@ func (sess *mqttSession) pubRelWriteKindLocked(pi uint16, act *mqttSendAction) b
 		return false
 	}
 	if act == nil {
-		return false // no slot-less retained exchange remains (F-105 7c): every PUBREL holds an action
+		return false // no slot-less retained exchange remains (issue #107 7c): every PUBREL holds an action
 	}
 	// An action the client's PUBCOMP answered while it was live writes nothing more: its exchange
 	// is complete, and only its drain is left (answerLocalActionLocked).

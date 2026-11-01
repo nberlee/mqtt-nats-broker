@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-// F-105 7d: the two acts a discarded generation's retirement takes under its closure, at the write
+// issue #107 7d: the two acts a discarded generation's retirement takes under its closure, at the write
 // boundary (plan-7d T5, T14, T16).
 
 // testDiscardPlantClosure plants generation gen's closure, discarding or not. Direct, because what

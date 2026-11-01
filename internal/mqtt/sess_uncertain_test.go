@@ -84,7 +84,7 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 // The generation is carried for the same reason the lineage is (see testRecordBody): a body
 // with no generation is a shape no save can produce, because buildPersistedSessionLocked
 // stamps sess.gen on every record. Omitting it used to be invisible — a discard deleted the
-// record whatever it carried — but the F-105 clean-start HANDOFF reads the displaced record's
+// record whatever it carried — but the issue #107 clean-start HANDOFF reads the displaced record's
 // generation and refuses one that disagrees with the standing authority, so a genless body
 // would fabricate an impossible predecessor.
 //
@@ -194,7 +194,7 @@ func TestUncertainWriteThreeWayReadback(t *testing.T) {
 		// A peer persists DIFFERENT content at a newer sequence — the exact shape
 		// "adopt the latest sequence" would swallow. What the local broker can see is
 		// that the content is not its own; who wrote it is the fixture's knowledge
-		// only (F-084).
+		// only (issue #86).
 		ps, _ := testLoadSessRecord(t, b, sess.idHash)
 		ps.Subs = map[string]byte{"theirs": 2}
 		ps.Origin = b.asm.jsa.id

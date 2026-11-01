@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// The generation's resource enumeration (F-105, row 8), which the teardown classification and
+// The generation's resource enumeration (issue #107, row 8), which the teardown classification and
 // the recovery executor read before anything a discard transfers is retired.
 
 // TestF105ATruncatedResourcePageIsNotAnAnswer is round I-6's third finding.

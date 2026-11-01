@@ -11,7 +11,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// F-101, route 2. A consumer teardown establishes what the TEARDOWN owes; it never
+// issue #103, route 2. A consumer teardown establishes what the TEARDOWN owes; it never
 // establishes that the CLIENT completed. These tests pin the two gates that follow from
 // that — the purge's and the void staging's — plus the send fence that keeps a staged
 // verdict true, and the reservation an open send section gets.
@@ -160,7 +160,7 @@ func TestMQTTTeardownStillReleasesAProvenUnsentEntry(t *testing.T) {
 	if stillTracked {
 		t.Fatal("a proven-unsent entry is released by the teardown: the client has never seen this PUBLISH")
 	}
-	// THE IDENTIFIER IS EXCLUDED AT THIS POINT (F-098, consult D-6 row (c)). The entry is
+	// THE IDENTIFIER IS EXCLUDED AT THIS POINT (issue #100, consult D-6 row (c)). The entry is
 	// gone and the register is owed to the ladder, but that ladder has not run: the durable
 	// record still stands, and nothing has confirmed its subject empty. Reusing the
 	// identifier here would hand it to a second exchange while a register naming it survives
@@ -261,7 +261,7 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 		ambiguous bool
 		wrote     bool
 		// markerSurvives is the DURABLE outcome the two faulted arms leave, and after
-		// F-102 it is what decides the restart half below: a surviving marker is positive
+		// issue #104 it is what decides the restart half below: a surviving marker is positive
 		// proof this PUBLISH never went out, so a fresh recovery over a source nothing can
 		// re-offer RELEASES the pair, while a deleted marker leaves it possibly-attempted
 		// and reserved. The live half is unaffected either way.
@@ -372,11 +372,11 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 				t.Fatal("the register survives too: nothing collected it")
 			}
 
-			// AND ACROSS A RESTART, where F-102 splits the four arms in two.
+			// AND ACROSS A RESTART, where issue #104 splits the four arms in two.
 			//
 			// The consumer goes, so the source classifies Lost through the REAL
 			// classifiers — no hook — and recovery then reads the marker. The live hold
-			// above is F-101's rule and is unchanged in every arm: a teardown cannot
+			// above is issue #103's rule and is unchanged in every arm: a teardown cannot
 			// manufacture non-transmission proof while a send section is unresolved. What
 			// changed is what a LATER pass may do once that uncertainty has settled.
 			//
@@ -388,7 +388,7 @@ func TestMQTTTeardownReservesAnOpenSendSectionInEveryOutcome(t *testing.T) {
 			// wrote any bytes — an unresolved or definitely-refused intent skips the write
 			// — and the surviving marker is what proves it; ambiguity ALONE would not, and
 			// the assertion at the top of this subtest is what establishes the marker is
-			// really there. F-102 releases the pair. This arm is therefore also the
+			// really there. issue #104 releases the pair. This arm is therefore also the
 			// hook-free end-to-end fixture for the Lost classification.
 			if _, err := e.sess.jsa.deleteConsumer(mqttStreamName, dur, true); err != nil {
 				t.Fatalf("delete the source consumer: %v", err)
@@ -533,7 +533,7 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 	// that record exists on the stream naming THIS exchange. Re-driving admitStoredBubRel
 	// here with a synthetic delivery instead was FLAKY — it races the store's readback, so
 	// it passed alone and failed intermittently in the package, and a flaky oracle is worth
-	// less than none (the admission arrow itself is F-092's tested territory).
+	// less than none (the admission arrow itself is issue #94's tested territory).
 	slotRec, slotMsg := e.loadRegister(t, pi)
 	if slotRec == nil || slotMsg == nil {
 		t.Fatal("the surviving owner slot is the exchange's transmission authority and must still be there")
@@ -549,9 +549,9 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 		t.Fatalf("the canonical PUBREL record the slot names must exist, or nothing can be admitted: %v", err)
 	}
 	// The test stops here deliberately. Everything past this point — admission's arrow, the
-	// PUBREL transmission, PUBCOMP and the terminal slot — is F-092's and F-089's lifecycle
+	// PUBREL transmission, PUBCOMP and the terminal slot — is issue #94's and issue #91's lifecycle
 	// and has its own tests; driving it from here meant racing the live PUBREL delivery and
-	// made this oracle intermittent. What F-101 owns is that the teardown left an exchange
+	// made this oracle intermittent. What issue #103 owns is that the teardown left an exchange
 	// that CAN complete: the acknowledgement was accepted rather than erroring the
 	// connection, and the durable authority it needs is still there.
 }

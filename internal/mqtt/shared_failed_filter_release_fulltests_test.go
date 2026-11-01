@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// TestMQTTSharedFailedFilterReleaseRunsFromTheResolver drives F-082's release through the
+// TestMQTTSharedFailedFilterReleaseRunsFromTheResolver drives issue #84's release through the
 // production route rather than by calling it: a real live SUBSCRIBE whose shared filter fails
 // AFTER its group join, whose rollback save goes ambiguous, and whose readLoop resolver then
 // proves that write durable and runs the landed continuation.
@@ -18,7 +18,7 @@ import (
 // The unit half is TestSharedFailedFilterReleaseDischargesOwnStateUnderARefusal and friends.
 // This one exists because a fixture that calls releaseFailedSharedFilter directly cannot show
 // that anything still REGISTERS it, or that the resolver still runs it — and the registration
-// is exactly what F-082 changed.
+// is exactly what issue #84 changed.
 //
 // The shape, and every step of it is load-bearing:
 //
@@ -34,7 +34,7 @@ import (
 //
 // The oracle is what the continuation is for: both group consumers gone, and the session's
 // MaxAckPending budget back where it started. The budget half is the one that fails against
-// the pre-F-082 release, which re-derived its work from sess.cons and found nothing there.
+// the pre-issue #84 release, which re-derived its work from sess.cons and found nothing there.
 func TestMQTTSharedFailedFilterReleaseRunsFromTheResolver(t *testing.T) {
 	const clientID = "failedfilterroute"
 	const group = "grp"
@@ -173,7 +173,7 @@ func TestMQTTSharedFailedFilterReleaseRunsFromTheResolver(t *testing.T) {
 		return nil
 	})
 
-	// The half the pre-F-082 release could not do at all: the failing attempt has not written
+	// The half the pre-issue #84 release could not do at all: the failing attempt has not written
 	// its join to cons, so a cons-keyed refund refunded nothing and this budget stayed raised
 	// for the life of the resident session.
 	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {

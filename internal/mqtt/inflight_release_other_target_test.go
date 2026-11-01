@@ -67,7 +67,7 @@ func testReleaseScript(t *testing.T, as *mqttAccountSessionManager,
 	return deleted
 }
 
-// A REQUEST FOR ANOTHER TARGET IS SETTLED BEFORE THE CURRENT SUBJECT SPEAKS (F-098 L4, holistic
+// A REQUEST FOR ANOTHER TARGET IS SETTLED BEFORE THE CURRENT SUBJECT SPEAKS (issue #100 L4, holistic
 // review round 2, findings 1 and 2). The drained delivery was re-offered under a new identifier
 // after an earlier attempt recorded Rel(A); the finalize now addresses B. Whatever B says —
 // empty, another exchange, our own register — is evidence about B only, so Rel(A) must be

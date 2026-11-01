@@ -616,7 +616,7 @@ func TestUnitCLandedSuccessorAfterTenureDisplacement(t *testing.T) {
 				t.Fatalf("B did not displace A: gen=%s tenure=%s", gen, tenure)
 			}
 			// B's accept on this connection object: its entitlement, and the session bound to
-			// it (F-105 7b) — B's recovery runs under B's entitlement.
+			// it (issue #107 7b) — B's recovery runs under B's entitlement.
 			e.c.mu.Lock()
 			e.c.mqtt.outEnt = mqttOutboundEntitlement{}
 			e.c.mu.Unlock()

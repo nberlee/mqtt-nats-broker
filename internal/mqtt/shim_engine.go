@@ -49,7 +49,7 @@ func (rf readCacheFlag) isSet(c readCacheFlag) bool { return rf&c != 0 }
 // so NATS cannot police them and the broker does it here, from the identity
 // snapshot authorizeClient takes at CONNECT (authz_identity.go). NATS still
 // enforces the client's own connection: SUBSCRIBE admission, and QoS 0 on a user
-// topic. F-079, F-080, F-081.
+// topic. issue #81, issue #82, issue #83.
 // ---------------------------------------------------------------------------
 
 // mqttClientOrigin distinguishes a real MQTT client from an internal
@@ -272,7 +272,7 @@ type Server struct {
 	willClaimWG      sync.WaitGroup
 	willWorkerWG     sync.WaitGroup
 
-	// THE PUBLISH SEND BARRIER (F-098). A QoS 1/2 PUBLISH send section takes a DURABLE
+	// THE PUBLISH SEND BARRIER (issue #100). A QoS 1/2 PUBLISH send section takes a DURABLE
 	// action on its exchange's slot and ends it by draining that action, and the drain is
 	// a JetStream write. A graceful shutdown that tore JetStream down while a section was
 	// open therefore left a live token on the record — and on the next start no reader can
@@ -284,7 +284,7 @@ type Server struct {
 	// as publisher workers are. The gate is closed and the wait performed while requests
 	// still work, which is what lets each HOLDER confirm its own drain — no shutdown pass
 	// clears a token it does not hold, because inferring holder death is precisely what
-	// F-098 refuses.
+	// issue #100 refuses.
 	publishSendMu     sync.Mutex
 	publishSendClosed bool
 	publishSendWG     sync.WaitGroup
@@ -301,7 +301,7 @@ type Server struct {
 	closeCertWG       sync.WaitGroup
 	// testConnectDeadlineBeforeLock, when set, runs in every one of this server's CONNECT
 	// deadline callbacks BEFORE the callback takes c.mu, so a test can make the callback late
-	// while the CONNECT path knows nothing of it (F-074). Installed before the test dials, so
+	// while the CONNECT path knows nothing of it (issue #77). Installed before the test dials, so
 	// it is in place before any timer is armed; atomic because it is read outside every lock.
 	// Nil in production.
 	testConnectDeadlineBeforeLock atomic.Pointer[func(*client)]
@@ -419,8 +419,8 @@ func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas
 // closeConnection, which drains the connection dialled just above, so a refused
 // CONNECT leaks nothing.
 //
-// F-079, F-080, F-081. A refusal reports WHICH refusal it is, as the CONNACK the caller
-// writes before the close (F-061): a credential the server refused, an identity the broker
+// issue #81, issue #82, issue #83. A refusal reports WHICH refusal it is, as the CONNACK the caller
+// writes before the close (issue #65): a credential the server refused, an identity the broker
 // will not admit, or an admission that could not be completed (mqttConnectRefusal). Every
 // branch below chooses its own; there is no default.
 func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
@@ -500,7 +500,7 @@ func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
 		// The v1 same-account constraint docs/ARCHITECTURE.md states. Until now
 		// nothing checked it, so credentials valid in another account
 		// authenticated while every durable operation landed in this one's
-		// streams. F-080.
+		// streams. issue #82.
 		s.Warnf("MQTT: refusing CONNECT for client %q: identity %q is bound to account %q, not the service account %q",
 			cid, id.user, id.account, svcAccount)
 		return mqttRefusalNotAuthorized, false
@@ -735,7 +735,7 @@ type client struct {
 	// on it just the same, and needs no lock, which keeps the drain from having to
 	// wait on a handshake that holds c.mu.
 	rawConn net.Conn
-	// outBind is this connection's immutable output identity (F-105). Assigned once at
+	// outBind is this connection's immutable output identity (issue #107). Assigned once at
 	// construction and never replaced, which is what lets a durable action captured against
 	// it stay bound to THIS connection across a resident reconnect that rebinds the session
 	// object. Nil only for a client built outside createMQTTClient, such as a unit fixture,
@@ -744,7 +744,7 @@ type client struct {
 
 	// No per-connection record of executed acquisitions: the consume-once fact lives on each
 	// acquisition's holder (mqttExecCell, outbound_frame_write.go), so a long-lived connection
-	// keeps no execution history per transmission (F-105 integrated gate, round 1).
+	// keeps no execution history per transmission (issue #107 integrated gate, round 1).
 
 	cid  uint64
 	kind int
@@ -795,7 +795,7 @@ type client struct {
 	connectAdmission mqttConnectAdmission
 	// connectDeadline is the instant the CONNECT deadline was armed for, on the same
 	// monotonic clock as connectTimer. Admission compares it, so a CONNECT arriving after
-	// the window is refused even when the timer's callback has not run yet (F-074). Zero
+	// the window is refused even when the timer's callback has not run yet (issue #77). Zero
 	// on a connection whose deadline was never armed. Written and read under c.mu.
 	connectDeadline time.Time
 	// testConnectDeadlinePause, when non-nil, is invoked by THIS connection's
@@ -1087,7 +1087,7 @@ func (c *client) initClient() {
 			c.nrc = c.srv.nrc
 		}
 	}
-	// The immutable output identity (F-105), minted HERE because it names the connection by
+	// The immutable output identity (issue #107), minted HERE because it names the connection by
 	// cid and the cid is assigned just above — minting it at the struct literal gave every
 	// client the same binding, since cid was still zero there. Before any write.
 	c.outBind = mqttBindConnection(c.cid)
@@ -1297,7 +1297,7 @@ func (c *client) writeSocketOutcome(data []byte, cap time.Time, seal bool) (mqtt
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	// THE OUTPUT GATE, checked under wmu (F-105). Certification seals the gate and then
+	// THE OUTPUT GATE, checked under wmu (issue #107). Certification seals the gate and then
 	// crosses this lock, so a writer that gets here after the seal declines, and one that
 	// got here before it has returned before certification completes. That pairing is what
 	// upgrades "no new writes are permitted" into "no write is in progress"; testing the
@@ -1385,7 +1385,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	if c.mqtt != nil {
 		c.Debugf("Client connection closed")
 	}
-	// CERTIFY, which closes the transport as its second step (F-105 8a): seal the output gate,
+	// CERTIFY, which closes the transport as its second step (issue #107 8a): seal the output gate,
 	// close outside the writer lock so a writer blocked in the socket returns, cross the writer
 	// barrier, record the certificate. A bare close stops future writes and says nothing about
 	// the one in progress. This is never reached holding wmu (TestCloseConnectionNeverRunsUnder
@@ -1426,7 +1426,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	// The MAP-SWAP teardown case: every subscription leaves c.subs at once, so all of their
 	// retained frames are detached under c.mu here and ABANDONED after the unlock. (The other
 	// two departure sites are processUnsub, which also abandons, and processSub's same-sid
-	// replacement, which TRANSFERS instead — detaching is not releasing.) F-091.
+	// replacement, which TRANSFERS instead — detaching is not releasing.) issue #93.
 	//
 	// Needed for TOTALITY rather than for correctness: mqttHandleClosedClient nils sess.c
 	// before this runs, so the holds this connection owned are already inert by the shared
@@ -1487,7 +1487,7 @@ func (c *client) abortSetup(reason ClosedState) {
 // (mqttClaimDisconnectLocked): a displacement that already notified this client
 // must not be followed by a 0x8B [MQTT-3.14.4-1]. What the displacement said —
 // 0x8E where it held the successor, 0x89 where it could only show the record is
-// not ours (F-084) — does not change the rule; spending the claim does.
+// not ours (issue #86) — does not change the rule; spending the claim does.
 //
 // deadline is the drain's shared absolute budget, passed as a cap so the write
 // is bounded by whichever of it and mqttWriteDeadline is sooner. It does NOT
@@ -1585,7 +1585,7 @@ var mqttTestProcessSubBeforeInstallV atomic.Pointer[func(*client)]
 // asking for the replay — and it would need `sess.mu`, which this generic function must not
 // take: `mqttProcessSubs` holds both `as.mu` and `sess.mu` across `sess.processSub`, which
 // reaches this call, and a Go mutex is not reentrant, so taking it here self-deadlocks the
-// read loop while it holds the account lock. Both were F-091 holistic-review findings.
+// read loop while it holds the account lock. Both were issue #93 holistic-review findings.
 func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward bool) (*subscription, mqttDisplacedRetained, error) {
 	// Re-subscribing an existing sid (e.g. MQTT re-SUBSCRIBE to an already
 	// subscribed topic, which reuses the same delivery-subject sid) must
@@ -1731,7 +1731,7 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 	// deciding whether to unsubscribe the old NATS interest, and a frame could be buffered
 	// onto the old subscription after it.
 	//
-	// A subscription leaving c.subs must not take an owed retained replay with it (F-091).
+	// A subscription leaving c.subs must not take an owed retained replay with it (issue #93).
 	// Its frames are MOVED to the replacement, which is the entry every later flush and
 	// every later teardown will find, so the replay is still delivered on a successful
 	// packet and the reservation is still released on a failed one — by the ordinary
@@ -1750,7 +1750,7 @@ func (c *client) processUnsub(sid []byte) error {
 	// This departure is a genuine teardown, so its retained frames are ABANDONED: nothing will
 	// ever write them, and the identifier would otherwise stay reserved against reallocation
 	// for the session's life. (A same-sid replacement in processSub detaches too, but
-	// TRANSFERS instead — see detachRetainedFramesLocked.) F-091.
+	// TRANSFERS instead — see detachRetainedFramesLocked.) issue #93.
 	retained := c.detachRetainedFramesLocked(sub)
 	delete(c.subs, string(sid))
 	c.mu.Unlock()
@@ -1769,7 +1769,7 @@ func (c *client) processUnsub(sid []byte) error {
 // c.pa.subject for subject mappings (inbound_pipeline.go).
 //
 // It does not touch the retained stream: a publication's retained update is
-// mqttIssuePublication's, and runs whether or not this send succeeded. F-060.
+// mqttIssuePublication's, and runs whether or not this send succeeded. issue #64.
 func (c *client) mqttFanOut(subject []byte, hdr int, msg []byte) bool {
 	if c.nrc == nil {
 		return false

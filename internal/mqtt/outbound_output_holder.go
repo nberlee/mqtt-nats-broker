@@ -15,7 +15,7 @@ package mqtt
 
 import "sync/atomic"
 
-// The live holder an authorized frame is executed for (F-105 row 2, consult 28).
+// The live holder an authorized frame is executed for (issue #107 row 2, consult 28).
 //
 // Consuming an action record is not enough to authorize its frame: an acquisition given up before
 // output still has an immutable, unconsumed record, and a saved request for it would pass
@@ -71,7 +71,7 @@ type mqttPublishOutput struct {
 	// control flow already never writes after a drain; this makes the boundary refuse it too.
 	closed atomic.Bool
 	// answered is set when the client's acknowledgement of this exchange's PUBLISH — a PUBREC, a
-	// PUBACK, a failed PUBREC — is processed while this section is open (F-115). An acknowledged
+	// PUBACK, a failed PUBREC — is processed while this section is open (issue #117). An acknowledged
 	// PUBLISH is not retransmitted: past PUBREC the exchange continues with the PUBREL alone, and
 	// a PUBLISH written after the acknowledgement reaches the client acknowledged. An execution
 	// that entered before the flag was set completes; it was a retransmission of a PUBLISH not

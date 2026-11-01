@@ -543,7 +543,7 @@ func (w *mqttDisposal) matchesRecord(r *mqttInflightRecord) bool {
 // is settled: nothing is left for it. Without this, an owner displaced before it decided waits
 // for a pair naming its own tenure that can never appear (its successor decides under ITS
 // tenure, and the floor may already have reclaimed the exchange), re-arms every 2 s and keeps
-// its removed session object reachable for good (docs/findings/resource-lifetime.md, D1).
+// its removed session object reachable for good (https://github.com/nberlee/mqtt-nats-broker/issues/138, D1).
 //
 // TWO positive facts, each read, never inferred from an absence:
 //

@@ -72,7 +72,7 @@ func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fro
 			// own fate would stop any of it — the acquisitions' verdicts decide the consumer,
 			// not this session's local state. The failing filter's own membership is already
 			// rolled back on this path, so the live map IS the surviving membership and no
-			// key needs excluding. F-082.
+			// key needs excluding. issue #84.
 			sess.mu.Lock()
 			stillOwn := sess.survivingSharedLocked(nil).ownsDurable(cc.Durable)
 			sess.mu.Unlock()
@@ -81,7 +81,7 @@ func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fro
 			}
 		} else {
 			// The failed filter's membership is rolled back: a decision, handed to the retirement
-			// owner rather than a raw delete (F-105 7c-lc).
+			// owner rather than a raw delete (issue #107 7c-lc).
 			sess.disposeSourceConsumer(c, cc, mqttDisposalRolledBack, "failed-filter")
 		}
 	}
@@ -109,7 +109,7 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 	if !pubRelSubscribed {
 		// Same completion ownership as every other session delivery callback; this is
 		// the one registered outside sess.processSub, so it wraps explicitly and the
-		// source guard asserts the pair is exhaustive (F-036 unit 1).
+		// source guard asserts the pair is exhaustive (issue #40 unit 1).
 		_, _, err := c.processSub(pubRelDeliverySubjectB, nil, pubRelDeliverySubjectB,
 			sess.leasedHandler(mqttDeliverPubRelCb, false), false)
 		if err != nil {
@@ -190,12 +190,12 @@ func (sess *mqttSession) ensurePubRelConsumerSubscription(c *client) error {
 			MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
 		},
 	}
-	// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3): the PUBREL consumer is
+	// SAFE INACTIVITY CONFIG FROM THE OUTSET (issue #107 §5.1 step 3): the PUBREL consumer is
 	// enrolled, so it is created with NO inactivity threshold — its lifetime is its resource's,
 	// and $MQTT_out is interest-retained, so a reap would silently drop stored PUBRELs. The
 	// definitive effective-config verify is at admission.
 	mqttClearConsumerInactivity(&ccr.Config)
-	// CLAIM THE PUBREL NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11 step 2). Unlike a
+	// CLAIM THE PUBREL NAME BEFORE THE CREATE (issue #107 §5.1, Codex consult 11 step 2). Unlike a
 	// source consumer's fresh-per-subscribe name, the PUBREL durable is GENERATION-SCOPED and
 	// STABLE across recreates within a generation, so its ownership is claimed once and a
 	// recreate (verified-absent, above) re-materialises the physical consumer under the STANDING
@@ -267,7 +267,7 @@ func (sess *mqttSession) pubRelClaimEntitled(ent mqttOutboundEntitlement, nameGe
 }
 
 // claimPubRelName claims the generation-scoped PUBREL consumer name, or adopts it where it already
-// stands LIVE for this generation (F-105 §5.1, Codex consult 11 step 2: the name is stable across
+// stands LIVE for this generation (issue #107 §5.1, Codex consult 11 step 2: the name is stable across
 // recreates within a generation, so its ownership is claimed once and a recreate re-materializes
 // the consumer under the standing ownership).
 //
@@ -364,7 +364,7 @@ func (sess *mqttSession) claimPubRelNameOnce(ent mqttOutboundEntitlement, nameGe
 			"generation %q, not this generation's LIVE own: a spent or foreign name is never reused",
 			id, name, own.State, own.OwnerGen)
 	}
-	// A LIVE NAME IS NOT A SERVING RESOURCE (F-105 7f). The same-owner rematerialization is
+	// A LIVE NAME IS NOT A SERVING RESOURCE (issue #107 7f). The same-owner rematerialization is
 	// sanctioned for the resource the name's owner names, and only while that resource is LIVE
 	// without a disposal decision: recreating a decided or retiring consumer would resurrect what
 	// its retirement is about to delete.
@@ -404,7 +404,7 @@ func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, su
 	if h := sess.testClaimPinned.Load(); h != nil {
 		(*h)()
 	}
-	// THE CONNECTION'S ENTITLEMENT, never the authority standing when the claim reads it (F-105
+	// THE CONNECTION'S ENTITLEMENT, never the authority standing when the claim reads it (issue #107
 	// 7f). A SUBSCRIBE whose connection a takeover displaced between its gate and here would
 	// otherwise claim under its successor's tenure, labelling the attempt with an entitlement
 	// that never decided it; opProvisionResource refuses an entitlement that moved.
@@ -414,7 +414,7 @@ func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, su
 	}
 	auth := ent
 	claim := &mqttSourceClaim{gen: ent.Gen, name: durName, inc: srcInc, ent: ent}
-	// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (F-105 cutover row 3, holistic review rounds
+	// RE-ATTEMPT UNDER THE PINNED ENTITLEMENT (issue #107 cutover row 3, holistic review rounds
 	// 2-3). The completion advance (opAdvanceExchangeAck) rewrites the authority on every
 	// client acknowledgement, so a concurrent advance can move the standing authority — its
 	// sequence, its inventory ledger, or both — between this claim's servingAuthority read and
@@ -426,15 +426,15 @@ func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, su
 	// genuine takeover fails opProvisionResource's own gen/tenure guard ("moved on") every attempt and the loop exhausts its budget rather than
 	// claiming under a successor. The claim is create-only over a fresh incarnation, so
 	// re-using srcInc is safe; an attempt that in fact LANDED late is found by the handle
-	// arbitration below and its incarnation disposed of (F-105 7c-lc).
+	// arbitration below and its incarnation disposed of (issue #107 7c-lc).
 	//
-	// SPACED (F-105 7c, consult 104): a retained replay's materialization is a burst of
+	// SPACED (issue #107 7c, consult 104): a retained replay's materialization is a burst of
 	// authority transitions on this same session, started by the previous SUBSCRIBE, and
 	// unspaced re-attempts lose every one of them to it. The wait precedes the next attempt's
 	// fresh reads and holds no session lock. It mitigates a burst; sustained contention can
 	// still exhaust the budget and refuse the subscription (docs/CONFORMANCE.md).
 	//
-	// EVERY SUBMITTED ATTEMPT'S HANDLE IS KEPT (F-105 7c-lc). A failed attempt may still have
+	// EVERY SUBMITTED ATTEMPT'S HANDLE IS KEPT (issue #107 7c-lc). A failed attempt may still have
 	// landed — its response lost, its batch queued — and a negative read proves nothing about a
 	// claim that may land after it. So an exhausted claim is not abandoned: its handles go to the
 	// retirement owner, which settles each by permanent arbitration (resolve, else abort) and
@@ -606,7 +606,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	// durable so the refund is exactly this and happens exactly once.
 	var charged int
 	// srcClaim is the name this attempt claimed, nil on the exists path: only it is ever
-	// disposed of by this attempt's failure (F-105 7c-lc).
+	// disposed of by this attempt's failure (issue #107 7c-lc).
 	var srcClaim *mqttSourceClaim
 	if exists {
 		inbox = cc.DeliverSubject
@@ -636,7 +636,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		}
 
 		durName := idHash + "_" + nuid.Next()
-		// CLAIM THE NAME BEFORE THE CREATE (F-105 §5.1, Codex consult 11 step 2). A source
+		// CLAIM THE NAME BEFORE THE CREATE (issue #107 §5.1, Codex consult 11 step 2). A source
 		// consumer's physical CONSUMER.CREATE is a queued request this broker can neither fence
 		// nor retract, so an outbound obligation depends on the NAME, not on the create landing.
 		// Claim the name's LIVE ownership, its resource incarnation (PENDING until sealed) and
@@ -664,7 +664,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 				MemoryStorage:  opts.MQTT.ConsumerMemoryStorage,
 			},
 		}
-		// SAFE INACTIVITY CONFIG FROM THE OUTSET (F-105 §5.1 step 3, Codex consult 4/11). An
+		// SAFE INACTIVITY CONFIG FROM THE OUTSET (issue #107 §5.1 step 3, Codex consult 4/11). An
 		// ENROLLED source consumer's lifetime is its resource's, not a timer's, so it is created
 		// with NO inactivity threshold — clearing it after dependence begins cannot establish
 		// preservation. The supported-configuration boundary (docs/CONFORMANCE.md) forbids
@@ -686,7 +686,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		if err := createErr; err != nil {
 			c.Errorf("Unable to add JetStream consumer for subscription on %q: err=%v", subject, err)
 			// THE CLAIM LANDED and the create may yet: the incarnation is disposed of, so a late
-			// CREATE lands under a RETIRED name no obligation can adopt (F-105 7c-lc).
+			// CREATE lands under a RETIRED name no obligation can adopt (issue #107 7c-lc).
 			sess.handSourceDisposal(srcClaim.gen, srcClaim.name, srcClaim.inc,
 				mqttDisposalProvisioningFailed, srcClaim.ent, "create-failed")
 			return nil, nil, nil, err
@@ -710,7 +710,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 	sess.mu.Unlock()
 
 	if err != nil {
-		// ONLY A CONSUMER THIS ATTEMPT CLAIMED is disposed of (F-105 7c-lc). A restored
+		// ONLY A CONSUMER THIS ATTEMPT CLAIMED is disposed of (issue #107 7c-lc). A restored
 		// subscription's consumer (the exists path) is the persisted subscription's durable, and
 		// a local subscription failure is not a decision to end it: the CONNECT that restores it
 		// refuses instead.
@@ -792,7 +792,7 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 			"are not durably recorded yet; their identifiers stay reserved until the cleanup "+
 			"is discharged", cc.Durable, sess.id)
 	}
-	// THE CONSUMER IS NOT DELETED HERE (F-105 7c-lc). An admitted obligation may still hold it —
+	// THE CONSUMER IS NOT DELETED HERE (issue #107 7c-lc). An admitted obligation may still hold it —
 	// a delivery outstanding when the drain was refused, a delivery admitted before the
 	// membership save — and its replay depends on that physical name. The route decides; the
 	// retirement owner retires the consumer once its holds are released, retiring its name in
@@ -871,29 +871,29 @@ func buildSharedGroupConsumerConfig(group, subject string, inc uint64, ackWait t
 // sid, and is nil on the live SUBSCRIBE path. A filter with no resident entry takes the
 // create path either way, which proves the durable by creating it.
 //
-// F-076 justified the nil with "a live SUBSCRIBE cannot reach the resume arm, because a
+// issue #78 justified the nil with "a live SUBSCRIBE cannot reach the resume arm, because a
 // connected session with a cons entry already has its deliver subscription". THAT IS FALSE
-// and is not reinstated. F-078 recorded the chain it was false about: a SUBSCRIBE whose
+// and is not reinstated. issue #80 recorded the chain it was false about: a SUBSCRIBE whose
 // rollback save failed DEFINITELY had `readd` restore cons[sid] while sharedSubs stayed at
 // the pre-packet snapshot, so a reconnect built its filters from a sharedSubs that lacked
 // the key, never collected the sid, and left the resident cons entry with no deliver
 // subscription.
 //
 // THAT CHAIN IS CLOSED. The rollback's definite arm now restores the shared membership
-// beside cons (restoreAttemptedShared, F-039), so the reconnect's filters do carry the key
-// and the sid is collected. What closed it is the membership restoration, NOT F-076's
+// beside cons (restoreAttemptedShared, issue #43), so the reconnect's filters do carry the key
+// and the sid is collected. What closed it is the membership restoration, NOT issue #78's
 // claim, which remains false for the reason above.
 //
 // The branch is retained anyway, because no positive proof of unreachability exists: a
 // post-resume live SUBSCRIBE takes the refresh arm, UNSUBSCRIBE's ambiguous window leaves
 // the subscription present-but-closed rather than absent (its own roadmap item), and a
-// failed CONNECT restore refuses the CONNECT (F-050). That is a survey of the routes we
+// failed CONNECT restore refuses the CONNECT (issue #54). That is a survey of the routes we
 // know, not a demonstration that none remains — an absence is not a fact. So this arm
 // still verifies nothing when it is reached with nil verdicts, and it still subscribes on
 // a remembered config. What it does not do is serve unarbitrated: the packet proves
-// ownership after its last record write and withholds transmission until it lands (F-078,
+// ownership after its last record write and withholds transmission until it lands (issue #80,
 // sub_operation_gate.go). The verification gap is local and stands; the arbitration gap
-// does not, and F-078's trigger — interest touched — is unchanged. Do not restore the old
+// does not, and issue #80's trigger — interest touched — is unchanged. Do not restore the old
 // justification.
 func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid string,
 	acq mqttSharedAcquisition, qos byte, retainAsPublished bool, subID int, fromSubProto bool,
@@ -938,7 +938,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// exists but no live deliver sub: a session resume on a new connection.
 		//
 		// This used to fall straight through to (re)subscribe, on the strength of a config
-		// remembered from an earlier connection — which is F-076. Nothing proved the group
+		// remembered from an earlier connection — which is issue #78. Nothing proved the group
 		// durable still existed, so a client whose durable had been deleted out of band was
 		// told Session Present = 1 and handed a subscription on a subject nothing publishes
 		// to, silently, on every reconnect while the condition persisted.
@@ -950,7 +950,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		if v, judged := verdicts[sid]; judged {
 			switch {
 			case mqttSharedGroupVerdictIsRepairable(v):
-				// AUTHORITATIVELY ABSENT, and this broker recreates it (F-077). The pre-pass
+				// AUTHORITATIVELY ABSENT, and this broker recreates it (issue #79). The pre-pass
 				// deliberately does not fail the filter for this verdict, so control reaches
 				// here; `exists` is forced false so the join arm below creates the durable and
 				// thereby proves it, exactly as a filter with no resident entry does.
@@ -1015,7 +1015,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 		// that still evaluated tmaxack + maxAckPending would refuse to repair a session
 		// sitting near the limit, on the strength of a charge already counted inside
 		// tmaxack. That refusal is permanent for as long as the session stays near capacity,
-		// which turns a recoverable absent durable back into the F-076 dead end this item
+		// which turns a recoverable absent durable back into the issue #78 dead end this item
 		// exists to end.
 		sess.mu.Lock()
 		_, alreadyCharged := sess.sharedCharged[durable]
@@ -1112,7 +1112,7 @@ func (sess *mqttSession) releaseSharedConsumerClassified(c *client, tok recordTx
 // failing packet made is not in cons at all, while its ack-budget charge, its pending
 // deliveries and its deliver-subject subscription are already real. The names are derived
 // from the membership's own acquisition references (mqttSharedGroupNamesFor), which is what
-// lets the failed-filter release discharge them without a config. F-082.
+// lets the failed-filter release discharge them without a config. issue #84.
 //
 // No lock held on entry.
 func (sess *mqttSession) releaseSharedGroupTarget(c *client, tok recordTx, durable, deliverSubject string) {
@@ -1127,8 +1127,8 @@ func (sess *mqttSession) releaseSharedGroupTarget(c *client, tok recordTx, durab
 // unsubscribe — so a durable this session still holds through another of its own shared keys
 // must not reach here. BOTH halves of the failed-filter release apply that fence themselves
 // (releaseFailedSharedFilter for the landed continuation, cleanupFailedSubClassified for the
-// confirmed inline path); the other callers do not, and that is the defect F-083 is filed
-// for, not an invariant this function may assume. F-082.
+// confirmed inline path); the other callers do not, and that is the defect issue #85 is filed
+// for, not an invariant this function may assume. issue #84.
 func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recordTx,
 	durable, deliverSubject string) bool {
 
@@ -1271,13 +1271,13 @@ func (sess *mqttSession) executeSharedReleases(c *client) {
 // incarnation-qualified group durable names the registers carry, so a cons walk purges
 // nothing. (The SUBSCRIBE
 // rollback used to supply the mirror case — a config outside the membership, because its
-// definite arm restored cons and not sharedSubs — and no longer does: F-039 restores both.
+// definite arm restored cons and not sharedSubs — and no longer does: issue #43 restores both.
 // The derivation below is unchanged, and must be: it never rested on that shape alone.)
 // Transmitted entries with NEITHER view left are reachable, which is why even the union is
 // not enough.
 //
 // Both operations that used to STRAND that shape now discharge it at the membership removal
-// rather than leaving it to this close: UNSUBSCRIBE's no-cons branch (F-083) and the 3.1.1
+// rather than leaving it to this close: UNSUBSCRIBE's no-cons branch (issue #85) and the 3.1.1
 // forced leave, which stages its void and purges its pending state over the same
 // pending-map derivation this function uses (sharedPendingDurablesLocked). This purge remains
 // the backstop for a session that simply disconnects.
@@ -1329,7 +1329,7 @@ func (sess *mqttSession) purgeSharedPendingStaged(c *client, lic mqttDestroyLice
 // restored from its record has membership without configs, so a cons walk names nothing.
 // (A rolled-back SUBSCRIBE used to supply the mirror shape — a config outside the
 // membership — and no longer does, since its definite arm restores the shared membership
-// beside cons, F-039. The derivation is unchanged and never rested on that shape alone.)
+// beside cons, issue #43. The derivation is unchanged and never rested on that shape alone.)
 // The 3.1.1 forced leave needs the union of all three, and it needs it BEFORE its
 // record write rather than after — the write that removes the membership is the write that
 // must carry "these allocations were never transmitted" (see voidRegistrationsLocked).
@@ -1426,11 +1426,11 @@ func mqttSharedDurablesFor(key string, m mqttSharedMembership) []string {
 // The pair travels together because a caller releasing what a filter joined needs BOTH: the
 // durable names the consumer, the pending state and the ack-budget charge, while the deliver
 // subject names this session's subscription to it. Deriving one and rediscovering the other
-// through sess.cons is what F-082 had to fix: addJSConsToSess runs only once the whole filter
+// through sess.cons is what issue #84 had to fix: addJSConsToSess runs only once the whole filter
 // succeeds, so a cons walk cannot see the join a FAILING filter just made. It may still find a
 // PRE-EXISTING entry for that durable, which is why the caller sweeps every match rather than
 // treating absence as given. The SUBSCRIBE rollback's definite arm was the illustration here
-// and is no longer one (F-039 restores the membership beside cons); the sweep is kept, since
+// and is no longer one (issue #43 restores the membership beside cons); the sweep is kept, since
 // closing one producer proves nothing about the rest.
 type mqttSharedGroupNames struct {
 	durable string

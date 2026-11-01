@@ -205,7 +205,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
 			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
-			// The PUBLISH-phase pair is one atomic batch (F-072).
+			// The PUBLISH-phase pair is one atomic batch (issue #76).
 			AllowAtomicPublish: true,
 		}}
 	}
@@ -277,7 +277,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 		t.Fatalf("a consumer inactivity limit is irrelevant to a stream with no consumers: %v", err)
 	}
 
-	// DenyPurge stopped being a prerequisite with F-034, and this asserts the removal
+	// DenyPurge stopped being a prerequisite with issue #38, and this asserts the removal
 	// positively rather than leaving its absence to be inferred. The teardown's
 	// per-incarnation FILTER PURGE was replaced by reapIncarnationRegisters, which deletes
 	// at exact sequences — covered by the DenyDelete rejection above. Refusing DenyPurge
@@ -286,7 +286,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 	si = good()
 	si.Config.DenyPurge = true
 	if err := validateInflightStream(si, 0, testBundleEpoch); err != nil {
-		t.Fatalf("deny_purge must be accepted since F-034 replaced the filter purge with "+
+		t.Fatalf("deny_purge must be accepted since issue #38 replaced the filter purge with "+
 			"exact-sequence deletes: %v", err)
 	}
 }
@@ -331,7 +331,7 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 }
 
 // testAcceptRigConnection accepts a rig's connection the way a CONNECT's accept loop does before
-// any resume runs (F-105 7b): a serving authority stands (the existing one is kept, so a peer rig
+// any resume runs (issue #107 7b): a serving authority stands (the existing one is kept, so a peer rig
 // restoring the same session shares it), the connection records its entitlement, and the session
 // object records the same as its accepted one (boundEnt). The connection is not BOUND as the
 // session's (sess.c): rigs that need that call bind() themselves, as before.
@@ -405,7 +405,7 @@ func (e *testInflightEnv) track(t *testing.T, dur string, sseq uint64, qos byte)
 	}
 	if !mqttDurIsSlotOnlyClass(dur) {
 		// An ordinary register without its exchange is a shape this broker no longer writes, and
-		// a resume refuses it as unadmitted (F-105 7b): the ordinary obligation is admitted as
+		// a resume refuses it as unadmitted (issue #107 7b): the ordinary obligation is admitted as
 		// production admits it, beside its exchange and its duty entry.
 		return e.trackAdmitted(t, dur, sseq, qos)
 	}
@@ -646,7 +646,7 @@ func TestMQTTInflightStoreAmbiguousResolvedByNonce(t *testing.T) {
 	e.asm.mu.Unlock()
 
 	// The register store itself, driven directly as TestMQTTInflightStoreDefiniteFailureUntracks
-	// drives it: e.track admits an ordinary obligation through the authority (F-105 7b), which
+	// drives it: e.track admits an ordinary obligation through the authority (issue #107 7b), which
 	// never reaches this door, and the door's only production caller is the affine delivery.
 	e.sess.mu.Lock()
 	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 200, 1))
@@ -748,7 +748,7 @@ func TestMQTTInflightStoreRefusesLiveForeignRegister(t *testing.T) {
 // leftover of a lost delete, and its identifier may be reused once it has been reaped at
 // its EXACT sequence.
 //
-// The second conjunct is C-II (F-098) and it is the whole point of this test's shape.
+// The second conjunct is C-II (issue #100) and it is the whole point of this test's shape.
 // Source completion is a fact about the DELIVERY; the identifier belongs to the CLIENT
 // exchange, and the two part company exactly when a PUBLISH went out and its
 // acknowledgement did not come back. This test used to seed a marker-less register — a
@@ -768,7 +768,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 	// register carries its unsent marker and is therefore PROVEN-UNSENT. A bare register leaves no
 	// marker, which is the possibly-attempted shape the sibling test covers.
 	//
-	// REBUILT by F-097/F-088 (ruling R-impl-1): this used to seed the pair with NO exchange, a shape
+	// REBUILT by issue #99/issue #90 (ruling R-impl-1): this used to seed the pair with NO exchange, a shape
 	// admission never writes and the door now refuses (WP3 edit 2), so the reap could never land.
 	// The admission's prerequisites also stand up the source consumer, which inflightSourceState
 	// consults first (it never reads a consumer's absence as completion); sequence 7 is absent
@@ -803,7 +803,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 }
 
 // TestMQTTInflightStoreReservesAPossiblyAttemptedCompleteRegister is C-II's arm at the
-// allocation edge (F-098), and it is the twin of the reap above.
+// allocation edge (issue #100), and it is the twin of the reap above.
 //
 // THE SCHEDULE. A QoS 2 PUBLISH goes out under this identifier. Its unsent marker is
 // deleted before the bytes leave, which is what makes the exchange durably
@@ -812,7 +812,7 @@ func TestMQTTInflightStoreReapsProvablyCompleteRegister(t *testing.T) {
 // CLIENT is still holding the identifier. A later allocation lands on the same identifier
 // and meets the leftover register.
 //
-// Before F-098 this arm reaped it, because source completion was read as exchange
+// Before issue #100 this arm reaped it, because source completion was read as exchange
 // completion — and `bumpPI` then re-minted an identifier the receiver still owned, or the
 // freed Receive Maximum capacity let a DIFFERENT identifier transmit. The register must be
 // RESERVED instead: possibly-attempted is exactly the state that carries a client
@@ -1035,7 +1035,7 @@ func (e *testInflightEnv) publishSource(t *testing.T, dur string) uint64 {
 // publishSourceDelivered is publishSource with a REAL delivery: the source message is received on
 // the consumer's deliver subject and its actual acknowledgement reply returned. An acknowledgement
 // of a sequence the consumer never delivered is rejected by the server without confirmation, so a
-// test whose settlement is confirmed needs the delivery itself, not a fabricated reply (F-105
+// test whose settlement is confirmed needs the delivery itself, not a fabricated reply (issue #107
 // 7c-lc consult 111).
 func (e *testInflightEnv) publishSourceDelivered(t *testing.T, dur string) (uint64, string) {
 	t.Helper()
@@ -1125,7 +1125,7 @@ func TestMQTTInflightRecoveryDropsCompletedSource(t *testing.T) {
 // Receive Maximum rule for a delivery that may be in the client's hands, and only a
 // transmitted one is that. An earlier version tracked without transmitting, leaving the
 // unsent marker in place — a provably never-transmitted exchange, which is the opposite
-// population and which F-102 legitimately releases. The comment below always described
+// population and which issue #104 legitimately releases. The comment below always described
 // the transmitted case; the fixture now matches it. The proven-unsent counterpart is
 // TestMQTTInflightRecoveryConsumesAProvenUnsentRegisterOverALostSource.
 func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
@@ -1159,7 +1159,7 @@ func TestMQTTInflightRecoveryKeepsIdentifierWhenConsumerGone(t *testing.T) {
 	// the client still holds the first (Spec5 [4.9]). A session stuck this way is a lost
 	// message reported honestly. Only a provably never-transmitted delivery may free an
 	// identifier, and TWO durable facts prove that: a cancellation tombstone, and an unsent
-	// MARKER still naming the register (F-102). Neither is present here — this exchange was
+	// MARKER still naming the register (issue #104). Neither is present here — this exchange was
 	// transmitted — so nothing licenses a release.
 	inflight := e.sess.receiveMaxOccupancyLocked()
 	e.sess.mu.Unlock()
@@ -1266,7 +1266,7 @@ func (e *testInflightEnv) endPubRelDelivery(t *testing.T) {
 
 // installServingAuthority gives the env's session the SERVING outbound authority a real
 // session already holds by the time it provisions a PUBREL or source consumer — minted at
-// CONNECT in production (F-105 cutover). A unit env that never CONNECTs must install it so the
+// CONNECT in production (issue #107 cutover). A unit env that never CONNECTs must install it so the
 // claim-before-create provisioning (opProvisionResource) has a serving authority to admit
 // under: there is deliberately no missing-authority fallback.
 func (e *testInflightEnv) installServingAuthority(t *testing.T) {
@@ -1276,7 +1276,7 @@ func (e *testInflightEnv) installServingAuthority(t *testing.T) {
 
 // testInstallServingAuthority installs the SERVING outbound authority a real session already
 // holds by the time it provisions a PUBREL or source consumer — minted at CONNECT in
-// production (F-105 cutover). A unit env that never CONNECTs must install it so the
+// production (issue #107 cutover). A unit env that never CONNECTs must install it so the
 // claim-before-create provisioning (opProvisionResource) has a serving authority to admit
 // under: there is deliberately no missing-authority fallback.
 func testInstallServingAuthority(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession) {
@@ -1297,10 +1297,10 @@ func testInstallServingAuthority(t *testing.T, asm *mqttAccountSessionManager, s
 		}
 	}
 	// AND THE FIXTURE CONNECTION IS ACCEPTED UNDER IT, as a real CONNECT's accept loop records
-	// (F-105 row 2): an ordinary acquisition names the connection's own entitlement.
+	// (issue #107 row 2): an ordinary acquisition names the connection's own entitlement.
 	sess.mu.Lock()
 	c := sess.c
-	// The session object records the same accepted entitlement (F-105 7b's boundEnt).
+	// The session object records the same accepted entitlement (issue #107 7b's boundEnt).
 	if !sess.boundEntOK {
 		sess.boundEnt, sess.boundEntOK = mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure}, true
 	}
@@ -1470,7 +1470,7 @@ func TestMQTTInflightRecoveryDuplicateSourceFailsClosed(t *testing.T) {
 // long as the session lives.
 //
 // WHAT CONVERGENCE DOES NOT INCLUDE IS DROPPING THE REGISTER, and this assertion is the
-// replacement for one that did (F-098, consult D-6 row (c), and D-7). `Retired` is written
+// replacement for one that did (issue #100, consult D-6 row (c), and D-7). `Retired` is written
 // on the strength of the client's own PUBREC, so the PUBLISH provably reached the client and
 // the client may still hold the identifier. The SOURCE's completion is a fact about the
 // source alone and never discharges the client's half of the exchange — that is C-II — so
@@ -2130,7 +2130,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 
 	sseq := e.publishSource(t, dur)
 	// Two registers, one source, different identifiers: a superseded broker wrote one.
-	// Each admitted as production admits it (F-105 7b), beside its own exchange.
+	// Each admitted as production admits it (issue #107 7b), beside its own exchange.
 	for _, pi := range []uint16{3, 4} {
 		e.landAdmission(t, pi, 2, dur, sseq, mqttNewInflightNonce())
 	}
@@ -2178,7 +2178,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 // Mutation check: drop the markInflightRegisterCancelled fallback and the resume reserves
 // the identifier and consumes the slot instead.
 //
-// REBUILT by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture wrote a bare
+// REBUILT by issue #99/issue #90 (plan rev 20, seven-red-tests table). The original fixture wrote a bare
 // ordinary register through storeInflightRegister (a shape admission no longer writes) and took
 // the fallback tombstone's Cancelled bit as the proof of non-transmission, the deleted premise.
 // It now runs on a REAL admission (register, exchange and unsent marker in one batch):
@@ -2353,7 +2353,7 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 	// e.track allocates and stores the register and never opens a send section, so this
 	// entry is PROVEN UNSENT (its marker is present and it is not transmitted) and the
 	// staging gate voids it. The fixture covers the never-sent population; it is not a
-	// transmitted one, and F-101 corrected the label.
+	// transmitted one, and issue #103 corrected the label.
 	_, abandoned := e.sess.voidRegistrationsLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	regs, _ := e.sess.purgeConsumerPendingLocked(dur, mqttTestLicenceLocked(e.sess, nil))
 	idHash := e.sess.idHash
@@ -2480,11 +2480,11 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 }
 
 // TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority is the AUTHORITY-ADMISSION
-// counterpart of the race above (F-097/F-088, plan rev 20, seven-red-tests table): a consumer
+// counterpart of the race above (issue #99/issue #90, plan rev 20, seven-red-tests table): a consumer
 // teardown cancels the allocation WHILE its admission batch is on its way to the store, and
 // secures the cancellation with a pending fence on the empty subject.
 //
-// Since F-119 the fence is disposed of only behind a confirmed authority advance, and only once no
+// Since issue #121 the fence is disposed of only behind a confirmed authority advance, and only once no
 // admission ladder of its nonce is still running. The two arms are the two halves of that rule:
 //
 //   - the fence stands when the batch reaches the store: the create-only register member is
@@ -2541,7 +2541,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority(t *testing.T) {
 					return send()
 				}
 				if tc.disposeInside {
-					// F-119's quiescence: this nonce's ladder is the one running this commit, so an
+					// issue #121's quiescence: this nonce's ladder is the one running this commit, so an
 					// attempt of it can still land once the fence is gone.
 					if out := e.sess.reapLoadedRegister(subject, fmsg.Sequence, fence, mqttSlotDeletePendingFence,
 						mqttLicenceOf(e.c), nil); out != mqttReapRefused {
@@ -2941,7 +2941,7 @@ func TestMQTTInflightDeferredDeleteStagingIsReversible(t *testing.T) {
 // Mutation check: treat a cancelled occupant like any other (drop the case) and the store is
 // refused.
 //
-// SPLIT by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture planted a
+// SPLIT by issue #99/issue #90 (plan rev 20, seven-red-tests table). The original fixture planted a
 // direct QoS 2 tombstone — not the shape the cancellation writer produces — and asserted it was
 // reaped on its Cancelled bit, the deleted premise (a cancellation decision is not a proof of
 // non-transmission). The two cases it conflated are now asserted separately:
@@ -3082,7 +3082,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 
 	// The CAS that was already on the wire LANDS, and the broker dies before its
 	// confirmation runs: nothing marks the register, and no obligation names its sequence.
-	// Admitted as production admits it (F-105 7b): the write on the wire is the admission batch,
+	// Admitted as production admits it (issue #107 7b): the write on the wire is the admission batch,
 	// register, exchange and duty entry together, never a register alone.
 	e.landAdmission(t, pi, 2, dur, sseq, nonce)
 	// And the UNSUBSCRIBE's consumer delete completed, so nothing can classify the source.
@@ -3104,7 +3104,7 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	inflight := restored.receiveMaxOccupancyLocked()
 	incomplete := restored.piSpaceIncomplete
 	intents := len(restored.voidedRegNonces)
-	// The admission's exchange is custody too (F-105 row 5): the void must end it, or the
+	// The admission's exchange is custody too (issue #107 row 5): the void must end it, or the
 	// identifier stays held by the ledger whatever the maps say.
 	custodyHeld := restored.custody.holdsPI(pi) || restored.custody.withholdsAllocation()
 	restored.mu.Unlock()
@@ -3685,7 +3685,7 @@ func TestMQTTInflightSharedPurgeReachesRestoredSession(t *testing.T) {
 // only the durable record. Absence is the durable decision; a resident entry left behind would
 // redeliver the source under an identifier the close already freed.
 //
-// SLOT-ONLY (experimental affine): since F-105 7b the contest, and so its Closed outcome, runs
+// SLOT-ONLY (experimental affine): since issue #107 7b the contest, and so its Closed outcome, runs
 // for that class alone. The ordinary drop routes retire their resident entries through the drop
 // loop's own handoff, which is why this is the input C23 needs.
 //
@@ -3851,7 +3851,7 @@ func TestMQTTInflightClaimPoisonedGroupRetiresLiveMemory(t *testing.T) {
 // so no PUBACK/PUBREC of them can be real. Accepting one tears the entry down, acknowledges
 // the source away — the lost message — and, on a successful PUBREC, hands off a bodyless entry
 // carrying jsDur == pubRelDurable() and regSeq 0 that admission cannot tell from a live
-// retained exchange, so a PUBREL later goes out with no durable action: F-092's own class.
+// retained exchange, so a PUBREL later goes out with no durable action: issue #94's own class.
 //
 // Mutation checks: drop `|| ack.regPending` from the decline in outbound_ack_route.go and both regPending
 // arms fail; drop `|| ack.regCancelled` and the settled-cancelled arm fails (its regPending is
@@ -3925,7 +3925,7 @@ func TestMQTTInflightUndurableReservationDeclinesAcknowledgement(t *testing.T) {
 // teardown's purge to remove". BOTH views of the group are then empty while the pending state
 // is still live, which is why the purge derives its targets from that state instead.
 //
-// Note on how the real forced leave reaches this shape, since it changed: since F-050 it runs
+// Note on how the real forced leave reaches this shape, since it changed: since issue #54 it runs
 // AFTER processSubs, not before, and there is no shared cons entry because the pre-CONNACK
 // restore excludes shared filters for a non-v5 connection — a different reason for the same
 // absence. A RESIDENT session can still carry shared cons entries from an earlier v5
@@ -4420,7 +4420,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 		t.Fatalf("scan-time absence is not proof; the verdict must survive the scan")
 	}
 
-	// The late write lands — as production writes it, the admission batch (F-105 7b)...
+	// The late write lands — as production writes it, the admission batch (issue #107 7b)...
 	e.landAdmission(t, pi, 2, dur, 4300, nonce)
 	// ...and the next scan retires the verdict against the proof of its deletion.
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
@@ -4429,7 +4429,7 @@ func TestMQTTInflightAbsentVerdictSurvivesUntilItsRegisterLands(t *testing.T) {
 	e.sess.mu.Lock()
 	_, kept = e.sess.voidedRegNonces[nonce]
 	_, reserved := e.sess.pendingPublish[pi]
-	// The late admission's exchange is custody too (F-105 row 5): the void must end it on this
+	// The late admission's exchange is custody too (issue #107 row 5): the void must end it on this
 	// same-object resume as it does across a restart.
 	custodyHeld := e.sess.custody.holdsPI(pi) || e.sess.custody.withholdsAllocation()
 	e.sess.mu.Unlock()
@@ -4638,7 +4638,7 @@ func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 // Mutation check: route a tombstoned in-set register to the fire-and-forget drop list (the
 // original ordering) and the verdict survives its own proof.
 //
-// RE-EXPRESSED by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture planted
+// RE-EXPRESSED by issue #99/issue #90 (plan rev 20, seven-red-tests table). The original fixture planted
 // a hand-built tombstone and treated "Cancelled is on the register" as the deletion licence, the
 // deleted premise (a cancellation decision is not a proof of non-transmission). HEAD's property —
 // the verdict is retired after a LICENSED, CONFIRMED deletion of the register it names — is kept,
@@ -5104,7 +5104,7 @@ func TestMQTTInflightRecoveryMissingStreamIsIncomplete(t *testing.T) {
 // Mutation check: use the asynchronous deleteInflightRegister here and the delete is no
 // longer observed as confirmed.
 //
-// REBUILT by F-097/F-088 (plan rev 20, seven-red-tests table). The original fixture reached the
+// REBUILT by issue #99/issue #90 (plan rev 20, seven-red-tests table). The original fixture reached the
 // delete through a bare ordinary register written by storeInflightRegister, a shape admission no
 // longer writes, deleted on its cancellation bit alone. The confirmation property is unchanged
 // and is now reached through a LICENSED destruction: another allocation's pending cancellation
@@ -5218,7 +5218,7 @@ func TestMQTTInflightRecoveryCachesConsumerLookups(t *testing.T) {
 // A session discard destroys the registers of the incarnation it retires: every
 // identifier it held is void.
 //
-// Named for the REAP rather than a purge since F-034: the removal is an
+// Named for the REAP rather than a purge since issue #38: the removal is an
 // enumerate-load-classify pass deleting at exact sequences, and this fixture asserts the
 // outcome for the case where every register is readable and at or below the watermark.
 // It does not assert that removal is unconditional — the reap spares an above-watermark
@@ -5260,7 +5260,7 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
 	})
-	// The RECLAMATION LICENCE (F-036 unit 2), planted BEFORE the register exists. A
+	// The RECLAMATION LICENCE (issue #40 unit 2), planted BEFORE the register exists. A
 	// register whose generation is absent from the reference walk is not thereby proven
 	// dead: a session live on another broker whose record is absent still holds this
 	// identifier and its Receive Maximum slot. So the sweep now requires a valid
@@ -5286,7 +5286,7 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 
 // seedOrphanRegisterWithoutLicence seeds an orphan register and deliberately plants NO
 // retirement watermark — the state a session live on ANOTHER broker with no record
-// leaves behind, which is what F-036 site 3 says absence does not distinguish from death.
+// leaves behind, which is what issue #40 site 3 says absence does not distinguish from death.
 func (e *testInflightEnv) seedOrphanRegisterWithoutLicence(t *testing.T, pi uint16) string {
 	t.Helper()
 	orphanHash, orphanGen := getHash("client-live-remote"), mqttNewSessGen()
@@ -5334,7 +5334,7 @@ func (e *testInflightEnv) registerPresent(t *testing.T, subject string) bool {
 // OBSERVATION, and never on the pass that first saw it — even at a zero grace.
 //
 // Driven through the reconcile rather than the whole sweep, with the test's OWN quarantine
-// and grace (F-069). The account manager's sweep goroutine runs beside this test at the
+// and grace (issue #73). The account manager's sweep goroutine runs beside this test at the
 // manager's own grace and against the manager's own table, so it can neither hand the test
 // a sighting nor delete a register seeded seconds ago; when the test borrowed the manager's
 // table at a zero grace, a background pass landing between the seed and the "first" pass
@@ -5553,7 +5553,7 @@ func TestMQTTInflightRecoveryQuarantinesIllegalPublishShapes(t *testing.T) {
 			sseq uint64
 		}{dur, sseq}
 		if row.legal {
-			// THE LEGAL CONTROL IS ADMITTED as production admits it (F-105 7b): a legal ordinary
+			// THE LEGAL CONTROL IS ADMITTED as production admits it (issue #107 7b): a legal ordinary
 			// register restores only beside the exchange its admission wrote, so a raw plant
 			// would be refused as unadmitted and the control would prove nothing.
 			pis[row.name] = e.track(t, dur, sseq, 2)

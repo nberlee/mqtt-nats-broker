@@ -11,7 +11,7 @@ import (
 // ranges over it under that lock, and every displacement writes it under that
 // lock. A close whose session-record write was unresolved parks its teardown and
 // then clears this client ID from the jail — and that removal was the one runtime
-// access in the tree taken with no lock at all (F-043).
+// access in the tree taken with no lock at all (issue #47).
 //
 // These tests are deliberately UNTAGGED. The defect is a data race, so the
 // instrument that discriminates it is the race detector, and `make test` is the

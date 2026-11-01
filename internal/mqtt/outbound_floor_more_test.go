@@ -29,7 +29,7 @@ import (
 )
 
 // T12. NO EXCHANGE ENUMERATION REACHES THE PAGED SUBJECT WALK (M6). streamSubjectsComplete is
-// sound only over filters whose records are never deleted; since F-112 exchange records are
+// sound only over filters whose records are never deleted; since issue #114 exchange records are
 // deleted behind the floor, so no production call may pass it the exchange walk filter, directly
 // or through a variable.
 func TestF112NoExchangeFilterReachesThePagedSubjectWalk(t *testing.T) {
@@ -62,7 +62,7 @@ func TestF112NoExchangeFilterReachesThePagedSubjectWalk(t *testing.T) {
 				walks++
 				if strings.Contains(body, "mqttExchangeWalkFilter(") {
 					t.Errorf("%s: %s passes an exchange filter to the paged subject walk: exchange records are "+
-						"deleted behind the floor, so the inventory [Lo, Hi] is the only sound enumeration (F-112)",
+						"deleted behind the floor, so the inventory [Lo, Hi] is the only sound enumeration (issue #114)",
 						name, fn.Name.Name)
 				}
 			}

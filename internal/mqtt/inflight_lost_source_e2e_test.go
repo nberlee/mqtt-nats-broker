@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased is F-102 end to end,
+// TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased is issue #104 end to end,
 // through a real broker with NO source-state hook anywhere: the classifier has to answer
 // Lost by itself, from a consumer this test really deletes.
 //
@@ -26,10 +26,10 @@ import (
 //     (mqttRecoveredPending), and the reap only scans entries that have one, so only the
 //     original pending entry surviving through the in-memory-wins branch reaches it.
 //  3. At before-connack, delete the source message. The reap then finds it absent,
-//     proves the entry unsent and releases it — F-100's arm, working correctly — and
+//     proves the entry unsent and releases it — issue #102's arm, working correctly — and
 //     leaves the durable pair behind.
 //  4. Delete the source consumer. Now the classifiers answer Lost rather than Complete.
-//  5. Resume again. Before F-102 the pair was restored with its marker, its mapping and
+//  5. Resume again. Before issue #104 the pair was restored with its marker, its mapping and
 //     no ack subject, and nothing could ever release it. Now it is consumed.
 func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testing.T) {
 	// NOT parallel: the send-window and restore-pause hooks are process-global.
@@ -165,7 +165,7 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 	sess.mu.Unlock()
 	if stillTracked || stillMapped {
 		sub.Close()
-		t.Fatalf("fixture: F-100's reap must have released the entry (tracked=%v mapped=%v)",
+		t.Fatalf("fixture: issue #102's reap must have released the entry (tracked=%v mapped=%v)",
 			stillTracked, stillMapped)
 	}
 	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err != nil || smsg == nil {

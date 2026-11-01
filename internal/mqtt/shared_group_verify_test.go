@@ -863,7 +863,7 @@ func TestSharedGroupLookupBatchIsBounded(t *testing.T) {
 	//
 	// Note what is NOT asserted: that the chunks cover every target. These durables do not
 	// exist, so the first chunk's first verdict is a refusal and the pass stops there by
-	// design — one refusal already refuses the CONNECT (F-077 later made an authoritatively
+	// design — one refusal already refuses the CONNECT (issue #79 later made an authoritatively
 	// ABSENT verdict repairable instead, which is a different arm and does not reach this
 	// batching rule) — so any further lookup is work whose
 	// result cannot change the outcome. An earlier version of this test required full

@@ -112,7 +112,7 @@ func (sess *mqttSession) disarmTerminalRetry(w *mqttTerminalRetry) {
 // ---- from outbound_withdraw_unsent.go ----
 
 // mqttEntitlementLicence is the licence of an entitlement captured from the deciding connection
-// earlier (a parked close, a resume walk). Test-only (F-054): production never mints a licence
+// earlier (a parked close, a resume walk). Test-only (issue #58): production never mints a licence
 // this way, and outbound_licence_provenance_test.go fails if a production call appears.
 func mqttEntitlementLicence(ent mqttOutboundEntitlement, ok bool) mqttDestroyLicence {
 	return mqttDestroyLicence{ent: ent, entOK: ok}
@@ -196,7 +196,7 @@ func mqttQoS2ClaimSubject(idHash, gen string, pi uint16) string {
 // ---- from sess_lease.go ----
 
 // retireBoundIncarnation is retireBoundIncarnationChecked with no pre-detach proof. A test
-// entry point (F-054): every production caller - the CONNECT clean-start arm and the gone
+// entry point (issue #58): every production caller - the CONNECT clean-start arm and the gone
 // retirement - supplies a proof and calls retireBoundIncarnationChecked directly.
 func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) (
 	*mqttRetiredBinding, *mqttPreparedClear, error) {
@@ -205,7 +205,7 @@ func (asm *mqttAccountSessionManager) retireBoundIncarnation(sess *mqttSession) 
 }
 
 // retirementPendingArmed reports whether a discard obligation is still parked on this
-// session's CURRENT incarnation. A test observation (F-054): the drain-triggered finisher
+// session's CURRENT incarnation. A test observation (issue #58): the drain-triggered finisher
 // (pendingDiscardFinisher) polls the tracker it CAPTURED, not this, so a later
 // incarnation's mark cannot stop it.
 func (sess *mqttSession) retirementPendingArmed() bool {
@@ -356,7 +356,7 @@ func mqttTestRestoreOnce(restore func()) func() {
 // ---- from unsub_drain.go ----
 
 // claimedCount reports how many sequences this drain still claims. A test observation
-// (F-054): whether the drain is finished is retirable()/retirableExcept()'s decision, which
+// (issue #58): whether the drain is finished is retirable()/retirableExcept()'s decision, which
 // asks more than whether the count is zero.
 //
 // sess.mu must be held.

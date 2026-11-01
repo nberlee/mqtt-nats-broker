@@ -20,7 +20,7 @@ import (
 )
 
 // The shared-group lifecycle's OPERATIONS: what a session does with the two records
-// (F-105, the shared-group lifecycle transfer). The records and their write boundary are in
+// (issue #107, the shared-group lifecycle transfer). The records and their write boundary are in
 // shared_lifecycle.go; this file is the protocol that drives them.
 //
 //   - ACQUIRE (J1): one acquisition per consumer a filter needs, under this CONNECT's tenure,
@@ -53,7 +53,7 @@ func (sess *mqttSession) sharedEpoch() string {
 }
 
 // mintAcceptanceTenure fixes this CONNECT's ONE tenure once its acceptance is finalized
-// (F-105 8b): the ID is the authority tenure the acceptance was finalized under, and the order
+// (issue #107 8b): the ID is the authority tenure the acceptance was finalized under, and the order
 // is the stream sequence of the acceptance's own create-only fact, READ BACK by the subject
 // the adopted batch committed. Not the session record's sequence: that slot advances with every
 // later save, so after a lost response nothing could say which of its sequences was THIS
@@ -268,7 +268,7 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 	jsa := sess.jsa
 
 	// The highest ledger sequence any attempt of `acq` was composed against: what the abort
-	// fence must move past. No attempt is ever composed against absence (F-105 8b).
+	// fence must move past. No attempt is ever composed against absence (issue #107 8b).
 	var composedMax uint64
 
 	for attempt := 0; attempt < mqttSharedAcquireAttempts; attempt++ {
@@ -345,7 +345,7 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 // abortSharedAcquisition is the abort settlement of one exhausted acquisition: a fence over
 // the ledger (a byte-identical BUMP under our tenure), then consult 2's outcome table over the
 // ledger as read afterwards. Every attempt was composed against an EXISTING ledger sequence
-// (a join never creates the ledger, F-105 8b), so the fence is always a bump; an absent ledger
+// (a join never creates the ledger, issue #107 8b), so the fence is always a bump; an absent ledger
 // here contradicts a record that is never deleted and is UNRESOLVED — never recreated.
 func (sess *mqttSession) abortSharedAcquisition(id, gen, epoch string, tenure mqttSharedTenure, acq string,
 	composedMax uint64) (mqttSharedAcquisition, mqttSharedAcquireOutcome, error) {
@@ -797,7 +797,7 @@ func (sess *mqttSession) acquireSharedFilter(c *client, f *mqttFilter, subject s
 	}
 }
 
-// installAndReconcileTenure is EVERY acceptance's disposition step (F-105 8b), run after its
+// installAndReconcileTenure is EVERY acceptance's disposition step (issue #107 8b), run after its
 // tenure is minted and before anything is served; for a record with no shared state the
 // reconcile below is vacuous and the installation is what remains:
 //

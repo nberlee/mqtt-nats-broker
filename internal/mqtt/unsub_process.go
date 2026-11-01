@@ -22,7 +22,7 @@ import (
 )
 
 // mqttDrainDisposal is one queued drain retirement: the durable and the entitlement its omission
-// was decided under (F-105 7c-lc).
+// was decided under (issue #107 7c-lc).
 type mqttDrainDisposal struct {
 	durable string
 	ent     mqttOutboundEntitlement
@@ -389,7 +389,7 @@ var mqttTestUnsubAckWindowHookV atomic.Pointer[func(c *client)]
 // structural backstop, not the routing authority: commitUnsub already dispatches on f.shared,
 // which is the parse-time truth. Nothing here may discriminate shared from plain LEXICALLY —
 // a literal '.' encodes as "//" (mqttToNATSSubjectConversion), so the ordinary plain filter
-// "$share.foo" has the sid "$share//foo" and a "$share/" prefix test would strand it. F-083.
+// "$share.foo" has the sid "$share//foo" and a "$share/" prefix test would strand it. issue #85.
 //
 // sess.mu must NOT be held: this takes it.
 func (sess *mqttSession) plainConsumerForUnsub(sid string) *ConsumerConfig {
@@ -408,9 +408,9 @@ func (sess *mqttSession) plainConsumerForUnsub(sid string) *ConsumerConfig {
 // THREE separate operations, because "this config is doomed" and "this durable is owed a
 // release" are different questions and the second does not imply the first. A durable an
 // overlapping key still holds is not owed — but the leaving key's own cons entries must go
-// regardless, or they outlive the membership with nothing left to reach them by. F-083.
+// regardless, or they outlive the membership with nothing left to reach them by. issue #85.
 //
-// The three dispositions per group consumer are F-082's, applied here: own-held discharges
+// The three dispositions per group consumer are issue #84's, applied here: own-held discharges
 // nothing and deletes nothing; a foreign holder or a REFUSED scan discharges this session's
 // own state and withholds the delete; unheld does both. Own-held targets are dropped before
 // the scan runs, so its answer can no longer be this session's own membership.
@@ -454,7 +454,7 @@ func (sess *mqttSession) releaseUnsubSharedTargets(c *client, tok recordTx, remo
 		// it by. After (1) any such entry is stale by definition, since no surviving key
 		// reaches an owed durable.
 		//
-		// The SUBSCRIBE rollback's definite arm no longer produces that shape (F-039), and
+		// The SUBSCRIBE rollback's definite arm no longer produces that shape (issue #43), and
 		// this backstop is kept regardless: it is a superset sweep, and narrowing it to the
 		// producers we can currently name is how a sweep boundary stops converging.
 		sess.mu.Lock()

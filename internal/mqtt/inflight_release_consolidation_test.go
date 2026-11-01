@@ -1,6 +1,6 @@
 // C-IV's consolidation: the release authority table, the observation-bound release token,
 // the extracted post-delete confirmation, and the identifier exclusion a removal site hands
-// off (F-098). Plus the two HEAD defects this item closes, F-103 and F-104.
+// off (issue #100). Plus the two HEAD defects this item closes, issue #105 and issue #106.
 
 package mqtt
 
@@ -249,7 +249,7 @@ func TestExclusionIsTheSixthLivenessTerm(t *testing.T) {
 	}
 }
 
-// TestStagedVerdictIsNotProvenUnsent is F-103's oracle.
+// TestStagedVerdictIsNotProvenUnsent is issue #105's oracle.
 //
 // mqttSlotEvidenceFor used to read BARE MEMBERSHIP in voidedRegNonces, which includes a
 // verdict that is merely STAGED — voidRegNonceLocked stamps an insertion revision that the
@@ -278,13 +278,13 @@ func TestStagedVerdictIsNotProvenUnsent(t *testing.T) {
 	if got := mqttSlotReleaseAuthority(ev); got != mqttSlotReservedAuthority {
 		t.Fatalf("a possibly-attempted slot with no durable cancellation must RESERVE, got %d", got)
 	}
-	// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This fixture used to assert that a
+	// RE-EXPRESSED by issue #99/issue #90 (plan rev 10, WP3 edit 1). This fixture used to assert that a
 	// DURABLY COVERED verdict makes the slot releasable; that is the deleted premise (a
 	// cancellation decision is not a proof of non-transmission), and the evidence member that
 	// carried the verdict is gone. What stays true, and is asserted: the record's own
 	// cancellation bit, the other carrier of the same decision, does not release a
 	// possibly-attempted slot either; only the standing marker does.
-	rec.Cancelled, rec.CancelOrigin = true, mqttCancelOriginOccupant // F-088: provenance is written
+	rec.Cancelled, rec.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: provenance is written
 	if got := mqttSlotReleaseAuthority(ev); got == mqttSlotProvenUnsentAuthority {
 		t.Fatal("a cancellation over a possibly-attempted slot must not yield proven-unsent authority")
 	}
@@ -294,7 +294,7 @@ func TestStagedVerdictIsNotProvenUnsent(t *testing.T) {
 	}
 }
 
-// TestEvidenceLoaderRequiresADurablyCoveredVerdict is F-103 at the LOADER, which is where the
+// TestEvidenceLoaderRequiresADurablyCoveredVerdict is issue #105 at the LOADER, which is where the
 // staged/durable distinction actually has to be drawn — the fixture above pins the function's
 // reading of the term, this one pins how the term is computed.
 func TestEvidenceLoaderRequiresADurablyCoveredVerdict(t *testing.T) {
@@ -362,7 +362,7 @@ func TestConfirmationDistinguishesAbsenceFromReplacement(t *testing.T) {
 	}
 }
 
-// TestEvidenceForRefusesAStagedVerdict is F-103's REAL oracle, and it exists because the two
+// TestEvidenceForRefusesAStagedVerdict is issue #105's REAL oracle, and it exists because the two
 // fixtures above did not kill the defect.
 //
 // Mutating mqttSlotEvidenceFor back to bare membership SURVIVED them: one drives the
@@ -400,7 +400,7 @@ func TestEvidenceForRefusesAStagedVerdict(t *testing.T) {
 		t.Fatal("a staged verdict must not license releasing a possibly-attempted identifier")
 	}
 
-	// RE-EXPRESSED by F-097/F-088 (plan rev 10, WP3 edit 1). This fixture used to assert that,
+	// RE-EXPRESSED by issue #99/issue #90 (plan rev 10, WP3 edit 1). This fixture used to assert that,
 	// once the save lands, the DURABLY COVERED verdict reaches the evidence and so licenses the
 	// release. That is the deleted premise: a void verdict proves nothing about
 	// transmission, and the loader no longer reads verdicts at all. Asserted instead: a durably
@@ -410,11 +410,11 @@ func TestEvidenceForRefusesAStagedVerdict(t *testing.T) {
 	e.sess.mu.Unlock()
 	ev, _, _ = e.sess.mqttSlotEvidenceFor(subject, mqttSlotIdentity{subject: subject, nonce: nonce})
 	if got := mqttSlotReleaseAuthority(ev); got == mqttSlotProvenUnsentAuthority {
-		t.Fatal("a durably covered verdict must not license releasing a possibly-attempted identifier (F-088)")
+		t.Fatal("a durably covered verdict must not license releasing a possibly-attempted identifier (issue #90)")
 	}
 }
 
-// TestVerdictSurvivesADeleteThatRemovedNothing is F-104's oracle.
+// TestVerdictSurvivesADeleteThatRemovedNothing is issue #106's oracle.
 //
 // deleteInflightRegisterConfirmed reports SUCCESS for an already-absent sequence. So a
 // caller holding an observation at sequence S, while a same-identity rewrite moved the
@@ -461,7 +461,7 @@ func TestVerdictSurvivesADeleteThatRemovedNothing(t *testing.T) {
 	_, stillHeld := e.sess.voidedRegNonces[nonce]
 	e.sess.mu.Unlock()
 	if !stillHeld {
-		t.Fatal("the verdict was retired against a delete that removed nothing (F-104): the surviving register is now unreleasable")
+		t.Fatal("the verdict was retired against a delete that removed nothing (issue #106): the surviving register is now unreleasable")
 	}
 
 	// And the positive half, so the gate is not simply refusing everything: once the record
@@ -597,7 +597,7 @@ func TestPubRelOpenerCarriesTheExclusionAcrossAReplacement(t *testing.T) {
 	}
 }
 
-// A DEFERRED SETTLEMENT HANDS OFF THE IDENTIFIER'S EXCLUSION BEFORE IT UNTRACKS (F-098,
+// A DEFERRED SETTLEMENT HANDS OFF THE IDENTIFIER'S EXCLUSION BEFORE IT UNTRACKS (issue #100,
 // consult D-7). When a removal path condemns an entry whose send section is still open,
 // `endSendWith` performs the untrack later — and for a settlement whose durable delete may
 // be refused by a freshness fence, fail, or never have been issued, that untrack would
@@ -687,7 +687,7 @@ func TestMQTTDeferredSettlementExcludesOnlyARegisterBackedIdentifier(t *testing.
 	}
 }
 
-// AN UNCONFIRMED DELETE IS NOT A RELEASE (F-098). `confirmSlotReleased` is the one
+// AN UNCONFIRMED DELETE IS NOT A RELEASE (issue #100). `confirmSlotReleased` is the one
 // definition of what a delete actually established, and it exists because an exact-sequence
 // delete reports success for an already-absent sequence — so "the delete returned nil" and
 // "this exchange's record is gone" are different facts.
@@ -874,7 +874,7 @@ func TestMQTTTerminalCleanupHoldsAnUnconfirmedRelease(t *testing.T) {
 	}
 }
 
-// A COLD RECOVERY DROP RESERVES ITS IDENTIFIER UNTIL THE DELETE IS PROVEN (F-098, holistic
+// A COLD RECOVERY DROP RESERVES ITS IDENTIFIER UNTIL THE DELETE IS PROVEN (issue #100, holistic
 // review round 1, finding 1).
 //
 // A staged drop is not a completed one. The drop loop runs after the apply phase and its
@@ -953,7 +953,7 @@ func TestMQTTColdRecoveryDropReservesUntilItsDeleteIsProven(t *testing.T) {
 	}
 }
 
-// A REASSERTED EXCLUSION INVALIDATES EVERY ABSENCE PROOF TAKEN BEFORE IT (F-098, holistic
+// A REASSERTED EXCLUSION INVALIDATES EVERY ABSENCE PROOF TAKEN BEFORE IT (issue #100, holistic
 // review round 2, finding 1).
 //
 // The exclusion's binds are a SET, so an identical restriction is not stored twice. That is
@@ -1038,7 +1038,7 @@ func TestReassertingAnExclusionInvalidatesAStaleAbsenceProof(t *testing.T) {
 }
 
 // EXPIRY OF A RECOVERED, REGISTER-BACKED ENTRY RESERVES ITS IDENTIFIER UNTIL THE DELETE IS
-// PROVEN (F-098, holistic review round 3).
+// PROVEN (issue #100, holistic review round 3).
 //
 // Message Expiry may drop a PUBLISH proven never transmitted, and that drop is licensed. What
 // is not licensed is treating the untrack as the moment the identifier becomes free: the
@@ -1121,7 +1121,7 @@ func TestMQTTExpiryOfARecoveredEntryReservesUntilItsDeleteIsProven(t *testing.T)
 }
 
 // A RETAINED TERMINAL SLOT KEEPS ITS IDENTIFIER EXCLUDED WHILE RELEASING ITS CAPACITY
-// (F-098, holistic review round 5).
+// (issue #100, holistic review round 5).
 //
 // `mqttTerminalRetainedReoffer` is the disposition where finalizeTerminalSlot deliberately
 // KEEPS the register, because the source may still re-offer. The terminal reservation must go
@@ -1183,7 +1183,7 @@ func TestMQTTRetainedTerminalSlotExcludesItsIdentifierButNotItsCapacity(t *testi
 	}
 }
 
-// EVERY RETAINED-REOFFER ARM USES THE RESERVING RELEASE (F-098, holistic review round 5).
+// EVERY RETAINED-REOFFER ARM USES THE RESERVING RELEASE (issue #100, holistic review round 5).
 //
 // The regression above proves what `releaseRetainedTerminalReservation` DOES; it cannot prove
 // that the three arms which must call it actually do. Mutating a call site left that test
@@ -1236,7 +1236,7 @@ func TestEveryRetainedReofferArmReservesTheIdentifier(t *testing.T) {
 			if bare && !reserving {
 				t.Errorf("%s:%d: a retained-reoffer arm calls the BARE releaseTerminalReservation: "+
 					"the register is deliberately KEPT here, so the identifier is not free even "+
-					"though the capacity is (F-098)", file, i+1)
+					"though the capacity is (issue #100)", file, i+1)
 			}
 			if !reserving && !excluding {
 				t.Errorf("%s:%d: a retained-reoffer arm neither reserves the identifier nor "+
@@ -1263,7 +1263,7 @@ func TestEveryRetainedReofferArmReservesTheIdentifier(t *testing.T) {
 			if strings.Contains(g, ".settled()") && !strings.Contains(g, "mqttTerminalRetainedReoffer") {
 				t.Errorf("%s:%d: a bare releaseTerminalReservation is gated on settled(), which "+
 					"is TRUE for mqttTerminalRetainedReoffer — a retained slot keeps its "+
-					"register, so settled() alone never licenses freeing its identifier (F-098)",
+					"register, so settled() alone never licenses freeing its identifier (issue #100)",
 					file, i+1)
 			}
 		}

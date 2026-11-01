@@ -83,7 +83,7 @@ type evictDecision struct {
 	// action is what the tail needs to discharge a parked deferred close. This route
 	// detaches the client inside the as.mu section and then closes it, and a detached
 	// client's close publishes only an IMMEDIATE Will (mqttPublishOwedWill), so before
-	// F-084 an armed or owed-DELAYED Will simply vanished here.
+	// issue #86 an armed or owed-DELAYED Will simply vanished here.
 	//
 	// The Session Expiry Interval is deliberately NOT carried: it is connection-owned and
 	// stays mutable, so the tail reads it under the lock that consumes the Will instead.
@@ -105,7 +105,7 @@ type evictDecision struct {
 // usable=false is the license path: the observation licensed the eviction and the
 // record could not narrow it (absent, undecodable, load error, or below the
 // trigger), so decisionSeq is the OBSERVATION level and the verdict concedes as
-// ownership-UNSETTLED — never a takeover, which no record shape proves (F-084).
+// ownership-UNSETTLED — never a takeover, which no record shape proves (issue #86).
 // The freshness arm still applies on this path — a trigger that
 // advanced past the observation this iteration answers is delivered knowledge,
 // not a lost observation, and the re-load may find the record readable at the
@@ -132,7 +132,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 		d.out = evictBusy
 		return d
 	}
-	// COMPLETION OWNERSHIP, per decision attempt (F-036 unit 1). This worker is
+	// COMPLETION OWNERSHIP, per decision attempt (issue #40 unit 1). This worker is
 	// spawned by the record-watch delivery and outlives the callback's own lease, so
 	// it owns the incarnation for the extent of THIS decision and no longer. A
 	// retirement in progress refuses it — never parks it, because it holds as.mu
@@ -187,7 +187,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	// leaves this pair stale behind a free fence. That staleness only ever NARROWS
 	// the verdict — a sibling of the unadopted attempt reads unrelated against the
 	// stale pair and CONCEDES (the stated one-hop recognition miss; what it concedes
-	// TO is the unsettled vocabulary, never a takeover claim — F-084), while a sibling of the
+	// TO is the unsettled vocabulary, never a takeover claim — issue #86), while a sibling of the
 	// acknowledged record itself still classifies forked (a true positive). No
 	// record shape can manufacture a false forked verdict from a stale pair, so
 	// the eviction proceeds; the unresolved attempt's own convergence stays with
@@ -266,14 +266,14 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 	// An UNUSABLE load concedes to the unsettled vocabulary, not the takeover one. It used
 	// to concede to the takeover, which was the strongest claim available on the weakest
 	// evidence there is: a record we could not read, that was gone, or that sat below the
-	// target says only that this observation cannot be classified. F-084.
+	// target says only that this observation cannot be classified. issue #86.
 	voc, forked := mqttDisposalOwnershipUnsettled, false
 	if usable {
 		voc, forked = disposalForRemotePersist(ps, wid, pwid)
 	}
 	// The subject has moved past our base, so this broker's expiry timer must not fire and
 	// delete state it no longer speaks for. (Not "the remote record owns the session": the
-	// observation identifies no owner — F-084.) Spec5 [3.1.2.11.2].
+	// observation identifies no owner — issue #86.) Spec5 [3.1.2.11.2].
 	as.cancelSessionExpiryLocked(cIDHash)
 	as.removeSession(sess, false)
 	sess.mu.Lock()
@@ -303,7 +303,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 		// classification rather than recovered from voc.reason, because the forked and the
 		// unsettled vocabularies both carry 0x89 — a reason-code test would mint a grant for
 		// a record that established nothing to anchor one to. See sess_fork_repair.go and
-		// F-084.
+		// issue #86.
 		as.mintForkedGrantLocked(sess, wid, pwid)
 	}
 	d.out = evictApplied
@@ -318,7 +318,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 // Both carry 0x89, inviting the reconnect that resolves the ambiguity; the difference is
 // the Reason String and, decisively, whether a repair grant is minted. No arm here reports
 // a takeover: this route learns of the displacement from a record, and no record shape
-// proves a successor. F-084.
+// proves a successor. issue #86.
 //
 // Two corrections to what this comment used to say. It is NOT the leader-transition
 // fork: that route is closed for two broker-authored conditional writes (the same-base
@@ -326,7 +326,7 @@ func (as *mqttAccountSessionManager) evictDecideOnce(cIDHash string, st *session
 // write. And THIS path cancels no delayed Will on either verdict — see the block below,
 // where that was deliberately removed in favour of the claimant deciding against the
 // permanent acceptance facts. The verdict's Will consequence lives on the BOUND
-// REJECTION path (sess_rejected_write.go) — where, since F-084, BOTH arms consume the
+// REJECTION path (sess_rejected_write.go) — where, since issue #86, BOTH arms consume the
 // Will: neither demonstrates a successor, and only a displacement this broker holds both
 // ends of may suppress one.
 //
@@ -484,7 +484,7 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 			// detaches inside the as.mu section and then closes, and a detached client's
 			// close publishes only an IMMEDIATE Will (mqttPublishOwedWill), so an armed or
 			// owed-DELAYED one simply vanished here. It runs in the tail because the tail is
-			// where every lock and the record token are already released. F-084.
+			// where every lock and the record token are already released. issue #86.
 			//
 			// The epoch is read from the manager rather than carried in the capsule: it is
 			// resolved once at initialization and immutable after, so a late read cannot skew.
@@ -502,7 +502,7 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 				// nil expiry: read from the connection under the lock that consumes the
 				// Will. This route detaches inside its as.mu section and runs the Will in a
 				// tail, so any value sampled at decision time can be stale by then — an
-				// MQTT 5 DISCONNECT override moves it. F-084.
+				// MQTT 5 DISCONNECT override moves it. issue #86.
 				s.mqttHandleWill(d.ec, nil, d.displacedGen, d.displacedSeq, as.sessStreamEpoch)
 			}
 			if d.ec != nil {

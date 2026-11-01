@@ -34,7 +34,9 @@ with that head's `server/mqtt.go`, and a whitespace-insensitive line diff agains
 nats-server v2.14.3; that is the dependency it built against, not the source of the core.
 
 Upstream changes taken since are recorded per change, by upstream pull request:
-nats-io/nats-server#8692 (F-120; the `mqtt_test.go` cases marked "Ported from upstream
+nats-io/nats-server#8692
+([issue #122](https://github.com/nberlee/mqtt-nats-broker/issues/122); the
+`mqtt_test.go` cases marked "Ported from upstream
 nats-server (#8692)"). `CONTRIBUTING.md`, "Syncing with upstream NATS", is the
 procedure.
 
@@ -61,7 +63,7 @@ the NATS Authors' copyright header, and [NOTICE](../NOTICE) carries the attribut
 ## Intentional divergence
 
 - **MQTT 5.0 is always on.** The CONNECT gate accepts protocol levels 4 and 5 on every
-  broker; there is no opt-in gate and no `max_protocol_version` cap (F-054).
+  broker; there is no opt-in gate and no `max_protocol_version` cap ([issue #58](https://github.com/nberlee/mqtt-nats-broker/issues/58)).
 - **Client identifiers** may be any valid UTF-8, which Eclipse Paho interop requires; the
   identifier is hashed, never used as a raw subject token. See "Client-ID handling" in
   [CONFORMANCE.md](CONFORMANCE.md).
@@ -74,7 +76,7 @@ the NATS Authors' copyright header, and [NOTICE](../NOTICE) carries the attribut
   server; compression, the no-masking negotiation and text frames are not supported.
 - **Writes are synchronous.** Upstream's write loop and outbound buffer are replaced by
   a synchronous write under `wmu`, which keeps upstream's per-write deadline
-  (`mqttWriteDeadline`, F-035).
+  (`mqttWriteDeadline`, [issue #39](https://github.com/nberlee/mqtt-nats-broker/issues/39)).
 - **Shared-subscription selection happens on the service connection**, so a member
   denied by authorization cannot be filtered out before a message is offered to it; the
   broker hands such an offer back to the group instead (CONFORMANCE.md).

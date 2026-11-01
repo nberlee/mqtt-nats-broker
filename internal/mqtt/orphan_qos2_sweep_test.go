@@ -116,10 +116,10 @@ func (e *testOrphanEnv) forget(t *testing.T) {
 	t.Helper()
 	e.dropLocalSession()
 	e.dropSessionRecord(t)
-	// The RETIREMENT LICENCE, which since F-036 unit 2 is a precondition of every
+	// The RETIREMENT LICENCE, which since issue #40 unit 2 is a precondition of every
 	// destructive arm below rather than something a fixture may leave out. Dropping the
 	// record and the resident object establishes only that nothing THIS BROKER can see
-	// names the generation — which is exactly the inference F-036 site 3 is a finding
+	// names the generation — which is exactly the inference issue #40 site 3 is a finding
 	// about, since a session live on another broker whose record is absent still uses
 	// these names. So a fixture that asserts reclamation must also plant the fact that
 	// licenses it: a valid watermark naming this generation.
@@ -608,7 +608,7 @@ func TestOrphanSweepAdoptionValidatesTheAffinePair(t *testing.T) {
 // affine pair is inconsistent — it must be INDETERMINATE. Reading it as "a valid
 // record for a different generation" turns it into proof of absence, which discards
 // a live assignment. (It could also delete a referenced consumer with its
-// interest-retained copies, until F-036 course E removed that route; the surviving
+// interest-retained copies, until issue #40 course E removed that route; the surviving
 // stake here is the claim transition.)
 func TestOrphanSweepPostSnapshotRereadsFailClosed(t *testing.T) {
 	// Each case is a record that decodes cleanly but cannot be interpreted, and that
@@ -1527,7 +1527,7 @@ func TestOrphanSweepAffineValidatorChecksEveryDerivedName(t *testing.T) {
 		// An INTERNALLY VALID copy subject for a DIFFERENT incarnation. The arbitrary
 		// string above is rejected by any derivation, so it cannot show that the
 		// incarnation takes part in the binding; this row can, and it is the only shape
-		// that discriminates a binding derived without the nonce. F-065.
+		// that discriminates a binding derived without the nonce. issue #69.
 		{"copy subject of another incarnation", subject, func(c *mqttQ2AffClaim) {
 			c.CopySubject = mqttQ2AffCopySubject(c.Winner, c.Gen, c.ClaimHash, mqttNewQ2AffGen())
 		}},
@@ -1580,7 +1580,7 @@ func TestOrphanSweepAffineValidatorDoesNotWidenTheSharedFloor(t *testing.T) {
 
 	// The sweep inventory does reject it, which costs this pass its right to write ANY
 	// affine claim transition — including for claims that have nothing to do with the
-	// malformed one. (It used to protect affine consumers too; F-036 course E removed
+	// malformed one. (It used to protect affine consumers too; issue #40 course E removed
 	// that delete, so the surviving stake is the claim transition.)
 	if _, err := e.asm.collectQ2AffInventory(); err == nil {
 		t.Fatal("the sweep inventory accepted a claim whose derived names do not match")
@@ -1940,7 +1940,7 @@ func (e *testOrphanEnv) consumerExists(t *testing.T, durable string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// F-036 course E: the sweep does not reclaim an affine consumer by absence
+// issue #40 course E: the sweep does not reclaim an affine consumer by absence
 // ---------------------------------------------------------------------------
 
 // TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence is the acceptance condition that
@@ -1951,7 +1951,7 @@ func (e *testOrphanEnv) consumerExists(t *testing.T, durable string) bool {
 // $MQTT_out is interest-retained, so deleting an affine consumer destroys the
 // acknowledged QoS 2 payloads it holds — and no positive fact can authorize that
 // delete: the retirement watermark records the SESSION generation while the consumer
-// is keyed by an AFFINE generation that outlives incarnations. F-036 course E removed
+// is keyed by an AFFINE generation that outlives incarnations. issue #40 course E removed
 // the route rather than patching it, and the accepted price is a leak.
 //
 // Every case below is a state that USED to authorize the delete, driven through the
@@ -2334,7 +2334,7 @@ func TestOrphanSweepDoesNotDiscardOnConsumerCandidacyAlone(t *testing.T) {
 
 // TestOrphanSweepLeavesForeignConsumersAlone pins the durable-prefix boundary from
 // the only side that still has one. The affine pass used to own the mirror of this
-// assertion; F-036 course E removed it, so what remains is that the PUBREL pass judges
+// assertion; issue #40 course E removed it, so what remains is that the PUBREL pass judges
 // $MQTT_PUBREL_* and nothing else — an affine consumer must survive it untouched, even
 // with no reference to it anywhere and every grace elapsed.
 func TestOrphanSweepLeavesForeignConsumersAlone(t *testing.T) {
@@ -2595,7 +2595,7 @@ func (e *testOrphanEnv) liveOwnedPubRelConsumer(t *testing.T, clientID string) t
 // retiredPubRelConsumer leaves a client's PUBREL consumer standing under a RETIRED name: the
 // state between its deletion's authorization and the physical delete (a crash there), and the
 // state a delayed CREATE after that delete reproduces. It is the orphan the PUBREL sweep exists
-// to reap (F-105 §5.1 points 5-6).
+// to reap (issue #107 §5.1 points 5-6).
 //
 // Every record on the way is produced by its production op, never planted. The name is claimed
 // LIVE by opProvisionResource before the CREATE, as ensurePubRelConsumerSubscription claims it.
@@ -2723,7 +2723,7 @@ func testPubRelDiscovered(cands []*mqttPubRelCandidate, durable string) bool {
 // The ordering is the point. Finishing in the same pass would release the record
 // moments after the marker landed, and a survivor broker whose lossy record watch
 // dropped that brief observation would face an ABSENT record instead of a moved one —
-// the F-036 shape. Deferring keeps it visibly MOVED for at least one backstop cadence.
+// the issue #40 shape. Deferring keeps it visibly MOVED for at least one backstop cadence.
 //
 // The watermark is produced by the REAL writer, never planted: a planted fence would
 // let this test pass even if no teardown ever recorded one.
@@ -2821,9 +2821,9 @@ func TestOrphanSweepCondemnsARetiredSurvivor(t *testing.T) {
 // TestOrphanSweepReapsAnOrphanedPubRelDurable is test 9: the companion half. A PUBREL
 // durable on $MQTT_out under a spent name was referenced by NOTHING before this class
 // existed — sweepOrphanedConsumers lists $MQTT_msgs only, and the affine pass judges no
-// consumer at all since F-036 course E — so it held its interest-retained PUBRELs forever.
+// consumer at all since issue #40 course E — so it held its interest-retained PUBRELs forever.
 //
-// What licenses the delete is the name's RETIRED ownership (F-105 §5.1 point 5), and it is
+// What licenses the delete is the name's RETIRED ownership (issue #107 §5.1 point 5), and it is
 // also what DISCOVERS the candidate: the in-flight walk reads the ownership record, and no
 // $MQTT_out listing is taken. A LIVE-owned or ownerless consumer is never a candidate.
 func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
@@ -2832,7 +2832,7 @@ func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 		// nothing here waits for a second sighting.
 		e := testNewOrphanEnv(t, "pubrel-orphan")
 		durable, _, _ := e.retiredPubRelConsumer(t, "pubrel-gone")
-		// The missing-ownership arm, in the same pass: carrying the F-036 watermark for its
+		// The missing-ownership arm, in the same pass: carrying the issue #40 watermark for its
 		// own generation, and claimed by no ownership record.
 		unowned := e.unownedPubRelConsumer(t, "pubrel-unowned")
 
@@ -2984,7 +2984,7 @@ func TestOrphanSweepPubRelValidatesTheConsumerConfig(t *testing.T) {
 // RETIRED ownership, the record re-read and the instance lookup; none of them is an
 // assignment claim.
 //
-// The affine-consumer control this test used to carry is GONE with F-036 course E: this
+// The affine-consumer control this test used to carry is GONE with issue #40 course E: this
 // pass no longer reclaims an affine consumer by absence, so asserting that one survives an
 // incomplete inventory would pass by default.
 // TestOrphanSweepDoesNotReclaimAnAffineConsumerByAbsence owns that invariant now,

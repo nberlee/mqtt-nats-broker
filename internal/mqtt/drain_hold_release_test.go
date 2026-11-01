@@ -19,7 +19,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// A DRAINED SOURCE'S ACKNOWLEDGEMENT RELEASES THE IDENTIFIER HOLD (F-098). The PUBACK untrack
+// A DRAINED SOURCE'S ACKNOWLEDGEMENT RELEASES THE IDENTIFIER HOLD (issue #100). The PUBACK untrack
 // holds an acknowledged exchange's identifier until its terminal cleanup is confirmed, and the
 // terminal completion is what releases it. A DRAINED source never runs that completion — the
 // drain's own finalize releases the register — so the hold must be released when the handler

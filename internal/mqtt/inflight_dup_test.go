@@ -17,7 +17,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// Behavioural tests for the unsent marker (inflight_marker.go, F-072): the durable pair,
+// Behavioural tests for the unsent marker (inflight_marker.go, issue #76): the durable pair,
 // the send state derived from it, and the three delete-owning operations. Each names the
 // contract row it pins and the mutation that must make it fail. Tests that install a
 // process-global hook are NOT parallel; the rest are.
@@ -613,7 +613,7 @@ func TestMQTTInflightMarkerAbsenceIsNotInterpretedAgainstAStaleSnapshot(t *testi
 			e.asm.mu.Lock()
 			e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 				// Only a batch that reads THIS register is the walk's or a reread: the inventory
-				// traversal's duty batches (F-105 7b) and the marker batches read the stream as
+				// traversal's duty batches (issue #107 7b) and the marker batches read the stream as
 				// it stands, or the walk's own read would be counted against another batch.
 				if isMarkerBatch(subjects) || !slices.Contains(subjects, subject) {
 					return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
@@ -936,7 +936,7 @@ func (e *testInflightEnv) noneHeldEntry(t *testing.T, dur string) uint16 {
 	return pi
 }
 
-// ROWS 24a AND 29 ARE ABOUT THE MARKER BOUNDARY, and under F-098 they have to be reached
+// ROWS 24a AND 29 ARE ABOUT THE MARKER BOUNDARY, and under issue #100 they have to be reached
 // through a release C-IV actually licenses (consult D-6 row (c), and D-7).
 //
 // `noneHeldEntry` TRANSMITS. Its earlier route — an identity-matched `mqttSlotDeleteComplete`
@@ -1434,7 +1434,7 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	sseq := e.publishSource(t, dur)
 
 	e.bind()
-	// Admitted as production admits it (F-105 7b): the pair lands beside its exchange and duty
+	// Admitted as production admits it (issue #107 7b): the pair lands beside its exchange and duty
 	// entry, and the admission's settlement is the step that reads the marker.
 	e.admissionPrerequisites(t, dur, 1)
 	e.acceptUnderServingAuthority(t)
@@ -1725,7 +1725,7 @@ func TestMQTTMarkerDecisionsGoThroughOneBoundary(t *testing.T) {
 	// The functions that may consult the boundary: the store path's derivation, the
 	// replacement arm, the sender, the evidence consumers, the reap executor — and the
 	// WRITE BOUNDARY, which re-asks it for every replacing register a transition carries
-	// (F-105, row 1). That last one is the point of the enumeration rather than an exception
+	// (issue #107, row 1). That last one is the point of the enumeration rather than an exception
 	// to it: the boundary must reach the same verdict as the composer, and it reaches it by
 	// asking the same table rather than by restating it.
 	consumers := map[string]bool{
@@ -2049,7 +2049,7 @@ func TestMQTTInflightPossiblyAttemptedEntryIsNeitherExpirableNorWithdrawn(t *tes
 }
 
 // ---------------------------------------------------------------------------
-// The release gate's FOURTH caller (F-100): the resume reap. A pending entry whose source
+// The release gate's FOURTH caller (issue #102): the resume reap. A pending entry whose source
 // message is authoritatively gone from $MQTT_msgs has nothing left to redeliver, but the
 // source vanishing is a fact about the BROKER's ability to continue, not about what the
 // client holds. Only a PROVEN-UNSENT exchange may be released with its Receive Maximum
@@ -2155,7 +2155,7 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 		defer e.sess.mu.Unlock()
 		lin := e.sess.pendingPublish[pi].ev.lin
 		e.sess.untrackPublishEntry(pi, testUntrackNoBinding)
-		// The identifier is reusable only once its exchange has durably ended (F-105 row 5:
+		// The identifier is reusable only once its exchange has durably ended (issue #107 row 5:
 		// custody holds it until then), so the candidate's exchange is observed ended — the
 		// withdrawal a never-transmitted candidate's untrack stands for — before the re-mint.
 		if at, ok := e.sess.custody.beginObservation(e.sess.gen, lin); !ok ||

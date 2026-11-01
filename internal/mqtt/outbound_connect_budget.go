@@ -18,16 +18,16 @@ import (
 	"time"
 )
 
-// The ownership protocol's deadline (F-105, row 9).
+// The ownership protocol's deadline (issue #107, row 9).
 //
-// # F-051 does not supply this, and an earlier draft claimed it did
+// # issue #55 does not supply this, and an earlier draft claimed it did
 //
-// `mqttProcessConnect` calls `mqttAdmitConnectLocked`, which STOPS F-051's timer
+// `mqttProcessConnect` calls `mqttAdmitConnectLocked`, which STOPS issue #55's timer
 // (`connect_deadline.go`), and it does so BEFORE authorization and ownership processing. So the
 // interval between that stop and a servable authority had no deadline at all — a CONNECT could
 // sit in the ownership protocol indefinitely while the client waited for a CONNACK.
 //
-// This budget is therefore a new one, and it is ANCHORED AT F-051'S STOP, so time spent before
+// This budget is therefore a new one, and it is ANCHORED AT issue #55'S STOP, so time spent before
 // the protocol's first write — the restore, the settlement of a standing proposal — is spent
 // from it. A budget that started at the first ownership WRITE would leave that time unaccounted.
 //
@@ -68,7 +68,7 @@ import (
 
 // mqttOwnershipBudget is one CONNECT's absolute budget for the ownership protocol.
 type mqttOwnershipBudget struct {
-	// Anchor is when F-051's deadline STOPPED, and Total the whole budget from there. Both are
+	// Anchor is when issue #55's deadline STOPPED, and Total the whole budget from there. Both are
 	// frozen: a retry may consume the budget and may never extend it.
 	Anchor time.Time
 	Total  time.Duration
@@ -76,18 +76,18 @@ type mqttOwnershipBudget struct {
 
 // mqttConnectOwnershipBudget is the absolute allowance the accepted CONNECT's ownership
 // protocol (reserve -> commit-metadata -> finalize, and any redrive) shares. It bounds the
-// interval between F-051's stop and a servable authority — the interval that had no deadline
-// before row 9. It is anchored at F-051's stop, and its deadline (Anchor + Total) caps every
+// interval between issue #55's stop and a servable authority — the interval that had no deadline
+// before row 9. It is anchored at issue #55's stop, and its deadline (Anchor + Total) caps every
 // request of the ownership protocol through the deadline view (outbound_connect_deadline.go).
 // The restore, the uncertain-record resolution and the incarnation retirement that run before
 // the protocol SPEND this budget's wall clock but keep their own bounds — the per-request
 // timeout, the re-drive cycle admission and the drain ceiling — and are not cut off at it.
 const mqttConnectOwnershipBudget = 20 * time.Second
 
-// mqttNewOwnershipBudget anchors a budget at the moment F-051's deadline stopped.
+// mqttNewOwnershipBudget anchors a budget at the moment issue #55's deadline stopped.
 func mqttNewOwnershipBudget(anchor time.Time, total time.Duration) (*mqttOwnershipBudget, error) {
 	if anchor.IsZero() {
-		return nil, fmt.Errorf("an ownership budget must be anchored at the moment F-051's " +
+		return nil, fmt.Errorf("an ownership budget must be anchored at the moment issue #55's " +
 			"deadline stopped, so the interval it covers is the interval that was uncovered")
 	}
 	if total <= 0 {
@@ -204,7 +204,7 @@ func mqttOwnershipStepAllowed(b *mqttOwnershipBudget, now time.Time, step string
 	}
 	if b.expired(now) {
 		return fmt.Errorf("the ownership step %q has no budget left of %v: the whole protocol "+
-			"shares one absolute budget anchored where F-051's deadline stopped, and a retry "+
+			"shares one absolute budget anchored where issue #55's deadline stopped, and a retry "+
 			"consumes it like anything else", step, b.Total)
 	}
 	return nil

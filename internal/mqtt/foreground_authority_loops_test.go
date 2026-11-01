@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// THE FOREGROUND AUTHORITY LOOPS F-114's CLASSIFICATION LEFT UNSPACED, converted
+// THE FOREGROUND AUTHORITY LOOPS issue #116's CLASSIFICATION LEFT UNSPACED, converted
 // (outbound_foreground_priority.go, bounded_reattempt_census_test.go). Each re-attempted an
 // authority transition three times with no spacing, and all but the PUBCOMP terminalization did so
 // without announcing itself, so this session's own background writers could defeat every attempt.

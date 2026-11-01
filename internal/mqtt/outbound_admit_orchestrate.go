@@ -24,13 +24,13 @@ import (
 // fallback.
 var errMQTTReplacementDepsNotReady = errors.New("the pair replacement's dependencies are not ready for use")
 
-// The ordinary QoS 1/2 admission orchestrator (F-105 cutover, step 5).
+// The ordinary QoS 1/2 admission orchestrator (issue #107 cutover, step 5).
 //
 // admitInflightPublish makes a freshly allocated identifier durable through the outbound
 // obligation AUTHORITY — the register and its unsent marker, the client-facing exchange, an edge
 // on every backing resource the obligation will need, and the authority's own revision, in ONE
 // atomic batch (opAdmitPublish). It replaces the standalone register-and-marker write, whose
-// failure F-105 exists to close: today the register can land on its own, so a source or PUBREL
+// failure issue #107 exists to close: today the register can land on its own, so a source or PUBREL
 // consumer can be deleted by a teardown that never knew an obligation depended on it, and the
 // register survives to prove nothing.
 //
@@ -51,7 +51,7 @@ func (sess *mqttSession) admitInflightPublish(c *client, pi uint16, qos byte, js
 	return sess.admitThroughAuthority(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, nil, life)
 }
 
-// admitSharedInflightPublish is the SHARED-GROUP QoS 1 admission (F-105 cutover, unit 7a): the same
+// admitSharedInflightPublish is the SHARED-GROUP QoS 1 admission (issue #107 cutover, unit 7a): the same
 // ladder and the same authority-carrying write as an ordinary delivery, except that the obligation
 // takes no RESOURCE edge — a group consumer is not a resource any generation owns — and depends on
 // the exact acquisition the delivery callback selected (sharedAcqForDeliveryLocked), whose
@@ -83,7 +83,7 @@ func (sess *mqttSession) admitThroughAuthority(c *client, pi uint16, qos byte, j
 	// cannot recapture either. A delivery with no entitlement, or a dependency that cannot be
 	// proven ready for use, is REFUSED here — never a fallback — and the ladder is not entered;
 	// AckWait re-offers.
-	// THE CUSTODY RESERVATION, for the whole ladder (F-105 row 5). In one critical section the
+	// THE CUSTODY RESERVATION, for the whole ladder (issue #107 row 5). In one critical section the
 	// tracked allocation moves from the scheduling projection to an admission reservation in
 	// the custody ledger, so the slot is never uncounted; and it stays reserved until this
 	// function returns AND every attempt it submitted is positively settled. The ladder
@@ -110,7 +110,7 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 	nonce, q2AffClaim, q2AffCopy string, shared *mqttAdmitShared, life *mqttDeliveryLifecycle) bool {
 	// A FOREGROUND AUTHORITY OPERATION for the whole ladder (outbound_foreground_priority.go): its
 	// bounded attempts are what a burst of background authority writes — the retained workers' and
-	// the F-112 floor unit's resolutions, advances and watermark updates — would otherwise exhaust,
+	// the issue #114 floor unit's resolutions, advances and watermark updates — would otherwise exhaust,
 	// abandoning a valid delivery for a re-offer.
 	fg := sess.announceForegroundAuthority()
 	defer fg.release()
@@ -327,7 +327,7 @@ func (sess *mqttSession) readyDependencyInc(c *client, owned mqttOwnedStream, st
 			durName, streamName, sess.id, lerr)
 		return _EMPTY_, false
 	}
-	// THE EFFECTIVE CONFIGURATION, as the server reports it (F-105 7c-lc). The broker creates these
+	// THE EFFECTIVE CONFIGURATION, as the server reports it (issue #107 7c-lc). The broker creates these
 	// consumers with no inactivity threshold, but what it requested is not what stands: an
 	// administrator's update, or a stream default substituted for zero, arms a timer that would
 	// reap a consumer an admitted obligation depends on. The stream half is checked above; this is

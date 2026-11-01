@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// A VANISHED CANONICAL PUBREL IS RE-MATERIALISED BY REBIND (F-105 7b, plan-7b §3.8, T16). An
+// A VANISHED CANONICAL PUBREL IS RE-MATERIALISED BY REBIND (issue #107 7b, plan-7b §3.8, T16). An
 // ordinary pubrel_ready slot whose exchange still reads PubRecObserved and whose named canonical
 // record is gone is never re-phased: a new canonical record is published and the slot's tuple is
 // rebound onto it in one authority batch. Nothing else about the obligation changes.

@@ -39,7 +39,7 @@ type mqttJSAResponse struct {
 
 // mqttJSA is one account's JetStream assistant: its shared state lives in mqttJSACore, and the
 // struct around it is a VIEW of that core. Every view of one account shares the same core —
-// replies, send queue, seams — and differs only in the deadline its requests honour (F-105 8a).
+// replies, send queue, seams — and differs only in the deadline its requests honour (issue #107 8a).
 //
 // The view exists because the ownership protocol owes ONE absolute deadline across every
 // request it makes, nested resolutions and retries included, and the ops are methods on this
@@ -52,7 +52,7 @@ type mqttJSA struct {
 	// timeout alone, which is every view but the ownership protocol's.
 	deadline time.Time
 	// gate, when set, is asked once per request this view queues, immediately before it is
-	// queued; a closed gate refuses that request with nothing sent (withRequestGate, F-119). Nil
+	// queued; a closed gate refuses that request with nothing sent (withRequestGate, issue #121). Nil
 	// on every view but a background caller's that owes per-request admission and accounting.
 	gate func() bool
 	// prefetched, when set, answers the first read of each subject a transition's write boundary
@@ -95,7 +95,7 @@ type mqttJSACore struct {
 	// exactly one of them. See mqttAcceptStoreObs.
 	acceptObs atomic.Pointer[func(mqttAcceptStoreObs) error]
 
-	// exchangeSubjectsObs is the F-105 obligation-enumeration seam. nil in production; a
+	// exchangeSubjectsObs is the issue #107 obligation-enumeration seam. nil in production; a
 	// test arms it to answer, page by page, the walk that decides whether a packet identifier
 	// is free (streamSubjectsComplete).
 	//
@@ -106,7 +106,7 @@ type mqttJSACore struct {
 	// passes through the same validation as the server's.
 	exchangeSubjectsObs atomic.Pointer[func(filter string, offset int) (mqttSubjectPage, error)]
 
-	// resourceSubjectsPageObs answers one page of the settlement's resource walk (F-105 7f): the
+	// resourceSubjectsPageObs answers one page of the settlement's resource walk (issue #107 7f): the
 	// paging and the insertion-between-pages shapes the walk must survive cannot be manufactured
 	// below the server's cap. nil in production.
 	resourceSubjectsPageObs atomic.Pointer[func(filter string, offset int) (map[string]uint64, int, error)]
@@ -533,7 +533,7 @@ func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 // (up to max_payload each) across the JS API on a disconnect path.
 //
 // The last sequence is what lets a caller BOUND a subsequent destructive purge to
-// what it actually enumerated (F-062). The two values are NOT one snapshot: the
+// what it actually enumerated (issue #66). The two values are NOT one snapshot: the
 // server builds State first and fills State.Subjects afterwards from a separate
 // store read, so a subject can appear in the map while its record sits ABOVE the
 // returned sequence. That direction is benign for every caller here — such a record
@@ -679,7 +679,7 @@ func mqttSubjectPageAdvance(p mqttSubjectPage, filter string, offset int) (next 
 // server removes whatever matches the filter when the purge APPLIES, which on a
 // clustered stream is after the caller's own enumeration. Callers that must not
 // destroy a record they never saw pass a bound; purgeQoS2Hold refuses to be called
-// without one at all (F-062).
+// without one at all (issue #66).
 func (jsa *mqttJSA) purgeStream(streamName, filter string, upToSeq uint64, noWait bool) error {
 	preq := JSApiStreamPurgeRequest{Subject: filter, Sequence: upToSeq}
 	req, _ := json.Marshal(preq)

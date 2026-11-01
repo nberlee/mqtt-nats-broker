@@ -287,7 +287,7 @@ var (
 	mqttTestDeleteMsgHookV   atomic.Pointer[func(stream string, seq uint64) error]
 	mqttTestStoreMsgHookV    atomic.Pointer[func(subject string, hdrLen int, msg []byte) error]
 	// mqttTestCloseCertPersistV observes every durable closure certificate a binding persists
-	// (F-105 8c), before the write; returning false suppresses the write. Process-wide because
+	// (issue #107 8c), before the write; returning false suppresses the write. Process-wide because
 	// the persister runs in its own goroutine with no account in reach.
 	mqttTestCloseCertPersistV atomic.Pointer[func(cert *mqttDurableCloseCert) bool]
 	// mqttTestCertClaimedV runs in completeCertification after a persistence attempt was
@@ -384,7 +384,7 @@ var mqttTestPubRelDeliveryDoneHookV atomic.Pointer[func(sub *subscription, reply
 // mqttTestPubRelWriteBlockV stalls a PUBREL transmission INSIDE its send section —
 // after the identifier is reserved and before the socket write — so a test can hold a
 // duplicate's write open while the client's PUBCOMP for an earlier copy arrives on the
-// read loop. That interleaving is the whole of F-089's primary execution, and without a
+// read loop. That interleaving is the whole of issue #91's primary execution, and without a
 // seam here it is unreachable from a test: the enqueue returns too quickly to be raced,
 // so a fixture would have to call the primitive directly and would then prove nothing
 // about this callback's own wiring.
@@ -397,7 +397,7 @@ var mqttTestCustodyTransferV atomic.Pointer[func()]
 
 var mqttTestPubRelWriteBlockV atomic.Pointer[func()]
 
-// The two MIXED output sites (F-105 WP-F step 1): the raw writers that still carry supported QoS 0
+// The two MIXED output sites (issue #107 WP-F step 1): the raw writers that still carry supported QoS 0
 // and actionless acknowledgements beside chapter P's slot-only QoS 1/2, and so stay outside both
 // boundaries. A call count cannot say which traffic a site carries; this hook lets a test watch the
 // frames themselves and show that no supported QoS 1/2 PUBLISH or PUBREL ever passes.
@@ -416,9 +416,9 @@ func mqttTestObserveMixedSite(c *client, site string, frame []byte) {
 	}
 }
 
-// mqttTestRetainedFlushBlockV stalls the SUBACK tail at the one instant F-091's execution needs
+// mqttTestRetainedFlushBlockV stalls the SUBACK tail at the one instant issue #93's execution needs
 // held open: the items are staged and reachable, their packet identifiers are reserved, and
-// NOTHING has been transferred to the driver or written yet (F-105 7c: the tail writes nothing
+// NOTHING has been transferred to the driver or written yet (issue #107 7c: the tail writes nothing
 // itself). A test can then run clear() on another goroutine and observe whether the identifier
 // survives the discard. It fires under c.mu, before the transfer.
 var mqttTestRetainedFlushBlockV atomic.Pointer[func([]*subscription)]

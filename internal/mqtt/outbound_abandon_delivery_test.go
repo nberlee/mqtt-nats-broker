@@ -26,7 +26,7 @@ import (
 	"testing"
 )
 
-// A restored delivery denied on resume is abandoned durably (F-105 row 5, plan-row5.md rev 9
+// A restored delivery denied on resume is abandoned durably (issue #107 row 5, plan-row5.md rev 9
 // §3.13). Every test starts from an ordinary delivery ADMITTED through the authority and then
 // TRANSMITTED (its unsent marker deleted, as a send's intent delete does), with the restored
 // entry and source mapping standing — the population the deny guard meets on a resume.
@@ -255,7 +255,7 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 			}},
 		{name: "cancelled on the successor", want: "cancellation or retirement mark",
 			mutate: func(_ *mqttAuthorityTransition, reg *mqttInflightRecord, _ *mqttOutboundExchange) (bool, bool) {
-				// F-088: with its provenance, so the forgery reaches the abandonment rule.
+				// issue #90: with its provenance, so the forgery reaches the abandonment rule.
 				reg.Cancelled, reg.CancelOrigin = true, mqttCancelOriginOccupant
 				return true, false
 			}},
@@ -281,7 +281,7 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 				x.Abandoned.Tenure = mqttNewInflightNonce()
 				return false, true
 			}},
-		// F-105 7c: the reason set and the fact's arm follow the register's source.
+		// issue #107 7c: the reason set and the fact's arm follow the register's source.
 		{name: "packet-too-large on an ordinary register", want: "an abandoned slot with no supported reason",
 			mutate: func(_ *mqttAuthorityTransition, reg *mqttInflightRecord, x *mqttOutboundExchange) (bool, bool) {
 				reg.AbandonReason = mqttAbandonReasonPacketTooLarge
@@ -449,12 +449,12 @@ func TestF105AbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
 	_ = f.e.asm.deleteInflightMarker(mqttMarkerCallerSender, f.subject, ml.seq, true)
 	cur, seq := f.register(t)
 	tomb := *cur
-	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // F-088: an occupant CAS
+	tomb.Cancelled, tomb.CancelOrigin = true, mqttCancelOriginOccupant // issue #90: an occupant CAS
 	nseq, err := f.e.asm.storeInflightCAS(f.subject, seq, &tomb)
 	if err != nil {
 		t.Fatalf("tombstone: %v", err)
 	}
-	// RE-EXPRESSED by F-097/F-088 (ruling R-impl-1, the WithdrawNeverManufactured class): this
+	// RE-EXPRESSED by issue #99/issue #90 (ruling R-impl-1, the WithdrawNeverManufactured class): this
 	// asserted the door destroys a marker-less tombstone "on its own proof", the deleted premise —
 	// a cancellation bit is no proof of non-transmission. The door now REFUSES and the register is
 	// kept; the control's own property (no abandonment is written by a door destruction attempt
