@@ -556,7 +556,7 @@ func TestMQTTv5DisconnectOverrideToZeroSurvivesARefusedDiscard(t *testing.T) {
 //
 // No Will-fence consequence is claimed here. The comment justifying that stamp
 // cites a mechanism mqttConsumeWillUnderGate says it does not use, and this item
-// deliberately rests nothing on it (see the roadmap bullet); the assertion is the
+// deliberately rests nothing on it (see issue #45); the assertion is the
 // stamp's presence and the order that produces it.
 func TestMQTTv5DisconnectRaiseToNeverExpireStampsInMemory(t *testing.T) {
 	t.Parallel()

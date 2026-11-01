@@ -1011,10 +1011,10 @@ func TestQ2AffProofPrecedesTheLossInference(t *testing.T) {
 }
 
 // The pass runs, and performs its own reap, even when the affine consumer cannot be
-// restored. That is the roadmap bullet's binding constraint: the recovery-and-reap route
-// at the end of resendPendingRedelivery is skipped whenever
-// ensureQ2AffineConsumerSubscription fails there, so discharging the reap by ordering is
-// unavailable.
+// restored. That is the binding constraint stated in docs/ARCHITECTURE.md,
+// "Session-affine shared-subscription QoS 2": the recovery-and-reap route at the end of
+// resendPendingRedelivery is skipped whenever ensureQ2AffineConsumerSubscription fails
+// there, so discharging the reap by ordering is unavailable.
 //
 // The restoration is failed through `q2AffClosing`, which is that function's first
 // refusal. Driving resendPendingRedelivery directly is deliberate: every way of failing

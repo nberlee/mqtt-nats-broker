@@ -49,7 +49,7 @@ func testBoundE2EMoveRecord(t *testing.T, s *Server, node, clientID string) {
 	}
 }
 
-// TestMQTTBoundRejectionE2EForeignClosesConnection is the roadmap item's own scenario over
+// TestMQTTBoundRejectionE2EForeignClosesConnection is issue #22's own scenario over
 // real connections: a live client whose session record has moved to another broker, with
 // the persist notification lost, must be told and closed BEFORE its next packet takes
 // effect — [MQTT-3.1.4-3]. Its Will is PUBLISHED: the probe found a record that is not ours

@@ -41,12 +41,13 @@ import (
 // Every claim assertion needs TWO contenders. "One DISCONNECT was sent" with a single
 // sender asserts the default and passes against a deleted claim.
 
-// TestMQTTDisplacementClaimsTheOneDisconnect is the residual the roadmap item names, run
-// through both production routes: a remote persist observation evicts this connection with
-// the unsettled 0x89, and the parse footer then tries to append the settlement's own 0x89
-// sentinel on the same socket. Exactly one DISCONNECT may be attempted, and it must be the
-// eviction's. (The eviction said 0x8E before issue #86, so the two codes used to differ; the
-// property under test was always the COUNT.)
+// TestMQTTDisplacementClaimsTheOneDisconnect is the residual stated as item 10 in
+// docs/CONFORMANCE.md, "A definite record-CAS rejection is settled by a probe, with bounded
+// convergence", run through both production routes: a remote persist observation evicts
+// this connection with the unsettled 0x89, and the parse footer then tries to append the
+// settlement's own 0x89 sentinel on the same socket. Exactly one DISCONNECT may be
+// attempted, and it must be the eviction's. (The eviction said 0x8E before issue #86, so
+// the two codes used to differ; the property under test was always the COUNT.)
 //
 // The capture keeps recording after the close on purpose. The persist path closes
 // asynchronously, so a capture that dropped post-close writes would report one frame

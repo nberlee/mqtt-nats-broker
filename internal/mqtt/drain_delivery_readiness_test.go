@@ -30,7 +30,7 @@ import (
 // what a failed filter does with an adoption that already happened, nor whether an
 // already-started QoS 2 exchange still completes at QoS 2 when the re-SUBSCRIBE asks
 // for QoS 1. Both are separate defects, reachable without this repair, and both are
-// stated in docs/CONFORMANCE.md and filed in docs/ROADMAP.md.
+// filed in docs/ROADMAP.md, "0.3 Confirmed alpha blockers".
 
 // unindexDrain removes a drain's reverse-index entry, which is the half of the R2
 // state a fixture cannot get from addTestDrain. The other half — no delivery

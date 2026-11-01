@@ -12,7 +12,7 @@ import (
 // issue #39. Every MQTT application write is bounded by mqttWriteDeadline, installed
 // and cleared in writeSocket, which is the single socket writer and the only
 // production acquirer of c.wmu. These tests assert that property directly; the
-// courtesy-DISCONNECT sites the roadmap bullet names are consequences of it, not
+// courtesy-DISCONNECT sites issue #39 names are consequences of it, not
 // separate mechanisms, which is why there is no per-site arming to test.
 //
 // Nothing here may run in parallel: the tests shorten the package-level

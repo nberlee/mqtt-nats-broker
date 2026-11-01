@@ -76,71 +76,60 @@ CI gates on *new* failures only:
 
 ### Broker behavior fixed to pass this suite
 
-- **Outbound flow control** (`test_flow_control1`): QoS 1/2 deliveries are
-  throttled to the client's advertised Receive Maximum (JetStream
-  `MaxAckPending` capped by `sess.rmax`), and a message withheld at the cap is
-  now **released promptly** when the client frees an in-flight slot. When a
-  PUBACK / failed-PUBREC / PUBCOMP frees a slot, the broker NAKs the oldest
-  withheld delivery on its JetStream ack subject
+- **Outbound flow control** (`test_flow_control1`): QoS 1/2 deliveries are throttled to
+  the client's advertised Receive Maximum (JetStream `MaxAckPending` capped by
+  `sess.rmax`), and a message withheld at the cap is **released promptly** when the client
+  frees an in-flight slot. When a PUBACK / failed-PUBREC / PUBCOMP frees a slot, the
+  broker NAKs the oldest withheld delivery on its JetStream ack subject
   (`sess.deferredNaksLocked` → `jsa.sendMsg(subj, AckNak)`), forcing JetStream to
-  redeliver within milliseconds instead of after the consumer's AckWait (default
-  30 s). Ordering is preserved on THIS path (ascending stream sequence, Spec5 §4.6) — the
-  citation was [MQTT-4.6.0-1], which governs CLIENT retransmission rather than server
-  ordering, so it is corrected to the section; the claim is about the withheld-delivery NAK,
-  and it does **not**
-  extend to the experimental affine shared-subscription path, where
-  [issue #75](https://github.com/nberlee/mqtt-nats-broker/issues/75) records a
-  parked same-topic ordering violation (see Known deviations) — and
-  the redelivery is a first transmission (DUP=0, [MQTT-3.3.1-1]) since the
-  withheld message was never sent. The same NAK path drains deferred deliveries
-  on session resume (`resendPendingRedelivery`). Spec5 [4.9]. Tests:
-  `TestMQTTv5ReceiveMaximumPromptRelease` /
+  redeliver within milliseconds instead of after the consumer's AckWait (default 30 s).
+  Ordering is preserved on THIS path (ascending stream sequence, Spec5 §4.6); the claim is
+  about the withheld-delivery NAK, and it does **not** extend to the experimental affine
+  shared-subscription path, where
+  [issue #75](https://github.com/nberlee/mqtt-nats-broker/issues/75) records a parked
+  same-topic ordering violation (see Known deviations) — and the redelivery is a first
+  transmission (DUP=0, [MQTT-3.3.1-1]) since the withheld message was never sent. The same
+  NAK path drains deferred deliveries on session resume (`resendPendingRedelivery`). Spec5
+  [4.9]. Tests: `TestMQTTv5ReceiveMaximumPromptRelease` /
   `TestMQTTv5ReceiveMaximumPromptReleaseQoS2` (`internal/mqtt/mqtt_v5_test.go`).
 - **Zero-payload JetStream ack/management delivery** (uncovered while fixing
   `test_flow_control1`): the JSA transport's payload-trim guard in
-  `processInboundClientMsg` (`internal/mqtt/shim_engine.go`) used `c.pa.size > 0`,
-  so an empty-payload message (a bare JetStream ack, or a `$JS.API.CONSUMER.DELETE`
-  request) was published with the sendq drain loop's trailing `"\r\n"` still
-  attached. nats-server's `processAck` matches ack payloads exactly / by prefix
-  with no default case, so a 2-byte `"\r\n"` was silently ignored — the ack never
-  landed and the consumer's ack-pending slot never freed. Changed to `>= 0` so the
-  trim applies to legitimate zero-length payloads too. This affects every
-  `jsa.sendAck` / `jsa.sendMsg(subj, nil)` call site, not just flow control.
-- **Deliver-subject interest flushed before SUBACK**: the JetStream consumer for
-  a QoS 1/2 subscription was already created synchronously before SUBACK, but the
-  NATS subscription on its deliver subject (`$MQTT.sub.<nuid>`) was issued without
-  a round-trip — the post-Subscribe `Flush` in `processSub`
-  (`internal/mqtt/shim_engine.go`) exempted all `$MQTT.*` subjects (it existed
-  only to surface permission violations on user subjects). A publish arriving
-  between SUBACK and interest registration missed the consumer's delivery attempt
-  and waited out AckWait (30 s). `processSub` now flushes `$MQTT.sub.*`
-  subscriptions too, so SUBACK implies the subscription is deliverable. (These
-  internal delivery subjects now live on the service connection rather than the
-  per-client one, and the flush follows them — see
-  [Reserved `$MQTT.>` namespace](ARCHITECTURE.md#reserved-mqtt-namespace).)
-  Regression test: `TestV5SubscribeThenImmediatePublish` (`internal/mqtt/v5_test.go`).
-  The remaining pre-SUBACK race is closed by the subs barrier below.
+  `processInboundClientMsg` (`internal/mqtt/shim_engine.go`) applies to zero-length
+  payloads too (`c.pa.size >= 0`), so an empty-payload message (a bare JetStream ack, or a
+  `$JS.API.CONSUMER.DELETE` request) is published without the sendq drain loop's trailing
+  `"\r\n"`. nats-server's `processAck` matches ack payloads exactly / by prefix with no
+  default case, so a 2-byte `"\r\n"` would be silently ignored and the consumer's
+  ack-pending slot never freed. This affects every `jsa.sendAck` /
+  `jsa.sendMsg(subj, nil)` call site, not just flow control.
+- **Deliver-subject interest flushed before SUBACK**: the JetStream consumer for a QoS 1/2
+  subscription is created synchronously before SUBACK, and the post-Subscribe `Flush` in
+  `processSub` (`internal/mqtt/shim_engine.go`) covers `$MQTT.sub.*` subscriptions on the
+  deliver subject (`$MQTT.sub.<nuid>`) too, so SUBACK implies the subscription is
+  deliverable; without it a publish arriving between SUBACK and interest registration
+  missed the consumer's delivery attempt and waited out AckWait (30 s). (These internal
+  delivery subjects live on the service connection rather than the per-client one, and the
+  flush follows them — see
+  [Reserved `$MQTT.>` namespace](ARCHITECTURE.md#reserved-mqtt-namespace).) Regression
+  test: `TestV5SubscribeThenImmediatePublish` (`internal/mqtt/v5_test.go`). The remaining
+  pre-SUBACK race is closed by the subs barrier below.
 - **QoS 1/2 publishes wait out in-flight SUBSCRIBEs** (`test_request_response`,
-  `test_subscribe_options`): both tests race a publish against the second
-  client's still-in-flight SUBSCRIBE (a suite bug makes their post-subscribe
-  wait return instantly). The messages stream uses interest-based retention, so
-  a message stored before the subscription's JetStream consumer registered
-  interest was discarded outright by the stream — **permanently lost** to the
-  new subscription (never delivered, not merely delayed; the store's PubAck
-  even reports a normal sequence). No consumer start-position setting can fix
-  this: the message is never stored. Instead, SUBSCRIBE processing
-  (`processSubs`) now holds an entry in a per-account barrier and the single QoS
-  1/2 store site (`mqttInitiateMsgDeliveryJSA`) waits out every SUBSCRIBE in flight
-  when it samples the barrier, before storing (`mqttSubsBarrier`,
+  `test_subscribe_options`): both tests race a publish against the second client's
+  still-in-flight SUBSCRIBE (a suite bug makes their post-subscribe wait return
+  instantly). The messages stream uses interest-based retention, so a message stored
+  before the subscription's JetStream consumer registered interest is discarded outright
+  by the stream — **permanently lost** to the new subscription (never delivered, not
+  merely delayed; the store's PubAck even reports a normal sequence). No consumer
+  start-position setting can fix this: the message is never stored. Instead, SUBSCRIBE
+  processing (`processSubs`) holds an entry in a per-account barrier and the single QoS
+  1/2 store site (`mqttInitiateMsgDeliveryJSA`) waits out every SUBSCRIBE in flight when
+  it samples the barrier, before storing (`mqttSubsBarrier`,
   `internal/mqtt/sess_manager.go`), matching the effectively-synchronous subscription
-  registration of in-memory brokers. A SUBSCRIBE that enters after the sample is
-  not waited for: the publish preceded it, so it may miss this message, and it cannot
-  extend the wait (until 2026-10-12 one shared count let continuously overlapping
-  SUBSCRIBEs hold a store indefinitely). A publish is only delayed while a SUBSCRIBE
-  it sampled is still being processed; otherwise the barrier is a single uncontended
-  mutex check. No elapsed-time bound is claimed: a wait lasts as long as the slowest
-  sampled SUBSCRIBE's own JetStream work.
-  Regression tests: `TestV5SubsBarrierHoldsAPublishUntilInterestExists`,
+  registration of in-memory brokers. A SUBSCRIBE that enters after the sample is not
+  waited for: the publish preceded it, so it may miss this message, and it cannot extend
+  the wait. A publish is only delayed while a SUBSCRIBE it sampled is still being
+  processed; otherwise the barrier is a single uncontended mutex check. No elapsed-time
+  bound is claimed: a wait lasts as long as the slowest sampled SUBSCRIBE's own JetStream
+  work. Regression tests: `TestV5SubsBarrierHoldsAPublishUntilInterestExists`,
   `TestV5PublishWaitsOnlyForSubscribesItSampled` and
   `TestMQTTSubsBarrierWaitIgnoresLaterEntrants` (`internal/mqtt/v5_test.go`,
   `internal/mqtt/subs_barrier_test.go`).
@@ -150,57 +139,46 @@ CI gates on *new* failures only:
   `mqttProcessPub` / `mqttParseConnect` in `internal/mqtt/publish_inbound.go` and
   `internal/mqtt/connect_process.go`.
 - **QoS2 hold purge on session discard** (`test_payload_format`,
-  `test_publication_expiry`): a force-disconnected session (e.g. `myclientid`
-  flooded QoS2 PUBLISHes past Receive Maximum in `test_flow_control2` and was
-  disconnected with reason 147) used to leave its `$MQTT_qos2in` dedup/hold
-  entries behind forever (`MaxMsgsPer: 1`, `DiscardNew`). A later session for
-  the same client ID then collided by Packet Identifier and could have a stale
-  payload resurface on PUBREL — the "stray `message N`" that broke these two
-  tests when run after `test_flow_control2` in the full sequential suite (both
-  passed standalone). `sess.clear()` (`internal/mqtt/sess_clear.go`), the single
-  funnel for every session-discard path, now also destroys the discarded
-  session's QoS2 hold entries. (It no longer does so with a hash-prefix
-  `STREAM.PURGE`, as this bullet originally described: it enumerates the retiring
-  incarnation's generation-scoped hold subjects and arbitrates each one, purging
-  only where it wins the release claim. See "Inbound QoS 2 PUBREL is at-least-once
-  across the unresolved move interval".) Regression test:
-  `TestSessionClearPurgesQoS2Hold` (`internal/mqtt/qos2_purge_test.go`).
+  `test_publication_expiry`): a force-disconnected session (e.g. `myclientid` flooded QoS2
+  PUBLISHes past Receive Maximum in `test_flow_control2` and was disconnected with reason
+  147) must not leave its `$MQTT_qos2in` dedup/hold entries behind (`MaxMsgsPer: 1`,
+  `DiscardNew`): a later session for the same client ID would collide by Packet Identifier
+  and could have a stale payload resurface on PUBREL. `sess.clear()`
+  (`internal/mqtt/sess_clear.go`), the single funnel for every session-discard path, also
+  destroys the discarded session's QoS2 hold entries: it enumerates the retiring
+  incarnation's generation-scoped hold subjects and arbitrates each one, purging only
+  where it wins the release claim. See "Inbound QoS 2 PUBREL is at-least-once across the
+  unresolved move interval". Regression test: `TestSessionClearPurgesQoS2Hold`
+  (`internal/mqtt/qos2_purge_test.go`).
 - **Reconnect after a discard of many held QoS 2 exchanges** (`test_keepalive` after
   `test_flow_control2`): a Clean Start CONNECT for a client ID whose previous session is
   still being torn down waits for that teardown. That is stated behavior, not a timing
-  promise, and it includes discarding every inbound QoS 2 hold. The discard used to
-  arbitrate them one at a time, two JS round trips each. The 1024 holds
-  `test_flow_control2` leaves behind at the default Receive Maximum took about a second,
-  and `test_keepalive`'s setup CONNECT, whose Paho client allows 0.3 s for the CONNACK
-  (`getPacket` sets the socket timeout to 0.3 s), timed out before any test ran. The holds
-  are now arbitrated concurrently, at most `mqttQoS2DiscardWalkWidth` at once (see
-  ARCHITECTURE "The release claim"). **What remains:** discard work is still linear in the
-  number of held exchanges, and only its wall time shrinks, until the server saturates. On
-  a single-node file store on the same host the reconnect after 1024 holds took 0.25 to
-  0.28 s when the CONNECT was sent the instant the DISCONNECT was read, and about 0.05 s
-  when it was sent 0.25 s later. That is under Paho's 0.3 s by a margin that a slower
-  runner or a replicated server may not keep, and the larger Receive Maximum values a
-  deployment can configure, up to 65535, scale it. A walk that meets an error stops
-  admitting holds and leaves the rest to the re-driven teardown or the orphan sweep. The
-  discard's wait for an in-flight release is a shared polling budget, not a wall-time
+  promise, and it includes discarding every inbound QoS 2 hold. `test_flow_control2`
+  leaves 1024 holds behind at the default Receive Maximum, and `test_keepalive`'s setup
+  CONNECT's Paho client allows 0.3 s for the CONNACK (`getPacket` sets the socket timeout
+  to 0.3 s). The holds are arbitrated concurrently, at most `mqttQoS2DiscardWalkWidth` at
+  once (see ARCHITECTURE "The release claim"). **What remains:** discard work is still
+  linear in the number of held exchanges, and only its wall time shrinks, until the server
+  saturates. On a single-node file store on the same host the reconnect after 1024 holds
+  took 0.25 to 0.28 s when the CONNECT was sent the instant the DISCONNECT was read, and
+  about 0.05 s when it was sent 0.25 s later. That is under Paho's 0.3 s by a margin that
+  a slower runner or a replicated server may not keep, and the larger Receive Maximum
+  values a deployment can configure, up to 65535, scale it. A walk that meets an error
+  stops admitting holds and leaves the rest to the re-driven teardown or the orphan sweep.
+  The discard's wait for an in-flight release is a shared polling budget, not a wall-time
   bound. Regression tests: `TestMQTTWalkBounded*`,
   `TestQoS2DiscardArbitrationUsesTheBoundedWalk`,
   `TestQoS2DiscardWalkUnderReleasingClaims` (`internal/mqtt/qos2_discard_walk_test.go`).
 - **Retained replay after acknowledged retained QoS 1** (`test_subscribe_options`, and the
   0.3 s CONNACK timeouts it cascaded into `test_unsubscribe` and `test_user_properties`):
-  each PUBACK of a retained QoS 1 delivery installed an ordinary terminal-source owner with
-  empty source coordinates. Its attempts asked a consumer lookup on an empty name, which a
-  server with permissions never answers, so each held foreground authority for the full
-  JetStream API timeout (5 s), never settled, and kept its identifier held; the session's
-  retained replay, a background writer, stalled behind them, so a later SUBSCRIBE or
-  re-SUBSCRIBE replayed some retained messages or none until the attempts paused. A stall,
-  not a loss: the copies stayed in the store. A retained acknowledgement now installs no
-  source owner, and every ordinary-source sink refuses empty coordinates in any shape (see
+  a retained acknowledgement installs no source owner, and every ordinary-source sink
+  refuses empty coordinates in any shape, so a retained QoS 1 PUBACK cannot leave an
+  attempt holding foreground authority and stalling the session's retained replay (see
   ARCHITECTURE "Retained delivery through the manifest
-  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c)").
-  No residual. Regression
-  tests: `TestF105RetainedPubAckInstallsNoSourceOwner`
-  (`internal/mqtt/outbound_retained_live_test.go`), `TestF105RetainedReplayTooLargeIsAbandonedQoS1`
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c)"). No
+  residual. Regression tests: `TestF105RetainedPubAckInstallsNoSourceOwner`
+  (`internal/mqtt/outbound_retained_live_test.go`),
+  `TestF105RetainedReplayTooLargeIsAbandonedQoS1`
   (`internal/mqtt/outbound_retained_abandon_test.go`) and
   `TestF105SourcelessCoordinatesAreRefusedAtEveryOrdinarySink`
   (`internal/mqtt/outbound_retained_sink_guard_test.go`).
@@ -231,15 +209,6 @@ credential-less `MQTTNB_NATS_URLS`: `DialClient` reuses that URL for every
 per-client auth-passthrough dial, and a URL-embedded userinfo would override the
 per-client credentials (nats.go `connectProto`), so all clients would inherit the
 service's rights.
-
-### Historical note (resolved)
-
-Previously the suite failed at `setUpClass` because a NATS-backed broker rejected
-client IDs containing spaces (its cleanup helper uses `"clean retained"`).
-Rejecting such IDs is spec-allowed (MQTT [MQTT-3.1.3-5] / 5.0 [3.1.3.1]: a server
-MUST accept only `[0-9a-zA-Z]`, 1–23 bytes, and MAY accept more). We chose to
-**relax** the broker to accept arbitrary valid-UTF-8 client IDs (see below), which
-unblocked the suite.
 
 ## nats-io/mqtt-test
 
@@ -317,16 +286,14 @@ callers. The supported suffix enumerations it reaches since the
 by file and line in "The storage this design keeps on `$MQTT_inflight`"
 ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) section).
 
-**Why nothing was built.** An implementation run planned an acknowledged-control-marker
-protocol in full; its review refuted the protocol's central proof with the silent-skip
-witness above, and the escalation ruled that the run record the blocker rather than
-build a
-mechanism whose evidence is not authoritative. The requirement is a read contract in which
-an unreadable candidate cannot silently disappear from a successful enumeration while
-genuine exhaustion stays distinguishable. **No client-side protocol satisfying that has been
-established under the present constraints, and universal client-side impossibility is NOT
-claimed**: two narrower error-reporting paths exist and are recorded in the roadmap bullet,
-neither yet an approved primitive.
+**What a correction must supply.** The requirement is a read contract in which an
+unreadable candidate cannot silently disappear from a successful enumeration while genuine
+exhaustion stays distinguishable; no mechanism is built on evidence that is not
+authoritative. **No client-side protocol satisfying that has been established under the
+present constraints, and universal client-side impossibility is NOT claimed**: two
+narrower error-reporting paths exist and are recorded in
+[issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110), neither yet an
+approved primitive.
 
 **[issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111)** covers
 the same root cause for per-subject point reads, and
@@ -346,16 +313,12 @@ with absence is the server's defect (the same root as
 [issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) and
 [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112)), and its correction
 is what closes this. No broker-side repair is planned, so no enumeration of the decisions
-that rest on that answer is maintained: the point-read absence census that mapped them was
-retired on 2026-10-15 (`docs/ROADMAP.md` chapter U), because it was bookkeeping for a
-repair this broker does not make. The
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) operations
-that read it (the CONNECT
-ownership reads and the record loads) are named in "The storage this design keeps on
-`$MQTT_inflight`"
-([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) section),
-beside the [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112)
-create-only writes.
+that rest on that answer is maintained. The
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) operations that read
+it (the CONNECT ownership reads and the record loads) are named in "The storage this
+design keeps on `$MQTT_inflight`"
+([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) section), beside the
+[issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) create-only writes.
 
 The shared-group ACQUIRE settlement inherits this. A join's settlement loop
 (`abortSharedAcquisition`) reaches its final unresolved exit ONLY when the ledger reads
@@ -374,15 +337,18 @@ class, not a broker-logic gap, and it closes with the same upstream correction.
 
 **Status: integrated, and accepted with
 [issue #108](https://github.com/nberlee/mqtt-nats-broker/issues/108) on
-2026-10-08 by the integrated gate.** What
-follows is current behaviour of the converted broker. The record classes, transitions and
-rules
-described under "The outbound obligation authority" in
-`docs/ARCHITECTURE.md` are implemented and tested. The ORDINARY in-flight lifecycle now
-admits through them — an ordinary QoS 1/2 delivery is admitted as an authority-carrying
-obligation (`admitInflightPublish`), its SUBSCRIBE claims the source consumer's name
-through the authority (`opProvisionResource`), and all three client-acknowledgement arrows
-that end a PUBLISH advance the exchange in the same batch that re-phases its slot
+2026-10-08 by the integrated gate.** What follows is current behaviour of the converted
+broker. Labels such as row 5, 7a-7f
+and 8a-8c name units of
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)'s cutover plan
+(glossed in `docs/ARCHITECTURE.md`, "The outbound obligation authority"). The record
+classes, transitions
+and rules described under "The outbound obligation authority" in `docs/ARCHITECTURE.md`
+are implemented and tested. The ORDINARY in-flight lifecycle now admits through them — an
+ordinary QoS 1/2 delivery is admitted as an authority-carrying obligation
+(`admitInflightPublish`), its SUBSCRIBE claims the source consumer's name through the
+authority (`opProvisionResource`), and all three client-acknowledgement arrows that end a
+PUBLISH advance the exchange in the same batch that re-phases its slot
 (`opAdvanceExchangeAck`): a PUBACK to Terminal, a refused PUBREC to Rejected, and a
 successful PUBREC to PUBREC-observed — and PUBCOMP ends the exchange at Terminal (or at
 terminal-pending-drain while a PUBREL action is live, which that action's drain then
@@ -398,28 +364,27 @@ obligation's ending releases its holds on its source and canonical-PUBREL consum
 ending's own batch, and every route that ends a subscription records a disposal decision
 under its own entitlement and hands the consumer to the session's retirement owner, which
 retires the name and deletes it only once nothing holds it. Since 7d a DISCARDED
-generation retires through its recovery owner: the teardown transfers its source, drain and
-PUBREL consumers instead of deleting them, and the recovery executor ends every obligation
-of the generation under the committed discarding closure (`Discarded`, which releases holds
-but no identifier), records the closure-licensed disposal, retires the names and deletes the
-consumers. Since 7e a shared acquisition is released only when no exchange still owes
-delivery through it (the release fence), and a discarded generation's shared acquisitions
-are released by its recovery owner, which the clean-start handoff previously never did.
-Since 7f a SERVING generation's next accepted tenure settles what its displaced tenures left
-undecided or unretired, and fork repair never reinstates a consumer another broker decided.
-Since 8a a CONNECT settles any ownership proposal a crashed or concurrent acceptance left
-standing before it destroys anything, every discard settles one at its own boundary, an
-expired or refused acceptance abandons its own aborted proposal, the ownership deadline caps
-every request of the protocol, and a refused acceptance is certified closed
-(`docs/ARCHITECTURE.md`, "A standing proposal is settled before anything is destroyed").
-Since 8c a connection that attempted an acquisition persists its closure certificate, and
-a persisted certificate ends the live output token its connection's holder left standing
-(`docs/ARCHITECTURE.md`, "A closure certificate outlives its process"). A shared-group
-QoS 1 delivery is admitted through the authority too
-since 7a, beside an exchange naming the exact acquisition it depends on; the experimental
-affine route alone still uses the
-pre-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) writer
-(chapter P).
+generation retires through its recovery owner: the teardown transfers its source, drain
+and PUBREL consumers instead of deleting them, and the recovery executor ends every
+obligation of the generation under the committed discarding closure (`Discarded`, which
+releases holds but no identifier), records the closure-licensed disposal, retires the
+names and deletes the consumers. Since 7e a shared acquisition is released only when no
+exchange still owes delivery through it (the release fence), and a discarded generation's
+shared acquisitions are released by its recovery owner. Since 7f a SERVING generation's
+next accepted tenure settles what its displaced tenures left undecided or unretired, and
+fork repair never reinstates a consumer another broker decided. Since 8a a CONNECT settles
+any ownership proposal a crashed or concurrent acceptance left standing before it destroys
+anything, every discard settles one at its own boundary, an expired or refused acceptance
+abandons its own aborted proposal, the ownership deadline caps every request of the
+protocol, and a refused acceptance is certified closed (`docs/ARCHITECTURE.md`, "A
+standing proposal is settled before anything is destroyed"). Since 8c a connection that
+attempted an acquisition persists its closure certificate, and a persisted certificate
+ends the live output token its connection's holder left standing (`docs/ARCHITECTURE.md`,
+"A closure certificate outlives its process"). A shared-group QoS 1 delivery is admitted
+through the authority too since 7a, beside an exchange naming the exact acquisition it
+depends on; the experimental affine route alone still uses the
+pre-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) writer (chapter
+P).
 
 So an obligation admitted in a live generation keeps its durable representation and
 completion route across a teardown. Every teardown route either cleans up under a licence
@@ -431,17 +396,14 @@ absent or empty ledger — or withholds, leaving the session record marked for a
 8a, 8b; `docs/ARCHITECTURE.md`, "One tenure and one closing driver"). A
 resume that preserves the generation restores its obligations from the inventory (7b, 7f,
 8c). The client-visible outcome through the assembled production route is witnessed with
-real clients and a peer winning retirement (WP-F W2,
-`internal/mqtt/outbound_peer_witness_e2e_test.go`): a PRESERVED obligation completes on the
-peer (`TestF105PreservedObligationCompletesOnThePeer`, and
+real clients and a peer winning retirement
+(`internal/mqtt/outbound_peer_witness_e2e_test.go`): a PRESERVED obligation completes on
+the peer (`TestF105PreservedObligationCompletesOnThePeer`, and
 `TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer`, whose PUBLISH is
 never re-sent there); an obligation of a DISCARDED generation is ended only under its
 discarding closure (`TestF105DiscardedObligationEndsUnderTheDiscardingClosure`,
 `TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure`); and an overdue session is
-not resumed on the peer (`TestF105AnOverdueSessionIsNotResumedOnThePeer`). The integration
-was accepted by
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)'s
-integrated gate on 2026-10-08.
+not resumed on the peer (`TestF105AnOverdueSessionIsNotResumedOnThePeer`).
 
 **A durable closure certificate is one attempt, and its absence is never a
 licence ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
@@ -491,7 +453,7 @@ within that bound leaves the proposal standing
 
 **A preserving closure with an acquisition that joined before the seal withholds.** The
 closing driver seals behind a non-discarding closure only when the generation's ledger lists
-nothing (consult 122). A closing that observed an empty ledger, then failed after a late join
+nothing. A closing that observed an empty ledger, then failed after a late join
 landed but before its seal, leaves an open ledger listing that join; the next adopter
 withholds on it rather than release an acquisition it cannot prove nothing depends on. Safe,
 but not guaranteed to converge for that schedule; production writes a preserving closure only
@@ -518,7 +480,7 @@ The restore, the uncertain-record resolution and the incarnation retirement befo
 the budget's wall clock but keep their own bounds, so a CONNECT can overrun the budget by
 what those phases take.
 
-**The PUBCOMP release blocker is closed; three limits of what closed it are stated.** A
+**The PUBCOMP release blocker is closed; four limits of what closed it are stated.** A
 PUBCOMP now records the completion on the exchange and the slot in one batch, so a
 completed ordinary QoS 2 exchange reads a durable ending and never "release owed"; the
 canonical PUBREL is not acknowledged until that completion is recorded; and a drained
@@ -527,7 +489,7 @@ every route that interprets the intent (`docs/ARCHITECTURE.md`, "The recovered P
 The release conjunction (row 5) is delivered: the custody ledger releases a charge or an
 identifier only on an exact read of an ended phase or on a generation discard ("Capacity
 and identifier custody belong to the exchange" below).
-What remains is accepted as three stated residuals (consult 125, 2026-10-05): each is a
+What remains is accepted as four stated residuals: each is a
 narrow case whose fix is costly.
 
 - **A PUBREL holder that dies without draining, with no usable persisted certificate for
@@ -696,16 +658,15 @@ limits:
     keeps them.
   - **A delivery admission outlasts the admitted background attempts on an empty
     identifier, and only there
-    ([issue #116](https://github.com/nberlee/mqtt-nats-broker/issues/116);
-    holistic round H4, consult 2).** The ordinary and
+    ([issue #116](https://github.com/nberlee/mqtt-nats-broker/issues/116)).**
+    The ordinary and
     shared delivery admission ladder announces itself as a foreground authority operation
     since [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114),
     so no background attempt admitted after it starts can take its attempts;
     attempts admitted BEFORE the announcement still may, one per background actor of the
     client registered at the announcement (each session object's retained driver,
     continuations, reclaimer, floor unit and exclusion reclaim, and each recovery visit of
-    the client's roots). With three attempts, three such commits exhausted it (attempt N
-    reads, writer N commits, attempt N loses its CAS). Its budget is now one more than
+    the client's roots). Its budget is one more than
     those actors (and never fewer than six), and an attempt that reached the commit is
     spaced from the next by the shared contention wait, so they alone cannot exhaust an
     admission to an empty identifier. They still can when the ladder has spent attempts on
@@ -755,15 +716,13 @@ limits:
     them.** A delivery's acquisition of its output action is foreground too (the retained
     driver's own excepted, which stays background), and its budget is one attempt more
     than the client's registered background actors (never fewer than six), so attempts
-    admitted through the handshake cannot exhaust it. Before this, the retained reclaim
-    chain after a retained replay, and the source retirement owner after a resume, won all
-    three of its attempts and a live QoS 1 delivery waited out AckWait. The bound does not
+    admitted through the handshake cannot exhaust it. The bound does not
     cover writes background code makes without an admission (the retained PUBREL action
     drain's completion, the denied delivery's disposal timer step), foreground operations
     of the same session contending with each other (acknowledgement advances, another
     delivery's admission or acquisition — spaced by the shared contention wait, not
     bounded), another broker, the adopted teardown's completion, or the custody
-    dispatcher's other units. Exhausted, the acquisition re-offers at AckWait as before:
+    dispatcher's other units. Exhausted, the acquisition re-offers at AckWait:
     latency, not loss.
   - **The acknowledgement's terminal release has the same bound.** A PUBACK's or refused
     PUBREC's `publish -> publish_terminal` advance re-runs its whole attempt, from a fresh
@@ -835,15 +794,14 @@ limits:
 - **A restored delivery denied on resume is abandoned, not retransmitted, and its
   identifier remains held until valid protocol completion and cleanup or generation
   discard.** Abandoning the retransmission
-  §4.4 would require is a deviation this broker already made (HEAD's deny acknowledged the
-  source away); what changed is that the ordinary delivery's abandonment is now durable
-  and its IDENTIFIER is held (HEAD freed it), because §4.3 ties identifier reuse to the
+  §4.4 would require is a deviation; the ordinary delivery's abandonment is durable
+  and its IDENTIFIER is held, because §4.3 ties identifier reuse to the
   acknowledgement. Its Receive Maximum charge is released on the resumed connection (Spec5
   §4.9). While the abandonment cannot be made durable — a send section open, the
   connection having itself acquired the delivery, an unresolved write — the source is left
   unacknowledged; installed authorized owners retry without requiring a re-offer.
 - **A restored delivery already claimed by an UNSUBSCRIBE or QoS 0 downgrade drain is NOT
-  abandoned** (consult 35). Terminal denial keeps the previous scheduling-entry and
+  abandoned**. Terminal denial keeps the previous scheduling-entry and
   register disposal and the source acknowledgement, and writes neither
   `delivery_abandoned` nor `DeliveryAbandoned`. Since
   [issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90) a POSSIBLY
@@ -893,8 +851,8 @@ not excuse a lost installed obligation, dropped retry after admission failure, u
 acknowledgement handling, suppression loss, or failure of an otherwise authorized owner to
 retry.
 
-P-12 f6 remains an ACCEPTED RESIDUAL under consults 46 and 48, not fixed or refuted. The
-original no-reconnect requirement remains unmet.
+P-12 f6 remains an accepted residual, not fixed or refuted: the original no-reconnect
+requirement remains unmet.
 
 "Source acknowledged" refers to JetStream source settlement; valid identity-bound
 MQTT ACKs retain their meaning. Local abandonment alone does not release the
@@ -915,18 +873,16 @@ requiring source redelivery.
   conversion is chapter P's. Shared-group QoS 1 output is acquired and executed through
   the authority since 7a, like an ordinary delivery's. This is a chapter P boundary, not an
   alpha residual: it is neither repaired nor accepted for supported traffic.
-- **Abandonment evidence is process-local (accepted residual, consult 125).** An ordinary
+- **Abandonment evidence is process-local (accepted residual).** An ordinary
   acquisition given up before it wrote is recorded ABANDONED on the connection that
   abandoned it, which only stops that connection from executing it; it neither ends the
   durable token nor serves as cross-process completion evidence. A persisted certificate
   ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 8c) or
   the generation's discard governs the remaining hold. This is distinct from
-  the durable `DeliveryAbandoned` fact and the source-suppression obligations above. The
-  whole-exchange discharge proof that once read it was deleted in
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 8c, unconsumed.
+  the durable `DeliveryAbandoned` fact and the source-suppression obligations above.
 
 **A shared delivery another member consumed while its member was away stays charged
-(pre-existing, stated at 7a consult 85).** A persistent member that disconnects with a
+(pre-existing).** A persistent member that disconnects with a
 transmitted, unacknowledged shared QoS 1 delivery keeps that exchange, its identifier and
 its source mapping, so on its resume the group's redelivery to it is retransmitted under
 the same identifier with DUP set. But the group may instead redeliver the source to
@@ -949,7 +905,7 @@ re-attempt of a withheld release (the owner's re-trigger, every stable pass of t
 sweep) also advances the session's outbound authority once, so a concurrent authority
 operation of that session pays one compare-and-swap re-read.
 
-**Shared QoS 0 output can overlap a later hand-back (accepted, 7a consult 84).** Before
+**Shared QoS 0 output can overlap a later hand-back (accepted).** Before
 output, a shared QoS 0 offer checks the session's source disposition. An existing HandBack
 binding or unresolved disposal prevents output and positive source acknowledgement. The
 check does not reserve the source against a disposal or recovery installation that occurs
@@ -964,26 +920,23 @@ not an at-least-once delivery guarantee for MQTT QoS 0, and no duplicate-count o
 bound is claimed. The overlap does not authorize a denied offer or allow this member to
 positively acknowledge a source while HandBack is held.
 
-**An accepted residual: ordinary QoS 1/2 acknowledgement-cleanup latency.** An
-ordinary acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN
-deletes the register (`recoverPublishTerminalSlot`), one authority round-trip more than
-the pre-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
-slot-only path. A packet identifier re-allocated inside that widened
-interval finds the prior terminal register still on its subject, classifies
-`mqttSlotDispTerminalCleanupWithdraw`, and is withheld to its source consumer's AckWait
-redelivery (default 30 s) rather than sent promptly. The interval is a pre-existing one —
-the slot-only path has the same terminal-register-on-reused-PI window — that this change
-widens by one round-trip; measured at 0 in 120 isolated runs and absent from the full
-suite under load. It was recorded as closing "at 7a"; that promise is WITHDRAWN (7a,
-consult 82): converting the shared class does not delete the register inside the advance
-batch — the advance writes a terminal register and terminal source completion still needs
-that register as its durable carrier, and nothing has shown that deleting it inside the
-batch is safe. Closing it needs a carrier/settlement design of its own, and consult 125
-(2026-10-05) accepted the delay as a stated residual rather than owed work: the window
-needs an identifier re-allocated within one authority round-trip, and the 0-in-120 figure
-is history, not a frequency guarantee.
+**An accepted residual: ordinary QoS 1/2 acknowledgement-cleanup latency.** An ordinary
+acknowledgement's terminal cleanup now runs `opAdvanceExchangeAck` and THEN deletes the
+register (`recoverPublishTerminalSlot`), one authority round-trip more than the
+pre-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) slot-only path. A
+packet identifier re-allocated inside that widened interval finds the prior terminal
+register still on its subject, classifies `mqttSlotDispTerminalCleanupWithdraw`, and is
+withheld to its source consumer's AckWait redelivery (default 30 s) rather than sent
+promptly. The interval is a pre-existing one — the slot-only path has the same
+terminal-register-on-reused-PI window — that this change widens by one round-trip.
+Converting the shared class does not delete the register inside the advance batch — the
+advance writes a terminal register and terminal source completion still needs that
+register as its durable carrier, and nothing has shown that deleting it inside the batch
+is safe. Closing it needs a carrier/settlement design of its own, and the delay is
+accepted as a stated residual rather than owed work: the window needs an identifier
+re-allocated within one authority round-trip, and no frequency bound is claimed.
 
-**The recovery pass (the checkpoint that added it).** The pass is real. A closing
+**The recovery pass.** A closing
 transition allocates a
 REACHABLE
 RECOVERY ROOT in the same atomic batch that writes the closure, seals the inventory and
@@ -1029,7 +982,7 @@ this does NOT establish that the maintenance goroutine as a whole cannot hang.
 
 A SECOND and more serious dependency is stated here rather than accepted as a residual:
 the walk's completeness proof assumes the closed generation admits no fresh undiscarded
-claim, and at HEAD it can. `beginQ2AffOp` admits a shared QoS 2 move against LOCAL session
+claim, and it can. `beginQ2AffOp` admits a shared QoS 2 move against LOCAL session
 state and the claim CAS never contends with the durable closure, so a mover paused before
 that CAS can install one after the final verification read. This is NOT admissible as a
 residual, because it has not been shown to be harmless — a late undiscarded claim
@@ -1056,15 +1009,10 @@ demonstrated is execution over the exercised fixture populations, not affine rec
 A generation whose duties are all terminal is retired: its completion
 certificate is written and confirmed first, and only then is its root deleted.
 
-The release gate's third fact changed with it. It asks whether the generation is REACHABLE
-— a
-root standing at the address its own closure records, inside its shard's high-water — and
-no
-longer whether that root's sweep is unfinished. A finished sweep is not a retirement, and
-making
-the gate depend on a cursor position would have made one goroutine's liveness into its
-safety
-condition.
+The release gate's third fact asks whether the generation is REACHABLE — a root standing
+at the address its own closure records, inside its shard's high-water — not whether that
+root's sweep is unfinished. A finished sweep is not a retirement, and the gate does not
+make one goroutine's liveness into its safety condition.
 
 **What is transferred, and what is not.** Cleanup ownership is per TARGET, and the
 selector is the
@@ -1079,7 +1027,7 @@ shared-group lifecycle's — a group record arbitrating each logical group's phy
 incarnation and holder count, a per-generation acquisition ledger the teardown SEALS before
 it releases what the ledger lists, and a closing gate that withholds the record's release
 until the sealed ledger is empty (`docs/ARCHITECTURE.md`, "A group durable is held by
-arbitration, not counted by a scan"). Landed 2026-09-22.
+arbitration, not counted by a scan").
 
 **Shared release is delivered by that lifecycle rather than by this recovery pass, and
 full P3 is not met.** A group durable is held by several sessions, so a name-based delete
@@ -1096,31 +1044,24 @@ completeness
 ([issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110), which
 awaits the upstream correction) — and full P3 remains unproved.
 
-**Nothing in this section blocks cutover step 2 any longer.** Until the boundary ruling of
-2026-09-21 this paragraph named sound evidence for the supported-path decisions
-[issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) and
-[issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) affect as a
-step-2 prerequisite; that sentence is retired. The converted broker
-handles a reported failure, an ambiguity, a concurrent change and a GENUINE absence by its
-own contract (a genuine absence never establishes completion); a false absence or a false
-end supplied by the store is the upstream defect's (`docs/known-upstream-issues.md`), and
-the broker does not compensate for it. The affine executor's two conditions block only the
-EXPERIMENTAL claim: session-affine shared-subscription QoS 2 is not an alpha release
-feature, [issue #109](https://github.com/nberlee/mqtt-nats-broker/issues/109)
-was relocated to `docs/ROADMAP.md`'s chapter P on 2026-09-20, and [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)'s
-affine completion work went with it. Full P3 stays unproved either way, and relocation
-completes nothing.
+**Nothing in this section blocks cutover step 2.** The converted broker handles a reported
+failure, an ambiguity, a concurrent change and a GENUINE absence by its own contract (a
+genuine absence never establishes completion); a false absence or a false end supplied by
+the store is the upstream defect's (`docs/known-upstream-issues.md`), and the broker does
+not compensate for it. The affine executor's two conditions block only the EXPERIMENTAL
+claim: session-affine shared-subscription QoS 2 is not an alpha release feature, and
+[issue #109](https://github.com/nberlee/mqtt-nats-broker/issues/109) and
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)'s affine completion
+work are in `docs/ROADMAP.md`'s chapter P. Full P3 stays unproved either way, and
+relocation completes nothing.
 
 #### Three populations this change left unresolved (one since closed), none client-visible
 
 Stated together because each is an accumulation rather than a lost message.
 
-**1. Roots that never retire — CLOSED on 2026-09-22.** This population was a cost of the
-split above: every generation carrying the untransferred shared cleanup duty kept that duty
-unresolved and its root was never retired. The shared-group lifecycle transfer deleted the
-duty — a shared group durable is no longer enrolled into a closure at all, so no root
-carries one — and with it the population. Whole-generation retirement is no longer
-prohibited on this ground; the affine populations below still stand.
+**1. Roots that never retire — CLOSED on 2026-09-22.** A shared group durable is no longer
+enrolled into a closure, so no root carries an unresolved shared cleanup duty; the affine
+populations below still stand.
 
 **2. A delayed affine create that lands after certification.** The readiness assertion
 does not
@@ -1157,7 +1098,8 @@ discard, a creation is reserved over it, the metadata write replaces the standin
 record,
 and the broker dies before any teardown — leaving that generation's affine consumer with
 nothing
-naming it. The outcome is identical at HEAD: the trace writes a closure there too, what it
+naming it. The outcome is identical without this change: the trace writes a closure there
+too, what it
 does
 not do is transfer the target, and nothing reaps an affine consumer either way. This
 change
@@ -1308,9 +1250,8 @@ create-only writes: every transition outcome (and the ABORTED verdict that compe
 the same subject), the first name-ownership claim at revision 1, and each closure
 certificate.
 
-This corrects the exposure statement. It does not reopen the upstream prerequisite, and the
-broker adds no compensation: each defect closes with its upstream correction and a reviewed
-pin bump (`docs/known-upstream-issues.md`).
+The broker adds no compensation: each defect closes with its upstream correction and a
+reviewed pin bump (`docs/known-upstream-issues.md`).
 
 ### The source consumer's lifecycle (#107 7c-lc): what it costs and what it does not cover
 
@@ -1367,8 +1308,9 @@ pin bump (`docs/known-upstream-issues.md`).
   provisioned. It runs in the background after the CONNACK and retries an incomplete visit
   with capped backoff while the session stays resident.
 - **A held unnamed source waits on its holds.** A settled consumer still held by an
-  obligation stuck at `Publish` (the 7a consult-85 residual) is decided but not retired until
-  that obligation ends; with the stuck exchange, it stays for the generation's life.
+  obligation stuck at `Publish` (the shared delivery another member consumed while its
+  member was away) is decided but not retired until that obligation ends; with the stuck
+  exchange, it stays for the generation's life.
 - **A late CREATE after a retirement** — a queued create landing once the name is RETIRED
   — leaves an orphan the plain orphan sweep reclaims on a later pass; nothing can depend
   on it. It consumes storage until then; it is not promised to exist only briefly.
@@ -1427,7 +1369,7 @@ leaves:
   QoS 0 delivery waits on the gate; its memory is bounded by the NATS pending limits,
   beyond which the client library drops QoS 0 messages, and a departure drops the waiting
   ones.
-- **An obligation this connection cannot settle closes the connection** (consult 106). A
+- **An obligation this connection cannot settle closes the connection**. A
   retained PUBLISH or PUBREL that cannot be acquired, bound or written, a withdrawal whose
   register delete is refused, a PUBREL entry whose installation is refused, and a replay
   whose authorization verdict is INDETERMINATE are each re-attempted with backoff while
@@ -1448,7 +1390,7 @@ leaves:
   object is resident; a store that keeps refusing keeps a capped retry running per copy
   for the session's life.
 - **A retained exchange whose records the store positively answers as unusable is
-  QUARANTINED, unowned** (consult 107) — the one exception to the ownership guarantee. When
+  QUARANTINED, unowned** — the one exception to the ownership guarantee. When
   answered reads establish one of the enumerated unusable or contradictory conditions (in
   `docs/ARCHITECTURE.md`, "One exit door"), or the register's own shape is refused, the
   resume may succeed with that exchange owned by nothing and with no delivery progress on
@@ -1457,7 +1399,7 @@ leaves:
   was corrected restores it, unchanged corruption withholds it indefinitely. This is a
   fail-closed residual for a data-layer fault, not a settlement or a repair. Unanswered
   reads and refused restorations still refuse the resume.
-- **Contradiction detection is not integrity protection** (consult 109). The broker refuses
+- **Contradiction detection is not integrity protection**. The broker refuses
   the contradictions its shared consistency checks and the copy's admission address
   establish — at recovery, at the copy's close and at the acknowledgement advance — and
   quarantine grants no authority to act; an explicit generation discard remains
@@ -1472,7 +1414,7 @@ leaves:
   while its inventory cannot rule a retained exchange out; the client's
   reconnect classifies again. A sustained store fault, or a retained exchange that keeps
   moving under every pass, therefore keeps such a client from resuming at all.
-- **Unfinished material without a CONNECT or a closure** (consult 99, verbatim): a crash
+- **Unfinished material without a CONNECT or a closure**: a crash
   can leave the session's single active retained materialization unfinished; without
   another CONNECT or generation closure its material can remain indefinitely; CONNECT
   discovers prior material and schedules reclamation; closure exposes it to recovery.
@@ -1509,14 +1451,14 @@ leaves:
   the periodic pass's next cycle. Nothing is delayed for any other client.
 - **The other bounded re-attempt loops are unchanged.** Sixteen further loops
   re-attempt an authority or register write with `mqttInflightStoreAttempts` (3) and no
-  spacing; they are recorded for classification (`docs/ROADMAP.md`) rather than converted
-  here.
+  spacing; each is classified, with its disposition, in `bounded_reattempt_census_test.go`
+  ([issue #116](https://github.com/nberlee/mqtt-nats-broker/issues/116)).
 
 ### A limit-evicted in-flight register can revive on a crash recovery — UPSTREAM DEFECT
 
 **This is a defect in the data layer, not in this broker** (tracked in
-`docs/known-upstream-issues.md`, MAXMSGSPER-REVIVAL). By the boundary ruling of
-2026-09-21 (`docs/known-upstream-issues.md`) a store that misreports its own contents is
+`docs/known-upstream-issues.md`, MAXMSGSPER-REVIVAL). By the boundary ruling
+(`docs/known-upstream-issues.md`) a store that misreports its own contents is
 never this broker's issue. The limitation below is real and current; it is recorded so
 the behaviour is not mistaken for a broker guarantee, and it closes when upstream corrects
 it and the pin moves. It is not yet filed as its own issue — the tracking artifact is the
@@ -1524,21 +1466,21 @@ closed, deferred PR
 [nats-io/nats-server#8506](https://github.com/nats-io/nats-server/pull/8506); a minimal
 witness is kept with the lane and a report is drafted for filing after alpha.
 
-**What is true of this broker today.** `$MQTT_inflight` uses a `MaxMsgsPer: 1` subject
-as a single-slot register: each rewrite limit-evicts the prior copy, and a terminal ack
-deletes the survivor at its exact sequence. On the pinned server a recovery that
-rebuilds a stream from raw blocks (a crash, an unclean shutdown, or a stale or missing
-`index.db`) can REVIVE an evicted copy when a neighbour keeps the register's storage
-block non-empty and the survivor carried an explicit-delete tombstone. A revived
-register is read back as a live pending delivery and reserves its packet identifier at
-the next resume. **Reproduced on a CLEAN shutdown too (2026-09-24,
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) PUBCOMP
-unit):** a minimal real-server witness on the pinned server — a `MaxMsgsPer: 1` register
-rewritten once (by a plain CAS, and separately by an atomic batch), a neighbour record,
-the survivor exact-deleted, the subject reading empty — revives the evicted first
-version after an ordinary `Shutdown()` and restart, in both modes. The earlier "a clean
-shutdown recovers correctly" is withdrawn; no index or rebuild cause is inferred from
-the witness. The witness is kept with the lane, outside the tree.
+**What is true of this broker today.** `$MQTT_inflight` uses a `MaxMsgsPer: 1` subject as
+a single-slot register: each rewrite limit-evicts the prior copy, and a terminal ack
+deletes the survivor at its exact sequence. On v2.15.1 (store paths unchanged in v2.15.2)
+a recovery that rebuilds a stream from raw blocks (a crash, an unclean shutdown, or a
+stale or missing `index.db`) can REVIVE an evicted copy when a neighbour keeps the
+register's storage block non-empty and the survivor carried an explicit-delete tombstone.
+A revived register is read back as a live pending delivery and reserves its packet
+identifier at the next resume. **Reproduced on a CLEAN shutdown too (2026-09-24,
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) PUBCOMP unit):** a
+minimal real-server witness (reproduced on v2.15.1; store paths unchanged in v2.15.2) — a
+`MaxMsgsPer: 1` register rewritten once (by a plain CAS, and separately by an atomic
+batch), a neighbour record, the survivor exact-deleted, the subject reading empty —
+revives the evicted first version after an ordinary `Shutdown()` and restart, in both
+modes. No index or rebuild cause is inferred from the witness. The witness is kept with
+the lane, outside the tree.
 
 **Scope, and what the broker does about it.**
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) WIDENS the
@@ -1571,21 +1513,15 @@ identifier.
 
 [issue #81](https://github.com/nberlee/mqtt-nats-broker/issues/81),
 [issue #82](https://github.com/nberlee/mqtt-nats-broker/issues/82) and
-[issue #83](https://github.com/nberlee/mqtt-nats-broker/issues/83) were three
-directions of one defect: the broker moved
-delivery and persistence onto the full-rights service connection while keeping
-upstream's client-connection permission hooks as inert stubs, and it never
-learned the authenticated identity's NATS account or permissions at all. It now
-asks, on the client's own connection, with `$SYS.REQ.USER.INFO`. The mechanism
-is in `docs/ARCHITECTURE.md`, "Auth passthrough"; what follows is only what the
-broker still does not promise.
+[issue #83](https://github.com/nberlee/mqtt-nats-broker/issues/83) are closed: the broker
+asks for the authenticated identity's NATS account and permissions on the client's own
+connection, with `$SYS.REQ.USER.INFO`. The mechanism is in `docs/ARCHITECTURE.md`, "Auth
+passthrough"; what follows is only what the broker still does not promise.
 
-What changed, against the measurements that opened these findings: a publish the
-account denies is no longer stored in `$MQTT_msgs`, no longer retained, no
-longer held for QoS 2 and no longer acknowledged as success; credentials from
-another NATS account no longer authenticate; and a wildcard subscription
-overlapping a narrower subscribe deny no longer receives QoS 1/2, retained or
-affine shared QoS 2 deliveries on the denied subject.
+A publish the account denies is not stored in `$MQTT_msgs`, not retained, not held for QoS
+2 and not acknowledged as success; credentials from another NATS account do not
+authenticate; and a wildcard subscription overlapping a narrower subscribe deny does not
+receive QoS 1/2, retained or affine shared QoS 2 deliveries on the denied subject.
 
 **Residual 1 — the permission snapshot is taken at CONNECT and never
 refreshed.** An ACL changed while a client is connected is enforced immediately
@@ -1698,19 +1634,11 @@ at the socket, which is a transport change this item did not take. It is filed a
 [issue #87](https://github.com/nberlee/mqtt-nats-broker/issues/87) in
 `docs/ROADMAP.md` §8, with the stopping rule stated there.
 
-**Removing one layer was tried and reverted**, and the reason is worth recording:
-disabling the service reconnect buffer narrowed nothing - the send queue behind it
-holds writes just the same - and introduced a reachable regression, because a QoS
-0 Will's publish then fails outright on an ordinary service blip and the outbox
-worker finalizes a Will that was never fanned out. The hazard needs an operator to
-repoint credentials mid-flight; the regression needed only a blip.
-
 **Residual 8 - a Will can still be lost when its authorized account is
 unavailable, but only in the cases named here.** A Will refused because
 `deliverWillRecord`'s account fence cannot establish the destination is now
 RETAINED in memory and published when that same account returns
-(`will_blip_retry.go`), so an ordinary NATS blip no longer destroys it. That was a
-regression this work introduced and it is fixed rather than accepted: an outage is
+(`will_blip_retry.go`), so an ordinary NATS blip does not destroy it: an outage is
 an UNKNOWN, and answering it the way a DENY is answered destroys a Will the client
 was entitled to.
 
@@ -1860,10 +1788,7 @@ fixture under that mutation. **The other two survive it**, so for those two the
 claim rests on reading the code, not on a falsifiable test. Both are the same
 one-line read of the same captured flag, and reaching them needs a record-derived
 eviction or a session-record ambiguity respectively - neither drivable from a
-connection. An attempt at the first was written, passed with a live control, and
-was then DELETED, because the mutation showed it was reaching the immediate site
-instead: a fixture that names a route it does not take is worse than an
-acknowledged gap. Filed as
+connection. Filed as
 [issue #88](https://github.com/nberlee/mqtt-nats-broker/issues/88) in `docs/ROADMAP.md`.
 
 **Residual 11 - a group message offered to a denied member has no delivery deadline
@@ -1887,18 +1812,11 @@ Upstream NATS avoids this by filtering denied queue members before selection, wh
 this broker cannot do because the selection happens on the service connection.
 
 **Residual 13 - a starting broker's JetStream account-info reply was observable on
-`_INBOX`. CLOSED 2026-10-20.** The `AccountInfo` probe `internal/backend` makes at
-startup through the high-level client replied on the service connection's default
-`_INBOX.` prefix, which an MQTT `#` subscriber in the same account could receive (the
-`$`-topic rule does not cover `_INBOX`), as could a native principal allowed `_INBOX.>`.
-The service connection now carries `CustomInboxPrefix("$MQTT.inbox")`, so the reply
-arrives under the reserved namespace: the broker refuses MQTT subscriptions and
-publications there, and the recommended client ACL denies `$MQTT.>` in both directions,
-so the reply is neither observable nor forgeable by a client. A native principal granted
-`$MQTT.>` already reads every QoS 1/2 message in the account; that is the deployment ACL
-boundary in `docs/ARCHITECTURE.md` ("Recommended NATS permissions"), not a residual of
-this probe. The probe itself stays: it is the only JetStream check before the MQTT
-listener opens.
+`_INBOX`. CLOSED 2026-10-20.** The service connection carries
+`CustomInboxPrefix("$MQTT.inbox")`, so the startup `AccountInfo` probe's reply arrives
+under the reserved namespace, which the broker refuses for MQTT subscriptions and
+publications and the recommended client ACL denies in both directions; the mechanism is
+stated in `docs/ARCHITECTURE.md`.
 
 ### A password without a user name
 
@@ -1918,16 +1836,9 @@ whose control is the same packet with a user name.
 
 ### Outgoing DUP on a first transmission — CLOSED (issue #76)
 
-**Status.** Closed 2026-09-09. The mechanism below is implemented, including the redesign
-that closed the crash window a holistic review found (a surviving marker used to be read as
-proof that nothing was transmitted, while the transmission was recorded only by a
-fire-and-forget delete issued after the socket write). The required validation and four
-holistic review rounds passed; round 4 approved after sweeping every identifier-release
-path.
-
 The outgoing DUP flag is derived from **durably recorded send intent for this identifier —
-the PUBLISH may have been written** — and from nothing else. `trackPublish` no longer reads
-the JetStream delivery count for it (`dcount > 1` was the defect: a copy offered and refused
+the PUBLISH may have been written** — and from nothing else. `trackPublish` does not read
+the JetStream delivery count for it (a copy offered and refused
 before tracking raises that count without any PUBLISH reaching the client). The durable fact
 is the **unsent marker** — a sibling record created with the in-flight register in one
 atomic batch and consumed, by a CONFIRMED delete, after the frame is admitted and BEFORE the
@@ -1937,7 +1848,7 @@ marker's presence and, since
 [issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90), from an
 output token the register still carries
 beside a standing marker (`inflight_marker.go`, `docs/ARCHITECTURE.md` "Outbound in-flight
-registers"). Both acceptance tests hold unchanged: a pre-`trackPublish` refusal sends DUP=0
+registers"). Both acceptance tests hold: a pre-`trackPublish` refusal sends DUP=0
 on the next offer although its delivery count is above one, and a broker that dies after
 the pair's confirmation and BEFORE intent is recorded re-offers the delivery DUP=0 under the
 register's own identifier after recovery.
@@ -1957,21 +1868,21 @@ retransmission —
 the behaviour this replaces — is the wire-visible error.
 
 **Cost accepted with it.** A Maximum Packet Size refusal of a RECOVERED possibly-attempted
-exchange retains the exchange whole — entry, register, source, identifier — because refusing
-this attempt proves nothing about earlier ones and the receiver may hold the identifier. The
-message is re-offered and refused at AckWait cadence until the client acknowledges it or the
-session ends; it occupies one in-flight slot for that long. The same holds across a
-restart for a possibly-attempted exchange whose source has meanwhile been acknowledged or
-reaped by its Message Expiry TTL: recovery reserves the identifier rather than consuming the
-register as complete, and nothing can be re-offered for it, so it too is held until the
-client acknowledges or the session ends. **And it holds on the LIVE resume reap**, which
-until [issue #102](https://github.com/nberlee/mqtt-nats-broker/issues/102)
-released such an entry outright on source absence alone: the identifier and its
-Receive Maximum slot are now retained there on the same evidence, because a message leaving
-`$MQTT_msgs` says what this broker can no longer do and nothing about what the client is
-holding. The cost is one identifier and one slot per such exchange, in place of a slot freed
-under a live obligation — and freeing it was the worse direction, since a later allocation
-of a *different* identifier then transmits while the first exchange still stands.
+exchange retains the exchange whole — entry, register, source, identifier — because
+refusing this attempt proves nothing about earlier ones and the receiver may hold the
+identifier. The message is re-offered and refused at AckWait cadence until the client
+acknowledges it or the session ends; it occupies one in-flight slot for that long. The
+same holds across a restart for a possibly-attempted exchange whose source has meanwhile
+been acknowledged or reaped by its Message Expiry TTL: recovery reserves the identifier
+rather than consuming the register as complete, and nothing can be re-offered for it, so
+it too is held until the client acknowledges or the session ends. **And it holds on the
+LIVE resume reap** ([issue #102](https://github.com/nberlee/mqtt-nats-broker/issues/102)):
+the identifier and its Receive Maximum slot are retained there on the same evidence,
+because a message leaving `$MQTT_msgs` says what this broker can no longer do and nothing
+about what the client is holding. The cost is one identifier and one slot per such
+exchange, in place of a slot freed under a live obligation — and freeing it was the worse
+direction, since a later allocation of a *different* identifier then transmits while the
+first exchange still stands.
 
 **The same cost now covers a NEVER-WRITTEN message whose holder's output authority was
 outstanding at recovery
@@ -2019,10 +1930,10 @@ completed as before. An intent delete whose result is ambiguous writes nothing a
 nothing; the next offer re-attempts the same exact delete — and "ambiguous" includes a
 generic delete failure, since the store may have recorded the deletion before failing.
 
-**Stated residuals this loop found at HEAD, filed rather than fixed here.**
+**Stated residuals.**
 
 - **[issue #103](https://github.com/nberlee/mqtt-nats-broker/issues/103) —
-  CLOSED, and both routes now release only on proof.** A teardown's purge and
+  both routes release only on proof.** A teardown's purge and
   the void staging before it both ask `provenUnsentReleasableLocked`, so a
   possibly-attempted exchange keeps its identifier and its capacity charge, keeps its
   durable owner register — uncollected, so the ladder cannot destroy the slot the exchange
@@ -2071,12 +1982,6 @@ generic delete failure, since the store may have recorded the deletion before fa
   the ledger does not own, which is stricter, and deliberately so
   (`receiveMaxOccupancyLocked`,
   [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) row 5).
-- **CLOSED by
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c: a
-  transmitted, unacknowledged RETAINED exchange no longer holds
-  its identifier and its capacity for the rest of the session's life.** It is a durable
-  obligation with its own copy, replayed at every resume — with DUP when possibly sent —
-  until the client completes it, so its reservation has the ordinary release edge.
 - **A STAGED retained allocation whose disposition never runs, or runs after its hold has
   been swept, keeps its identifier.** The release is at the abandonment, and
   `releaseRetainedSendAbandonedLocked` returns early when the hold is gone — rebind sweeps
@@ -2156,8 +2061,7 @@ generic delete failure, since the store may have recorded the deletion before fa
 
   **Identifier exclusion outlives the entry, and its reclamation is bounded but not
   guaranteed**
-  ([issue #100](https://github.com/nberlee/mqtt-nats-broker/issues/100)'s C-IV
-  consolidation, then its prompt-reclamation successor). Every
+  ([issue #100](https://github.com/nberlee/mqtt-nats-broker/issues/100)). Every
   route that removes local tracking while the durable slot's release is unconfirmed hands
   the IDENTIFIER's exclusion to the send hold. The exclusion charges **no** Receive Maximum
   capacity, so it never consumes the client's in-flight window — but it does **not** follow
@@ -2290,40 +2194,34 @@ as this identifier's PUBLISH having been sent). This is honest per identifier an
 to a conforming receiver — §3.3.1.1 says DUP is not a receiver-side dedup signal, and
 QoS 2 is protected by the packet-identifier exchange regardless.
 
-**Residual: a QoS 1 re-offer dispatched before its acknowledgement landed
-(2026-10-15).** A QoS 1 source re-offer that JetStream dispatched before it processed
-the source's acknowledgement can reach admission after the terminal-source suppression
-has been released; it is then delivered again, after the client's PUBACK, with a fresh
-packet identifier and DUP=0 — the at-least-once duplicate a QoS 1 receiver must already
-tolerate. The broker no longer WIDENS this window: an acknowledgement's terminal release
-used to run on the delivery goroutine when the PUBACK landed on a still-open send
-section, which held every re-offer queued behind it until the suppression had lifted
-(deterministic once the release outlasted AckWait). It is now handed to the
-terminal-retry dispatcher, which removes THIS source of blocking and allows re-offers
-processed while the suppression is still held to meet it (docs/ARCHITECTURE.md, "An
+**Residual: a QoS 1 re-offer dispatched before its acknowledgement landed (2026-10-15).**
+A QoS 1 source re-offer that JetStream dispatched before it processed the source's
+acknowledgement can reach admission after the terminal-source suppression has been
+released; it is then delivered again, after the client's PUBACK, with a fresh packet
+identifier and DUP=0 — the at-least-once duplicate a QoS 1 receiver must already tolerate.
+An acknowledgement's terminal release is handed to the terminal-retry dispatcher rather
+than run on the delivery goroutine, so it does not hold re-offers queued behind it, and
+re-offers processed while the suppression is still held meet it (docs/ARCHITECTURE.md, "An
 acknowledgement's release never runs on the delivery goroutine";
-`TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed`). It does not guarantee
-timely admission: no ordering barrier is established between a delivery callback and the
-acknowledgement's confirmation, so a re-offer that came due before the acknowledgement
-was processed can still be admitted after settlement. That is reachable in practice
-whenever the release (first delivery to confirmed source acknowledgement) outlasts
-AckWait: observed 2026-10-15 under CPU starvation at a 500 ms AckWait, where the release
-took 590-680 ms and the re-offer was admitted 165-222 ms after the confirmation, which
-is why `TestMQTTInflightTransmittedRedeliversWithDup` budgets 2 s. **At the 30 s default
-it needs only a backlog**, not a slow release: JetStream pushes up to MaxAckPending
-(1024) offers to the delivery callback at once, and every offer that waits there longer
-than AckWait is re-offered while its first offer is still queued. Measured on 2026-10-26
-before the change: a burst of 150 to one QoS 1 subscriber re-delivered 15 acknowledged
-messages with fresh identifiers and DUP=0, a burst of 300 re-delivered 115. Since that
-change a re-offer of a source THIS SESSION acknowledged is declined at the allocation
-point and its reply re-acknowledged (docs/ARCHITECTURE.md, "An acknowledged PUBLISH is
-not sent again"); a burst of 500 then re-offered 339 times and delivered nothing twice.
-What remains of this residual: a re-offer of a source acknowledged by another session or
-broker (a takeover, another member of a shared group), or evicted from the session's
-bounded record (1024 sequences per durable, 64 durables), or one arriving after a
-restart (the record is in memory). QoS 2 is not affected: its retirement suppression
-carries the exchange past the source acknowledgement
-(`TestMQTTInflightQoS2SlowSourceAckLeavesNoDuplicate`).
+`TestMQTTInflightParkedAckReleaseLeavesReOffersSuppressed`). It does not guarantee timely
+admission: no ordering barrier is established between a delivery callback and the
+acknowledgement's confirmation, so a re-offer that came due before the acknowledgement was
+processed can still be admitted after settlement. That is reachable in practice whenever
+the release (first delivery to confirmed source acknowledgement) outlasts AckWait:
+observed 2026-10-15 under CPU starvation at a 500 ms AckWait, where the release took
+590-680 ms and the re-offer was admitted 165-222 ms after the confirmation, which is why
+`TestMQTTInflightTransmittedRedeliversWithDup` budgets 2 s. **At the 30 s default it needs
+only a backlog**, not a slow release: JetStream pushes up to MaxAckPending (1024) offers
+to the delivery callback at once, and every offer that waits there longer than AckWait is
+re-offered while its first offer is still queued. A re-offer of a source THIS SESSION
+acknowledged is declined at the allocation point and its reply re-acknowledged
+(docs/ARCHITECTURE.md, "An acknowledged PUBLISH is not sent again"); a burst of 500 then
+re-offered 339 times and delivered nothing twice. What remains of this residual: a
+re-offer of a source acknowledged by another session or broker (a takeover, another member
+of a shared group), or evicted from the session's bounded record (1024 sequences per
+durable, 64 durables), or one arriving after a restart (the record is in memory). QoS 2 is
+not affected: its retirement suppression carries the exchange past the source
+acknowledgement (`TestMQTTInflightQoS2SlowSourceAckLeavesNoDuplicate`).
 
 **Second residual: a pair whose register delete never lands is re-offered as unsent.**
 Recovery's drop loop deletes an unverdicted register fire-and-forget and reaps its marker
@@ -2351,9 +2249,7 @@ than becoming a half-torn pair.
 
 The experimental affine QoS 2 path shares the one derivation site, so it inherits the fix;
 its own parked ordering defect (below) is unrelated. See
-[issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76). **This does
-not license a release: [issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90)
-remains an unconditional alpha blocker.**
+[issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76).
 
 ### Outbound QoS 1/2 delivery rate per subscriber: a measured ceiling
 
@@ -2388,20 +2284,9 @@ three interleaved runs of each tree, medians), against the tree before batched a
 | QoS 1, four subscribers, 200 each | 104.2 msg/s in aggregate | 215.1 msg/s in aggregate | 42.0 / 123.3 |
 | QoS 1, one subscriber, 20 at rest after 300 | 41.1 msg/s | 52.1 msg/s | 24.1 / 31.1 |
 
-The roadmap item's acceptance (twice the QoS 1 burst rate of a same-day baseline on each
-rig, by the ratio of three-run medians) is met standalone (2.40x) and missed on R3 (1.94x),
-and the item stays open. The R3 baseline's own runs spread from 34.9 to 46.7 msg/s, and the
-same commit measured 35.8 the day before; that is context for the miss, not an exception to
-the gate. Measured again on 2026-10-29 (QoS 1 burst of 500 only, three interleaved runs each,
-medians): 6548ed9 25.0 / 46.2 msg/s standalone / R3, the current tree 57.6 / 65.6 (2.30x /
-1.42x); R3 runs of identical code have spread from about 60 to 90 msg/s across days.
-Batching back-to-back acknowledgement advances was evaluated and deferred: its principal
-saving is the standalone commit write, where the gate is met. The write boundaries'
-independent member reads were the next part of the roadmap item and landed on 2026-10-30
-(below; [issue #132](https://github.com/nberlee/mqtt-nats-broker/issues/132),
-"Completion evaluation (2026-10-29)"). A QoS 2
-delivery's PUBREL acquisition still CASes the authority record a flush's acquisition also
-CASes, so the two still contend.
+A QoS 2 delivery's PUBREL acquisition still CASes the authority record a flush's
+acquisition also CASes, so the two still contend
+([issue #132](https://github.com/nberlee/mqtt-nats-broker/issues/132)).
 
 Measured again on 2026-10-30 after the write boundary began requesting the records it
 re-reads in one pipelined request (docs/ARCHITECTURE.md, "The boundary reads what it
@@ -2421,9 +2306,9 @@ processed, deliveries not yet admitted and admitted ones not yet acquired or wri
 left to JetStream, NAK'd forward when a resumed session frees a slot or re-offered at
 AckWait, as a callback refused its lease always left them. Measured with three overlapping
 subscriptions and 16 queued messages, a clean-start CONNACK took a median 108 ms, p95 153,
-maximum 188 (219 / 282 / 336 before batching; 187 / 274 / 344 with the broker and
-nats-server pinned to one core). A takeover still waits for the one step in progress (an
-admission or acquisition attempt and its settlement, or a write).
+maximum 188 (187 / 274 / 344 with the broker and nats-server pinned to one core). A
+takeover still waits for the one step in progress (an admission or acquisition attempt and
+its settlement, or a write).
 
 **The identifier walk no longer re-detects a corrupted duty it has validated before.**
 Identifier exclusivity caches each duty position's validated identity (kind, reference,
@@ -2443,30 +2328,25 @@ and their identifiers reserved. No such stall was observed in the measured runs.
 
 ### Per-(Topic, QoS) delivery order: an intended implementation property
 
-MQTT orders delivery only per (Topic, QoS): an *Ordered Topic* server sends PUBLISHes
-"for the same Topic and QoS in the order that they were received" (MQTT 5.0 §4.6, whose
+MQTT orders delivery only per (Topic, QoS): an *Ordered Topic* server sends PUBLISHes "for
+the same Topic and QoS in the order that they were received" (MQTT 5.0 §4.6, whose
 normative statements end at MQTT-4.6.0-6). It does **not** order across topics or across
 QoS levels. This broker **intends** that per-(Topic, QoS) order on every path: each
-topic-filter+QoS stream rides a single ordered carrier (one core-NATS subscription for
-QoS 0, one JetStream push consumer for QoS 1 and 2) on a single dispatch goroutine. That
+topic-filter+QoS stream rides a single ordered carrier (one core-NATS subscription for QoS
+0, one JetStream push consumer for QoS 1 and 2) on a single dispatch goroutine. That
 carrier is ordered only while no delivery is abandoned and re-offered: a re-offer queues
 behind everything already pushed to the subscription, so the message it carries reaches
-the client after messages published later. Before the 2026-10-26 throughput item, an
-admission that lost every attempt of its contention budget to the session's own
-acknowledgements did exactly that on a plain QoS 1 subscription: observed in 4 of 15
-bursts of 500 on the tree before the change and 1 of 15 with only the item's other parts
-in place, one message overtaken by the next. An admission defeated only by stale
-expectations is now re-attempted for the connection's life instead of abandoned
-(docs/ARCHITECTURE.md, "An admission defeated only by contention keeps the
-subscription's order"; 0 of 15 bursts after it), which removes that route. It is not a
-universal ordering guarantee: an admission refused for any other reason (a dependency
-not ready, a withholding, a closing connection) still abandons its offer, and that
-re-offer still arrives late. The order is the intent on every path, and it is what
-justified rewriting three inherited upstream tests that asserted order across topics or
-QoS levels (`docs/PROVENANCE.md`): two Subscription-Identifier cases accept either
-arrival order of their topic/property pairs, and `TestMQTTv5OutboundTopicAliasMixedQoS`
-lets whichever QoS path arrives first bind the alias. The affine shared-subscription QoS
-2 path violates it (next section).
+the client after messages published later. An admission defeated only by stale
+expectations is re-attempted for the connection's life instead of abandoned
+(docs/ARCHITECTURE.md, "An admission defeated only by contention keeps the subscription's
+order"), which removes that route. It is not a universal ordering guarantee: an admission
+refused for any other reason (a dependency not ready, a withholding, a closing connection)
+still abandons its offer, and that re-offer still arrives late. The order is the intent on
+every path, and it is what justified rewriting three inherited upstream tests that
+asserted order across topics or QoS levels (`docs/PROVENANCE.md`): two
+Subscription-Identifier cases accept either arrival order of their topic/property pairs,
+and `TestMQTTv5OutboundTopicAliasMixedQoS` lets whichever QoS path arrives first bind the
+alias. The affine shared-subscription QoS 2 path violates it (next section).
 
 ### Same-topic ordering on the affine QoS 2 path — PARKED EXPERIMENTAL DEFECT
 
@@ -2498,10 +2378,6 @@ both, exactly one arbitrary message was transmitted first with DUP=0 while every
 followed in publication order with DUP=1. The evidence is the broker's own packet identifier,
 minted immediately before the synchronous register gate and enqueue, on a subscription
 `nats.go` dispatches with a single goroutine — so the harness cannot be the source.
-
-An earlier version of this entry rested on a capture whose eight messages came from eight
-DIFFERENT publishing Clients, which §4.6 does not order. That claim did not follow from its
-evidence and was withdrawn; the single-publisher reproduction above replaced it.
 
 Scope, as far as it is established: the affine shared-subscription delivery path. Plain
 subscriptions had their own reordering route through admission abandonment (previous section),
@@ -2562,13 +2438,11 @@ pre-existing post-proof paused-releaser residual recorded elsewhere in this docu
 
 **One arm is deliberately UNGATED and out of scope**: `discardAbsentWinnerClaim`, which
 commits `Discarded` for an affine winner whose record is absent. It is affine assignment
-mutation, and
-[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s
-supported-scope ruling of 2026-09-02 accumulates affine-only
-regressions under ROADMAP chapter P rather than widening this finding. The census of gated
-arms is today's enumeration and is **not** claimed to stay complete: the structural
-inventory guard that would have claimed that was designed, reviewed three times and
-deleted, because a primitive-only AST inventory cannot catch a new unsafe CALLER of an
+mutation, and [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s
+supported-scope ruling of 2026-09-02 accumulates affine-only regressions under ROADMAP
+chapter P rather than widening this finding. The census of gated arms is today's
+enumeration and is **not** claimed to stay complete: no structural inventory guard
+enforces it, because a primitive-only AST inventory cannot catch a new unsafe CALLER of an
 already-inventoried destructive helper.
 
 **The retained population also costs recurring WORK, and the PUBREL arm's share is
@@ -2613,18 +2487,16 @@ to **[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)**,
 with the proof-to-ack residual below behind its second half.
 
 **Why there is no guarded version.** `$MQTT_out` is interest-retained, so deleting an
-affine consumer destroys the acknowledged QoS 2 payloads it holds, and every positive
-authorization for that delete was sought and refused. A retirement proof is structurally
-unavailable — `recordGenRetirement` writes the **session** generation while the consumer is
-keyed by an **affine** generation that outlives incarnations. Consumer metadata has the
-same mismatch. `NumPending == 0` is an instantaneous observation, not a fence. Removing
-only the absent-record route still lets a stale owner create a fresh nonterminal claim
-after the verification scan, because `discardQ2AffClaimsFor` installs no fence against
-future claim creation. And the two guards that read as defenses were not: a record re-read
-cannot distinguish "no session" from "a live session whose record is absent"
-([issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s own
-premise), and the `ConsumerInfo.Created` instance fingerprint cannot see an **adoption**,
-since provisioning is a create-or-update that leaves it unchanged.
+affine consumer destroys the acknowledged QoS 2 payloads it holds, and no positive
+authorization for that delete is available. A retirement proof is structurally unavailable
+— `recordGenRetirement` writes the **session** generation while the consumer is keyed by
+an **affine** generation that outlives incarnations. Consumer metadata has the same
+mismatch. `NumPending == 0` is an instantaneous observation, not a fence.
+`discardQ2AffClaimsFor` installs no fence against future claim creation, so a stale owner
+can create a fresh nonterminal claim after its verification scan. A record re-read cannot
+distinguish "no session" from "a live session whose record is absent", and the
+`ConsumerInfo.Created` instance fingerprint cannot see an **adoption**, since provisioning
+is a create-or-update that leaves it unchanged.
 
 **What leaks is an unbounded CORRELATED population**, not a consumer alone:
 
@@ -2655,73 +2527,59 @@ present copy.
 every authorized cleanup route that **fails** after dropping the durable or in-memory
 reference, with no retry anchor. Its known members are the unused-path unwind's `dispose`
 failure arm, `finishQ2AffineUnwind`'s failed consumer delete, and provisioning rollback's
-failed minted-consumer delete. All three previously depended on orphan collection; each
-now logs that the consumer is retained and must be removed by hand.
+failed minted-consumer delete. Each logs that the consumer is retained and must be removed
+by hand.
 
-**Why this is accepted.** The alternative is an unclosed destruction path for
-acknowledged messages, which also manufactured
-[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)'s
-claim-without-copy precondition.
-A leak is preferred to a loss, and
-[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) has since
-taken the same trade for the general
-session classes — see "Orphan reconciliation retains session-generation state without
-retirement proof" above.
-**[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) itself is
-CLOSED** (unit 1 on 2026-09-02, unit 2 on
-2026-09-03); "A retirement refuses rather than disposing under a live owner" below states
-what each unit closed and the residuals they left.
+**Why this is accepted.** The alternative is an unclosed destruction path for acknowledged
+messages, which also manufactured
+[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)'s claim-without-copy
+precondition. A leak is preferred to a loss, and
+[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) takes the same trade
+for the general session classes — see "Orphan reconciliation retains session-generation
+state without retirement proof" above.
 
 ### A retirement refuses rather than disposing under a live owner
 
-[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s unit 1
-landed the incarnation completion lease
-("The incarnation completion lease" in `docs/ARCHITECTURE.md`), which closes the
-**incarnation admission invariant** — including the single-broker clean-start silent
-loss of an acknowledged QoS 2 message, where a displaced PUBREL derived its hold
-subject under the re-minted generation and answered a success-shaped PUBCOMP for a
-payload the same teardown destroyed. The generation is now re-minted only under a
-permit proving no client is bound and the incarnation's owners have drained.
+The incarnation completion lease ("The incarnation completion lease" in
+`docs/ARCHITECTURE.md`,
+[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)) re-mints the
+generation only under a permit proving no client is bound and the incarnation's owners
+have drained.
 
-**Unit 2 has since landed**, closing the two-dimensional PUBREL classifier and sites 1
-and 3 on the lease identity unit 1 supplied, so
-**[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) is
-CLOSED**. It introduces exactly
-THREE new residuals: the no-licence half of the deleted-record shape (in the
+[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s fix (the lease
+identity, the two-dimensional PUBREL classifier and sites 1 and 3 on that identity) adds
+three new residuals: the no-licence half of the deleted-record shape (in the
 deleted-record bullet below), the orphan-reconciliation retention leak with its unbounded
 discovery cost (its own section above), and the **take-to-durable-handoff window** on the
 licensed retirement's Will — an abnormal exit after `mqttTakeWillLocked` has consumed the
-Will but before it is published or durably enqueued loses it. That third one is deliberate
-rather than overlooked: the Will backstop on that route recovers an exit BEFORE the take
-and is a harmless no-op after it, and closing the remainder would need a
-claimed/completed handoff with a stable outbox identity, refused as disproportionate for a
-window no comparable route survives either — `reparkRefusedDiscard` already documents that
-a crash there drops a parked Will, and the eviction worker's guard accepts trigger loss.
-Production has no post-take abnormal-exit source on this route, and a real uncaught panic
-ends the process. "Three" counts what unit 2 ADDS, not the total: several PRE-EXISTING
-residuals in the same area are
-unchanged by it and are deliberately not absorbed into it, the most important being the
-**post-proof paused-releaser** residual on the inbound QoS 2 release path. That one is
-narrowed but NOT eliminated: the classifier catches every retirement already durable when
-it runs, so what survives is the suffix after it — a releaser that has passed the
-classifier and then pauses can still fan out while a peer completes and reaps the same
-exchange. It is stated where it arises, and unit 2 makes no claim on it.
+Will but before it is published or durably enqueued loses it. That third one is
+deliberate: the Will backstop on that route recovers an exit BEFORE the take and is a
+harmless no-op after it, and closing the remainder would need a claimed/completed handoff
+with a stable outbox identity, refused as disproportionate for a window no comparable
+route survives either — `reparkRefusedDiscard` already documents that a crash there drops
+a parked Will, and the eviction worker's guard accepts trigger loss. Production has no
+post-take abnormal-exit source on this route, and a real uncaught panic ends the process.
+"Three" counts what the fix adds, not the total: several pre-existing residuals in the
+same area are unchanged by it, the most important being the **post-proof paused-releaser**
+residual on the inbound QoS 2 release path. That one is narrowed but NOT eliminated: the
+classifier catches every retirement already durable when it runs, so what survives is the
+suffix after it — a releaser that has passed the classifier and then pauses can still fan
+out while a peer completes and reaps the same exchange. It is stated where it arises.
 
 Three stated consequences of the mechanism:
 
-- **A clean-start takeover is REFUSED while the incumbent has work outstanding.** A
-  wedged owner — a route blocked in a synchronous socket write, or one waiting out a
-  JetStream request's own timeout — holds its
-  lease until the drain ceiling, and the ceiling's disposition is to reopen
-  admission, leave the incumbent bound with its Will, socket, expiry and disconnect
-  state untouched, and refuse the contending CONNECT. A v5 contender is TOLD, with a
-  CONNACK carrying reason **0x89** and a Reason String, because the disposition is
-  "retry" and a bare socket close would leave that inference to the client; 3.1.1 has
-  no such code and gets the close. The client retries
-  and succeeds once the work completes. Availability degrades; nothing is disposed
-  under a live owner, which is the outcome every earlier attempt at this finding
-  foundered on. The displaced socket is deliberately NOT closed by that arm: closing
-  it would be a takeover effect with no successor established ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
+- **A clean-start takeover is REFUSED while the incumbent has work outstanding.** A wedged
+  owner — a route blocked in a synchronous socket write, or one waiting out a JetStream
+  request's own timeout — holds its lease until the drain ceiling, and the ceiling's
+  disposition is to reopen admission, leave the incumbent bound with its Will, socket,
+  expiry and disconnect state untouched, and refuse the contending CONNECT. A v5 contender
+  is TOLD, with a CONNACK carrying reason **0x89** and a Reason String, because the
+  disposition is "retry" and a bare socket close would leave that inference to the client;
+  3.1.1 has no such code and gets the close. The client retries and succeeds once the work
+  completes. Availability degrades; nothing is disposed under a live owner. The displaced
+  socket is deliberately NOT closed by that arm: closing it would be a takeover effect
+  with no successor established
+  ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
 - **A displaced packet parked at the admission boundary is answered by nothing.** If
   the transition completes, the parked route is cancelled and its connection closed
   without a protocol response — the connection is being displaced, and the client's
@@ -2748,9 +2606,7 @@ The teardown-owned release of shared group durables is **outside** this boundary
 retirement work created after the displaced incarnation has drained, not an effect derived
 by an admitted displaced route. Its target is safe by a property of its own — a
 `CONSUMER.DELETE` is issued only for an incarnation the group record has moved into
-`retiring`, whose incarnation-qualified name no successor reuses — so the scan-then-delete
-race on a deterministic group name that used to be recorded here is CLOSED with the
-shared-group lifecycle transfer, not carried.
+`retiring`, whose incarnation-qualified name no successor reuses.
 
 ### Shared-subscription QoS 2: affinity holds, against a non-atomic proof
 
@@ -2779,37 +2635,30 @@ marked `Lost`: a terminal state that is deliberately **not** reapable, so the
 record survives for an operator to find instead of being written off as a
 completed delivery.
 
-**`Lost` is what the broker can prove, not what necessarily happened**, and the
-difference matters to anyone acting on the marking. The write order above is
-sound for the JetStream copy acknowledgement and **not** for the client's PUBREC,
-which is answered earlier: `mqttProcessPublishReceived` stores the correlated
-PUBREL before it reaches `mqttFinishQ2AffineDelivery`. So a client may already
-have received and acknowledged the PUBLISH while only the copy acknowledgement is
-unproven. That was a reporting defect rather than a deviation — see the paragraph
-below on why nothing is redistributed and the client is not deprived — and it is
-now **corrected**: the stored PUBREL names the assignment it completes, and
-resolving that reference on resume records `PubRecProven`, which outranks `Lost`.
-The five residuals that remain are stated below.
+**`Lost` is what the broker can prove, not what necessarily happened**, and the difference
+matters to anyone acting on the marking. The write order above is sound for the JetStream
+copy acknowledgement and **not** for the client's PUBREC, which is answered earlier:
+`mqttProcessPublishReceived` stores the correlated PUBREL before it reaches
+`mqttFinishQ2AffineDelivery`. So a client may already have received and acknowledged the
+PUBLISH while only the copy acknowledgement is unproven. The stored PUBREL names the
+assignment it completes, and resolving that reference on resume records `PubRecProven`,
+which outranks `Lost`. The five residuals that remain are stated below.
 
-**Corrected by
-[issue #37](https://github.com/nberlee/mqtt-nats-broker/issues/37)'s audit
-(2026-08-18): the marking is not automatic.** `Lost` has
-exactly one writer in the tree, `recoverQ2AffClaims`, and it runs on **the owning
-session's own resume**. While the record is live and names the same generation, the
-orphan sweep skips every claim of that generation by design, so an assignment orphaned
-by an out-of-band consumer destruction is marked `Lost` only if that session comes back.
-A session that never resumes — which a session expiry interval of `0xFFFFFFFF` permits —
-leaves it unmarked. That was
-**[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)**, and it
-is now **partly closed**: for an
-assignment that never reached `materialized`, a contender taking the group redelivery
-restores the destroyed consumer from the winner's record and materializes onto it, so
-the source is released without the owner. For an assignment that DID reach
-`materialized`, nothing changes — a replacement copy there could become a second
-PUBLISH for an exchange already past PUBREC — so its source is still re-offered
-forever, because the group consumer sets no `MaxDeliver`. That remainder is
-[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)'s
-**residual 8**, and the sentence above still describes the resumed case only.
+**The marking is not automatic.** `Lost` has exactly one writer in the tree,
+`recoverQ2AffClaims`, and it runs on **the owning session's own resume**. While the record
+is live and names the same generation, the orphan sweep skips every claim of that
+generation by design, so an assignment orphaned by an out-of-band consumer destruction is
+marked `Lost` only if that session comes back. A session that never resumes — which a
+session expiry interval of `0xFFFFFFFF` permits — leaves it unmarked
+([issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)). For an assignment
+that never reached `materialized`, a contender taking the group redelivery restores the
+destroyed consumer from the winner's record and materializes onto it, so the source is
+released without the owner. For an assignment that DID reach `materialized`, nothing is
+restored: a replacement copy could become a second PUBLISH for an exchange already past
+PUBREC, so its source is still re-offered forever, because the group consumer sets no
+`MaxDeliver`. That remainder is
+[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)'s **residual 8**, and
+the sentence above still describes the resumed case only.
 
 **[issue #69](https://github.com/nberlee/mqtt-nats-broker/issues/69), closed: a
 reaped claim no longer strands its copy — with a re-scoped
@@ -2833,37 +2682,28 @@ is RETAINED rather than collected:
 3. the attempt's final claim observation is itself indeterminate, which retains the copy
    by design rather than guessing at it.
 
-Two later events remove such a copy: the winner's ordinary session teardown, which
-deletes the affine consumer and takes its retained copies with it; or, where a LATER
-incarnation now holds the claim subject, the delivery gate disposing the superseded copy
-on its next redelivery — a positive fact about a record just read, not an inference from
-an absence. **A third used to exist and no longer does**: an orphan-sweep pass deleting
-that consumer once no session record referenced it, removed by
-[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) course E because no
-positive fact could authorize it. Where neither of the two occurs — a session that keeps
-running, never resumes, and whose claim subject no later incarnation claims — the copy is
-retained until an
-operator removes it or
-[issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s
-stream-identity remedy supplies the fact that would
-license collecting it. A retained copy is invisible to the client: it is never
-published, because the delivery gate refuses a copy no live claim of its own incarnation
-authorizes.
+Two later events remove such a copy: the winner's ordinary session teardown, which deletes
+the affine consumer and takes its retained copies with it; or, where a LATER incarnation
+now holds the claim subject, the delivery gate disposing the superseded copy on its next
+redelivery — a positive fact about a record just read, not an inference from an absence.
+No orphan-sweep pass deletes that consumer for lack of a session record
+([issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) course E). Where
+neither of the two occurs — a session that keeps running, never resumes, and whose claim
+subject no later incarnation claims — the copy is retained until an operator removes it or
+[issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s stream-identity
+remedy supplies the fact that would license collecting it. A retained copy is invisible to
+the client: it is never published, because the delivery gate refuses a copy no live claim
+of its own incarnation authorizes.
 
-**That residual is now CLOSED, and what replaced it is narrower.** On the
-successful-PUBREC path, if the incarnation-fenced `AffineDone` write fails, the affine
-copy remains unacknowledged and the register is durably rewritten as retired; the
-immediate source-state probe sees the copy still live and removes neither. For a client
-that completes PUBCOMP, disconnects before AckWait redelivery and keeps a non-expiring
-session that never resumes, the live record used to preserve all three — the
-`$MQTT_qos2assign` claim through its affine reference, the retired `$MQTT_inflight`
-register through its separate session-generation reference, and the copy on the
-referenced consumer — unbounded in count and bounded only in kind. Orphan reconciliation
-now collects that triple: the register is durable evidence of a successful PUBREC, so
-under a live reference the sweep records `AffineDone` from it, deletes the copy at its
-exact sequence with a confirmed delete, reaps the claim and deletes the register last.
-Terminal claims of a live generation are likewise reaped rather than left to an owner
-resume that may never come.
+On the successful-PUBREC path, if the incarnation-fenced `AffineDone` write fails, the
+affine copy remains unacknowledged and the register is durably rewritten as retired; the
+immediate source-state probe sees the copy still live and removes neither. Orphan
+reconciliation collects the resulting triple — the `$MQTT_qos2assign` claim, the retired
+`$MQTT_inflight` register and the copy — even under a live session record: the register is
+durable evidence of a successful PUBREC, so under a live reference the sweep records
+`AffineDone` from it, deletes the copy at its exact sequence with a confirmed delete,
+reaps the claim and deletes the register last. Terminal claims of a live generation are
+likewise reaped rather than left to an owner resume that may never come.
 
 **What remains open in that area, stated with its direction.** Two populations:
 
@@ -2904,19 +2744,14 @@ invariant of the form `AffineDone ⇒ materialized` would refuse a LEGITIMATE re
 the delivery gate's `Discarded` arm records `AffineDone` before its phase arm is
 reached.
 
-**[issue #67](https://github.com/nberlee/mqtt-nats-broker/issues/67), closed
-2026-08-19: the broker no longer releases a source against a store
-response.** Because `$MQTT_out` is interest-retained, a copy stored after its consumer is
-gone succeeds and keeps nothing; the broker used to acknowledge the group source on the
-strength of that store, so the message was released from the shared group having never
-existed on any consumer, and the distinguishing write order above could not help because
-no delivery had run. Every route to that acknowledgement now proves the copy with a
-presence check on the copy subject and authorizes the release from
-`copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨ SourceAcked`, refusing otherwise. A claim
-left nonterminal by that refusal is
-**[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)**'s to
-resolve; refusal preserves the only
-recoverable asset, which is the unacked group delivery.
+**[issue #67](https://github.com/nberlee/mqtt-nats-broker/issues/67): the broker does not
+release a source against a store response.** Because `$MQTT_out` is interest-retained, a
+copy stored after its consumer is gone succeeds and keeps nothing. Every route to the
+group source's acknowledgement therefore proves the copy with a presence check on the copy
+subject and authorizes the release from `copyPresent ∨ AffineDone ∨ Discarded ∨ Lost ∨
+SourceAcked`, refusing otherwise. A claim left nonterminal by that refusal is
+**[issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)**'s to resolve;
+refusal preserves the only recoverable asset, which is the unacked group delivery.
 
 **The stated residual: a consumer deleted between the final proof and the ack.** The
 guarantee is conditioned on a fresh but **non-atomic** observation, and that wording is
@@ -2946,15 +2781,11 @@ span
 - A fresh or on-behalf materialization pays the full load-and-CAS, retried up to three
   times.
 
-An earlier draft of this section wrongly called the whole thing "one round trip that
-nothing inside the broker can widen", and its first correction still wrongly gave the
-already-materialized owner route the ack alone. What the
-change actually replaces is an acknowledgement resting on a store response, or on evidence
-gathered before the store, or on the phase alone; what it does not do is make the span
-zero. Such an assignment is left `materialized` with no copy and no `AffineDone`, which is
-exactly the state `recoverQ2AffClaims` records as `Lost` on the owner's next resume — so
-the outcome is retained as evidence rather than laundered, subject to the resume caveat
-above ([issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)).
+The span is not zero. Such an assignment is left `materialized` with no copy and no
+`AffineDone`, which is exactly the state `recoverQ2AffClaims` records as `Lost` on the
+owner's next resume — so the outcome is retained as evidence rather than laundered,
+subject to the resume caveat above
+([issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)).
 
 That discrimination holds **while the owning session record still exists**. If the
 record disappears first — the session expired, or a broker died without tearing it
@@ -2975,18 +2806,15 @@ whose `Lost` marking depends on the owner resuming
 span between the final copy proof and the source ack. Both are stated
 with their mechanism rather than a bound they do not have.
 
-**The false loss report is CLOSED, and what remains of it is stated here.**
-`mqttProcessPublishReceived` stores the correlated PUBREL before it records
-`AffineDone`, so PUBREC → broker stop → out-of-band consumer destruction leaves
-`materialized ∧ ¬AffineDone ∧ copy absent` for a message the client already answered.
-The owner's resume used to record that as `Lost`, which was untruthful — never a
-deviation, since `Lost` releases the group delivery without re-offering the message and
-the handshake completes from the independently persisted PUBREL, but wrong in what it
-told the operator, and it left a claim that was never reaped. (Writing `Discarded`
-instead was never available as a shortcut, and the reason is phase-sensitive: where a
-correlated PUBREL proves PUBREC it is merely untruthful, but for the undifferentiated
-shape, where nothing proves the client was reached, it would deprive a client still owed
-the PUBLISH and `[MQTT-4.8.2-4]` does bite.)
+`mqttProcessPublishReceived` stores the correlated PUBREL before it records `AffineDone`,
+so PUBREC → broker stop → out-of-band consumer destruction leaves
+`materialized ∧ ¬AffineDone ∧ copy absent` for a message the client already answered. A
+`Lost` recorded for that shape is untruthful but never a deviation: `Lost` releases the
+group delivery without re-offering the message, and the handshake completes from the
+independently persisted PUBREL. Recording `Discarded` for that shape is not available:
+where a correlated PUBREL proves PUBREC it would merely be untruthful, but for the
+undifferentiated shape, where nothing proves the client was reached, it would deprive a
+client still owed the PUBLISH, and `[MQTT-4.8.2-4]` does bite.
 
 The stored PUBREL now names the assignment it completes, as a bound
 `(claim subject, copy subject)` pair, and `reconcileQ2AffPubRelProofs` resolves that
@@ -3102,13 +2930,9 @@ keep nothing while `$MQTT_out`'s configured duplicate window has an entry for th
 copy's stable `Nats-Msg-Id` from an earlier no-interest store; the validator waives
 `Duplicates`, so that bound is operator-configured.
 
-Not this, despite the heading this section carried until
-[issue #67](https://github.com/nberlee/mqtt-nats-broker/issues/67) closed:
-
-Packet-identifier continuity across a broker restart or failover is **no longer** a
-deviation, here or on any other outbound path: a started delivery's identifier is
-durable and is restored before the redelivery. See "Outbound in-flight identifiers"
-below.
+Packet-identifier continuity across a broker restart or failover is **not** a deviation,
+here or on any other outbound path: a started delivery's identifier is durable and is
+restored before the redelivery. See "Outbound in-flight identifiers" below.
 
 **Scope.** Affinity is enforced by the brokers that consult `$MQTT_qos2assign`, which
 is every broker serving the account — they all run this tree (see the Compatibility
@@ -3136,20 +2960,16 @@ than that one session:
   affine generation, so it contributes no affine reference although the session it
   describes may own an affine consumer and outstanding claims; nothing can then prove
   which affine generations are still referenced, and `reconcileOrphanQ2AffClaims` is
-  suppressed for every session in the account. (It also suppressed affine consumer
-  deletion until
-  [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) course E
-  removed that route; the retired affine **register** arm is
-  not behind the gate.) Since
-  nothing removes the record, that is permanent, and it is logged as a warning naming
-  the recovery on every pass. **Inbound QoS 2 holds, outbound in-flight registers and
-  PUBREL consumers keep being reclaimed**: the record's identity and generation are
-  sound, so the references it contributes to the first two classes are complete, and the
-  PUBREL class reads no reference at all (its licence is the name's RETIRED ownership).
-  A record whose *identity* cannot be established — undecodable, unattributable, or
-  carrying a malformed `Gen` — is the stronger case and still aborts the whole pass.
-  Either way the recovery is the same: stop the account's brokers and reset the
-  broker-owned `$MQTT_*` streams — all ten, which are one recreation unit.
+  suppressed for every session in the account. (The retired affine **register** arm is not
+  behind the gate.) Since nothing removes the record, that is permanent, and it is logged
+  as a warning naming the recovery on every pass. **Inbound QoS 2 holds, outbound
+  in-flight registers and PUBREL consumers keep being reclaimed**: the record's identity
+  and generation are sound, so the references it contributes to the first two classes are
+  complete, and the PUBREL class reads no reference at all (its licence is the name's
+  RETIRED ownership). A record whose *identity* cannot be established — undecodable,
+  unattributable, or carrying a malformed `Gen` — is the stronger case and still aborts
+  the whole pass. Either way the recovery is the same: stop the account's brokers and
+  reset the broker-owned `$MQTT_*` streams — all ten, which are one recreation unit.
 
 Plain (non-shared) subscriptions no longer drop an unacknowledged QoS 1/2 PUBLISH
 on UNSUBSCRIBE — see the next section.
@@ -3178,35 +2998,32 @@ Residuals:
   Bounded by the Session Expiry Interval and by storage capacity — global stream
   limits on `$MQTT_msgs` are refused at startup (they would evict undelivered
   messages), so no stream limit bounds it.
-- **Stream-level consumer inactivity limits.** A drain must outlive an offline
-  period, and `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs` gives every
-  consumer a deletion timer that no consumer config can opt out of. Where that
-  limit is set — or cannot be read — the broker **refuses to drain**, and logs a warning
-  naming the limit. Since
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c-lc the
-  UNSUBSCRIBE no longer tears the consumer down: a
-  started QoS 1/2 delivery's obligation holds its source consumer, so the consumer is kept
-  until that obligation ends and only then retired. The started delivery is still not
-  RETRANSMITTED (its in-flight entry is purged, as before), so [MQTT-3.10.4-3] is honored
-  only where the client completes the delivery it already holds; a client that never
-  answers leaves the obligation, and the consumer it holds, standing until its generation
-  is discarded (see "A cancelled transmitted obligation retains its source consumer"
-  below). Running `$MQTT_msgs` without a stream-level consumer inactivity limit is
-  therefore a deployment requirement, exactly as it already is
-  for shared subscriptions. The `$MQTT_msgs` startup validator deliberately adds
-  no check here: the limit can be imposed *after* startup, so these runtime
-  refusals remain the authority (the same field **is** a startup failure on
-  `$MQTT_out`, whose affine durables must survive offline sessions — see
-  "Stream prerequisites" in `docs/ARCHITECTURE.md`).
-- **Per-consumer inactivity timers.** Since
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) the
-  broker creates every plain
-  QoS 1/2 source consumer (and the PUBREL consumer) with NO inactivity threshold,
-  and has no option that would request one, so there is no per-consumer timer to
-  clear when a drain is committed; the clearing mechanism is deleted. Admission
-  verifies the consumer's EFFECTIVE configuration as the server reports it and
-  refuses a consumer an administrator armed — see "The supported-configuration
-  boundary for consumer inactivity" below for what that snapshot cannot cover.
+- **Stream-level consumer inactivity limits.** A drain must outlive an offline period, and
+  `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs` gives every consumer a deletion timer
+  that no consumer config can opt out of. Where that limit is set — or cannot be read —
+  the broker **refuses to drain**, and logs a warning naming the limit. The UNSUBSCRIBE
+  does not tear the consumer down
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)): a started QoS
+  1/2 delivery's obligation holds its source consumer, so the consumer is kept until that
+  obligation ends and only then retired. The started delivery is still not RETRANSMITTED
+  (its in-flight entry is purged), so [MQTT-3.10.4-3] is honored only where the client
+  completes the delivery it already holds; a client that never answers leaves the
+  obligation, and the consumer it holds, standing until its generation is discarded (see
+  "A cancelled transmitted obligation retains its source consumer" above). Running
+  `$MQTT_msgs` without a stream-level consumer inactivity limit is therefore a deployment
+  requirement, exactly as it already is for shared subscriptions. The `$MQTT_msgs` startup
+  validator deliberately adds no check here: the limit can be imposed *after* startup, so
+  these runtime refusals remain the authority (the same field **is** a startup failure on
+  `$MQTT_out`, whose affine durables must survive offline sessions — see "Stream
+  prerequisites" in `docs/ARCHITECTURE.md`).
+- **Per-consumer inactivity timers.** The broker creates every plain QoS 1/2 source
+  consumer (and the PUBREL consumer) with NO inactivity threshold
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)), and has no
+  option that would request one, so there is no per-consumer timer to clear when a drain
+  is committed. Admission verifies the consumer's EFFECTIVE configuration as the server
+  reports it and refuses a consumer an administrator armed — see "The
+  supported-configuration boundary for consumer inactivity" above for what that snapshot
+  cannot cover.
 - **Plain QoS 1/2 durables are reconciled at CONNECT, and only there.** A
   resumed session verifies every plain QoS 1/2 consumer its record names —
   and recreates a reaped one under a fresh identity — **before the CONNACK**
@@ -3263,14 +3080,11 @@ Residuals:
     client re-grants them on its next connection — which, for a requested
     interval of 0, means the session ends at that close exactly as the client
     requested.
-  - A filter subscription restoration that fails no longer leaves an accepted
-    session behind it: restoration runs before the success CONNACK and a filter
-    it cannot install **refuses the CONNECT**
+  - Filter subscription restoration runs before the success CONNACK, and a filter it
+    cannot install **refuses the CONNECT**
     ([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54), see
-    `docs/ARCHITECTURE.md` "The restore gate"). The residual that used to sit
-    here — a filter skipped after the CONNACK, swept, and unavailable until the
-    next CONNECT — is retired with it. What replaces it is narrower and is
-    listed below: a filter that can never be restored refuses every resume.
+    `docs/ARCHITECTURE.md` "The restore gate"); an accepted session never has a
+    filter skipped behind it.
   - **A filter that can never be restored refuses every resume.** The reachable
     cause is a subscribe permission revoked since the filter was saved: the raw
     subscription install fails deterministically, so each `Clean Start = 0`
@@ -3293,81 +3107,44 @@ Residuals:
     a channel close and therefore negligible but not zero. The window ends at the
     open rather than at the CONNACK deliberately: opening first would let a woken
     delivery race the CONNACK write and reach the client ahead of it, violating
-    [MQTT-3.2.0-1]. The alternatives were worse: buffering is a new unbounded
-    mechanism, a NATS subscription's queue group cannot be joined late, and
-    installing the subscription outside the verdict makes a QoS 0 PUBLISH the
-    client's first packet, violating [MQTT-3.2.0-1]. For a **plain** filter the
-    same drop happens today, because no raw subscription exists in that window at
-    all.
+    [MQTT-3.2.0-1]. For a **plain** filter the same drop happens, because no raw
+    subscription exists in that window at all.
   - **A QoS 1/2 delivery withheld by a REFUSED resume can lose its
-    never-transmitted marker to a rebind, and then waits out AckWait.** (The
-    marker loss and the delayed redelivery are current; the **DUP consequence is
-    HISTORICAL** — see the closing note on this residual.) The refusal wakes every
-    withheld delivery so it can record itself, but it then returns and releases the
-    session's ownership gate, so a reconnect can bind before a woken callback runs. That
-    callback is stale — the marker is scoped to the connection that withheld the delivery
-    — so nothing records it. The message stays owed and is redelivered, but it **waits for
-    AckWait instead of being NAKed promptly forward**. Its first client-visible
-    PUBLISH used to carry DUP = 1; **that half is CLOSED
-    ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76), 2026-09-09)** and
-    is stated here as the historical diagnosis. DUP is now derived from the durable
-    unsent marker at one site, so a stale woken callback can no longer make a first
-    transmission carry it. **The lost prompt NAK and the AckWait delay remain open**
-    and are this residual's live content, as do the ordering residual and the
-    displaced-broker window below.
-
-    Two remedies were built and withdrawn across three review rounds: draining the
-    woken callbacks (a counter is not an admission barrier — a callback can be
-    descheduled before it registers, or arrive after the drain saw zero, and
-    delivery interest stays live until teardown), and deciding on the durable
-    rather than the connection (removes the race but not the lateness, and the set
-    of places a durable can live is neither complete nor sequence-precise). Closing
-    it needs a real callback-admission boundary, which this item does not justify.
-
-    **[issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76) owned
-    the DUP half and CLOSED it (2026-09-09)** — deriving the MQTT
-    flag from the JetStream delivery count was its defect, and DUP now follows the
-    durable per-identifier send-intent fact; see "Outgoing DUP on a first
-    transmission — CLOSED
-    ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76))" above.
-    What remains here is **not** that: it is
-    the lost prompt NAK, stated as
-    [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s own
-    residual. The population is new to this change:
-    before it, a restore failure never refused, so no marker was owed on that path.
+    never-transmitted marker to a rebind, and then waits out AckWait.** The refusal
+    wakes every withheld delivery so it can record itself, but it then returns and
+    releases the session's ownership gate, so a reconnect can bind before a woken
+    callback runs. That callback is stale — the marker is scoped to the connection that
+    withheld the delivery — so nothing records it. The message stays owed and is
+    redelivered, but it **waits for AckWait instead of being NAKed promptly forward**.
+    DUP is derived from the durable unsent marker at one site, so a stale woken callback
+    cannot make a first transmission carry it
+    ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)).
+    The lost prompt NAK and the AckWait delay are
+    [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s
+    own residual; closing it needs a real callback-admission boundary, which is not built.
   - **A shared QoS 1/2 delivery loses that marker even without the rebind race.**
     The ordinary close of the refused connection runs `purgeSharedPending`, which
     removes withheld markers for shared durables — deliberate behaviour that stops a
     resume NAK-stealing group messages. It gives up only a shared delivery PROVEN never
-    transmitted (withdrawn through the ordinary door since 7a); a possibly-transmitted one
-    keeps its identifier and custody, since a disconnect is not client completion. Kept as
-    a separate statement from the race above because it does not depend on any
-    interleaving. Fixing it means changing what a disconnect does to shared pending state,
-    which is not [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s.
-  - **A timed-out affine gate wait fell into
-    [issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)'s
-    population, since CLOSED.** An
-    affine QoS 2 copy that reaches its callback before the CONNACK waits, and a wait
-    that runs out returns the copy unacknowledged. **The diagnosis that follows is
-    historical.** The affine path used to derive DUP from the JetStream delivery
-    count, so the redelivery could carry DUP on a first transmission — which was
-    [issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)'s defect
-    and is **CLOSED (2026-09-09)**. DUP is now the durable
-    per-identifier send-intent fact at one derivation site, and no path derives it
-    from the delivery count. The wait itself still stands; waiting rather than
-    dropping is what keeps the ordinary case out of the population at all.
+    transmitted (withdrawn through the ordinary door); a possibly-transmitted one keeps
+    its identifier and custody, since a disconnect is not client completion. It does not
+    depend on any interleaving. Fixing it means changing what a disconnect does to
+    shared pending state, which is not
+    [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s.
+  - **A timed-out affine gate wait returns its copy unacknowledged.** An affine QoS 2
+    copy that reaches its callback before the CONNACK waits, and a wait that runs out
+    returns the copy unacknowledged. Its redelivery takes DUP from the durable
+    per-identifier send-intent fact, never from the JetStream delivery count
+    ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)).
+    Waiting rather than dropping is what keeps the ordinary case out of this population.
   - **A displaced broker can acknowledge and serve, and the window has no upper
     bound.** Nothing at the CONNACK proves this broker still owns the record: the
     accept CAS arbitrated one instant, restoration only aggregates local failures,
     and an unchanged lifetime, an already-recorded affine consumer and ordinary
     shared restoration all write nothing. So a peer can take the record while this
     broker restores, and this broker still sends its CONNACK and serves until the
-    eviction closes it. Moving restoration before the CONNACK does not change that
-    consequence — under the old order the same interleaving served the client from
-    an earlier CONNACK onward, and one interleaving strictly improves, since a
-    displaced broker whose restoration fails now refuses instead of silently
-    dropping a filter. What it does add is one QoS 0 loss shape inside that
-    window: a group message selected for the displaced member is dropped rather
+    eviction closes it; a displaced broker whose restoration fails refuses. Inside
+    that window a group message selected for the displaced member is dropped rather
     than transmitted to its stale connection. Convergence rests on the
     session-record watch and the record-state backstop; the backstop's interval
     (15 minutes by default) is the **first opportunity**, not a bound — a busy or
@@ -3390,13 +3167,11 @@ Residuals:
   admitted as a fresh delivery if no other existing guard suppresses it, and the client then
   receives the payload a second time. Terminal cleanup may still be owned elsewhere at that
   point. The schedule needs the source durable's delivery callback held across the PUBREL
-  delivery and the client's PUBCOMP round trip, through the reservation's release; before
-  [issue #117](https://github.com/nberlee/mqtt-nats-broker/issues/117) the same
-  gap opened at PUBREC. Closing it would need a separate queue-boundary
-  mechanism (declining a source for the offers already queued on its subscription when the
-  acknowledgement was confirmed), which is not built. The experimental session-affine class
-  keeps its existing order. See "An acknowledged PUBLISH is not sent again" in
-  `docs/ARCHITECTURE.md`.
+  delivery and the client's PUBCOMP round trip, through the reservation's release. Closing
+  it would need a separate queue-boundary mechanism (declining a source for the offers
+  already queued on its subscription when the acknowledgement was confirmed), which is not
+  built. The experimental session-affine class keeps its existing order. See "An
+  acknowledged PUBLISH is not sent again" in `docs/ARCHITECTURE.md`.
 - **A drained QoS 2 source is held until its PUBREL is proven.** An ordinary QoS 2
   PUBREC acknowledges the stored message as soon as the PUBREL is stored. A
   *drained* one does not: on the interest-retained `$MQTT_out` a store with no
@@ -3429,8 +3204,8 @@ Residuals:
     companion and option changes — can remain unapplied once the accept save lands.
     The client must re-issue the operation. Same residual class as the existing
     `draining -> draining, differing` conflict.
-- **Drain retirement proves disposal before releasing the sid (FIXED), with three
-  stated residuals.** Retirement now releases the sid and closes the delivery path
+- **Drain retirement proves disposal before releasing the sid, with one stated
+  residual.** Retirement releases the sid and closes the delivery path
   under **one** `sess.mu` hold — `sub.mqtt.closed` is set together with the map drop —
   so an already-dispatched delivery callback cannot pass its checks after map removal
   and reach ordinary PUBLISH processing. That closes the disposal route to the same
@@ -3438,35 +3213,22 @@ Residuals:
   [issue #96](https://github.com/nberlee/mqtt-nats-broker/issues/96) closed
   through adoption. The drain object is **terminally**
   marked, so neither a SUBSCRIBE rollback's shallow snapshot, nor the resume's restore,
-  nor the two-map re-insertion helper, nor an inactivity-timer clear can hand it back to
-  this session object. The consumer delete is issued with a wait and **classified**:
-  deleted, confirmed already absent, or unknown. Reconciliation's direct consumer-absent
-  removal refunds its local consumer charge on a proven-landed save.
+  nor the two-map re-insertion helper can hand it back to
+  this session object. The drain does not delete its consumer: its confirmed omission is
+  the disposal decision, handed to the session's retirement owner, which retires the name
+  and performs the classified delete once nothing holds the consumer
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c-lc; see
+  "Retirement and disposal" in `docs/ARCHITECTURE.md`). Reconciliation's direct
+  consumer-absent removal refunds its local consumer charge on a proven-landed save.
 
-  Three residuals remain, and each is a real limit rather than a restatement:
+  One residual remains, and it is a real limit rather than a restatement:
 
-  - Reclamation of a durable whose delete could **not be confirmed** is *eventual*, not
-    prompt: the orphaned-consumer sweep reclaims it on a later pass that completes its
-    consumer listing and its record walk and whose own delete succeeds, and it
-    deliberately spares a consumer that any session record — a fork sibling's included —
-    still names. There is no retry loop and no reaper of its own. The unknown outcome is
-    reported so an operator can see it. The consumer's still-pending messages, both
-    re-offers of exchanges the record no longer claims and fresh messages on a filter the
-    client unsubscribed from, go with it; no client is owed either, and deleting the
-    consumer does not destroy a message another consumer still holds interest in.
   - Terminal retirement is scoped to the retiring **session object**, not to the
     incarnation: a record restore builds a new session object while preserving the
     generation, so a fork sibling's record that still names the drain can rebuild it on a
-    fresh `*mqttDrain`, and a delete the retiring object issued can land on that rebuilt
-    consumer. This is **pre-existing and unwidened** — the previous unconfirmed delete had
-    the identical exposure, and confirming the request adds no reconstruction route and no
-    deletion authority. Closing it would need a retirement fact a *sibling's* record could
+    fresh `*mqttDrain`, and the disposal the retiring object decided can delete that
+    rebuilt consumer. Closing it would need a retirement fact a *sibling's* record could
     see, which no record of ours can supply.
-  - An inactivity-timer clear already in flight when a drain is retired can land after the
-    disposal, recreating the durable under a retired name. It is absent from the retiring
-    object's maps and delivery path, so that object delivers nothing on it, and the same
-    sweep reclaims it once no resident object and no session record reference it — under
-    both qualifications above.
 - **A drain whose completion is retried after a failed save keeps its consumer until
   resume settlement or generation disposal
   ([issue #126](https://github.com/nberlee/mqtt-nats-broker/issues/126)).** When
@@ -3489,67 +3251,28 @@ Residuals:
   in-session disposal after the failure. The mechanism is in code the
   [issue #99](https://github.com/nberlee/mqtt-nats-broker/issues/99)/ [issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90)
   close-out leaves unchanged against `d784cdb`; it was observed with that change applied
-  and not separately reproduced on `d784cdb`. Filed as
-  [issue #126](https://github.com/nberlee/mqtt-nats-broker/issues/126) in
-  `docs/ROADMAP.md` §0.3
-  and accepted there as this residual on 2026-10-12: it needs a failed last-claim removal
-  save.
+  and not separately reproduced on `d784cdb`. It needs a failed last-claim removal save.
 - **A live SUBSCRIBE reclaims a drain that cannot deliver.** A resume can leave a
   drain with no delivery subscription — CONNECT withholds source interest from
   **every** QoS 2 drain when PUBREL subscription setup fails, including drains holding
   only PUBLISH-phase claims that no hold covers, and a restore whose own
   `processQOS12Sub` failed leaves the same shape. A QoS > 0 re-SUBSCRIBE over such a
-  drain now installs its delivery subscription and adopts it in one step, with the
-  terms the client asked for, or answers the filter `0x80`. Previously the filter was
-  granted and then delivered nothing for the rest of the connection, with no log line
-  and no reason code.
+  drain installs its delivery subscription and adopts it in one step, with the
+  terms the client asked for, or answers the filter `0x80`.
 
-  The **barrier-skipped** route once listed here was never live and the claim is
-  withdrawn: every durable in the PUBREL barrier's skip set is intent-bearing by
-  construction, so
+  A **barrier-skipped** drain is not in this population: every durable in the PUBREL
+  barrier's skip set is intent-bearing by construction, so
   [issue #96](https://github.com/nberlee/mqtt-nats-broker/issues/96)'s hold
   refuses its adoption for as long as the drain object
   exists.
 
-  The residuals below are deliberate. Two of the original three are now **CLOSED**; what
-  remains is filed as its own release-blocking finding rather than fixed here, alongside one
-  residual this repair introduces:
-  - ~~**A filter that fails after adopting can strand its durable.**~~ **CLOSED for the
-    absent-membership case**, which was the release-blocking one, and it was worse than
-    "strand": between the adoption and the packet's final update the record named the
-    durable **nowhere**, so a sibling broker's orphan sweep deleted a live session's
-    consumer with its started deliveries — no crash, no failure, same-version peers, on an
-    interest-retained stream. An adopted drain is now **retained and named continuously**,
-    in `Cons` where the membership survives and in `Drains` where it does not, and
-    `Drains` omission is authorized only by an owned retirement transition rather than
-    by a claim count. The post-adoption claim loss is closed too: a restored drain's
-    persisted `Started` set is a **floor**, and a delivery a recovered register
-    evidences as possibly attempted is enrolled rather than acked away — which also
-    stops its packet identifier being held for the life of the session with no
-    delivery left to discharge it. Mechanism in `docs/ARCHITECTURE.md` under "An
-    adopted durable is named continuously (I8)" and "A restored drain's claim set is
-    a floor".
-
-    **Still open, and deferred to its own `docs/ROADMAP.md` §0.3 bullet:** the **CONNECT
-    restore** route, where a persisted QoS 0 membership over a live `Cons` entry reaches
-    `execDeferredConsumerDelete` **inline** during restoration and destroys the
-    outstanding exchanges. That is the mirror case — where the membership key is absent the
-    record forgot the durable, and where it is present at QoS 0 the restore destroys it —
-    and it needs a restore-side persistence and completion contract of its own.
+  Two residuals remain:
   - **An already-empty drain reference whose removal write definitely failed is retried
     only by the next resume.** `recoverDrains` revisits it before its no-plans return,
     subject to that pass's own eligibility and skip guards, but there is no periodic pass:
     a connection that never resumes **can** hold that reference, and its consumer, until a
     later adoption or the session's destruction ends it. The failure mode is a retained
     reference, never a lost message.
-  - ~~An already-started QoS 2 exchange reclaimed by a QoS 1 re-SUBSCRIBE is
-    retransmitted at QoS 1.~~ **CLOSED.** A started exchange's QoS is now a property of
-    the exchange: it is carried on the pending entry, sourced from the in-flight
-    register's own QoS on recovery, and read under the lock that admits the send rather
-    than recomputed from the subscription. The population was larger than this entry
-    said — the plain existing-consumer refresh reaches it with no drain, no UNSUBSCRIBE
-    and no reclaim — and both directions are fixed. See the exchange-QoS section of
-    `docs/ARCHITECTURE.md` for the mechanism and for what it does **not** cover.
   - **A closed-but-present delivery subscription under a live `cons[sid]`.** A QoS 0
     downgrade closes the delivery while deliberately keeping the consumer entry until the
     packet's **final-update boundary** — later than any per-filter occurrence — so one
@@ -3566,10 +3289,9 @@ Residuals:
   durable per drained filter until its session ends.
 
 Shared-subscription QoS 1 redistribution to another member remains permitted. The
-QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade is **no longer out of scope**: it replaces a
-subscription rather than removing one, and it now drains that subscription's started
-deliveries exactly as a removal does — see "A QoS 0 re-SUBSCRIBE drains rather than
-destroys" below.
+QoS 1/2 → QoS 0 re-SUBSCRIBE downgrade replaces a subscription rather than removing
+one, and it drains that subscription's started deliveries exactly as a removal does —
+see "A QoS 0 re-SUBSCRIBE drains rather than destroys" below.
 
 ### A started exchange keeps the QoS it was first transmitted at
 
@@ -3577,31 +3299,31 @@ A subscription's maximum QoS is an input to a message's **first** transmission a
 nothing else. A re-SUBSCRIBE may replace a filter's maximum QoS at any time
 ([MQTT-3.8.4-3]) and must not interrupt a publication already in flight, so once
 transmitted a message's QoS is a property of that exchange and every retransmission
-carries it unchanged. Both directions are honored: a downgrade no longer abandons a
-QoS 2 handshake, and an upgrade no longer drives a PUBREC whose slot transition the
+carries it unchanged. Both directions are honored: a downgrade does not abandon a
+QoS 2 handshake, and an upgrade does not drive a PUBREC whose slot transition the
 CAS refuses.
 
-**Three limitations are stated rather than implied.**
+**Two limitations are stated rather than implied.**
 
-- ~~**A QoS 1/2 → QoS 0 re-SUBSCRIBE is not covered.** That path does not retransmit at
-  all: it closes delivery, purges pending exchanges and registers, and deletes the
-  consumer, destroying outstanding exchanges outright.~~ **CLOSED for a live
-  SUBSCRIBE.** That path is teardown rather than transmission, so it was never the
-  exchange-QoS fix's to widen; it is fixed instead by making the downgrade **convert its
-  consumer into a drain** — see "A QoS 0 re-SUBSCRIBE drains rather than destroys" below
-  and `docs/ARCHITECTURE.md` under "UNSUBSCRIBE drain". Two residuals remain and are
-  stated there, not here: a stream-imposed consumer inactivity limit, and the **CONNECT
-  restore** path.
-- **The replacing allocation's lifecycle is not covered.** Where a register for the
-  same delivery already exists, written by another broker, an admitted replacement
-  **preserves the occupant's QoS** and a successful confirmation threads the QoS the
-  record actually landed holding back onto the pending entry. That does **not**
-  guarantee the inherited exchange survives concurrent cancellation or failed-store
-  settlement: those are pre-existing lifecycle defects of the replacement arm and are
-  consolidated into
-  **[issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90)**'s
-  bullet in `docs/ROADMAP.md` §0.3, which is the single
-  authoritative home for that seam and remains an unfixed release blocker.
+- **The replacing allocation keeps the inherited exchange but does not serve it on this
+  connection.** Where a register for the same delivery already exists, written by
+  another broker, an admitted replacement **preserves the occupant's QoS** and a
+  successful confirmation threads the QoS the record actually landed holding back onto
+  the pending entry. A cancellation before confirmation that meets a landed
+  register-only replacement destroys nothing: the cancelled placeholder goes, the
+  identifier stays excluded and the custody ledger keeps the exchange's charge. A store
+  that fails after adoption with the allocation still uncancelled keeps the identifier
+  excluded until a confirmed absence settles it and, when the attempt may have landed,
+  withholds the source's offers under admission continuity (the residual "An admission
+  that may have landed withholds its source rather than doubling it" above); one
+  cancelled while its store was in flight is settled by the cancellation's own durable
+  rung. In both cases no live entry is rebuilt for
+  the inherited exchange on this connection: it is neither retransmitted nor enrolled in
+  a drain there, and the next resume restores the register as a possibly-attempted
+  delivery. While the replacement's store is unconfirmed, a client's PUBACK or PUBREC
+  for the inherited exchange is declined, and nothing replays it. The closed analysis is
+  [issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90)'s and
+  [issue #99](https://github.com/nberlee/mqtt-nats-broker/issues/99)'s.
 - **Shared-subscription QoS 2 is not covered.** An effective-QoS-2 shared delivery
   branches into the affine move before the identifier is allocated, so that route is
   untouched. Shared subscriptions are capped at granted QoS 1 for the alpha, so the
@@ -3615,7 +3337,7 @@ interrupting the flow of publications. So a re-SUBSCRIBE at QoS 0 over a live Qo
 subscription may neither be refused nor made to wait, and the QoS 1 or QoS 2 exchanges
 the broker has already transmitted on that filter must still complete.
 
-They now do. The downgrade converts its consumer into a **drain** instead of deleting
+The downgrade converts its consumer into a **drain** instead of deleting
 it: the durable and its messages survive, the started exchanges are retransmitted and
 completed under their original packet identifiers, and the QoS 0 filter is served by the
 raw subscription — so a fresh message reaches the client once, at QoS 0, while the drain
@@ -3632,10 +3354,10 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
   what it costs. The identical limitation applies to UNSUBSCRIBE and is stated above.
 - **The CONNECT restore path is covered too, by a boundary of its own.** A session can hold
   a QoS 0 membership *and* a live consumer entry for the same filter — what a failed drain
-  adoption leaves behind. Resume reconciliation skips QoS 0 memberships, so the restore used
-  to reach the existing-consumer arm and delete that consumer **inline**, with its started
-  exchanges. It now defers instead, and a restore-side boundary converts the consumer
-  into a drain and makes that durable before anything is torn down; `restoreDrains` then
+  adoption leaves behind. Resume reconciliation skips QoS 0 memberships, so the restore
+  reaches the existing-consumer arm; there it defers the delete, and a restore-side
+  boundary converts the consumer into a drain and makes that durable before anything is
+  torn down; `restoreDrains` then
   gives the drain source interest as it does for any record-restored one. A
   stream-imposed consumer inactivity limit disables it there exactly as it does for the
   live path, and the destructive teardown stands. The drain keeps QoS 0 — the value its
@@ -3654,11 +3376,10 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
   This can retain state indefinitely. In particular, a restore-converted QoS 0 drain can
   complete a QoS 1 exchange with the client, release its register, and then definitely fail
   the save removing its claim. The restored claim, durable consumer and source message can
-  remain retained even after storage recovers and across reconnects or restarts. This change
-  provides no automatic repair for that state; clearing the session discards the retained
-  session state rather than completing an outstanding exchange. The restore conversion makes
-  this retention case reachable for the newly converted population. Positive-QoS drains
-  retain their existing behavior.
+  remain retained even after storage recovers and across reconnects or restarts. The
+  broker provides no automatic repair for that state; clearing the session discards the
+  retained session state rather than completing an outstanding exchange. Positive-QoS
+  drains retain their existing behavior.
 - **A retransmission's Subscription Identifier and Retain As Published come from the
   membership that survives.** A restore-converted drain has no subscription to copy delivery
   options from, so those two are taken from the record's current values for the same filter.
@@ -3672,8 +3393,7 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
   across the packet; it does not close it.
 - **A withheld marker is not crash-safe.** The evidence that a cancelled or
   cap-withheld delivery was never transmitted lives in memory, so a process crash loses
-  it and that delivery's eventual first transmission carries DUP=1. Pre-existing, and
-  unchanged by this.
+  it and that delivery's eventual first transmission carries DUP=1.
 - **"Transmitted" means what the drain's existing classification means.** Register
   confirmation and actual transmission are not equivalent; the exchanges preserved are
   the ones that classification enrols, and the existing transmission and DUP residuals
@@ -3724,11 +3444,10 @@ graded-QoS inaccuracy on one message is preferred to duplication or loss. The tr
 the replacement uncertainty window. **What is guaranteed is narrower than "for that
 exchange's lifetime":** the admitted replacement preserves the occupant's QoS byte, and a
 successful confirmation threads the QoS the record landed holding back onto the pending
-entry. Whether the inherited exchange then survives a failed-store settlement is still
-[issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90)'s, per the
-residual above.
+entry. What happens to the inherited exchange after a cancellation or a failed store
+is stated in the replacing-allocation limitation above.
 
-**A cancellation of the replacing allocation no longer frees the identifier.** A
+**A cancellation of the replacing allocation does not free the identifier.** A
 cancellation is not evidence that a PUBLISH was never sent
 ([issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90): the release authority
 admits a never-transmitted release only on the allocation's standing unsent marker), so a
@@ -3765,68 +3484,44 @@ On resume both are read back before any source interest exists, so the redeliver
 reuses the identifier the client is holding and a fresh allocation cannot collide
 with one. See "Outbound in-flight registers" in `docs/ARCHITECTURE.md`.
 
-What this closes, beyond the deviation itself: an allocation could previously mint an
-identifier that an unreplayed PUBREL record still owned, because the in-memory PUBREL
-map was empty until that record was delivered.
-
 Residuals:
 
-- **CLOSED by
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c:
-  retained-message deliveries are covered across a restart, and so
-  is the identifier.** An admitted retained QoS 1/2 delivery has a register, an exchange
-  and a copy, so a restart restores it like an ordinary one — replayed from its verified
-  bytes under its original identifier (DUP when possibly sent), its PUBREL from the
-  canonical record — and the identifier is the ledger's, never re-minted while a QoS 2
-  client holds it. What
-  [issue #93](https://github.com/nberlee/mqtt-nats-broker/issues/93) built for
-  the in-memory phase now covers only the STAGED
-  allocation between the snapshot and the admission, which a crash loses together with the
-  replay ("Retained delivery through the manifest" below).
-- **[issue #94](https://github.com/nberlee/mqtt-nats-broker/issues/94) and
-  [issue #95](https://github.com/nberlee/mqtt-nats-broker/issues/95) are
-  advanced by the assembled seventh increment but NOT fully closed —
-  one open item remains (#2, the custody-after-drain stall, below).** The sixth attempt
-  built the owner slot, admission, terminal release and
-  [issue #95](https://github.com/nberlee/mqtt-nats-broker/issues/95)'s ordered
-  handoff, then
-  stopped at a no-ship verdict. The final increment added universal pre-CONNACK custody
-  refresh over the positive eligible set, restored admission's current-custody check,
-  closed the census, and made terminal deletion conditional on a complete same-exchange
-  PUBREL scan with affine-proof-first confirmed disposal and a final freshness reread.
-  What follows describes the resulting mechanism;
-  [issue #94](https://github.com/nberlee/mqtt-nats-broker/issues/94) and
-  [issue #95](https://github.com/nberlee/mqtt-nats-broker/issues/95) stay unchecked in
-  `docs/ROADMAP.md` pending #2, whose ruled fix is recorded as Decision 7 in the work lane.
-  A stored PUBREL is no longer transmitted under an identifier another exchange owns. One
+- **Retained-message deliveries are covered across a restart, and so is the identifier**
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c). An admitted
+  retained QoS 1/2 delivery has a register, an exchange and a copy, so a restart restores
+  it like an ordinary one — replayed from its verified bytes under its original identifier
+  (DUP when possibly sent), its PUBREL from the canonical record — and the identifier is
+  the ledger's, never re-minted while a QoS 2 client holds it. What
+  [issue #93](https://github.com/nberlee/mqtt-nats-broker/issues/93) built for the
+  in-memory phase covers only the STAGED allocation between the snapshot and the
+  admission, which a crash loses together with the replay ("Retained delivery through the
+  manifest" below).
+- **A stored PUBREL is not transmitted under an identifier another exchange owns**
+  ([issue #94](https://github.com/nberlee/mqtt-nats-broker/issues/94),
+  [issue #95](https://github.com/nberlee/mqtt-nats-broker/issues/95)). One
   `$MQTT_inflight` record — the owner slot — owns an exchange for its whole life, so the
-  identifier has exactly one durable claimant instead of two independently changing durable
-  sets nothing could arbitrate between; and no SLOT-BACKED PUBREL bytes go out without
-  first ATOMICALLY ACQUIRING a non-revocable action on that slot. A live retained exchange
-  is no exception since 7c: it has a register, and its PUBREL is acquired on it and
+  identifier has exactly one durable claimant; and no SLOT-BACKED PUBREL bytes go out
+  without first ATOMICALLY ACQUIRING a non-revocable action on that slot. A live retained
+  exchange is no exception: it has a register, and its PUBREL is acquired on it and
   written from its canonical record on `$MQTT_inflight`. A record naming a different
   exchange is refused and, deliberately, **not acknowledged**: AckWait re-offers it, so a
-  refusal can never lose a PUBREL the client is owed.
-  [issue #95](https://github.com/nberlee/mqtt-nats-broker/issues/95) goes with
-  it — a completed
-  exchange leaves no `pendingPublish` entry and no `cpending` mapping, so it no longer
-  reserves an identifier and a Receive Maximum slot for the life of the session.
+  refusal can never lose a PUBREL the client is owed. A completed exchange leaves no
+  `pendingPublish` entry and no `cpending` mapping, so it does not reserve an identifier
+  and a Receive Maximum slot for the life of the session.
 
   **THE RESIDUAL: an abandoned action holds its identifier for an unbounded TIME.** An
   abandoned action is any acquired action whose holder can no longer confirm its durable
   drain.
 
-  **[issue #100](https://github.com/nberlee/mqtt-nats-broker/issues/100) WIDENS
-  THIS RESIDUAL from the PUBREL path to every outbound QoS 1/2
-  transmission.** A PUBLISH transmission now acquires a durable action of its own, because
-  the process-memory hold it had before fenced no peer: two brokers may legitimately serve
-  one incarnation, so `sendsInFlight` excluded nobody, and `recordSendIntent` records
-  nothing at all on a retransmission (it returns `intentNone` whenever the marker is
-  already gone). The exclusion is real now, and so is its cost: **an ordinary QoS 1
-  delivery, or any QoS 1/2 retransmission, whose broker dies mid-send strands its
-  identifier, its Receive Maximum capacity and the drain serving that source** until the
-  holder confirms the drain, the generation is discarded, or an operator intervenes. The
-  ends listed below are unchanged; only the population reaching them is larger.
+  **[issue #100](https://github.com/nberlee/mqtt-nats-broker/issues/100) WIDENS THIS
+  RESIDUAL from the PUBREL path to every outbound QoS 1/2 transmission.** A PUBLISH
+  transmission acquires a durable action of its own: two brokers may legitimately serve
+  one incarnation, so a process-memory hold would fence no peer. The exclusion is real,
+  and so is its cost: **an ordinary QoS 1 delivery, or any QoS 1/2 retransmission, whose
+  broker dies mid-send strands its identifier, its Receive Maximum capacity and the drain
+  serving that source** until the holder confirms the drain, the generation is discarded,
+  or an operator intervenes. The ends listed below are the same; only the population
+  reaching them is larger.
 
   **A graceful shutdown joins every admitted PUBLISH send section**, and re-attempts every
   unresolved drain and terminal cleanup by its holder,
@@ -3904,16 +3599,15 @@ Residuals:
   interval. A retained exchange's PUBREL is no stored record since 7c: an emission that
   could not acquire is re-attempted by the session's continuation worker.
 
-  **The custody gap from the sixth attempt is closed at recovery, with one open residual
-  after a drain (#2 below).** Before source interest is restored,
-  recovery contests every positively eligible publish or past-PUBREC slot and rewrites its
-  custody to the current session acceptance. Admission requires that current claim before
-  it can acquire an action. The positive set includes a retired `pubrel_ready` slot only
-  when a present PUBREL record names its exact source, identifier and exchange nonce: that
+  **Custody is restored at recovery.** Before source interest is restored, recovery
+  contests every positively eligible publish or past-PUBREC slot and rewrites its custody
+  to the current session acceptance. Admission requires that current claim before it can
+  acquire an action. The positive set includes a retired `pubrel_ready` slot only when a
+  present PUBREL record names its exact source, identifier and exchange nonce: that
   evidence means the client is still waiting for the step admission can acquire. A retired
   flag alone, a cancelled slot, an active action and a terminal slot receive no custody
-  rewrite. A slot observed concurrently moving into an action or terminal state is withheld
-  rather than overwritten.
+  rewrite. A slot observed concurrently moving into an action or terminal state is
+  withheld rather than overwritten.
 
   A stored PUBREL with no surviving authority remains a deliberate fail-closed residual:
   it is refused rather than acknowledged, so genuine residue may occupy `$MQTT_out` space
@@ -3949,13 +3643,13 @@ Residuals:
   indeterminate cleanup keeps that reservation and retries through the shutdown-aware
   worker gate until the durable consequence is proven.
 
-  **Related, and narrower — CLOSED.** Custody transfer is still withheld for a slot with a
+  **Related, and narrower.** Custody transfer is still withheld for a slot with a
   live action, so a takeover completes for the rest of the session while that one exchange
   stays non-actionable until the action drains; a holder that already acquired an action
   completes it across a later acceptance, so a successor may see one PUBREL written to the
   predecessor's closing socket for a real past-PUBREC exchange, with nothing durable
   landing under the superseded acceptance. The drain then clears the action fields but
-  leaves the predecessor's Claim — and the successor now REPAIRS that at admission rather
+  leaves the predecessor's Claim — and the successor REPAIRS that at admission rather
   than waiting for a reconnect: a stored PUBREL that passes every admission condition
   except custody moves custody to the proving incarnation, once per delivery, and the
   consumer's own re-offer is the retry. The transmission fence
@@ -4006,14 +3700,13 @@ Residuals:
   owns exclusion across terminal cleanup
   and PUBREC advancement including the store-before-phase window.
 
-  **Scope since the
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) PUBCOMP
-  arm: affine slots only** (shared slots were in scope until
-  7a made them ordinary; a shared delivery is QoS 1 and has no PUBCOMP at all). For an ORDINARY
-  exchange step 3 no longer happens — PUBCOMP withholds the canonical PUBREL's acknowledgement
-  until the completion is recorded on the exchange and the slot — and step 6 no longer happens
-  either: recovery finishes an ordinary `pubrel_ready` slot only beside a durably Terminal
-  exchange, never on an absence. The schedule above remains for the slot-only classes.
+  **Scope since the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
+  PUBCOMP arm: affine slots only** (a shared delivery is QoS 1 and has no PUBCOMP at all).
+  For an ORDINARY exchange step 3 no longer happens — PUBCOMP withholds the canonical
+  PUBREL's acknowledgement until the completion is recorded on the exchange and the slot —
+  and step 6 no longer happens either: recovery finishes an ordinary `pubrel_ready` slot
+  only beside a durably Terminal exchange, never on an absence. The schedule above remains
+  for the slot-only classes.
 
   **A past-PUBREC reservation with no record is reaped only on a resume that proves source
   completion
@@ -4029,20 +3722,17 @@ Residuals:
   **What is NOT repaired, and it predates this mechanism.** There is no general
   successor-side reconciliation of stranded LOCAL PUBREL reservations. If a peer completes
   an exchange and removes the slot and its canonical record before this broker completes
-  its own local release path, this broker can retain the identifier and its Receive Maximum
-  charge indefinitely — including an empty withheld reservation, and an entry whose
-  acknowledgement subject was filled before a transmission that did not happen. A
+  its own local release path, this broker can retain the identifier and its Receive
+  Maximum charge indefinitely — including an empty withheld reservation, and an entry
+  whose acknowledgement subject was filled before a transmission that did not happen. A
   same-object reconnect does not guarantee release; rebuilding the session object from
   durable state removes purely local residue, and a whole-generation discard clears it. At
   Receive Maximum 1 one such reservation blocks further outbound QoS 1/2 delivery. It
   requires a completion overlapping a takeover or a recovery, has no trigger in
   single-broker steady state or on a clean takeover, and is not a cost of the inline
   custody repair — the same reservation is reachable without it. A malformed or
-  marker-less PUBREL record is never
-  interpreted and costs stream space rather than an identifier. A **retained** QoS 2
-  exchange's PUBREL is not authorized across a restart — it has no register at all, so its
-  authority is the live in-memory owner identity of that incarnation — and its record is
-  refused rather than dropped.
+  marker-less PUBREL record is never interpreted and costs stream space rather than an
+  identifier.
 - **What IS enforced today, stated narrowly on purpose.** A stored PUBREL carries a
   mandatory `Nmqtt-Q2Owner` exchange identity, and a record whose identity is absent or
   malformed is **withheld** by the delivery callback — never transmitted and never
@@ -4052,83 +3742,59 @@ Residuals:
   carries a mandatory owner nonce AND the packet identifier the client is waiting on,
   and a record found for that intent must match **both** exactly before the drain claim
   is finalized; a mismatch is treated as no record and the exchange's own is recreated.
-  The identifier half was missing until a review round found it: a record with the right
-  source and the right exchange under a foreign identifier confirmed the intent, after
-  which the original exchange had no PUBREL and no evidence left to rebuild one from.
   Every production write of an in-flight register is validated against one legal-shape
   matrix and **refused rather than written** if it does not conform.
 - **An in-flight register's schema is CLOSED, and its shape is enforced on both sides of
   the boundary.** Every path that WRITES one is validated at the single write boundary and
   refused rather than written. Every path that READS one decodes through a single decoder
   that rejects **any unrecognised field**, any case variant of a known one and any
-  duplicate member, and then applies the same matrix — so an illegal
-  body, or one carrying a field this broker does not define, is **unreadable**, exactly as
-  malformed JSON is, and may not authorize a mutation, a deletion or an identifier release.
-  The closed schema replaced five declared-but-unproduced fields whose only function was to
-  refuse themselves; that was an incomplete closed schema, since a sixth plausible control
-  field would have been dropped silently by the JSON decoder and the record read as an
-  ordinary legal register.
-  Two review rounds were needed to close the read half. The first left the matrix governing
-  writes only, so an unsupported shape read back counted as readable; the second found that
-  validating it in the recovery scan alone still left the destructive readers — drain
-  identity release, the gated reap and generation teardown — trusting an identity-valid but
-  illegal body. Enumerating readers was the defect, so the rule is now a property of the
-  one decoder rather than a check repeated per site.
-  Recovery restores every valid state according to its phase: publish entries return to
-  the publish maps, ready/sending states reserve the PUBREL exchange or its action, and
-  terminal states finish only through the terminal disposal gate. An invalid or absent
-  state is quarantined and cannot authorize a mutation, deletion or release.
-  An earlier revision tolerated an absent state as "what earlier writers produced". That
-  was rolling-upgrade machinery, which this project's compatibility boundary forbids
-  outright, and it was also incoherent: every shared register is claim-rewritten through
-  the write boundary, whose validator refuses an absent state, so a tolerated record
-  became an unresumable session a moment later. Pre-alpha, with no releases anywhere,
-  there is no population to serve — a developer stream carrying older records resets, and
-  the ten broker-owned streams are one recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)).
-- **A marker-less drain intent does NOT refuse the session record, contrary to the
-  plan.** A past-PUBREC intent that nothing can attribute — no usable exchange identity, or
-  no packet identifier — is restored and marked
-  **non-finalizable** — the same treatment a duplicate register gets, because which record
-  the client holds is unknowable — so nothing finalizes on evidence it cannot attribute. The
-  documented whole-record read-only refusal is **not built**: it needs an error
-  propagated through normal restore, expiry, teardown and fork-repair, and an earlier
-  attempt that simply dropped the drain was worse than restoring it, since the session
-  was then accepted without a drain whose consumer and pending exchange were stranded.
-  The broker does not write such a record — the intent's identity is validated before
-  it is saved — so this is a tolerance for records from elsewhere, not a supported shape.
-  The PHASE is read from the `PubRel` flag alone. An earlier revision required a nonzero
-  packet identifier alongside it, which folded "past PUBREC but unattributable" into "not
-  past PUBREC" — restoring such a record as an ordinary claimed source, eligible to have
-  its payload redelivered to a client that had already answered it. Whether an intent can
-  be acted on is a separate question, and its answer is the quarantine; the drain's durable
-  also joins the resume SKIP set, so no source interest is restored for it.
-  A **SUBSCRIBE** that names such a drain is refused with a failure code, **fork repair
-  refuses the whole filter change**, and each refusal covers **every sid the filter owns**:
-  a wildcard's level-up companion is quarantined
-  independently of its main sid, and refusing them one at a time adopted the usable one
-  before failing, which the next successful save turned into a lost drain. The client can
-  restore the filter only by removing the record.
-- **Adopting a drain no longer erases an unfinished past-PUBREC intent
-  ([issue #96](https://github.com/nberlee/mqtt-nats-broker/issues/96), FIXED).**
-  A re-SUBSCRIBE over a draining filter, and fork repair's destructive rows, used to remove
-  the drain from both maps and persist no `Started` obligations — so the stored PUBREL could
-  complete on the ordinary non-drain path while the unacknowledged source was free to
-  redeliver as a fresh PUBLISH, duplicating an exchange the client had already answered.
-  **Every** past-PUBREC intent now holds its sid, not just the unattributable subset, and
-  the refusal is protocol-visible: the client sees `SUBACK 0x80` for that filter. The hold
-  is released when the drain is RETIRED — deliberately not "when the PUBREL completes",
-  which would be wrong for a finalized intent held beside another outstanding claim. The
-  costs are stated in the drain-section residuals above. The two things
-  [issue #96](https://github.com/nberlee/mqtt-nats-broker/issues/96) did not
-  close are now closed by their own changes rather than deferred: delivery readiness on
-  adoption, by the live-SUBSCRIBE reclaim, and the disposal route to the same duplicate,
-  by retirement's delivery barrier and classified delete. What remains open is not a
-  route to a duplicate PUBLISH but the three disposal residuals stated above.
-- **CLOSED by
-  [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c: a
-  retained QoS 2 exchange's PUBREL survives a restart and is
-  TRANSMITTED** from its canonical record, acquired on the exchange's own register. The
-  slot-less admission (`retainedPubRelAdmittedLocked_`) is deleted, and a `$MQTT_out`
+  duplicate member, and then applies the same matrix — so an illegal body, or one carrying
+  a field this broker does not define, is **unreadable**, exactly as malformed JSON is,
+  and may not authorize a mutation, a deletion or an identifier release. The rule is a
+  property of the one decoder rather than a check repeated per site, so the destructive
+  readers — drain identity release, the gated reap and generation teardown — are bound by
+  it too. Recovery restores every valid state according to its phase: publish entries
+  return to the publish maps, ready/sending states reserve the PUBREL exchange or its
+  action, and terminal states finish only through the terminal disposal gate. An invalid
+  or absent state is quarantined and cannot authorize a mutation, deletion or release. An
+  absent state is not tolerated as an older writer's shape: the compatibility boundary
+  forbids that, a developer stream carrying older records resets, and the ten broker-owned
+  streams are one recreation unit
+  ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)).
+- **A marker-less drain intent does NOT refuse the session record, contrary to the plan.**
+  A past-PUBREC intent that nothing can attribute — no usable exchange identity, or no
+  packet identifier — is restored and marked **non-finalizable** — the same treatment a
+  duplicate register gets, because which record the client holds is unknowable — so
+  nothing finalizes on evidence it cannot attribute. The documented whole-record read-only
+  refusal is **not built**: it needs an error propagated through normal restore, expiry,
+  teardown and fork-repair. The broker does not write such a record — the intent's
+  identity is validated before it is saved — so this is a tolerance for records from
+  elsewhere, not a supported shape. The PHASE is read from the `PubRel` flag alone, so a
+  past-PUBREC but unattributable intent is never restored as an ordinary claimed source
+  whose payload could be redelivered to a client that had already answered it. Whether an
+  intent can be acted on is a separate question, and its answer is the quarantine; the
+  drain's durable also joins the resume SKIP set, so no source interest is restored for
+  it. A **SUBSCRIBE** that names such a drain is refused with a failure code, **fork
+  repair refuses the whole filter change**, and each refusal covers **every sid the filter
+  owns**: a wildcard's level-up companion is quarantined independently of its main sid, so
+  the filter is refused as a whole rather than one sid at a time. The client can restore
+  the filter only by removing the record.
+- **Adopting a drain does not erase an unfinished past-PUBREC intent
+  ([issue #96](https://github.com/nberlee/mqtt-nats-broker/issues/96)).** **Every**
+  past-PUBREC intent holds its sid against a re-SUBSCRIBE over the draining filter and
+  against fork repair's destructive rows, not just the unattributable subset, so the
+  unacknowledged source cannot redeliver as a fresh PUBLISH duplicating an exchange the
+  client had already answered. The refusal is protocol-visible: the client sees
+  `SUBACK 0x80` for that filter. The hold is released when the drain is RETIRED —
+  deliberately not "when the PUBREL completes", which would be wrong for a finalized
+  intent held beside another outstanding claim. The costs are stated in the drain-section
+  residuals above. Delivery readiness on adoption is covered by the live-SUBSCRIBE
+  reclaim, and the disposal route to the same duplicate by retirement's delivery barrier
+  and classified delete. What remains open is not a route to a duplicate PUBLISH but the
+  three disposal residuals stated above.
+- **A retained QoS 2 exchange's PUBREL survives a restart and is TRANSMITTED** from its
+  canonical record, acquired on the exchange's own register
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c). A `$MQTT_out`
   PUBREL that no slot-backed exchange owns is refused.
 - **Promptness, not continuity, still depends on the reconnect being same-process.**
   The identifier is restored either way, but the immediate NAK-driven redelivery needs
@@ -4184,8 +3850,6 @@ Residuals:
   that
   becomes actionable late: up to one cap interval per exchange, once the backoff has
   grown.
-  A plain NAK was measured at 9214 re-offers in ten seconds for one copy, which is the
-  behaviour this replaces.
 - **A source acknowledgement that cannot be confirmed costs one discarded
   redelivery.** On the QoS 2 PUBREC path the source ack is confirmed; if that
   confirmation fails the source is *retired* — left unacknowledged on purpose, so
@@ -4277,9 +3941,9 @@ Residuals:
   its consumed action (pre-existing); CONNECT's clean start rejects without evicting; the
   clean close and session expiry park the discard and restore residency only when the
   shared helper ACCEPTS, failing closed to the historical evict-and-log when it declines;
-  and the CONNECT rollback's zero-lifetime branch parks it on a session that never left
-  the maps, reporting `rollbackParked` and removing nothing, or takes its historical
-  outcome — classify and remove — when the helper declines.
+  and the pending-discard finisher, which completes a discard a drain ceiling parked,
+  parks it through the same helper on a session that is still resident, logging at
+  error level and evicting nothing when the helper declines.
   The two remaining callers
   that clear a transient object built from a record they just read have an unreachability
   proof rather than a recovery, plus the same fail-closed refusal if that proof were ever
@@ -4303,28 +3967,25 @@ Residuals:
   reconciliation worker that then finds the object resident and deliberately does nothing
   — so convergence there is eventual, through the uncertainty classification calling the
   object foreign, not immediate.
-  - For a v5 DISCONNECT that overrode a non-zero Session Expiry Interval to 0, losing the
-    obligation used to be a spec deviation rather than a leak, and
-    **[issue #45](https://github.com/nberlee/mqtt-nats-broker/issues/45) closed that**:
-    the override is now persisted as `Clean = true` with `ExpiryInterval = 0` **before**
-    the discard is attempted, so a refused discard leaves a record a reconnect declines to
-    resume. What remains on these paths is the leak — the record, its consumers and the
-    generation's registers survive with no resident object — and no longer a session that
-    reports Session Present true after the DISCONNECT ended it (Spec5 [3.1.2.11]).
-    **The reduction is claimed only for a backstop that was successfully persisted.** A
-    definite failure of the lifetime write leaves the pre-override terms durable and the
-    old deviation stands for that intersection; the close reports it at warning level. And
-    for a FINITE override the record instead carries the elapsed lifetime with its
-    disconnect stamp, which both resume checks read as overdue — a different route to the
-    same refusal, and the reason the stamp is written alongside the pair rather than left
-    to the discard.
-    The reconnect race
-    ([issue #44](https://github.com/nberlee/mqtt-nats-broker/issues/44)) reaches
-    the same write from the other side: a takeover
-    that holds the gate while the DISCONNECT's connection is still bound now performs it
-    on the close's behalf before deciding (see "A reconnect racing its own DISCONNECT"
-    below), so the definite-write-failure intersection above is reachable from that
-    caller too, with the same warning.
+  - For a v5 DISCONNECT that overrode a non-zero Session Expiry Interval to 0, the
+    override is persisted as `Clean = true` with `ExpiryInterval = 0` **before** the
+    discard is attempted
+    ([issue #45](https://github.com/nberlee/mqtt-nats-broker/issues/45)), so a refused
+    discard leaves a record a reconnect declines to resume. What remains on these paths is
+    the leak — the record, its consumers and the generation's registers survive with no
+    resident object — and not a session that reports Session Present true after the
+    DISCONNECT ended it (Spec5 [3.1.2.11]). **That is claimed only for a backstop that was
+    successfully persisted.** A definite failure of the lifetime write leaves the
+    pre-override terms durable and the Session Present deviation stands for that
+    intersection; the close reports it at warning level. And for a FINITE override the
+    record instead carries the elapsed lifetime with its disconnect stamp, which both
+    resume checks read as overdue — a different route to the same refusal, and the reason
+    the stamp is written alongside the pair rather than left to the discard. The reconnect
+    race ([issue #44](https://github.com/nberlee/mqtt-nats-broker/issues/44)) reaches the
+    same write from the other side: a takeover that holds the gate while the DISCONNECT's
+    connection is still bound performs it on the close's behalf before deciding (see "A
+    reconnect racing its own DISCONNECT" below), so the definite-write-failure
+    intersection above is reachable from that caller too, with the same warning.
   - A crash in the CLEAN close's window leaves an expiry-0, `Clean = true` record with its
     consumers: nothing reaps it autonomously (the retry pass needs residency, the expiry
     sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
@@ -4332,26 +3993,18 @@ Residuals:
   - **The same crash can lose that close's WILL, because the recovery runs BEFORE the Will
     is published.** The refusal deliberately keeps the Will out of the parked action, so
     the close publishes it by falling through to `mqttHandleWill`, after the recovery has
-    parked the obligation and restored residency. The original rationale for that split —
-    that a memory-only Will parked on the action would be dropped by a takeover — no longer
-    holds as stated:
-    [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) made
-    every RECORD-DERIVED disposal discharge a parked action's
-    Will, so only the LICENSED takeover still drops one, and there by design. The split is
-    retained on the narrower ground that an owed-now Will must not wait on a teardown the
-    recovery may never complete. A crash in between loses the Will permanently: no durable
-    intent exists for an owed-now Will. The window is PRE-EXISTING — today a failed
-    `clear()` logs and reaches the same `mqttHandleWill` just as late — and this change
-    keeps the same ORDERING while replacing that log with the recovery's own work: a
-    parking call under `sess.mu` and a residency insert under the manager lock, and no
-    log at all on the path that parks successfully. Whether the window is net wider is
-    not established here and is not claimed. Reordering was
-    considered and not taken: publishing first needs a second `mqttHandleWill` call site
-    with a hand-derived takeover-fence baseline, and deferring the recovery until after
-    the Will only trades this window for a longer one in which the session is evicted
-    with its record intact. Closing it properly needs a durable, cluster-visible Will
-    intent, which is Will-outbox scope. Recorded as a candidate follow-up rather than
-    claimed safe.
+    parked the obligation and restored residency. The split is kept because an owed-now
+    Will must not wait on a teardown the recovery may never complete; since
+    [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) every
+    RECORD-DERIVED disposal discharges a parked action's Will, so only the LICENSED
+    takeover drops one, and there by design. A crash in between loses the Will
+    permanently: no durable intent exists for an owed-now Will. The window is PRE-EXISTING
+    — a failed `clear()` that only logged reached the same `mqttHandleWill` just as late —
+    and the recovery keeps that ORDERING, doing a parking call under `sess.mu` and a
+    residency insert under the manager lock where the log was. Whether the window is net
+    wider is not established here and is not claimed. Closing it properly needs a durable,
+    cluster-visible Will intent, which is Will-outbox scope. Recorded as a candidate
+    follow-up rather than claimed safe.
   - A crash in the EXPIRY window can leave a finite record still saying
     `DisconnectedAt = 0` when the original disconnect save had failed, since that save is
     best-effort and the timer is armed regardless. An origin or standalone sweep may then
@@ -4397,16 +4050,6 @@ Residuals:
   no owner identity, so nothing there can prove whose deadline or whose Will a retarget would
   overwrite. Whether those shapes can reach a discard caller at all is not established, and
   the design deliberately does not depend on the answer.
-- **A void-register verdict staged during the CONNECT accept rollback is lost with the
-  aborted object.** The rollback's record snapshot is taken inside the rollback, so a nonce
-  staged after it is deliberately not credited (crediting it would claim durable what
-  nothing wrote). What the surviving register then means has three shapes: with a resumable
-  record, a live, lost or unprovable source has its identifier RESERVED fail-closed; a
-  source proven complete has its register scheduled for asynchronous deletion, and a failed
-  no-wait delete simply leaves it for a later reconciliation; and with the record ABSENT
-  after a failed rollback (classified applied) the next CONNECT starts a fresh generation,
-  so the old-generation register is ORPHANED — the orphan sweep's territory — rather than
-  reserved. Pre-existing behavior of the rollback path.
 - **Recovery's opaque and duplicate-source reservations are never purged.** A register
   whose body cannot be read, and the loser of a duplicate claim on one source, are held
   as identifier reservations that carry no durable name — so no durable-keyed purge can
@@ -4486,14 +4129,12 @@ missing-close- observation fallback is unchanged.
 
 ### A reconnect racing its own DISCONNECT
 
-[issue #44](https://github.com/nberlee/mqtt-nats-broker/issues/44): a v5 client
-that ends its session with DISCONNECT (Session Expiry Interval
-0) and reconnects could be told Session Present 1, with its old subscriptions
-resumed, when the reconnect took the ownership gate before the old connection's
-close did (Spec5 [3.1.2.11], [MQTT-3.2.2-3]). A takeover that finds the
-DISCONNECT's connection still bound now persists the ending on the close's behalf
-and discards; see `docs/ARCHITECTURE.md`, "The DISCONNECT lifetime override is a
-connection's OBLIGATION". Three gaps remain.
+[issue #44](https://github.com/nberlee/mqtt-nats-broker/issues/44): when a v5 client
+ends its session with DISCONNECT (Session Expiry Interval 0) and its reconnect takes the
+ownership gate before the old connection's close, a takeover that finds the DISCONNECT's
+connection still bound persists the ending on the close's behalf and discards (Spec5
+[3.1.2.11], [MQTT-3.2.2-3]); see `docs/ARCHITECTURE.md`, "The DISCONNECT lifetime
+override is a connection's OBLIGATION". Three gaps remain.
 
 - **A DISCONNECT recorded after the takeover's sample is a displaced connection's
   DISCONNECT, and does nothing.** The broker observes the override when the packet
@@ -4567,23 +4208,22 @@ the asynchronous resolver of a PUBREL intent (`pubrel_intent_resolution.go`) rol
 exchange back to its PUBLISH phase when the intent is classified as never recorded. The
 client proved receipt on that connection, so on MQTT 5.0 the reinstated PUBLISH is held by
 it and not resent there; the client, which answered PUBREC, receives no PUBREL either, and
-the exchange continues only when it reconnects. Before this change the next AckWait
-re-offer resent the PUBLISH, which [MQTT-4.4.0-1] forbids for 5.0; a 3.1.1 connection
-still gets that resend. The synchronous rollback in the PUBREC handler ends the
+the exchange continues only when it reconnects. A 3.1.1 connection still gets
+the AckWait resend. The synchronous rollback in the PUBREC handler ends the
 connection, so it has no such wait.
 
 ### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
 
-Found 2026-10-24 while adding MQTT 5.0 session coverage over WebSocket; pre-existing and
-independent of the transport. A v5 client with a nonzero Session Expiry Interval holds a
-QoS 1 subscription and sends DISCONNECT, closing at once (paho.golang's `Disconnect` does).
-Another client publishes QoS 1 to the topic immediately, and the first reconnects with
-Clean Start 0. Session Present is 1, but in about half the runs the message published in
-that window arrives only around 30 s after the resume, which is the consumer's AckWait,
-instead of being resent with the session [MQTT-4.4.0-1]. It is latency, not loss: the
-message is redelivered. Measured over plain TCP as well (3 of 6 runs not delivered within
-10 s, one arrival at 30.02 s); with a 1 s pause between the DISCONNECT and the publish, 6
-of 6 arrive within about 150 ms. The 30 s is the observed delay, not a proven bound.
+Pre-existing and independent of the transport. A v5 client with a nonzero Session Expiry
+Interval holds a QoS 1 subscription and sends DISCONNECT, closing at once (paho.golang's
+`Disconnect` does). Another client publishes QoS 1 to the topic immediately, and the first
+reconnects with Clean Start 0. Session Present is 1, but in about half the runs the
+message published in that window arrives only around 30 s after the resume, which is the
+consumer's AckWait, instead of being resent with the session [MQTT-4.4.0-1]. It is
+latency, not loss: the message is redelivered. Measured over plain TCP as well (3 of 6
+runs not delivered within 10 s, one arrival at 30.02 s); with a 1 s pause between the
+DISCONNECT and the publish, 6 of 6 arrive within about 150 ms. The 30 s is the observed
+delay, not a proven bound.
 
 The mechanism is untraced. A plausible one is that the publish is delivered to the old
 connection while its teardown runs, and the resume does not count it as unacknowledged.
@@ -4597,14 +4237,12 @@ DISCONNECT, so they deliberately do not cover this window.
 
 ### No Local is decided when the message is owned
 
-[issue #119](https://github.com/nberlee/mqtt-nats-broker/issues/119): a
-re-SUBSCRIBE that changed the No Local option re-judged messages the
-broker already owned whenever their offer reached the subscription after the
-re-SUBSCRIBE. Turning it OFF delivered the client's own earlier message
-([MQTT-3.8.3-3]); turning it ON acknowledged away an admitted message, a loss
-([MQTT-3.8.4-4]). The decision is now taken at ownership and carried by the
-message; see `docs/ARCHITECTURE.md`, "No Local is decided when the message is
-owned". Three gaps remain.
+[issue #119](https://github.com/nberlee/mqtt-nats-broker/issues/119): No Local is decided
+when the broker takes ownership of a message and carried by the message, rather than
+re-judged from the subscription's live option when a re-SUBSCRIBE changed it before the
+message's offer reached the subscription ([MQTT-3.8.3-3], [MQTT-3.8.4-4]); see
+`docs/ARCHITECTURE.md`, "No Local is decided when the message is owned". Three gaps
+remain.
 
 - **Another server run does not enforce it.** The tags are keyed by a per-run
   secret that is neither persisted nor shared, so a self-published message
@@ -4635,8 +4273,8 @@ base, never by reading the base sequence and calling the write dead (see
 `docs/ARCHITECTURE.md`). That closes the false-foreign disposal for a non-zero base. What
 it does *not* promise:
 
-- **A wedged proposal keeps the session unresolved across passes.** The old arm restored
-  writability immediately, by guessing. Now a proposal genuinely stuck in process upstream
+- **A wedged proposal keeps the session unresolved across passes.**
+  A proposal genuinely stuck in process upstream
   leaves the session unresolved until the pipeline settles it (apply, or a leader
   transition clearing the in-process entry), bounded by the periodic pass cadence. That is
   an availability cost, not a correctness one: unresolved is the posture every caller
@@ -4646,11 +4284,10 @@ it does *not* promise:
   connection with no UNSUBACK), and a refused CONNECT's lifetime grant all keep their
   mutation, and once a resolution verdict is obtained that mutation is durable unless a
   competing write intervened. Both outcomes were always legal — the client was told nothing
-  and must reconcile on reconnect — and the landed one was always possible; what changed
-  is that it became deterministic. A granted Session Expiry Interval of 0 therefore ends
+  and must reconcile on reconnect — and the landed one is
+  taken deterministically. A granted Session Expiry Interval of 0 therefore ends
   the session at that close even though the CONNECT was refused, which is the
-  grant-at-durability rule this broker already followed whenever the write happened to
-  land.
+  grant-at-durability rule.
   **A shared membership can survive a failed SUBSCRIBE on a second route, and it is not a
   resolution verdict.** Its eager per-filter write goes to the record BEFORE its group
   consumer exists, so that write may have succeeded while the packet's final update AND its
@@ -4749,15 +4386,14 @@ it does *not* promise:
   spent — landing after the ownership sample: such a connection can still receive its
   UNSUBACK. That is the pre-existing "nothing gates non-DISCONNECT traffic" residual of
   the claim mechanism, narrowed here rather than closed.
-- **CLOSED by
-  [issue #31](https://github.com/nberlee/mqtt-nats-broker/issues/31): the create
-  is conditional, so base 0 is no longer excluded.** A
-  first-ever record write now carries the expected-last-subject-sequence header at 0,
-  where it means "the subject must currently be empty". An ambiguous create therefore
-  flows through the ordinary arms and is settled by RE-ATTEMPTING it, exactly as any
-  other base is. What remains at base 0 is not specific to it: an absent record whose
-  re-attempt is refused 10071 is still classified foreign fail-safe, for the reason
-  residual 7 states.
+- **Base 0 is not excluded: the create is conditional
+  ([issue #31](https://github.com/nberlee/mqtt-nats-broker/issues/31)).** A first-ever
+  record write carries the expected-last-subject-sequence header at 0, where it means "the
+  subject must currently be empty". An ambiguous create therefore flows through the
+  ordinary arms and is settled by RE-ATTEMPTING it, exactly as any other base is. What
+  remains at base 0 is not specific to it: an absent record whose re-attempt is refused
+  10071 is still classified foreign fail-safe, for the reason item 7 of "A definite
+  record-CAS rejection is settled by a probe, with bounded convergence" states.
 - **A record found BELOW the attempt's base is classified foreign fail-safe**, not proven:
   sequences are monotonic within a stream incarnation, so that shape implies a reset or
   re-provisioned store. Nothing is adopted and nothing is written there.
@@ -4804,9 +4440,7 @@ it does *not* promise:
   proposal) leaves the session UNRESOLVED rather than disposing it. A refusal with
   **10071** is classified foreign, and that is the residual: an unconditional foreign
   write carries no expectation for any check to compare, so a body that lands on the
-  subject is still read as not-ours. (It was read as *another owner's* before
-  [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86); the
-  disposal is the same, and the claim it makes no longer names an owner.)
+  subject is still read as not-ours.
   (For a competing CONDITIONAL write the
   route is closed — see the same-base boundary below.) Narrowed from "absence is a
   verdict", not closed.
@@ -4815,15 +4449,13 @@ it does *not* promise:
 
 `$MQTT_sess` records carry `WID`/`PWID`, a parent pointer, so a survivor that provably
 **CLAIMS the parent** of the record this broker was acknowledged for is recognised as a
-SIBLING — which is what mints the repair grant. It also stopped being reported as a
-takeover here, which
-[issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) has since
-generalised: **no** record-derived route claims one.
+SIBLING — which is what mints the repair grant. No record-derived route reports it as a
+takeover ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
 The client is told **0x89 "server busy, try again later"**
 instead of 0x8E, which invites the reconnect 0x8E forbids. Five classified paths consult
 it — the definite rejection probe (bound and unbound), the ambiguity resolver, the two
-CONNECT-time saves, and the persist observation's eviction worker — plus the CONNECT
-rollback readback. See `docs/ARCHITECTURE.md`, "Recognising a forked session record".
+CONNECT-time saves, and the persist observation's eviction worker. See
+`docs/ARCHITECTURE.md`, "Recognising a forked session record".
 
 What it does NOT do:
 
@@ -4845,16 +4477,12 @@ What it does NOT do:
     business. Nothing recreates a deleted or inactivity-reaped watch consumer under a
     live manager: the watch stays absent and the backstop alone converges until the
     next manager start;
-  - the MOVED-record and lost-observation subcase is closed outright, not "once a
-    rollout completes". Every broker is built from this tree (see the Compatibility
-    boundary), so there is no older path to be asymmetric with. It did **not** by itself
-    close [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s
-    bound deleted-record case, which unit 2 has since split — see the next
-    bullet;
+  - the MOVED-record and lost-observation subcase is closed outright. Every broker is
+    built from this tree (see the Compatibility boundary), so there is no older path to
+    be asymmetric with. The bound deleted-record case is the next bullet;
   - a record that was **deleted** rather than moved is handed to the ownership marker,
-    which converges an UNBOUND session. **Its BOUND outcome is now split by
-    [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) unit 2,
-    and only one half converges.** Where a valid retirement watermark's `mseq` exceeds the
+    which converges an UNBOUND session. **Its BOUND outcome is split, and only one half
+    converges.** Where a valid retirement watermark's `mseq` exceeds the
     sequence this broker is acknowledged for, that watermark plus the record's absence
     plus a full in-fence revalidation is a LICENCE, and the periodic pass retires the
     bound session itself with no traffic from the client — reporting **0x89 "ownership
@@ -4868,49 +4496,39 @@ What it does NOT do:
     only positive evidence available, and absence alone is exactly the inference
     [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s
     site 3 exists to refuse. Absence is a real ownership fact — only a party that claimed
-    the record at our
-    sequence can remove it — but it is **not a successor fact**, and
-    [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) corrected the
-    claim accordingly: this text used to say the accompanying `0x8E` was "right either
-    way" and only its Reason String imprecise, which had the defect backwards. No new
-    connection need exist, and none is now asserted. The disposal is right either way and
+    the record at our sequence can remove it — but it is **not a successor fact**. No new
+    connection need exist, and none is asserted. The disposal is right either way and
     the client's reconnect correctly gets a fresh session. **A gone-specific vocabulary
     value that would tell an expiry-driven vanishing from a takeover WILL NOT EXIST, and
-    this is a permanent stated residual rather than filed work.** Its roadmap bullet was
-    closed as refuted: the only positive evidence available, the retirement watermark's
-    retired-record identity, names a record's BYTES rather than one OCCURRENCE of them, so
-    it cannot say which occurrence a retirement removed; the field has been removed. So a
+    this is a permanent stated residual rather than filed work.** The only positive
+    evidence available, the retirement watermark's retired-record identity, names a
+    record's BYTES rather than one OCCURRENCE of them, so it cannot say which occurrence a
+    retirement removed. So a
     vanished record, an unreadable one, an undecodable one, a below-base one and a
     valid-shaped stranger all report this one `0x89`, and an operator cannot tell an
     ordinary retirement from a store fault from that line. Closing it needs a claimed
     predecessor SEQUENCE on two permanent shapes, refused as disproportionate — see
-    `docs/ARCHITECTURE.md`, "The generation-retirement watermark". **Removing the field
-    also removed a FORMAT GATE, and that is disclosed rather than claimed away**: a
-    watermark carrying a valid `id`, `gen` and non-zero `mseq` but no `rwid` was CORRUPT
-    before and is VALID after, so four logical readers now ACT where they previously
-    refused — the CONNECT restore's discard of a retired record, the orphan sweep's
-    condemnation, the record-absent create's refusal (which keys on the corrupt verdict
-    alone), and `recordGenRetirement` itself, which proceeds to a no-op-or-replace and
-    then to deletion instead of failing closed. Two of those read the watermark AGAIN
-    after their first read and a no-`rwid` value can appear in between: the writer's
-    `retirementFenced` re-reads and the sweep's act-time revalidation. It creates **no new
-    LOGICAL false positive**, because the validator only ever checked the field for
-    NON-EMPTINESS and never compared it with anything, so an arbitrary non-empty string
-    already passed every one of those readers; what was lost is a format check, never a
-    semantic one. No client-visible behaviour changes for currently valid supported state;
-  - **the deleted-record shape does NOT converge a bound session that never sends
-    another packet.** Unlike the moved-record shape — where the eviction worker
-    disposes a bound session itself — arming the marker hands the case to the record
-    rejection settlement, whose unbound half refuses while a client is attached and
+    `docs/ARCHITECTURE.md`, "The generation-retirement watermark". **The watermark has no
+    `rwid` field, so it carries no format check on one**: a watermark carrying a valid
+    `id`, `gen` and non-zero `mseq` is VALID, and four logical readers ACT on it — the
+    CONNECT restore's discard of a retired record, the orphan sweep's condemnation, the
+    record-absent create's refusal, and `recordGenRetirement` itself, which proceeds to a
+    no-op-or-replace and then to deletion. Two of those read the watermark AGAIN after
+    their first read: the writer's `retirementFenced` re-reads and the sweep's act-time
+    revalidation. That is a lost format check, never a semantic one: no reader ever
+    compared an `rwid` with anything;
+  - **without that licence, the deleted-record shape does NOT converge a bound session
+    that never sends another packet.** Unlike the moved-record shape — where the eviction
+    worker disposes a bound session itself — arming the marker hands the case to the
+    record rejection settlement, whose unbound half refuses while a client is attached and
     whose bound half runs pre-dispatch on that connection's own readLoop. A
     conformant client sends a PINGREQ within its Keep Alive and therefore converges
     within about 1.5 intervals, but a client that negotiated **Keep Alive 0** and then
     goes silent has no such bound, so it can stay resident indefinitely after a lost
     teardown observation. This is the packet-driven property the bound settlement has
     always had (`docs/ARCHITECTURE.md`, "A definite record-CAS rejection is
-    outstanding work"), now reached by one more shape; closing it needs a periodic
-    bound-session disposal that does not depend on client traffic, which is filed as
-    its own roadmap bullet rather than claimed here;
+    outstanding work"), reached by one more shape
+    ([issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40));
   - a **serving window**: between the observation and the worker's decision the
     displaced client keeps being served for the worker's latency (a record read plus
     bounded retries). Any record write it triggers is CAS-rejected; deliveries in the
@@ -4919,39 +4537,25 @@ What it does NOT do:
     worker decides from knowledge at least as new as every observation actually
     delivered before its decision, never newer;
   - a **clean-start** fork sibling CONCEDES here, and the reason is the write-lineage
-    audit rather than the generation. The classifier used to concede on the re-minted
-    generation before it ever compared parents; it no longer consults the generation at
-    all, and briefly `clear()` carried the claimed record's identity across the re-mint so
-    the sibling arrived PARENTED. That inheritance, and the three others like it, were
-    deleted: a create is parentless, so a clean-start sibling and a parentless
-    create pair both concede at arm 2's `ackPWID` conjunct. See R-create below for
-    the direction and the evidence. The one-hop limit applies as everywhere — including
+    audit rather than the generation: the classifier does not consult the generation, and
+    a create is parentless, so a clean-start sibling and a parentless create pair both
+    concede at arm 2's `ackPWID` conjunct. See R-create below. The one-hop limit applies
+    as everywhere — including
     through an UNRESOLVED local attempt: a save whose store landed ambiguously leaves
     the acknowledged pair stale behind a free fence, so a remote sibling of that
     unadopted attempt CONCEDES, while a sibling of the acknowledged record itself still
     classifies forked; a stale pair can only narrow the verdict, never manufacture a
-    false forked one. **What conceding says was corrected by
-    [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)**: it
-    used to be 0x8E
-    plus the takeover-path Will cancel, and is now `0x89` ownership-unsettled with the
-    Will taken through ordinary handling — failing to recognise sibling-hood leaves the
-    broker knowing less, and less knowledge cannot license a stronger claim;
+    false forked one. Conceding answers `0x89` ownership-unsettled with the Will taken
+    through ordinary handling
+    ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86));
   - the **timer-cancel** consequences are unchanged in shape: both verdicts cancel the
     session-expiry timer (this broker may not write the record either way, so its timer
-    must not fire against it), which still bounds what the rollback path's preserved timer
-    is worth;
-  - a bound connection's never-enqueued delayed Will **was** lost on eviction, on both
-    verdicts, because eviction detached `sess.c` and the close's teardown gate then failed
-    so the Will was never enqueued.
-    **[issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) closed
-    that**: the eviction tail now discharges
-    a parked deferred action, or hands a live Will to ordinary handling, before the
-    notification and the close. What THIS item narrowed was only the destruction of
-    already-durable outbox state;
-  - an **interrupted cancel scan** left a durable partial state — earlier records
-    cancelled, later ones pending, no resume marker. Historical: the eviction worker runs
-    no cancel scan on any verdict now, the displaced incarnation's Wills being the
-    claimant's business at fire time;
+    must not fire against it);
+  - on eviction, on both verdicts, the eviction tail discharges a parked deferred action,
+    or hands a bound connection's live Will to ordinary handling, before the notification
+    and the close ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86));
+  - the eviction worker runs no cancel scan on any verdict, the displaced incarnation's
+    Wills being the claimant's business at fire time;
   - on the forked verdict the preserved outbox record can **still be cancelled at
     `FireAt`** by the lineage-blind watermark/session-record fences (filed separately);
   - **shutdown-time observations are dropped** once the dispatch gate closes or the
@@ -5015,39 +4619,24 @@ What it does NOT do:
     repair holds two record bodies per resident session, and that is bounded rather than
     trusted: a very large subscription set
     forgoes the repair instead of doubling its footprint. The grant is materialised from
-    those bytes only on the fork path, never on a save — an earlier revision built it on
-    every save attempt under the session lock, which measured 2.5 ms and ~1 MB per attempt
-    at 1000 filters;
+    those bytes only on the fork path, never on a save;
   - a repaired **QoS 2** membership whose PUBREL provisioning then fails is no longer
     accepted-but-dead: `processSubs` runs before the success CONNACK now, and that
     failure refuses the CONNECT ([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54));
-  - **shared-subscription membership is still excluded, but by choice rather than by
-    ordering.** The ordering that forced it — the success CONNACK preceding shared
-    restoration — is gone with
-    [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54). Widening
-    the repair set to shared membership is
-    [issue #29](https://github.com/nberlee/mqtt-nats-broker/issues/29)'s own
-    work, tracked as its own roadmap bullet, and until it lands the
-    exclusion stands.
+  - **shared-subscription membership is excluded, by choice.** Widening
+    the repair set to shared membership is outside
+    [issue #29](https://github.com/nberlee/mqtt-nats-broker/issues/29)'s closed
+    scope and no roadmap entry schedules it; the exclusion stands.
 - **The verdict does not prove the survivor erased us.** A teardown claim is a full-body
   CAS off the same base, so a sibling can merely have become current after `clear()`
   deleted our record. What is established is only that the survivor is not demonstrably
   a successor of ours.
-- **RESOLVED BY
-  [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86).** This
-  bullet used to say the withheld verdict could publish a Will
-  a genuine takeover would have suppressed, because on the definite-rejection bound path the
-  foreign settlement discarded the Will while the 0x89 route ran ordinary close bookkeeping
-  and published it. **Both arms now publish**: the foreign settlement demonstrates no
-  successor either, so it consumes the Will exactly as the 0x89 route does. There is no
-  longer a divergence for the forked verdict to reach more often.
-- **The ambiguity path's treatment is unchanged in every other respect**, and one part of
-  it was **RESOLVED BY
-  [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)**:
-  `disposeForeignStateLocked` still takes the parked deferred
-  disconnect, but it no longer drops it — the prepared disposition DISCHARGES that action's
-  Will against its original deadline, so the only copy of a Will and its expiry deadline are
-  no longer lost there. **What the discharge does NOT carry is the session's expiry**
+- **The ambiguity path's treatment.**
+  `disposeForeignStateLocked` takes the parked deferred
+  disconnect and DISCHARGES that action's
+  Will against its original deadline
+  ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
+  **What the discharge does NOT carry is the session's expiry**
   ([issue #30](https://github.com/nberlee/mqtt-nats-broker/issues/30), accepted
   as a residual 2026-10-12): the foreign discharge performs no session
   save and no expiry scheduling, so an ambiguously parked close later disposed as foreign
@@ -5059,16 +4648,6 @@ What it does NOT do:
   Will is preserved; the
   [issue #127](https://github.com/nberlee/mqtt-nats-broker/issues/127) overlap
   is stated separately.
-- **A preserved rollback timer can miss its record once, and the sweep is what catches
-  it.** When the timer a forked rollback leaves armed fires, a surviving sibling that is
-  still `DisconnectedAt == 0` makes `loadExpiringSessionRecord` report not-due, the one-shot
-  entry is consumed, and nothing re-arms *at that moment*. It is not stranded: the periodic
-  `sweepSessionExpiries` (15 minutes) stamps any finite-expiry record that claims a
-  connected client with no resident session and arms a timer from it. The residual is the
-  DELAY — up to one sweep interval plus the expiry — and the sweep's own origin gate, which
-  in a cluster leaves such a record to the broker named in `Origin`, so a record written by
-  a broker that is now down waits for it to return. Preserving the timer is nonetheless
-  strictly better than the `rollbackSuperseded` behavior it replaces, which CANCELS it.
 - **The bound 0x89 close leaves the session resident with its marker armed.** For a
   never-expiring session the object survives the close and the state terminates after one
   failed pre-CONNACK reconnect (whose accept save CASes against the forked record and is
@@ -5091,47 +4670,26 @@ What it does NOT do:
   broker-authored conditional writes rather than true only within a term. What is NOT
   recognised is the pair produced by a write no CAS can exclude — an unconditional
   foreign one — where both records exist and the loser's is
-  erased: [issue #33](https://github.com/nberlee/mqtt-nats-broker/issues/33)
-  closed it by having a create
-  inherit the identity of the record whose deletion emptied the subject, and the
-  write-lineage audit deleted every such inheritance because each was reachable equally by
-  a false fork. A clean-start side concedes for the same reason. A side whose observation
+  erased: a create is parentless, so that pair concedes. A clean-start side concedes for
+  the same reason. A side whose observation
   was lost still decides nothing until the backstop reaches it.
 
-  **A CREATE IS PARENTLESS, and the recognition it used to supply is GIVEN UP.** The
-  write-lineage audit deleted every source a create drew a parent from: the
-  generation-retirement watermark's `RWID` (a field since removed outright), an adopted
-  marker's own `PWID`, `clear()`'s
-  stamp of the record its claim held, and the `$MQTT_origin` session-interval register
-  with the stream itself. The reason is stated below and is the whole finding of that
-  audit — every route by which the inheritance produced a verdict was reachable equally
-  by a FALSE fork, and there was no route on which it was reachable only by a true one.
+  **A CREATE IS PARENTLESS, and the recognition it would supply is GIVEN UP.** Since the
+  write-lineage audit, no create draws a parent from any source: not from the
+  generation-retirement watermark, an adopted marker's own `PWID`, `clear()`'s stamp of
+  the record its claim held, or any session-interval register. Every route by which such
+  an inheritance produced a verdict was reachable equally by a FALSE fork, and there was
+  no route on which it was reachable only by a true one.
 
-  **Read the vocabulary in this subsection historically.** It records the write-lineage
-  audit as it stood, when conceding meant `0x8E` plus a takeover-path Will cancellation.
-  **[issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) changed
-  what conceding SAYS and DOES** — `0x89` ownership-unsettled, with the Will
-  taken through ordinary handling — so every "concedes to the takeover vocabulary" below
-  describes the audit's reasoning, not today's wire behaviour. The audit's *conclusions*
-  about which pairs are recognised are unaffected.
-
-  There are two failure DIRECTIONS. A **missed recognition** concedes to the takeover
-  vocabulary and is exactly the behavior that preceded
-  [issue #33](https://github.com/nberlee/mqtt-nats-broker/issues/33). A **false
-  fork** reports
-  the fork vocabulary — reason code 0x89, its Reason String, the log line and the close
-  reason travel as one value — where the takeover vocabulary would have been reported,
-  and PRESERVES a delayed Will the takeover path would have cancelled; that is the
-  dangerous direction. The audit's result is that the create side now has only the first.
+  There are two failure DIRECTIONS. A **missed recognition** concedes. A **false fork**
+  reports a fork where none was proven and mints a repair for it; that is the dangerous
+  direction. The create side has only the first.
 
   - **R-create — the parentless create pair is not recognised.** Two records both carry
     no parent — so arm 2's `ackPWID != ""`
-    conjunct concedes from either orientation and the erased side answers 0x8E about a
-    takeover nothing arbitrated, cancelling its delayed Will on that path. This is the
-    general form of what
-    [issue #33](https://github.com/nberlee/mqtt-nats-broker/issues/33) closed
-    and this audit reopened, and it subsumes the
-    former R0 and its sub-routes entirely: a record-absent create with no usable
+    conjunct concedes from either orientation and the erased side concedes about a
+    takeover nothing arbitrated. This
+    subsumes every create-side sub-route: a record-absent create with no usable
     watermark, a genuine first-ever interval, a client whose retirement history was lost,
     and the transient watermark read all reach the same concession by the same conjunct,
     with no interval identity to diverge, replay or regress.
@@ -5141,60 +4699,27 @@ What it does NOT do:
     create paths, and end to end on the wire by
     `TestMQTTCreateForkE2EAnswersUnsettledToTheDisplacedClient`.
 
-    **Its cost is no longer vocabulary at all.** The conceding side used to report 0x8E and
-    cancel its delayed Will; since
-    [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) it
-    reports 0x89 exactly as a recognised fork does,
-    and destroys no durable Will state either. What still differs is the REPAIR: a
+    **Its cost is not vocabulary.** The conceding side reports 0x89 exactly as a
+    recognised fork does
+    ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)),
+    and destroys no durable Will state either. What differs is the REPAIR: a
     recognised fork mints a grant anchored to a record proven to claim our parent, and a
     concession mints nothing, because nothing was proven.
 
     **The residual is conditioned on EVIDENCE, not on a rollout.** It stands unless a
     route is found that produces a true create-pair verdict without also producing the
-    false ones below. Two refutations stay recorded so they are not re-proposed. A
-    **reserved parent token** stamped on the record-absent arm was designed and REFUTED,
-    because an absence is not a fact: administrative deletion and partial restore can
-    leave a `$MQTT_teardown` with no historical fences. (Recreating it ALONE used to do
-    the same and was the sharper example; that operation is now refused at startup —
-    see "Stream prerequisites" — but the refutation stands on the operations that
-    remain, which are unsupported rather than impossible.)
-    Every other row of this design degrades to conceding when it cannot prove something;
-    that token degraded to a false affirmative. **Minting a retirement watermark at a
-    first create** is refused for its own reason: a watermark carrying a fresh generation
-    would fence the session being created, and would replace the standing watermark under
-    `mseq` ordering, unfencing a generation a real teardown retired.
-
-  - **The FALSE-FORK routes the deletion closes**, recorded because each was a live
-    defect and because they are the evidence for the paragraph above. Every one needed a
-    create carrying an INHERITED identity that had outlived the interval it named, and
-    each produced the dangerous direction:
-
-    - a register whose sequences a restore or a live stream recreation replayed or
-      regressed, handing two intervals one identity (the former R0c);
-    - a create whose watermark read was separated from its admission by a complete remote
-      lifecycle, so it stamped a retired interval's identity into the current one (R1);
-    - a regressed `$MQTT_teardown` slot presenting an older interval's identity (R2),
-      downstream of the stated decision-time-monotonicity residual;
-    - a delayed same-base proposal outliving an interval (R3, below);
-    - an out-of-band deletion of a live record (R4, below).
-
-    The first three cease to exist with the inheritance and are not restated. R3 and R4
-    are, because their routes survive parentlessness with a changed VERDICT rather than
-    disappearing.
+    false ones. A reserved parent token stamped on the record-absent arm, and a retirement
+    watermark minted at a first create, are both refused
+    ([issue #33](https://github.com/nberlee/mqtt-nats-broker/issues/33)).
 
   - **R3 — a delayed same-base proposal that outlives an interval. CONDITIONAL: every
-    consequence below holds IF this interleaving is reachable, and this item does not
-    settle that — see the closing note of this bullet.** Suppose a child write admitted
+    consequence below holds IF this interleaving is reachable, which is not settled —
+    see the closing note of this bullet.** Suppose a child write admitted
     against record `P` applies after `P` was properly retired and deleted and a create
-    `X` took its place. `X` no longer inherits `P`'s identity, so the lineage
-    verdict is a CONCESSION rather than a fork — `X`'s broker reports 0x8E "session taken
-    over" where it reported 0x89, and **performs the takeover-path Will cancellation the
-    forked verdict used to skip**, destroying durable Will state on a takeover nothing
-    demonstrated. That is the same direction as R-create and R4 and it is stated here
-    explicitly, because the pre-audit text recorded the opposite consequence for this
-    route. What does not go is the route or its other
-    costs — all equally conditional on the supposition above, and all PRE-EXISTING
-    rather than introduced here: the survivor wins the
+    `X` took its place. `X` does not inherit `P`'s identity, so the lineage
+    verdict is a CONCESSION rather than a fork, and nothing is repaired. Its other
+    costs — all equally conditional on the supposition above, and all PRE-EXISTING: the
+    survivor wins the
     single slot either way, so `X`'s granted state is lost and unrecoverable; condemning
     the survivor by the retirement fence is destructive where it added state;
     the [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)
@@ -5202,16 +4727,13 @@ What it does NOT do:
     acknowledged for membership the fence subsequently deletes — a conditional false
     acknowledgement that is a property of the delayed-proposal window and the fence.
 
-    **What this item settles about R3, and what it deliberately does not.** The same-base
+    **What is and is not settled about R3.** The same-base
     boundary below is about two broker-authored CONDITIONAL writes taken from ONE base.
     R3's interleaving is a different shape — it involves a DELETE and a create at base 0 —
-    so the boundary neither states it nor closes it. The framing this route used to carry,
-    that it is an instance of two same-base conditional writes both applying, is RETIRED,
-    because that shape is excluded. **Whether R3's interleaving is reachable at all is NOT
-    settled here**: an adversarial review argued it is excluded by proposal ordering and
-    the in-process per-subject guard, and this item did not verify that against the pinned
-    server. R3 therefore stands as previously documented, pending an analysis that owns
-    it, and nothing in this change is evidence for or against it. Both writers reach
+    so the boundary neither states it nor closes it. **Whether R3's interleaving is
+    reachable at all is NOT settled**: that it is excluded by proposal ordering and
+    the in-process per-subject guard is argued but not verified against the pinned
+    server. Both writers reach
     whatever remains identically: the batch's apply-layer behaviour is measured
     (`test/depproof/README.md`, R-batch) and its refusals are the same code —
     `ProposeMulti` carries `proposeLocked`'s captured-term comparison verbatim, and a
@@ -5220,59 +4742,52 @@ What it does NOT do:
 
   - **R4 — out-of-band record deletion.** `$MQTT_sess` must have `DenyDelete == false`
     because the broker's own deleter needs it, so an operator deleting a live record
-    leaves the standing watermark untouched. The route is unchanged and its FALSE-FORK
-    half is gone with the inheritance; what remains is the concession. Say the interval's
-    create is `C{PWID: ""}` and an acknowledged save made it `S{PWID: C}`. An operator
-    deletes `S`; the next create is `N{PWID: ""}`. Against a broker acknowledged for `S`
-    that is a CONCESSION — `N` carries no parent, so nothing matches and the erased side
-    answers 0x8E with the takeover-path Will cancellation. Against one still acknowledged
-    for `C` it is equally a concession now, where the inherited identity used to make it
-    a false fork. Eliminating either would need durable evidence of the record actually
+    leaves the standing watermark untouched. What it produces is a concession. Say the
+    interval's create is `C{PWID: ""}` and an acknowledged save made it `S{PWID: C}`. An
+    operator deletes `S`; the next create is `N{PWID: ""}`. Against a broker acknowledged
+    for `S` that is a CONCESSION — `N` carries no parent, so nothing matches. Against one
+    still acknowledged for `C` it is equally a concession. Eliminating either would need
+    durable evidence of the record actually
     deleted rather than the last one retired, which no in-broker fence can supply for a
     deletion the broker did not perform.
 
-  - **Not a recognition route, and it survives this deletion independently: the
-    rollback's own teardown claim can be regressed by a write it cannot exclude.** The
-    teardown claim is a full-body CAS at the candidate's sequence. Its RE-FOUNDED route is
+  - **Not a recognition route: a teardown claim can be regressed by a write it cannot
+    exclude.** The teardown claim every `clear()` caller takes is a full-body CAS at the
+    record's sequence. Its route is
     an UNCONDITIONAL foreign write, which carries no expectation for the check to compare;
     a competing CONDITIONAL successor off the same base is excluded by the same-base
-    boundary below, so the cross-term framing this residual used to carry is retired.
-    **Only ONE ordering is reachable, and the symmetry the cross-term framing carried does
-    not survive with it.** The claim is CONDITIONAL, so it cannot be the one that lands
+    boundary below.
+    **Only ONE ordering is reachable.** The claim is CONDITIONAL, so it cannot be the one
+    that lands
     last: if the unconditional write was admitted first it is in the stream's in-flight
     state and the claim is refused, and if it has already applied its new sequence refuses
     the claim too (the same admission rule stated for the re-attempt above). The reachable
     order is claim-FIRST, then the unconditional write, which evicts the marker and leaves
     the hollow survivor — the retirement is recorded, so the survivor is condemned by the
     retirement fence, and a client whose save succeeded can lose its resumable state. That
-    arm alone is what the retirement watermark exists to protect against, and it is
-    untouched by this correction; what goes is only the claim-LAST consequence, which
-    would require an admission path bypassing both refusals, and none is documented.
-    Parentless creates are not its justification and do not narrow it — the claim
-    is a record write of its own, not a create — which is why it is stated here rather
-    than carried out with the create-side routes. This is the SAME claim-apply window
-    every other `clear()` caller carries — see "decision-time monotonicity" in
+    arm is what the retirement watermark exists to protect against.
+    Parentless creates do not narrow it — the claim
+    is a record write of its own, not a create. This is the claim-apply window
+    every `clear()` caller carries — see "decision-time monotonicity" in
     `docs/ARCHITECTURE.md`, "The generation-retirement watermark". Narrowing it means
     durable evidence of the interval a claim overwrote, which is new durable state for
-    all seven callers.
+    every caller.
 
   **What the AUTHORED-RECORD fork retains, and why.** Two CAS writes off a base this
   broker actually held still classify as siblings, and `sess_fork_repair.go` still
   repairs the grant one erased.
 
-  The reason previously stated for that retention was an evidence gap in the accepted
-  CONNECT's writer, and **that gap is now closed**. Every one of its Raft-level facts
-  holds — at the pinned nats-server no Raft-level field preserves "these entries came
+  At the pinned nats-server no Raft-level field preserves "these entries came
   from one `ProposeMulti`"; entries are pushed individually, popped as whatever prefix
-  exists, regrouped by size thresholds, and each group rechecks leadership on its own —
-  but the consequence drawn from them was false. Batch identity is carried in the stream
+  exists, regrouped by size thresholds, and each group rechecks leadership on its own.
+  Batch identity is carried in the stream
   entry encoding and enforced at apply, so a committed prefix applies **nothing**, and
   the accepted CONNECT's fact and record commit together or not at all. The R-batch row
   is measured (`test/depproof/README.md`), and the broker's own use of the batch is
   asserted at the store boundary by `TestMQTTAcceptBatchReplicatedIndivisible`.
 
   **The same-base boundary (authoritative; other sections reference this one).** State it
-  in three parts, because collapsing them is what produced two wrong conclusions in a row:
+  in three parts, and do not collapse them:
 
   1. **Closed.** Two BROKER-AUTHORED CONDITIONAL writes on `$MQTT_sess` taken from one
      base cannot both apply. Every broker-authored production writer of the record
@@ -5283,8 +4798,7 @@ What it does NOT do:
      R-old, closed by the captured-term comparison; if it is read and proposed in the new
      term, the leader admitting it must still expose the earlier applied state, which is
      R-new. [issue #34](https://github.com/nberlee/mqtt-nats-broker/issues/34)
-     established that trichotomy and Part A supplied the writer it was
-     missing. This is why no statement here may still explain live behaviour by "two
+     established that trichotomy. No statement here may explain live behaviour by "two
      writes off one base can both apply".
   2. **Still open.** The same durable END STATE — a foreign body in the one slot, off a
      base this broker held — remains reachable, because an **unconditional** write is not
@@ -5297,43 +4811,36 @@ What it does NOT do:
      clients; they are not a guard against permitted NATS publication.
   3. **Untouched**, and the reasons differ per stream — do not collapse them.
      **Deletes** carry no per-subject expectation, so no admission closure speaks about
-     them. **`$MQTT_inflight`'s ran
-     ([issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38), closed
-     2026-08-22)**: no lineage was needed
-     there either, and what it found instead was a reachable identity-confusion route,
-     remedied by identity conditioning plus bounded destruction.
-     **`$MQTT_qos2assign`'s ran
-     ([issue #37](https://github.com/nberlee/mqtt-nats-broker/issues/37), closed
-     2026-08-18)**: every claim write is
-     funnelled through one CAS helper that always emits its expectation, so it needed no
-     lineage, and what it found instead was a source ack bound to a copy store that never
-     proved retention, a reference skip, a reap on a stale reading and a claim key that
-     outlives the `$MQTT_msgs` incarnation it indexes —
+     them. **`$MQTT_inflight`**
+     ([issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38))
+     needed no lineage;
+     its identity-confusion route is remedied by identity conditioning plus bounded
+     destruction. **`$MQTT_qos2assign`**
+     ([issue #37](https://github.com/nberlee/mqtt-nats-broker/issues/37)):
+     every claim write is funnelled through one CAS helper that always emits its
+     expectation, so it needed no lineage;
      [issue #67](https://github.com/nberlee/mqtt-nats-broker/issues/67),
      [issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68),
      [issue #69](https://github.com/nberlee/mqtt-nats-broker/issues/69) and
-     [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70),
-     none of which this admission closure speaks to. **`$MQTT_qos2in`'s
-     ran ([issue #36](https://github.com/nberlee/mqtt-nats-broker/issues/36),
-     closed 2026-08-17)**: every write there carries its expectation, so it
-     needed no lineage, and what it found instead was a hold purge carrying no condition at
-     all — [issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66)
-     (closed 2026-08-18 by giving the purge a proven cutoff) and
-     [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40), neither
-     of which this admission closure speaks to.
+     [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)
+     are findings this admission closure does not speak to. **`$MQTT_qos2in`**
+     ([issue #36](https://github.com/nberlee/mqtt-nats-broker/issues/36)):
+     every write there carries its expectation, so it needed no lineage;
+     [issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66) and
+     [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) are findings
+     this admission closure does not speak to.
      **`$MQTT_teardown`** is not one of those: it carries its own separately documented
      residuals (the retirement watermark and the single slot), stated where they arise.
-     **`$MQTT_origin` is not in scope at all**: the register was deleted by the
-     write-lineage audit and the stream is REFUSED at startup, so there is nothing about
-     it left to retire. Nothing above retires a statement about any of these.
+     **`$MQTT_origin` is not in scope at all**: the register does not exist and the
+     stream is REFUSED at startup. Nothing above retires a statement about any of these.
 
-  **So the machinery is retained, and on part 2 rather than on the batch gap.** The
-  classifier's predicate `found.PWID == ackPWID && found.WID != ackWID` establishes that
+  **So the classifier is retained, on part 2.** Its predicate
+  `found.PWID == ackPWID && found.WID != ackWID` establishes that
   the surviving body CLAIMS the same parent — never that it is provably descended from
   it, which unvalidated restore forbids anyone from concluding. That is still exactly the
-  claim needed: a body claiming our parent does not establish a takeover, and reporting
-  one as a takeover would cancel a delayed Will that is still owed
-  (`sess_rejected_write.go`, foreign arm) and skip the repair capsule.
+  claim needed: a body claiming our parent does not establish a takeover, and classifying
+  it foreign would dispose the session (`sess_rejected_write.go`, foreign arm) and skip
+  the repair capsule.
 
   **What the re-founded route costs the REPAIR, stated as a residual.** The repair's
   conflict predicate (`mqttSurvivorDecidedGrant`) re-asserts our delta for a filter only
@@ -5377,11 +4884,6 @@ What it does NOT do:
   belong to one interval, because neither carries a parent. What no interleaving can
   produce is a FALSE fork between two creates, which is the direction the deletion buys
   and the reason it was taken.
-- **The other four arbitrated streams have no lineage at all** — `$MQTT_willq`,
-  `$MQTT_qos2in` (both its hold subjects and their `.rel` siblings),
-  `$MQTT_qos2assign` and `$MQTT_inflight` — so the same leader-transition overwrite is
-  unrecognisable on each, with a different consequence per stream. One independently
-  checkable roadmap bullet each, naming that consequence.
 - **The Raft window itself is not reproduced by any test.** What the tests stage is the
   DURABLE OUTCOME — two records off one parent, the later surviving under
   `MaxMsgsPer: 1` — with an unconditional store. Not reproduced: pre-proposal
@@ -5391,8 +4893,8 @@ What it does NOT do:
   different claim and is stated as one.
 - **A drain whose consumer another broker decided is NOT reinstated, and what only it
   carried is lost
-  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7f,
-  consult 116).** Fork repair reinstates a consumer of ours
+  ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)).**
+  Fork repair reinstates a consumer of ours
   only while it still serves; a DRAIN of ours whose consumer the survivor's tenure has
   since disposed of (its record did not name it) is omitted, identity and contents. Where
   that drain carried evidence or pending work no independently continuing exchange
@@ -5436,10 +4938,9 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   than "never serves a displaced client".** The gate runs per packet inside `mqttParse`,
   claims the ownership gate as the bound client, and serves only on a landed CAS; every
   other outcome closes the connection — a `0x89` ownership-unsettled ATTEMPT when the
-  probe proved the session foreign (it was `0x8E` before
-  [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86), which
-  claimed a successor
-  the probe never found), a `0x89` "server busy" attempt when nothing was established, and
+  probe proved the session foreign (it claims no successor, which the probe never
+  established; [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)),
+  a `0x89` "server busy" attempt when nothing was established, and
   SILENCE when the session was found REBOUND (the displacement owns the notification and
   makes its own attempt; a courtesy packet here would contradict it on the same socket).
   Each of those is
@@ -5448,9 +4949,11 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   a write can lose to a concurrent close. A refused ownership claim is retried while this
   connection is still the owner rather than read as a verdict. What that leaves:
   1. **Outbound deliveries continue** to the displaced client until an inbound packet
-     triggers the settlement, or the connection ends. Closing that needs a delivery-side
-     gate, which is the "resident session never re-validates" item's territory.
-  2. **A silent client with keepalive 0 converges only at unbind.** The bound is a
+     triggers the settlement, the periodic backstop pass reaches the session, or the
+     connection ends. Closing that needs a delivery-side gate, which nothing here
+     provides.
+  2. **A silent client with keepalive 0 is never reached by the pre-dispatch gate.** It
+     converges at the periodic backstop pass or at unbind. For the gate, the bound is a
      conformant client's PINGREQ — about 1.5 keepalive intervals — and a client that
      promises nothing is owed nothing.
   3. **The packet that races the marker's arming is served.** A rejection that lands after
@@ -5472,17 +4975,14 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
      split-brain is closed by whichever broker owns that session, and no broker acts on
      another's residents.
   7. **The AT-BASE false foreign verdict is CLOSED at every CAS base, base 0 included;
-     one fail-safe residual remains.** The uncertainty resolver no longer clears an
+     one fail-safe residual remains.** The uncertainty resolver does not clear an
      ambiguity on a plain load at the base sequence: it RE-ATTEMPTS the attempt's exact
      bytes, so a late-committing proposal loses that arbitration instead of being read
-     later as another owner's record. The **unconditional create** used to be excluded
-     from that — a first-ever write carried no CAS header, so re-sending it would have
-     overwritten whatever was there rather than arbitrating.
-     **[issue #31](https://github.com/nberlee/mqtt-nats-broker/issues/31) made
-     every create
-     conditional**, so base 0 is settled the same way as any other, and two brokers
-     creating one session from nothing are arbitrated rather than one erasing the other.
-     That is now unqualified for two broker-authored conditional writes — a create is
+     later as another owner's record. Every create is conditional
+     ([issue #31](https://github.com/nberlee/mqtt-nats-broker/issues/31)),
+     so base 0 is settled the same way as any other, and two brokers creating one
+     session from nothing are arbitrated rather than one erasing the other.
+     That is unqualified for two broker-authored conditional writes — a create is
      conditional too, base 0 meaning *the subject must currently be empty* — see the
      same-base boundary below. What remains is a parentless record arriving by a route no
      CAS excludes (an unconditional write, or an out-of-band deletion then a create),
@@ -5494,13 +4994,12 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
        unconditional foreign write is excluded by nothing, so a body landing on the
        subject afterwards is still classified foreign — evicting
        the session and closing a live connection before its own write lands. Narrowed
-       (10164 now defers instead of disposing) rather than closed; see the settlement
-       section below.
-       **[issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)
-       narrowed the CONSEQUENCE too**: that close reports `0x89`
+       (10164 defers instead of disposing) rather than closed; see the settlement
+       section below. That close reports `0x89`
        ownership-unsettled rather than `0x8E`, and the connection's Will is CONSUMED rather
-       than discarded, so a wrongly-classified live connection no longer loses its Will and
-       is no longer told to stop reconnecting.
+       than discarded, so a wrongly-classified live connection does not lose its Will and
+       is not told to stop reconnecting
+       ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
   8. **An ambiguous probe's fail-closed close parks a memory-only teardown**, so a crash
      before resolution loses the parked Will and the original expiry deadline. That is the
      pre-existing parked-teardown exposure, newly reachable from this path.
@@ -5512,11 +5011,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       notification is a per-connection claim (`mqttClaimDisconnectLocked`) shared by all four
       displacement paths, the parse-error footer, the packet-too-large 0x95 and the shutdown
       drain, so no second server DISCONNECT can follow a first on one socket, which is what
-      [MQTT-3.14.4-1] forbids. (Stated as codes before
-      [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86); the
-      displacement vocabularies
-      now share `0x89`, so the guarantee is about the COUNT, which is what the claim always
-      enforced.) Every enqueue-path writer consumes it in the
+      [MQTT-3.14.4-1] forbids. The guarantee is about the COUNT, which is what the claim
+      enforces. Every enqueue-path writer consumes it in the
       same `c.mu` critical section as its write; `shutdownDisconnect` is the exception and
       RESERVES it, claiming under the lock and attempting its capped write
       (`writeActionlessFrameBy`) after releasing it.
@@ -5547,8 +5043,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
         [MQTT-3.14.4-1] also forbids. The reader-owned error DISCONNECTs (the parse-error
         footer and 0x95) seal the output gate in the same write section, so nothing trails
         those; the displacement notifications discussed here are not gated, and closing that
-        needs a delivery-side gate, the "resident session never re-validates" item's
-        territory.
+        needs a delivery-side gate, which nothing here provides.
       - **The notification write is deadline-bounded**
         ([issue #39](https://github.com/nberlee/mqtt-nats-broker/issues/39)) and
         the persist
@@ -5596,7 +5091,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
       the spin, without having rebound yet), the fail-closed close marks the Will owed —
       independently of whether its 0x89 attempt is written at all — and the
       takeover's later discard preserves an owed Will by design. Narrow, and the same
-      Will-disposition race roadmap bullet 1297 tracks.
+      Will-disposition race
+      [issue #42](https://github.com/nberlee/mqtt-nats-broker/issues/42) tracks.
 - **Sustained contention holds the object for as long as it lasts.** A readback that finds
   the record at the probe's own base sequence, or that cannot be performed at all,
   establishes nothing, so the marker stays and the object is kept until a later pass — at
@@ -5608,8 +5104,8 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
 - **A rejected close still publishes its Will, and the settlement cannot retract it.**
   When the ordinary close's disconnect save is CAS-rejected by a remote takeover, the Will
   is published synchronously by that close, before anything has classified the rejection;
-  a probe that later proves the session foreign cannot take it back. Pre-existing and
-  untouched here — a CAS rejection is contention, not takeover evidence, so discarding the
+  a probe that later proves the session foreign cannot take it back. A CAS rejection is
+  contention, not takeover evidence, so discarding the
   Will on one would drop a Will a session that is still ours owes, and parking it is
   memory-only and non-transferable. **Accepted as a residual
   ([issue #42](https://github.com/nberlee/mqtt-nats-broker/issues/42) arm (a), 2026-10-12):**
@@ -5617,7 +5113,7 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   from that close, which subscribers may read as a false offline notification; it is never
   a lost Will, and its scope is that close's publication, not an exactly-once guarantee.
   Retracting it needs a durable Will intent. The periodic pass's bound-foreign disposal
-  that this bullet used to name as a second route no longer reaches the takeover arm
+  does not reach the takeover arm
   ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
 - **A rejected finite close that crashes before settlement loses its deadline
   ([issue #41](https://github.com/nberlee/mqtt-nats-broker/issues/41),
@@ -5629,11 +5125,12 @@ settlement re-attempts the write so a fresh CAS arbitrates ownership (see
   but no bound measured from the original disconnect is guaranteed, and the sweep's origin
   gate can defer it until the originating broker returns. Reached only by a rejected save
   followed by a crash in that window.
-- **A takeover with the notification lost and NO local rejection is still not reaped.**
-  The probe runs only where a rejection armed the marker. A resident session that never
-  writes again is never re-validated, so what this change bounds is convergence for
-  rejection-caused staleness, not for staleness in general. Filed as its own roadmap item
-  rather than papered over.
+- **A takeover with the notification lost and NO local rejection converges at the
+  backstop, not at the probe.** The probe runs only where a rejection armed the marker.
+  A resident session that never writes again is re-read by the committed-read backstop
+  on the periodic pass (see "a lost observation is no longer lost" above), so its
+  convergence is bounded by the next pass that reaches the session, not by a fixed
+  interval ([issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)).
 - **The marker is memory-only.** A crash drops it, which is benign: nothing durable was
   written and the crash removes the object the settlement would have removed.
 - **The record arbitrates the last accepted state transition; it is not a liveness
@@ -5697,15 +5194,12 @@ claimant suppresses a delayed Will only for an acceptance of that EXACT client, 
 incarnation, strictly newer than the connection that created the Will, and dated BEFORE
 the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 
-- **Two same-base claimant writes across a leader transition: RETIRED for a conforming
-  `$MQTT_willq`.** Two residuals were stated here — claimant DIVERGENCE, where a reclaim
-  overwrites a licensing decision, and terminal REGRESSION, where it overwrites a
-  committed `done` — on the premise that the expected-sequence check is pre-proposal and
-  the in-process map is cleared by a transition, so two broker-authored conditional
-  writes taken from one base could both apply.
-  [issue #34](https://github.com/nberlee/mqtt-nats-broker/issues/34) disproved
-  that premise against the
-  supported server.
+- **Two same-base claimant writes across a leader transition cannot both apply for a
+  conforming `$MQTT_willq`**
+  ([issue #34](https://github.com/nberlee/mqtt-nats-broker/issues/34)):
+  neither claimant DIVERGENCE (a reclaim overwriting a licensing decision) nor terminal
+  REGRESSION (a reclaim overwriting a committed `done`) is reachable
+  against the supported server.
 - **What is refused.** A write conditioned on base `S` can only reach the stream
   after a committed `done` has replaced `S` by one of two routes. **R-old** — an
   operation whose captured proposing term outlives that term — is refused by Raft's
@@ -5735,19 +5229,12 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   change the stream-level admission and sequence mechanisms that refuse it.
 - **What the closure says nothing about.** `$MQTT_sess`, `$MQTT_qos2in`,
   `$MQTT_qos2assign` and `$MQTT_inflight`: the server mechanisms are stream-independent,
-  but each of those findings owns its own consequence, and **all of them have now been
-  audited on their own terms.**
-  [issue #36](https://github.com/nberlee/mqtt-nats-broker/issues/36) closed
-  producing [issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66),
-  which closed on 2026-08-18;
-  [issue #37](https://github.com/nberlee/mqtt-nats-broker/issues/37) closed
-  producing [issue #67](https://github.com/nberlee/mqtt-nats-broker/issues/67),
-  [issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68),
-  [issue #69](https://github.com/nberlee/mqtt-nats-broker/issues/69) and
-  [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70);
-  [issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38) closed on 2026-08-22
-  producing [issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)
-  and [issue #72](https://github.com/nberlee/mqtt-nats-broker/issues/72). It also
+  but each of those findings owns its own consequence, and **all of them have been
+  audited on their own terms**
+  ([issue #36](https://github.com/nberlee/mqtt-nats-broker/issues/36),
+  [issue #37](https://github.com/nberlee/mqtt-nats-broker/issues/37) and
+  [issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38);
+  see part 3 of the same-base boundary above). It also
   does not claim the two backstops below
   the proved mechanisms — an entry admitted anyway is discarded by apply-time log order,
   and beneath that by the store's refusal of any sequence that is not the next one — but
@@ -5798,8 +5285,8 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
   would skip the store that protects the racing subscriber and trade a duplicate for a
   LOSS. **Accepted as a residual (2026-10-12):** subscribers can receive a duplicate Will
   when a claimant stalls past its lease during subscription restoration; do not advertise
-  an unconditional maximum of two. End-to-end phase-aware ownership, described in the
-  ticked `docs/ROADMAP.md` §0.4 entry, remains the fix if it is taken up.
+  an unconditional maximum of two. End-to-end phase-aware ownership remains the fix if it
+  is taken up.
 
   The permanent acceptance facts did not introduce this: a slow barrier always let a
   peer reclaim and republish. What they changed is that the peer now reuses a persisted
@@ -5850,10 +5337,8 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 
   1. A fact has readers besides the Will scan. `mintAcceptanceTenure` reads the CURRENT
      acceptance's own fact back on every CONNECT and refuses the CONNECT unless it reads
-     landed. A fact commits below its own record, so `L` takes exactly that fact. (The
-     uncertain-acceptance resolver once read an attempt's own fact too; that readback was
-     deleted with the superseded mechanisms on 2026-10-19, which leaves
-     `mintAcceptanceTenure` the only reader of an acceptance's own fact.)
+     landed. A fact commits below its own record, so `L` takes exactly that fact.
+     `mintAcceptanceTenure` is the only reader of an acceptance's own fact.
   2. A delayed Will can be outside `$MQTT_willq` for an unbounded time while its origin
      connection already exists. Worked interleaving, with auth passthrough enabled: client
      `A` connects on broker 1 (record `r0`) and closes with a delayed Will due at `T`;
@@ -5956,7 +5441,7 @@ the Will fell due. See `docs/ARCHITECTURE.md`. Its boundary and residuals are:
 ### Session teardown: arbitrated across brokers, and fenced by a permanent watermark
 
 Discarding a session (clean start, a v5 DISCONNECT with expiry 0, session expiry,
-takeover-discard) now runs under a durable **teardown claim** on the session record
+takeover-discard) runs under a durable **teardown claim** on the session record
 and deletes only resources named after the **retiring session incarnation**
 (`internal/mqtt/sess_teardown.go`, `sess_incarnation.go`). A broker that loses the
 claim deletes nothing; the release is a sequence-targeted delete whose outcome is
@@ -5973,23 +5458,11 @@ has no name to use.
 A teardown that WINS its claim records a permanent per-client **generation-retirement
 watermark** on `$MQTT_teardown` before it deletes anything, so the fact survives the one
 thing the record cannot: an unconditional foreign write evicting the marker off the
-record's own subject. Three readers act on it — the winner's own
-release-superseded arm, which condemns a same-generation survivor with a fresh marker;
-the CONNECT restore, which discards a retired record instead of resuming it hollow; and
-the orphan sweep, which condemns one with no CONNECT at all. A FOURTH was deleted by the
-write-lineage audit: the record-absent create, which inherited the retired record's
-identity as its own parent
-([issue #33](https://github.com/nberlee/mqtt-nats-broker/issues/33)). Its `RWID`
-field outlived that reader and has since
-been **REMOVED**, by the vanished-record item that was the last candidate to give it one:
-a write identity names a record's bytes rather than one occurrence of them, so it could not
-tell which occurrence a retirement removed.
-[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) was the other
-candidate and failed
-earlier — its 2026-08-27 attempt disproved the predicate, since a one-slot-per-client
-watermark makes `ackWID == rwid` recreate the superseded-watermark false negative. What the
-field also enforced, that a record carrying no `WID` fails its teardown closed, is now an
-explicit precondition in `recordGenRetirement`. Nothing ever reaps a watermark. See
+record's own subject. Three readers act on it — the winner's own release-superseded arm,
+which condemns a same-generation survivor with a fresh marker; the CONNECT restore, which
+discards a retired record instead of resuming it hollow; and the orphan sweep, which
+condemns one with no CONNECT at all. A record carrying no `WID` fails its teardown closed,
+an explicit precondition in `recordGenRetirement`. Nothing ever reaps a watermark. See
 `docs/ARCHITECTURE.md`, "The generation-retirement watermark".
 
 What the repair is, exactly: **truthful termination, never restoration.** The deleted
@@ -6022,22 +5495,16 @@ Residuals and hard requirements:
 - **A finish can outrun the survivor's own observation.** Whoever finishes the
   condemnation marker deletes the record, and a bound, silent Keep Alive 0 client on the
   survivor's broker that dropped the marker observation then faces an ABSENT record — the
-  [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) shape,
-  whose §0.2 item is now CLOSED
-  ([issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)): unit 2's
-  licensed retirement converges that
-  client where a valid watermark's `mseq` exceeds the survivor's own sequence, and leaves
-  it stranded where no such licence exists, which is the residual stated with it. The
-  sweep defers its finish by a pass to narrow the case it owns; a CONNECT adoption
-  finishes immediately by design.
+  [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) shape: its licensed
+  retirement converges that client where a valid watermark's `mseq` exceeds the survivor's
+  own sequence, and leaves it stranded where no such licence exists, which is the residual
+  stated with it. The sweep defers its finish by a pass to narrow the case it owns; a
+  CONNECT adoption finishes immediately by design.
 - **A whole-bundle reset loses every open fence**, along with everything else the ten
-  streams hold. `$MQTT_teardown` recreated ALONE is no longer admitted — it used to be,
-  stamping the current epoch and starting clean with the fences silently gone, and that
-  admission is exactly the residual
-  [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s
-  enforcement withdraws: an account holding
-  nine of the ten is now refused before anything is provisioned. Watermark storage is
-  permanent and bounded by the client-ID population.
+  streams hold. `$MQTT_teardown` recreated ALONE is not admitted: an account holding nine
+  of the ten is refused before anything is provisioned
+  ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)). Watermark storage
+  is permanent and bounded by the client-ID population.
 - **A PUBREL durable standing under a RETIRED name is reaped, and the PUBRELs it held go
   with it.** The licence is the name's RETIRED ownership record, which only the batch
   authorizing the resource's deletion writes (every hold released, a disposal decision
@@ -6049,8 +5516,6 @@ Residuals and hard requirements:
   observation grace and no instance fingerprint, since a spent name has no construction
   window to protect; the only vetoes are a session record that still names the generation
   or the durable (or cannot be read) and a consumer config that does not match its name.
-  This is a timing change from the listing-driven arm it replaced, which waited two
-  sightings and refused a recreated instance.
 - **A session record without a generation is rejected, not resumed.** Records
   written before generation-scoped naming existed carry no `gen`, and a CONNECT that
   finds one fails with recreate guidance rather than falling back to hash-only
@@ -6078,12 +5543,11 @@ Residuals and hard requirements:
 
 ### Inbound QoS 2 PUBREL is at-least-once across the unresolved move interval
 
-The destructive move window that used to lose messages here is closed. The QoS 2
-hold record on `$MQTT_qos2in` is a two-state machine
-(`internal/mqtt/qos2_move.go`): a create-only CAS writes `held`, PUBREL delivers
-the message onward **first**, and only then does a CAS at the held record's exact
-sequence replace it with a terminal `delivered` tombstone. A later PUBREL that
-finds the tombstone answers `0x00` without re-delivering.
+The QoS 2 hold record on `$MQTT_qos2in` is a two-state machine
+(`internal/mqtt/qos2_move.go`): a create-only CAS writes `held`, PUBREL delivers the
+message onward **first**, and only then does a CAS at the held record's exact sequence
+replace it with a terminal `delivered` tombstone. A later PUBREL that finds the tombstone
+answers `0x00` without re-delivering.
 
 The guarantee, stated exactly:
 
@@ -6098,8 +5562,8 @@ The guarantee, stated exactly:
 
 **What a teardown of an incarnation a peer is still serving can and cannot do.**
 *Derived from
-[issue #131](https://github.com/nberlee/mqtt-nats-broker/issues/131)
-[issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66), which is
+[issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66) (recorded in the
+[issue #131](https://github.com/nberlee/mqtt-nats-broker/issues/131) dossier), which is
 authoritative for the
 mechanisms and their arms; what follows states only what a reader of the guarantee needs.*
 It can no longer destroy an acknowledged PUBLISH that no removal was entitled to reach. Every
@@ -6111,15 +5575,13 @@ on the same packet identifier proves the marker is not about it, reaps it and pr
 of being answered `0x92` with its hold released.
 
 **Which cutoff each PURGING arm uses is NOT uniform, and neither is what licenses a
-destruction on each.** There are four arms in the analysis and three of them purge: the arm
-that waits out a release destroys nothing at all, and re-competes instead. This document
-states neither the mapping nor the criterion, because every paraphrase of
-them attempted here has been wrong.
+destruction on each.** There are four arms in the analysis and three of them purge: the
+arm that waits out a release destroys nothing at all, and re-competes instead. This
+document states neither the mapping nor the criterion;
 [issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66) carries the
-authoritative mapping and the per-arm
-criterion; read it there. The one consequence a reader of this guarantee needs, and the only
-one stated here: **"accepted after some teardown enumerated" is not by itself a safety
-property.**
+authoritative mapping and the per-arm criterion; read it there. The one consequence a
+reader of this guarantee needs, and the only one stated here: **"accepted after some
+teardown enumerated" is not by itself a safety property.**
 
 Neither remedy makes the claim exchange-exclusive; it is not, and must not be described that
 way.
@@ -6152,22 +5614,20 @@ rollout:
   sequence never rewinds under a delete, a replacement, a filtered purge, a compact at or
   below the tail, or expiry — so it is a disposition rather than an operational hazard.
 
-Every sequence identity above, the fence included, is scoped to **one stream incarnation**;
-recreating `$MQTT_qos2in` by itself is no longer a SUPPORTED operation — the ten
-broker-owned streams are one recreation unit, and an account holding a proper subset is
-REFUSED at the next manager initialization — so the supported operation is an
+Every sequence identity above, the fence included, is scoped to **one stream
+incarnation**; recreating `$MQTT_qos2in` by itself is no longer a SUPPORTED operation —
+the ten broker-owned streams are one recreation unit, and an account holding a proper
+subset is REFUSED at the next manager initialization — so the supported operation is an
 all-brokers-stopped reset of the whole bundle (`docs/ARCHITECTURE.md`, "The ten streams
 are one recreation unit"). Refused is not prevented: nothing stops an administrative
 deletion, a manual recreation, a partial restore, or a config mutation behind an already
 initialized manager. The refusal is what a broker does when it next starts. Two
-neighbouring consequences of the same condition (a delivery
-after discard, and the orphan sweep condemning a live remote generation whose record is
-absent) belonged to
-**[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)**, now
-CLOSED: unit 2's release classifier refuses the
-delivery for the first, and its retirement proof gate retains rather than condemns for the
-second. The cutoff had widened the first of them, since a spared hold stays serviceable by
-that peer — which is precisely the population the classifier answers.
+neighbouring consequences of the same condition (a delivery after discard, and the orphan
+sweep condemning a live remote generation whose record is absent) are answered by
+**[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)**: its release
+classifier refuses the delivery for the first, and its retirement proof gate retains
+rather than condemns for the second. A spared hold stays serviceable by that peer, which
+is precisely the population the classifier answers.
 
 This is **not** "exactly-once across a nats-server restart", and should not be
 described that way.
@@ -6191,29 +5651,28 @@ The deviations that remain:
   `0x92`** rather than `0x00`. Absence is indistinguishable from never-existed,
   and Spec5 sanctions `0x92` during recovery.
 - **A release that has already won its claim may still fan out after the discard
-  completed.** A PUBREL now takes a durable **release claim** before delivering
-  anything (`internal/mqtt/qos2_release_claim.go`): a create-only CAS on a sibling
-  of the hold subject, which a session discard competes for and which exactly one
-  of them can win **while a record occupies that subject**. So a discard that observes no
-  claim is not followed by a delivery **of the exchange it enumerated**, and the finalizer
-  can no longer read a purge's absence as proof the exchange completed. Two limits on that
+  completed.** A PUBREL takes a durable **release claim** before delivering anything
+  (`internal/mqtt/qos2_release_claim.go`): a create-only CAS on a sibling of the hold
+  subject, which a session discard competes for and which exactly one of them can win
+  **while a record occupies that subject**. So a discard that observes no claim is not
+  followed by a delivery **of the exchange it enumerated**, and the finalizer can no
+  longer read a purge's absence as proof the exchange completed. Two limits on that
   sentence: the enumeration is a one-shot snapshot, so a hold on a subject it never saw is
-  never competed for, and was therefore deliverable after the discard until
-  [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) unit 2's
-  retirement classifier refused exactly that population (the watermark is recorded before
-  any teardown deletion, so it is observable there); and the claim
-  subject is reused by successive exchanges, so exclusivity is per-occupancy rather than per
-  identifier for all time. What makes that second limit harmless is not the claim but the
-  fence a `discarded` marker records, which lets a later exchange prove the marker is not
-  about it ([issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66)).
-  What the claim does not order is the wire: a
-  releaser that claimed before the discard observed the register is committed, and
-  its live core-NATS fan-out may reach subscribers after the discard released the
-  session record and its CONNACK reported Session Present false. The delivery
-  *decision* is ordered against the discard; the delivery is not. A discard that
-  observes a claim waits briefly for the exchange to terminate, and on the same
-  broker an in-process fence closes the window outright — but a broker that dies
-  mid-release cannot be waited out.
+  never competed for, and
+  [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s retirement
+  classifier refuses exactly that population (the watermark is recorded before any
+  teardown deletion, so it is observable there); and the claim subject is reused by
+  successive exchanges, so exclusivity is per-occupancy rather than per identifier for all
+  time. What makes that second limit harmless is not the claim but the fence a `discarded`
+  marker records, which lets a later exchange prove the marker is not about it
+  ([issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66)). What the claim
+  does not order is the wire: a releaser that claimed before the discard observed the
+  register is committed, and its live core-NATS fan-out may reach subscribers after the
+  discard released the session record and its CONNACK reported Session Present false. The
+  delivery *decision* is ordered against the discard; the delivery is not. A discard that
+  observes a claim waits briefly for the exchange to terminate, and on the same broker an
+  in-process fence closes the window outright — but a broker that dies mid-release cannot
+  be waited out.
 - **A discarded session leaves one small claim record per inbound QoS 2 exchange
   that was in flight.** The `discarded` marker is the only durable proof that a
   late releaser must lose, so nothing may reap it at teardown time — "no releaser
@@ -6290,15 +5749,14 @@ rolling upgrade.
 
 ### Broker-owned stream prerequisites: startup refusal, a snapshot, and dropped fallbacks
 
-Every broker-owned `$MQTT_*` stream is now validated at account-manager
-initialization against the list its own protocol derives (see "Stream
-prerequisites" in `docs/ARCHITECTURE.md`). This extends the startup-refusal
-surface that previously covered five streams to **all ten** — the provisioning
-table's closed set, which its own test asserts. Separately, and not as a tenth
-member, the retired `$MQTT_origin` is refused by a **lookup-only** preflight run
-before the provisioning loop, because a table entry with an always-failing
-validator would provision the very stream it refuses. The consequences are the
-ones the `$MQTT_qos2in` precedent established:
+Every broker-owned `$MQTT_*` stream is validated at account-manager initialization
+against the list its own protocol derives (see "Stream prerequisites" in
+`docs/ARCHITECTURE.md`). The startup-refusal surface covers **all ten** — the provisioning
+table's closed set, which its own test asserts. Separately, and not as a tenth member, the
+retired `$MQTT_origin` is refused by a **lookup-only** preflight run before the
+provisioning loop, because a table entry with an always-failing validator would provision
+the very stream it refuses. The consequences are the ones the `$MQTT_qos2in` precedent
+established:
 
 - **A nonconforming stream fails broker startup**, with an error naming the
   stream, the offending setting, and the recovery. Nothing is repaired or
@@ -6375,28 +5833,23 @@ ones the `$MQTT_qos2in` precedent established:
     variation such as a `Sources` topology on `$MQTT_rmsgs` is not reconstructed and is
     the operator's to reapply.
 
-  `$MQTT_origin`, once a member of the old `$MQTT_sess`/`$MQTT_teardown` unit, is no
-  longer defined by this broker: an account still holding it is REFUSED at startup with
-  delete guidance rather than validated. This is not a rolling
-  upgrade. A *conforming* deployment restarts exactly as before —
-  default broker-created streams are conforming, and so are supported administrative
-  variations such as a source on `$MQTT_rmsgs`.
-- **Startup validation is a snapshot.** A stream config mutated *after*
-  initialization is not re-checked until the next process start or manager
-  recreation. Runtime guards exist exactly where the code already has them: the
-  drain refusal (both entry points) and the shared-subscription guard for a
-  stream-forced `ConsumerLimits.InactiveThreshold` on `$MQTT_msgs`, and
-  JetStream's own consumer-create rejection for a `MaxAckPending` limit below
-  the broker's cap. That list is where the guards are, not where they would all
-  be needed: the affine owner's normal create on `$MQTT_out` has none, so a
-  post-initialization stream limit is substituted into a durable that requested
-  zero and the owner never reads it back. The equivalent refusal exists only in
-  `recoverQ2AffineStorageConflict`, which is entered after a create has already
-  failed. That is
-  [issue #98](https://github.com/nberlee/mqtt-nats-broker/issues/98), and it is
-  affine-only. A persisted "validated" flag was
-  considered and rejected: it goes stale against exactly the mutations it claims
-  to cover.
+  `$MQTT_origin` is no longer defined by this broker: an account still holding it is
+  REFUSED at startup with delete guidance rather than validated. This is not a rolling
+  upgrade. A *conforming* deployment restarts exactly as before — default broker-created
+  streams are conforming, and so are supported administrative variations such as a source
+  on `$MQTT_rmsgs`.
+- **Startup validation is a snapshot.** A stream config mutated *after* initialization is
+  not re-checked until the next process start or manager recreation. Runtime guards exist
+  exactly where the code already has them: the drain refusal (both entry points) and the
+  shared-subscription guard for a stream-forced `ConsumerLimits.InactiveThreshold` on
+  `$MQTT_msgs`, and JetStream's own consumer-create rejection for a `MaxAckPending` limit
+  below the broker's cap. That list is where the guards are, not where they would all be
+  needed: the affine owner's normal create on `$MQTT_out` has none, so a
+  post-initialization stream limit is substituted into a durable that requested zero and
+  the owner never reads it back. The equivalent refusal exists only in
+  `recoverQ2AffineStorageConflict`, which is entered after a create has already failed.
+  That is [issue #98](https://github.com/nberlee/mqtt-nats-broker/issues/98), and it is
+  affine-only.
 
 - **A server-side consumer cap is invisible to this validation.** Four of the
   validators require their stream to leave `MaxConsumers` unlimited, because each of
@@ -6428,7 +5881,7 @@ ones the `$MQTT_qos2in` precedent established:
   prerequisite: the policy choice is closed, the limitation is not, and the broker still
   cannot validate the server setting through its own API access.
 
-- **This project's own external conformance environments now meet both prerequisites,
+- **This project's own external conformance environments meet both prerequisites,
   and assert them.** All three launches — the two CI conformance jobs
   (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` — run
   `synadia/nats-server:2.15.2-scratch` *by digest*, at the floor, with
@@ -6437,18 +5890,14 @@ ones the `$MQTT_qos2in` precedent established:
   configuration edit, which is how two environments come to disagree about the server they
   ran.
 
-  **The image is the upstream publisher's, not the Docker Official Image.** When the floor
-  moved to 2.15.1, and again to 2.15.2, the Docker Official `nats` repository had no tag
-  for it, and GitHub's
-  container registry carries no public nats-server image. `synadia/nats-server` on Docker
-  Hub is where nats-io/nats-docker publishes each release; its image configuration
-  (entrypoint `/nats-server`, ports 4222/6222/8222) matches the official image's, and
-  `run.sh` reads the version from `/varz`, never from the image tag.
+  **The image is the upstream publisher's, not the Docker Official Image.**
+  `synadia/nats-server` on Docker Hub is where nats-io/nats-docker publishes each release;
+  its image configuration (entrypoint `/nats-server`, ports 4222/6222/8222) matches the
+  official image's, and `run.sh` reads the version from `/varz`, never from the image tag.
 
-  **The three did not share one remedy.** The Paho job and the Compose environment mount
-  `test/conformance/nats.conf` and read the limit from it. The Rust conformance job
-  previously ran `-js` with no configuration file at all, so it gained its own
-  `test/conformance/nats-plain.conf` — unauthenticated, like the launch it replaces,
+  **The three do not share one configuration file.** The Paho job and the Compose
+  environment mount `test/conformance/nats.conf` and read the limit from it. The Rust
+  conformance job runs with its own `test/conformance/nats-plain.conf` — unauthenticated,
   because that job's broker runs without auth passthrough and the Paho environment's ACLs
   would break it.
 
@@ -6463,15 +5912,14 @@ ones the `$MQTT_qos2in` precedent established:
   no opt-out.
 
   The check **decodes** `/varz` rather than pattern-matching it, and that is a correctness
-  requirement rather than a style choice: a text match accepted `-1.5` as `-1`, accepted a
-  duplicate key whose second value was malformed, and accepted a duplicate key written
-  with a `\u` escape so that it did not match the literal text but decoded to the same
-  name. Decoding rejects a truncated or ambiguous document
-  outright and reads both fields at their exact paths. It costs a `python3` dependency,
-  which is why the Rust conformance job now sets Python up even though it runs no Python
-  suite. The floor also requires a bare `X.Y.Z`: prereleases are refused, because
-  `sort -V` orders `2.15.0-RC.1` *above* `2.15.0` and a range test alone would admit
-  precisely the population a GA floor excludes.
+  requirement rather than a style choice: a text match can accept `-1.5` as `-1`, a
+  duplicate key whose second value is malformed, or a duplicate key written with a `\u`
+  escape that does not match the literal text but decodes to the same name. Decoding
+  rejects a truncated or ambiguous document outright and reads both fields at their exact
+  paths. It costs a `python3` dependency, which is why the Rust conformance job sets
+  Python up even though it runs no Python suite. The floor also requires a bare `X.Y.Z`:
+  prereleases are refused, because `sort -V` orders `2.15.0-RC.1` *above* `2.15.0` and a
+  range test alone would admit precisely the population a GA floor excludes.
 
 Two pre-release fallbacks were **removed** rather than validated around, under
 the compatibility boundary (no released contract exists for either):
@@ -6490,8 +5938,7 @@ the compatibility boundary (no released contract exists for either):
   until the stream is fixed. Fixing it means the whole-bundle reset per the
   compatibility boundary — all ten broker-owned streams are one recreation unit, so
   recreating the offending stream alone is refused. The support floor is nats-server
-  2.15.1, which always understands `AllowMsgTTL` — as did every release back to 2.14.5,
-  so raising the floor neither gained nor lost anything for this row.
+  2.15.2, which always understands `AllowMsgTTL`, as did every release back to 2.14.5.
 - **The two inherited upstream migrations are gone.** Pre-2.10 nats-server
   per-client `$MQTT_sess_<hash>` session streams and pre-2.10.10 single-subject
   retained messages are no longer transferred at startup — and they are no
@@ -6509,17 +5956,15 @@ the compatibility boundary (no released contract exists for either):
 ### A resumed shared subscription proves its group durable, repairs it, and arbitrates
 
 A resume verifies the JetStream group durable behind every shared subscription whose
-consumer configuration is still resident on this broker, and refuses the CONNECT before the
-CONNACK when it cannot prove the durable exists and is usable
+consumer configuration is still resident on this broker, and refuses the CONNECT before
+the CONNACK when it cannot prove the durable exists and is usable
 ([issue #78](https://github.com/nberlee/mqtt-nats-broker/issues/78)). It then proves that
-this broker still **owns** the membership it is restoring, through a classified record write
-under the accept transaction's CAS
-([issue #79](https://github.com/nberlee/mqtt-nats-broker/issues/79)). Previously
-such a resume was accepted with
-Session Present = 1 and a subscription on a subject nothing publishes to.
+this broker still **owns** the membership it is restoring, through a classified record
+write under the accept transaction's CAS
+([issue #79](https://github.com/nberlee/mqtt-nats-broker/issues/79)).
 
 **The self-repair residual is closed for one verdict and retained for the others.** An
-**authoritatively absent** durable is now recreated rather than refused, so a session whose
+**authoritatively absent** durable is recreated rather than refused, so a session whose
 group consumer was deleted out of band recovers on its next reconnect instead of refusing
 forever. The other two verdicts keep their refusals, and the reasons are the ones that made
 them distinct in the first place: a **present but non-canonical** durable may be serving
@@ -6570,13 +6015,12 @@ register recovery, the restore path, the shared-membership ownership write, the 
 QoS 1/2 reconciliation verdicts and the lifetime grant, and the only one still silent
 is the **failed success-CONNACK write**, whose channel is the thing that failed.
 
-**Exits EARLIER in the CONNECT stay silent, and that is a stated residual rather than
-an oversight.** A CONNECT refused before the accept save — an unresolved record state,
-or a post-clear failure that disposes the old client — returns without a CONNACK.
-Those exits precede the point at which this connection is bound and its session
-accepted, which is the boundary the signal was scoped to when
-[issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54) introduced it;
-generalising past it was never part of this work.
+**Exits EARLIER in the CONNECT stay silent, and that is a stated residual rather than an
+oversight.** A CONNECT refused before the accept save — an unresolved record state, or a
+post-clear failure that disposes the old client — returns without a CONNACK. Those exits
+precede the point at which this connection is bound and its session accepted, which is the
+boundary the signal is scoped to
+([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)).
 
 A **3.1.1** client still gets a bare close wherever it is refused: its CONNACK has no
 reason code above 5.
@@ -6584,51 +6028,45 @@ reason code above 5.
 Three residuals attach to that signal.
 
 - **It deliberately UNDER-claims.** A disposing refusal says "session ownership could not
-  be confirmed" even where a child-shaped body was observed. Only a body claiming our parent
-  gets the more specific "ownership could not be established; try again". **The DISCONNECT
-  and log paths no longer over-claim in the other direction** —
-  [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) withdrew the takeover
-  assertion from every route that cannot hold the successor — so what remains here is one
-  direction, not two.
+  be confirmed" even where a child-shaped body was observed. Only a body claiming our
+  parent gets the more specific "ownership could not be established; try again". **The
+  DISCONNECT and log paths do not over-claim in the other direction**: no route that
+  cannot hold the successor asserts a takeover
+  ([issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)).
 - **The Reason String can be dropped for a client with a tight Maximum Packet Size.**
   `mqttMakeConnAckV5Frame` drops it **wholesale** rather than truncating when the frame would
   exceed the client's limit, and suppresses the frame entirely if it still does not fit. Such
   a client learns the reason code and nothing more, or nothing at all; the refusal proceeds
   either way.
-- **The failure CONNACK's write no longer defers this frame indefinitely, but the frame
-  is not bounded.** `writeActionlessFrameBy` reaches `writeSocket`, which installs
+- **The failure CONNACK's write does not defer this frame indefinitely, but the frame is
+  not bounded.** `writeActionlessFrameBy` reaches `writeSocket`, which installs
   `mqttWriteDeadline`
-  ([issue #39](https://github.com/nberlee/mqtt-nats-broker/issues/39)), so a
-  non-reading client can no longer stall that write for
-  the life of the connection. The signal precedes the disposal by design, so such a client
-  still delays this frame while it holds the session gate, the open record transaction
-  and, for the reconciliation and lifetime sites, the session's residency and its binding
-  — and a local same-client-ID CONNECT waits behind it. **No figure is claimed for that
-  delay.** The deadline starts only once `wmu` has been acquired, so it bounds neither the
-  preceding mutex waits nor anything else in the frame, and nothing bounds how many
-  bounded writes one critical section may contain. What changed is that a non-reading
-  socket is no longer an unbounded source of the delay; that is the whole of it. Remote
-  durable ownership is unaffected either way: it is arbitrated by the record CAS, not by
-  the gate. The ownership gate and the transaction were already held across this write at
-  every pre-existing refusal site, so what is new is residency and binding at those two.
+  ([issue #39](https://github.com/nberlee/mqtt-nats-broker/issues/39)), so a non-reading
+  client cannot stall that write for the life of the connection. The signal precedes the
+  disposal by design, so such a client still delays this frame while it holds the session
+  gate, the open record transaction and, for the reconciliation and lifetime sites, the
+  session's residency and its binding — and a local same-client-ID CONNECT waits behind
+  it. **No figure is claimed for that delay.** The deadline starts only once `wmu` has
+  been acquired, so it bounds neither the preceding mutex waits nor anything else in the
+  frame, and nothing bounds how many bounded writes one critical section may contain. A
+  non-reading socket is not an unbounded source of the delay; that is the whole of the
+  bound. Remote durable ownership is unaffected either way: it is arbitrated by the record
+  CAS, not by the gate.
 
 **A delivery admitted before the operation gate was armed can still escape it.** A live
 SUBSCRIBE arms its gate before it installs anything, but a delivery callback that has
-already completed its final gate check and is then descheduled before its irreversible send
-cannot observe a gate armed in between — there is no further wake, and shared QoS 0 does not
-wait at all. Worked: a QoS 1/2 callback reads both gates open and is descheduled; the
-readLoop begins a shared SUBSCRIBE and arms generation N; the callback resumes and
-transmits. **The direction is what bounds it**: because arming precedes every install, that
-callback was admitted by interest which *predates* the packet — authorised by whatever
-operation installed it, the CONNECT that
-[issue #79](https://github.com/nberlee/mqtt-nats-broker/issues/79) arbitrates or
-an earlier SUBSCRIBE that this
-one does — and never by the un-arbitrated interest the packet is about to install. It
-therefore belongs to the point-in-time-ownership convergence window below, not
-to [issue #80](https://github.com/nberlee/mqtt-nats-broker/issues/80)'s
-new-interest guarantee. Closing it entirely needs a real callback-admission boundary, whose
-cheap form (a counter registered after the check) is already refuted: a callback can be
-descheduled between loading the verdict and registering.
+already completed its final gate check and is then descheduled before its irreversible
+send cannot observe a gate armed in between — there is no further wake, and shared QoS 0
+does not wait at all. Worked: a QoS 1/2 callback reads both gates open and is descheduled;
+the readLoop begins a shared SUBSCRIBE and arms generation N; the callback resumes and
+transmits. **The direction is what bounds it**: because arming precedes every install,
+that callback was admitted by interest which *predates* the packet — authorised by
+whatever operation installed it, the CONNECT that
+[issue #79](https://github.com/nberlee/mqtt-nats-broker/issues/79) arbitrates or an
+earlier SUBSCRIBE that this one does — and never by the un-arbitrated interest the packet
+is about to install. It therefore belongs to the point-in-time-ownership convergence
+window above, not to [issue #80](https://github.com/nberlee/mqtt-nats-broker/issues/80)'s
+new-interest guarantee. Closing it entirely needs a real callback-admission boundary.
 
 **The operation gate's collateral cost.** While a shared SUBSCRIBE is unresolved, the
 connection's *other* QoS 1/2, PUBREL and affine deliveries wait too, and its shared QoS 0
@@ -6659,20 +6097,18 @@ the affine items own.
 **What the verification establishes, and what it does not.** It is evidence about the
 durable's *configuration*. Ownership is the ownership write's to establish.
 
-**An unsupported record shape is refused rather than repaired.** A session record
-carrying a shared group consumer configuration in `Cons` is a format this broker never
-writes — shared membership is held in `SharedSubs` alone — and every path that reads one
-refuses it and
-leaves the record untouched: the CONNECT restore, both expiry paths, the orphan-consumer
-sweep, and the shared record validator. The same refusal meets a record whose `shared_subs`
-values are the pre-transfer numeric QoS rather than a membership carrying acquisition
-references (the shared-group lifecycle transfer, 2026-09-22). The one path that decides by
-**absence of a reference** across the whole record set refuses in the way that withholds
-its destructive act, because it may not act on a partial view: the orphan-consumer sweep
-**aborts its whole pass**. (The last-holder scan, which used to be the second such path, no
-longer exists.) The recovery is the compatibility boundary's: stop the account's brokers
-and reset the broker-owned `$MQTT_*` streams — all ten, which are one recreation unit.
-This is not a rolling upgrade.
+**An unsupported record shape is refused rather than repaired.** A session record carrying
+a shared group consumer configuration in `Cons` is a format this broker never writes —
+shared membership is held in `SharedSubs` alone — and every path that reads one refuses it
+and leaves the record untouched: the CONNECT restore, both expiry paths, the
+orphan-consumer sweep, and the shared record validator. The same refusal meets a record
+whose `shared_subs` values are the pre-transfer numeric QoS rather than a membership
+carrying acquisition references. The one path that decides by **absence of a reference**
+across the whole record set refuses in the way that withholds its destructive act, because
+it may not act on a partial view: the orphan-consumer sweep **aborts its whole pass**. The
+recovery is the compatibility boundary's: stop the account's brokers and reset the
+broker-owned `$MQTT_*` streams — all ten, which are one recreation unit. This is not a
+rolling upgrade.
 
 ### The retained index is ordered by stream sequence, and a lost application is repaired
 
@@ -6732,15 +6168,12 @@ for the mechanism. What that does and does not guarantee:
   destination and expired upstream. No convergence defect has been reproduced there; this
   states the gap.
 
-Supported current-format retained behavior is otherwise unchanged. Records the
-broker cannot decode now fail closed everywhere — warned with the subject and the
-error, and evicted rather than silently ignored — where the development-era JSON
-fallback used to accept some of them; a record carrying a valid `Nmqtt-RFlags`
-header from a sourced foreign account is still accepted, and malformed *optional*
-headers (properties, expiry) are still ignored rather than rejected. Legacy
-development records (a JSON body, or a `-1` marker tombstone) and mixed old/new
-development fleets deliberately change behavior per the compatibility boundary and
-are not supported topologies.
+Records the broker cannot decode fail closed everywhere — warned with the subject and the
+error, and evicted rather than silently ignored; a record carrying a valid `Nmqtt-RFlags`
+header from a sourced foreign account is still accepted, and malformed *optional* headers
+(properties, expiry) are still ignored rather than rejected. Legacy development records (a
+JSON body, or a `-1` marker tombstone) and mixed old/new development fleets deliberately
+change behavior per the compatibility boundary and are not supported topologies.
 
 ### A retained update the store did not confirm closes the publisher's connection
 
@@ -6810,24 +6243,19 @@ the edges:
 - **Interleaving clients gain less.** Every packet other than a PUBLISH or PUBREL waits
   for the pipe to drain, the client's own acknowledgements included, because an outbound
   PUBREC can hold the session record transaction a queued release's classifier needs.
-- **Receive Maximum is now enforced over unanswered QoS 1 identifiers too.** Before, only
-  QoS 2 identifiers held between PUBREC and PUBCOMP were observable, because a QoS 1
-  PUBLISH was answered before the next packet was read. The server releases an identifier
-  before it writes the answer the client waits for, so a compliant client's own
-  outstanding set always contains the server's and is never refused; a client exceeding
-  its quota with QoS 1 publications is now disconnected with 0x93 [MQTT-3.3.4-7]. A packet
-  identifier reused while still unanswered ([MQTT-2.2.1-3] makes that the client's
-  violation) is processed as a new publication and answered again, in order, as the serial
-  path did.
+- **Receive Maximum is enforced over unanswered QoS 1 identifiers as well.** The server
+  releases an identifier before it writes the answer the client waits for, so a compliant
+  client's own outstanding set always contains the server's and is never refused; a client
+  exceeding its quota with QoS 1 publications is disconnected with 0x93
+  [MQTT-3.3.4-7]. A packet identifier reused while still unanswered ([MQTT-2.2.1-3] makes
+  that the client's violation) is processed as a new publication and answered again, in
+  order, as the serial path did.
 
 ### A client that cannot absorb a write within the deadline is disconnected
 
 Every MQTT application write is bounded by `mqttWriteDeadline` (10s, no operator knob),
-installed and cleared in `writeSocket`; see `docs/ARCHITECTURE.md`, "Every MQTT application
-write is deadline-bounded". This restores upstream nats-server's per-flush deadline and its
-`SlowConsumerWriteDeadline` close, which this broker had dropped when it replaced upstream's
-`writeLoop` and outbound buffer. Before it, a client whose socket send buffer stayed full
-blocked its writer — and any lock that writer held — for as long as the connection lasted.
+installed and cleared in `writeSocket`; see `docs/ARCHITECTURE.md`, "Every MQTT
+application write is deadline-bounded".
 
 What the new behaviour costs, stated:
 
@@ -6854,22 +6282,23 @@ What the new behaviour costs, stated:
    Pre-existing on a peer reset; newly reachable on a timeout. A PUBLISH header and payload
    are separately bounded, so one frame gets two deadlines rather than one.
 7. **No caller learns a new return outcome**, only a new cause of an existing failure. In
-   particular a delivery timeout does not make `mqttEnqueuePublishMsgTo` return `false`,
-   whose caller reads `false` as a packet-size discard and acknowledges and removes state.
-8. **No gate-duration bound is claimed.** The deadline removes indefinite blocking
-   caused by a non-reading socket; it does not bound how long the gate is held. A `c.mu`
-   section can contain many bounded writes (the retained flush plus the live PUBLISH under
-   one hold), and a gate-held Will phase can wait on `subsBarrier.wait`, which has no
-   elapsed-time bound: since 2026-10-12 later SUBSCRIBEs cannot extend that wait, but it
-   lasts as long as the slowest SUBSCRIBE in flight at its sample. Both are stated in
-   `docs/ARCHITECTURE.md`.
-9. **Two pre-existing durable-loss exposures become MORE REACHABLE, not new.** A Will living
-   only in client or disposition memory when the socket closes, and the parked-teardown
-   exposure behind an ambiguous probe, now both have timeout-triggered schedules. The
-   related `FireAt` defect this item made more reachable — a delayed Will's deadline
-   computed at CONSUMPTION rather than at the close — is **now FIXED**: the delay is
-   measured from the observed close. What that fix does **not** bound is the interval
-   between the close and the observation itself; see below.
+   particular a delivery timeout does not make `mqttEnqueuePreparedPublishMsgTo` return
+   `false`, which means nothing of the frame was emitted: a timed-out write is recorded as
+   written, never as a refusal, so nothing is acknowledged or removed on its account.
+8. **No gate-duration bound is claimed.** The deadline removes indefinite blocking caused
+   by a non-reading socket; it does not bound how long the gate is held. A `c.mu` section
+   can contain more than one bounded write (a PUBLISH's header and payload under one
+   hold; retained frames go to the replay driver, one frame per section), and a gate-held
+   Will phase can wait on `subsBarrier.wait`, which has no elapsed-time bound: later
+   SUBSCRIBEs cannot extend that wait, but it lasts as long as the slowest SUBSCRIBE in
+   flight at its sample. Both are stated in `docs/ARCHITECTURE.md`.
+9. **Two pre-existing durable-loss exposures become MORE REACHABLE, not new.** A Will
+   living only in client or disposition memory when the socket closes, and the
+   parked-teardown exposure behind an ambiguous probe, both have timeout-triggered
+   schedules. A delayed Will's delay is measured from the observed close, not from its
+   consumption. What that does **not** bound is the interval between the close and the
+   observation itself, stated above under
+   "Authorization of the authenticated identity — CLOSED, with residuals".
 
 ### A session object removed without its reset keeps working while its work is unresolved
 
@@ -6891,11 +6320,10 @@ indefinitely without the required progress: a client that never acknowledges, a 
 whose span stays above the floor's slack. An object still reachable after its work
 completed and its ledger went quiescent exceeds this residual and is a defect; the
 failover soak fails on one (`TestResourceChurnFailover`,
-`TestResourceDisplacedDisposalCollected`). It found one: a displaced disposal whose
-exchange the serving broker abandoned under its own tenure, which now ends once its
-tenure no longer serves and its source is settled, whether or not the exchange record still
-exists (`docs/ARCHITECTURE.md`, "Resource lifetime and
-shutdown release"). See
+`TestResourceDisplacedDisposalCollected`). A displaced disposal whose exchange the serving
+broker abandoned under its own tenure ends once its tenure no longer serves and its source
+is settled, whether or not the exchange record still exists (`docs/ARCHITECTURE.md`,
+"Resource lifetime and shutdown release"). See
 [issue #138](https://github.com/nberlee/mqtt-nats-broker/issues/138), D1.
 
 ### A slow subscriber can hold the client library's pending buffer per subscription
@@ -6933,16 +6361,13 @@ CONNACK the parser would send a malformed or unsupported CONNECT. CONNECT authen
 itself is unchanged: credentials are still adjudicated by the configured client dialer.
 
 **What "closed after `-connect-timeout`" promises, both halves.** The bound makes a silent
-connection's LIFETIME finite: the timer callback closes the socket whenever it is scheduled,
-so no such connection is held indefinitely, and that is the resource guarantee. And a
-CONNECT arriving after the configured window is refused, measured at admission (after the
-CONNECT was parsed) against the instant the deadline was armed for, not against whether the
-callback has run. Until
-[issue #77](https://github.com/nberlee/mqtt-nats-broker/issues/77) only the
-first half held: admission tested the callback's
-state alone, so a late callback let a late CONNECT through. Nor is the timeout a strict
-pre-authentication admission bound, which is the reading to guard against: once admitted,
-authentication runs on its own bound.
+connection's LIFETIME finite: the timer callback closes the socket whenever it is
+scheduled, so no such connection is held indefinitely, and that is the resource guarantee.
+And a CONNECT arriving after the configured window is refused, measured at admission
+(after the CONNECT was parsed) against the instant the deadline was armed for, not against
+whether the callback has run. Nor is the timeout a strict pre-authentication admission
+bound, which is the reading to guard against: once admitted, authentication runs on its
+own bound.
 
 On [3.1.4]: it is a SHOULD, and the timer implements it — a connection that stays silent is
 closed, and one whose CONNECT arrives too late is refused and closed.
@@ -6956,12 +6381,10 @@ consequence here is simply that this bound covers the pre-CONNECT window and no
 other. `-keepalive-max` is the operator surface that caps a v5 client's requested
 Keep Alive.
 
-This bound is not a denial-of-service defense and is not documented as one. It
-makes an idle connection's lifetime finite; a peer can still hold roughly
-`accept rate x window` connections open, and `-max-conns` is the absolute cap.
-Until [issue #56](https://github.com/nberlee/mqtt-nats-broker/issues/56) that
-cap did not exist: the flag was written to a field the accept path
-never read, and an unset or ignored `-max-conns` means no cap at all.
+This bound is not a denial-of-service defense and is not documented as one. It makes an
+idle connection's lifetime finite; a peer can still hold roughly `accept rate x window`
+connections open, and `-max-conns` is the absolute cap. An unset `-max-conns` means no cap
+at all ([issue #56](https://github.com/nberlee/mqtt-nats-broker/issues/56)).
 
 ### Programmatic AckWait near the duration limit
 
@@ -7200,42 +6623,30 @@ stated here rather than left to be inferred:
   deferral to carry its family and reason rather than allowing a row to be silently
   absent.
 
-**So [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s
-completeness deferral is NOT discharged**, and the census says so at its
-head rather than in a footnote. The plan's own rule is that an unproven closure class
-means claiming neither completeness nor that discharge, and the interpretation surface is
-such a class: a guard that catches real drift is not a proof that no drift is possible.
-[issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s remedy USED
-TO depend on the population and would have inherited the same bound.
-**It no longer does, and the enforcement is LANDED**: the all-ten recreation contract is
-keyed on the STREAM set rather than on the identities those streams carry, so an unclosed
-interpretation surface does not bound it. The census's own undischarged deferral above is
-unaffected and stands exactly as written — it is simply no longer on
-[issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s path.
-
-The reason for stopping there rather than claiming more is the history of this
-enumeration. Four earlier attempts were each falsified as a filter presented as a sweep,
-and two were refuted by an entry in the table they themselves introduced. A stated partial
-span that a test defends is worth more than a total claim that a fifth review round
-falsifies.
+**So [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s completeness
+deferral is NOT discharged**, and the census says so at its head rather than in a
+footnote. An unproven closure class means claiming neither completeness nor that
+discharge, and the interpretation surface is such a class: a guard that catches real
+drift is not a proof that no drift is possible.
+[issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)'s remedy is not
+bounded by it: the all-ten recreation contract is keyed on the STREAM set rather than on
+the identities those streams carry, so an unclosed interpretation surface does not bound
+it, and the census's undischarged deferral above stands exactly as written.
 
 ### A session teardown fails closed on an unreadable in-flight register
 
-**Newly reachable, by construction, from a store written before the exchange lineage
-existed.** The in-flight register's `Lin` is mandatory and an absent or malformed one is
-REFUSED rather than defaulted, so such a record now loads unreadable and reaches this
-residual — which is the compatibility boundary working as specified, not a new defect and
-not a rollout condition. There are no releases and no mixed fleet: a record without a
-lineage means the development store predates the design and must be recreated. The
-mechanism is in `docs/ARCHITECTURE.md` under "An exchange's LINEAGE is carried, where its
-nonce is deliberately re-minted"; the residual itself is unchanged and is stated below.
+An in-flight register's `Lin` is mandatory and an absent or malformed one is REFUSED
+rather than defaulted, so a record from a store written before the exchange lineage
+existed loads unreadable and reaches this residual. That is the compatibility boundary
+working as specified, not a rollout condition: such a development store must be
+recreated. The mechanism is in `docs/ARCHITECTURE.md` under "An exchange's LINEAGE is
+carried, where its nonce is deliberately re-minted".
 
-[issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38) replaced the
-blind `$MQTT_inflight` filter purge at teardown with a pass that
-enumerates, loads, checks each occupant's identity, and deletes only at or below the
-watermark its own enumeration returned. That pass **cannot** proceed past a register it
-could not read, and the consequence is a deliberate liveness cost rather than an
-oversight.
+Since [issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38), teardown does
+not purge `$MQTT_inflight` by filter: it enumerates, loads, checks each occupant's
+identity, and deletes only at or below the watermark its own enumeration returned. That
+pass **cannot** proceed past a register it could not read, and the consequence is a
+deliberate liveness cost rather than an oversight.
 
 **What happens.** An unreadable or indeterminate register makes `deleteTeardownTargets`
 return an error, so the session record is **not released**. Every deletion that already
@@ -7246,9 +6657,7 @@ record.** On a record-backed teardown the generation-retirement watermark stands
 record stays marked, so a later attempt re-enumerates and finishes the remainder. On the
 **no-record** branch (`mqttPreparedClear.destroy`, `sess_clear.go`, `seq == 0`) there is
 no record and no marker to anchor anything: that branch returns before the claim, so
-nothing re-drives it and cleanup falls to the orphan sweep alone. An earlier draft of
-this passage said the marker stands and every caller retries, without that split; it was
-wrong for one of the three call sites and is corrected here.
+nothing re-drives it and cleanup falls to the orphan sweep alone.
 
 **Who is affected.** Every caller of that path: the ordinary discard, a teardown
 **adopted** from a broker that vanished, session **expiry**, and the **orphan sweep**'s
@@ -7256,17 +6665,15 @@ reach into the same state. None of them completes a teardown on a state it could
 — which is the guarantee. Which of them can RETRY it is the separate question the second
 table answers.
 
-**And the wedge used to reach the shared group durables too**, because their release ran
-after `deleteTeardownTargets`. Since the shared-group lifecycle transfer the shared closing
-(seal the generation's acquisition ledger, release every listed acquisition, gate on the
-empty seal) runs on the record-backed routes BEFORE `deleteTeardownTargets`, right after
-`recordGenRetirement`, so a refused register reap no longer withholds a shared release; a
-refusal inside the shared closing withholds the record's release through its own gate
-instead, and the adoption repeats the closing from the ledger.
+**A refused register reap does not withhold a shared release.** On the record-backed
+routes the shared closing (seal the generation's acquisition ledger, release every
+listed acquisition, gate on the empty seal) runs BEFORE `deleteTeardownTargets`, right
+after `recordGenRetirement`; a refusal inside the shared closing withholds the record's
+release through its own gate instead, and the adoption repeats the closing from the
+ledger.
 
-Four earlier drafts of this passage each overstated something, so it is now a table of
-outcomes rather than prose. **What a refused reap leaves**, in the order
-`deleteTeardownTargets` performs it (`sess_teardown.go:730` onward):
+**What a refused reap leaves**, in the order `deleteTeardownTargets` performs it
+(`sess_teardown.go:903` onward):
 
 | Step, in order | On a refused reap |
 |---|---|
@@ -7278,25 +6685,22 @@ outcomes rather than prose. **What a refused reap leaves**, in the order
 | **the register reap** | **REFUSES here — this is the abort point** |
 | the shared group durables | already released by the shared closing, which precedes this on the record-backed routes; on the no-record branch there is no generation to seal |
 
-**What can be retried, and by what.** This is where the drafts went wrong twice:
+**What can be retried, and by what.**
 
 | Call site | Marker/record after a refused reap | Adoption retry possible? |
 |---|---|---|
 | `mqttPreparedClear.destroy` (`sess_clear.go`), no record (`seq == 0`) | none exists — `releaseTeardown` is not part of this branch at all | **No.** Nothing anchors a retry; the orphan sweep is the only path |
 | `mqttPreparedClear.destroy` (`sess_clear.go`), ordinary discard | record and marker stand, since `releaseTeardown` was never reached | Yes |
-| `sess_teardown.go:1052`, adopted teardown | as above | Yes |
+| `sess_teardown.go:1270`, adopted teardown | as above | Yes |
 
-**And a successful attempt is now ordered so a crash leaves work, not an orphan.** The
-order is seal → release every listed acquisition → gate on the empty seal → `releaseTeardown`
-deletes the record. A crash anywhere before the record delete leaves the record MARKED and
-the ledger sealed, so the adoption repeats the release from the ledger; a crash between an
-acquisition's release and its incarnation's consumer delete leaves a `retiring` entry in the
-group record that the orphan sweep's retirement pass finishes. (An earlier passage here
-described the record being removed BEFORE the shared release and a group durable surviving
-"until a member rejoins that `$share` group and adopts it"; that ordering and that
-disposition are gone — a later joiner mounts a fresh incarnation and never adopts a retired
-one.) A durable another member still holds is retained by the group record's count, never
-by a scan.
+**A successful attempt is ordered so a crash leaves work, not an orphan.** The order is
+seal → release every listed acquisition → gate on the empty seal → `releaseTeardown`
+deletes the record. A crash anywhere before the record delete leaves the record MARKED
+and the ledger sealed, so the adoption repeats the release from the ledger; a crash
+between an acquisition's release and its incarnation's consumer delete leaves a
+`retiring` entry in the group record that the orphan sweep's retirement pass finishes. A
+later joiner mounts a fresh incarnation and never adopts a retired one. A durable
+another member still holds is retained by the group record's count, never by a scan.
 
 **The cost, stated.** If the register is *permanently* unreadable — a shape no broker in
 this tree writes, which is what makes it unreadable — that client ID's teardown never
@@ -7315,25 +6719,17 @@ interpret ([issue #60](https://github.com/nberlee/mqtt-nats-broker/issues/60),
 
 ### A group durable's release is arbitrated by its group record, and what that leaves
 
-Until 2026-09-22 five release paths deleted a group consumer on the answer of a walk over
-every session record (`sharedDurablesHeldByOthers`), and this section recorded what that
-walk cost: a retained durable nothing reclaimed while any record was unreadable,
-retention unbounded in count, a same-client-ID skip that made the new owner's record
-invisible after a takeover, and a join/delete race the walk could not close because a
-read is not an arbitration. The shared-group lifecycle transfer replaced the walk with a
-group record per logical group (physical incarnation, holder count, retiring
-incarnations), a per-generation acquisition ledger the teardown seals, and release
-verdicts in the session record executed against those two — `docs/ARCHITECTURE.md`, "A
-group durable is held by arbitration, not counted by a scan". **Every residual of the
-walk is CLOSED with it**: no record's readability spares another group's durable; the
-same-client-ID question does not arise, because a release removes exactly the acquisition
-its verdict names rather than deciding about other sessions; and the join/delete race is
-closed by naming — a delete is issued only for an incarnation the record has moved into
-`retiring`, and a join names the incarnation it CASes the record against, so a late
-delete can never reach a successor.
-[issue #84](https://github.com/nberlee/mqtt-nats-broker/issues/84)'s separation
-of the local release from the
-consumer's fate stands (a refusal never strands this session's own state), and
+A group consumer's release is arbitrated by a group record per logical group (physical
+incarnation, holder count, retiring incarnations), a per-generation acquisition ledger
+the teardown seals, and release verdicts in the session record executed against those
+two — `docs/ARCHITECTURE.md`, "A group durable is held by arbitration, not counted by a
+scan". No record's readability spares another group's durable; a release removes exactly
+the acquisition its verdict names rather than deciding about other sessions; and a
+delete is issued only for an incarnation the record has moved into `retiring`, while a
+join names the incarnation it CASes the record against, so a late delete can never reach
+a successor. [issue #84](https://github.com/nberlee/mqtt-nats-broker/issues/84)'s
+separation of the local release from the consumer's fate stands (a refusal never strands
+this session's own state), and
 [issue #85](https://github.com/nberlee/mqtt-nats-broker/issues/85)'s
 surviving-membership property still decides the LOCAL half; neither decides an
 acquisition, which is released unconditionally.
@@ -7353,8 +6749,7 @@ acquisition, which is released unconditionally.
    independent of the consumer's age and of the record's connection status, since a hard
    crash leaves `DisconnectedAt == 0` on a record nothing else revisits when the session
    never expires. During that window the consumer stays alive and holds interest; this is
-   the same order of window as the orphaned-consumer residual and no larger than the
-   pre-transfer one, where the crash left a committed membership nothing released.
+   the same order of window as the orphaned-consumer residual.
 4. **ONE client-visible refusal.** A join that must MOUNT a new incarnation while its
    group's `retiring` list is full (sixteen entries) first finishes the entries it can
    inline and otherwise fails that filter with a retryable reason. It is reachable only
@@ -7386,17 +6781,13 @@ exits that
 survive on purpose.
 
 1. **A post-CONNACK refusal still closes, and therefore still publishes the Will**
-   ([MQTT-3.1.2-8] requires it on a close not preceded by a DISCONNECT, and post-CONNACK there
-   is no licence to discard it). Three arms reach it: an **unresolvable** ambiguous
-   write, a
-   **10164** outcome that is local-definite or unresolved, and a **10071** classified as a
-   fork or as ownership-unsettled. The first two are the right trade — a connection
-   serving a session that can persist nothing is worse — and the third is an ownership
-   disposition,
-   where stopping is the point. (The third read "classified takeover or fork"
-   before [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)
-   withdrew the takeover claim from this arm.)
-   Each abandons the restore verdict so withheld deliveries are woken rather than parked.
+   ([MQTT-3.1.2-8] requires it on a close not preceded by a DISCONNECT, and post-CONNACK
+   there is no licence to discard it). Three arms reach it: an **unresolvable**
+   ambiguous write, a **10164** outcome that is local-definite or unresolved, and a
+   **10071** classified as a fork or as ownership-unsettled. The first two are the right
+   trade — a connection serving a session that can persist nothing is worse — and the
+   third is an ownership disposition, where stopping is the point. Each abandons the
+   restore verdict so withheld deliveries are woken rather than parked.
 2. **A leave that never completes leaves the memberships durable and their group durables
    alive** until a later resume re-derives it. This belongs to the refusing arms only:
    on the
@@ -7413,8 +6804,7 @@ survive on purpose.
    rejection.** The
    forced leave samples both itself, so it is covered; the shared helper remains
    incomplete for
-   other continuation callers, which were not analysed here. A known gap, stated rather than
-   widened under an item that never planned for it.
+   other continuation callers, which have not been analysed for it. A known gap, stated.
 5. **A late rejection or ambiguity raised by the commit's register cleanup on the CONTINUATION
    path** — where the connection may already be gone — is logged and left to the marker or
    uncertainty the write itself armed. Nothing is serving there, so there is nothing to gate;
@@ -7445,7 +6835,7 @@ bodies arrive through unconditional publication, and acknowledged bytes are repl
 verbatim. Only an in-process same-client-ID replacement this broker holds both ends of
 licenses the claim.
 
-Three residuals follow, and the alpha ships with them stated.
+Four residuals follow, and the alpha ships with them stated.
 
 1. **A genuine remote takeover is under-reported.** Another broker really does take the
    session, this broker observes its record, and the displaced client is told `0x89`
@@ -7456,17 +6846,13 @@ Three residuals follow, and the alpha ships with them stated.
    nothing established that, on evidence a forged, replayed, unrelated or malformed record
    produces identically.
 
-2. **That takeover's Will is published rather than suppressed.** The same routes previously
-   ran the takeover's Will discard. A displacement that cannot prove a successor may not
-   suppress a Will — suppressing it would be silent loss on evidence that establishes
-   nothing — so the displaced connection's Will now takes ordinary handling: published
-   immediately, or enqueued on the outbox against its delay where a qualifying acceptance
-   fact may still suppress it. For a real remote takeover whose client reconnects promptly
-   the acceptance fact converges it; for one whose client does not, a Will is delivered that
-   the pre-[issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86)
-   broker would have dropped. **The specified behavior is the Will, and the
-   old suppression was the deviation**, but a deployment that relied on the old silence will
-   see traffic it did not before.
+2. **That takeover's Will is published rather than suppressed.** A displacement that
+   cannot prove a successor may not suppress a Will — suppressing it would be silent
+   loss on evidence that establishes nothing — so the displaced connection's Will takes
+   ordinary handling: published immediately, or enqueued on the outbox against its delay
+   where a qualifying acceptance fact may still suppress it. For a real remote takeover
+   whose client reconnects promptly the acceptance fact converges it; for one whose
+   client does not, a Will is delivered. **The specified behavior is the Will.**
 
 3. **The in-memory consume window, newly reachable.** `mqttTakeWillLocked` marks the Will
    discharged and returns it, and the publish or enqueue follows outside `c.mu`. A crash in
@@ -7475,7 +6861,7 @@ Three residuals follow, and the alpha ships with them stated.
    [issue #86](https://github.com/nberlee/mqtt-nats-broker/issues/86) did not
    create it — but it is now reachable on the
    disposal routes as well. Closing it needs a durable intent record written before the
-   in-memory consume, which is new durable state and out of scope for this item. The same
+   in-memory consume, which is new durable state the broker does not have. The same
    applies to a parked action consumed into a prepared disposition and lost to a crash
    before its discharge: the discharge deliberately does **not** re-park, because phase 1
    has already deresidented the session and a re-parked action would be unreachable by any
@@ -7492,10 +6878,10 @@ Three residuals follow, and the alpha ships with them stated.
    pass and by the next CONNECT: re-parking would convert a logged loss into a silent one.
    Pinned by `TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked`. Closing it
    needs a durable intent record written before the in-memory consume, which is new durable
-   state and out of scope for this item — the same boundary residual 3 sits behind.
+   state the broker does not have — the same boundary residual 3 sits behind.
 
-Two adjacent outbox behaviors are **pre-existing** and unchanged, and are recorded here only
-because these routes now reach them: an enqueue whose retries are exhausted publishes
+Two adjacent outbox behaviors are **pre-existing** and unchanged, and are recorded here
+because these routes reach them: an enqueue whose retries are exhausted publishes
 immediately as a fail-safe, and because the create is then unconfirmed rather than proven
 absent, a record that landed with its ack lost fires later as well and the Will is published
 **twice**; actual loss requires that fail-safe publication to fail too.
@@ -7510,12 +6896,12 @@ rather than carrying a retired delivery's decisions forward.
 Two refusals, and they are visibly different to an operator:
 
 - **Before the release**, the finalize simply reports the delivery as not its own,
-exactly as it does for a drain it never had. Nothing is logged, because nothing was
-attempted. - **After the release but before the save**, it logs *"withholding the
-completion of drained sequence N ... the session was cleared while its in-flight
-register was being released"* and leaves the source unacknowledged. The register release
-already happened and is not undone; what is withheld is the claim removal and the
-acknowledgement.
+  exactly as it does for a drain it never had. Nothing is logged, because nothing was
+  attempted.
+- **After the release but before the save**, it logs *"withholding the completion of
+  drained sequence N ... the session was cleared while its in-flight register was being
+  released"* and leaves the source unacknowledged. The register release already happened
+  and is not undone; what is withheld is the claim removal and the acknowledgement.
 
 **The cost** is that the source message stays pending and is redelivered. The retired
 incarnation's own claim state is left untouched, so nothing about the fresh session is
@@ -7533,11 +6919,11 @@ different packet identifiers, which one the client holds is unknowable — a str
 orders the writes and not the sends. The pre-existing posture is that all such registers are
 reserved, none is released, and new outbound QoS 1/2 allocation is withheld for the session.
 
-[issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38) adds one
-thing: the drain no longer **finalizes over** that state. It previously
-removed its claim and acknowledged the source while both registers survived behind a
-consumer about to be deleted, which stranded them and reserved their identifiers for the
-life of the session. Now the delivery is withheld instead.
+Since [issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38) the drain does
+not **finalize over** that state: the delivery is withheld, rather than removing its
+claim and acknowledging the source while both registers survive behind a consumer about
+to be deleted, which would strand them and reserve their identifiers for the life of the
+session.
 
 **Convergence is at the next resume, not mid-connection.** The ambiguity is an observation
 rather than a latch: it is not persisted, and every complete recovery scan recomputes it
@@ -7656,14 +7042,12 @@ above). What it does now is end that packet coherently.
 **Closed.** The deferred QoS 0 teardown is REVOKED by the later occurrence: the consumer
 survives, the record names it, the delivery subscription reopens under the last
 occurrence's terms, and the verdicts the staging recorded on transmitted registers are
-withdrawn durably in the packet's own write. (Where the downgrade is eligible to become a
-drain instead, its staging records no such verdict in the first place, so a revocation has
-none to withdraw — see "A QoS 0 re-SUBSCRIBE drains rather than destroys".) Previously
-the client was granted QoS 1 and
-then received nothing for the rest of the connection, while the record named a durable the
-packet went on to delete. Both halves of a multi-level wildcard are covered. Where delivery
-readiness cannot be established the filter is REFUSED `0x80` and the downgrade stands,
-because granting a QoS the broker cannot serve is the defect, not a lesser form of it.
+withdrawn durably in the packet's own write. (Where the downgrade is eligible to become
+a drain instead, its staging records no such verdict in the first place, so a revocation
+has none to withdraw — see "A QoS 0 re-SUBSCRIBE drains rather than destroys".) Both
+halves of a multi-level wildcard are covered. Where delivery readiness cannot be
+established the filter is REFUSED `0x80` and the downgrade stands, because granting a
+QoS the broker cannot serve is the defect, not a lesser form of it.
 
 **Not claimed: atomicity across duplicate occurrences of one filter in a packet.** The
 earlier occurrence's raw subscription is still displaced by the later one's `processSub`,
@@ -7672,22 +7056,11 @@ membership standing — the revocation re-stages the downgrade so the *consumer*
 coherent with the record in that case, but the packet is not transactional across
 occurrences.
 
-**A revived consumer's deliveries skipped while the barrier was down used to redeliver
-with `DUP=1` on their first transmission — CLOSED by
-[issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)
-(2026-09-09).** It was [issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)'s
-defect reached by a new route rather than a new one: `deferredNaksLocked` deleted the
-`sess.deferred` key before NAKing it and `trackPublish` cleared `dup` only for a key still
-present, so any acknowledgement in the interval consumed the fact that would clear the flag.
-The attribution rested on a PROPERTY rather than a case analysis, and
-[issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76) delivered it:
-the flag now follows the durable per-identifier send-intent fact at its single derivation
-site, and the six `sess.deferred` DUP claims were deleted with it, so every case is decided
-there. The route therefore needs no entry in
-[issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)'s close set,
-and no second,
-weaker marker is added here — a marker recorded in this window cannot survive to be
-consumed, for the reason above.
+**A revived consumer's deliveries skipped while the barrier was down are not flagged
+`DUP=1` on their first transmission**
+([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)): the flag follows
+the durable per-identifier send-intent fact at its single derivation site, and no
+second, weaker marker is added here.
 
 **A revived consumer's skipped deliveries are NOT NAKed, so each waits out `AckWait`
 before it is re-offered — and can be overtaken while it waits.** Stated separately from the
@@ -7715,7 +7088,7 @@ revocation calls no `deferredNaksLocked`, so there is nothing to NAK.
 serializes a record MID-LOOP, and that record carries occurrence 1's void verdict on a
 TRANSMITTED register beside a still-pre-packet plain membership. A crash in that window
 leaves a record saying a delivery the client is holding was never transmitted, which
-licenses re-minting its identifier. This change does not close it — closing it would mean
+licenses re-minting its identifier. The broker does not close it — closing it would mean
 either withholding the early save's `VoidedRegs`, which the revision-stamping design
 deliberately does not do, or making the staging conditional on no later occurrence
 existing, which cannot be done without failing the earlier occurrences too. What the
@@ -7733,9 +7106,9 @@ remain durable; their dependent acknowledgement and drain retirement are withhel
 identity-bound acknowledgement can advance the exchange; otherwise confirmed generation
 discard ends the hold. Reconnect alone does not guarantee progress.
 
-This is not a new hold — the broker already reserved this shape and said so under the
-oversize-refusal cost above — but the drain release request and the claim now held with it
-are new, and the withheld acknowledgement is what keeps the two consistent across a crash.
+The hold itself is the shape the oversize-refusal cost above already reserves; the drain
+release request and the claim held with it are added to it, and the withheld
+acknowledgement is what keeps the two consistent across a crash.
 
 **A SUBSCRIBE rollback reaches this shape too.** A delivery whose send section is open on
 a consumer that a SUBSCRIBE packet created, while that packet's final save fails DEFINITELY

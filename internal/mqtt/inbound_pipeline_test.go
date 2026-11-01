@@ -21,8 +21,8 @@ import (
 // holds the work its decision depends on at a named seam, positively observes the competing
 // event, and asserts on the DECISION RECORD the deciding code made — a record the correct code
 // and its mutant both produce — rather than on silence. They arm process-global hooks, so none
-// runs in parallel. The paired mutations are listed in docs/ROADMAP.md (the implementation
-// bullet) and were each run against these tests.
+// runs in parallel. The paired mutations are listed in the roadmap's former implementation
+// bullet, linked from issue #132 (the platform audit), and were each run against these tests.
 
 // inboundPipeFix is one fresh broker with interest on the fixture's subjects and one raw v5
 // client.

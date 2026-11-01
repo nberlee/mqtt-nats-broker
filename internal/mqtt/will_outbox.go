@@ -192,8 +192,8 @@ type mqttWillOutbox struct {
 	// own evicted connection enqueued. That cancel is DELETED — a reconnect-time
 	// cancel cannot say when the acceptance happened, which is the whole point of the
 	// dated facts — so nothing reads this field today. It is still written and still
-	// validated, and it is called out in docs/CONFORMANCE.md as a field whose reader
-	// is gone rather than quietly left to look load-bearing.
+	// validated, and it is called out here as a field whose reader is gone rather
+	// than quietly left to look load-bearing.
 	Gen string `json:"gen"`
 	// Decision is the act this record has been LICENSED to perform, and it is
 	// immutable once set. It exists because a fresh decision per claimant is

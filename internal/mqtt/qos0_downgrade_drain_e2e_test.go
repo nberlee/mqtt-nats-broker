@@ -45,7 +45,7 @@ func testDrainClaimsLocked(sess *mqttSession) int {
 }
 
 // TestMQTTQoS0ReSubscribeKeepsAStartedQoS1Exchange is T1: the acceptance test for
-// docs/ROADMAP.md's "A QoS 1/2 -> QoS 0 re-SUBSCRIBE destroys outstanding exchanges".
+// docs/CONFORMANCE.md's "A QoS 0 re-SUBSCRIBE drains rather than destroys".
 //
 // [MQTT-3.8.4-3] requires a re-SUBSCRIBE on an identical filter to REPLACE the
 // subscription without interrupting the flow of publications, so a PUBLISH already

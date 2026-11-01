@@ -90,7 +90,7 @@ func testF116IdentifierFree(t *testing.T, e *testInflightEnv, pi uint16, what st
 	})
 }
 
-// T1 (the original trigger, staged as the roadmap names it). The client's PUBCOMP for a written
+// T1 (the original trigger, staged as issue #118 names it). The client's PUBCOMP for a written
 // copy completes the exchange while a redelivered copy sits between its commit and its write
 // entry; write entry then refuses, nothing is written, and the redelivered attempt's unit is
 // given back, so the identifier is free once the exchange's cleanup is done — no second PUBCOMP,

@@ -33,8 +33,8 @@ import (
 // Cons still names a live durable, and returns the durable, the sid and the packet
 // identifier of the exchange the client is holding.
 //
-// The schedule is a FAILED DRAIN ADOPTION, which is what the roadmap bullet names as the
-// producer, and every step is ordinary client behaviour plus one injected filter failure:
+// The schedule is a FAILED DRAIN ADOPTION, and every step is ordinary client behaviour plus
+// one injected filter failure:
 //
 //  1. SUBSCRIBE a wildcard at QoS 1 and let one PUBLISH reach the client unacknowledged.
 //  2. Re-SUBSCRIBE the same filter at QoS 0. The downgrade converts the consumer into a
@@ -819,9 +819,9 @@ func TestMQTTRestoreDefiniteSaveFailureRestoresTheConsumerAndRefusesTheConnect(t
 // a later step refusing the CONNECT must leave it standing — the client's exchanges are owed
 // either way, and the next resume picks the drain up from Drains.
 //
-// It drives the requested-lifetime save, which the roadmap bullet's own analysis said did
-// not exist: applyRequestedLifetime runs AFTER processSubs and saves whenever the terms
-// moved, so a client reconnecting with a different Session Expiry Interval reaches it.
+// It drives the requested-lifetime save: applyRequestedLifetime runs AFTER processSubs and
+// saves whenever the terms moved, so a client reconnecting with a different Session Expiry
+// Interval reaches it.
 func TestMQTTRestoreLaterFailureDoesNotRollBackAConfirmedConversion(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second

@@ -2106,7 +2106,7 @@ func TestMQTTDeferredDischargeReparksWhenUnresolvedUnderTheFence(t *testing.T) {
 // Mutation MU13d (both homes of the unbound rule removed): the attempt writes against a
 // bound session. Removing only ONE home is not observable here and is not claimed to be:
 // MU13b (the claim alone) is caught by the re-validation and MU13 (the predicate alone) by
-// the claim, both recorded as surviving in docs/ROADMAP.md with that reasoning.
+// the claim, both recorded as surviving in issue #19 with that reasoning.
 func TestMQTTVoidVerdictHandoffYieldsToARebindInTheGateWindow(t *testing.T) {
 	e := testNewDeferredEnv(t, "client-handoff-rebind", "handoff.rebind")
 	stores, restoreCount := testSessRecordStoreCounter(e.sess)

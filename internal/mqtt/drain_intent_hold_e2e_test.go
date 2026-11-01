@@ -139,8 +139,7 @@ func TestMQTTReSubscribeOverAnUnfinishedDrainedIntentIsRefused(t *testing.T) {
 	// SCOPE: evidence about the schedule this test exercises, NOT a claim that retirement
 	// excludes every re-offer. Retirement's own exclusion — the delivery barrier and the
 	// confirmed disposal — is pinned by drain_disposal_test.go, and what it still does not
-	// exclude (an indeterminate delete, and a fork sibling rebuilding the drain) is stated
-	// in docs/CONFORMANCE.md.
+	// exclude (a fork sibling rebuilding the drain) is stated in docs/CONFORMANCE.md.
 	//
 	// Publishing on the control filter proves the connection is alive and delivering in
 	// this very window, so "nothing else arrived" is a fact about the drained source and

@@ -1814,7 +1814,7 @@ func TestMQTTReconcileAmbiguousRepairSaveIsSettledForward(t *testing.T) {
 // A v5 CONNECT carrying a Will, refused in each branch. It used to assert that the
 // client saw NO PACKET AT ALL, and that is the behaviour the pre-CONNACK-signal item
 // replaced: this site was one of the TWO still refusing in silence — the lifetime grant
-// was the other, which the roadmap bullet had wrongly reported as done — so an automatic
+// was the other, which had wrongly been reported as done — so an automatic
 // client could not tell a refusal from a network fault or learn that a clean start is
 // the recovery.
 //

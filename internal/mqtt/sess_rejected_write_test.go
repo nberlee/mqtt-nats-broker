@@ -21,7 +21,7 @@ const testRejectionWait = 10 * time.Second
 
 // Settling a DEFINITELY REJECTED session-record CAS.
 //
-// The reproduction the roadmap item demanded is a CAUSAL PAIR, because the defect is
+// The reproduction issue #21 demanded is a CAUSAL PAIR, because the defect is
 // the absence of a reaper rather than a wrong decision: the persist notification is an
 // at-most-once core-NATS observation, and only by showing that the same takeover is
 // reaped WITH it and not reaped WITHOUT it is the notification pinned as the sole
@@ -607,7 +607,7 @@ func (e *testRejectionEnv) bind(t *testing.T) {
 // break; a duplicate check in the caller would mask it.
 //
 // A bound session's rejection is therefore settled when it unbinds, which is the residual
-// docs/CONFORMANCE.md states and the subject of its own roadmap item.
+// docs/CONFORMANCE.md states and the subject of issue #22.
 func TestMQTTRejectedRecordPassLeavesBoundSessionsAlone(t *testing.T) {
 	e := testNewRejectionEnv(t, "rejboundalone")
 	e.dropPersistObservations(t, e.idHash)
@@ -649,7 +649,7 @@ func TestMQTTRejectedRecordPassLeavesBoundSessionsAlone(t *testing.T) {
 // entry hook, which is that window exactly.
 //
 // This is also the site with NO reaper of its own for a never-expiring session, which is what
-// the roadmap bullet was about.
+// issue #21 was about.
 func TestMQTTRejectedRecordDeferredDischargeSite(t *testing.T) {
 	e := testNewRejectionEnv(t, "rejdefersite")
 	e.dropPersistObservations(t, e.idHash)
@@ -1703,7 +1703,7 @@ func (e *testRejectionEnv) deliveryBarrier(t *testing.T, sub *nats.Subscription,
 	return msg
 }
 
-// TestMQTTBoundRejectionForeignStopsPublish is the reproduction the roadmap bullet
+// TestMQTTBoundRejectionForeignStopsPublish is the reproduction issue #22
 // demanded, and the one nine review rounds of earlier attempts never had: the packet is a
 // QoS 1 PUBLISH, not a PINGREQ. Being served first is harmless for a PINGREQ, which is
 // exactly why every earlier test read past a settlement that ran AFTER the dispatch

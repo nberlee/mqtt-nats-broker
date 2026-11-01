@@ -228,8 +228,8 @@ func TestForcedLeavePreStoreRefusalStillRefuses(t *testing.T) {
 	}
 }
 
-// TestForcedLeaveDoesNotPublishTheWillWhileTheConnectionLives is the harm the roadmap bullet
-// names, asserted directly: the Will announces to other clients that this client died, and it
+// TestForcedLeaveDoesNotPublishTheWillWhileTheConnectionLives is the forced leave's harm,
+// asserted directly: the Will announces to other clients that this client died, and it
 // fired because the BROKER could not persist a bookkeeping write.
 //
 // Suppressing the Will is not the fix and never was — [MQTT-3.1.2-8] requires it on a close not
@@ -273,11 +273,11 @@ func TestForcedLeaveDoesNotPublishTheWillWhileTheConnectionLives(t *testing.T) {
 	testMQTTExpectNothingFor(t, rw, 500*time.Millisecond)
 }
 
-// TestForcedLeaveExpiryIsNeverZeroOnThisPath pins A3, a claim in the roadmap bullet that turned
-// out to be VACUOUS on this path — recorded as a test rather than deleted, so a later change
-// that makes it reachable fails here instead of passing quietly.
+// TestForcedLeaveExpiryIsNeverZeroOnThisPath pins A3, a claim that turned out to be VACUOUS
+// on this path — recorded as a test rather than deleted, so a later change that makes it
+// reachable fails here instead of passing quietly.
 //
-// The bullet inherited "and can delete a zero-expiry session" from issue #68's general review of
+// The claim inherited "and can delete a zero-expiry session" from issue #68's general review of
 // post-CONNACK failure. It cannot happen here: a non-clean 3.1.1 CONNECT maps to
 // mqttSessionNeverExpire, and a clean start has no persisted membership to leave — so
 // len(sharedSubs) > 0 and expiry == 0 cannot co-occur.
@@ -630,8 +630,8 @@ func TestForcedLeaveRefusalTerminatesTheRestoreVerdict(t *testing.T) {
 // Both are gone. The phase now RETURNS an outcome and a vocabulary, mqttProcessConnect's
 // refuseDisposing runs abort → signal → dispose, and the merged verdict is split into
 // DisposingNonForked and DisposingForked. The same treatment closed the lifetime grant, which
-// this note never mentioned because the roadmap bullet said the reconciliation verdicts were
-// the only site left and it was wrong.
+// this note never mentioned because the reconciliation verdicts were believed to be the only
+// site left, and they were not.
 //
 // The claim that reaching the route needed "a reconciliation-scoped injection seam that does
 // not exist yet" was ALSO wrong: TestMQTTReconcileRefusalDisciplineWithWill already had one —
@@ -916,7 +916,7 @@ func TestForcedLeaveWithholdsTheReleaseWhenOwnershipIsUnresolved(t *testing.T) {
 }
 
 // TestPreConnackRefusalSignalAtTheLifetimeGrantDisposingArms is T6, and it covers the
-// population the roadmap bullet wrongly reported as done.
+// population once wrongly reported as done.
 //
 // TestPreConnackRefusalSignalAtTheLifetimeGrant above injects a PRE-STORE failure, which
 // reaches the grant's local arm — no vocabulary, no disposal. Its DISPOSING arms had no

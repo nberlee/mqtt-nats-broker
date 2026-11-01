@@ -46,7 +46,8 @@
 // against an older Cond waiter, so identity churn can starve one waiter at a
 // constant count), and no priority at all over ordinary sess.mu traffic, which is
 // invisible to the count. A try-caller delayed past the waiter's completion succeeds
-// normally, which lengthens nothing. See docs/CONFORMANCE.md residual 13 for the
+// normally, which lengthens nothing. See docs/CONFORMANCE.md, "A definite record-CAS
+// rejection is settled by a probe, with bounded convergence", item 11, for the
 // blocking-vs-blocking residual this leaves stated rather than fixed.
 
 package mqtt
@@ -93,7 +94,8 @@ func (sess *mqttSession) recordTxCondLocked() *sync.Cond {
 // them. There is no FIFO among blocking waiters: a newly arriving beginRecordTx can win
 // the post-broadcast mutex race against an older Cond waiter, so under a sustained stream
 // of blocking arrivals one waiter can be preceded indefinitely. That residual is stated,
-// not fixed (docs/CONFORMANCE.md residual 13); what this function does guarantee is
+// not fixed (docs/CONFORMANCE.md, "A definite record-CAS rejection is settled by a
+// probe, with bounded convergence", item 11); what this function does guarantee is
 // priority over the NON-BLOCKING form, below.
 //
 // The wait is BARGE-PROOF against non-blocking acquisitions. sync.Cond gives no

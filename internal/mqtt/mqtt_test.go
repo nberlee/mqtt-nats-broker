@@ -4347,7 +4347,8 @@ func TestMQTTUnsubscribeWithPendingAcks(t *testing.T) {
 	// was dropped by the UNSUBSCRIBE. [MQTT-3.10.4-3] forbids that — the server
 	// must complete the delivery of a QoS 1/2 message it has already started
 	// sending — so the consumer survives as a DRAIN instead and the delivery is
-	// still owed. See internal/mqtt/unsub_drain.go and docs/ROADMAP.md.
+	// still owed. See internal/mqtt/unsub_drain.go and docs/ARCHITECTURE.md,
+	// "UNSUBSCRIBE drain".
 	mc := testMQTTGetClient(t, s, "sub")
 	mc.mu.Lock()
 	sess := mc.mqtt.sess

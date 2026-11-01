@@ -632,8 +632,8 @@ func (jsa *mqttJSA) loadGenRetirementRecord(domainTk, idHash string) (*mqttGenRe
 // because a write identity names a record's BYTES rather than one OCCURRENCE of them —
 // storeFramedSessionMsg replays acknowledged bytes verbatim and restore adopts WID/PWID
 // unvalidated, so one identity can stand at two sequences and no reader could tell which
-// occurrence a retirement removed. See docs/ROADMAP.md's vanished-record bullet for the
-// worked interleaving and for what an exact reader would need instead.
+// occurrence a retirement removed. See docs/ROADMAP.md's vanished-record bullet for what an
+// exact reader would need instead.
 //
 // What survives is the PRECONDITION it always doubled as, and it is load-bearing: a
 // session record carrying NO identity cannot be retired by name, so its teardown fails

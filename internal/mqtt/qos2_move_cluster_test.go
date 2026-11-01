@@ -309,11 +309,11 @@ func TestQoS2MoveReplicatedStream(t *testing.T) {
 	c.waitStreamCurrent(t, testGlobalAccount, mqttQoS2IncomingMsgsStreamName)
 }
 
-// TestQoS2MoveSurvivesBrokerRestartAfterFinalize is what the roadmap item is
-// asking for: a terminal state committed before a node is lost must still suppress
-// re-delivery afterwards. Terminal cleanup is blocked so the tombstone survives,
-// the stream-leader node and the originating broker are stopped, and the publisher
-// retries its PUBREL through a surviving broker.
+// TestQoS2MoveSurvivesBrokerRestartAfterFinalize asserts that a terminal state
+// committed before a node is lost must still suppress re-delivery afterwards.
+// Terminal cleanup is blocked so the tombstone survives, the stream-leader node and
+// the originating broker are stopped, and the publisher retries its PUBREL through a
+// surviving broker.
 //
 // The claim is precisely "the terminal state, not a deduplication window, is what
 // suppresses the second delivery": the window would also have suppressed the

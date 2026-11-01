@@ -68,7 +68,7 @@ var errMQTTGoneRetireNoLicence = errors.New("no retirement licence for the delet
 // mutation-provable: a test alters the binding or a manager index here and the proof must
 // then refuse.
 //
-// It is deliberately NOT a pre-DISPOSAL hook. The roadmap's owed item (c) describes one,
+// It is deliberately NOT a pre-DISPOSAL hook. Issue #40's owed item (c) describes one,
 // because disposeForeignStateFenced decides `applied == false` internally — but
 // disposeCaptured reports applied: true unconditionally and performs no identity check at
 // all, so on this route there is no such outcome to observe. The only point where an
@@ -76,7 +76,7 @@ var errMQTTGoneRetireNoLicence = errors.New("no retirement licence for the delet
 var mqttTestGoneRetireIdentityHookV atomic.Pointer[func(sess *mqttSession)]
 
 // mqttTestGoneRetireProofEntryHookV fires at the ENTRY of the in-fence proof, before its
-// durable reads — the BETWEEN-READ seam the roadmap's owed item (d) calls for.
+// durable reads — the BETWEEN-READ seam issue #40's owed item (d) calls for.
 //
 // It is a different seam from the identity hook and cannot be replaced by it: this one
 // runs before the watermark and record reads, so a test can make the record REAPPEAR or

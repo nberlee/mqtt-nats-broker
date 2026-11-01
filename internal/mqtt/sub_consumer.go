@@ -886,8 +886,8 @@ func buildSharedGroupConsumerConfig(group, subject string, inc uint64, ackWait t
 //
 // The branch is retained anyway, because no positive proof of unreachability exists: a
 // post-resume live SUBSCRIBE takes the refresh arm, UNSUBSCRIBE's ambiguous window leaves
-// the subscription present-but-closed rather than absent (its own roadmap item), and a
-// failed CONNECT restore refuses the CONNECT (issue #54). That is a survey of the routes we
+// the subscription present-but-closed rather than absent, and a failed CONNECT restore
+// refuses the CONNECT (issue #54). That is a survey of the routes we
 // know, not a demonstration that none remains — an absence is not a fact. So this arm
 // still verifies nothing when it is reached with nil verdicts, and it still subscribes on
 // a remembered config. What it does not do is serve unarbitrated: the packet proves

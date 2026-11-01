@@ -29,8 +29,8 @@ func testDrainQoS2Restart(t *testing.T, s *Server, o *Options) *Server {
 
 // q2PreRestartReader reads the setup's packets before the restart, setting aside only a
 // same-connection retransmission of an exchange already seen: a JetStream re-offer past AckWait
-// is retransmitted on a 3.1.1 connection (docs/CONFORMANCE.md, "A JetStream re-offer retransmits
-// on the same connection"), so a client answer that arrives late meets its exchange's DUP
+// is retransmitted on a 3.1.1 connection (docs/CONFORMANCE.md, "An MQTT 3.1.1 connection is resent an
+// unacknowledged delivery every AckWait"), so a client answer that arrives late meets its exchange's DUP
 // PUBLISH, or A's PUBREL again, ahead of the packet it is waiting for. A retransmission never
 // stands in for an expected packet, and anything else that arrives fails the test.
 type q2PreRestartReader struct {

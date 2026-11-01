@@ -6,8 +6,8 @@
 //
 // The restart tests in inflight_register_e2e_test.go establish the mechanism, but
 // they replace one broker with another over the same store. What they cannot
-// establish is the case the roadmap item is actually about: a client resuming on a
-// DIFFERENT broker that never saw the delivery start, with the durable state reached
+// establish is the cross-broker case: a client resuming on a DIFFERENT broker that
+// never saw the delivery start, with the durable state reached
 // over a replicated stream rather than a single-node one. Broker B here has none of
 // A's memory — no cpending, no pendingPublish — so the identifier it re-offers can
 // only have come from `$MQTT_inflight`.

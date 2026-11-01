@@ -46,7 +46,6 @@ was not repeated.
 | [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
-| CALLOUT-CONN-TYPES | A user an auth callout issues is admitted on any connection type, whatever its `allowed_connection_types` | Not filed; no existing report found (searched 2026-10-25; [#5786](https://github.com/nats-io/nats-server/issues/5786) is the scoped-signing-key case, without a callout) | nothing the broker relies on; an operator following the callout pattern in `docs/AUTHENTICATION.md` who restricts connection types | **Fixed in v2.15.2** (the callout reply now calls `connectionTypeAllowed`); the witness fails on v2.15.1 and passes on v2.15.2 (2026-10-27); closed by the 2.15.2 pin and floor, never filed |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -69,9 +68,8 @@ phantom pending message, which exhausts the `MaxAckPending` window.
 the revival violates that across a raw-block recovery.
 
 **Precondition.** Recovery from raw blocks - a crash, an unclean shutdown, or a
-stale or missing `index.db`. The earlier "a clean shutdown recovers correctly" is
-withdrawn: the second witness below reproduces the revival after a clean shutdown,
-and no index or rebuild cause is inferred from it.
+stale or missing `index.db`. The second witness below also reproduces the revival after
+a clean shutdown, and no index or rebuild cause is inferred from it.
 
 **Exposure.** Present independently of
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107): a clean tree fails
@@ -85,11 +83,9 @@ no longer only multi-session accounts. Not claimed for every restart, and not cl
 universal (below).
 
 **[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) widens
-the potential exposure.** An earlier form of the shared-group
-transfer wrote its per-generation ledger to `$MQTT_inflight` on every resume; those
-records moved to the dedicated `$MQTT_shared` stream (`DenyDelete`, so no tombstone
-and no revival shape), and that history stands. The
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover itself keeps
+the potential exposure.** The shared-group transfer's records are on the dedicated
+`$MQTT_shared` stream (`DenyDelete`, so no tombstone and no revival shape), but the
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover keeps
 permanent records ON `$MQTT_inflight`: every accepted CONNECT CASes the per-client
 authority and leaves at least two permanent transition outcomes, and every admitted
 QoS 1/2 register is written in one batch with its permanent exchange, outcome and
@@ -131,13 +127,11 @@ That witness's clean-shutdown control is clean. Confirmed on `v2.15.0` and
 `v2.16.0-dev`. A draft report is prepared but not posted.
 
 **A second witness reproduces it after a CLEAN shutdown (2026-09-24).** Through the
-broker's own harness on the pinned `v2.15.0` GA (the
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) PUBCOMP lane,
-`revival-witness_test.go.txt`, kept outside the tree): a `MaxMsgsPer:1` register on
-`$MQTT_inflight` written, a neighbour record written, the register rewritten once — by a
-plain CAS, and separately by an atomic batch — the survivor exact-deleted and the subject
-reading "no message found", then an ordinary server `Shutdown()` and a restart on the same
-store directory: the subject reads the limit-evicted FIRST version again, in both modes. It
+broker's own harness on `v2.15.0` (`revival-witness_test.go.txt`, kept outside the
+tree): a `MaxMsgsPer:1` register on `$MQTT_inflight` beside a neighbour record,
+rewritten once by a plain CAS and separately by an atomic batch, its survivor
+exact-deleted, then an ordinary server `Shutdown()` and a restart on the same store
+directory: the subject reads the limit-evicted FIRST version again, in both modes. It
 contradicts the first witness's clean-shutdown control; no index or rebuild cause is
 inferred from it. The draft report is to be amended with it before filing (not posted;
 filing needs the user's approval). What the broker does with the revived register is in
@@ -145,20 +139,17 @@ filing needs the user's approval). What the broker does with the revived registe
 
 **Re-run on v2.15.1 (2026-10-11): both witnesses reproduce.** The minimal witness prints
 `RESURRECTED seq=3` after dropping `index.db`, and its clean-shutdown control stays clean.
-The harness witness no longer runs at the current tree, because the broker's own write
-boundary now refuses its fixture shape before anything is stored, so it was run at the
-commit it was recorded on (`1b2a49a`), first on v2.15.0 and then with only the pin moved to
-v2.15.1: on both, in both the plain-CAS and atomic-batch modes, the limit-evicted first
-version revives after a clean restart. None of the 2.15.1 compaction or recovery changes
-(#8623, #8629, #8710) touches the per-subject limit, the tombstones or the index rebuild.
+The harness witness runs only at the commit it was recorded on (`1b2a49a`), because the
+current write boundary refuses its fixture shape before anything is stored; there, with
+only the pin moved to v2.15.1, the limit-evicted first version revives after a clean
+restart in both the plain-CAS and atomic-batch modes.
 
 **Unblock.** An upstream correction plus a reviewed pin bump closes this defect and
 the register path is no longer exposed. Neither
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) unit waits on it. The
-shared-group transfer's own records are on `$MQTT_shared` and add no revival shape;
-the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover
-WIDENS the potential exposure as stated above, which is a disclosed
-disposition, not a repair this repository owes.
+[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) unit waits on it:
+the shared-group transfer's own records are on `$MQTT_shared` and add no revival shape,
+and the cutover's widened potential exposure (above) is a disclosed disposition, not a
+repair this repository owes.
 
 ## issue #110: a failed read reads as an empty suffix
 
@@ -175,17 +166,13 @@ Receiver is `msgBlock`: `firstMatching` returns early only
 on `errPartialCache`/`errNoCache`, and `firstMatchingMulti`'s three `cacheLookup`
 sites do not propagate the error (one discards it and reports success). Filed as
 [nats-server#8632](https://github.com/nats-io/nats-server/issues/8632). Reproduced
-against `v2.15.0`; byte-identical on `main` as of the filing date. Witness at
-`~/.claude/lanes/f-109-remainder/` (`UPSTREAM-WITNESS.md`, `issue1/`). Unblock: an
-upstream correction plus a reviewed pin bump. The affected-caller analysis was carried in
-the roadmap's former chapter U, now removed; this section plus the lane witness are the
-standing record until the issue is filed after alpha.
+against `v2.15.0`; byte-identical on `main` as of the filing date. Unblock: an
+upstream correction plus a reviewed pin bump.
 
-**Re-run on v2.15.1 (2026-10-11): reproduces.** Both enumeration witnesses (`issue1/` and
-`jsrepro/`) deliver only the later record and never the damaged one, with no
-error and no gap; the undamaged control delivers both. Upstream status on that date: #8632
-is open, and the latest maintainer comment there (2026-09-22) treats a checksum failure as
-lost data.
+**Re-run on v2.15.1 (2026-10-11): reproduces.** Both enumeration witnesses deliver only
+the later record and never the damaged one, with no error and no gap; the undamaged
+control delivers both. Upstream status on that date: #8632 is open, and the latest
+maintainer comment there (2026-09-22) treats a checksum failure as lost data.
 
 ## issue #111: a point-read failure reads as absence
 
@@ -200,30 +187,10 @@ different repair. Tracked under #8632 rather than filed separately.
 **Re-run on v2.15.1 (2026-10-11): reproduces.** A point read of the damaged sequence still
 answers `message not found`.
 
-**The point-read absence census was RETIRED on 2026-10-15** (`docs/ROADMAP.md` chapter U).
-It mapped which broker decisions rest on this answer, which is bookkeeping for a broker-side
-repair this broker does not make. Its two checks that state a transport fact rather than
-census bookkeeping survive as `internal/mqtt/jsa_msgget_transport_test.go`: every point read
-enters through the five `mqttJSA` message-GET methods and one decode arm, no second decoder
-of their replies exists, and no direct-get route exists. The record below is why it was
-already not a completeness gate.
-
-**The census was historical, not a current completeness gate** (decided with
-[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7b,
-2026-09-30). Its tests were already failing before 7b (122 diagnostics at `3e937fd`,
-including unaccounted edges and stale evidence fingerprints in functions 7b does not
-touch), and 7b's reads are not entered in it (186 diagnostics on the 7b tree; three more
-of its tests fail: `TestPointReadCensusDestinationsResolve`,
-`TestPointReadCensusExclusionsAreAccounted`, `TestPointReadCensusNoAlternateDecoder`). The
-reads 7b adds or moves are `traverseGenerationInventory` (replacing
-`enumerateCustodyExchanges`: batched duty reads through `loadInflightRecordsMulti`,
-decoded by `decodeDutyResponse`, and the `loadGenLedger` read), `readCustodySubject` /
-`loadDutyEntryAt`, `readCustodyExchange`, `rematerializeOnce` and `canonicalPubRelProven`
-(`loadMsg`), `pubRelResourceHoldsExchange`, `checkCanonicalRebindRegister`,
-`disposeRematerializeCandidate`, `opWithdrawUnsent` / `opTombstoneRegister`, and
-`resumeEntitlementServes`. Accepting these failures neither fixes nor closes
-[issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111), which
-stays tracked under #8632.
+**The point-read absence census was RETIRED on 2026-10-15.** Its two checks that state a
+transport fact survive as `internal/mqtt/jsa_msgget_transport_test.go`: every point read
+enters through the five `mqttJSA` message-GET methods and one decode arm, no second
+decoder of their replies exists, and no direct-get route exists.
 
 ## issue #112: a create-only CAS does not prove the subject was empty
 
@@ -235,15 +202,12 @@ that reads back `message not found`), so a create-only CAS does not establish th
 the subject was empty. This refuted
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)'s original
 substrate premise. Reproduced
-against `v2.15.0` on 2026-09-21. Fact sheet at
-`~/.claude/lanes/f-109-remainder/ISSUE-2-facts-for-defect-template.md`, witness in
-`issue2/`. Upstream issue to be filed after alpha; the fact sheet and witness in the
-lane are the standing record.
+against `v2.15.0` on 2026-09-21. Upstream issue to be filed after alpha.
 
 **Re-run on v2.15.1 (2026-10-11): reproduces.** The create-only publish is admitted at a new
 sequence over the unreadable occupant, which is gone afterwards and stays gone across a
 restart; the readable-occupant, empty-subject and nonzero-expectation controls behave as
-before. The two `issue2/` variants print output identical to a v2.15.0 run of the same
+before. The two witness variants print output identical to a v2.15.0 run of the same
 module. On #8632 the maintainer's 2026-09-22 comment says an expectation of zero "still
 legitimately passes" over a record that failed its checksum.
 
@@ -256,7 +220,7 @@ milliseconds with `nats: Authorization Violation` or `nats: maximum account acti
 connections exceeded`; in-process it fails after 10 s with `io: read/write on closed
 pipe`. A correct connect is unaffected (under a millisecond).
 
-**Where (pinned nats-server v2.15.1, nats.go v1.54.0), from goroutine stacks taken
+**Where (nats-server v2.15.1, nats.go v1.54.0), from goroutine stacks taken
 during the hang.** nats.go `processConnectInit` sets the connect deadline
 (`nats.go:2900`, `Timeout`, 2 s by default), then `sendConnect` writes the PING through
 `timeoutWriter` (`nats.go:3205` → `2354` → `6921`), which replaces the write deadline with
@@ -268,10 +232,10 @@ closes the pipe. Two contracts are involved: nats.go's connect `Timeout` does no
 the handshake's writes, and the in-process transport lets the server's refusal block on
 a client that is itself blocked writing.
 
-**Witness.** `~/.claude/lanes/embedded-nats-image/upstream/inprocess_refusal_test.go`:
+**Witness.** A test outside this repository:
 one server from a configuration file, a wrong-password connect and an over-limit connect,
 each over TCP and in-process; it requires the in-process refusal to match the TCP error
-within the 2 s connect timeout, and fails on both cases at the pin.
+within the 2 s connect timeout, and fails on both cases on v2.15.1.
 
 **Here.** Embedded mode refuses a wrong MQTT credential about 10 s late, and a wrong
 service credential fails startup after the same delay with the pipe error.
@@ -281,30 +245,11 @@ post-alpha roadmap item (section 8); the user writes the reports personally.
 
 ## CALLOUT-CONN-TYPES: an auth callout issued user's connection types are not applied
 
-**What.** In operator mode, a user JWT that an auth callout issues with
-`allowed_connection_types: [MQTT]` is admitted on a standard client connection. The
-same restriction on a configuration-file user, or on a user JWT the client presents
-itself, is enforced.
-
-**Where (nats-server v2.15.1).** The configuration-user and direct-JWT paths
-call `connectionTypeAllowed` (`auth.go:929`, `943`, `958`, `1008`, `1095`). The
-callout's reply handler in `processClientOrLeafCallout` converts the claim
-(`getExpirationAndAllowedConnections`, `auth_callout.go:197`, called at `286`) and
-stores it on the internal user (`buildInternalNkeyUser`, `auth_callout.go:318`;
-`RegisterNkeyUser`, `client.go:1055`), and nothing on that path compares it with the
-connection's type. `auth_callout.go` on `main` at `f8f6db89` (2026-10-20) has the same
-lines.
-
-**Witness.** `~/.claude/lanes/migration-security-guide/upstream-callout-conn-types/repro_test.go`,
-nats.go only: an operator, an `AUTH` account with a callout, a `default_sentinel`, and
-a responder that issues every user into `APP`, restricting `mqtt-only` to `MQTT`. The
-control connects; `mqtt-only` connecting as a standard client must be refused, and is
-admitted on v2.15.1.
-
-**Fixed in v2.15.2.** The callout's reply handler now checks the issued user with
-`connectionTypeAllowed`, after the scoped template is applied (`auth_callout.go`). Re-run
-on 2026-10-27, the witness fails on v2.15.1 and passes on v2.15.2, and the pin and the
-floor moved to v2.15.2 that day. Nothing to file.
+**What.** In operator mode, a user JWT that an auth callout issued with
+`allowed_connection_types: [MQTT]` was admitted on a standard client connection on
+v2.15.1. **Fixed in v2.15.2**: the callout's reply handler now checks the issued user
+with `connectionTypeAllowed`. The witness fails on v2.15.1 and passes on v2.15.2
+(2026-10-27), and the pin and the floor moved to v2.15.2 that day. Nothing to file.
 
 **Here.** Nothing in the broker depended on the defect: auth passthrough always dials a
 standard connection, and the broker reads the issued user's account and permissions

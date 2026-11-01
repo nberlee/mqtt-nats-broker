@@ -156,7 +156,8 @@ func mqttSharedNames(group, subject string, inc uint64) (queue, deliver, durable
 }
 
 // mqttTestSharedQoS0OutputHook runs between a shared QoS 0 offer's pre-output HandBack check and its
-// frame write (the window docs/CONFORMANCE.md states for consult 84). Nil in production.
+// frame write (the window stated in docs/CONFORMANCE.md, "Outbound obligations across
+// retirement (issue #107) - integrated and accepted"). Nil in production.
 var mqttTestSharedQoS0OutputHook atomic.Pointer[func(jsDur, reply string)]
 
 // mqttSharedQueueName is the LOGICAL queue-group name alone, for the callers that need no

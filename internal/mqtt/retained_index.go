@@ -33,7 +33,7 @@ import (
 // subject whose state changed after W is redelivered.
 //
 // What stays bounded rather than closed is a SUPERSEDED value in the cache — see
-// docs/CONFORMANCE.md, "The retained index is arbitrated by stream sequence". The index
+// docs/CONFORMANCE.md, "The retained index is ordered by stream sequence". The index
 // decides which subjects are candidates; values are always served from the cache or an
 // authoritative load.
 

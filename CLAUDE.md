@@ -8,8 +8,10 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
 
 ## The docs are load-bearing
 
-- `docs/ROADMAP.md` is the authoritative todo. Its bullets carry the finding
-  and the prior analysis, not just a title. Section 0 is release blockers.
+- `docs/ROADMAP.md` is the authoritative, ordered todo. Each entry names its
+  GitHub issue when it has one, and the issue carries the finding and its
+  analysis: evidence, rejected approaches, rounds and dispositions. Read the
+  entry and its issue together. Section 0 is release blockers.
 - `docs/ARCHITECTURE.md` documents the mechanism. "JetStream behaviors this
   design depends on" is the section to read before anything touching streams
   or consumers.
@@ -29,6 +31,28 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
 
 Any change to a mechanism updates `docs/ARCHITECTURE.md`; any behavior gap it
 leaves updates `docs/CONFORMANCE.md`. Both in the same change, not later.
+
+### A finding is a GitHub issue
+
+- **A finding's record is its issue** in `nberlee/mqtt-nats-broker`: what is
+  wrong, the evidence, the analysis, the review rounds and the disposition.
+- **The docs keep only current statements**, each linking its issue where it
+  has one: `docs/ARCHITECTURE.md` the mechanism and its rules,
+  `docs/CONFORMANCE.md` a current gap stated as behavior (a residual is a
+  current behavior statement, not a finding record),
+  `docs/known-upstream-issues.md` the current upstream exposure, and
+  `docs/ROADMAP.md` one ordered entry per open item naming its issue. A
+  checked roadmap item is one line: what was done, its date and its issue.
+- **Which findings become issues.** A finding against the change under review
+  is fixed or refuted in that change and is not filed. A finding about
+  something outside the change, or a part of an item deliberately deferred,
+  gets an issue: a new one, or a comment on the existing issue it extends.
+  Filing never replaces fixing or refuting a finding against the change.
+- **Posting is the owner's call.** An issue or comment in this repository is
+  drafted, and posted only after the owner approves its exact text. A report to
+  an upstream project is written by the owner; a run prepares the evidence.
+- **Memory keeps working lessons**, with links. It is not where a finding is
+  recorded.
 
 ## An upstream bug belongs upstream
 
@@ -55,12 +79,13 @@ workaround:
 2. **Check it is still a bug** before honoring it as a blocker: is the pin
    behind, is it corrected on the dependency's `main`, is it already filed. A
    finding that upstream has fixed is not a blocker, it is a pin bump.
-3. **File it upstream**, with the minimal reproduction and the source locations.
-   Filing is outward-facing, so the report text gets the user's explicit
-   approval before it is posted — the direction does not need re-asking, the
-   wording does. Prefer a comment on an existing issue over a duplicate.
-4. **Record the issue in the roadmap bullet** and leave the item blocked on the
-   correction. The broker's own GitHub issue for the finding links it too.
+3. **Prepare the upstream report**: the minimal reproduction and the source
+   locations, for the owner to file. The owner writes and posts upstream
+   reports; a run never posts one. Prefer a comment on an existing upstream
+   issue over a duplicate.
+4. **Link the upstream issue from this repository's issue** for the finding,
+   name that issue in the roadmap entry, and leave the item blocked on the
+   correction.
 
 **Never fork, never `replace`, and never patch around it.** The module pin is
 evidence about the tested contract, and changing a client build's dependency
@@ -257,7 +282,7 @@ no HEAD copy and a stray `git checkout` destroys them outright.
 
 ## Memory
 
-Durable findings live in
+Durable working lessons live in
 `/home/nicob/.claude/projects/-home-nicob-repo-mqtt-nats-bridge/memory/`, with
 `MEMORY.md` as the index. Several files encode invariants that reviews have
 already caught being broken — generation identity over sequences, durable

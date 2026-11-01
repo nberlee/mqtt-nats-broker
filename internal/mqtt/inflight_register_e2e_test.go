@@ -20,8 +20,8 @@ import (
 // re-offered to the same session under its ORIGINAL packet identifier with DUP set,
 // rather than under a freshly allocated one.
 //
-// These are the tests the roadmap item exists for. Each is mutation-checked: the
-// mutation named in its comment must make it fail, or the test is not evidence.
+// Each is mutation-checked: the mutation named in its comment must make it fail, or the
+// test is not evidence.
 
 // testInflightRestart shuts the broker down while leaving its embedded
 // nats-server (and so all JetStream state) running, then brings a fresh broker up

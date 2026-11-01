@@ -896,7 +896,7 @@ func TestQ2AffineUnaccountableConsumerFailsClosed(t *testing.T) {
 // A SUBSCRIBE whose FINAL session save fails must leave no affine delivery path
 // behind. It costs a JetStream consumer, a MaxAckPending charge and a persisted
 // generation — none of which a packet that never took effect should leave in
-// place, and all of which the roadmap item required to be unwound.
+// place, and all of which issue #10 required to be unwound.
 func TestQ2AffineSubscribeRollbackUnwindsProvisioning(t *testing.T) {
 	b := testQ2AffSetup(t, "subrb")
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "subrb", cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
@@ -1853,7 +1853,7 @@ func testQ2AffOnContinuationSave(t *testing.T, id string, act func() error) *ato
 	return fired
 }
 
-// The OTHER packet shape, and the one the roadmap bullet's stated mechanism was
+// The OTHER packet shape, and the one issue #26's stated mechanism was
 // written about. With a filter that succeeds alongside the shared QoS 2 one,
 // `needUpdate` is true, so the packet's final `sess.update` really is attempted —
 // and refused, because the provisioning save left the session unresolved. That
@@ -1927,7 +1927,7 @@ func TestQ2AffineAmbiguousProvisioningIsUnwoundAfterPacketRollback(t *testing.T)
 		t.Fatalf("%d shared membership(s) survived the rollback, so the pending write is not the provisioning save", shared)
 	}
 	// The rollback re-attached the path it detached, because its own save was
-	// refused too. This is the state the roadmap bullet measured.
+	// refused too. This is the state issue #26 measured.
 	if durs := b.affineConsumers(t, idHash); len(durs) != 1 {
 		t.Fatalf("expected exactly one affine consumer after the rollback, got %v", durs)
 	}
