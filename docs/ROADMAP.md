@@ -771,6 +771,11 @@ write](https://github.com/nberlee/mqtt-nats-broker/issues/39).
   longer replace passthrough clients' own; usage text no longer prints environment values.
   Done 2026-10-25; [issue #129](https://github.com/nberlee/mqtt-nats-broker/issues/129).
 
+- [ ] Answer a clean-start CONNECT without waiting on its predecessor's teardown: a
+  bounded, event-driven wait on the client-ID gate with a v5 CONNACK 0x89 when it runs
+  out, and the predecessor's reclamation moved off the gate under a durable retirement;
+  [issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155).
+
 ### 0.4 Release-verification investigations
 
 These entries preserve observations without pretending the implementation scope is
