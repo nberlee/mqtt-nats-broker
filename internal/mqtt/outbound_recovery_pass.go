@@ -116,6 +116,11 @@ type mqttRecoveryBudget struct {
 	// production teardown already pays for the same generation — `discardQ2AffClaimsFor` is that
 	// same account-wide walk — so the pass performing it adds no cost that the teardown did not.
 	readiness bool
+	// refused records that the CURRENT visit had an attempt refused by its client's foreground
+	// coordinator (admitRecoveryAttempt). Sticky for the visit: it admits nothing more, and the
+	// visit reports itself REFUSED however its later bookkeeping goes. visitRecoveryRoot clears it
+	// at both ends of every visit.
+	refused bool
 }
 
 func newMqttRecoveryBudget() *mqttRecoveryBudget {
@@ -254,7 +259,13 @@ func (as *mqttAccountSessionManager) walkRecoveryShard(s *Server, hdr *mqttDirSh
 			// decreases, so a retired root leaves its ordinal behind, and the CERTIFICATE is what
 			// claims a generation completed. Nothing is written here and nothing is concluded.
 		default:
-			as.visitRecoveryRoot(s, root, rootSeq, b, stop)
+			if as.visitRecoveryRoot(s, root, rootSeq, b, stop) {
+				// REFUSED BY ITS CLIENT'S FOREGROUND, which is not a visit at all: the prompt drive
+				// resumes it as soon as that client is idle (the prompt drive visits only a
+				// discarding generation's root; any other is revisited on this walk's next
+				// cycle). A full prompt drive leaves it to this walk, as it leaves every kick.
+				as.kickRecoveryRoot(root.ID, root.Epoch, root.Gen)
+			}
 		}
 		pos++
 		if b.readinessSpent() {
@@ -294,9 +305,18 @@ func (as *mqttAccountSessionManager) walkRecoveryShard(s *Server, hdr *mqttDirSh
 	}
 }
 
-// visitRecoveryRoot sweeps one batch of one root, executes what it may, and records progress.
+// visitRecoveryRoot sweeps one batch of one root, executes what it may, and records progress. It
+// reports whether the visit was REFUSED by its client's foreground coordinator — at its entry, or
+// at any authority attempt inside it — which a caller resumes rather than charges.
+//
+// THE VISIT IS AN ACTOR OF ITS CLIENT'S COORDINATOR (outbound_foreground_priority.go), registered
+// for its whole span, kicked and periodic alike, so an announcement's allowance counts it; and it
+// CHECKS THE COORDINATOR BEFORE ANYTHING ELSE — before the finished-sweep branch that rolls or
+// concludes, before any cursor write, before any duty. An announced client's root gets no root work
+// at all from this visit. Passing the check grants nothing: every authority attempt past it admits
+// on its own (admitRecoveryAttempt), before its reads.
 func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttRecoveryRoot,
-	rootSeq uint64, b *mqttRecoveryBudget, stop func() bool) {
+	rootSeq uint64, b *mqttRecoveryBudget, stop func() bool) (refused bool) {
 
 	// COUNTED, so that "the pass ends after the root that spends the readiness attempt" is a
 	// measurable fact rather than a claim. Whether that coupling holds cannot be read off the
@@ -305,6 +325,21 @@ func (as *mqttAccountSessionManager) visitRecoveryRoot(s *Server, root *mqttReco
 	if h := mqttTestRecoveryRootVisitHookV.Load(); h != nil {
 		(*h)()
 	}
+	defer as.registerForegroundActor(root.ID)()
+	b.refused = false
+	defer func() { refused, b.refused = b.refused, false }()
+	if as.foregroundAnnounced(root.ID) {
+		b.refused = true
+		return
+	}
+	as.visitAdmittedRecoveryRoot(s, root, rootSeq, b, stop)
+	return
+}
+
+// visitAdmittedRecoveryRoot is a visit past its entry check.
+func (as *mqttAccountSessionManager) visitAdmittedRecoveryRoot(s *Server, root *mqttRecoveryRoot,
+	rootSeq uint64, b *mqttRecoveryBudget, stop func() bool) {
+
 	if mqttSweepFinished(root) {
 		as.concludeRecoveryRoot(s, root, rootSeq, b, stop)
 		return

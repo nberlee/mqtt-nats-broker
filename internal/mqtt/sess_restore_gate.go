@@ -434,6 +434,18 @@ func mqttTestRestoreGateBlockedHook(kind string) {
 	}
 }
 
+// mqttTestQoS0GateDecidedV observes a QoS 0 delivery reaching the restore verdict's decision,
+// blocked or not, per session. A test that publishes inside a restore pause ends the pause on
+// this rather than on a timer: the delivery runs on its own subscription's goroutine, so neither
+// the publish returning nor another subscriber receiving the message says it was decided yet.
+var mqttTestQoS0GateDecidedV atomic.Pointer[func(sessID string, blocked bool)]
+
+func mqttTestQoS0GateDecidedHook(sessID string, blocked bool) {
+	if h := mqttTestQoS0GateDecidedV.Load(); h != nil {
+		(*h)(sessID, blocked)
+	}
+}
+
 // mqttTestRestorePauseV pauses a CONNECT at one named boundary of the restore, so
 // a test can act while the verdict is in a specific state. The boundaries are the
 // ones mutations move code across:

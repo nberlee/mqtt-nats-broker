@@ -251,7 +251,7 @@ func TestMQTTForegroundAcquireRetainedStaysBackground(t *testing.T) {
 		t.Fatal("the retained replay never committed its admission")
 	}
 	announced.Store(true)
-	releaseFg := rig.sess.announceForegroundAuthority()
+	releaseFg := rig.sess.announceForegroundAuthority().release
 	releaseOnce.Do(func() { close(release) })
 	select {
 	case <-acquisitionWaited:

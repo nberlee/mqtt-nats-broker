@@ -60,7 +60,9 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 	// outcome as today, where no raw subscription exists in that window at all;
 	// for a shared one it is an accepted cost, stated in docs/CONFORMANCE.md. See
 	// sess_restore_gate.go.
-	if sess.restoreGateBlocksQoS0() {
+	blocked := sess.restoreGateBlocksQoS0()
+	mqttTestQoS0GateDecidedHook(sess.id, blocked)
+	if blocked {
 		mqttTestRestoreGateBlockedHook("qos0")
 		return
 	}

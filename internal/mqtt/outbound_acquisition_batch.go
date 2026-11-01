@@ -161,8 +161,8 @@ func (sess *mqttSession) acquirePublishActions(secs []*mqttPublishSection) []mqt
 	c := secs[0].cc
 	// ONE FOREGROUND ANNOUNCEMENT for the whole batch, held through every attempt and the
 	// settlement (outbound_foreground_priority.go).
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	var in []int
 	for i, sec := range secs {
 		cur, seq, ok := sess.acquirePremise(as, sec)
@@ -201,7 +201,7 @@ func (sess *mqttSession) acquirePublishActions(secs []*mqttPublishSection) []mqt
 	// participant to a re-offer queued behind later messages.
 	life := secs[0].tok.life
 	ext := newDeliveryContentionExtension(sess, c, life)
-	budget := mqttForegroundAcquireAttempts
+	budget := fg.budget(mqttForegroundAcquireAttempts)
 	for attempt := 0; ; attempt++ {
 		// After the previous attempt's wait and premise re-reads: only a positively-never-landed
 		// contended attempt loops, and the give-up below releases its participants in that state.

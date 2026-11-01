@@ -70,8 +70,8 @@ var errMQTTPubRelIntentNotRecorded = errors.New(
 func (sess *mqttSession) intendPubRelSlot(c *client, ack *mqttPending) (out mqttPubRelIntentOutcome) {
 	// A FOREGROUND authority operation for its whole span: the retained background writers yield to
 	// it (outbound_foreground_priority.go).
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	defer func() { sess.finishAbandonedAckResolution(ack, out) }()
 	if ack != nil && ack.slot.abandonedAck != nil && !ack.slot.abandonedAck.belongsTo(sess) {
 		return mqttPubRelIntentUnresolved
@@ -592,8 +592,8 @@ func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttReco
 	if sess.asm == nil || !ref.slotOK() || ref.name.subject == _EMPTY_ {
 		return mqttRecoveredPubRecUnresolved
 	}
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	resolve := func() mqttRecoveredPubRecOutcome {
 		cur, smsg, err := sess.asm.loadInflightRecord(ref.name.subject)
 		switch {
@@ -614,7 +614,7 @@ func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttReco
 		return mqttRecoveredPubRecRecorded
 	}
 	contended := false
-	for attempt := 0; attempt < mqttForegroundAcquireAttempts; attempt++ {
+	for attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++ {
 		if contended {
 			sess.authorityContentionWait() // before the fresh reads, never between a read and its batch
 		}
@@ -892,9 +892,9 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 	background := len(admit) > 0 && admit[0] != nil
 	budget := mqttInflightStoreAttempts
 	if !background {
-		release := sess.announceForegroundAuthority()
-		defer release()
-		budget = mqttForegroundAcquireAttempts
+		fg := sess.announceForegroundAuthority()
+		defer fg.release()
+		budget = fg.budget(mqttForegroundAcquireAttempts)
 	}
 	contended := false
 	for attempt := 0; attempt < budget; attempt++ {
@@ -2013,13 +2013,13 @@ type mqttPubCompResult struct {
 // Session lock NOT held on entry.
 func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlotRef) mqttPubCompResult {
 	// A FOREGROUND authority operation for its whole span (outbound_foreground_priority.go).
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	if !ref.slotOK() || ref.name.subject == _EMPTY_ {
 		return mqttPubCompResult{outcome: mqttTerminalDone, recorded: true}
 	}
 	contended := false
-	for attempt := 0; attempt < mqttForegroundAcquireAttempts; attempt++ {
+	for attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++ {
 		if contended {
 			// SPACED, BEFORE the fresh reads: the advance before reached its commit, where a
 			// same-session commit defeats it, and the burst it lost to is outlasted, not raced.
@@ -2616,8 +2616,8 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	if pi == 0 {
 		return nil, false
 	}
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	if owner.State != mqttPubRelOwnerValid {
 		// Absent or malformed. Slice 1 made the header mandatory with a tri-state parser
 		// precisely so this refusal can distinguish "no claim" from "a claim this broker

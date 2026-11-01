@@ -278,7 +278,7 @@ func TestF112ARetiredPositionsUncertaintyWaitsForACensus(t *testing.T) {
 		}
 	}
 	for i := 0; i < 64; i++ {
-		more, err := jsa.deleteRetiredPositionsStep(sess.id, epoch, f.gen)
+		more, err := jsa.deleteRetiredPositionsStep(sess.id, epoch, f.gen, nil)
 		if err != nil {
 			t.Fatalf("deleting: %v", err)
 		}
@@ -410,7 +410,7 @@ func TestF112AdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 		t.Fatalf("fixture: the position was not retired: %+v", led)
 	}
 	for i := 0; i < 64; i++ {
-		more, err := jsa.deleteRetiredPositionsStep(sess.id, epoch, gen)
+		more, err := jsa.deleteRetiredPositionsStep(sess.id, epoch, gen, nil)
 		if err != nil {
 			t.Fatalf("deleting the retired positions: %v", err)
 		}

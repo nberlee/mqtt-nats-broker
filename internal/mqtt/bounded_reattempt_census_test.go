@@ -25,9 +25,12 @@ import (
 
 // THE BOUNDED RE-ATTEMPT FAMILY, classified (F-114).
 //
-// mqttInflightStoreAttempts is three attempts with no spacing; mqttForegroundAcquireAttempts is one
-// more than the attempts this broker's admitted background writers can take from an announced
-// foreground operation (outbound_foreground_priority.go), spaced by the authority-contention wait.
+// mqttInflightStoreAttempts is three attempts with no spacing; mqttForegroundAcquireAttempts and
+// mqttSubscribeClaimAttempts are an announced foreground operation's BASE budgets, spaced by the
+// authority-contention wait, and every announced loop runs the DERIVED budget
+// handle.budget(base) = max(base, allowance + base - mqttBackgroundAuthorityWriters), where the
+// allowance is the client's registered background actors at the announcement — the attempts
+// admitted before it that can still commit after it (outbound_foreground_priority.go).
 // They are not interchangeable retry policies: a register delete, a walk restart or a fence read is
 // not helped by more attempts, a background loop gains no priority from a larger budget, and a
 // foreground authority transition that announces itself is bounded only against the PRE-admitted
@@ -46,6 +49,7 @@ import (
 
 type reattemptRow struct {
 	store, fg int      // body references to mqttInflightStoreAttempts and mqttForegroundAcquireAttempts
+	claim     int      // body references to mqttSubscribeClaimAttempts
 	fors      []string // every for and range header, rendered
 	budgets   []string // every assignment to an identifier named budget, rendered
 	class     string
@@ -70,7 +74,7 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "REGISTER-DELETE (foreground drain finalize and its background timer): re-reads after a delete that found the same identity rewritten",
 		exhausted: "only a same-identity rewrite of that register re-enters it; exhaustion is Undecided and the drain finalize retries every 2 s without limit",
 		done:      "LEFT: not an authority CAS loop; its continuation is unbounded in attempts"},
-	"inflight_register.go:(mqttSession).acquirePublishAction": {store: 1, fg: 1, fors: []string{"attempt := 0; ; attempt++"}, budgets: []string{"budget := mqttInflightStoreAttempts", "budget = mqttForegroundAcquireAttempts"},
+	"inflight_register.go:(mqttSession).acquirePublishAction": {store: 1, fg: 1, fors: []string{"attempt := 0; ; attempt++"}, budgets: []string{"budget := mqttInflightStoreAttempts", "budget = fg.budget(mqttForegroundAcquireAttempts)"},
 		class:     "FG-AUTHORITY (a live delivery's send-section acquisition, announced) and BG-AUTHORITY (the retained driver's own, admitted per attempt)",
 		exhausted: "foreground: the admitted background writers cannot exhaust it, other causes re-offer at AckWait; a subscription callback's section also gives up at the head of any attempt after the first once the callback's lifecycle ends (mqttDeliveryLifecycle), through the same resolver; background: its outer loop backs off 50 ms<<n eight times, then closes the connection and the resume replays",
 		done:      "CONVERTED (foreground arm, 2026-10-16); background arm LEFT: a larger budget buys a background attempt no priority"},
@@ -86,9 +90,9 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "REGISTER-CAS: the send section's drain, through casInflightSlot",
 		exhausted: "rarely contended, by writers rewriting a tokened register (mostly acknowledgement advances); exhaustion enrols a 2 s reconcile without limit, the identifier reserved meanwhile",
 		done:      "LEFT: register-level, unbounded continuation"},
-	"inflight_register.go:(mqttSession).markInflightRegisterCancelled": {store: 1, fg: 1, fors: []string{"attempt := 0; attempt < budget; attempt++"}, budgets: []string{"budget := mqttInflightStoreAttempts", "budget = mqttForegroundAcquireAttempts"},
+	"inflight_register.go:(mqttSession).markInflightRegisterCancelled": {store: 1, fg: 1, fors: []string{"attempt := 0; attempt < budget; attempt++"}, budgets: []string{"budget := mqttInflightStoreAttempts", "budget = fg.budget(mqttForegroundAcquireAttempts)"},
 		class:     "FG-AUTHORITY, announced unless its licence admits each attempt: withdrawUnsent or the cancellation tombstone from teardown and cancellation paths (CONNECT, SUBSCRIBE, UNSUBSCRIBE, close, the deferred-disconnect discharge, settled uncertain writes, the resident sweep) and inside the announced admission ladder's cleanup",
-		exhausted: "the admitted background writers cannot exhaust it; other brokers, recovery, unadmitted writes, foreground contention and store failures can, and exhaustion leaves the exchange at Publish holding its Receive Maximum unit and its identifier until a later resume honours the nonce verdict (no owed withdrawal is recorded for a never-landed exhaustion)",
+		exhausted: "the admitted background writers cannot exhaust it; other brokers, the adopted teardown's completion, unadmitted writes, foreground contention and store failures can, and exhaustion leaves the exchange at Publish holding its Receive Maximum unit and its identifier until a later resume honours the nonce verdict (no owed withdrawal is recorded for a never-landed exhaustion)",
 		done:      "CONVERTED (foreground: announced, mqttForegroundAcquireAttempts, spaced after a handled write); an admitting licence keeps the plain budget, unannounced"},
 	"inflight_register.go:(mqttSession).markInflightRegisterCancelledPending": {store: 1, fg: 0, fors: []string{"attempt := 0; attempt < mqttInflightStoreAttempts; attempt++"}, budgets: nil,
 		class:     "FG-AUTHORITY, UNANNOUNCED, cleanup tier: the create-only cancellation tombstone",
@@ -106,11 +110,11 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "CHAPTER-P: the experimental affine route's standalone pair write, unreachable from the production command",
 		exhausted: "unspaced, three attempts; exhaustion re-offers at AckWait",
 		done:      "LEFT: chapter P is not alpha work"},
-	"outbound_admission_batch.go:(mqttSession).attemptAdmissionBatch": {store: 0, fg: 1, fors: []string{"attempt := 0; ; attempt++", "i, it := range items", "k, it := range items"}, budgets: []string{"budget := mqttForegroundAcquireAttempts", "budget = attempt + 1"},
+	"outbound_admission_batch.go:(mqttSession).attemptAdmissionBatch": {store: 0, fg: 1, fors: []string{"attempt := 0; ; attempt++", "i, it := range items", "k, it := range items"}, budgets: []string{"budget := fg.budget(mqttForegroundAcquireAttempts)", "budget = attempt + 1"},
 		class:     "FG-AUTHORITY: a subscription's batched creates (opAdmitPublishes), announced for the whole batch by admitInflightPublishBatch; spaces only an attempt that reached its commit, before re-reading the batch's register subjects; the range headers build the attempt and locate an occupied slot, they bound nothing",
 		exhausted: "as admitThroughAuthority for the same writers; a batch whose every attempt lost to a stale expectation with every slot empty is EXTENDED while its connection serves (mqttDeliveryContentionExtension), an occupied slot splits it in order, any other refusal hands its head to the single ladder; exhaustion, and the delivery callback's lifecycle ending at the head of any attempt after the first (mqttDeliveryLifecycle), abandon every participant and re-offer at AckWait",
 		done:      "CONVERTED (mqttForegroundAcquireAttempts, the delivery entrance's extension)"},
-	"outbound_acquisition_batch.go:(mqttSession).acquirePublishActions": {store: 0, fg: 1, fors: []string{"i := range parts", "i, sec := range secs", "_, i := range in", "_, i := range in", "_, i := range in", "attempt := 0; ; attempt++", "_, i := range in", "k, i := range in", "k, i := range in", "_, i := range in", "_, i := range in", "_, i := range in", "_, i := range in"}, budgets: []string{"budget := mqttForegroundAcquireAttempts", "budget = attempt + 2"},
+	"outbound_acquisition_batch.go:(mqttSession).acquirePublishActions": {store: 0, fg: 1, fors: []string{"i := range parts", "i, sec := range secs", "_, i := range in", "_, i := range in", "_, i := range in", "attempt := 0; ; attempt++", "_, i := range in", "k, i := range in", "k, i := range in", "_, i := range in", "_, i := range in", "_, i := range in", "_, i := range in"}, budgets: []string{"budget := fg.budget(mqttForegroundAcquireAttempts)", "budget = attempt + 2"},
 		class:     "FG-AUTHORITY: a flush's batched PUBLISH acquisitions (opAcquireActions), announced once for the whole batch; every submitted attempt is settled by its receipt before the next, and a contended one spaced before its participants' registers are re-read; the range headers build the attempt, adopt or release participants, they bound nothing",
 		exhausted: "as attemptAdmissionBatch: an attempt that lost only to stale expectations is EXTENDED (mqttDeliveryContentionExtension) while the delivery callback's lifecycle lasts, which is decided at the head of every attempt after the first, the base budget included (mqttDeliveryLifecycle); exhaustion and that stop release every participant unsent and re-offer at AckWait; a refusal before submission sends every participant to the single acquisition at its turn; an UNRESOLVED attempt is carried by the custody dispatcher (mqttAcquireSettleOwed)",
 		done:      "CONVERTED (mqttForegroundAcquireAttempts, the delivery entrance's extension)"},
@@ -120,7 +124,7 @@ var reattemptCensus = map[string]reattemptRow{
 		done:      "CONVERTED (F-114), via admitUnderReservation"},
 	"outbound_admit_orchestrate.go:(mqttSession).admitUnderReservation": {store: 0, fg: 1, fors: nil, budgets: nil,
 		class:     "FG-AUTHORITY: the ordinary and shared delivery admission, announced for the whole ladder, under a reservation its caller holds (admitThroughAuthority, or a batch handing one delivery to the single ladder)",
-		exhausted: "the admitted background writers cannot exhaust an admission to an empty identifier; classification and cleanup attempts on an occupied one are not covered, nor are other brokers, recovery, unadmitted writes, foreground contention or store failures; an admission whose every attempt lost to a stale expectation is EXTENDED while its connection serves (mqttDeliveryContentionExtension), so a re-offer cannot overtake the subscription's order; any other exhaustion re-offers at AckWait",
+		exhausted: "the admitted background writers cannot exhaust an admission to an empty identifier; classification and cleanup attempts on an occupied one are not covered, nor are other brokers, the adopted teardown's completion, unadmitted writes, foreground contention or store failures; an admission whose every attempt lost to a stale expectation is EXTENDED while its connection serves (mqttDeliveryContentionExtension), so a re-offer cannot overtake the subscription's order; any other exhaustion re-offers at AckWait",
 		done:      "CONVERTED (F-114)"},
 	"outbound_close_cert.go:(mqttSession).clearCertifiedRegister": {store: 1, fg: 0, fors: []string{"attempt := 0; attempt < mqttInflightStoreAttempts; attempt++"}, budgets: nil,
 		class:     "REGISTER-CAS, with a rare authority arm (pubrel_terminal, mostly the resume pre-pass)",
@@ -130,7 +134,7 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "FG-AUTHORITY (an ACL-denied delivery's synchronous step) and BG-AUTHORITY UNADMITTED (its 2 s timer and the shutdown pass)",
 		exhausted: "yes; exhaustion leaves the disposal pending for the 2 s timer, without limit; the timer step is a same-session background authority writer outside the handshake",
 		done:      "LEFT: rare path, unbounded continuation; named in the handshake's not-covered list"},
-	"pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority": {store: 1, fg: 1, fors: []string{"attempt := 0; attempt < budget; attempt++"}, budgets: []string{"budget := mqttInflightStoreAttempts", "budget = mqttForegroundAcquireAttempts"},
+	"pubrel_action.go:(mqttSession).acquirePubRelThroughAuthority": {store: 1, fg: 1, fors: []string{"attempt := 0; attempt < budget; attempt++"}, budgets: []string{"budget := mqttInflightStoreAttempts", "budget = fg.budget(mqttForegroundAcquireAttempts)"},
 		class:     "FG-AUTHORITY, announced (the PUBREL callback; the PUBREC handler's retained PUBREL) and BG-AUTHORITY (retained continuations, admitted per attempt)",
 		exhausted: "foreground: the admitted background writers cannot exhaust it (an attempt spent clearing a certified token is not covered), and exhaustion waits out AckWait or hands the retained PUBREL to the continuation; background: the continuation's backoff and then a connection close",
 		done:      "CONVERTED (foreground arms); background arm LEFT: a larger budget buys a background attempt no priority"},
@@ -138,7 +142,7 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "FG redispatch over FG-AUTHORITY, announced for its whole span: the PUBREL callback re-dispatching into the acquisition, the recovered-PUBREC record and custody transfer",
 		exhausted: "each authority write it reaches carries the foreground budget itself, and the span's announcement keeps background writers from admitting fresh attempts between them; iterations spent on the recovered PUBREC or custody transfer are not covered; exhaustion leaves the PUBREL unacknowledged until AckWait",
 		done:      "CONVERTED (announced across the redispatch); its own budget LEFT at three, unspaced: each inner write is spaced"},
-	"pubrel_action.go:(mqttSession).mqttTerminalizeOnPubComp": {store: 0, fg: 1, fors: []string{"attempt := 0; attempt < mqttForegroundAcquireAttempts; attempt++"}, budgets: nil,
+	"pubrel_action.go:(mqttSession).mqttTerminalizeOnPubComp": {store: 0, fg: 1, fors: []string{"attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++"}, budgets: nil,
 		class:     "FG-AUTHORITY, announced: the PUBCOMP advance (also run by the completion worker)",
 		exhausted: "the admitted background writers cannot exhaust it; the other causes enrol the completion worker (2 s), holding the Receive Maximum unit, the terminal reservation and the canonical PUBREL acknowledgement",
 		done:      "CONVERTED (mqttForegroundAcquireAttempts, spaced after a handled advance)"},
@@ -146,7 +150,7 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "READ: the PUBREL fence's session-record read, re-read on a head/sequence mismatch",
 		exhausted: "not an authority CAS and none of the counted writers saves a session record; exhaustion is Indeterminate and the PUBREL waits out AckWait",
 		done:      "LEFT: outside the authority-contention question"},
-	"pubrel_action.go:(mqttSession).recordRecoveredPubRec": {store: 0, fg: 1, fors: []string{"attempt := 0; attempt < mqttForegroundAcquireAttempts; attempt++"}, budgets: nil,
+	"pubrel_action.go:(mqttSession).recordRecoveredPubRec": {store: 0, fg: 1, fors: []string{"attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++"}, budgets: nil,
 		class:     "FG-AUTHORITY, announced: the recovered PUBREC arrow, before CONNACK (route B), at the drain resume and from the PUBREL callback",
 		exhausted: "the admitted background writers cannot exhaust it; the other causes, on route B, quarantine the slot and mark the identifier space incomplete, so nothing new is allocated session-wide until a later resume completes; at the drain resume the drain is skipped on this resume",
 		done:      "CONVERTED (mqttForegroundAcquireAttempts, spaced after a handled advance)"},
@@ -154,17 +158,30 @@ var reattemptCensus = map[string]reattemptRow{
 		class:     "BG-AUTHORITY UNADMITTED (op-drain-complete, rare) or REGISTER-CAS: the PUBREL action drain's completion",
 		exhausted: "yes for the authority arm; exhaustion schedules the 2 s reconcile without limit",
 		done:      "LEFT: named in the handshake's not-covered list"},
+	"sess_resume_reconcile.go:(mqttAccountSessionManager).reconcileResumedConsumers": {store: 0, fg: 0, claim: 1, fors: []string{"subject, qos := range sess.subs", "deliver := range installed", "deliver := range installed", "_, cc := range created", "_, cc := range created", "key := range sess.deferred", "_, r := range replaced", "_, e := range entries", "_, e := range entries", "_, e := range entries", "key := range sess.deferred", "attempt := 0; attempt < fg.budget(mqttSubscribeClaimAttempts); attempt++", "deliver := range installed", "_, r := range replaced"}, budgets: nil,
+		class:     "FG-AUTHORITY, announced: the resume's replacement source-consumer name claim, re-attempted on a stale expectation only, spaced; the range headers walk the session's filters and consumers, they bound nothing",
+		exhausted: "the pre-announcement attempts of the client's registered actors (the announcement's allowance) cannot exhaust it; other brokers, the adopted teardown's completion, unadmitted writes, foreground contention and store failures can, and exhaustion refuses the resume before CONNACK with the claim's handles sent to arbitration",
+		done:      "CONVERTED (derived: fg.budget(mqttSubscribeClaimAttempts))"},
+	"sub_consumer.go:(mqttSession).claimPubRelName": {store: 0, fg: 0, claim: 1, fors: []string{"attempt := 0; attempt < fg.budget(mqttSubscribeClaimAttempts); attempt++", "_, h := range handles"}, budgets: nil,
+		class:     "FG-AUTHORITY, announced: a QoS 2 SUBSCRIBE's PUBREL consumer name claim, spaced; the range settles the submitted attempts on exhaustion, it bounds nothing",
+		exhausted: "the pre-announcement attempts of the client's registered actors — every session object's workers and every recovery visit of the client — cannot exhaust it; other brokers, the adopted teardown's completion, unadmitted writes, foreground contention and store failures can, and exhaustion settles every submitted attempt and refuses the filter (0x80)",
+		done:      "CONVERTED (derived: fg.budget(mqttSubscribeClaimAttempts))"},
+	"sub_consumer.go:(mqttSession).claimSourceConsumerName": {store: 0, fg: 0, claim: 1, fors: []string{"attempt := 0; attempt < fg.budget(mqttSubscribeClaimAttempts); attempt++"}, budgets: nil,
+		class:     "FG-AUTHORITY, announced: a SUBSCRIBE's source consumer name claim under the pinned entitlement, spaced",
+		exhausted: "as claimPubRelName; exhaustion hands every submitted attempt to the retirement owner and refuses the filter",
+		done:      "CONVERTED (derived: fg.budget(mqttSubscribeClaimAttempts))"},
 }
 
 // reattemptEntranceBudgets pins the budget argument each entrance passes to the shared admission
 // ladder, which loops on that parameter and names neither budget itself.
 var reattemptEntranceBudgets = map[string]string{
-	"outbound_admit_orchestrate.go:(mqttSession).admitUnderReservation": "mqttForegroundAcquireAttempts",
+	"outbound_admit_orchestrate.go:(mqttSession).admitUnderReservation": "fg.budget(mqttForegroundAcquireAttempts)",
 	"inflight_register.go:(mqttSession).storeInflightRegister":          "mqttInflightStoreAttempts",
 }
 
 type reattemptObserved struct {
 	store, fg int
+	claim     int
 	fors      []string
 	budgets   []string
 }
@@ -179,6 +196,8 @@ func reattemptObserve(f fgCensusFunc) reattemptObserved {
 				o.store++
 			case "mqttForegroundAcquireAttempts":
 				o.fg++
+			case "mqttSubscribeClaimAttempts":
+				o.claim++
 			}
 		case *ast.ForStmt:
 			parts := make([]string, 3)
@@ -223,7 +242,7 @@ func reattemptLiteral(key string, o reattemptObserved) string {
 		}
 		return "[]string{" + strings.Join(out, ", ") + "}"
 	}
-	return fmt.Sprintf("%q: {store: %d, fg: %d, fors: %s, budgets: %s},", key, o.store, o.fg, q(o.fors), q(o.budgets))
+	return fmt.Sprintf("%q: {store: %d, fg: %d, claim: %d, fors: %s, budgets: %s},", key, o.store, o.fg, o.claim, q(o.fors), q(o.budgets))
 }
 
 func TestBoundedReattemptLoopsAreClassified(t *testing.T) {
@@ -231,7 +250,7 @@ func TestBoundedReattemptLoopsAreClassified(t *testing.T) {
 	var unlisted []string
 	for key, f := range funcs {
 		o := reattemptObserve(f)
-		if _, listed := reattemptCensus[key]; !listed && (o.store > 0 || o.fg > 0) {
+		if _, listed := reattemptCensus[key]; !listed && (o.store > 0 || o.fg > 0 || o.claim > 0) {
 			unlisted = append(unlisted, reattemptLiteral(key, o))
 		}
 	}
@@ -255,7 +274,7 @@ func TestBoundedReattemptLoopsAreClassified(t *testing.T) {
 			t.Errorf("%s: a row without its class, exhaustion cost and disposition classifies nothing", key)
 		}
 		o := reattemptObserve(f)
-		if o.store != row.store || o.fg != row.fg || !reattemptSame(o.fors, row.fors) || !reattemptSame(o.budgets, row.budgets) {
+		if o.store != row.store || o.fg != row.fg || o.claim != row.claim || !reattemptSame(o.fors, row.fors) || !reattemptSame(o.budgets, row.budgets) {
 			t.Errorf("%s changed shape; re-classify it before re-pinning. Observed:\n\t%s", key, reattemptLiteral(key, o))
 		}
 	}
@@ -323,6 +342,146 @@ func ladder(budget int) {
 		got := observe(src)
 		if reattemptSame(got.fors, want.fors) && got.store == want.store && got.fg == want.fg {
 			t.Errorf("a second loop %q left the observation unchanged (%q): the census would not fail", second, got.fors)
+		}
+	}
+}
+
+// TestBoundedReattemptForegroundBudgetsAreDerived: no production loop runs a raw foreground base
+// budget. Every reference to mqttForegroundAcquireAttempts or mqttSubscribeClaimAttempts inside a
+// function body is the sole argument of a handle's budget call, and every handle that call is made
+// on was announced in the same function or handed in as a parameter by a caller whose own handle
+// is — the propagation of one announcement's allowance to the loop that spends it.
+func TestBoundedReattemptForegroundBudgetsAreDerived(t *testing.T) {
+	funcs := fgCensusParse(t)
+	base := map[string]bool{"mqttForegroundAcquireAttempts": true, "mqttSubscribeClaimAttempts": true}
+	// handleParams: function key -> the parameter name of type mqttForegroundHandle.
+	handleParams := map[string]string{}
+	derivedUses := 0
+	for key, f := range funcs {
+		if f.fd.Type.Params != nil {
+			for _, p := range f.fd.Type.Params.List {
+				if id, ok := p.Type.(*ast.Ident); ok && id.Name == "mqttForegroundHandle" {
+					for _, n := range p.Names {
+						handleParams[key] = n.Name
+					}
+				}
+			}
+		}
+		derived := map[*ast.Ident]bool{}
+		announced := map[string]bool{}
+		ast.Inspect(f.fd.Body, func(n ast.Node) bool {
+			switch v := n.(type) {
+			case *ast.AssignStmt:
+				for i, r := range v.Rhs {
+					if c, ok := r.(*ast.CallExpr); ok {
+						if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "announceForegroundAuthority" && i < len(v.Lhs) {
+							if id, ok := v.Lhs[i].(*ast.Ident); ok {
+								announced[id.Name] = true
+							}
+						}
+					}
+				}
+			case *ast.CallExpr:
+				sel, ok := v.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "budget" || len(v.Args) != 1 {
+					return true
+				}
+				arg, ok := v.Args[0].(*ast.Ident)
+				if !ok || !base[arg.Name] {
+					return true
+				}
+				derived[arg] = true
+				recv, ok := sel.X.(*ast.Ident)
+				switch {
+				case !ok:
+					t.Errorf("%s derives a budget from a handle expression it cannot name", key)
+				case announced[recv.Name] || handleParams[key] == recv.Name:
+					derivedUses++
+				default:
+					t.Errorf("%s derives a budget from %q, which is neither announced there nor its handle parameter", key, recv.Name)
+				}
+			}
+			return true
+		})
+		ast.Inspect(f.fd.Body, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && base[id.Name] && !derived[id] {
+				t.Errorf("%s runs the raw base budget %s: an announced loop runs handle.budget(base)", key, id.Name)
+			}
+			return true
+		})
+	}
+	if derivedUses < 10 {
+		t.Fatalf("observed only %d derived budgets: the observer is wrong", derivedUses)
+	}
+	// PROPAGATION: every call of a function taking a handle passes one the caller announced or
+	// was itself handed.
+	for _, c := range censusScanPackage(t).Calls {
+		for key, param := range handleParams {
+			if !strings.HasSuffix(key, "."+c.Callee) {
+				continue
+			}
+			f := funcs[key]
+			idx := -1
+			pos := 0
+			for _, p := range f.fd.Type.Params.List {
+				for _, n := range p.Names {
+					if n.Name == param {
+						idx = pos
+					}
+					pos++
+				}
+			}
+			if idx < 0 || idx >= len(c.Args) {
+				t.Errorf("%s calls %s without its handle", c.Fn, c.Callee)
+				continue
+			}
+			arg := c.Args[idx]
+			caller := c.Fn.String()
+			ok := handleParams[caller] == arg
+			if !ok {
+				ast.Inspect(funcs[caller].fd.Body, func(n ast.Node) bool {
+					if as, isAssign := n.(*ast.AssignStmt); isAssign {
+						for i, r := range as.Rhs {
+							if cl, isCall := r.(*ast.CallExpr); isCall && i < len(as.Lhs) {
+								if sel, isSel := cl.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "announceForegroundAuthority" {
+									if id, isID := as.Lhs[i].(*ast.Ident); isID && id.Name == arg {
+										ok = true
+									}
+								}
+							}
+						}
+					}
+					return !ok
+				})
+			}
+			if !ok {
+				t.Errorf("%s hands %s a handle %q it neither announced nor was handed", caller, c.Callee, arg)
+			}
+		}
+	}
+}
+
+// TestForegroundBudgetIsDerivedFromTheAllowance: the derived budget never falls below its base and
+// always keeps the base's margin over the allowance, from zero registered actors up.
+func TestForegroundBudgetIsDerivedFromTheAllowance(t *testing.T) {
+	for _, tc := range []struct {
+		base, allowance, want int
+	}{
+		{mqttForegroundAcquireAttempts, 0, 6},
+		{mqttForegroundAcquireAttempts, 5, 6},
+		{mqttForegroundAcquireAttempts, 6, 7},
+		{mqttForegroundAcquireAttempts, 11, 12},
+		{mqttSubscribeClaimAttempts, 0, 8},
+		{mqttSubscribeClaimAttempts, 5, 8},
+		{mqttSubscribeClaimAttempts, 6, 9},
+		{mqttSubscribeClaimAttempts, 12, 15},
+	} {
+		got := mqttForegroundHandle{allowance: tc.allowance}.budget(tc.base)
+		if got != tc.want {
+			t.Errorf("budget(%d) with allowance %d = %d, want %d", tc.base, tc.allowance, got, tc.want)
+		}
+		if got < tc.base || got-tc.allowance < tc.base-mqttBackgroundAuthorityWriters {
+			t.Errorf("budget(%d) with allowance %d = %d loses the base or its margin", tc.base, tc.allowance, got)
 		}
 	}
 }

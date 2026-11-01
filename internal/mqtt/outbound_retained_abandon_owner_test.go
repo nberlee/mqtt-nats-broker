@@ -641,7 +641,7 @@ func TestF105RetainedCloseLocatesTheRegisterByItsAdmission(t *testing.T) {
 			sess.testBackgroundWait.Store(&wait)
 			var raced atomic.Int32
 			stepped := func(mqttRetainedReclaimKey, mqttReclaimStep, error) { raced.Add(1) }
-			release := sess.announceForegroundAuthority()
+			release := sess.announceForegroundAuthority().release
 			select {
 			case <-parked:
 			case <-time.After(3 * time.Second): // nothing pending: no reclaimer to park

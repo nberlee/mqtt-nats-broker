@@ -648,7 +648,7 @@ func TestF105SourceRetirementWaitsForTheForeground(t *testing.T) {
 		}
 	}
 	e.sess.testBackgroundWait.Store(&waitHook)
-	release := e.sess.announceForegroundAuthority()
+	release := e.sess.announceForegroundAuthority().release
 	e.sess.handSourceDisposal(cl.gen, cl.name, cl.inc, mqttDisposalUnsubscribed, cl.ent, "test")
 	select {
 	case <-waited:

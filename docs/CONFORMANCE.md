@@ -646,66 +646,70 @@ limits:
     identifier, and only there (F-114; holistic round H4, consult 2).** The ordinary and
     shared delivery admission ladder announces itself as a foreground authority operation
     since F-112, so no background attempt admitted after it starts can take its attempts;
-    attempts admitted BEFORE the announcement still may, one per counted writer (the
-    retained driver, the continuations, the reclaimer, the floor unit, exclusion reclaim).
-    With three attempts, three such commits exhausted it (attempt N reads, writer N
-    commits, attempt N loses its CAS). Its budget is now one more than those five writers,
-    and an attempt that reached the commit is spaced from the next by the shared
-    contention wait, so they alone cannot exhaust an admission to an empty identifier.
-    They still can when the ladder has spent attempts on its own classification or cleanup
-    of an OCCUPIED identifier: its first create meeting a same-delivery occupant, and the
-    marker, cancellation-tombstone and complete-source reaps each consume one. Not covered
-    at all: another broker, the recovery pass, same-session writes made without an
-    admission (the retained PUBREL action drain's completion, the denied delivery's
-    disposal timer step), foreground operations of the same session contending with each
-    other, and store failures. Nothing is stranded or doubled: an attempt that may have
-    landed installs admission continuity, and a never-landed one is deferred and its
-    source NAKed when the admission's custody reservation is released, which is at once
-    when every attempt settled and at AckWait at the latest. The cost is latency, with no
-    finite bound under repeated contention, plus the settlement of each attempt that
-    reached the commit (up to six per offer): a resolution, and for one it leaves
-    unresolved a create-only aborted outcome record and a second resolution.
+    attempts admitted BEFORE the announcement still may, one per background actor of the
+    client registered at the announcement (each session object's retained driver,
+    continuations, reclaimer, floor unit and exclusion reclaim, and each recovery visit of
+    the client's roots). With three attempts, three such commits exhausted it (attempt N
+    reads, writer N commits, attempt N loses its CAS). Its budget is now one more than
+    those actors (and never fewer than six), and an attempt that reached the commit is
+    spaced from the next by the shared contention wait, so they alone cannot exhaust an
+    admission to an empty identifier. They still can when the ladder has spent attempts on
+    its own classification or cleanup of an OCCUPIED identifier: its first create meeting
+    a same-delivery occupant, and the marker, cancellation-tombstone and complete-source
+    reaps each consume one. Not covered at all: another broker, the adopted teardown's
+    completion, same-client writes made without an admission (the retained PUBREL action
+    drain's completion, the denied delivery's disposal timer step, among the others the
+    bullet on foreground priority lists), foreground operations of the same client
+    contending with each other, and store failures. Nothing is stranded or doubled: an
+    attempt that may have landed installs admission continuity, and a never-landed one is
+    deferred and its source NAKed when the admission's custody reservation is released,
+    which is at once when every attempt settled and at AckWait at the latest. The cost is
+    latency, with no finite bound under repeated contention, plus the settlement of each
+    attempt that reached the commit (up to six per offer): a resolution, and for one it
+    leaves unresolved a create-only aborted outcome record and a second resolution.
   - **The converted foreground authority loops outlast the admitted background attempts,
     and only them.** The cancellation's withdrawal or tombstone
     (`markInflightRegisterCancelled`), the recovered PUBREC (`recordRecoveredPubRec`), the
     PUBREL acquisition's foreground arms (`acquirePubRelThroughAuthority`) with the PUBREL
     callback's redispatch (`admitStoredPubRel`, announced across its loop) and the PUBCOMP
     terminalization (`mqttTerminalizeOnPubComp`) announce themselves and take one attempt
-    more than the five background writers, each re-attempt after a commit-stage loss spaced
-    by the contention wait, so the attempts admitted before the announcement cannot exhaust
-    them. Other brokers, the recovery pass, unadmitted background writes, foreground
-    operations of the same session and store failures still can, and so can a loop that
-    spends its attempts on its own classification or cleanup (a certified-token clearance,
-    the redispatch's recovered PUBREC or custody transfer). Exhausted, each costs what it
-    always did: the cancellation leaves the exchange at Publish holding its Receive Maximum
-    unit and its identifier until a later resume honours the verdict, and a never-landed
-    exhaustion records no owed withdrawal (under Receive Maximum 1 the session's QoS 1/2
-    deliveries stall until then); route B's recovered PUBREC quarantines the slot and marks
-    the identifier space incomplete, so nothing new is allocated session-wide until a later
+    more than the client's registered background actors (never fewer than six), each
+    re-attempt after a commit-stage loss spaced by the contention wait, so the attempts
+    admitted before the announcement cannot exhaust them. Other brokers, the adopted
+    teardown's completion, unadmitted background writes, foreground operations of the same
+    client and store failures still can, and so can a loop that spends its attempts on its
+    own classification or cleanup (a certified-token clearance, the redispatch's recovered
+    PUBREC or custody transfer). Exhausted, each costs what it always did: the
+    cancellation leaves the exchange at Publish holding its Receive Maximum unit and its
+    identifier until a later resume honours the verdict, and a never-landed exhaustion
+    records no owed withdrawal (under Receive Maximum 1 the session's QoS 1/2 deliveries
+    stall until then); route B's recovered PUBREC quarantines the slot and marks the
+    identifier space incomplete, so nothing new is allocated session-wide until a later
     resume completes, and the drain resume skips that drain; the PUBREL callback waits out
-    AckWait, and the PUBREC handler's retained PUBREL goes to the continuation; the PUBCOMP
-    goes to the completion worker after 2 s, holding the unit, the terminal reservation and
-    the canonical PUBREL acknowledgement. Nothing is lost or doubled on any of them. The
-    added cost is time with the session's background writers held — at most six attempts
-    and five 10-25 ms waits per call, eighteen acquisitions and fifteen waits on the PUBREL
-    callback's acquisition path — and for the cancellation up to six durable ABORTED
-    outcomes per call where it left three. A caller that admits each attempt (exclusion
-    reclaim, the retained withdrawal, the retained continuation) is background and keeps
-    the three-attempt budget, unannounced. The classification of every loop is
-    `bounded_reattempt_census_test.go`.
+    AckWait, and the PUBREC handler's retained PUBREL goes to the continuation; the
+    PUBCOMP goes to the completion worker after 2 s, holding the unit, the terminal
+    reservation and the canonical PUBREL acknowledgement. Nothing is lost or doubled on
+    any of them. The added cost is time with the session's background writers held — at
+    most six attempts and five 10-25 ms waits per call, eighteen acquisitions and fifteen
+    waits on the PUBREL callback's acquisition path — and for the cancellation up to six
+    durable ABORTED outcomes per call where it left three. A caller that admits each
+    attempt (exclusion reclaim, the retained withdrawal, the retained continuation) is
+    background and keeps the three-attempt budget, unannounced. The classification of
+    every loop is `bounded_reattempt_census_test.go`.
   - **The send-section acquisition outlasts the admitted background attempts, and only
     them.** A delivery's acquisition of its output action is foreground too (the retained
-    driver's own excepted, which stays background), and its budget is one attempt more than
-    the five background writers above, so attempts admitted through the handshake cannot
-    exhaust it. Before this, the retained reclaim chain after a retained replay, and the
-    source retirement owner after a resume, won all three of its attempts and a live QoS 1
-    delivery waited out AckWait. The bound does not cover writes background code makes
-    without an admission (the retained PUBREL action drain's completion, the denied
-    delivery's disposal timer step), foreground operations of the same session contending
-    with each other (acknowledgement advances,
-    another delivery's admission or acquisition — spaced by the shared contention wait, not
-    bounded), another broker, the recovery pass, or the custody observer's other units.
-    Exhausted, the acquisition re-offers at AckWait as before: latency, not loss.
+    driver's own excepted, which stays background), and its budget is one attempt more
+    than the client's registered background actors (never fewer than six), so attempts
+    admitted through the handshake cannot exhaust it. Before this, the retained reclaim
+    chain after a retained replay, and the source retirement owner after a resume, won all
+    three of its attempts and a live QoS 1 delivery waited out AckWait. The bound does not
+    cover writes background code makes without an admission (the retained PUBREL action
+    drain's completion, the denied delivery's disposal timer step), foreground operations
+    of the same session contending with each other (acknowledgement advances, another
+    delivery's admission or acquisition — spaced by the shared contention wait, not
+    bounded), another broker, the adopted teardown's completion, or the custody
+    dispatcher's other units. Exhausted, the acquisition re-offers at AckWait as before:
+    latency, not loss.
   - **The acknowledgement's terminal release has the same bound.** A PUBACK's or refused
     PUBREC's `publish -> publish_terminal` advance re-runs its whole attempt, from a fresh
     read, up to that budget, so the admitted background writers alone cannot push it to
@@ -1272,8 +1276,10 @@ pin bump (`docs/known-upstream-issues.md`).
 ### A discarded generation's retirement (F-105 7d) — residuals
 
 - **Cleanup after a teardown is eventual, not prompt by promise.** The teardown kicks its
-  generation's recovery root and a bounded worker visits it at once (32 visits per kick, a
-  bounded set whose overflow is dropped); whatever it leaves is the periodic pass's, which
+  generation's recovery root and a bounded worker visits it at once (32 charged visits per
+  kick, a bounded set whose overflow is dropped; while the client has a foreground
+  authority operation announced, every visit is refused, uncharged and retried behind a
+  backoff); whatever it leaves is the periodic pass's, which
   promises eventual visitation and no latency bound. Until then a torn-down session's source
   and PUBREL consumers stand, retaining their streams' interest-retained traffic. Not
   client-visible: nothing delivers from them.
@@ -1375,14 +1381,27 @@ leaves:
   this broker composing from the same standing authority; only the producer's workers
   close an unadmitted copy under that arm.
 - **Foreground priority is bounded, not total.** A foreground authority operation on this
-  broker (the SUBSCRIBE name claim, the PUBREC, PUBACK and PUBCOMP advances) loses at most
-  one attempt per retained background worker (three) to their writes. Contention from
-  writers outside the handshake — another broker, the recovery pass, the ordinary delivery
-  paths, store failures — can still exhaust the SUBSCRIBE claim's eight spaced attempts
-  and refuse the subscription; the spacing adds 70-175 ms in that case and bounds no
-  latency. Background retained work waits while any foreground operation is announced, so
-  continuous foreground traffic can delay it without bound, and a foreground operation
-  that never returns keeps it waiting.
+  broker (the SUBSCRIBE name claims, the PUBREC, PUBACK and PUBCOMP advances, the delivery
+  admission and acquisition) loses at most its announcement's ALLOWANCE of attempts to
+  this broker's background writes: one per background actor of the same client
+  registered when it announced, which counts the session workers of every session object
+  of the client and every recovery visit of its roots, so a reused client identifier's
+  claim is covered against the previous object's workers and the previous generation's
+  recovery alike. Its budget is derived from that allowance and is never smaller than
+  before. Contention from writers outside the handshake can still exhaust it and, for a
+  SUBSCRIBE claim, refuse the subscription: another broker, the adopted teardown's
+  completion (the one recovery exclusion), background writes made without an admission
+  (the retained PUBREL action drain's completion, the denied delivery's disposal timer
+  step, `abandonOwnProposal`'s settlement, record-driven expiry's clear, the custody
+  dispatcher's units other than the floor unit), foreground operations of the same client
+  contending with each other, and store failures; the spacing adds 70-175 ms in that case
+  and bounds no latency. Background work waits, and recovery of the client's roots is
+  refused, while any foreground operation of that client is announced, so continuous
+  foreground traffic on one client delays its background work and the cleanup of its
+  previous generations without bound, and a foreground operation that never returns keeps
+  them waiting. A refused root of a discarded generation is retried by the prompt drive
+  behind a 50 ms to 1 s backoff, uncharged; one of a non-discarded generation waits for
+  the periodic pass's next cycle. Nothing is delayed for any other client.
 - **The other bounded re-attempt loops are unchanged.** Sixteen further loops
   re-attempt an authority or register write with `mqttInflightStoreAttempts` (3) and no
   spacing; they are recorded for classification (`docs/ROADMAP.md`) rather than converted

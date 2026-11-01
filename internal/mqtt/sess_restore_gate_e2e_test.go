@@ -592,12 +592,28 @@ func TestTheRestoreVerdictOpensAfterTheConnAck(t *testing.T) {
 	defer cp.Close()
 	testMQTTReadConnAckV5(t, rp)
 
+	// THE PAUSE ENDS ONLY ONCE THE RESUMING SESSION'S CALLBACK HAS DECIDED THE PUBLICATION.
+	// Ending it on a timer instead lets a slow publication reach the callback after the open,
+	// where the correct code transmits it, and the test then reports correct code as broken.
+	// The decision is observed for both outcomes, so a mutant that opened early is decided too
+	// (transmitted) and the assertion below catches it.
+	payload := []byte("between-connack-and-open")
+	decided := make(chan struct{})
+	var decidedOnce sync.Once
+	t.Cleanup(setMQTTTestQoS0GateDecided(func(sessID string, _ bool) {
+		if sessID == id {
+			decidedOnce.Do(func() { close(decided) })
+		}
+	}))
+	var reached atomic.Bool
 	ctr := testWatchRestoreGateBlocks(t)
 	fired := testPauseRestoreAt(t, "before-open", func() {
-		testMQTTPublishV5(t, cp, 0, 0, plainTopic, []byte("between-connack-and-open"))
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) && ctr.count("qos0") == 0 {
-			time.Sleep(10 * time.Millisecond)
+		testMQTTPublishV5(t, cp, 0, 0, plainTopic, payload)
+		// Runs on the CONNECT's goroutine, so it reports through reached rather than t.
+		select {
+		case <-decided:
+			reached.Store(true)
+		case <-time.After(20 * time.Second):
 		}
 	})
 
@@ -613,9 +629,12 @@ func TestTheRestoreVerdictOpensAfterTheConnAck(t *testing.T) {
 	// The CONNACK is written BEFORE this pause, so reading it above can return while
 	// the pause body is still running. Both assertions therefore WAIT rather than
 	// sampling once — sampling is a race that reports the correct code as broken.
-	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+	checkFor(t, 30*time.Second, 25*time.Millisecond, func() error {
 		if fired.Load() == 0 {
 			return fmt.Errorf("the restore has not paused between the CONNACK and the open yet")
+		}
+		if !reached.Load() {
+			return fmt.Errorf("the publication made inside the pause was never decided by the resuming session")
 		}
 		if got := ctr.count("qos0"); got == 0 {
 			return fmt.Errorf("no QoS 0 delivery was withheld between the CONNACK and the open")

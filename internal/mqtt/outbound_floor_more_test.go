@@ -268,7 +268,7 @@ func TestF112AReclaimedExchangesUncertaintyIsDischarged(t *testing.T) {
 		}
 	}
 	for i := 0; i < 64; i++ {
-		more, err := jsa.deleteRetiredPositionsStep(sess.id, epoch, gen)
+		more, err := jsa.deleteRetiredPositionsStep(sess.id, epoch, gen, nil)
 		if err != nil {
 			t.Fatalf("deleting: %v", err)
 		}

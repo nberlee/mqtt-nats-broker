@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 )
 
 // The inventory floor (F-112): a live generation's history is retired behind a PROVEN contiguous
@@ -583,12 +584,24 @@ func mqttDutyEntryEqual(a, b *mqttDutyEntry) bool {
 // names no exchange, and only its own entry goes. Every delete is by the EXACT sequence just read,
 // and a delete that removes nothing is classified by a re-read rather than assumed: the subjects
 // carry the generation and the nonce or ordinal, so a late delete can only name what is gone.
-func (jsa *mqttJSA) deleteRetiredPositionsStep(id, epoch, gen string) (bool, error) {
-	return jsa.deleteRetiredPositionsUpTo(id, epoch, gen, mqttFloorBatchPositions)
+//
+// admit, when set, admits the watermark's authority attempt immediately before it, after the
+// deletes; a refusal records nothing and reports errMQTTForegroundRefused. Nil when the caller's own
+// admission already covers the whole step (the floor unit's).
+func (jsa *mqttJSA) deleteRetiredPositionsStep(id, epoch, gen string, admit func() bool) (bool, error) {
+	return jsa.deleteRetiredPositionsUpTo(id, epoch, gen, mqttFloorBatchPositions, admit)
 }
 
+// mqttTestFloorAdvanceAdmitV, when set, runs after a step's position deletes and before its
+// watermark's admission: the seam between the two. Nil in production.
+var mqttTestFloorAdvanceAdmitV atomic.Pointer[func(id, gen string)]
+
+// errMQTTForegroundRefused reports an authority attempt its client's foreground coordinator
+// refused: nothing was attempted.
+var errMQTTForegroundRefused = errors.New("refused: a foreground authority operation of this client is announced")
+
 // deleteRetiredPositionsUpTo is deleteRetiredPositionsStep bounded to at most limit positions.
-func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint64) (bool, error) {
+func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint64, admit func() bool) (bool, error) {
 	led, ledSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
 	if lerr != nil {
 		return false, lerr
@@ -626,6 +639,12 @@ func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint
 					ord, gen, aerr)
 			}
 		}
+	}
+	if h := mqttTestFloorAdvanceAdmitV.Load(); h != nil {
+		(*h)(id, gen)
+	}
+	if admit != nil && !admit() {
+		return true, errMQTTForegroundRefused
 	}
 	f := &mqttFloorAdvance{ID: id, Epoch: epoch, Gen: gen, Ledger: led, LedgerSeq: ledSeq, DelTo: end}
 	if err := jsa.opAdvanceFloor(f, mqttNewInflightNonce()); err != nil {

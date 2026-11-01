@@ -110,8 +110,8 @@ func (sess *mqttSession) admitInflightPublishBatch(c *client, items []*mqttBatch
 	if len(open) == 0 {
 		return
 	}
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
 		hook := as.testAdmitReserved
@@ -164,7 +164,7 @@ func (sess *mqttSession) admitInflightPublishBatch(c *client, items []*mqttBatch
 	if len(ready) == 0 {
 		return
 	}
-	sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, ready, abandon, life)
+	sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, ready, abandon, life, fg)
 }
 
 // admissionBatchPreamble is runInflightAdmission's preamble for each delivery: the allocation must
@@ -231,7 +231,7 @@ func (sess *mqttSession) admissionBatchPreamble(c *client, items []*mqttBatchAdm
 // Session lock NOT held on entry.
 func (sess *mqttSession) runAdmissionBatch(c *client, gen, epoch string, auth mqttOutboundEntitlement,
 	depsByQoS map[byte][]mqttAdmitDependency, items []*mqttBatchAdmission, abandon func([]*mqttBatchAdmission),
-	life *mqttDeliveryLifecycle) {
+	life *mqttDeliveryLifecycle, fg mqttForegroundHandle) {
 
 	for len(items) > 0 {
 		if life.over() {
@@ -242,7 +242,7 @@ func (sess *mqttSession) runAdmissionBatch(c *client, gen, epoch string, auth mq
 			sess.admitBatchDeliverySingly(c, gen, items[0], life)
 			return
 		}
-		rest, single := sess.attemptAdmissionBatch(c, gen, epoch, auth, depsByQoS, items, abandon, life)
+		rest, single := sess.attemptAdmissionBatch(c, gen, epoch, auth, depsByQoS, items, abandon, life, fg)
 		if single != nil {
 			if life.over() {
 				abandon(append([]*mqttBatchAdmission{single}, rest...))
@@ -261,10 +261,10 @@ func (sess *mqttSession) runAdmissionBatch(c *client, gen, epoch string, auth mq
 // Session lock NOT held on entry.
 func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, auth mqttOutboundEntitlement,
 	depsByQoS map[byte][]mqttAdmitDependency, items []*mqttBatchAdmission,
-	abandon func([]*mqttBatchAdmission), life *mqttDeliveryLifecycle) (rest []*mqttBatchAdmission, single *mqttBatchAdmission) {
+	abandon func([]*mqttBatchAdmission), life *mqttDeliveryLifecycle, fg mqttForegroundHandle) (rest []*mqttBatchAdmission, single *mqttBatchAdmission) {
 
 	ext := newDeliveryContentionExtension(sess, c, life)
-	budget := mqttForegroundAcquireAttempts
+	budget := fg.budget(mqttForegroundAcquireAttempts)
 	var lastErr error
 	for attempt := 0; ; attempt++ {
 		if attempt >= budget {
@@ -334,7 +334,7 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 				return items[1:], items[0]
 			}
 			// The deliveries before k are admitted first, as a batch of their own; k follows singly.
-			sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, items[:k], abandon, life)
+			sess.runAdmissionBatch(c, gen, epoch, auth, depsByQoS, items[:k], abandon, life, fg)
 			return items[k+1:], items[k]
 		}
 	}

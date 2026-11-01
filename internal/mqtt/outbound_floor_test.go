@@ -148,7 +148,7 @@ func testF112AdvanceTo(t *testing.T, e *testF105Env, end uint64) {
 		}
 	}
 	for i := 0; i < 64; i++ {
-		more, err := jsa.deleteRetiredPositionsStep(e.id, e.epoch, testF105Gen)
+		more, err := jsa.deleteRetiredPositionsStep(e.id, e.epoch, testF105Gen, nil)
 		if err != nil {
 			t.Fatalf("deleting retired positions: %v", err)
 		}

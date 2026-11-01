@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // The authority transition (F-105).
@@ -325,6 +326,11 @@ type mqttAuthorityTransition struct {
 // transition must contend against. No other member's sequence is inferred from it: a caller
 // needing one loads that subject authoritatively, exactly as the pair writer does for its
 // marker.
+// mqttTestTransitionAttemptV, when set, observes every transition attempt reaching its commit, in
+// the committing goroutine: the seam a test pairs an attempt with the admission its actor holds.
+// Nil in production.
+var mqttTestTransitionAttemptV atomic.Pointer[func(id string, kind mqttTransitionKind, free bool)]
+
 func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint64, error) {
 	if t == nil || t.Attempt == nil {
 		return 0, fmt.Errorf("unreachable: an authority transition with no attempt")
@@ -332,6 +338,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	a := t.Attempt
 	if verr := mqttValidateTransitionAttempt(a); verr != nil {
 		return 0, fmt.Errorf("refusing to commit an unsupported transition attempt: %w", verr)
+	}
+	if h := mqttTestTransitionAttemptV.Load(); h != nil {
+		(*h)(a.ID, a.Kind, mqttAttemptAuthorityFree(a.Kind, a.Rev))
 	}
 	idHash := getHash(a.ID)
 	// AN AUTHORITY-FREE ATTEMPT writes no authority, names no predecessor and proposes no

@@ -783,8 +783,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		repairInc := mqttNewInflightNonce()
 		repairClaim := &mqttSourceClaim{gen: repairEnt.Gen, name: durName, inc: repairInc, ent: repairEnt}
 		var perr error
-		releaseFG := sess.announceForegroundAuthority()
-		for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
+		fg := sess.announceForegroundAuthority()
+		for attempt := 0; attempt < fg.budget(mqttSubscribeClaimAttempts); attempt++ {
 			if attempt > 0 {
 				sess.authorityContentionWait()
 			}
@@ -799,7 +799,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 				break
 			}
 		}
-		releaseFG()
+		fg.release()
 		if perr != nil {
 			// The claim may have landed: its handles go to arbitration (F-105 7c-lc).
 			sess.custodyFailedClaim(repairClaim)

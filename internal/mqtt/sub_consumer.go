@@ -288,11 +288,11 @@ func (sess *mqttSession) pubRelClaimEntitled(ent mqttOutboundEntitlement, nameGe
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) claimPubRelName(ent mqttOutboundEntitlement, nameGen, name string) error {
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	var handles []*mqttTransitionHandle
 	var lastErr error
-	for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
+	for attempt := 0; attempt < fg.budget(mqttSubscribeClaimAttempts); attempt++ {
 		if attempt > 0 {
 			sess.authorityContentionWait()
 		}
@@ -398,8 +398,8 @@ var (
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, subject, durName string) (*mqttSourceClaim, error) {
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	srcInc := mqttNewInflightNonce()
 	if h := sess.testClaimPinned.Load(); h != nil {
 		(*h)()
@@ -440,7 +440,7 @@ func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, su
 	// retirement owner, which settles each by permanent arbitration (resolve, else abort) and
 	// disposes of the incarnation if any landed.
 	var perr error
-	for attempt := 0; attempt < mqttSubscribeClaimAttempts; attempt++ {
+	for attempt := 0; attempt < fg.budget(mqttSubscribeClaimAttempts); attempt++ {
 		if attempt > 0 {
 			sess.authorityContentionWait()
 		}

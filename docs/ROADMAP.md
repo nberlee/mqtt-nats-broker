@@ -9685,6 +9685,34 @@ reads](findings/resolved.md#f-054).
   residual). Mechanism: docs/ARCHITECTURE.md, "A transmission is not repeated on the
   connection that may hold it".
 
+### Intermittent reds
+
+- [x] **Repair three pre-existing intermittent reds.** **Done 2026-11-01**, one broker fix
+  and two fixture repairs. `TestTheRestoreVerdictOpensAfterTheConnAck`: the fixture's
+  "before-open" pause ended after at most 5 s whether or not the publication had reached
+  the resuming session, so a publication arriving after the open was transmitted (correct
+  there) and read as a withheld delivery's failure. A test seam now reports the
+  restore-verdict decision for each QoS 0 delivery (`mqttTestQoS0GateDecidedV`), and the
+  pause ends on the resuming session's own decision.
+  `TestF105RetainedConcurrentPubCompIsNotQuarantined`: the harness's client count included
+  a socket that never presented a CONNECT (a stray dial of a shard process sharing
+  ephemeral ports is the inferred origin); it now counts only clients that presented one,
+  pinned by `TestClientCountIgnoresASocketThatNeverPresentedConnect`.
+  `TestPubRelClaimSurvivesQuickClientIdentifierReuse` was a broker defect: the
+  foreground-priority handshake was per session OBJECT while the authority record is per
+  client, so a clean-session reuse's QoS 2 claim gated neither the previous object's
+  workers nor account recovery, which performs most of the previous generation's
+  retirement and consulted no gate, and eight spaced claim attempts could all lose to that
+  cleanup. The handshake is now one coordinator per client identifier held by the account;
+  background actors (the five session workers and every recovery visit) register for their
+  lifetime, an announcement's allowance is the actors registered at it, and foreground
+  budgets are derived from it. Recovery checks the coordinator at a visit's entry and
+  admits every authority attempt past it, and a refused visit is resumed behind a backoff
+  rather than charged. `docs/ARCHITECTURE.md`, "Foreground priority over the background
+  authority writers"; residual in `docs/CONFORMANCE.md`, "Foreground priority is bounded,
+  not total". Witnesses: `foreground_coordinator_test.go` and
+  `foreground_coordinator_e2e_test.go`.
+
 ### NATS platform follow-ups
 
 - [x] **Move the pin and the floor to nats-server 2.15.2, and the toolchain to Go 1.27.**

@@ -263,13 +263,25 @@ func checkFor(t testing.TB, totalWait, sleepDur time.Duration, fn func() error) 
 	}
 }
 
-// checkClientsCount polls the server's connected-client count until it matches
-// expected or times out.
+// checkClientsCount polls the server's count of clients that have presented a CONNECT until it
+// matches expected or times out.
+//
+// A connection that never presented one is not counted: every caller counts MQTT clients it
+// connected itself, each of which presented a CONNECT before it was answered. Counting every
+// accepted socket made the count hostage to a stranger's dial, which is what a port another
+// process released and this server's listener reused delivers: an unlabeled, never-closed
+// "cid:N" that no test of this server opened.
 func checkClientsCount(t testing.TB, s *Server, expected int) {
 	t.Helper()
 	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
 		s.mu.Lock()
-		n := len(s.clients)
+		n := 0
+		for _, c := range s.clients {
+			// The label is stored when a CONNECT is parsed, failed or not (mqttParse).
+			if c.ncs.Load() != nil {
+				n++
+			}
+		}
 		s.mu.Unlock()
 		if n != expected {
 			return fmt.Errorf("expected %d clients, got %d: %s", expected, n, testDescribeClients(s))

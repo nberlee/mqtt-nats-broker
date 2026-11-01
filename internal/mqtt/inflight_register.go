@@ -2746,8 +2746,8 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 	// A FOREGROUND authority operation for its whole span, every re-attempt and contention wait
 	// included: the acknowledgement's advance outlasts the retained background writers
 	// (outbound_foreground_priority.go).
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 
 	// A CONTENDED ADVANCE IS RE-ATTEMPTED, AS A WHOLE ATTEMPT. The advance is conditioned on the
 	// sequences its read captured (exchange, register, resources; it is authority-free), so a
@@ -2765,7 +2765,7 @@ func (sess *mqttSession) attemptTerminalRegisterRelease(c *client, pi uint16, re
 		if sess.attemptTerminalRegisterReleaseOnce(c, pi, ref, acknowledged, &contended) {
 			return true
 		}
-		if !contended || attempt+1 >= mqttForegroundAcquireAttempts {
+		if !contended || attempt+1 >= fg.budget(mqttForegroundAcquireAttempts) {
 			return false
 		}
 		sess.authorityContentionWait()
@@ -4163,9 +4163,9 @@ func (sess *mqttSession) markInflightRegisterCancelled(c *client, pi uint16, jsD
 	foreground := lic.admit == nil
 	budget := mqttInflightStoreAttempts
 	if foreground {
-		release := sess.announceForegroundAuthority()
-		defer release()
-		budget = mqttForegroundAcquireAttempts
+		fg := sess.announceForegroundAuthority()
+		defer fg.release()
+		budget = fg.budget(mqttForegroundAcquireAttempts)
 	}
 	var lastErr error
 	contended := false
@@ -7348,9 +7348,10 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 	// waited out AckWait. A BACKGROUND section (the retained driver's, which passes tok.admit)
 	// never announces: it would then wait on its own announcement at every admission.
 	foreground := tok.admit == nil
+	var fg mqttForegroundHandle
 	if foreground {
-		release := sess.announceForegroundAuthority()
-		defer release()
+		fg = sess.announceForegroundAuthority()
+		defer fg.release()
 	}
 	// THE REFERENCE IS REBUILT FROM A FRESH READ, not taken from the entry's capture, and
 	// a full-suite regression is what proved it necessary.
@@ -7501,7 +7502,7 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 			// against a FOREGROUND burst (acknowledgement advances); that one is not bounded.
 			budget := mqttInflightStoreAttempts
 			if foreground {
-				budget = mqttForegroundAcquireAttempts
+				budget = fg.budget(mqttForegroundAcquireAttempts)
 			}
 			if attempt+1 < budget {
 				if foreground {

@@ -569,7 +569,7 @@ func TestFloorYieldDoesNotHoldTheReleaser(t *testing.T) {
 	if len(g.source(t).Deps) == 0 {
 		t.Fatal("fixture: the holds were released with the releaser held")
 	}
-	release := g.sess.announceForegroundAuthority()
+	release := g.sess.announceForegroundAuthority().release
 	defer release()
 	refused := make(chan struct{}, 1)
 	wait := func() {

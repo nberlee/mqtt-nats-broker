@@ -341,6 +341,9 @@ func (sess *mqttSession) rearmCustodyAfterReopen() {
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) runCustodyDispatcher(srv *Server, admitted bool, lease *mqttLease, gen, epoch string) {
+	// A REGISTERED ACTOR of its client's foreground coordinator for its whole run, so every
+	// announcement's allowance counts it (outbound_foreground_priority.go).
+	defer sess.registerForegroundActor()()
 	defer func() {
 		if lease != nil {
 			lease.release()

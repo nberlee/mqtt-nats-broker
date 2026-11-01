@@ -279,6 +279,9 @@ func (sess *mqttSession) disarmExclusionReclaimLocked() {
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) runExclusionReclaim(delay time.Duration) {
+	// A REGISTERED ACTOR of its client's foreground coordinator for its whole run, so every
+	// announcement's allowance counts it (outbound_foreground_priority.go).
+	defer sess.registerForegroundActor()()
 	as := sess.asm
 	if as == nil {
 		sess.mu.Lock()

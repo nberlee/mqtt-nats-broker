@@ -791,10 +791,7 @@ func TestF105ForegroundAuthorityPriorityReleaseOnExhaustion(t *testing.T) {
 	if attempts != mqttSubscribeClaimAttempts {
 		t.Fatalf("the claim made %d attempts, want its budget of %d", attempts, mqttSubscribeClaimAttempts)
 	}
-	rig.sess.foreground.mu.Lock()
-	n := rig.sess.foreground.n
-	rig.sess.foreground.mu.Unlock()
-	if n != 0 {
+	if n, _, _ := testForegroundEntry(rig.sess.asm, rig.sess.id); n != 0 {
 		t.Fatalf("the exhausted claim left %d announcements standing", n)
 	}
 	done := make(chan bool, 1)

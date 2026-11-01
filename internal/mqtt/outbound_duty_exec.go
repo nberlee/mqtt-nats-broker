@@ -78,6 +78,13 @@ func (as *mqttAccountSessionManager) executeRecoveryDuty(s *Server, root *mqttRe
 		// in this sweep's accumulator; there is nothing to act on.
 		return true
 	}
+	// ONE ADMITTED ATTEMPT PER DUTY STEP, before the step's first read
+	// (outbound_foreground_priority.go): every step below performs at most one authority attempt,
+	// and none re-attempts one. A refused step leaves its duty outstanding, exactly as a withheld
+	// one does, and the visit admits nothing more.
+	if !as.admitRecoveryAttempt(root.ID, b) {
+		return true
+	}
 	// THE KIND IS EXCLUDED BEFORE THE CLASSIFIER RUNS, not after it: one record read decides
 	// whether this pass may act on the duty at all, so no classification is performed for a
 	// duty whose verdict would be thrown away.
@@ -347,9 +354,17 @@ func (as *mqttAccountSessionManager) concludeRecoveryRoot(s *Server, root *mqttR
 		if !b.spendProgress(1) {
 			return
 		}
-		if _, derr := as.jsa.deleteRetiredPositionsStep(root.ID, root.Epoch, root.Gen); derr != nil {
+		// THE FLOOR ADVANCEMENT IS AN AUTHORITY ATTEMPT OF ITS OWN, admitted immediately before
+		// it, after the position deletes: an announcement landing between the two refuses it,
+		// and the deletes it leaves behind are repeated by the next visit as already-gone.
+		admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }
+		if _, derr := as.jsa.deleteRetiredPositionsStep(root.ID, root.Epoch, root.Gen, admit); derr != nil {
 			s.Debugf("MQTT recovery pass: deleting retired positions of %q/%q was not confirmed: %v",
 				root.ID, root.Gen, derr)
+		}
+		if b.refused {
+			// A REFUSED FLOOR LEAVES THE ROOT UNCONCLUDED: no roll, no certificate.
+			return
 		}
 		if led, _, lerr = as.jsa.loadGenLedger(root.ID, root.Epoch, root.Gen); lerr != nil {
 			return

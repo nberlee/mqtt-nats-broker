@@ -371,6 +371,9 @@ func (sess *mqttSession) wakeRetainedDriver(c *client, objs []*mqttRetainedRepla
 
 // runRetainedDriver is the REPLAY worker: it executes queued objects in order until none remains.
 func (sess *mqttSession) runRetainedDriver() {
+	// A REGISTERED ACTOR of its client's foreground coordinator for its whole run, so every
+	// announcement's allowance counts it (outbound_foreground_priority.go).
+	defer sess.registerForegroundActor()()
 	d := &sess.retainedDriver
 	for {
 		d.mu.Lock()
@@ -390,6 +393,9 @@ func (sess *mqttSession) runRetainedDriver() {
 // owed transmission is due, each backing off on its own, until none remains. It never waits on the
 // replay worker.
 func (sess *mqttSession) runRetainedContinuations() {
+	// A REGISTERED ACTOR of its client's foreground coordinator for its whole run, so every
+	// announcement's allowance counts it (outbound_foreground_priority.go).
+	defer sess.registerForegroundActor()()
 	d := &sess.retainedDriver
 	for {
 		d.mu.Lock()

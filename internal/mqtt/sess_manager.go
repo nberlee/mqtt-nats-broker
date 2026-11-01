@@ -838,6 +838,17 @@ type mqttAccountSessionManager struct {
 	// bounded caller of the recovery pass's own visit, so a teardown's consumers are retired
 	// promptly rather than at the next pass. See outbound_recovery_kick.go.
 	recoveryKick mqttRecoveryKick
+
+	// foreground is the foreground-priority coordinator of each client authority, keyed by MQTT
+	// client ID (outbound_foreground_priority.go): ONE per authority record, whichever session
+	// objects, workers and recovery visits of that client are running. Every entry and every
+	// counter in it is guarded by fgMu, never by mu.
+	fgMu       sync.Mutex
+	foreground map[string]*mqttForegroundAuthority
+	// fgAnnounced and fgAdmitted are account-wide sequences, guarded by fgMu: the announcement
+	// stamp and the admission identity test seams read. Account-wide rather than per entry, so a
+	// deleted and recreated entry never reuses one.
+	fgAnnounced, fgAdmitted uint64
 }
 
 // sessionReconcileState orders remote-persist workers for a single client ID

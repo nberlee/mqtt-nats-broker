@@ -621,7 +621,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		f, n, _ := r.fence("f", 110)
 		r.exclude(r.e.sess, X, f, n)
 		rev := f119RevOf(t, r.e)
-		release := r.e.sess.announceForegroundAuthority()
+		release := r.e.sess.announceForegroundAuthority().release
 		done := make(chan []string, 1)
 		go func() { done <- r.pass(r.e.sess) }()
 		select {

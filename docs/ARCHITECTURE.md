@@ -9986,8 +9986,9 @@ next attempt's read as past PUBREC and resolved as Confirmed. Eight spaced attem
 mitigate a contention burst and guarantee nothing against sustained contention. The
 sustained contention that exhausts them in practice is the session's own: while a
 resuming session's redeliveries are admitted and acquired, each rewrites the authority
-and its registers, and the foreground-priority protocol makes only the retained
-background writers yield to this advance, not those. That is F-126: the resulting
+and its registers, and the foreground-priority protocol makes only the client's
+registered background actors (its session workers and recovery visits) yield to this
+advance, not those. That is F-126: the resulting
 connection drop is a nonblocking residual in `docs/CONFORMANCE.md`, with its dossier in
 `docs/findings/runtime-correctness.md`. An acknowledged batch
 is itself the proof that the intent is durable, so `Confirmed` is returned without a
@@ -13452,61 +13453,122 @@ VERIFIES is not a fresh phase either: an answer on another broker after the pass
 a moved pair re-runs the pass. The pass re-checks the entitlement before its exhaustion
 fallback, for both arms (a pre-existing gap for ordinary registers too).
 
-**Foreground priority over the retained workers (consults 104, 105).** Every outbound
-authority transition of a session CASes its one authority record, so this broker's own
-writers serialize on it, and the retained workers (replay, continuation, reclaimer)
-produce bursts of such writes right after a SUBSCRIBE and after every retained
-acknowledgement. A foreground operation — the SUBSCRIBE's source-consumer name claim, the
-PUBREC, PUBACK and PUBCOMP advances, and since F-112 the ordinary and shared delivery
-admission ladder — ANNOUNCES itself before its first relevant read and stays announced
+**Foreground priority over the background authority writers (consults 104, 105).** Every
+outbound authority transition of a client CASes its one authority record, so this broker's
+own writers serialize on it, and the background writers produce bursts of such writes: the
+retained workers (replay, continuation, reclaimer) right after a SUBSCRIBE and after every
+retained acknowledgement, and the account's recovery of a previous generation after every
+close whose retirement it performs. A foreground operation (the SUBSCRIBE's name claims,
+the PUBREC, PUBACK and PUBCOMP advances, and since F-112 the ordinary and shared delivery
+admission ladder) ANNOUNCES itself before its first relevant read and stays announced
 across every attempt; every background authority-transition ATTEMPT is admitted on its own
-and waits while any is announced (`outbound_foreground_priority.go`). An attempt admitted
-just before an announcement may still commit, so a continuously announced foreground
-operation loses at most one attempt to each background writer. There are five, each
-single-flight per session and admitting one attempt at a time
-(`mqttBackgroundAuthorityWriters`): the retained driver, the retained continuations, the
-reclaimer (which also steps the source retirement owner), the custody dispatcher (which
-runs the F-112 floor unit) and exclusion reclaim. `foreground_priority_census_test.go`
-pins both halves of that count against the source: every admission belongs to one of them,
-and each launch site runs its single-flight guard, rendered and compared. The SUBSCRIBE
-claim's budget is eight, spaced by the shared authority-contention wait before each
-re-attempt's fresh reads. A delivery's send-section acquisition (`acquirePublishAction`)
-is foreground as well, unless it is the retained driver's own, which stays background and
-admits each attempt; its budget is `mqttForegroundAcquireAttempts`, one more than the
-writers, with the same spacing. The acknowledgement's terminal release
-(`attemptTerminalRegisterRelease`: a PUBACK or refused PUBREC's `publish ->
-publish_terminal` advance and its cleanup) has the same budget: a contended advance
-re-runs the WHOLE attempt — deferral, generation, epoch and ACK-owner checks, a fresh read
-and every premise on it — after the contention wait, so an advance that landed behind a
-lost response is adopted through the `publish_terminal` arm rather than advanced twice;
-exhaustion falls back to the continuation at `mqttActionReconcileDelay`, as a single
-failure did before. Without it one commit by the reclaimer stepping a resume's
-source-retirement owner between the advance's read and its CAS deferred a restored drain's
-claim release by the whole delay. The delivery admission ladder (`admitThroughAuthority`
-running `runInflightAdmission`) has the same budget (F-114): the entrance passes
-`mqttForegroundAcquireAttempts`, and an attempt whose operation reached `commitOp` — it
-carries a handle beside its error, which is where a same-session commit can defeat it,
-though a boundary refusal or a transport failure there reports the same — is followed by
-the contention wait BEFORE the ladder's reread, so the classifier and a replacement's CAS
-read what stands after it; a refusal decided before the commit is re-attempted unspaced.
-The admitted background writers alone therefore cannot exhaust an admission to an empty
-identifier. On an occupied one the ladder spends attempts on its own classification (the
-first create meets the occupant, and that collision is spaced too) and cleanup (marker,
-tombstone and complete-source reaps), and only the remainder stands against them. A failed
-attempt also resets the record's QoS with its lineage: a replacement preserves the
-occupant's QoS, and the create that follows a refused one admits a fresh exchange whose
-dependencies were assembled for the incoming QoS. The chapter-P entrance
-(`storeInflightRegister`) keeps three unspaced attempts. Exhausted, the delivery is
-abandoned and its source deferred, and the deferral is NAKed when the admission's custody
-reservation is released, so it is re-offered at once when every attempt settled and at
-AckWait at the latest.
+and is granted only while nothing is announced (`outbound_foreground_priority.go`).
+
+The handshake is the CLIENT's, not a session object's. The authority record is per client
+identifier, and a clean-session reuse builds a fresh session object while the previous
+object's workers and the previous generation's recovery still run, so a per-object
+handshake gated neither. The account manager therefore holds ONE coordinator per client
+identifier (`mqttAccountSessionManager.foreground`), looked up by identifier at every use
+under one account-level mutex (`fgMu`) that guards every counter of every entry: lookup,
+check and update are one critical section, and no session object holds a reference. An
+entry exists only while it carries state (an announcement or a registered actor) and is
+deleted under `fgMu` the moment it carries none, so a recreated entry is indistinguishable
+from the deleted one whichever object last touched it.
+
+Background ACTORS register with their client's coordinator for their lifetime: the five
+single-flight session workers (the retained driver, the retained continuations, the
+reclaimer, which also steps the source retirement owner, the custody dispatcher, which runs
+the F-112 floor unit, and exclusion reclaim) at their entry, and each recovery visit of a
+root, kicked or periodic, for the visit. An announcement snapshots the registered actors as
+its ALLOWANCE and returns a handle carrying it. An attempt admitted just before an
+announcement may still commit, each actor is single-flight and holds at most one admitted
+attempt, and an actor registering after the snapshot is not admitted while it stands, so a
+continuously announced foreground operation loses at most `allowance` attempts to admitted
+background work, however many session objects or recovery visits of the client are
+running. `foreground_priority_census_test.go` pins it against the source: every admission
+belongs to a registered actor, each worker registers as its first statement and each
+launch site runs its single-flight guard, rendered and compared, and every transition a
+recovery visit can reach (a name-based over-approximation of its call graph) is classified
+as admitted per attempt, authority-free bookkeeping, or a shared-ledger operation; no
+function that builds a transient session object outside CONNECT (the adopted teardown,
+the orphan sweep's condemnation, record-driven expiry, the affine readiness) reaches an
+admission except through a registered actor.
+
+Budgets are DERIVED from the allowance. Every announced loop on
+`mqttForegroundAcquireAttempts` (6) or `mqttSubscribeClaimAttempts` (8) runs
+`handle.budget(base) = max(base, allowance + base - mqttBackgroundAuthorityWriters)`: never
+fewer attempts than before, and always the margin over the allowance that the base had
+over the five session workers (1 for the acquisition loops, 3 for the claims). A loop that
+receives its budget from its caller takes the handle as a parameter;
+`bounded_reattempt_census_test.go` refuses a raw base budget anywhere in a function body
+and a handle that was neither announced in the function nor handed in by such a caller.
+
+**Recovery yields to the client's foreground and never waits.** A recovery visit
+(`visitRecoveryRoot`) registers and then checks its client's coordinator before anything
+else: before the finished-sweep branch that rolls or concludes, before any cursor write,
+before any duty. An announced client's root gets no root work at all from that visit, and
+the visit reports itself REFUSED. Passing the check grants nothing: every authority
+attempt past it admits on its own with the non-waiting form (`admitRecoveryAttempt`)
+before its reads, once per duty step in `executeRecoveryDuty` (no step performs more than
+one authority attempt, and none re-attempts one; the hold release that `opResolveDuty`
+re-composes is authority-free) and once per floor advancement in `concludeRecoveryRoot`,
+admitted immediately before `opAdvanceFloor`, after the position deletes, so an
+announcement landing between the two refuses it and the next visit repeats the deletes as
+already gone. A refused step leaves its duty outstanding; a refused floor leaves the root
+unconcluded and unrolled. A refusal is sticky for the visit: it admits nothing more, and
+it ends REFUSED whatever its later bookkeeping does.
+
+A refused visit is resumed, not charged. The prompt drive (`outbound_recovery_kick.go`)
+counts an attempt against its kick's 32 visits unless a coordinator check inside that
+attempt actually refused it; a closure or root it cannot read before the visit's entry
+keeps today's charge (an announcement standing then exempts nothing), so a persistently
+unreadable key still exhausts and leaves. A refused key ends its turn and is requeued
+behind a not-before time, 50 ms doubling to 1 s and reset by a charged visit; the worker
+serves due keys in FIFO order with its per-quantum fairness, sleeps outside its mutex only
+when none is due, and a new kick of a queued key never postpones it. A refused PERIODIC
+visit kicks its root into the prompt drive (which visits only a discarding generation's
+root; a full set leaves it to the periodic pass, as any kick does). Continuous foreground
+traffic on one client therefore delays that client's cleanup without bound, as it delays
+its background writers, and nobody else's.
+
+The SUBSCRIBE claims' base budget is eight, spaced by the shared authority-contention wait
+before each re-attempt's fresh reads. A delivery's send-section acquisition
+(`acquirePublishAction`) is foreground as well, unless it is the retained driver's own,
+which stays background and admits each attempt; its base budget is
+`mqttForegroundAcquireAttempts`, one more than the five session workers, with the same
+spacing. The acknowledgement's terminal release (`attemptTerminalRegisterRelease`: a
+PUBACK or refused PUBREC's `publish -> publish_terminal` advance and its cleanup) has the
+same budget: a contended advance re-runs the WHOLE attempt — deferral, generation, epoch
+and ACK-owner checks, a fresh read and every premise on it — after the contention wait, so
+an advance that landed behind a lost response is adopted through the `publish_terminal`
+arm rather than advanced twice; exhaustion falls back to the continuation at
+`mqttActionReconcileDelay`, as a single failure did before. Without it one commit by the
+reclaimer stepping a resume's source-retirement owner between the advance's read and its
+CAS deferred a restored drain's claim release by the whole delay. The delivery admission
+ladder (`admitThroughAuthority` running `runInflightAdmission`) has the same budget
+(F-114): the entrance passes `fg.budget(mqttForegroundAcquireAttempts)`, and an attempt
+whose operation reached `commitOp` — it carries a handle beside its error, which is where
+a same-session commit can defeat it, though a boundary refusal or a transport failure
+there reports the same — is followed by the contention wait BEFORE the ladder's reread, so
+the classifier and a replacement's CAS read what stands after it; a refusal decided before
+the commit is re-attempted unspaced. The pre-announcement attempts of the client's
+registered actors alone therefore cannot exhaust an admission to an empty identifier. On
+an occupied one the ladder spends attempts on its own classification (the first create
+meets the occupant, and that collision is spaced too) and cleanup (marker, tombstone and
+complete-source reaps), and only the remainder stands against them. A failed attempt also
+resets the record's QoS with its lineage: a replacement preserves the occupant's QoS, and
+the create that follows a refused one admits a fresh exchange whose dependencies were
+assembled for the incoming QoS. The chapter-P entrance (`storeInflightRegister`) keeps
+three unspaced attempts. Exhausted, the delivery is abandoned and its source deferred, and
+the deferral is NAKed when the admission's custody reservation is released, so it is
+re-offered at once when every attempt settled and at AckWait at the latest.
 
 The remaining foreground authority loops F-114's classification found unspaced are
-converted the same way: each announces itself for its whole span, takes
-`mqttForegroundAcquireAttempts`, and waits out the contention after an attempt whose batch
-reached its commit (the operation's outcome carries a handle, which `commitOp` freezes
-before the boundary checks and the send, so it proves neither; a refusal decided before it
-is re-attempted unspaced). They are the PUBCOMP terminalization
+converted the same way: each announces itself for its whole span, takes the budget derived
+from `mqttForegroundAcquireAttempts`, and waits out the contention after an attempt whose
+batch reached its commit (the operation's outcome carries a handle, which `commitOp`
+freezes before the boundary checks and the send, so it proves neither; a refusal decided
+before it is re-attempted unspaced). They are the PUBCOMP terminalization
 (`mqttTerminalizeOnPubComp`, which already announced and kept three attempts, so five
 pre-admitted commits sent the completion to the 2 s worker with the Receive Maximum unit,
 the terminal reservation and the canonical PUBREL's acknowledgement held); the recovered
@@ -13533,28 +13595,34 @@ from it passing an admission. Nested inside the announced admission ladder, the
 cancellation's announcement is one more count and its six attempts are spent inside one
 cleanup attempt, which the ladder's bound already excludes.
 
-The bound counts attempts lost to the pre-admitted writers and nothing else: iterations a
+The bound counts attempts lost to the pre-admitted actors and nothing else: iterations a
 loop spends on its own classification or cleanup (the ladder's, a PUBREL acquisition's
 certified-token clearance, the redispatch's recovered PUBREC and custody transfer) are not
-covered. The cost is time with the session's background writers held: at most six attempts
-and five 10-25 ms waits per converted call; on the PUBREL callback's acquisition path at
-most eighteen acquisitions and fifteen waits; per route-B slot, six attempts and five
-waits per walk pass, under contention only. The store requests and settlements between
-them are not bounded by this. A cancellation call can also leave up to six durable ABORTED
-outcomes where it left three, one per attempt whose landing was unresolved; the PUBCOMP,
-recovered-PUBREC and PUBREL loops abort nothing, they re-read.
+covered. The cost is time with the client's background actors held: at most six attempts
+(more only when more than five actors were registered at the announcement, one per extra
+actor) and five 10-25 ms waits per converted call; on the PUBREL callback's acquisition
+path at most eighteen acquisitions and fifteen waits; per route-B slot, six attempts and
+five waits per walk pass, under contention only. The store requests and settlements
+between them are not bounded by this. A cancellation call can also leave up to six durable
+ABORTED outcomes where it left three, one per attempt whose landing was unresolved; the
+PUBCOMP, recovered-PUBREC and PUBREL loops abort nothing, they re-read.
 
-Writes outside the handshake are not covered by any of these budgets: another broker, the
-recovery pass, background code that writes without an admission — the retained PUBREL
-action drain's completion (`startActionDrain`) and the ACL-denied delivery's disposal
-timer step (`(*mqttDisposal).step`, from `armDisposalLocked`) — and foreground operations
-of the same session contending with each other; continuous foreground traffic can delay
-background work without bound. Every loop on either budget is classified in
-ONE table, `bounded_reattempt_census_test.go`: what its attempt writes, whether this
-session's background writers can exhaust it, what exhaustion costs, and its disposition.
-The test pins each listed function's references to both budgets, its `for` and `range`
-headers and its budget bindings, and each ladder entrance's budget argument, so a new loop
-on either budget, or a second loop inside a listed one, fails until it is classified.
+Writes outside the handshake are not covered by any of these budgets: another broker; the
+one recovery exclusion, the adopted teardown's completion (`finishAdoptedTeardown`'s
+settlement and close); background code that writes without an admission, namely the
+retained PUBREL action drain's completion (`startActionDrain`), the ACL-denied delivery's
+disposal timer step (`(*mqttDisposal).step`, from `armDisposalLocked`),
+`abandonOwnProposal`'s asynchronous settlement, record-driven expiry's clear
+(`settleDiscardAuthority`) and the custody dispatcher's units other than the floor unit;
+foreground operations of the same client contending with each other; and store failures.
+Continuous foreground traffic can delay background work without bound. Every loop on
+either budget is classified in ONE table, `bounded_reattempt_census_test.go`: what its
+attempt writes, whether this session's background writers can exhaust it, what exhaustion
+costs, and its disposition. The test pins each listed function's references to the three
+budgets (`mqttInflightStoreAttempts`, `mqttForegroundAcquireAttempts`,
+`mqttSubscribeClaimAttempts`), its `for` and `range` headers and its budget bindings, and
+each ladder entrance's budget argument, so a new loop on any of them, or a second loop
+inside a listed one, fails until it is classified.
 
 ### The source consumer's lifecycle: ending release, disposal and retirement (F-105 7c-lc)
 
@@ -13790,10 +13858,15 @@ successor (this closed row 6's "continuation 4").
 
 **The prompt drive is a caller, not a mechanism.** The teardown kicks the root as soon
 as its discarding closure stands — before, and independently of, the shared closing —
-and a worker visits it with the pass's own `visitRecoveryRoot`: at most 32 visits per
-kick, 8 per FIFO turn, a bounded set whose overflow is dropped — a root the worker puts
-back after its turn included, since kicks may have filled the set while it held the root
-(before 2026-10-27 that requeue bypassed the cap). It judges no progress;
+and a worker visits it with the pass's own `visitRecoveryRoot`: at most 32 charged
+visits per kick (a visit its client's foreground refused is not charged and is requeued
+behind a not-before backoff, see the foreground-priority section), 8 per FIFO turn among
+the due roots, a bounded set whose overflow is dropped. The cap counts every root the
+drive holds, the one being visited included, so a kick landing while the worker holds a
+root cannot take that root's slot, and putting a root back after its turn (a refused one
+especially, which has visits left) never drops it (before 2026-10-27 that requeue
+bypassed the cap; until 2026-11-01 it could drop the root once kicks had filled its
+slot). It judges no progress;
 whatever it leaves is the periodic pass's, which promises eventual visitation and no
 latency bound.
 

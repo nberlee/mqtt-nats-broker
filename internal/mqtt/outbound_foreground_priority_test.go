@@ -24,7 +24,8 @@ import (
 func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 	newSess := func() (*mqttSession, chan struct{}) {
 		quit := make(chan struct{})
-		return &mqttSession{jsa: &mqttJSA{mqttJSACore: &mqttJSACore{c: &client{srv: &Server{quitCh: quit}}}}}, quit
+		return &mqttSession{id: "fg-release", asm: &mqttAccountSessionManager{},
+			jsa: &mqttJSA{mqttJSACore: &mqttJSACore{c: &client{srv: &Server{quitCh: quit}}}}}, quit
 	}
 	admitted := func(sess *mqttSession) chan bool {
 		out := make(chan bool, 1)
@@ -53,18 +54,18 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 
 	t.Run("release is idempotent and returns to idle", func(t *testing.T) {
 		sess, _ := newSess()
-		release := sess.announceForegroundAuthority()
+		release := sess.announceForegroundAuthority().release
 		release()
 		release()
-		if sess.foreground.n != 0 || sess.foreground.idle != nil {
-			t.Fatalf("after a double release: n=%d idle=%v", sess.foreground.n, sess.foreground.idle)
+		if n, actors, ok := testForegroundEntry(sess.asm, sess.id); ok {
+			t.Fatalf("after a double release the client's coordinator entry stands: n=%d actors=%d", n, actors)
 		}
 		expect(t, admitted(sess), true, time.Second)
 	})
 	t.Run("overlapping scopes", func(t *testing.T) {
 		sess, _ := newSess()
-		r1 := sess.announceForegroundAuthority()
-		r2 := sess.announceForegroundAuthority()
+		r1 := sess.announceForegroundAuthority().release
+		r2 := sess.announceForegroundAuthority().release
 		ch := admitted(sess)
 		waiting(t, ch)
 		r1()
@@ -77,7 +78,7 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 		granted := false
 		h := func(uint64) { granted = true }
 		sess.testBackgroundAdmit.Store(&h)
-		release := sess.announceForegroundAuthority()
+		release := sess.announceForegroundAuthority().release
 		defer release()
 		ch := admitted(sess)
 		waiting(t, ch)
@@ -92,16 +93,28 @@ func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
 		if _, err := e.sess.claimSourceConsumerName(testServingEntitlement(t, e.sess), "fg.ok", e.sess.idHash+"_fgok"); err != nil {
 			t.Fatalf("the fixture's claim was expected to land: %v", err)
 		}
-		if e.sess.foreground.n != 0 {
-			t.Fatalf("the claim's success left %d announcements standing", e.sess.foreground.n)
+		if n, _, _ := testForegroundEntry(e.sess.asm, e.sess.id); n != 0 {
+			t.Fatalf("the claim's success left %d announcements standing", n)
 		}
 		// A connection with no accepted entitlement: the claim refuses before it writes anything.
 		orphan := &mqttSession{id: "fg-no-authority", idHash: getHash("fg-no-authority"), asm: e.sess.asm, jsa: e.sess.jsa}
 		if _, err := orphan.claimSourceConsumerName(mqttOutboundEntitlement{}, "fg.early", "dur"); err == nil {
 			t.Fatal("a claim with no entitlement was expected to be refused")
 		}
-		if orphan.foreground.n != 0 {
-			t.Fatalf("the claim's early error left %d announcements standing", orphan.foreground.n)
+		if n, _, _ := testForegroundEntry(orphan.asm, orphan.id); n != 0 {
+			t.Fatalf("the claim's early error left %d announcements standing", n)
 		}
 	})
+}
+
+// testForegroundEntry reads client id's coordinator entry: its standing announcements, its
+// registered actors, and whether it exists at all.
+func testForegroundEntry(as *mqttAccountSessionManager, id string) (n, actors int, ok bool) {
+	as.fgMu.Lock()
+	defer as.fgMu.Unlock()
+	f := as.foreground[id]
+	if f == nil {
+		return 0, 0, false
+	}
+	return f.n, f.actors, true
 }

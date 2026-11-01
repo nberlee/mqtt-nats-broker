@@ -298,6 +298,9 @@ func (rc *mqttRetainedReclaim) wake(sess *mqttSession, gen, inc string) {
 // runRetainedReclaim drives every pending copy one step at a time, round-robin, until none
 // remains; a withheld copy backs off without blocking the others.
 func (sess *mqttSession) runRetainedReclaim() {
+	// A REGISTERED ACTOR of its client's foreground coordinator for its whole run, so every
+	// announcement's allowance counts it (outbound_foreground_priority.go).
+	defer sess.registerForegroundActor()()
 	rc := &sess.retainedReclaim
 	for {
 		resident := sess.resident() // read outside rc.mu: as.mu is never taken under it

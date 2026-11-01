@@ -296,3 +296,14 @@ func (jsa *mqttJSA) setAcceptStoreObserver(h func(mqttAcceptStoreObs) error) fun
 	}
 	return func() { jsa.acceptObs.Store(prev) }
 }
+
+// setMQTTTestQoS0GateDecided is only reached from the tagged restore-gate tests.
+func setMQTTTestQoS0GateDecided(h func(sessID string, blocked bool)) func() {
+	prev := mqttTestQoS0GateDecidedV.Load()
+	if h == nil {
+		mqttTestQoS0GateDecidedV.Store(nil)
+	} else {
+		mqttTestQoS0GateDecidedV.Store(&h)
+	}
+	return mqttTestRestoreOnce(func() { mqttTestQoS0GateDecidedV.Store(prev) })
+}

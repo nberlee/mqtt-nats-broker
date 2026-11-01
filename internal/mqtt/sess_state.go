@@ -436,12 +436,11 @@ type mqttSession struct {
 	// retainedReclaim reclaims their copies; each guards itself.
 	retainedDriver  mqttRetainedDriver
 	retainedReclaim mqttRetainedReclaim
-	// foreground is this broker's foreground-priority handshake over the retained background
-	// writers (outbound_foreground_priority.go); testForegroundAnnounce observes an announcement
-	// (true) and its release (false), testBackgroundAdmit an admitted background attempt, each with
-	// the handshake's announcement count read under its lock. Both nil outside tests, set before the
-	// session is used.
-	foreground             mqttForegroundAuthority
+	// The foreground-priority handshake is the CLIENT's, held by the account manager
+	// (outbound_foreground_priority.go), never this object's. testForegroundAnnounce observes an
+	// announcement this object made (true) and its release (false), testBackgroundAdmit an
+	// attempt this object's workers were admitted, each with the account's announcement stamp read
+	// under its lock. Both nil outside tests, set before the session is used.
 	testForegroundAnnounce atomic.Pointer[func(announced bool, stamp uint64)]
 	testBackgroundAdmit    atomic.Pointer[func(stamp uint64)]
 	// testBackgroundWait observes a background admission starting to wait on an announcement;

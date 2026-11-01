@@ -133,7 +133,7 @@ func (sess *mqttSession) runFloorUnit(gen, epoch string) bool {
 			more = true
 			break
 		}
-		_, derr := jsa.deleteRetiredPositionsUpTo(id, epoch, gen, mqttFloorUnitPositions)
+		_, derr := jsa.deleteRetiredPositionsUpTo(id, epoch, gen, mqttFloorUnitPositions, nil)
 		progress, more = derr == nil, true
 	case led.State == mqttGenLedgerOpen && mqttLedgerSpan(led) > mqttFloorSlack:
 		p, m := sess.floorHorizonStep(gen, epoch, led)

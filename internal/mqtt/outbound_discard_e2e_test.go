@@ -443,7 +443,22 @@ func setMQTTTestRecoveryKickHook(h func(id, gen string) bool) func() {
 	return func() { mqttTestRecoveryKickHookV.Store(prev) }
 }
 
+// setMQTTTestRecoveryKickVisit replaces each prompt-drive visit with h, which reports whether the
+// root is gone; every other visit is charged.
 func setMQTTTestRecoveryKickVisit(h func(id, gen string) bool) func() {
+	if h == nil {
+		return setMQTTTestRecoveryKickVisitOutcome(nil)
+	}
+	return setMQTTTestRecoveryKickVisitOutcome(func(id, gen string) mqttRecoveryVisitOutcome {
+		if h(id, gen) {
+			return mqttRecoveryVisitGone
+		}
+		return mqttRecoveryVisitCharged
+	})
+}
+
+// setMQTTTestRecoveryKickVisitOutcome replaces each prompt-drive visit with h and its outcome.
+func setMQTTTestRecoveryKickVisitOutcome(h func(id, gen string) mqttRecoveryVisitOutcome) func() {
 	prev := mqttTestRecoveryKickVisitV.Load()
 	if h == nil {
 		mqttTestRecoveryKickVisitV.Store(nil)

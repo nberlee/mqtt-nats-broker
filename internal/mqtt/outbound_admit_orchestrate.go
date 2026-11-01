@@ -112,8 +112,8 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 	// bounded attempts are what a burst of background authority writes — the retained workers' and
 	// the F-112 floor unit's resolutions, advances and watermark updates — would otherwise exhaust,
 	// abandoning a valid delivery for a re-offer.
-	release := sess.announceForegroundAuthority()
-	defer release()
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
 	if as := sess.asm; as != nil {
 		as.mu.RLock()
 		hook := as.testAdmitReserved
@@ -154,7 +154,7 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 	// AND PAST IT, while every attempt has lost only to a stale expectation: abandoning the offer
 	// would let its re-offer reach the client behind later messages (outbound_admission_contention.go).
 	ext := newDeliveryContentionExtension(sess, c, life)
-	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, mqttForegroundAcquireAttempts,
+	return sess.runInflightAdmission(c, pi, qos, jsDur, sseq, nonce, q2AffClaim, q2AffCopy, fg.budget(mqttForegroundAcquireAttempts),
 		func(regExpect, markerExpect uint64, registerOnly bool, cur, rec *mqttInflightRecord, subject string) (uint64, bool, error) {
 			if regExpect == 0 && !registerOnly {
 				// CREATE: the authority-carrying admission. opAdmitPublish compares the captured
