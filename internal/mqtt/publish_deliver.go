@@ -206,8 +206,8 @@ func mqttDeliverMsgCbQoS0(sub *subscription, pc *client, _ *Account, subject, re
 //
 // col carries the fresh deliveries collected ahead of this offer in the same callback. A fresh
 // ordinary delivery joins it; every other exit of the locked decision region releases the lock
-// through col.unlockAndFlush, and both waits flush before waiting, so nothing this offer does
-// after its decision overtakes what was collected before it.
+// through col.unlockAndFlush, and the transmission-gate wait flushes before waiting, so nothing
+// this offer does after its decision overtakes what was collected before it.
 func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string, rmsg []byte, col *mqttDeliveryCollector) {
 	// Message on foo.bar is stored under $MQTT.msgs.foo.bar, so the subject has to be
 	// at least as long as the stream subject prefix "$MQTT.msgs.", and after removing
@@ -277,59 +277,17 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// track of pending acks, etc. There is no need to acquire the subsMu RLock
 	// since sess.Lock is overarching for modifying subscriptions.
 	sess.mu.Lock()
-	// A resume-reconciliation subscription holds its consumer's interest before
-	// the CONNACK, so JetStream pushes the session's offline backlog into a
-	// window in which nothing may be transmitted yet. WAIT for the phase to
-	// release it rather than skipping: skipping would stall each until AckWait.
-	// (DUP is not at stake either way: it is the exchange's transmitted state,
-	// issue #76.) The
-	// lock is released while waiting — the releasing goroutine needs it — and
-	// every check below is re-evaluated afterwards. See sess_resume_reconcile.go.
-	if sub.mqtt != nil && sub.mqtt.phaseGate != nil {
-		gate := sub.mqtt.phaseGate
-		if !col.unlockAndFlush(sess) {
-			sess.recordWithheldStopped(col.life, sub, reply)
-			return
-		}
-		timer := time.NewTimer(mqttPhaseGateWaitFor(cc))
-		// The retirement of THIS connection's incarnation cancels the wait, for the
-		// same reason it cancels the transmission gates: this cap is up to 30 seconds,
-		// well past the incarnation drain ceiling, so waiting it out would make a
-		// clean-start takeover refuse for a reason unrelated to the contender. The
-		// re-checks below then take the ordinary withheld path — recorded, not acked —
-		// because sub.mqtt.closed or the ownership term will have moved (issue #40 unit 1).
-		// The callback's own closing cycle, captured at its entry: a close and reopen during the
-		// flush must not leave this wait on the new cycle.
-		if h := mqttTestPhaseGateWaitHook.Get(); h != nil {
-			h(sub)
-		}
-		select {
-		case <-gate:
-		case <-col.life.closing:
-		case <-timer.C:
-		}
-		timer.Stop()
-		if col.life.over() {
-			sess.recordWithheldStopped(col.life, sub, reply)
-			return
-		}
-		sess.mu.Lock()
-	}
 	if sess.c != cc || sub.mqtt == nil || sub.mqtt.closed {
-		// A delivery the phase never released — the wait ran out, or the filter
-		// was reclaimed unadopted — was not transmitted on this attempt. Record it the
-		// way an in-flight-cap withholding is recorded, which lets a freed slot NAK it
-		// forward rather than waiting out AckWait. Its redelivery's DUP flag is its
-		// exchange's transmitted state (issue #76): DUP=0 for a delivery never
-		// attempted, DUP=1 for a resumed exchange that was.
+		// A delivery whose connection detached, or whose subscription was closed, after its
+		// verdict opened was not transmitted on this attempt. Record it the way an
+		// in-flight-cap withholding is recorded, which lets a freed slot NAK it forward
+		// rather than waiting out AckWait. Its redelivery's DUP flag is its exchange's
+		// transmitted state (issue #76).
 		//
 		// WHICH deliveries are still owed is not decided here. The owed-delivery
-		// predicate — and its sess.c == nil arm, which covers a RACE rather than a
-		// state a test can schedule — lives in recordWithheldDeliveryLocked, its
-		// single home, shared with the connection-scoped restore verdict so both
-		// withholdings owe the client the same thing. This arm restated that rule
-		// for its own case and the restatement went stale, which is what a second
-		// home for one fact does.
+		// predicate, including its sess.c == nil arm for a connection that detached while
+		// this callback was dispatching, lives in recordWithheldDeliveryLocked, its single
+		// home, shared with the restore verdict's arm above.
 		if h := mqttTestDeliverySkippedHookV.Load(); h != nil {
 			(*h)(sub, reply)
 		}

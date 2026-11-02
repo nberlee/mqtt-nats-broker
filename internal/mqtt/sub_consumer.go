@@ -558,14 +558,14 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		}
 		// CONNECT restore of an entry the resume reconciliation phase already
 		// verified (or repaired): its delivery subscription was installed CLOSED
-		// and phase-owned, and it is adopted IN PLACE — metadata refreshed and the
-		// gate opened under the same dual-lock write the re-SUBSCRIBE refresh
+		// and phase-owned, and it is adopted IN PLACE — metadata refreshed and
+		// `closed` cleared under the same dual-lock write the re-SUBSCRIBE refresh
 		// uses, on the SAME subscription object. Re-issuing it through processSub
 		// would unsubscribe the old subscription and install a new one, putting a
 		// no-interest gap right back into the flow — the exact stream-forced
-		// inactivity race the phase's subscribe-first rule closes. Deliveries that
-		// arrived while closed were skipped unacked; AckWait redelivers them now.
-		// See sess_resume_reconcile.go.
+		// inactivity race the phase's subscribe-first rule closes. Deliveries pushed
+		// while it was closed wait on the restore verdict, which opens after the
+		// CONNACK, and read the fields below then. See sess_resume_reconcile.go.
 		c.mu.Lock()
 		phaseSub := c.subs[cc.DeliverSubject]
 		c.mu.Unlock()
@@ -580,11 +580,6 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 				phaseSub.mqtt.subID = subID
 				phaseSub.mqtt.closed = false
 				phaseSub.mqtt.phaseOwned = false
-				// Released LAST, in the same critical section: a delivery waiting
-				// on the gate re-reads every field above once it wakes, so the
-				// backlog JetStream pushed before the CONNACK is delivered now, in
-				// order, with this filter's live options. See mqttSub.phaseGate.
-				mqttReleasePhaseGateLocked(phaseSub)
 				adopted = true
 			}
 			sess.subsMu.Unlock()

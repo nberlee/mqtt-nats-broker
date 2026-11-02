@@ -3076,9 +3076,9 @@ Residuals:
     for that connection and repaired at the next one.
   - A re-SUBSCRIBE that adopts a drain whose durable was reaped inherits a
     dead entry until the next CONNECT repairs it.
-  - A backlog delivery that runs out its phase-gate wait (reconciliation
-    slower than the connection's AckWait), or that belongs to a filter the
-    sweep reclaims unadopted, is redelivered rather than delivered in place:
+  - A backlog delivery that runs out its restore-verdict wait (reconciliation
+    slower than min(AckWait, the wait cap)) is redelivered rather than delivered
+    in place:
     it is still marked a first transmission, but it can arrive **after**
     messages that were pushed later. Ordering across a redelivery is not
     preserved — the same residual any AckWait or NAK redelivery carries.
@@ -3089,7 +3089,7 @@ Residuals:
     ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)): DUP=0
     for a delivery never attempted, DUP=1 for one that was or may have been.
   - A backlog large enough to exhaust the NATS client's per-subscription
-    pending-byte limit while deliveries are parked on the phase gate has its
+    pending-byte limit while deliveries are parked on the restore verdict has its
     excess dropped by the client library before the broker sees it. Nothing is
     lost — the messages were never acknowledged, so JetStream redelivers them
     after AckWait, without the prompt NAK, since the broker never got the chance

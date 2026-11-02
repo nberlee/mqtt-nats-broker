@@ -84,8 +84,8 @@ type mqttIncarnationTracker struct {
 	owners   int
 	promoted int
 	// closing is closed by close(): in-route bounded waits (the QoS 1/2
-	// transmission and phase gates) select on it so retirement is never held
-	// behind a 30s gate wait.
+	// transmission gates) select on it so retirement is never held behind a 30s
+	// gate wait.
 	closing chan struct{}
 	// drained is closed when owners-promoted reaches 0 while closing.
 	drained chan struct{}

@@ -420,7 +420,7 @@ func TestF117RestoredFwcBacklogKeepsItsStamp(t *testing.T) {
 	}
 
 	// Installed BEFORE the reconnect: a restored callback captures the done hook at entry,
-	// before waiting on the phase gate, so a watcher installed afterwards could miss it.
+	// before waiting on the restore verdict, so a watcher installed afterwards could miss it.
 	restored := f117Watch(t, id, false)
 	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()

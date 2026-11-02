@@ -4622,20 +4622,18 @@ The pass:
    Installing interest this early means JetStream immediately pushes the
    session's whole **offline backlog** into a window in which nothing may be
    transmitted yet, so a QoS 1/2 delivery arriving there **waits** on the
-   subscription's *phase gate* rather than being dropped: dropping it would
-   hold every queued message until AckWait (30s by default) — turning an
-   immediate resume delivery into a half-minute stall — and then re-send it
-   with DUP set on its **first** transmission to the client. Waiting keeps the
-   backlog first deliveries, in order, at adoption speed. The wait is bounded
-   by the connection's effective **AckWait** (capped by
-   `mqttPhaseGateWaitMax`), which is the deadline past which waiting buys
-   nothing because JetStream re-pushes the message anyway, and which also stops
-   a CONNECT that died without releasing — every ordinary exit releases, so
-   that means a panic — from parking a delivery goroutine. A delivery that does
-   run out its wait, or that belongs to a filter the sweep reclaims unadopted,
-   is **recorded as withheld** exactly as an in-flight-cap deferral is, so a
-   freed slot can NAK it forward instead of waiting out AckWait (its DUP flag is
-   its exchange's transmitted state, never the record's). A re-offer of a
+   connection's restore verdict ("The restore gate" below) rather than being
+   dropped: dropping it would hold every queued message until AckWait (30s by
+   default), turning an immediate resume delivery into a half-minute stall.
+   Waiting keeps the backlog prompt and in order. The verdict is armed before
+   this phase installs anything and opens only after the success CONNACK, by
+   which point every phase subscription has been adopted or swept, so there is
+   no per-subscription gate. The wait is bounded by min(AckWait,
+   `mqttPhaseGateWaitMax`); with AckWait above the cap it can end before any
+   redelivery. A delivery that runs out its wait is **recorded as withheld**
+   exactly as an in-flight-cap deferral is, so the resume can NAK it forward
+   instead of waiting out AckWait (its DUP flag is its exchange's transmitted
+   state, never the record's). A re-offer of a
    sequence that already has an exchange records nothing: the exchange owns its
    replay (see "A withheld marker names an unmapped source" below). Its
    position in the stream's order is not preserved, which is the ordinary
@@ -4700,9 +4698,8 @@ The pass:
    refresh uses. Re-issuing it through `processSub` would unsubscribe the old
    subscription and install a new one, putting a no-interest gap right back
    into the flow — the exact stream-forced inactivity race the subscribe-first
-   rule closes. The phase gate is released last, in the same critical section,
-   so every delivery parked on it wakes, re-reads the fields just written, and
-   goes out under this filter's live options.
+   rule closes. A delivery parked on the verdict reads the fields just written
+   once the verdict opens, and goes out under this filter's live options.
 6. **Sweep what restoration did not adopt.** For a supported record this population is
    empty: restoration runs before the CONNACK
    ([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)) and a filter it
@@ -4712,9 +4709,9 @@ The pass:
    refresh does not clear `closed`. The sweep is retained as the reclaimer of last
    resort — it still runs immediately after `processSubs`, before its error is tested,
    with an idempotent deferred fallback for the exits that never reach it. The phase's
-   own `undo` is unaffected and remains live. Every reclamation path releases the gate
-   **before** unsubscribing, so a parked delivery wakes, finds the subscription still
-   closed, and skips instead of waiting out the bound.
+   own `undo` is unaffected and remains live. A path that removes a subscription whose
+   durable is being deleted disowns it first, so a delivery the abandoned verdict wakes
+   into the removal records nothing.
 
 ## Shared group durables are verified on resume, not assumed
 
@@ -5780,7 +5777,7 @@ The four delivery callbacks, and why they differ:
 
 | Callback | Disposition while the verdict is armed and not opened |
 |---|---|
-| `mqttDeliverMsgCbQoS12` | **waits**, bounded by the same deadline the reconciliation gate uses; a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so a freed slot can NAK it forward; a re-offer of a sequence that already has an exchange records nothing, because that exchange owns its replay ("A withheld marker names an unmapped source"). The recording is shared with the reconciliation phase's own gate through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
+| `mqttDeliverMsgCbQoS12` | **waits**, bounded by min(AckWait, `mqttPhaseGateWaitMax`); a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so a freed slot can NAK it forward; a re-offer of a sequence that already has an exchange records nothing, because that exchange owns its replay ("A withheld marker names an unmapped source"). The recording is shared with the post-verdict re-check arm (a connection that detached, or a subscription closed, after the verdict opened) through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
 | `mqttDeliverMsgCbQoS0` | **drops.** QoS 0 has no redelivery, so parking a NATS delivery goroutine on an MQTT handshake would buy nothing |
 | `mqttDeliverPubRelCb` | **waits**, then disposes by WHY the wait ended. A refusal returns silently, so JetStream redelivers on its own schedule and nothing spins against a session with no client. A TIMEOUT **NAKs**: the bound is min(AckWait, cap), so with AckWait above the cap the wait ends long before any redelivery would, and a PUBREL carries no withheld marker — without the NAK an owed one sits unsent for the rest of that AckWait on a resume that SUCCEEDED. PUBREL carries no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing further is owed |
 | `mqttDeliverQ2AffineCb` | **waits**, then disposes by why the wait ended, exactly as PUBREL does above: silent on a refusal, **NAK** on a timeout. The NAK matters most for a copy that was materialized and never delivered — absent from the resume's pending snapshot, so nothing else re-drives it. No withheld bookkeeping: DUP is the entry's own `transmitted` bit, seeded on resume from the unsent marker ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), so a copy refused here before `trackPublish` writes no marker and its next offer is a first transmission. Waiting is what keeps the ordinary case out of it |
@@ -5814,11 +5811,10 @@ whether a call charged it or reused a resident entry, so refunding by durable
 would erase an earlier connection's charge and leave the accounting permanently
 short.
 
-The reconciliation phase below is independent of the restore gate: its
-`phaseOwned`/`closed`/`phaseGate` triple keeps its own meaning, its
-adoption still clears `closed` and releases its own gate, and
-`sweepUnadoptedPhaseSubs` still keys on `phaseOwned` alone. A delivery that wakes
-from the phase's gate simply meets the connection's verdict next.
+The reconciliation phase below relies on the restore gate to hold its backlog: its
+subscriptions are installed with `closed` and `phaseOwned` set, adoption clears both,
+and `sweepUnadoptedPhaseSubs` keys on `phaseOwned` alone. All of that happens before the
+verdict opens, so no delivery ever meets a phase subscription still being decided.
 
 **Pre-CONNACK abort discipline.** Every post-bind failure exit before a
 confirmed success CONNACK — the register-recovery error, the reconciliation
@@ -9014,9 +9010,9 @@ the retirement owes no wait beyond the synchronous owner's return.
   closing tracker holds nothing and nothing leased waits on it. See "The inbound
   acknowledgement pipeline".
 
-An in-route bounded wait is cancelled by the retirement too. Both QoS 1/2 waits — the
-transmission gates and the phase gate — select on the tracker's per-cycle closing
-signal, because their cap is up to thirty seconds, far past the drain ceiling: a
+An in-route bounded wait is cancelled by the retirement too. The QoS 1/2 transmission-gate
+wait selects on the tracker's per-cycle closing signal, because its cap is up to thirty
+seconds, far past the drain ceiling: a
 delivery admitted just before a takeover would otherwise hold its lease long enough to
 make the takeover refuse, repeatedly, for a reason unrelated to the contender. The
 answer on that arm is the one an armed gate already gives — WITHHELD, recorded without
@@ -10313,8 +10309,8 @@ Every other offer ends the batch: the body's locked decision region has exactly 
 that releases the session lock without flushing the collector (the collect exit;
 `TestDeliveryOfferHasOneUnflushedExit` pins it), every other exit releases it through
 `unlockAndFlush`, the acknowledgement of a declined re-offer is submitted after that
-flush, the transmission gate flushes at the point it decides to wait and on every non-Open
-verdict, and the phase gate flushes before it waits. So before a later offer's callback
+flush, and the transmission gate flushes at the point it decides to wait and on every
+non-Open verdict. So before a later offer's callback
 submits client output, a source acknowledgement or NAK, performs a synchronous JetStream
 request or enters a wait, the deliveries collected ahead of it are admitted and sent.
 Locked bookkeeping may still schedule the existing workers (the disposal worker from
@@ -10484,9 +10480,7 @@ the flush reports whether the lifecycle still lasts, and after a flush that ende
 offer starts no work of its own: not a terminal source's resolution or wake, a drain's
 resolution retry or finalization, a denied re-offer's release, acknowledgement or
 hand-back, a retired source's settlement, a shared QoS 0 offer's expiry or write, a fresh
-offer's expiry or admission, or a phase-gate wait (which also waits on the callback's own
-captured closing channel, so a close and reopen during the flush cannot leave it waiting
-on the new cycle). It still settles what it decided under the lock: a declined offer's
+offer's expiry or admission. It still settles what it decided under the lock: a declined offer's
 acknowledgement, a withheld record. The collector's plain flush does not appear in the
 offer body, and `TestDeliveryOfferStartsNoWorkAfterAStoppingFlush` holds every flush exit
 to this.

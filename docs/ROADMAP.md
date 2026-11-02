@@ -1457,8 +1457,9 @@ them in order where a later lint change depends on an earlier cleanup.
   [#153](https://github.com/nberlee/mqtt-nats-broker/issues/153),
   [#154](https://github.com/nberlee/mqtt-nats-broker/issues/154)).
 
-- [ ] Give two withheld-marker tests an oracle that still discriminates: their only check
-  is DUP, which since issue #76 no longer depends on the marker they guard
+- [x] Give the withheld-marker recordings discriminating tests (the refused-restore test
+  already asserted its marker; the timed-out verdict and a detached delivery now assert
+  theirs) and delete the unreachable per-subscription phase-gate wait. Done 2026-11-02
   ([issue #158](https://github.com/nberlee/mqtt-nats-broker/issues/158)).
 
 - [ ] Decide whether fork repair carries shared-subscription membership now that issue #54

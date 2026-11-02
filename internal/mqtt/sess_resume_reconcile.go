@@ -356,26 +356,10 @@ func classifyRejectedProbe(outcome saveOutcome, detail mqttSessSaveDetail, smsg 
 	}
 }
 
-// mqttReleasePhaseGateLocked releases a phase-installed subscription's delivery
-// gate, waking any QoS 1/2 delivery waiting on it. Idempotent — every release
-// path (adoption, the sweep, the phase's own undo) calls it, and the release
-// must happen exactly once for a channel close to be safe.
-//
-// sess.mu and sess.subsMu must both be held, the same pair that guards `closed`:
-// a waiter re-reads that flag the moment it wakes, so releasing under anything
-// weaker would let it observe a half-written decision.
-func mqttReleasePhaseGateLocked(sub *subscription) {
-	if sub == nil || sub.mqtt == nil || sub.mqtt.phaseGate == nil {
-		return
-	}
-	close(sub.mqtt.phaseGate)
-	sub.mqtt.phaseGate = nil
-}
-
 // disownPhaseSub clears the phase-owned marker, so a QoS 1/2 delivery that
-// wakes on the gate afterwards neither counts as adoptable nor records itself as
-// withheld. Used by the paths that REMOVE a phase subscription; the paths that
-// keep it (an ambiguous refusal) release the gate alone.
+// meets the closed subscription afterwards neither counts as adoptable nor records
+// itself as withheld. Used by the paths that REMOVE a phase subscription whose
+// durable is being deleted.
 //
 // No lock held on entry.
 func (sess *mqttSession) disownPhaseSub(sub *subscription) {
@@ -387,16 +371,6 @@ func (sess *mqttSession) disownPhaseSub(sub *subscription) {
 	if sub.mqtt != nil {
 		sub.mqtt.phaseOwned = false
 	}
-	sess.subsMu.Unlock()
-	sess.mu.Unlock()
-}
-
-// mqttReleasePhaseGate is mqttReleasePhaseGateLocked for a caller holding
-// neither lock.
-func (sess *mqttSession) mqttReleasePhaseGate(sub *subscription) {
-	sess.mu.Lock()
-	sess.subsMu.Lock()
-	mqttReleasePhaseGateLocked(sub)
 	sess.subsMu.Unlock()
 	sess.mu.Unlock()
 }
@@ -446,7 +420,7 @@ func (c *client) mqttAbortAcceptedConnect() {
 // closeConnection on another goroutine before the caller could enqueue a
 // CONNACK, which is what kept this site silent (docs/ROADMAP.md's
 // pre-CONNACK-signal item). Everything else the verdict names — the phase's own
-// undo, its gate releases — has already happened on return.
+// undo — has already happened on return.
 //
 // No lock held on entry.
 func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession, c *client, tok recordTx) mqttResumeReconcileResult {
@@ -528,29 +502,10 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	}
 	var replaced []replacedCons
 
-	// releaseGates wakes every delivery parked on a phase subscription without
-	// removing the subscription itself. The refusal paths that KEEP the phase's
-	// state — an ambiguous save, whose outcome only a readback can settle — still
-	// owe this: a parked delivery would otherwise wait out its whole bound and
-	// then find the session detached, at which point it can no longer record
-	// itself as withheld and its redelivery waits out AckWait instead of being
-	// NAKed forward.
-	releaseGates := func() {
-		for deliver := range installed {
-			c.mu.Lock()
-			sub := c.subs[deliver]
-			c.mu.Unlock()
-			sess.mqttReleasePhaseGate(sub)
-		}
-	}
-
-	// unsubscribePhase removes one phase-installed subscription, releasing its
-	// gate FIRST so a delivery parked on it wakes, re-reads `closed`, and skips
-	// rather than waiting out the bound against a subscription that is going
-	// away.
+	// unsubscribePhase removes one phase-installed subscription.
 	// doomed says this subscription's durable is being deleted (or is already
 	// authoritatively absent), so a withheld marker for it could never
-	// be consumed: disown before opening the gate, and a delivery that wakes
+	// be consumed: disown it first, and a delivery the abandoned verdict wakes
 	// into the removal records nothing. A SURVIVING consumer is the opposite
 	// case — its messages are still owed, so it stays phase-owned and the woken
 	// delivery records itself exactly as the docs promise.
@@ -561,7 +516,6 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		if doomed {
 			sess.disownPhaseSub(sub)
 		}
-		sess.mqttReleasePhaseGate(sub)
 		if uerr := c.processUnsub([]byte(deliver)); uerr != nil {
 			c.Warnf("MQTT: unable to remove a resume-reconciliation delivery subscription on %q: %v", deliver, uerr)
 		}
@@ -618,7 +572,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// the same sess.mu critical section that installs the subscription; the
 	// QoS 1/2 callback checks it at entry under the same lock, so nothing
 	// reaches the client before the CONNACK. A delivery pushed into that window
-	// WAITS on the phase gate instead of being dropped — see mqttSub.phaseGate.
+	// waits on the connection's restore verdict (sess_restore_gate.go), which opens
+	// only after the CONNACK and after restoration adopted or swept this subscription.
 	subscribeClosed := func(e *mqttReconcileEntry, deliver, durable string) error {
 		sess.mu.Lock()
 		sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil, e.filterKey,
@@ -628,11 +583,6 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 			if sub.mqtt != nil {
 				sub.mqtt.closed = true
 				sub.mqtt.phaseOwned = true
-				// The gate every delivery pushed into this window waits on. It is
-				// what keeps the offline backlog prompt and in order instead of
-				// AckWait-delayed; released on adoption, and on every path that
-				// reclaims this subscription instead.
-				sub.mqtt.phaseGate = make(chan struct{})
 			}
 			sess.subsMu.Unlock()
 		}
@@ -737,7 +687,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		sess.mu.Lock()
 		if e.cc != nil {
 			sess.refundConsumerChargeLocked(e.cc.Durable)
-			// A delivery that ran out its gate wait before this durable was found
+			// A delivery that ran out its restore-verdict wait before this durable was found
 			// absent may have recorded a withheld marker against it. That
 			// consumer will never deliver again, so trackPublish can never consume
 			// the marker and resendPendingRedelivery would NAK a dead ack subject
@@ -922,8 +872,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		// path, the periodic uncertain pass, or the next CONNECT — and no traffic is
 		// served meanwhile: no SUCCESS CONNACK is written (the caller's refusal carries
 		// 0x83 and this step's own diagnostic, which opens nothing) and every phase
-		// subscription stays closed.
-		releaseGates()
+		// subscription stays closed. The caller's refusal abandons the restore verdict,
+		// which wakes every delivery parked on it.
 		err := cs.err
 		if cs.contended {
 			// The 10164 route says so, because a rejection whose resolution is
@@ -934,9 +884,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	case mqttPreConnackDisposingNonForked, mqttPreConnackDisposingForked:
 		// The disposal is the CALLER'S, not this phase's: it schedules
 		// closeConnection on another goroutine, so a CONNACK enqueued after it has
-		// lost a race with its own socket close. The phase releases its gates and
-		// reports; mqttProcessConnect aborts, signals, then disposes.
-		releaseGates()
+		// lost a race with its own socket close. The phase reports; mqttProcessConnect
+		// aborts (abandoning the restore verdict), signals, then disposes.
 		return mqttResumeReconcileResult{outcome: cs.outcome, voc: cs.voc, err: cs.err}
 	default: // mqttPreConnackLocal
 		// Nothing was stored and sess.seq is right: undo and refuse.
@@ -1237,14 +1186,9 @@ func (sess *mqttSession) reattemptPendingStore(domainTk, cidHash string, pw *mqt
 }
 
 // sweepUnadoptedPhaseSubs removes every reconciliation-phase subscription that
-// subscription restoration did not adopt. Restoration can legitimately skip a
-// collected filter — it runs before the CONNACK, and a PUBREL setup failure fails a QoS 2
-// filter, a raw-subscription failure continues without reaching
-// processJSConsumer — and the connection stays live, so nothing else would ever
-// remove that subscription: it would sit closed forever, holding consumer
-// interest, and a later re-SUBSCRIBE's metadata refresh does not clear
-// `closed`. Such a filter stays unavailable until the next CONNECT (stated
-// residual: live re-SUBSCRIBE is not a recovery mechanism).
+// subscription restoration did not adopt, so none sits closed holding consumer
+// interest. A filter restoration failed refuses the CONNECT (issue #54), so on a
+// success path this finds nothing to remove; it runs on every exit regardless.
 //
 // Idempotent, and identity-current: only a subscription still carrying the
 // phase-owned marker is removed, so an adopted (or already-swept) one is left
@@ -1270,13 +1214,11 @@ func (sess *mqttSession) sweepUnadoptedPhaseSubs(c *client, delivers []string) {
 		}
 		c.Warnf("MQTT: subscription restoration did not adopt the verified delivery subscription on %q; "+
 			"removing its interest — the filter is unavailable until the next CONNECT", deliver)
-		// The gate opens, but the subscription is NOT disowned: this consumer
-		// SURVIVES — only its interest is being withdrawn — so a delivery parked
-		// on the gate is still owed to the session and must record itself as
-		// withheld, so a freed slot can NAK its redelivery forward rather than leave
-		// it to AckWait. Only a durable that is
+		// NOT disowned: this consumer SURVIVES — only its interest is being
+		// withdrawn — so a delivery parked on the restore verdict is still owed to the
+		// session and must record itself as withheld, so a freed slot can NAK its
+		// redelivery forward rather than leave it to AckWait. Only a durable that is
 		// being deleted is disowned (see unsubscribePhase's doomed argument).
-		sess.mqttReleasePhaseGate(sub)
 		if uerr := c.processUnsub([]byte(deliver)); uerr != nil {
 			c.Warnf("MQTT: unable to remove the unadopted delivery subscription on %q: %v", deliver, uerr)
 		}

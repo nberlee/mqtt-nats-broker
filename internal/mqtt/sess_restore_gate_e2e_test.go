@@ -744,9 +744,11 @@ func TestRefusedRestoreKeepsADurableTheRecordNames(t *testing.T) {
 // records itself as withheld, and the retry that follows receives the
 // message as a FIRST transmission with DUP = 0. No rebind races the callback here.
 //
-// The DUP oracle no longer discriminates the recording: since issue #76 DUP is the entry's
-// transmitted bit, so dropping the withheld recording on the verdict's arm leaves the retry's
-// delivery at DUP = 0.
+// The marker assertion is the oracle: dropping the recordWithheldDelivery call on
+// mqttDeliverQoS12Offer's restore-verdict arm fails it. The retry's DUP = 0 discriminates
+// nothing, since issue #76 makes DUP the entry's transmitted bit (issue #158). This is the
+// refused half of that arm; TestMQTTReconcileTimedOutRestoreVerdictRecordsItsDelivery is the
+// timed-out half.
 func TestRefusedRestoreRecordsItsWithheldDelivery(t *testing.T) {
 	b := testQ2AffSetup(t, "f050drain")
 	id := "f050-drain"

@@ -46,10 +46,10 @@ import (
 //     allowed to transmit" that way.
 //
 // So the fact lives on the session as one atomically-published verdict that
-// every delivery callback consults BEFORE it touches sub.mqtt. The
-// per-subscription phaseGate of the resume reconciliation phase is untouched and
-// keeps its own meaning; a delivery that wakes from that gate then meets this
-// one.
+// every delivery callback consults BEFORE it touches sub.mqtt. It is also what
+// holds the resume reconciliation phase's backlog: the phase installs its
+// subscriptions closed, and every one is adopted or swept before this verdict
+// opens, so there is no per-subscription gate.
 //
 // See docs/ARCHITECTURE.md "The restore gate".
 
@@ -79,15 +79,13 @@ var mqttTestRestoreOpenHookV atomic.Pointer[func()]
 //
 // A waiter whose bound expires instead may legitimately observe opened false
 // while the CONNECT is still working. That is not a stale read — the delivery
-// really has not been allowed out yet — and it is treated as withheld, which is
-// the same disposition the reconciliation phase's own gate timeout takes.
+// really has not been allowed out yet — and it is treated as withheld.
 //
 // resolved is what makes the two terminal transitions safe rather than merely
 // unreachable together. They live on different code paths — one after a confirmed
 // success CONNACK, one on every refusal — and a channel close that runs twice
 // PANICS THE BROKER. Today the paths are exclusive; a CAS is what keeps that from
-// being an invariant a later caller can break silently, and it is the same posture
-// mqttReleasePhaseGateLocked takes with its nil check.
+// being an invariant a later caller can break silently.
 type mqttRestoreGate struct {
 	done     chan struct{}
 	opened   atomic.Bool
@@ -98,10 +96,9 @@ type mqttRestoreGate struct {
 //
 // Called BEFORE the first subscription the CONNECT installs — before the resume
 // reconciliation phase, not merely before subscription restoration. The phase's
-// own subscriptions are installed closed and behind their own gate, so arming
-// this early is defence in depth rather than a behaviour a test can distinguish;
-// what it buys is that no subscription installed anywhere inside the CONNECT can
-// be outside the verdict.
+// own subscriptions are installed closed, and this verdict is the only thing that
+// holds the backlog JetStream pushes into them: no subscription installed anywhere
+// inside the CONNECT can be outside it.
 //
 // UNCONDITIONAL on every accepted CONNECT, including a clean start and a resume
 // whose record names no filters, because an abandoned verdict is deliberately LEFT
@@ -310,10 +307,9 @@ func (sess *mqttSession) refundSharedCharges(fromSubProto bool, charges []mqttSh
 // AckWait. (DUP is not this record's to decide: since issue #76 it is the entry's
 // transmitted bit, [MQTT-3.3.1-1].)
 //
-// One helper for both withholding reasons, deliberately: the reconciliation
-// phase's own gate and this connection's restore verdict owe the client exactly
-// the same thing, and an earlier revision of this change lost the property by
-// recording it in only one of the two places.
+// One helper for both of mqttDeliverQoS12Offer's withholding arms, deliberately: the
+// restore verdict's arm and the post-verdict re-check arm owe the client exactly the
+// same thing.
 //
 // No lock held on entry.
 func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, reply string) {
@@ -373,7 +369,7 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 //     yet: still closed, still owed.
 //
 //   - Everything else is DOOMED, and must record nothing. A phase subscription
-//     whose durable is being deleted is DISOWNED before its gate opens
+//     whose durable is being deleted is DISOWNED before it is removed
 //     (`unsubscribePhase`'s doomed arm), and an ordinary subscription torn down by
 //     an UNSUBSCRIBE, or by a QoS downgrade that STANDS, was never owed this
 //     message at all. Writing a marker for either strands an entry nothing can

@@ -702,8 +702,8 @@ type mqttSession struct {
 
 	// deferred records QoS 1/2 delivery ATTEMPTS that reached a callback and were
 	// withheld, not transmitted: by trackPublish at the effective in-flight cap
-	// (Receive Maximum / MaxAckPending), by the restore or phase gate
-	// (recordWithheldDeliveryLocked), and for a cancelled or abandoned
+	// (Receive Maximum / MaxAckPending), by the restore verdict or a detached or
+	// closed subscription (recordWithheldDeliveryLocked), and for a cancelled or abandoned
 	// registration. Keyed by JS durable + stream sequence; the value is the
 	// latest delivery attempt's JS ack subject, NAK'd to force prompt
 	// redelivery when the client frees a slot (Spec5 [4.9]). A marker records the

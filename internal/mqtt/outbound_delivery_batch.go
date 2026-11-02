@@ -73,10 +73,6 @@ var mqttTestDeliveryOfferHook = new(mqttKnob[func(sub *subscription, reply strin
 // "terminal", "drain-resolve", "drain-finalize", "denied", "retired". Nil in production.
 var mqttTestOfferContinuationHook = new(mqttKnob[func(site string)])
 
-// mqttTestPhaseGateWaitHook runs as an offer is about to wait on its subscription's phase gate,
-// after the lifecycle allowed the wait. Nil in production.
-var mqttTestPhaseGateWaitHook = new(mqttKnob[func(sub *subscription)])
-
 // mqttTestDeliveryCallbackDoneHook runs once as a processing callback returns, after its last
 // flush. Nil in production.
 var mqttTestDeliveryCallbackDoneHook = new(mqttKnob[func(sub *subscription, col *mqttDeliveryCollector)])

@@ -430,9 +430,8 @@ var (
 	// shorten it; the orphan QoS 2 sweep additionally supports an instance-scoped
 	// override, because it is read by a goroutine a test cannot synchronize with.
 	mqttOrphanSweepGrace = newMQTTKnob(5 * time.Minute)
-	// Ceiling on how long a delivery waits for a gate to release its subscription:
-	// the reconciliation phase's per-subscription gate, and the connection-scoped
-	// restore verdict. The bound exists so a CONNECT that dies without releasing —
+	// Ceiling on how long a delivery waits on its transmission gates: the
+	// connection-scoped restore verdict and the subscription-operation gate. The bound exists so a CONNECT that dies without releasing —
 	// every ordinary exit releases, so that means a panic — cannot park a delivery
 	// goroutine indefinitely. A var so tests can shorten it.
 	//
@@ -443,7 +442,7 @@ var (
 	// AckWait above it the wait ends long before any redelivery, which is why a
 	// timed-out wait is a DISTINCT verdict from a refusal and why the two classes
 	// carrying no withheld marker (PUBREL, affine copies) NAK on it rather than
-	// returning. See mqttTransmissionTimedOut and mqttSub.phaseGate.
+	// returning. See mqttTransmissionTimedOut.
 	mqttPhaseGateWaitMax = newMQTTKnob(30 * time.Second)
 )
 

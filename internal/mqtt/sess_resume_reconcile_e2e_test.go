@@ -757,7 +757,7 @@ func TestMQTTReconcileStreamForcedThresholdRefusesAdmission(t *testing.T) {
 // the pre-create hook observes that the flushed delivery subscription already
 // exists when createDurableConsumer is about to run, and captures the
 // subscription OBJECT so the post-restoration state can be proven to be the
-// same object with its gate opened in place (a processSub re-issue installs a
+// same object, adopted in place (a processSub re-issue installs a
 // new object and fails the pointer assertion).
 func TestMQTTReconcileSubscribeBeforeCreateAndInPlaceAdoption(t *testing.T) {
 	t.Parallel()
@@ -836,7 +836,7 @@ func TestMQTTReconcileSubscribeBeforeCreateAndInPlaceAdoption(t *testing.T) {
 	testReconcileQoS1Publish(t, o, topic, []byte("adopted"))
 	testReconcileExpectQoS1(t, c2, r2, topic, []byte("adopted"))
 
-	// ...and it is the SAME subscription object, gate opened in place (M11).
+	// ...and it is the SAME subscription object, adopted in place (M11).
 	ob.client.mu.Lock()
 	live := ob.client.subs[ob.deliver]
 	ob.client.mu.Unlock()
@@ -1146,7 +1146,7 @@ func testReconcileClientGone(t testing.TB, s *Server, cid string) {
 // gated message with its packet identifier.
 func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 	o := testMQTTDefaultOptions()
-	// Longer than the parked window below: a delivery waiting on the phase gate
+	// Longer than the parked window below: a delivery waiting on the restore verdict
 	// still holds a JetStream delivery attempt, so an AckWait shorter than the
 	// park would have the message re-pushed and delivered a second time with DUP
 	// — legal, but it would blur what this test is asserting.
@@ -1206,7 +1206,7 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 
 	unpark()
 	r := testReconcileReadConnAck(t, conn, true)
-	// The delivery pushed while the save was parked WAITED on the phase gate, so it
+	// The delivery pushed while the save was parked WAITED on the restore verdict, so it
 	// arrives now rather than after AckWait, and (never transmitted before) at DUP = 0.
 	pi := testMQTTCheckPubMsgNoAck(t, conn, r, topic, mqttPubQos1, []byte("while-parked"))
 	if pi == 0 {
@@ -2524,24 +2524,19 @@ func TestMQTTReconcileRefusedResumeKeepsSessionLifetime(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// A gated delivery that is never released is still a FIRST transmission
+// An untransmitted delivery records its withheld attempt
 // ---------------------------------------------------------------------------
 
-// Review finding, from before issue #76: a delivery that runs out its phase-gate
-// wait, or whose filter the sweep reclaims unadopted, was skipped with no record
-// that it had never been transmitted — so JetStream's next attempt (delivery
-// count > 1) reached the client with DUP set on what was, for the client, the
-// first send.
+// A backlog delivery whose restore-verdict wait runs out is withheld untransmitted, so
+// mqttDeliverQoS12Offer records its source and the resume can NAK it forward instead of
+// leaving it to AckWait. The oracle is the recording decision itself; DUP=0 discriminates
+// nothing since issue #76 (issue #158). This is the timed-out half of the verdict arm;
+// TestRefusedRestoreRecordsItsWithheldDelivery is the refused half.
 //
-// The skip now records the source the way an in-flight-cap withholding is
-// recorded, so a freed slot can NAK it forward. DUP=0 on the attempt that finally
-// goes out no longer depends on that record: since issue #76 DUP is the entry's
-// transmitted bit. So dropping the sess.deferred record in mqttDeliverMsgCbQoS12
-// is NOT caught here; TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery
-// asserts a marker directly.
-func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
+// Mutation check: drop the recordWithheldDelivery call on the restore-verdict arm and no
+// recording decision is observed.
+func TestMQTTReconcileTimedOutRestoreVerdictRecordsItsDelivery(t *testing.T) {
 	o := testMQTTDefaultOptions()
-	// Short, so the redelivery of the skipped attempt lands inside the test.
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -2555,17 +2550,40 @@ func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 	// A message waiting in the backlog for the resume.
 	testReconcileQoS1Publish(t, o, topic, []byte("backlog"))
 
-	// Hold the phase open past the gate wait: the lookup hook sleeps while the
-	// consumer's delivery is parked on the gate, so the wait expires and the
-	// attempt is skipped — the exact case the finding names.
 	restoreWait := mqttPhaseGateWaitMax.Get()
 	mqttPhaseGateWaitMax.Set(300 * time.Millisecond)
 	defer func() { mqttPhaseGateWaitMax.Set(restoreWait) }()
 
+	// Counted before the arm records, so the mutation leaves this reach signal standing.
+	blocked := make(chan struct{})
+	var blockOnce sync.Once
+	defer setMQTTTestRestoreGateBlocked(func(kind string) {
+		if kind == "qos12" {
+			blockOnce.Do(func() { close(blocked) })
+		}
+	})()
+	recorded := make(chan bool, 1)
+	decided := func(d string, _ uint64, rec bool) {
+		if d == dur {
+			select {
+			case recorded <- rec:
+			default:
+			}
+		}
+	}
+	mqttTestWithheldDecidedV.Store(&decided)
+	defer mqttTestWithheldDecidedV.Store(nil)
+
+	// Hold the reconciliation open until the delivery's verdict wait has run out.
+	var reached atomic.Bool
 	asm := testMQTTGetGlobalASM(t, s)
 	asm.mu.Lock()
 	asm.testResumeReconcileLookup = func(durables []string) ([]*ConsumerInfo, []bool, error) {
-		time.Sleep(900 * time.Millisecond) // longer than the gate wait above
+		select {
+		case <-blocked:
+			reached.Store(true)
+		case <-time.After(3 * time.Second):
+		}
 		infos := make([]*ConsumerInfo, len(durables))
 		oks := make([]bool, len(durables))
 		for i, d := range durables {
@@ -2586,15 +2604,99 @@ func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	if !reached.Load() {
+		t.Fatal("no QoS 1 delivery was withheld by the restore verdict during reconciliation, so this fixture never reached the recording")
+	}
+	select {
+	case rec := <-recorded:
+		if !rec {
+			t.Fatalf("the withheld delivery of %q was not recorded", dur)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("no recording decision for the withheld delivery of %q", dur)
+	}
 
-	// The backlog message arrives on a later JetStream attempt, but it is the
-	// client's FIRST sight of it: DUP must be 0 [MQTT-3.3.1-1].
+	// The client's FIRST sight of the message: DUP must be 0 [MQTT-3.3.1-1].
 	pi := testMQTTCheckPubMsgNoAck(t, c2, r2, topic, mqttPubQos1, []byte("backlog"))
 	if pi == 0 {
 		t.Fatal("delivery carried no packet identifier")
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi)
 	testMQTTFlush(t, c2, nil, r2)
+}
+
+// A delivery whose verdict was open, but whose connection detached before it took the
+// session lock, was not transmitted: the re-check arm of mqttDeliverQoS12Offer sees
+// sess.c != cc and records the attempt, which recordWithheldDeliveryLocked accepts for a
+// detached session (sess.c == nil). Socket teardown leaves sub.mqtt.closed unset.
+//
+// Mutation check: drop the recordWithheldDeliveryLocked call on that arm and no marker is
+// left for the durable.
+func TestMQTTDetachedDeliveryRecordsItsWithheldAttempt(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	const cid, topic, sid = "detach-record", "detach/record", "detach.record"
+	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
+	dur := testReconcileConsDur(t, s, cid, sid)
+	sess := testMQTTResidentSession(t, s, cid)
+
+	parked, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var parkOnce, doneOnce sync.Once
+	var held atomic.Pointer[subscription]
+	defer setMQTTTestDeliveryPreLockHook(func(sub *subscription) {
+		if sub.client == nil || sub.client.mqtt == nil || sub.client.mqtt.sess != sess {
+			return
+		}
+		if !held.CompareAndSwap(nil, sub) {
+			return
+		}
+		parkOnce.Do(func() { close(parked) })
+		<-release
+	})()
+	doneHook := func(sub *subscription) {
+		if held.Load() == sub {
+			doneOnce.Do(func() { close(done) })
+		}
+	}
+	mqttTestDeliveryDoneHookV.Store(&doneHook)
+	defer mqttTestDeliveryDoneHookV.Store(nil)
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	testReconcileQoS1Publish(t, o, topic, []byte("detached"))
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fixture: the delivery never reached the session lock")
+	}
+
+	c.Close()
+	testReconcileClientGone(t, s, cid)
+	checkFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		if sess.c != nil {
+			return errors.New("the session is still attached")
+		}
+		return nil
+	})
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("fixture: the released delivery never returned")
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	for k := range sess.deferred {
+		if k.jsDur == dur {
+			return
+		}
+	}
+	t.Fatalf("the detached delivery left no withheld marker for %q", dur)
 }
 
 // A refused resume must leave the RECORD describing the session's own lifetime,
@@ -2679,9 +2781,7 @@ func TestMQTTReconcileRefusedResumePersistsRestoredLifetime(t *testing.T) {
 // the marker can never be consumed. Every retried repair mints another
 // identity to strand, growing the map for the life of the session.
 //
-// Mutation checks: drop undo's purge (M24) and the marker survives; drop the
-// disown-before-release ordering and a delivery waking into the removal
-// records a fresh one after the purge.
+// Mutation check: drop undo's purge (M24) and the marker survives.
 func TestMQTTReconcileFailedRepairStrandsNoDeferredMarker(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
@@ -2718,14 +2818,13 @@ func TestMQTTReconcileFailedRepairStrandsNoDeferredMarker(t *testing.T) {
 		failed = true
 		// Publish now: the replacement consumer exists and its (closed) delivery
 		// subscription holds the interest, so this message is pushed straight
-		// into the phase gate.
+		// into the restore verdict's wait.
 		go testReconcileQoS1Publish(t, o, topic, []byte("stranded"))
-		// Then hold the repair open LONGER than the phase-gate wait (the AckWait
-		// set above), so that delivery times out and records its
-		// never-transmitted marker against the fresh consumer — the only way a
-		// marker exists for a durable the undo below then deletes. A shorter
-		// pause would leave it parked, and the undo would disown it before it
-		// could record anything.
+		// Then hold the repair open LONGER than that wait (the AckWait set above),
+		// so the delivery times out and records its never-transmitted marker
+		// against the fresh consumer — the only way a marker exists for a durable
+		// the undo below then deletes. A shorter pause would leave it parked, and
+		// the undo would disown its subscription before the refusal woke it.
 		time.Sleep(3 * time.Second)
 		return errors.New("simulated definite repair-save failure")
 	})
@@ -2742,8 +2841,8 @@ func TestMQTTReconcileFailedRepairStrandsNoDeferredMarker(t *testing.T) {
 	restoreSave()
 
 	// No marker may survive for a consumer that no longer exists. Polled: a
-	// delivery woken by the undo's gate release is racing this assertion, and
-	// the point of the disown-before-release ordering is that it cannot add one.
+	// delivery woken by the refusal's verdict abandon is racing this assertion, and
+	// the point of disowning before that wakeup is that it cannot add one.
 	sess := testMQTTResidentSession(t, s, cid)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -3001,7 +3100,7 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 // A delivery gated for a SURVIVING consumer is still recorded as never
 // transmitted when the resume it was gated by is REFUSED.
 //
-// Review finding: disowning every gated subscription before opening its gate is
+// Review finding: disowning every gated subscription before waking its deliveries is
 // right only for a durable that is being deleted. For a verified consumer that
 // survives, the message is still owed, so the woken delivery must record itself as
 // withheld or its eventual redelivery waits out AckWait instead of being NAKed
@@ -3025,7 +3124,7 @@ func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	// Comfortably longer than the wait inside the verification below, so the
-	// delivery parked on the gate is released by the REFUSAL rather than by its own
+	// delivery parked on the restore verdict is released by the REFUSAL rather than by its own
 	// bound — the timeout path records a marker of its own and would mask what this
 	// test is about. It also means the redelivery below can only be prompt if the
 	// marker exists: resendPendingRedelivery NAKs recorded withholdings, while an
@@ -3134,7 +3233,7 @@ func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 // A successful repair leaves no never-transmitted marker naming the durable it
 // retired.
 //
-// Review finding: a delivery that ran out its gate wait while the OLD durable
+// Review finding: a delivery that ran out its restore-verdict wait while the OLD durable
 // was still alive records a marker naming it; the lookup then reports that
 // durable absent and the repair retires it. Nothing can ever consume that
 // marker — the consumer will never deliver again — and resendPendingRedelivery
@@ -3146,7 +3245,7 @@ func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 func TestMQTTReconcileRepairPurgesRetiredDurableMarkers(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = time.Second // also the phase-gate bound
+	o.MQTT.AckWait = time.Second // also the verdict-wait bound
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

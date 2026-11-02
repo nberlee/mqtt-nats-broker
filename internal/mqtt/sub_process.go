@@ -59,20 +59,6 @@ type mqttSub struct {
 	// nothing. Guarded like closed. See sess_resume_reconcile.go.
 	phaseOwned bool
 
-	// phaseGate is closed when the reconciliation phase releases this
-	// subscription — adopted by restoration, or reclaimed by the sweep/undo. A
-	// QoS 1/2 delivery that arrives while it is still open WAITS for it rather
-	// than being skipped: the interest is installed before the CONNACK, so
-	// JetStream pushes the session's whole offline backlog into that window, and
-	// skipping it would hold every one of those messages until AckWait (30s by
-	// default) — turning an immediate resume delivery into a half-minute stall.
-	// Waiting keeps them prompt, in order, at adoption speed.
-	// Bounded by mqttPhaseGateWait so a CONNECT that dies without releasing
-	// cannot park a delivery goroutine; past it the delivery falls back to the
-	// closed-subscription skip and AckWait. nil once released (and on every
-	// subscription the phase did not install). Guarded like closed.
-	phaseGate chan struct{}
-
 	// Pending serialization of retained messages to be sent when subscription
 	// is registered. The sub's delivery callbacks must wait until `prm` is
 	// ready (can block on sess.mu for that, too).

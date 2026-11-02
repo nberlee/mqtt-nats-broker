@@ -12,7 +12,7 @@
 // limitations under the License.
 
 // The account session manager: its state, construction and stream provisioning, the
-// subscription barrier, the phase gate, flapper jailing, the session-record CAS, the orphaned
+// subscription barrier, the transmission-gate wait bound, flapper jailing, the session-record CAS, the orphaned
 // consumer sweep, session locking and registration, and create-or-restore of a session.
 
 package mqtt
@@ -33,11 +33,10 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// mqttPhaseGateWaitFor is how long a delivery waits on a reconciliation phase
-// gate: the connection's effective AckWait, capped at mqttPhaseGateWaitMax.
-// Tying it to AckWait is what keeps the wait from changing the outcome — at
-// that deadline JetStream redelivers regardless, and the skipped attempt is
-// recorded so a freed slot can NAK the redelivery forward.
+// mqttPhaseGateWaitFor is how long a delivery waits on its transmission gates
+// (awaitTransmissionGatesThen): the connection's effective AckWait, capped at
+// mqttPhaseGateWaitMax. A wait that runs out is withheld and recorded, so the
+// redelivery can be NAKed forward rather than left to AckWait.
 func mqttPhaseGateWaitFor(c *client) time.Duration {
 	wait := mqttDefaultAckWait
 	if c != nil && c.srv != nil {
