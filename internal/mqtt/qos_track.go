@@ -132,6 +132,47 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 	return subjects
 }
 
+// recordWithheldAttemptLocked records that an offer of (dur, sseq) reached its callback and
+// was not transmitted, so a freed slot can NAK it forward (deferredNaksLocked) and a resume
+// re-offers it, instead of either waiting out AckWait. It is the ONLY writer of sess.deferred.
+//
+// A MARKER NAMES AN UNMAPPED SOURCE (issue #162). A sequence cpending maps already has an
+// exchange, and that exchange owns its re-offer: every re-offer reaching trackPublish refreshes
+// the entry's own ack subject, and a resume replays it from there. A marker beside it would be
+// NAK'd as withheld work — spending a prompt-release slot a genuinely withheld delivery is
+// owed, and re-offering the exchange early — and the resume would budget it twice. So a mapped
+// sequence is refused here, and mapSourceLocked consumes a marker its mapping overtakes.
+// Unmapped is not "never transmitted": a terminal-held, disposal-held or past-PUBREC source is
+// unmapped too, and its re-offer goes to its owner.
+//
+// The latest subject overwrites an earlier one; JetStream honours a NAK on any delivery of a
+// still-pending sequence, so either would do, and the latest is the attempt it re-offers next.
+//
+// Reports whether a marker was written. Lock held on entry.
+func (sess *mqttSession) recordWithheldAttemptLocked(dur string, sseq uint64, reply string) bool {
+	if dur == _EMPTY_ || sseq == 0 || reply == _EMPTY_ {
+		return false
+	}
+	if pi, _ := sess.cpending.lookup(dur, sseq); pi != 0 {
+		return false
+	}
+	if sess.deferred == nil {
+		sess.deferred = make(map[mqttDeferredKey]string)
+	}
+	sess.deferred[mqttDeferredKey{dur, sseq}] = reply
+	return true
+}
+
+// mapSourceLocked maps (dur, sseq) to pi in cpending, and is the ONLY writer of that map. The
+// mapping gives the sequence an exchange, so a withheld marker recorded before it is consumed
+// here: the exchange owns the re-offer from now on (see recordWithheldAttemptLocked).
+//
+// Lock held on entry.
+func (sess *mqttSession) mapSourceLocked(dur string, sseq uint64, pi uint16) {
+	sess.cpending.put(dur, sseq, pi)
+	delete(sess.deferred, mqttDeferredKey{dur, sseq})
+}
+
 // trackPublishRetained allocates a PI for one QoS 1/2 retained replay item and adds it to
 // pendingPublish as a retained ALLOCATION: no register and no source until the replay
 // driver's admission lands and promotes it. Spec5 [3.3.4].
@@ -298,19 +339,16 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			sess.kickCustodyPassLocked()
 			// At the in-flight cap: withhold the message and remember its ack
 			// subject so a freed slot can NAK it for prompt redelivery
-			// (deferredNaksLocked); AckWait remains the fallback. Overwrite on
-			// re-deferral: JS ignores acks for superseded delivery attempts, so
-			// only the latest subject is NAK-able. Spec5 [4.9].
-			if sess.deferred == nil {
-				sess.deferred = make(map[mqttDeferredKey]string)
-			}
-			sess.deferred[mqttDeferredKey{jsDur, sseq}] = jsAckSubject
+			// (deferredNaksLocked); AckWait remains the fallback. Spec5 [4.9].
+			sess.recordWithheldAttemptLocked(jsDur, sseq, jsAckSubject)
 			return 0, false
 		}
 
 		// A withheld sequence's NAK subject is consumed with the offer that admits it;
 		// the marker says nothing about DUP — the fresh allocation's entry starts
-		// transmitted=false whatever the delivery count says.
+		// transmitted=false whatever the delivery count says. Consumed HERE, ahead of
+		// bumpPI and not at the mapping below: a successful allocation retires the
+		// custody demand only when nothing is left deferred (noteAllocationSucceededLocked).
 		delete(sess.deferred, mqttDeferredKey{jsDur, sseq})
 
 		pi = sess.bumpPI()
@@ -318,7 +356,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			return 0, false
 		}
 
-		sess.cpending.put(jsDur, sseq, pi)
+		sess.mapSourceLocked(jsDur, sseq, pi)
 		isNew = true
 	}
 
@@ -340,6 +378,8 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			return 0, false
 		}
 	} else {
+		// The exchange's own subject is refreshed by its re-offer. No withheld marker can stand
+		// beside a mapped sequence, so there is none to consume here (issue #162).
 		ack.jsAckSubject = jsAckSubject
 		ack.sseq = sseq
 		ack.jsDur = jsDur
@@ -756,7 +796,7 @@ func (sess *mqttSession) retrackPublishLocked(c *client, pi uint16, ack *mqttPen
 	if ack.jsDur == _EMPTY_ {
 		return
 	}
-	sess.cpending.put(ack.jsDur, ack.sseq, pi)
+	sess.mapSourceLocked(ack.jsDur, ack.sseq, pi)
 }
 
 // resendPendingRedelivery re-sends the session's unacknowledged QoS 1/2 PUBLISH
@@ -856,11 +896,12 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// Deferred (withheld) delivery attempts from before the disconnect should
 	// not wait an AckWait either; NAK them here too.
 	//
-	// The entry is NAK'd but KEPT; trackPublish removes it when its new-allocation
-	// branch admits the message, while its existing-exchange branch leaves it in
-	// place (see the prompt-release note in docs/CONFORMANCE.md). It does not
-	// protect DUP: since issue #76 DUP is the entry's transmitted bit, so a first
-	// transmission carries DUP=0 whatever the delivery count.
+	// The entry is NAK'd but KEPT; the offer it produces consumes it when trackPublish's
+	// new-allocation branch admits the message. Every marker names an UNMAPPED source
+	// (recordWithheldAttemptLocked, issue #162), so none of these is also in pubNaks above:
+	// nothing is NAK'd twice or budgeted twice. It does not protect DUP: since issue #76 DUP
+	// is the entry's transmitted bit, so a first transmission carries DUP=0 whatever the
+	// delivery count.
 	deferredNaks := make([]pendingNak, 0, len(sess.deferred))
 	for k, subj := range sess.deferred {
 		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj, k.jsDur})
@@ -1038,6 +1079,19 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 		}
 	}
 	pubNaks = live
+	// So is the deferred set, and against the LIVE markers: a delivery callback can have
+	// allocated a marked sequence while the lock was released, and mapSourceLocked consumed
+	// its marker then. A snapshot surviving that mapping would NAK a sequence that now has an
+	// exchange, from the deferred allowance, and leave a still-withheld one to AckWait (issue
+	// #162). The live subject is taken, which is the latest withheld attempt.
+	liveDeferred := deferredNaks[:0]
+	for _, n := range deferredNaks {
+		if subj, ok := sess.deferred[mqttDeferredKey{n.jsDur, n.sseq}]; ok {
+			n.ackSubject = subj
+			liveDeferred = append(liveDeferred, n)
+		}
+	}
+	deferredNaks = liveDeferred
 	// Everything in flight that is NOT being NAK'd still occupies a slot at the client:
 	// a fresh delivery, a pre-resume entry with no ack subject to NAK, every exchange the
 	// custody ledger charges, and — since issue #102 — an entry this pass reserved because its
@@ -1142,7 +1196,7 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	if jsAckSubject == _EMPTY_ {
 		return
 	}
-	sess.cpending.put(jsDur, sseq, pi)
+	sess.mapSourceLocked(jsDur, sseq, pi)
 }
 
 // Stops a PI from being tracked as a PUBREL.

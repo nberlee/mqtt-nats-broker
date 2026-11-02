@@ -96,7 +96,14 @@ there.
   [issue #75](https://github.com/nberlee/mqtt-nats-broker/issues/75) records a parked
   same-topic ordering violation (see Known deviations) — and the redelivery is a first
   transmission (DUP=0, [MQTT-3.3.1-1]) since the withheld message was never sent. The same
-  NAK path drains deferred deliveries on session resume (`resendPendingRedelivery`). Spec5
+  NAK path drains deferred deliveries on session resume (`resendPendingRedelivery`). A
+  re-offer of a message the client has already been sent is never recorded as withheld,
+  so it never takes a freed slot's NAK from a delivery waiting at the cap: that exchange
+  is resent by the resume's replay, or after a restart or failover, whose rebuilt entry has
+  no ack subject to NAK, at AckWait. A withheld source that is already past its exchange
+  (acknowledged, being disposed of, or past PUBREC) can still take one NAK, whose re-offer
+  goes to that exchange's owner and transmits nothing
+  ([issue #162](https://github.com/nberlee/mqtt-nats-broker/issues/162)). Spec5
   [4.9]. Tests: `TestMQTTv5ReceiveMaximumPromptRelease` /
   `TestMQTTv5ReceiveMaximumPromptReleaseQoS2` (`internal/mqtt/mqtt_v5_test.go`).
 - **Zero-payload JetStream ack/management delivery** (uncovered while fixing
@@ -3414,9 +3421,11 @@ own PUBREL machinery. The membership at QoS 0 and the drain are written in **one
 - **A send already admitted past the delivery barrier is not retracted.** Cancelling the
   not-yet-transmitted allocations at the filter's staging keeps that window from widening
   across the packet; it does not close it.
-- **A withheld marker is not crash-safe.** The evidence that a cancelled or
-  cap-withheld delivery was never transmitted lives in memory, so a process crash loses
-  it and that delivery's eventual first transmission carries DUP=1.
+- **A withheld marker is not crash-safe.** The record that a cancelled or cap-withheld
+  delivery was withheld lives in memory, so a process crash loses it and that delivery is
+  re-offered at AckWait rather than by a freed slot's NAK. Its DUP flag does not depend on
+  the marker: it is the exchange's transmitted bit
+  ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)).
 - **"Transmitted" means what the drain's existing classification means.** Register
   confirmation and actual transmission are not equivalent; the exchanges preserved are
   the ones that classification enrols, and the existing transmission and DUP residuals

@@ -792,9 +792,9 @@ and kept as an archive
 ([issue #136](https://github.com/nberlee/mqtt-nats-broker/issues/136)); the entries moved
 there below are recorded in it.
 
-- [ ] Establish whether a withheld marker left beside an already-transmitted exchange
-  mis-steers the drain's I5 drop, the resume allowance or the prompt NAK
-  ([issue #162](https://github.com/nberlee/mqtt-nats-broker/issues/162)).
+- [x] A withheld marker beside a started exchange took a freed slot's NAK and was
+  budgeted twice at resume (the I5 drop was unaffected); a marker now names only an
+  unmapped source. Fixed 2026-11-02; [issue #162](https://github.com/nberlee/mqtt-nats-broker/issues/162).
 
 - [x] Reproduce and fix a reconnect racing its own DISCONNECT with Session Expiry 0: the
   takeover persists the bound connection's ending override before its resume decision.

@@ -869,7 +869,9 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 		}
 	}
 	// The withheld-attempt markers are dropped, not enrolled (I5): enrolment above came
-	// from the started set, and a marker records only that an attempt was withheld.
+	// from the started set, and a marker records only that an attempt was withheld. A
+	// marker never names an enrolled sequence — markers name unmapped sources
+	// (recordWithheldAttemptLocked, issue #162) — so the drop touches no started exchange.
 	for k := range sess.deferred {
 		if k.jsDur == cc.Durable {
 			delete(sess.deferred, k)
@@ -892,13 +894,9 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	// BEFORE the "nothing staged" return below, not after: when every entry was cancelled
 	// there is no drain to stage, but the marker rule is unchanged.
 	for k, ackSubject := range cancelled {
-		if ackSubject == _EMPTY_ {
-			continue // nothing to NAK, and an empty subject must never reach sendMsg
-		}
-		if sess.deferred == nil {
-			sess.deferred = make(map[mqttDeferredKey]string)
-		}
-		sess.deferred[k] = ackSubject
+		// An empty subject records nothing: there is nothing to NAK, and it must never
+		// reach sendMsg.
+		sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, ackSubject)
 	}
 	if len(d.seqs) == 0 {
 		// Nothing provably started. Same distinction as the empty-mapping return above: if
@@ -1116,13 +1114,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 		// The withheld markers, so a freed slot can NAK a delivery that does eventually go
 		// out forward. Same rule and same reason as staging's.
 		for k, ackSubject := range cancelled {
-			if ackSubject == _EMPTY_ {
-				continue
-			}
-			if sess.deferred == nil {
-				sess.deferred = make(map[mqttDeferredKey]string)
-			}
-			sess.deferred[k] = ackSubject
+			sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, ackSubject)
 		}
 	}
 	return withdrawn
@@ -4137,8 +4129,9 @@ func (conv mqttDowngradeConversion) any() bool {
 //     regression introduced by the conversion rather than an inherited drain behavior.
 //
 // A marker is what lets a freed slot NAK that delivery forward rather than leave it to
-// AckWait (DUP is not its concern: since issue #76 it is the entry's transmitted bit). So the
-// durable's LIVE
+// AckWait (DUP is not its concern: since issue #76 it is the entry's transmitted bit). Every
+// live marker names an unmapped source, and stageDrain maps nothing, so the re-install can
+// never stand beside a sequence the drain enrolled (issue #162). So the durable's LIVE
 // marker set is snapshotted before the call and re-installed after it — the live map,
 // never a descriptor's history, because history is neither complete (the cap case) nor
 // attributable to the converting occurrence (a packet carrying the same filter at 0, then
@@ -4190,10 +4183,7 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 		staged := sess.stageDrain(dd.sid, dd.cc, sub, mqttLicenceOf(c))
 
 		for k, v := range marks {
-			if sess.deferred == nil {
-				sess.deferred = make(map[mqttDeferredKey]string)
-			}
-			sess.deferred[k] = v
+			sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, v)
 		}
 		if !staged {
 			// Nothing provably started, or a held drain owns this sid. The ordinary

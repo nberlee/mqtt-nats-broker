@@ -605,7 +605,7 @@ func (sess *mqttSession) bindActionToPubRelLocked(pi uint16, act *mqttSendAction
 	if !sess.setPendingLocked(mqttPendingPubRelMap, pi, mqttExpectAny(), next) {
 		return false
 	}
-	sess.cpending.put(jsDur, sseq, pi)
+	sess.mapSourceLocked(jsDur, sseq, pi)
 	// issue #95's ordered handoff, now that this exchange's PUBREL-side owner is installed. Its
 	// ownership test passed above, so it cannot refuse here.
 	sess.handOffPublishEntryLocked(pi, act)

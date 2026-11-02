@@ -411,11 +411,18 @@ func (sess *mqttSession) recordWithheldDeliveryLocked(cc *client, sub *subscript
 	if sseq == 0 {
 		return
 	}
-	if sess.deferred == nil {
-		sess.deferred = make(map[mqttDeferredKey]string)
+	// A re-offer of a sequence that already has an exchange is that exchange's to replay, and
+	// records nothing (issue #162): the writer refuses a mapped sequence.
+	recorded := sess.recordWithheldAttemptLocked(sub.mqtt.jsDur, sseq, reply)
+	if h := mqttTestWithheldDecidedV.Load(); h != nil {
+		(*h)(sub.mqtt.jsDur, sseq, recorded)
 	}
-	sess.deferred[mqttDeferredKey{sub.mqtt.jsDur, sseq}] = reply
 }
+
+// mqttTestWithheldDecidedV observes recordWithheldDeliveryLocked's decision for one offer, under
+// sess.mu and after it is made: a test asserting that NOTHING was recorded needs a boundary
+// after the decision, which no earlier hook on the gate's route provides.
+var mqttTestWithheldDecidedV atomic.Pointer[func(dur string, sseq uint64, recorded bool)]
 
 // mqttTestRestoreGateBlockedV counts, per message class, the deliveries the
 // restore verdict blocked. Tests assert the block POSITIVELY: "the client received

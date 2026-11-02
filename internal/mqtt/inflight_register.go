@@ -4654,13 +4654,9 @@ func (sess *mqttSession) cancelPendingRegistrationsLocked(durable string, lic mq
 			continue // not this connection's decision any more (issue #107 7b): the entry stands
 		}
 		out = append(out, mqttRegCancellation{pi: pi, nonce: ack.regNonce, durable: durable, sseq: sseq, reply: ack.registerSourceAckReply()})
-		if ack.jsAckSubject != _EMPTY_ {
-			if sess.deferred == nil {
-				sess.deferred = make(map[mqttDeferredKey]string)
-			}
-			sess.deferred[mqttDeferredKey{durable, sseq}] = ack.jsAckSubject
-		}
+		// Unmapped FIRST: the writer refuses a sequence that still has an exchange (issue #162).
 		sess.cpending.deleteSeq(durable, sseq)
+		sess.recordWithheldAttemptLocked(durable, sseq, ack.jsAckSubject)
 		sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectExactly(ack), mqttNewCancelledHold(ack.regNonce))
 	}
 	return out
@@ -6813,13 +6809,7 @@ func (sess *mqttSession) abandonInflightRegister(lic mqttDestroyLicence, pi uint
 		ackSubject, lic) {
 		return
 	}
-	if ackSubject == _EMPTY_ {
-		return
-	}
-	if sess.deferred == nil {
-		sess.deferred = make(map[mqttDeferredKey]string)
-	}
-	sess.deferred[mqttDeferredKey{jsDur, sseq}] = ackSubject
+	sess.recordWithheldAttemptLocked(jsDur, sseq, ackSubject)
 }
 
 // mqttStagedRelease is a recovery release the resume decided on, held until the resume has
@@ -11516,7 +11506,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		if mqttRefuseSourcelessAtOrdinarySink(dur, sseq) {
 			return
 		}
-		sess.cpending.put(dur, sseq, pi)
+		sess.mapSourceLocked(dur, sseq, pi)
 	}
 	// The install body for a recovered PUBREL, called by the ordinary restore loop below.
 	// The correlated cpending restore is what

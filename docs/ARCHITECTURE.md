@@ -4273,13 +4273,15 @@ about it, and each is load-bearing:
   `sess.deferred` for its durable: it drops every entry and re-installs only the
   cancellations it discovered itself, so a marker whose sequence the earlier cancellation
   already removed — and a marker for a delivery withheld at the in-flight **cap**, which
-  never had a registration at all — would be destroyed. A marker is what makes a later
-  *first* transmission carry DUP=0, so the boundary snapshots the durable's live set
-  before the call and re-installs it after, merging it into the drain's own set so a
-  commit retires it and a rollback keeps it. The **live map** is the source, never a
-  packet descriptor's history: history is neither complete nor attributable to the
-  occurrence that converts, and a marker already consumed is absent from the live map and
-  so cannot be wrongly resurrected.
+  never had a registration at all — would be destroyed. A marker is what lets a freed slot
+  NAK that delivery forward instead of leaving it to AckWait (DUP is the exchange's
+  transmitted bit, not the marker's), and every live marker names an unmapped source, so
+  none of them stands beside a sequence the drain enrols. The boundary snapshots the
+  durable's live set before the call and re-installs it after, merging it into the
+  drain's own set so a commit retires it and a rollback keeps it. The **live map** is
+  the source, never a packet descriptor's history: history is neither complete nor
+  attributable to the occurrence that converts, and a marker already consumed is absent
+  from the live map and so cannot be wrongly resurrected.
 - **A definite save failure un-converts before the rollback enumerates.** The rollback
   discovers the consumers the packet created by walking `sess.cons`, so a converted one
   has left that map; putting it back first is what lets the existing classification see
@@ -4631,11 +4633,13 @@ The pass:
    a CONNECT that died without releasing — every ordinary exit releases, so
    that means a panic — from parking a delivery goroutine. A delivery that does
    run out its wait, or that belongs to a filter the sweep reclaims unadopted,
-   is **recorded as withheld** exactly as an in-flight-cap deferral is, so the
-   attempt that finally goes out is still marked a first transmission
-   ([MQTT-3.3.1-1]) and a freed slot can NAK it forward instead of waiting out
-   AckWait. Its position in the stream's order is not preserved, which is the
-   ordinary consequence of any redelivery and is recorded as a residual.
+   is **recorded as withheld** exactly as an in-flight-cap deferral is, so a
+   freed slot can NAK it forward instead of waiting out AckWait (its DUP flag is
+   its exchange's transmitted state, never the record's). A re-offer of a
+   sequence that already has an exchange records nothing: the exchange owns its
+   replay (see "A withheld marker names an unmapped source" below). Its
+   position in the stream's order is not preserved, which is the ordinary
+   consequence of any redelivery and is recorded as a residual.
    Then one bounded, batched `lookupConsumersMulti` pass resolves every
    collected durable: **present** (the closed subscription holds its interest),
    **absent** (authoritatively gone → repair), or **indeterminate** (a
@@ -5758,7 +5762,7 @@ touches `sub.mqtt`:
   **not cleared**: a delivery arriving after the abandon must still be blocked,
   and the abort helper deliberately leaves `c.mqtt.sess` in place, so `sess.c`
   still names this connection. Waking the waiters is what lets a withheld QoS 1/2
-  delivery record itself as never transmitted instead of waiting out its whole
+  delivery record itself as withheld instead of waiting out its whole
   bound — but that recording is **best-effort across a rebind, deliberately**. The
   marker is scoped to the connection that withheld the delivery, and the refusal
   returns and releases the ownership gate, so a reconnect can bind first and leave
@@ -5776,7 +5780,7 @@ The four delivery callbacks, and why they differ:
 
 | Callback | Disposition while the verdict is armed and not opened |
 |---|---|
-| `mqttDeliverMsgCbQoS12` | **waits**, bounded by the same deadline the reconciliation gate uses; a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so the attempt that finally goes out is a first transmission ([MQTT-3.3.1-1]) and a freed slot can NAK it forward. The recording is shared with the reconciliation phase's own gate through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
+| `mqttDeliverMsgCbQoS12` | **waits**, bounded by the same deadline the reconciliation gate uses; a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so a freed slot can NAK it forward; a re-offer of a sequence that already has an exchange records nothing, because that exchange owns its replay ("A withheld marker names an unmapped source"). The recording is shared with the reconciliation phase's own gate through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
 | `mqttDeliverMsgCbQoS0` | **drops.** QoS 0 has no redelivery, so parking a NATS delivery goroutine on an MQTT handshake would buy nothing |
 | `mqttDeliverPubRelCb` | **waits**, then disposes by WHY the wait ended. A refusal returns silently, so JetStream redelivers on its own schedule and nothing spins against a session with no client. A TIMEOUT **NAKs**: the bound is min(AckWait, cap), so with AckWait above the cap the wait ends long before any redelivery would, and a PUBREL carries no withheld marker — without the NAK an owed one sits unsent for the rest of that AckWait on a resume that SUCCEEDED. PUBREL carries no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing further is owed |
 | `mqttDeliverQ2AffineCb` | **waits**, then disposes by why the wait ended, exactly as PUBREL does above: silent on a refusal, **NAK** on a timeout. The NAK matters most for a copy that was materialized and never delivered — absent from the resume's pending snapshot, so nothing else re-drives it. No withheld bookkeeping: DUP is the entry's own `transmitted` bit, seeded on resume from the unsent marker ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), so a copy refused here before `trackPublish` writes no marker and its next offer is a first transmission. Waiting is what keeps the ordinary case out of it |
@@ -6272,6 +6276,49 @@ reconnect against permanently unclassifiable state. That is accepted deliberatel
 broker cannot tell that case apart from a forged, replayed, unrelated or malformed record,
 and telling a live client to stop reconnecting on evidence that establishes nothing is
 worse. Stated in `docs/CONFORMANCE.md`.
+
+## A withheld marker names an unmapped source
+
+`sess.deferred[(durable, sequence)]` records that an offer reached its delivery callback and
+was not transmitted: withheld at the in-flight cap, by the restore or reconciliation gate,
+by a refused or stopped delivery lease, or left by a cancelled or abandoned registration.
+A freed slot NAKs the marked sequences in stream order (`deferredNaksLocked`, at most the
+capacity freed), and a resume NAKs them after its replay (`resendPendingRedelivery`), so
+the delivery is re-offered at once instead of after AckWait. It is in memory only, and it
+says nothing about DUP, which is the exchange's transmitted bit
+([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)).
+
+**The rule: a marker never names a sequence `cpending` maps**
+([issue #162](https://github.com/nberlee/mqtt-nats-broker/issues/162)). A mapped sequence
+already has an exchange, and that exchange owns its re-offer: every re-offer reaching
+`trackPublish` refreshes the entry's own ack subject, and a resume replays the entry from
+there. A marker beside it was NAK'd as withheld work, taking a freed slot's NAK from a
+delivery genuinely waiting for it and re-offering the exchange early (on MQTT 3.1.1 a
+same-connection resend; on 5.0 refused by the resend rule), and a resume budgeted it once
+as a replay and again as new work. JetStream honours a NAK on any delivery attempt of a
+still-pending sequence, not only the latest, so a superseded attempt's subject still
+re-offers.
+
+The rule is enforced where the two maps change, not at the readers:
+
+- **One writer**, `recordWithheldAttemptLocked`, refuses a mapped sequence. Every recorder
+  goes through it; a cancellation unmaps its sequence before recording.
+- **One mapper**, `mapSourceLocked`, is the only `cpending.put` and consumes the sequence's
+  marker. A marker recorded while recovery had not yet mapped the sequence is consumed when
+  it does. `trackPublish`'s new allocation also consumes it ahead of the allocator, because
+  a successful allocation retires the custody demand only when nothing is left deferred.
+
+So the readers (the freed-slot NAK, the resume's deferred NAKs and its allowance,
+`stageDrain`'s I5 drop and the conversion's re-install, and the custody demand latch) see
+only unmapped sources. The resume reads its deferred set twice, because its stream lookups
+release the lock: it selects what to NAK from the markers still standing under its final
+budget lock, so a sequence a delivery callback allocated in that gap is not NAK'd from the
+deferred allowance. As for its replay NAKs, the accounting is coherent at that lock, not
+through the sends that follow it. Unmapped is not "never transmitted": a terminal-held, disposal-held
+or past-PUBREC source is unmapped too, and its marker's NAK re-offers it to its owner, which
+keeps the fresh reply or declines it. A re-offer of a mapped exchange that a gate withholds
+is replayed by the resume when its entry carries an ack subject; an entry rebuilt from its
+register after a restart or a failover has none, and its re-offer waits for AckWait.
 
 ## Outbound in-flight registers
 

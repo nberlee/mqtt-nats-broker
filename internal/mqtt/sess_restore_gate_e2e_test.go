@@ -1757,3 +1757,155 @@ func TestGateTimeoutNaksAnUndeliveredAffineCopy(t *testing.T) {
 		t.Fatal("the undelivered affine copy waited out AckWait instead of being re-driven")
 	}
 }
+
+// A re-offer of an exchange the client has ALREADY been sent, withheld by the restore gate,
+// records no withheld marker (issue #162): the sequence is mapped, and the exchange owns its
+// replay. Before the fix it recorded one beside the mapped exchange, which a freed slot then
+// NAK'd as withheld work and a resume budgeted twice.
+//
+// The re-offer here is the durable re-pushing a NAK'd pending sequence as soon as the
+// restoration reinstalls interest, which is what parks it at the gate before the injected
+// failure refuses the restore. The decision hook fires under sess.mu after the writer has
+// decided, so the absence asserted below is a fact and not a race against the recording.
+func TestRestoreGateWithheldReofferOfAStartedExchangeRecordsNoMarker(t *testing.T) {
+	b := testQ2AffSetup(t, "f162start")
+	id := "f162-start"
+	const topic, sid = "f162start/plain", "f162start.plain"
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, b.o.MQTT.Host, b.o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	if codes := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1}}); len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("SUBACK = %v, want [1]", codes)
+	}
+	testMQTTFlush(t, c, nil, r)
+	b.bind(t, id)
+	sess := testMQTTResidentSession(t, b.s, id)
+	sess.mu.Lock()
+	cc0 := sess.cons[sid]
+	if cc0 == nil {
+		sess.mu.Unlock()
+		t.Fatalf("no consumer entry for %q", sid)
+	}
+	dur := cc0.Durable
+	sess.mu.Unlock()
+
+	// The exchange is STARTED: the client receives the PUBLISH and never acknowledges it.
+	cp, rp := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "f162start-pub", cleanStart: true}, b.o.MQTT.Host, b.o.MQTT.Port)
+	defer cp.Close()
+	testMQTTReadConnAckV5(t, rp)
+	testMQTTPublishV5(t, cp, 1, 1, topic, []byte("started"))
+	testMQTTReadPubAckV5(t, rp, 1)
+	testRestoreAwaitPublishDUP(t, r, "started", false)
+
+	var sseq uint64
+	var reply string
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		for _, p := range sess.pendingPublish {
+			if p.jsDur == dur && p.jsAckSubject != _EMPTY_ {
+				sseq, reply = p.sseq, p.jsAckSubject
+				return nil
+			}
+		}
+		return fmt.Errorf("no tracked exchange on %q", dur)
+	})
+	c.Close()
+	// The sequence is re-offered the moment interest returns, as AckWait expiry would.
+	sess.jsa.sendMsg(reply, AckNak)
+
+	type decision struct{ recorded bool }
+	decided := make(chan decision, 8)
+	h := func(d string, s uint64, recorded bool) {
+		if d == dur && s == sseq {
+			select {
+			case decided <- decision{recorded}:
+			default:
+			}
+		}
+	}
+	mqttTestWithheldDecidedV.Store(&h)
+	defer mqttTestWithheldDecidedV.Store(nil)
+
+	parked := make(chan struct{})
+	var parkOnce sync.Once
+	aboutToWait := func(s *mqttSession) {
+		if s.id == id {
+			parkOnce.Do(func() { close(parked) })
+		}
+	}
+	mqttTestGateAboutToWaitV.Store(&aboutToWait)
+	defer mqttTestGateAboutToWaitV.Store(nil)
+	var sawParked atomic.Bool
+	b.asm.mu.Lock()
+	prevFail := b.asm.testRestoreFilterFail
+	b.asm.testRestoreFilterFail = func(gotExit, _ string) error {
+		if gotExit != "consumer" {
+			return nil
+		}
+		select {
+		case <-parked:
+			sawParked.Store(true)
+		case <-time.After(10 * time.Second):
+		}
+		return errRestoreExitInjected
+	}
+	b.asm.mu.Unlock()
+	defer func() {
+		b.asm.mu.Lock()
+		b.asm.testRestoreFilterFail = prevFail
+		b.asm.mu.Unlock()
+	}()
+
+	cc, rr := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, b.o.MQTT.Host, b.o.MQTT.Port)
+	if _, reason, _ := testMQTTReadConnAckV5(t, rr); reason != mqttReasonImplementationSpecificError {
+		t.Fatalf("CONNACK reason = 0x%x, want the refusal", reason)
+	}
+	if !sawParked.Load() {
+		t.Fatal("no delivery was parked at the restore gate before the restore failed")
+	}
+	cc.Close()
+
+	select {
+	case d := <-decided:
+		if d.recorded {
+			t.Fatalf("the gate recorded a withheld marker for the started exchange %s/%d", dur, sseq)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the gate never decided the started exchange's re-offer; this fixture never reached the writer")
+	}
+	sess.mu.Lock()
+	pi, _ := sess.cpending.lookup(dur, sseq)
+	_, marked := sess.deferred[mqttDeferredKey{dur, sseq}]
+	sess.mu.Unlock()
+	if pi == 0 {
+		t.Fatal("the started exchange is no longer mapped, so the refusal above proves nothing")
+	}
+	if marked {
+		t.Fatal("a withheld marker stands beside the mapped started exchange")
+	}
+
+	// The exchange is still owed, and the successful resume replays it as a resend.
+	b.asm.mu.Lock()
+	b.asm.testRestoreFilterFail = nil
+	b.asm.mu.Unlock()
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{
+		clientID:   id,
+		cleanStart: false,
+		props:      mqttV5ConnPropsSessionExpiry(300),
+	}, b.o.MQTT.Host, b.o.MQTT.Port)
+	defer c2.Close()
+	if _, reason, _ := testMQTTReadConnAckV5(t, r2); reason != 0 {
+		t.Fatalf("the retry's CONNACK reason = 0x%x, want 0", reason)
+	}
+	got := testRestoreAwaitPublishDUP(t, r2, "started", true)
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, got)
+}
