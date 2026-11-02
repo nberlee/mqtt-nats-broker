@@ -201,7 +201,7 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
-The pinned dependency is **nats-server v2.15.2**, with `nats.go` 1.54.0. This is the
+The pinned dependency is **nats-server v2.15.2**, with `nats.go` 1.55.0. This is the
 *pin*, the version CI builds and tests against, and it is a different statement from the
 deployment floor above, which is **2.15.2** on every JetStream peer; the two name the same
 release. The pin carries the fix to the upstream `CONSUMER.CREATE` versus `CONSUMER.LIST`

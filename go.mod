@@ -8,10 +8,10 @@ require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/nats-io/jwt/v2 v2.8.2
 	github.com/nats-io/nats-server/v2 v2.15.2
-	github.com/nats-io/nats.go v1.54.0
+	github.com/nats-io/nats.go v1.55.0
 	github.com/nats-io/nkeys v0.4.16
 	github.com/nats-io/nuid v1.0.1
-	github.com/yuin/goldmark v1.8.6
+	github.com/yuin/goldmark v1.8.7
 	gopkg.in/yaml.v3 v3.0.1
 )
 
