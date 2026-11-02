@@ -35,8 +35,9 @@
 //	    removing and acking the source claim.
 //	I3  an entry exists in the record iff its durable must survive; the durable is
 //	    deleted only after the save that removed the entry.
-//	I5  only a delivery that was actually TRANSMITTED is drained. Sequences withheld
-//	    by the in-flight cap were never sent, so they are discarded, not drained.
+//	I5  only a delivery that was actually TRANSMITTED is drained: enrolment comes from
+//	    the started set (cpending). Withheld-attempt markers are dropped, not drained;
+//	    a marker records that an attempt was withheld, not the exchange's history.
 //	I7  single ownership. From the moment a drain is staged its ConsumerConfig lives
 //	    exclusively in sess.drains and its cons[sid] entry is gone, so nothing can
 //	    reach a drained consumer through cons — which would otherwise create a
@@ -374,9 +375,10 @@ type mqttDrain struct {
 	retired bool
 
 	// cancelled names the WITHHELD MARKERS this staging owns, keyed by sequence. A ROLLBACK
-	// keeps them, so a later first transmission still carries DUP=0; a COMMIT drops them,
-	// because the staging they were protecting is settled and no first transmission of
-	// theirs remains to protect. Staging state only, never persisted.
+	// keeps them, so a freed slot can still NAK those deliveries forward; a COMMIT drops
+	// them, because the staging they served is settled. That ends the prompt-NAK
+	// bookkeeping only: a committed drain keeps its consumer, which may still re-offer
+	// those sequences (see commitDrains). Staging state only, never persisted.
 	//
 	// "the sequences whose registration this staging cancelled" is what this said, and it
 	// is too narrow now: a QoS 0 downgrade's conversion transfers the durable's live marker
@@ -627,8 +629,8 @@ func mqttDrainFilterSubject(cc *ConsumerConfig) string {
 // and only when it still holds started deliveries.
 //
 // It moves cons[sid] into drains[sid] (I7), registers drainByDur so the delivery
-// callback can find it, and drops this durable's withheld (never transmitted)
-// deliveries, which are discarded rather than drained (I5). It does NOT mark the
+// callback can find it, and drops this durable's withheld-attempt markers, which are
+// not drained (I5). It does NOT mark the
 // subscription closed, does NOT purge pendingPublish/cpending, and does NOT delete
 // the durable — that is the whole point.
 //
@@ -803,15 +805,15 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			// nothing on this side remembers. (The consumer itself may SURVIVE, as a drain
 			// keeping its durable; what ends either way is this membership's claim on the
 			// delivery.) Removing the entry hands the decision to
-			// that callback's own ownership revalidation: confirmInflightRegister finds no
-			// entry, deletes the register it just wrote and refuses the send.
+			// that callback's own ownership revalidation: confirmInflightRegister finds the
+			// allocation cancelled, refuses the send, and disposes of the register by what
+			// landed (see its cancelled arm).
 			//
-			// It is also recorded as WITHHELD, below, which keeps the DUP flag honest if
-			// this staging is rolled back: nothing was transmitted, so the eventual first
-			// transmission must carry DUP=0 ([MQTT-3.3.1-1]) — but its redelivery arrives
-			// with a JetStream delivery count above one, and trackPublish derives dup from
-			// that count unless the sequence is known to have been withheld. Exactly the
-			// state, and the marker, that a delivery withheld at the in-flight cap has.
+			// It is also recorded as WITHHELD, below, so that if this staging is rolled back
+			// a freed slot can NAK the redelivery forward instead of waiting out AckWait —
+			// exactly the state, and the marker, that a delivery withheld at the in-flight cap
+			// has. Its eventual first transmission carries DUP=0 regardless: since issue #76
+			// DUP is the entry's own transmitted bit, never the delivery count.
 			cancelled[mqttDeferredKey{cc.Durable, sseq}] = ack.jsAckSubject
 			// The cancellation is recorded DURABLY too, keyed by the allocation's nonce.
 			// The handoff above is in-memory only, and this packet is about to persist the
@@ -866,8 +868,8 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			d.seqs[sseq].regSeq = ack.regSeq
 		}
 	}
-	// Withheld deliveries were never transmitted, so [MQTT-3.10.4-3] does not
-	// cover them: drop them rather than enrolling them as started (I5).
+	// The withheld-attempt markers are dropped, not enrolled (I5): enrolment above came
+	// from the started set, and a marker records only that an attempt was withheld.
 	for k := range sess.deferred {
 		if k.jsDur == cc.Durable {
 			delete(sess.deferred, k)
@@ -875,8 +877,9 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	}
 	// The cancelled registrations go in AFTER that drop, which is why they were collected
 	// rather than recorded in place. They are withheld in exactly the I5 sense — never
-	// transmitted — and the marker is what makes their eventual first transmission carry
-	// DUP=0 if this staging is rolled back.
+	// transmitted — and the marker is what lets a freed slot NAK them forward if this
+	// staging is rolled back. (Their first transmission carries DUP=0 either way: since
+	// issue #76 DUP is the entry's transmitted bit.)
 	//
 	// A CALLER may own further live markers this drop also removed and this loop cannot
 	// rediscover — one cancelled before the call, or one for a delivery withheld at the
@@ -884,10 +887,10 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	// and convertDowngradeCandidatesLocked does it by snapshotting the durable's live set
 	// around this whole call. A COMMITTED teardown drops them again, in
 	// commitDrains for a staged drain and in purgeConsumerPendingLocked otherwise, because
-	// the staging is settled and the marker has no first transmission left to protect.
+	// the staging is settled and the marker has nothing left to NAK forward.
 	//
 	// BEFORE the "nothing staged" return below, not after: when every entry was cancelled
-	// there is no drain to stage, but the DUP rule is unchanged.
+	// there is no drain to stage, but the marker rule is unchanged.
 	for k, ackSubject := range cancelled {
 		if ackSubject == _EMPTY_ {
 			continue // nothing to NAK, and an empty subject must never reach sendMsg
@@ -1110,8 +1113,8 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 				}
 			}
 		}
-		// The withheld markers, so a first transmission that does eventually happen still
-		// carries DUP=0. Same rule and same reason as staging's.
+		// The withheld markers, so a freed slot can NAK a delivery that does eventually go
+		// out forward. Same rule and same reason as staging's.
 		for k, ackSubject := range cancelled {
 			if ackSubject == _EMPTY_ {
 				continue
@@ -1187,8 +1190,8 @@ func (sess *mqttSession) commitDrains() (withdrawn []mqttVoidedReg) {
 		// verdicts naming them are durable in this packet's record (N-7.7).
 		withdrawn = append(withdrawn, d.withdrawn...)
 		d.withdrawn = nil
-		// The teardown is committed, so the staging these markers protect is settled and
-		// they have no first transmission left to protect; they would otherwise linger. Only
+		// The teardown is committed, so the staging these markers serve is settled and
+		// they have nothing left to NAK forward; they would otherwise linger. Only
 		// a rollback keeps them.
 		//
 		// Deliberately NOT "the consumer is gone and nothing will re-offer them": this drain
@@ -1824,8 +1827,8 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 				"more than one in-flight register names it, so none may be released", sseq, sess.id)
 			return true
 		case pi == 0:
-			// No identifier, so no register was ever written (R6: a retained send has no
-			// JetStream backing at all). Nothing to release, and nothing to withhold for.
+			// No identifier was allocated for this delivery, so no register was ever written
+			// for it. Nothing to release, and nothing to withhold for.
 		case pastPubRec:
 			// §10.5: a past-PUBREC exchange's register is the owner slot and is NOT
 			// released here. The phase gate independently refuses its deletion in every
@@ -4124,7 +4127,7 @@ func (conv mqttDowngradeConversion) any() bool {
 //
 // THE WITHHELD MARKERS ARE TRANSFERRED AROUND stageDrain, and that is the subtle part.
 // stageDrain owns sess.deferred for its durable: it drops every entry (I5 — a withheld
-// delivery was never transmitted, so it is not drained) and re-installs only the
+// marker is not drained) and re-installs only the
 // cancellations it discovered itself in cpending. Two kinds of live marker are therefore
 // invisible to it and would be destroyed:
 //
@@ -4133,8 +4136,9 @@ func (conv mqttDowngradeConversion) any() bool {
 //     all. HEAD's downgrade teardown performs no I5 drop, so losing this one would be a
 //     regression introduced by the conversion rather than an inherited drain behavior.
 //
-// A marker is what makes a later FIRST transmission carry DUP=0 ([MQTT-3.3.1-1]), since
-// trackPublish otherwise derives dup from JetStream's delivery count. So the durable's LIVE
+// A marker is what lets a freed slot NAK that delivery forward rather than leave it to
+// AckWait (DUP is not its concern: since issue #76 it is the entry's transmitted bit). So the
+// durable's LIVE
 // marker set is snapshotted before the call and re-installed after it — the live map,
 // never a descriptor's history, because history is neither complete (the cap case) nor
 // attributable to the converting occurrence (a packet carrying the same filter at 0, then
@@ -4224,7 +4228,7 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 		}
 		// The drain now OWNS the markers, which is what retires them: commitDrains drops
 		// them once the staging is settled, and a rollback leaves them standing because
-		// the first transmission they protect is still owed.
+		// the delivery they mark is still owed.
 		if d.cancelled == nil {
 			d.cancelled = make(map[mqttDeferredKey]string, len(marks))
 		}

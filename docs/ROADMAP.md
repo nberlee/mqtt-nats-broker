@@ -792,6 +792,10 @@ and kept as an archive
 ([issue #136](https://github.com/nberlee/mqtt-nats-broker/issues/136)); the entries moved
 there below are recorded in it.
 
+- [ ] Establish whether a withheld marker left beside an already-transmitted exchange
+  mis-steers the drain's I5 drop, the resume allowance or the prompt NAK
+  ([issue #162](https://github.com/nberlee/mqtt-nats-broker/issues/162)).
+
 - [x] Reproduce and fix a reconnect racing its own DISCONNECT with Session Expiry 0: the
   takeover persists the bound connection's ending override before its resume decision.
   Fixed 2026-10-14; [issue #44](https://github.com/nberlee/mqtt-nats-broker/issues/44).
@@ -1444,16 +1448,28 @@ them in order where a later lint change depends on an earlier cleanup.
 - [x] Delete `-consumer-replicas`: consumers on the interest-retention streams inherit the
   stream's replica count, and the flag now fails startup as undefined. Done 2026-10-25.
 
-- [ ] Correct the code comments the dead-text cut found stale: the deleted CONNECT-accept
-  rollback ([issue #147](https://github.com/nberlee/mqtt-nats-broker/issues/147)), the
-  pre-register retained send ([issue #149](https://github.com/nberlee/mqtt-nats-broker/issues/149),
-  [issue #150](https://github.com/nberlee/mqtt-nats-broker/issues/150)), the removed
-  retained flush ([issue #152](https://github.com/nberlee/mqtt-nats-broker/issues/152)),
-  two contradicted claims ([issue #153](https://github.com/nberlee/mqtt-nats-broker/issues/153))
-  and claims stale beyond their pointer
-  ([issue #154](https://github.com/nberlee/mqtt-nats-broker/issues/154)). Comment-only,
-  except that #154's unstated retained-identifier residual is either stated in
-  `docs/CONFORMANCE.md` or dropped.
+- [x] Correct the code comments the dead-text cut found stale, by semantic family; #154's
+  retained-identifier residual dropped (no population reaches it). Done 2026-11-02
+  ([#147](https://github.com/nberlee/mqtt-nats-broker/issues/147),
+  [#149](https://github.com/nberlee/mqtt-nats-broker/issues/149),
+  [#150](https://github.com/nberlee/mqtt-nats-broker/issues/150),
+  [#152](https://github.com/nberlee/mqtt-nats-broker/issues/152),
+  [#153](https://github.com/nberlee/mqtt-nats-broker/issues/153),
+  [#154](https://github.com/nberlee/mqtt-nats-broker/issues/154)).
+
+- [ ] Give two withheld-marker tests an oracle that still discriminates: their only check
+  is DUP, which since issue #76 no longer depends on the marker they guard
+  ([issue #158](https://github.com/nberlee/mqtt-nats-broker/issues/158)).
+
+- [ ] Decide whether fork repair carries shared-subscription membership now that issue #54
+  refuses the CONNECT its exclusion was about
+  ([issue #159](https://github.com/nberlee/mqtt-nats-broker/issues/159)).
+
+- [ ] Cover `commitUnsub` releasing under the wrong record token
+  ([issue #160](https://github.com/nberlee/mqtt-nats-broker/issues/160)).
+
+- [ ] Correct the code comments that name identifiers which no longer exist
+  ([issue #161](https://github.com/nberlee/mqtt-nats-broker/issues/161)).
 
 ### Performance and resource audits
 

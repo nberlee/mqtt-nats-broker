@@ -488,9 +488,9 @@ func TestMQTTLeasedHandlerRefusalDoesNotWriteTheFreshIncarnation(t *testing.T) {
 		called++
 	}, true)
 
-	// CLOSING: the delivery is refused, and the withheld record IS owed — it keeps the
-	// eventual redelivery a first transmission for DUP purposes, and it lands on the
-	// retiring object, which the destroy then nils.
+	// CLOSING: the delivery is refused, and the withheld record IS owed — it lets a freed
+	// slot NAK the redelivery forward, and it lands on the retiring object, which the
+	// destroy then nils.
 	e.sess.leases.close()
 	h(sub, e.c, nil, "topic", reply, nil)
 	if called != 0 {

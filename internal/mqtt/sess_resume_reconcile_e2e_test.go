@@ -1206,8 +1206,8 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 
 	unpark()
 	r := testReconcileReadConnAck(t, conn, true)
-	// The delivery pushed while the save was parked WAITED on the phase gate, so
-	// it arrives as the first transmission it is — not a DUP after AckWait.
+	// The delivery pushed while the save was parked WAITED on the phase gate, so it
+	// arrives now rather than after AckWait, and (never transmitted before) at DUP = 0.
 	pi := testMQTTCheckPubMsgNoAck(t, conn, r, topic, mqttPubQos1, []byte("while-parked"))
 	if pi == 0 {
 		t.Fatal("delivery carried no packet identifier")
@@ -2527,17 +2527,18 @@ func TestMQTTReconcileRefusedResumeKeepsSessionLifetime(t *testing.T) {
 // A gated delivery that is never released is still a FIRST transmission
 // ---------------------------------------------------------------------------
 
-// Review finding: a delivery that runs out its phase-gate wait, or whose filter
-// the sweep reclaims unadopted, was skipped with no record that it had never
-// been transmitted — so JetStream's next attempt (delivery count > 1) reached
-// the client with DUP set on what was, for the client, the first send.
+// Review finding, from before issue #76: a delivery that runs out its phase-gate
+// wait, or whose filter the sweep reclaims unadopted, was skipped with no record
+// that it had never been transmitted — so JetStream's next attempt (delivery
+// count > 1) reached the client with DUP set on what was, for the client, the
+// first send.
 //
 // The skip now records the source the way an in-flight-cap withholding is
-// recorded, which is exactly what makes trackPublish clear DUP on the attempt
-// that finally goes out.
-//
-// Mutation check: drop the sess.deferred record in mqttDeliverMsgCbQoS12 and
-// the redelivery arrives with DUP set, failing this test.
+// recorded, so a freed slot can NAK it forward. DUP=0 on the attempt that finally
+// goes out no longer depends on that record: since issue #76 DUP is the entry's
+// transmitted bit. So dropping the sess.deferred record in mqttDeliverMsgCbQoS12
+// is NOT caught here; TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery
+// asserts a marker directly.
 func TestMQTTReconcileUnreleasedGatedDeliveryIsFirstTransmission(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	// Short, so the redelivery of the skipped attempt lands inside the test.
@@ -2669,11 +2670,11 @@ func TestMQTTReconcileRefusedResumePersistsRestoredLifetime(t *testing.T) {
 	testReconcileExpectQoS1(t, c3, r3, topic, []byte("still here"))
 }
 
-// A repair that FAILS must leave no never-transmitted marker behind for the
+// A repair that FAILS must leave no withheld marker behind for the
 // consumer it deleted.
 //
 // Review finding: a gated backlog delivery records itself in sess.deferred so
-// its eventual redelivery is not marked DUP. If the repair then fails, undo
+// a freed slot can NAK its redelivery forward. If the repair then fails, undo
 // deletes that fresh consumer — and nothing will ever deliver on it again, so
 // the marker can never be consumed. Every retried repair mints another
 // identity to strand, growing the map for the life of the session.
@@ -3002,9 +3003,9 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 //
 // Review finding: disowning every gated subscription before opening its gate is
 // right only for a durable that is being deleted. For a verified consumer that
-// survives, the message is still owed, so the woken delivery must record itself or
-// its eventual redelivery reaches the client marked DUP on first sight —
-// contradicting [MQTT-3.3.1-1].
+// survives, the message is still owed, so the woken delivery must record itself as
+// withheld or its eventual redelivery waits out AckWait instead of being NAKed
+// forward.
 //
 // **Re-aimed by issue #54**, which moved that property from the swept-but-accepted
 // connection to the REFUSED one. The lever is unchanged (a PUBREL setup the budget
@@ -3016,8 +3017,8 @@ func TestMQTTReconcileContendedRetryExhaustionClassifiesForeign(t *testing.T) {
 // phase's own undo — so a recording rule that did not discriminate would either
 // lose this marker or strand one for a durable the undo deleted.
 //
-// Mutation checks: drop the withheld recording on the verdict's arm and the
-// redelivery below arrives with DUP set; record unconditionally (ignoring the
+// Mutation checks: drop the withheld recording on the verdict's arm and the marker
+// assertion below fails; record unconditionally (ignoring the
 // owed-delivery predicate) and TestMQTTReconcileFailedRepairStrandsNoDeferredMarker
 // strands a marker instead.
 func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
@@ -3077,8 +3078,7 @@ func TestMQTTReconcileRefusedResumeStillRecordsAGatedDelivery(t *testing.T) {
 
 	// The marker is the property, asserted DIRECTLY rather than inferred from the
 	// redelivery alone: the consumer survived the refusal, so the message is still
-	// owed, and only a recorded withholding makes the attempt that finally goes out
-	// a first transmission.
+	// owed, and only a recorded withholding lets a freed slot NAK it forward.
 	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()

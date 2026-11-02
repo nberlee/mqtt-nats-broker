@@ -253,8 +253,8 @@ func TestMQTTConnectCleanStartRejectsWithoutEvicting(t *testing.T) {
 //
 // What is asserted here is the common case: the discard is retried and completed at the
 // next resolution, so the reconnect gets Session Present FALSE. The crash and
-// remote-takeover windows are NOT asserted — they are a separate §0 roadmap item, and this
-// change narrows them rather than closing them.
+// remote-takeover windows are NOT asserted: this mechanism narrows them rather than
+// closing them.
 //
 // Mutation MU-B: log instead of parking, and the reconnect resumes the ended session.
 // Mutation MU-H: condition the recovery on sess.clean rather than on the sentinel — the

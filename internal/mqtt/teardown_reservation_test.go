@@ -525,12 +525,11 @@ func TestMQTTReservedTeardownExchangeStillAnswersAPubRec(t *testing.T) {
 	// AND THE SURVIVING SLOT CARRIES WHAT ADMISSION REQUIRES. Stopping at "a PUBREL entry
 	// exists with a slot reference" would be satisfied by a stored PUBREL that admission
 	// refuses forever — precisely what a destroyed slot produces, since admitStoredPubRel
-	// accepts a slot-less record only for a retained exchange and
-	// retainedPubRelAdmittedLocked_ then refuses one whose regSeq is non-zero.
+	// refuses every record no slot answers for.
 	//
 	// So what is asserted is the DURABLE PRECONDITION admission tests: the PUBREC re-phased
 	// the surviving slot to pubrel_ready, recorded the canonical PUBREL sequence on it, and
-	// that record exists on the stream naming THIS exchange. Re-driving admitStoredBubRel
+	// that record exists on the stream naming THIS exchange. Re-driving admitStoredPubRel
 	// here with a synthetic delivery instead was FLAKY — it races the store's readback, so
 	// it passed alone and failed intermittently in the package, and a flaky oracle is worth
 	// less than none (the admission arrow itself is issue #94's tested territory).

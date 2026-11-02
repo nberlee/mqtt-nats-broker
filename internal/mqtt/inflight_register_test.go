@@ -1608,7 +1608,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 		t.Fatalf("an unreadable register names no source, got %+v", ack)
 	}
 	if ack.regSeq == 0 {
-		t.Fatalf("the reservation must carry its register sequence: it is what says this hold stands on a register rather than being a retained send's register-less shape (R6)")
+		t.Fatalf("the reservation must carry its register sequence: it is what says this hold stands on a register rather than being an allocation whose register never landed")
 	}
 	if !incomplete {
 		t.Fatalf("an unreadable register leaves the identifier space incomplete")
@@ -1827,15 +1827,13 @@ func TestMQTTInflightClearResetsIncompleteSpace(t *testing.T) {
 	}
 }
 
-// A register store that fails leaves the sequence marked as withheld, so its eventual
-// FIRST transmission carries DUP=0.
+// A register store that fails leaves the sequence marked as withheld, so a freed slot can
+// NAK it forward, and its eventual FIRST transmission carries DUP=0 ([MQTT-3.3.1-1]): since
+// issue #76 DUP is the entry's transmitted bit, so a fresh allocation is not transmitted
+// whatever the AckWait redelivery's JetStream delivery count says.
 //
-// Nothing was put on the wire, but the AckWait redelivery arrives with a JetStream
-// delivery count above one, and trackPublish derives dup from that count unless the
-// sequence is known to have been withheld ([MQTT-3.3.1-1]).
-//
-// Mutation check: drop the deferred marker from abandonInflightRegister and the
-// redelivery reports dup=true.
+// Mutation check: drop the deferred marker from abandonInflightRegister and the withheld
+// assertion fails.
 func TestMQTTInflightAbandonedRegisterKeepsFirstSendDupClear(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-dup")
@@ -1983,8 +1981,8 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 		t.Fatalf("the source must not stay mapped to a cancelled identifier")
 	}
 	// EVERY entry was cancelled, so no drain is staged — but the withheld marker must
-	// still be installed, or a rolled-back UNSUBSCRIBE costs the first real transmission
-	// its DUP=0. This is the case an install placed after the "nothing staged" return
+	// still be installed, or after a rolled-back UNSUBSCRIBE no freed slot can NAK the
+	// delivery forward. This is the case an install placed after the "nothing staged" return
 	// would miss entirely.
 	e.sess.mu.Lock()
 	_, withheld := e.sess.deferred[mqttDeferredKey{dur, 1600}]
@@ -1999,17 +1997,13 @@ func TestMQTTInflightStageDrainCancelsPendingRegister(t *testing.T) {
 	}
 }
 
-// A cancelled registration is recorded as WITHHELD, so a rolled-back UNSUBSCRIBE does not
-// cost the first transmission its DUP=0.
+// A cancelled registration is recorded as WITHHELD, so after a rolled-back UNSUBSCRIBE a
+// freed slot can NAK it forward; its first transmission carries DUP=0 in any case
+// ([MQTT-3.3.1-1]), since issue #76 made DUP the entry's transmitted bit. A COMMITTED
+// teardown drops the marker instead, because the staging it protects is settled.
 //
-// Nothing was put on the wire, but the redelivery arrives with a JetStream delivery count
-// above one, and trackPublish derives dup from that count unless the sequence is known to
-// have been withheld ([MQTT-3.3.1-1]). A COMMITTED teardown drops the marker instead,
-// because the staging it protects is settled and no first transmission of that sequence
-// remains to protect.
-//
-// Mutation check: cancel without recording the marker and the DUP assertion fails; drop
-// the commitDrains cleanup and the committed case leaves the marker behind.
+// Mutation check: cancel without recording the marker and the withheld assertion fails;
+// drop the commitDrains cleanup and the committed case leaves the marker behind.
 func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-cancel-dup")
@@ -2032,13 +2026,14 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 		}
 	}
 
-	// ROLLED BACK: the marker survives, so the eventual first transmission is DUP=0.
+	// ROLLED BACK: the marker survives; the eventual first transmission is DUP=0 because
+	// nothing was ever transmitted, not because of the marker.
 	stage(t)
 	e.sess.mu.Lock()
 	_, withheld := e.sess.deferred[mqttDeferredKey{dur, sseq}]
 	e.sess.mu.Unlock()
 	if !withheld {
-		t.Fatalf("a cancelled registration must be recorded as withheld, or its first send carries DUP=1")
+		t.Fatalf("a cancelled registration must be recorded as withheld, or a freed slot cannot NAK its redelivery forward")
 	}
 	e.sess.mu.Lock()
 	rePI, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
@@ -3908,8 +3903,8 @@ func TestMQTTInflightUndurableReservationDeclinesAcknowledgement(t *testing.T) {
 			if asPubRel {
 				t.Fatal("a never-transmitted reservation must not be handed off to a PUBREL entry")
 			}
-			// No PUBREL reached $MQTT_out: nothing durable was written, so admission has no
-			// slot-less record it could later misclassify as retained and transmit.
+			// No PUBREL reached $MQTT_out: nothing durable was written, so no slot-less
+			// record is left for admission to refuse.
 			if n, _, err := e.asm.jsa.streamSubjects(mqttOutStreamName, e.sess.pubRelSubject); err == nil && len(n) != 0 {
 				t.Fatalf("a never-transmitted reservation must not store a PUBREL, found %v", n)
 			}

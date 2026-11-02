@@ -1582,8 +1582,10 @@ func (j *mqttInboundJob) releaseFences() bool {
 	//
 	// This fence decides only the occupancy it competed for. What that is worth is bounded
 	// by the marker's fence, which makes an occupancy the discard was never entitled to
-	// provable here (issue #66), and by one open blocker that is not decidable here at all:
-	// issue #40 (https://github.com/nberlee/mqtt-nats-broker/issues/131). Do not restate their boundary in this file.
+	// provable here (issue #66), and by one boundary that is not decidable here at all:
+	// issue #40's, closed by a retirement licence in place of every inference from absence
+	// (https://github.com/nberlee/mqtt-nats-broker/issues/131). Do not restate their
+	// boundary in this file.
 	if r.sess != nil {
 		if !r.sess.beginQoS2ReleaseOp() {
 			// This session is being discarded on this broker. Deliver nothing and claim

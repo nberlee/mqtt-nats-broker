@@ -533,8 +533,8 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// state — an ambiguous save, whose outcome only a readback can settle — still
 	// owe this: a parked delivery would otherwise wait out its whole bound and
 	// then find the session detached, at which point it can no longer record
-	// itself as never transmitted and its redelivery reaches the client marked
-	// DUP.
+	// itself as withheld and its redelivery waits out AckWait instead of being
+	// NAKed forward.
 	releaseGates := func() {
 		for deliver := range installed {
 			c.mu.Lock()
@@ -549,7 +549,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	// rather than waiting out the bound against a subscription that is going
 	// away.
 	// doomed says this subscription's durable is being deleted (or is already
-	// authoritatively absent), so a never-transmitted marker for it could never
+	// authoritatively absent), so a withheld marker for it could never
 	// be consumed: disown before opening the gate, and a delivery that wakes
 	// into the removal records nothing. A SURVIVING consumer is the opposite
 	// case — its messages are still owed, so it stays phase-owned and the woken
@@ -589,7 +589,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 			}
 		}
 		sess.mu.Lock()
-		// A gated delivery may already have recorded a never-transmitted marker
+		// A gated delivery may already have recorded a withheld marker
 		// against a durable this undo just deleted. trackPublish consumes such a
 		// marker only when that durable delivers again, which it never will, so
 		// leaving it would strand an entry for the life of the session — and every
@@ -629,9 +629,9 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 				sub.mqtt.closed = true
 				sub.mqtt.phaseOwned = true
 				// The gate every delivery pushed into this window waits on. It is
-				// what keeps the offline backlog a set of first transmissions
-				// instead of AckWait-delayed DUPs; released on adoption, and on
-				// every path that reclaims this subscription instead.
+				// what keeps the offline backlog prompt and in order instead of
+				// AckWait-delayed; released on adoption, and on every path that
+				// reclaims this subscription instead.
 				sub.mqtt.phaseGate = make(chan struct{})
 			}
 			sess.subsMu.Unlock()
@@ -738,7 +738,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 		if e.cc != nil {
 			sess.refundConsumerChargeLocked(e.cc.Durable)
 			// A delivery that ran out its gate wait before this durable was found
-			// absent may have recorded a never-transmitted marker against it. That
+			// absent may have recorded a withheld marker against it. That
 			// consumer will never deliver again, so trackPublish can never consume
 			// the marker and resendPendingRedelivery would NAK a dead ack subject
 			// on every resume. Same reasoning as undo's purge of created durables.
@@ -1273,8 +1273,8 @@ func (sess *mqttSession) sweepUnadoptedPhaseSubs(c *client, delivers []string) {
 		// The gate opens, but the subscription is NOT disowned: this consumer
 		// SURVIVES — only its interest is being withdrawn — so a delivery parked
 		// on the gate is still owed to the session and must record itself as
-		// never transmitted, or the redelivery that follows the next CONNECT
-		// reaches the client marked DUP on first sight. Only a durable that is
+		// withheld, so a freed slot can NAK its redelivery forward rather than leave
+		// it to AckWait. Only a durable that is
 		// being deleted is disowned (see unsubscribePhase's doomed argument).
 		sess.mqttReleasePhaseGate(sub)
 		if uerr := c.processUnsub([]byte(deliver)); uerr != nil {

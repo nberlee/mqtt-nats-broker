@@ -3076,17 +3076,18 @@ Residuals:
     messages that were pushed later. Ordering across a redelivery is not
     preserved — the same residual any AckWait or NAK redelivery carries.
   - A message JetStream pushed into a reconciliation subscription that the
-    broker then loses to a crash is redelivered with DUP set on what is, to
-    the client, its first transmission: nothing durable records that the
-    attempt was never put on the wire. This is the pre-existing behavior of
-    any pushed-but-untransmitted delivery at a crash, not specific to
-    reconciliation.
+    broker then loses to a crash is redelivered only after AckWait. Its DUP flag
+    is the exchange's own recovered transmitted state, never the JetStream
+    delivery count
+    ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)): DUP=0
+    for a delivery never attempted, DUP=1 for one that was or may have been.
   - A backlog large enough to exhaust the NATS client's per-subscription
     pending-byte limit while deliveries are parked on the phase gate has its
     excess dropped by the client library before the broker sees it. Nothing is
     lost — the messages were never acknowledged, so JetStream redelivers them
-    — but those redeliveries carry DUP on their first sight by the client,
-    since the broker never got the chance to record them as withheld.
+    after AckWait, without the prompt NAK, since the broker never got the chance
+    to record them as withheld. DUP follows the exchange's transmitted state as
+    above, not the redelivery.
   - A resume refused **before the grant point** leaves the session's Session
     Expiry Interval and Clean flag untouched, in memory and in the record:
     they are applied only once every check that could refuse the CONNECT has

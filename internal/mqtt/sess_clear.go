@@ -434,8 +434,8 @@ func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
 // request timeout runs out — the store cannot answer — leaves the proposal standing, and the
 // discard proceeds exactly as it did before this boundary existed: a receiptless claim, no
 // authorized discarding closure, no enrolment. The record CAS still arbitrates that claim
-// against the proposal's own metadata commit. docs/CONFORMANCE.md carries it as a
-// release-blocking gap.
+// against the proposal's own metadata commit. docs/CONFORMANCE.md states it ("The discard
+// boundary's settlement can fail", issue #107).
 func (sess *mqttSession) settleDiscardAuthority() (mqttAuthorityLoad, bool) {
 	if sess.asm == nil {
 		return mqttAuthorityLoad{}, false

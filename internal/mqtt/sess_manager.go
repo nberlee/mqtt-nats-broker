@@ -37,7 +37,7 @@ import (
 // gate: the connection's effective AckWait, capped at mqttPhaseGateWaitMax.
 // Tying it to AckWait is what keeps the wait from changing the outcome — at
 // that deadline JetStream redelivers regardless, and the skipped attempt is
-// recorded so the redelivery is still the client's first transmission.
+// recorded so a freed slot can NAK the redelivery forward.
 func mqttPhaseGateWaitFor(c *client) time.Duration {
 	wait := mqttDefaultAckWait
 	if c != nil && c.srv != nil {
@@ -1685,8 +1685,8 @@ func (as *mqttAccountSessionManager) lockSessionForVoidHandoff(sess *mqttSession
 	defer as.mu.Unlock()
 	// RESIDENCY by identity, in the same critical section as the gate itself, which is what
 	// makes it a claim rather than a stale sample: a trigger's session pointer can be
-	// evicted before its turn — a remote persist, an accept rollback, an expiry, a foreign
-	// disposition — and that object may no longer write its record. Claiming the
+	// evicted before its turn — a remote persist, an expiry, a foreign disposition — and that
+	// object may no longer write its record. Claiming the
 	// shared client-ID gate for it would hold a replacement CONNECT off across a JetStream
 	// store for a session this broker no longer has. Identity, not client ID: a CONNECT may
 	// already have installed a restored replacement under the same ID.

@@ -26,9 +26,9 @@ import (
 )
 
 // buildPersistedSessionLocked builds the on-stream persisted form of the session.
-// sess.mu must be held. Shared by save() and the CONNECT-accept watermark-failure
-// rollback, so a rejected session is re-persisted (as disconnected) with its full
-// resumable state rather than a partial record.
+// sess.mu must be held. Shared by save() and clear()'s pre-teardown snapshot, so the
+// teardown marker preserves the same full resumable state a save would write rather than a
+// partial record.
 //
 // Persist only consumer configs that still correspond to a live subscription:
 //   - Shared (DeliverGroup) consumers are group-owned and reconstructed from

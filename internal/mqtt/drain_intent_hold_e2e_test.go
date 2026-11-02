@@ -326,7 +326,7 @@ func TestMQTTQoS0ReSubscribeOverAHeldDrainIsUnchanged(t *testing.T) {
 //
 // SCOPE: the negative assertion is evidence for the exercised schedule only. It is NOT a
 // claim that retirement disposes of the consumer or excludes every re-offer — retirement
-// keeps HEAD's semantics there, which is a stated residual and its own roadmap item.
+// keeps its existing semantics there, outside this test's scope.
 func TestMQTTAdoptedDrainMustNotRedeliverAPastPubRecPayload(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second

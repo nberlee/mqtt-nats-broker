@@ -351,8 +351,8 @@ func (sess *mqttSession) awaitTransmissionGatesThen(cc *client, beforeWait func(
 	// long enough to make the takeover time out and refuse, repeatedly, for a reason
 	// that has nothing to do with the contender. Closing is the incarnation this
 	// CONNECTION was admitted under, so the answer is the same one an armed gate
-	// gives: WITHHELD, which the caller records without acking, keeping the eventual
-	// redelivery a first transmission (issue #40 unit 1).
+	// gives: WITHHELD, which the caller records without acking, so a freed slot can NAK
+	// the redelivery forward (issue #40 unit 1).
 	var closing <-chan struct{}
 	if cc != nil && cc.mqtt != nil && cc.mqtt.tracker != nil {
 		closing = cc.mqtt.tracker.closingSignal()

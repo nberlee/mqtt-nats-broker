@@ -662,7 +662,7 @@ func (asm *mqttAccountSessionManager) disposeCaptured(sess *mqttSession,
 // while the tracker is still CLOSING:
 //
 // recordWithheld asks for the withheld-delivery record a QoS 1/2 skip owes, which
-// keeps the eventual redelivery a FIRST transmission for DUP purposes. It is taken
+// lets a freed slot NAK the redelivery forward. It is taken
 // only after revalidating, under sess.mu, that the captured tracker is still this
 // session's current tracker and still closing — so the write lands on the retiring
 // object and before any re-mint. On a RETIRED tracker it is skipped entirely:

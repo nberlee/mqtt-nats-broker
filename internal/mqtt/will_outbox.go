@@ -1226,8 +1226,8 @@ func (as *mqttAccountSessionManager) scanBudget() time.Duration { return 2 * as.
 //     approaching zero — `T < L` is not `2T < L`. The worker then also waits on
 //     mqttSubsBarrier, which no timeout bounds at all. So the worker's deliberate lack
 //     of renewal does not rest on this relationship; the overrun it leaves is the
-//     residual docs/CONFORMANCE.md discloses, for which docs/ROADMAP.md carries a
-//     phase-aware lease-ownership fix (see willPublishWorker);
+//     residual docs/CONFORMANCE.md discloses, accepted rather than fixed by
+//     phase-aware lease ownership (see willPublishWorker);
 //   - the claim interval must be below the lease, so a record is reclaimed by a LATER
 //     scan rather than one whose lease is still valid. Note this is about lease
 //     VALIDITY, not about whether the owning broker is alive — a live broker whose
@@ -1512,7 +1512,8 @@ func (as *mqttAccountSessionManager) storeWillClaimCAS(subject string, expectSeq
 // completion unknown". Bounding the barrier here would be worse, not better — the
 // fan-out already happened, so abandoning would skip the store that protects the
 // racing subscriber, trading a duplicate for a LOSS. End-to-end phase-aware
-// ownership is a ROADMAP item; the honest statement today is that this worker can
+// ownership was not built: the duplicate it would remove is an accepted residual
+// (docs/CONFORMANCE.md), and the honest statement today is that this worker can
 // outlive its lease without anything crashing.
 func (as *mqttAccountSessionManager) willPublishWorker(s *Server, subject string, rec *mqttWillOutbox, seq uint64) {
 	defer s.willWorkerWG.Done()

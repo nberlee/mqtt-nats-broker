@@ -1041,8 +1041,8 @@ func TestMQTTVoidVerdictHandoffYieldsToTheOwnershipGate(t *testing.T) {
 // CONNECT's own inline delete.
 //
 // The behavioral scenario at the inline site is unreachable today: an aborted CONNECT keeps
-// its binding for the close bookkeeping to detach, and the paths that DO unbind mid-CONNECT
-// (the accept rollback, a foreign disposition) evict the object as well. So the inline call is
+// its binding for the close bookkeeping to detach, and the path that DOES unbind mid-CONNECT
+// (a foreign disposition) evicts the object as well. So the inline call is
 // defensive wiring, and what is testable is the helper's own contract: it triggers for a
 // resident unbound session with a gap, and skips an object no map points at.
 func TestMQTTVoidVerdictHandoffHelperSkipsNonresident(t *testing.T) {
@@ -1803,7 +1803,7 @@ func TestMQTTVoidVerdictBackstopConvergesAfterDefiniteFailure(t *testing.T) {
 
 	// And an EVICTED snapshot is not the backstop's business. The periodic pass holds raw
 	// pointers, so a session the manager no longer maps to this object — a remote persist, an
-	// accept rollback, an expiry, a foreign disposition — must not have its gate claimed for
+	// expiry, a foreign disposition — must not have its gate claimed for
 	// a JetStream store: that object can no longer speak for the record, and holding the
 	// shared client-ID gate would keep a replacement CONNECT out meanwhile. The per-session STEP is
 	// what must refuse, because the eviction window is between the pass's snapshot and this

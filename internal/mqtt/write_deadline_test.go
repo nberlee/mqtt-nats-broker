@@ -610,8 +610,8 @@ func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 }
 
 // T5. The delivery section, which is the population the issue #39 dossier did NOT name:
-// it named `wmu` only. `mqttEnqueuePublishMsgTo` holds the RECEIVER's `c.mu` across
-// its `queueOutbound` calls, so before the bound an ordinary QoS 0 delivery to a
+// it named `wmu` only. The delivery writer holds the RECEIVER's `c.mu` across its socket
+// write, so before the bound an ordinary QoS 0 delivery to a
 // stalled subscriber blocked every path that needed that client's mutex — including,
 // gate-held, the whole Will phase of every disposal.
 //
@@ -625,8 +625,7 @@ func TestF035DeliverySectionReleasesTheClientMutex(t *testing.T) {
 	cc, sc := testStalledClient(t)
 	cc.mqtt = &mqtt{proto: mqttProtoLevel5, pp: &mqttPublish{}, cp: &mqttConnectProto{}}
 	cc.initClient()
-	// A real subscription: sub.mqtt must be non-nil or the retained-flush branch
-	// panics before the section is ever entered.
+	// A real subscription, as the production caller passes one.
 	sub := &subscription{client: cc, mqtt: &mqttSub{}}
 	sender := &client{}
 	sender.mqtt = &mqtt{proto: mqttProtoLevel5, pp: &mqttPublish{}, cp: &mqttConnectProto{}}
@@ -667,10 +666,10 @@ func TestF035DeliverySectionReleasesTheClientMutex(t *testing.T) {
 	select {
 	case ok := <-delivered:
 		// A timeout is a new CAUSE of an existing failure, never a new return
-		// outcome: false here means "packet too large", whose caller acknowledges
-		// and removes state. A delivery that timed out must not claim that.
+		// outcome: false here means the frame did not fit. A delivery that timed out
+		// must not claim that.
 		if !ok {
-			t.Fatal("a write timeout made mqttEnqueuePublishMsgTo return false, which its caller reads as a packet-size discard and answers by acknowledging and removing in-flight state")
+			t.Fatal("a write timeout made mqttEnqueueQoS0PublishMsgTo return false, which reports a frame that did not fit, not a write that timed out")
 		}
 	case <-time.After(budget):
 		t.Fatal("the delivery never returned")
@@ -685,7 +684,7 @@ func TestF035DeliverySectionReleasesTheClientMutex(t *testing.T) {
 // `TestMQTTBoundRejectionNoReentryAfterForeign` already uses for the same reason.
 //
 // The TCP-specific half — establishing backpressure by shrinking a real socket
-// buffer — is explicitly OWED and recorded in docs/ROADMAP.md. `net.Pipe` is
+// buffer — is explicitly not covered here. `net.Pipe` is
 // unbuffered and synchronous, so a write with no reader is blocked by construction
 // rather than by a buffer-fill argument that would have to be proved.
 func TestF035SlowConsumerIsDisconnected(t *testing.T) {
@@ -804,10 +803,9 @@ func testJoinTeardown(t *testing.T, s *Server, what string) {
 // implementation that sampled the session instead of using the fence would pass a
 // fixture where they happened to agree.
 //
-// FireAt is bracketed against the CURRENT, consumption-based anchoring. That is
-// deliberately not an assertion that consumption-time anchoring is RIGHT — it is a
-// filed roadmap item that it is wrong — only that the value produced is the one this
-// code is specified to produce today.
+// FireAt is asserted against the close-anchored Will Delay: exactly the instant the
+// teardown observed the close plus the delay when that instant is known, and otherwise
+// bracketed around the consuming call (see assertOutbox).
 func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 	const delaySecs = 600
 

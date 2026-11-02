@@ -726,7 +726,7 @@ func TestRefusedRestoreKeepsADurableTheRecordNames(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// A refusal records its withheld delivery, so an unraced retry sees DUP = 0
+// A refusal records its withheld delivery, and an unraced retry sees DUP = 0
 // ---------------------------------------------------------------------------
 
 // **This test replaces one whose claim was WITHDRAWN.** Its predecessor,
@@ -741,11 +741,12 @@ func TestRefusedRestoreKeepsADurableTheRecordNames(t *testing.T) {
 // the old name with a weakened interleaving.
 //
 // What is still proved: a refusal wakes its withheld QoS 1/2 delivery, that delivery
-// records itself as never transmitted, and the retry that follows receives the
+// records itself as withheld, and the retry that follows receives the
 // message as a FIRST transmission with DUP = 0. No rebind races the callback here.
 //
-// Mutation check: drop the withheld recording on the verdict's arm and the retry's
-// delivery arrives DUP = 1.
+// The DUP oracle no longer discriminates the recording: since issue #76 DUP is the entry's
+// transmitted bit, so dropping the withheld recording on the verdict's arm leaves the retry's
+// delivery at DUP = 0.
 func TestRefusedRestoreRecordsItsWithheldDelivery(t *testing.T) {
 	b := testQ2AffSetup(t, "f050drain")
 	id := "f050-drain"
@@ -877,8 +878,8 @@ func TestRefusedRestoreRecordsItsWithheldDelivery(t *testing.T) {
 		t.Fatalf("the retry's CONNACK reason = 0x%x, want 0", reason)
 	}
 
-	// The owed message is the client's FIRST sight of it, which is the whole point
-	// of recording the withholding.
+	// The owed message is the client's FIRST sight of it (it was never transmitted),
+	// so it carries DUP = 0.
 	pi := testRestoreAwaitPublishDUP(t, r2, "owed", false)
 	if pi == 0 {
 		t.Fatal("the owed delivery carried no packet identifier")
@@ -887,8 +888,7 @@ func TestRefusedRestoreRecordsItsWithheldDelivery(t *testing.T) {
 }
 
 // testRestoreAwaitPublishDUP is testRestoreAwaitPublish with an assertion on the
-// DUP flag of the matching delivery, which is the whole point wherever a
-// never-transmitted marker is under test.
+// DUP flag of the matching delivery.
 func testRestoreAwaitPublishDUP(t *testing.T, r *mqttReader, want string, wantDUP bool) uint16 {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -1120,10 +1120,10 @@ func TestRefusedRestoreRefundsTheSharedChargeItAdded(t *testing.T) {
 // VERDICT (positively, through the block counter) and that it then arrives promptly
 // after the open rather than after an AckWait stall.
 //
-// Given issue #76 — the affine path derives DUP from the JetStream delivery count — the
-// DUP expectation on the post-open delivery is deliberately not asserted here; a
-// copy that was offered and refused before trackPublish is exactly that finding's
-// population.
+// The DUP flag on the post-open delivery is not asserted here: since issue #76 it is the
+// entry's transmitted bit on the affine path too, and a copy refused before trackPublish is
+// covered by issue #76's acceptance tests
+// (TestMQTTAffineRefusalBeforeTrackingSendsFirstPublishWithoutDup).
 //
 // Mutation check: remove the gate consultation from mqttDeliverQ2AffineCb and the
 // block counter stays at zero.
@@ -1613,9 +1613,8 @@ func TestGateTimeoutNaksAnAffineCopy(t *testing.T) {
 	// blocked counter above) and that an already-tracked copy owed across a gate
 	// timeout still arrives.
 	//
-	// The DUP flag is deliberately not asserted: the affine path derives it from the
-	// JetStream delivery count, which is issue #76's open defect, and a NAK increments
-	// that count.
+	// The DUP flag is not asserted: since issue #76 it is the entry's transmitted bit,
+	// which issue #76's acceptance tests cover; this fixture is about the gate.
 	deadline := time.Now().Add(1200 * time.Millisecond)
 	pi := testRestoreAwaitPublish(t, r2, "affto")
 	if pi == 0 {

@@ -2619,7 +2619,7 @@ func TestQ2AffineReclaimDiscardFailureStillReleasesTheLocalHalf(t *testing.T) {
 	// claim inside the scan, so claims reached before the malformed record are
 	// discarded while the rest are not. This fixture seeds no owned assignments, so
 	// it pins neither half of that. Both residuals are stated in
-	// docs/CONFORMANCE.md and filed in docs/ROADMAP.md.
+	// docs/CONFORMANCE.md.
 	if durs := a.b.affineConsumers(t, a.idHash); len(durs) != 1 || durs[0] != durable {
 		t.Fatalf("the reclaim deleted a consumer whose assignments it could not terminate, got %v", durs)
 	}

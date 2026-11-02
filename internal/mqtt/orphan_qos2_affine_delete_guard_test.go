@@ -77,7 +77,7 @@ func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 
 		// Lifecycle teardown. Reached both by ordinary teardown and by the sweep, which
 		// ADOPTS abandoned teardown markers and finishes them. Known pre-existing call
-		// site, outside course E's behavioral change and owned by open issue #40, retained
+		// site, outside course E's behavioral change and owned by issue #40 (since closed), retained
 		// here WITHOUT any claim that it is race-free: a won claimTeardown authorizes
 		// proceeding with lifecycle teardown relative to the claimed record, but does NOT
 		// fence a stale same-affine-generation peer's beginQ2AffOp and create-only claim

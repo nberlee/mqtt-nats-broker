@@ -488,16 +488,13 @@ func TestMQTTInflightPubAckParksThroughTheAckPath(t *testing.T) {
 // re-opens the stale-send race in full.
 //
 // WHAT THIS PROVES, and what it does not. It binds every identifier-bearing call to
-// mqttEnqueuePublishMsgTo and to the two PUBREL response helpers to a send section
+// mqttPreparePublishMsgTo and to the two PUBREL response helpers to a send section
 // whose endSend is deferred BEFORE the call. It does NOT prove that some future code
 // path could not frame a packet by hand, and it does not resolve an alias that crosses
-// a function boundary. One identifier-bearing transmission is deliberately outside it:
-// a RETAINED QoS 1/2 message allocates through trackPublishRetained, builds its frame
-// directly and is flushed by a later queueOutbound with no section at all (issue #93),
-// which this guard cannot see because the retained path uses neither helper.
+// a function boundary; testFramingCloseSet covers hand-built frames, the retained
+// snapshot's included.
 //
-// The QoS 0 enqueues (a literal 0 identifier) allocate nothing and are excluded by the
-// same rule that keeps retained sends outside the register invariants (R6). The skip is
+// The QoS 0 enqueues (a literal 0 identifier) allocate nothing and are excluded. The skip is
 // COUNTED and asserted nonzero: a selector that quietly matched nothing would otherwise
 // look exactly like a clean pass.
 func TestMQTTInflightEveryQoS12SendIsReserved(t *testing.T) {
@@ -696,8 +693,8 @@ func testFramingCloseSet(t *testing.T) {
 	want := map[string]string{
 		// Reserved by beginRetainedSendLocked, in this same function, before the append.
 		"mqttAccountSessionManager.serializeRetainedMsgsForSub": "beginRetainedSendLocked",
-		// DELEGATED: ADMISSION and TRANSMISSION are the two halves mqttEnqueuePublishMsgTo
-		// was split into so a QoS 1/2 sender can record durable intent between them; their
+		// DELEGATED: ADMISSION and TRANSMISSION are the two halves an outbound PUBLISH is
+		// split into so a QoS 1/2 sender can record durable intent between them; their
 		// identifier-bearing callers open beginSendLocked, which the pairing guard binds.
 		"client.mqttPreparePublishMsgTo":         "the caller's beginSendLocked",
 		"client.mqttEnqueuePreparedPublishMsgTo": "the caller's beginSendLocked",
@@ -799,7 +796,7 @@ func testFramingCloseSet(t *testing.T) {
 		if _, ok := want[name]; !ok {
 			t.Errorf("%s frames an identifier-bearing PUBLISH and is not in the frozen close set: "+
 				"say which reservation covers its identifier and add it here, or route it through "+
-				"mqttEnqueuePublishMsgTo", name)
+				"mqttPreparePublishMsgTo", name)
 		}
 	}
 	for name, reservation := range want {
@@ -841,10 +838,9 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// The helpers that mutate a hold.
 		"mqttSession.beginSendLocked": {}, "mqttSession.beginPubRelSendLocked": {},
 		"mqttSession.endSendCore": {}, "mqttSession.consumePubRelAckLocked": {},
-		// A retained frame's reservation: one opener and two release verbs, because
-		// written completion is fenced by the session incarnation and abandonment is not
-		// (issue #93). endRetainedSends and abandonRetainedSends are deliberately ABSENT:
-		// they only take the lock and delegate, so the map access stays in these three.
+		// A retained snapshot's reservation: one opener, the abandonment and the shared
+		// drop (issue #93). abandonRetainedSends is deliberately ABSENT: it only takes the
+		// lock and delegates, so the map access stays in these three.
 		"mqttSession.beginRetainedSendLocked":            {},
 		"mqttSession.releaseRetainedSendAbandonedLocked": {},
 		"mqttSession.dropRetainedSendLocked":             {},
@@ -2137,8 +2133,7 @@ func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 	// admitted because the slot that owns its identifier hands out a non-revocable action —
 	// whether the slot is already past PUBREC (`pubrel_ready`) or still in `publish` (the
 	// direct `publish -> pubrel_sending` arrow from a proven record) — not because the
-	// callback was reached. (A live retained exchange has no slot, R6, and is admitted by
-	// its in-memory owner instead.) So a fixture that drives the callback for a slot-backed
+	// callback was reached. So a fixture that drives the callback for a slot-backed
 	// exchange must establish that slot, or it exercises the refusal path and nothing else
 	// (feedback_fixture_must_reach_its_route).
 	//

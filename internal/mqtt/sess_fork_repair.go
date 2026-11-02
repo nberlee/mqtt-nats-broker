@@ -195,12 +195,11 @@ func (e *mqttGrantEntry) sidState(sid string) mqttSidState {
 // mqttGrantSnap is the grant of ONE session record: the per-filter map plus the two
 // session-scoped members, so the capsule's whole payload has a single provenance.
 //
-// Shared-subscription membership is deliberately absent. A per-filter shared restore can
-// fail while the membership stays durable, so a re-asserted SharedSubs membership would be
-// while a per-filter restore failure leaves no group join and no consumer — the
-// accepted-but-dead state issue #54 already records. Repairing into that ordering would extend
-// an open finding rather than respect it; shared membership becomes repairable when issue #54
-// closes. See docs/CONFORMANCE.md.
+// Shared-subscription membership is deliberately absent. It was excluded while a per-filter
+// shared restore could fail with the membership left durable and the CONNECT accepted — no
+// group join and no consumer, the accepted-but-dead state of issue #54 — so a re-asserted
+// membership would have repaired into that state. Since issue #54 such a CONNECT is refused
+// instead; the repair still does not carry shared membership.
 type mqttGrantSnap struct {
 	filters   map[string]mqttGrantEntry
 	regNonces map[string]struct{}

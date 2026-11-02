@@ -32,10 +32,9 @@ var mqttTestTornWriterUnlockedHookV atomic.Pointer[func(c *client)]
 
 // The action-consuming output boundary (issue #107, row 2).
 //
-// The conversion's structural property is not about a deleted symbol, because four of the
-// production emitters never called the one that was deleted — the retained flush inside
-// mqttEnqueuePreparedPublishMsgTo, reachable even from a QoS 0 delivery; the SUBACK tail; and
-// both isNew==false retransmission branches. The property is about EFFECTS:
+// The conversion's structural property is not about a deleted symbol, because several of the
+// production emitters it converted never called the one that was deleted. The property is about
+// EFFECTS:
 //
 //	Every QoS 1/2 emission consumes its own acquired action, bound to its exchange and its
 //	destination.
@@ -48,9 +47,9 @@ var mqttTestTornWriterUnlockedHookV atomic.Pointer[func(c *client)]
 //
 // # What "consumed once" means, and what it does not
 //
-// ONE LOGICAL FRAME, not one writeSocket call and not one net.Conn.Write. The existing emitters
-// send a PUBLISH header and its body separately, and the retained flush does the same, so
-// consuming per invocation would consume on the header and reject the body. Header, payload and
+// ONE LOGICAL FRAME, not one writeSocket call and not one net.Conn.Write. The emitters send a
+// PUBLISH header and its body separately, so consuming per invocation would consume on the
+// header and reject the body. Header, payload and
 // any continuation of remaining bytes are one execution.
 //
 // CONSUMPTION IS NOT DRAIN. The action stays outstanding while its execution can still emit;

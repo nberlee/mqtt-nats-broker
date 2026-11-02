@@ -132,16 +132,14 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 	return subjects
 }
 
-// trackPublishRetained is invoked when a retained (QoS) message is published. It
-// allocates a new PI and adds it to pendingPublish with an empty value (no
-// JetStream backing). Spec5 [3.3.4].
+// trackPublishRetained allocates a PI for one QoS 1/2 retained replay item and adds it to
+// pendingPublish as a retained ALLOCATION: no register and no source until the replay
+// driver's admission lands and promotes it. Spec5 [3.3.4].
 //
-// qos is the effective QoS the caller selected for this replay, and it is the one
-// piece of per-exchange evidence a retained send ever has: there is no register to
-// recover it from (R6), so the entry's own qos field is seeded here or nowhere.
-// A retained frame is serialized under this same lock and flushed later, so it is
-// never a JetStream redelivery and never reaches the started path -- the seed is
-// for coherence with every other exchange, not because a re-offer will read it.
+// qos is the effective QoS the caller selected for this replay. Until the admission lands
+// there is no register to read it from, so the entry's own qos field is seeded here; the
+// admission records the same value in the register. A retained item is never a JetStream
+// redelivery and never reaches the started path.
 //
 // Lock held on entry
 func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
@@ -165,17 +163,10 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 	if pi == 0 {
 		return 0
 	}
-	// The exchange nonce is minted HERE even though a retained send has no register (R6).
+	// The exchange nonce is minted HERE, with the allocation, because the admission that
+	// writes the register carries it: the register, the marker and the snapshot's
+	// disposition all name this allocation by it, never by the identifier alone.
 	//
-	// A retained delivery's PUBREC stores a PUBREL like any other, and that record carries a
-	// MANDATORY exchange identity — so an entry with no nonce cannot produce a storable
-	// record at all. A review found this the hard way: without the mint, every outbound
-	// retained QoS 2 replay stalled at PUBREC and could terminate the connection, because
-	// the builder refused the empty owner and the handler returned an error.
-	//
-	// Minted rather than derived: there is no register to take an identity from, which is
-	// exactly why retained is the one exchange whose identity lives only in memory. Its
-	// authority is this entry, so a retained record surviving a restart has none.
 	// A HOLD until the admission lands (issue #107 7c): the identifier is reserved across the
 	// materialization and the admission, and acts for nothing until the landing promotes it to a
 	// register-backed Retained entry the ledger charges.
@@ -862,17 +853,14 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// Any pending PUBREL (including a placeholder created at PUBREC before its
 	// delivery recorded an ack subject) needs the PUBREL delivery subscription.
 	hasPendingPubRel := len(sess.pendingPubRel) > 0
-	// Deferred (withheld, never transmitted) deliveries from before the
-	// disconnect should not wait an AckWait either; drain them here too.
+	// Deferred (withheld) delivery attempts from before the disconnect should
+	// not wait an AckWait either; NAK them here too.
 	//
-	// The entry is NAK'd but KEPT: it is the only record that this message has
-	// never been on the wire, and the NAK's own redelivery arrives with a
-	// JetStream delivery count above one, so dropping it here would mark that
-	// delivery DUP on the client's FIRST sight of it — the very property this
-	// mechanism is documented to preserve ([MQTT-3.3.1-1]; see the prompt-release
-	// note in docs/CONFORMANCE.md). trackPublish removes the entry when the
-	// message actually goes out, which is the point at which it stops being
-	// never-transmitted; a re-send after that is a genuine DUP.
+	// The entry is NAK'd but KEPT; trackPublish removes it when its new-allocation
+	// branch admits the message, while its existing-exchange branch leaves it in
+	// place (see the prompt-release note in docs/CONFORMANCE.md). It does not
+	// protect DUP: since issue #76 DUP is the entry's transmitted bit, so a first
+	// transmission carries DUP=0 whatever the delivery count.
 	deferredNaks := make([]pendingNak, 0, len(sess.deferred))
 	for k, subj := range sess.deferred {
 		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj, k.jsDur})
@@ -1074,9 +1062,9 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 		jsa.sendMsg(n.ackSubject, AckNak)
 	}
 
-	// Deferred (withheld, never transmitted) deliveries fill the capacity left
-	// after pending redeliveries; the rest re-offer via AckWait and re-enter
-	// deferred through trackPublish.
+	// Deferred (withheld) delivery attempts fill the capacity left after pending
+	// redeliveries; the rest re-offer via AckWait and may be withheld, and
+	// recorded, again.
 	if rem := deferredCap; rem > 0 {
 		slices.SortFunc(deferredNaks, bySeq)
 		if len(deferredNaks) > rem {
@@ -1131,16 +1119,15 @@ func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	// session. That defect appeared twice during issue #94's implementation, at two different
 	// sites, before being fixed here where every caller inherits it.
 	//
-	// AND SO DOES ITS AUTHORITY, and no more of it: the successor inherits the predecessor's
-	// kind and evidence (mqttNewPubRelSuccessor) and never mints any. Prefer an existing
-	// pendingPubRel: on record redelivery it is already the PUBREL-side authority, while a
-	// resident pendingPublish entry may be the stale half issue #95's ordered handoff is about.
-	// The first PUBREC handoff runs before untrackPublishEntry, so the PUBLISH entry supplies
-	// the identity there — including for RETAINED QoS 2, where there is deliberately no
-	// durable slot to recover it from (retainedPubRelAdmittedLocked_ finds the Retained kind),
-	// and the custody charge, which the PUBREC keeps (Spec5 [4.9]) and the ledger already
-	// charges. A Hold predecessor (the scan's placeholder) yields a Hold: only an acquired
-	// action promotes it (bindActionToPubRelLocked).
+	// AND SO DOES ITS AUTHORITY, and no more of it: the successor inherits the
+	// predecessor's kind and evidence (mqttNewPubRelSuccessor) and never mints any. Prefer
+	// an existing pendingPubRel: on record redelivery it is already the PUBREL-side
+	// authority, while a resident pendingPublish entry may be the stale half issue #95's
+	// ordered handoff is about. The first PUBREC handoff runs before untrackPublishEntry,
+	// so the PUBLISH entry supplies the identity there, and the custody charge, which the
+	// PUBREC keeps (Spec5 [4.9]) and the ledger already charges. A Hold predecessor (the
+	// scan's placeholder) yields a Hold: only an acquired action promotes it
+	// (bindActionToPubRelLocked).
 	prev, pub := sess.pendingPubRel[pi], sess.pendingPublish[pi]
 	var sseq uint64
 	if jsAckSubject != _EMPTY_ {

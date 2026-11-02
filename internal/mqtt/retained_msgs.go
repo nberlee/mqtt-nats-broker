@@ -238,13 +238,12 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		if qos > 0 {
 			pi = sess.trackPublishRetained(qos)
 
-			// The identifier has to stay reserved for the WHOLE span from here to
-			// whichever later queueOutbound writes this frame, and the pendingPublish
-			// entry trackPublishRetained just installed cannot do that job: clear()
-			// nils it and resets last_pi while a flush is still to come, and the
-			// displaced connection's write outlives the call. Taken in this same
-			// sess.mu acquisition so the identifier is never allocated-and-unreserved
-			// (issue #93).
+			// The identifier has to stay reserved for the WHOLE span from here until the
+			// replay driver hands it to the send section that transmits the admitted copy,
+			// and the pendingPublish entry trackPublishRetained just installed cannot do
+			// that job alone: clear() nils it and resets last_pi while the item is still
+			// staged. Taken in this same sess.mu acquisition so the identifier is never
+			// allocated-and-unreserved (issue #93).
 			if pi != 0 {
 				if ack := sess.pendingPublish[pi]; ack != nil {
 					nonce = ack.regNonce
@@ -282,7 +281,7 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 			props = mqttSetMessageExpiry(rm.Props, rem)
 		}
 		// MQTT 5.0 Subscription Identifier: inject the subscription's identifier
-		// (this path builds the header directly, bypassing mqttEnqueuePublishMsgTo).
+		// (this path builds the header directly, bypassing mqttPreparePublishMsgTo).
 		// After the expiry rewrite and before the size check below. Spec5 [3.8.2.1.2].
 		if v5 && sub.mqtt.subID > 0 {
 			props = mqttInjectSubID(props, sub.mqtt.subID)
@@ -291,9 +290,9 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// Need to use the subject for the retained message, not the `sub` subject.
 		// We can find the published retained message in rm.sub.subject.
 		// Set the RETAIN flag: [MQTT-3.3.1-8].
-		// Retained frames are intentionally not aliased: they are buffered into
-		// sub.mqtt.prm here (under the session lock) and flushed later under cc.mu,
-		// so binding an alias here could order the binding after live frames already
+		// Retained frames are intentionally not aliased: they are staged on sub.mqtt.prm
+		// here (under the session lock) and written later by the replay driver, so
+		// binding an alias here could order the binding after live frames already
 		// queued. A full topic is always legal; the first live message binds instead.
 		flags, headerBytes := mqttMakePublishHeader(pi, qos, false, true, v5, []byte(rm.Topic), props, len(rm.Msg))
 
@@ -304,9 +303,8 @@ func (as *mqttAccountSessionManager) serializeRetainedMsgsForSub(rms map[string]
 		// was allocated (the session lock is held on entry). Spec5 [3.1.2.11.4].
 		if mp := c.mqtt.maxPacketSize; mp != 0 && len(headerBytes)+len(rm.Msg) > int(mp) {
 			if pi != 0 {
-				// The one place a RESERVED retained frame is provably never written: it
-				// was never even buffered. Abandoned rather than written, so the
-				// generation fence does not apply — no bytes reached the client (issue #93).
+				// A RESERVED retained item that is provably never admitted: it was never
+				// even staged, and no bytes reached the client (issue #93).
 				// The abandonment untracks the entry itself, so the separate
 				// untrackPublish this site used to issue is gone rather than left beside
 				// it: two mechanisms freeing one identifier is one too many (issue #103).
@@ -940,10 +938,11 @@ func (c *client) mqttSendRetainedMsgsToNewSubs(subs []*subscription) {
 // write them and the identifier would otherwise stay reserved against reallocation for the
 // session's life (issue #93).
 //
-// The detach shares the c.mu section that mutates c.subs, which is what makes a flusher and
-// a departure contend on ONE mutex: exactly one of them takes the slice, so each frame gets
-// exactly one disposition — written by the flusher, or detached here and then TRANSFERRED to
-// a replacement or ABANDONED by a teardown. Never both, never neither.
+// The detach shares the c.mu section that mutates c.subs, which is what makes the SUBACK
+// tail's transfer to the replay driver and a departure contend on ONE mutex: exactly one of
+// them takes the slice, so each frame gets exactly one disposition — transferred to the
+// driver, or detached here and then TRANSFERRED to a replacement or ABANDONED by a teardown.
+// Never both, never neither.
 //
 // Nil-tolerant by requirement, not by habit: this runs from processUnsub, which is generic
 // and is called on the internal account client during session-manager startup rollback —

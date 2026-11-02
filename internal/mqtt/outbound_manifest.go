@@ -22,12 +22,12 @@ import (
 
 // Immutable retained replay material (issue #107, row 7; design D4).
 //
-// # What retained QoS 1/2 loses
+// # What retained QoS 1/2 does not have
 //
-// Its register bypass. A retained send today builds its frames from the live retained slot, so
-// the material an obligation replays is whatever that slot happens to hold later — which is not
-// the material the client was promised. Replay material therefore becomes its own durable thing,
-// with a payload identity whose lifetime is NOT shared with the retained topic slot.
+// A register bypass. A retained send never builds its frames from the live retained slot, whose
+// content is whatever that slot happens to hold later — not the material the client was
+// promised. Replay material is its own durable thing, with a payload identity whose lifetime is
+// NOT shared with the retained topic slot.
 //
 // # A manifest plus create-only chunks, and the fence between them
 //

@@ -218,30 +218,29 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// reason: whether its PUBLISH was ever transmitted is unknown, so nothing here may
 		// settle the exchange; the next resume reads the pair whole (N-7.2).
 		//
-		// THREE shapes reach here, and what unifies them is that this handler cannot
-		// ADVANCE any of them safely — not that the acknowledgement must be illegitimate.
-		// R1 makes the illegitimacy argument hold for an ordinary allocation, whose PUBLISH
-		// was never sent. It does NOT hold for one that adopted an occupant: the same-source
-		// replacement arm preserves a live occupant's QoS precisely because the client may
-		// already be holding that exchange, so its acknowledgement can be entirely
-		// legitimate. The decline is still correct, for the mechanical reasons below, and it
-		// is not self-healing: nothing replays a discarded acknowledgement. A confirmed
-		// store clears regPending and a LATER acknowledgement can proceed, ordinarily after
+		// FOUR shapes reach here (the marker-opaque reservation above and the three below),
+		// and what unifies them is that this handler cannot ADVANCE any of them safely —
+		// not that the acknowledgement must be illegitimate. R1 makes the illegitimacy
+		// argument hold for an ordinary allocation, whose PUBLISH was never sent. It does
+		// NOT hold for one that adopted an occupant: the same-source replacement arm
+		// preserves a live occupant's QoS precisely because the client may already be
+		// holding that exchange, so its acknowledgement can be entirely legitimate. The
+		// decline is still correct, for the mechanical reasons below, and it is not
+		// self-healing: nothing replays a discarded acknowledgement. A confirmed store
+		// clears regPending and a LATER acknowledgement can proceed, ordinarily after
 		// another PUBLISH — conditional progress, not a guarantee.
 		//
 		//   - regForeign: the register behind this identifier is a record recovery could not
 		//     interpret, so the exchange is not this object's to advance.
 		//   - regPending: allocated but its register store has not confirmed. Accepting a
 		//     PUBREC here would trackAsPubRel a bodyless entry carrying jsDur=pubRelDurable()
-		//     and regSeq 0 — indistinguishable from a live retained exchange — tear down the
-		//     PUBLISH entry so the store then finds it gone and transmits nothing, and ack
-		//     the source away. PUBREL delivery would later admit that entry as retained and
-		//     put a PUBREL on the wire with no durable action: issue #94's own class plus the
-		//     lost source. The failed arm skips the PUBREL but still untracks and acks the
-		//     source, the same loss without the stray PUBREL.
+		//     and regSeq 0, tear down the PUBLISH entry so the store then finds it gone and
+		//     transmits nothing, and ack the source away: the source is lost. (PUBREL
+		//     admission refuses such a slot-less entry's record, so no PUBREL follows.) The
+		//     failed arm untracks and acks the source too, the same loss.
 		//   - regCancelled: a settled-but-unproven cancellation placeholder is bodyless and
 		//     equally never transmitted; a spurious success would convert it into the same
-		//     retained-looking PUBREL shape.
+		//     bodyless PUBREL shape.
 		//
 		// For regForeign, acting would convert the reservation into durable state for an
 		// exchange this object does not own — an UNCORRELATED PUBREL a later resume reads as
@@ -440,9 +439,10 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// failed delete was ignored, and a connected idle session had no continuation at all.
 		terminalOwned = true
 		if ack.res == nil {
-			// No section ever opened for this exchange — a retained send (R6), or an entry
-			// recovery installed — so there is no acquisition to wait on and the entry's own
-			// captured identity is the binding.
+			// No section ever opened for this exchange — an entry recovery installed, for one;
+			// an admitted retained exchange opens one like any other since issue #107 7c — so
+			// there is no acquisition to wait on and the entry's own captured identity is the
+			// binding.
 			sess.completeAcknowledgedPublish(c, pi, ack)
 			return
 		}
@@ -654,9 +654,6 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			// recorded the intent — is the continuation that rebuilds it. The empty
 			// PUBREL entry stays and holds the identifier; the materialized record's own
 			// delivery fills it through trackAsPubRel.
-			//
-			// A RETAINED exchange has no slot (R6), so nothing durable records its PUBREC
-			// and the rollback remains its only continuation.
 			//
 			// KEYED ON THE CLASSIFIED INTENT, never on the slot's existence: a slot whose intent
 			// CAS definitely failed still reads PUBLISH, and suppressing the rollback there

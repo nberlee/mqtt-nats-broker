@@ -319,8 +319,8 @@ func TestForcedLeaveExpiryIsNeverZeroOnThisPath(t *testing.T) {
 	}
 	if interval == 0 || clean {
 		t.Fatalf("a non-clean 3.1.1 resume carrying a shared membership had expiryInterval=%d "+
-			"clean=%v, want a non-zero interval and clean=false: the roadmap's "+
-			"'deletes a zero-expiry session' harm is unreachable on this path, and if that "+
+			"clean=%v, want a non-zero interval and clean=false: a refusal that deletes a "+
+			"zero-expiry session is unreachable on this path, and if that "+
 			"stops being true the forced leave's refusal arms become destructive", interval, clean)
 	}
 }
@@ -532,9 +532,9 @@ func TestPreConnackRefusalSignalAtTheLifetimeGrant(t *testing.T) {
 // openRestoreGate OR abandonRestoreGate. While the gate opened BEFORE the forced leave, every
 // post-CONNACK refusal already had its terminal behind it. Now that it opens AFTER the
 // settlement, a refusing arm that says nothing leaves the verdict un-terminated — and that is
-// not untidy, it is a lost first transmission: a withheld delivery parks until its bound
-// expires, finds the session detached, and can no longer record itself as never transmitted, so
-// its redelivery reaches the client marked DUP.
+// not untidy, it is a lost prompt redelivery: a withheld delivery parks until its bound
+// expires, finds the session detached, and can no longer record itself as withheld, so its
+// redelivery waits out AckWait instead of being NAKed forward.
 //
 // The assertion is the WAKE, not merely "the gate was not opened". A test that only checked the
 // latter would pass against the un-terminated bug, which is the whole hazard.
@@ -605,8 +605,8 @@ func TestForcedLeaveRefusalTerminatesTheRestoreVerdict(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the withheld waiter was never woken: a post-CONNACK refusal that neither opens " +
 			"nor abandons the restore verdict leaves every withheld delivery parked until its " +
-			"bound expires, after which it can no longer record itself as never transmitted and " +
-			"its redelivery reaches the client marked DUP")
+			"bound expires, after which it can no longer record itself as withheld and " +
+			"its redelivery waits out AckWait instead of being NAKed forward")
 	}
 	mu.Lock()
 	gotWoke, gotVerdict := woke, verdict

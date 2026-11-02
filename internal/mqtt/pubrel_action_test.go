@@ -684,8 +684,8 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 // "the slot must already say pubrel_ready".
 //
 // The corrected invariant is: NO SLOT-BACKED PUBREL BYTES ARE TRANSMITTED WITHOUT FIRST
-// ATOMICALLY ACQUIRING `pubrel_sending` (a live retained exchange has no slot, R6, and is
-// authorized by its live in-memory owner instead). The weaker version was wrong and cost
+// ATOMICALLY ACQUIRING `pubrel_sending`, and since issue #107 7c a retained exchange's PUBREL
+// is no exception (it is acquired on its own register). The weaker version was wrong and cost
 // the fulltests suite —
 // the store makes a record deliverable and JetStream delivers it before the PUBREC
 // handler's own phase CAS can run, so requiring `pubrel_ready` refused the very PUBREL the
@@ -1400,16 +1400,13 @@ func TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T)
 	}
 }
 
-// TestF092RecoveredSourceBackedPlaceholderIsNotRetained discriminates the jsDur guard in
-// retainedPubRelAdmittedLocked_. A drain/removal-versus-PUBREL-store crash cut leaves a
-// recovered placeholder whose durable owner slot is absent; installPubRelLocked writes it with
-// jsDur = the SOURCE consumer durable (or empty when the record has no source). Neither shape
-// names THIS generation's PUBREL consumer, so neither is a live retained exchange, and admitting
-// either through the slot-less retained path transmits a PUBREL with no durable action, recreating
-// issue #94 across brokers. jsDur — not sseq — is the discriminator: a genuine retained exchange
-// carries jsDur = pubRelDurable() and a NON-ZERO sseq on every AckWait redelivery after the first,
-// so an sseq test refused legitimate retained redeliveries. The sibling redelivery test covers
-// the admitted side.
+// TestF092RecoveredSourceBackedPlaceholderIsNotRetained: a drain/removal-versus-PUBREL-store
+// crash cut leaves a recovered placeholder whose durable owner slot is absent;
+// installPubRelLocked writes it with jsDur = the SOURCE consumer durable (or empty when the
+// record has no source). Transmitting either shape would put a PUBREL on the wire with no
+// durable action, recreating issue #94 across brokers. admitStoredPubRel refuses any record no
+// slot answers for — since issue #107 7c there is no slot-less retained admission at all — so
+// both arms must write nothing.
 func TestF092RecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
 	const owner = "zzzzzzzzzzzzzzzzzzzzzz"
 	for _, arm := range []struct {

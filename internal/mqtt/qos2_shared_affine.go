@@ -3185,11 +3185,10 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	// A resuming CONNECT provisions this affine consumer before its CONNACK, and
 	// [MQTT-3.2.0-1] makes the CONNACK the first packet the client may see. Wait
 	// rather than skip, and on a withheld verdict return WITHOUT acknowledging so
-	// JetStream redelivers. No withheld-marker bookkeeping: the affine path derives
-	// DUP from the JetStream delivery count, which is issue #76's open defect, and a
-	// copy refused here before trackPublish is exactly that finding's
-	// offered-but-never-transmitted population. Waiting is what keeps the ordinary
-	// case out of it. See sess_restore_gate.go.
+	// JetStream redelivers. No withheld-marker bookkeeping: DUP on the affine path is
+	// the entry's transmitted bit like everywhere else (issue #76), so refusing a copy
+	// here before trackPublish does not change the DUP flag it later carries. Waiting
+	// keeps the ordinary case from waiting out AckWait. See sess_restore_gate.go.
 	switch sess.awaitTransmissionGates(cc) {
 	case mqttTransmissionWithheld:
 		mqttTestRestoreGateBlockedHook("affine")
@@ -4293,10 +4292,12 @@ func (sess *mqttSession) reconcileQ2AffPubRelProofs(c *client) mqttQ2AffProofEvi
 //     a known reporting defect rather than a subtlety. mqttProcessPublishReceived
 //     stores the correlated PUBREL before it reaches mqttFinishQ2AffineDelivery, so
 //     PUBREC then a crash then an out-of-band consumer delete leaves exactly this
-//     shape for a message the client already answered. Lost is therefore sometimes
-//     a false loss report. It is not a conformance defect — Lost releases the group
-//     delivery without re-offering the message, so nothing is redistributed — and
-//     correcting it is its own roadmap item. See issue #68's residual 1.
+//     shape for a message the client already answered. The stored PUBREL names the
+//     assignment it completes, and resolving that reference on resume records
+//     PubRecProven, which outranks Lost; what Lost still cannot prove is stated in
+//     docs/CONFORMANCE.md ("`Lost` is what the broker can prove") with issue #68's
+//     residuals. It is not a conformance defect — Lost releases the group delivery
+//     without re-offering the message, so nothing is redistributed.
 //
 //   - claimed with the SOURCE MESSAGE authoritatively gone and no copy: no PUBLISH
 //     can ever have passed the materialization gate, and no group delivery can
@@ -4827,8 +4828,7 @@ func mqttRecordHasSharedQoS2(ps *mqttPersistedSession) bool {
 // confirmed: a remote winner that took the session over and PRESERVED this
 // generation wins the CAS instead, and the definite arm then restores a path
 // whose claims were never touched. The other two unwind sites still dispose
-// first; converting them has its own failure semantics and is filed in
-// docs/ROADMAP.md.
+// first; converting them has its own failure semantics (issue #52).
 //
 // Runs from the resolver, holding its record transaction and its ownership gate.
 // Safe against the move fence: closeQ2AffAndDrain waits only for in-flight move

@@ -267,8 +267,10 @@ func (sess *mqttSession) intendPubRelSlotOnly(c *client, ack *mqttPending) mqttP
 type mqttPubRelIntentOutcome uint8
 
 const (
-	// mqttPubRelIntentNoSlot: the exchange has no durable slot (a retained send, R6), so
-	// nothing durable records its PUBREC. The store proceeds, and a failed store rolls
+	// mqttPubRelIntentNoSlot: the PUBREC's entry carries no durable slot identity (an
+	// uncorrelated PUBREL, or no pending entry at all), so nothing durable records its PUBREC.
+	// A retained exchange is not this case: its PUBREC is its own register advance (issue
+	// #107 7c). The store proceeds, and a failed store rolls
 	// the exchange back — the rollback is its only continuation.
 	mqttPubRelIntentNoSlot mqttPubRelIntentOutcome = iota
 	// mqttPubRelIntentConfirmed: the slot is PROVEN past PUBREC under this exchange's
@@ -1732,8 +1734,8 @@ func (sess *mqttSession) terminalRefOKLocked(ref mqttInflightSlotRef) bool {
 // captured after the lock was re-taken, so a same-record redelivery that refreshed the ACK
 // subject is the one converted and its latest subject is the one returned for acknowledgement.
 // Its exact mapping goes; its evidence and ledger charge stay on the reservation; no ACK subject
-// does. A registerless RETAINED exchange has no slot to reserve, so its reference fails the
-// terminal-reference check and it is simply untracked.
+// does. An entry whose reference fails the terminal-reference check has no slot to reserve,
+// so it is simply untracked.
 //
 // sess.mu must be held.
 func (sess *mqttSession) pubCompConvertLocked(pi uint16, ack *mqttPending, ref mqttInflightSlotRef) (jsAckSubject string, reserved bool) {
@@ -1782,8 +1784,8 @@ func (sess *mqttSession) releaseTerminalReservation(ref mqttInflightSlotRef) {
 // everywhere else, and this site had merged them.
 //
 // The store's fail-closed behaviour over a retained terminal slot does NOT cover it: that
-// fence protects a re-mint that goes through storeInflightRegister, and a registerless
-// retained send allocates without consulting any register at all (R6). `bumpPI` asks the
+// fence protects a re-mint that goes through storeInflightRegister, and a retained snapshot
+// takes its identifier from bumpPI without consulting any register at all. `bumpPI` asks the
 // send registry, which is exactly what the exclusion is recorded in.
 //
 // Capacity release is unchanged — an exclusion charges none — so a Receive Maximum 1 client
@@ -2569,10 +2571,9 @@ func (sess *mqttSession) advanceFinishedSlotToTerminal(c *client, ref *mqttInfli
 //	No SLOT-BACKED PUBREL bytes are transmitted without first ATOMICALLY ACQUIRING
 //	`pubrel_sending`.
 //
-// The one exception is a LIVE RETAINED exchange: it has no register and so no slot (R6),
-// and is authorized instead by the live in-memory owner identity of its incarnation, in
-// the `smsg == nil` branch via retainedPubRelAdmittedLocked_. Everything with a slot obeys
-// the invariant above.
+// There is no exception. A retained exchange's PUBREL is acquired on its own register and
+// never stored on $MQTT_out (emitRetainedPubRel, issue #107 7c), so a record reaching this
+// admission with no slot is refused for every shape.
 //
 // It is NOT "the slot must already say pubrel_ready". That formulation looked equivalent
 // and is not, and the difference cost the fulltests suite: the store is what makes a record
@@ -2638,10 +2639,9 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 	// completion path releases the register, so there may be no slot". §10.5 removed that
 	// release: a past-PUBREC drained exchange keeps its owner slot for its whole life, so
 	// the slot IS present and admission binds transmission to an action on it exactly like
-	// every other slot-backed PUBREL (the sole slot-less exception is a live retained
-	// exchange — R6 — authorized by its in-memory owner, which a drained exchange is not).
+	// every other slot-backed PUBREL.
 	// Forwarding without an action contradicts the callback's "nothing below without an
-	// action" rule for a slot-backed record and leaves the no-deadline write unfenced — the
+	// action" rule for a slot-backed record and leaves the PUBREL write unfenced — the
 	// issue #94 hazard the whole item closes.
 	//
 	// The intent-vs-slot nonce "disagreement" the old shortcut existed for does not occur:
@@ -2692,16 +2692,12 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 			// can put a duplicate identifier on the wire.
 			return nil, false
 		case smsg == nil:
-			// NO SLOT. That is the RETAINED exchange's normal shape, not an error: a
-			// retained send has no JetStream source, so no register at all (R6), and
-			// nothing durable for an action to bind to. Across a restart that in-memory
-			// identity is gone, which is exactly right — a retained record surviving a
-			// restart has no durable authority and is refused rather than transmitted.
+			// NO SLOT, and nothing durable for an action to bind to, so nothing can
+			// authorize transmitting the record.
 			//
 			// A drained exchange is not admitted on intent alone. Its whole-life slot is
 			// required below just like every other source-backed exchange, so a slot-less
-			// delivery reaches the same fail-closed result as residue. Only retained
-			// exchanges can be admitted here without a durable slot.
+			// delivery reaches the same fail-closed result as residue.
 			//
 			// NO ABSENT-SLOT DISPOSAL, and this is a correction to the plan rather than
 			// an omission.
@@ -2730,9 +2726,8 @@ func (sess *mqttSession) admitStoredPubRel(c *client, pi uint16, owner mqttPubRe
 				"slot names exchange %q, so nothing can authorize transmitting it", pi, sess.id, owner.Nonce)
 			return nil, false
 		case cur == nil:
-			// PRESENT BUT UNREADABLE is not the slot-less retained shape. It reserves
-			// this identifier for an exchange that cannot be attributed, so no in-memory
-			// owner may authorize transmitting over it.
+			// PRESENT BUT UNREADABLE. It reserves this identifier for an exchange that
+			// cannot be attributed, so nothing may authorize transmitting over it.
 			return nil, false
 		}
 		if cur.Nonce != owner.Nonce {
@@ -3369,9 +3364,8 @@ func (sess *mqttSession) pubRelAdmissionContext(c *client, pi uint16, cur *mqttI
 	}
 	if !corr.Ok || corr.SrcDur != cur.Dur || corr.SrcSeq != cur.Seq {
 		// The record names a DIFFERENT source than the slot's exchange. Refused: this is
-		// the positive mismatch. An absent correlation is the retained shape, whose normal
-		// authority is slot-less; it cannot authorize a source-backed slot merely because
-		// an owner nonce happened to match.
+		// the positive mismatch. An absent correlation cannot authorize a source-backed slot
+		// merely because an owner nonce happened to match.
 		c.Warnf("MQTT: withholding a stored PUBREL for packet identifier %d of client %q: it "+
 			"correlates to source %s/%d but the identifier's exchange came from %s/%d",
 			pi, sess.id, corr.SrcDur, corr.SrcSeq, cur.Dur, cur.Seq)
@@ -3489,8 +3483,8 @@ func (sess *mqttSession) handOffPublishEntryLocked(pi uint16, act *mqttSendActio
 		return false
 	}
 	if act == nil {
-		// Slot-less retained admission owns no source-backed PUBLISH entry. Treating an
-		// unexpected one as ours would delete another exchange on nonce-less authority.
+		// No action, no authority over the PUBLISH entry. Treating an unexpected one as ours
+		// would delete another exchange on nonce-less authority.
 		return false
 	}
 	// UNIQUELY OWNED: the entry must be the one this exchange is about. A different
@@ -3506,8 +3500,7 @@ func (sess *mqttSession) handOffPublishEntryLocked(pi uint16, act *mqttSendActio
 	// An acquired action means the slot is the authority for this exchange, and a
 	// `pubrel_ready`-or-later slot is itself the durable statement that the exchange is past
 	// PUBREC. The retirement is therefore already durable; marking it insecure would make
-	// PUBCOMP wait for a second write stating the same fact. Slot-less retained admission
-	// has no recovered PUBLISH entry to hand off, so it returns at the top of this helper.
+	// PUBCOMP wait for a second write stating the same fact.
 	if mqttInflightPastPubRec(act.slot.state) {
 		sess.retireSourceLocked(pub.jsDur, pub.sseq, &mqttRetiredSource{
 			pi:         pi,

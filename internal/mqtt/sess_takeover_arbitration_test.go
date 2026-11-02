@@ -811,7 +811,8 @@ func TestRejectionMarkerRepresentsBaseZero(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestWonClaimDeletesEvenWhenItsReleaseIsSuperseded guards the rejected B5 reordering
-// (M20a), and states the window the roadmap tracks.
+// (M20a), and states the claim-won deletion window, which the generation-retirement
+// watermark makes recognisable and repairs (issue #32).
 //
 // Releasing before deleting was designed to close the claim-won deletion window and was
 // refuted: releaseTeardown proves absence rather than authorship, the unsafe interval
@@ -820,7 +821,7 @@ func TestRejectionMarkerRepresentsBaseZero(t *testing.T) {
 //
 // The discriminating shape is a teardown whose claim was WON and whose release was then
 // SUPERSEDED. Under the shipped order the deletions have already happened, so the
-// retiring generation's consumers are gone — which is exactly the open window. Under the
+// retiring generation's consumers are gone — which is exactly that window. Under the
 // rejected order they would still be there. Asserting on the ordering at claim time
 // cannot tell the two apart, because both orders have deleted nothing yet.
 func TestWonClaimDeletesEvenWhenItsReleaseIsSuperseded(t *testing.T) {
@@ -870,7 +871,8 @@ func TestWonClaimDeletesEvenWhenItsReleaseIsSuperseded(t *testing.T) {
 // A bound-gated arm calling a parentless foreign record a fork was designed and refuted:
 // its premise — that nothing legitimately deletes a bound session's record — is false,
 // and a FALSE fork suppresses delayed-Will cancellation, so the failure was never
-// vocabulary-only. Cross-term create x create recognition stays a ROADMAP §0.2 blocker.
+// vocabulary-only. Cross-term create x create recognition is not provided: the pair
+// concedes, a stated residual (docs/CONFORMANCE.md, R-create; issue #33).
 //
 // Aimed at that ADDITIVE arm specifically. The broader mutation — dropping the
 // ackPWID != "" conjunct outright — is already killed by TestSessEmptyParentsAreNotSiblings,

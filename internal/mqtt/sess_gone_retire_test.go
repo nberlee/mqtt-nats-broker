@@ -487,7 +487,7 @@ func TestF036GoneRetirementAbnormalExitAfterTheDetach(t *testing.T) {
 	// THE CONNECTION. It must be closed rather than left attached to a session object
 	// that has been reset and re-minted underneath it.
 	// Polled, because the close itself runs on its own goroutine: the tail deliberately
-	// does not block the sweep on a socket write that takes c.mu with no deadline.
+	// does not block the sweep on a socket write that holds c.mu until it returns.
 	deadline := time.Now().Add(2 * time.Second)
 	for !b.closed() {
 		if time.Now().After(deadline) {

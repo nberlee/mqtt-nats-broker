@@ -47,7 +47,8 @@
 // what removed its record. Absence from the reference set is therefore not proof that a
 // generation is dead; it is proof that this broker cannot see an owner.
 //
-// That gap is **issue #40**'s open false-absence inference, whose scope was widened for it by
+// That gap is **issue #40**'s false-absence inference, closed by putting a retirement licence in
+// place of every inference from absence; its scope was widened for it by
 // issue #36's audit (https://github.com/nberlee/mqtt-nats-broker/issues/131). It is not restated at each site below:
 // the word "authoritative" throughout this file carries exactly the bound stated here, and
 // the consequences per resource class belong to the findings that own those classes —

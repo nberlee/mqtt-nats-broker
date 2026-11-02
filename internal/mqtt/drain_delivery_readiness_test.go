@@ -29,8 +29,10 @@ import (
 // the terms the client asked for, or the filter fails. They deliberately do NOT cover
 // what a failed filter does with an adoption that already happened, nor whether an
 // already-started QoS 2 exchange still completes at QoS 2 when the re-SUBSCRIBE asks
-// for QoS 1. Both are separate defects, reachable without this repair, and both are
-// filed in docs/ROADMAP.md, "0.3 Confirmed alpha blockers".
+// for QoS 1. Both were separate defects, reachable without this repair, and both are
+// closed: an adopted durable is named continuously, and an exchange keeps the QoS it was
+// first transmitted at (docs/CONFORMANCE.md, "A started exchange keeps the QoS it was first
+// transmitted at").
 
 // unindexDrain removes a drain's reverse-index entry, which is the half of the R2
 // state a fixture cannot get from addTestDrain. The other half — no delivery

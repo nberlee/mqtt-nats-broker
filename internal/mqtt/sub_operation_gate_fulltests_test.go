@@ -67,12 +67,8 @@ func TestLiveSubPlainQoS0IsNotGated(t *testing.T) {
 }
 
 // TestLiveSubGateWithholdsQoS12AndRecordsIt pins the QoS 1/2 disposition through the real
-// callback: the delivery is withheld, and it is RECORDED as never transmitted so the attempt
-// that finally goes out is still a first send [MQTT-3.3.1-1].
-//
-// Waiting rather than dropping is what keeps the ordinary case out of issue #76's
-// DUP-on-a-first-transmission population; the marker is what makes a withheld attempt
-// distinguishable from a delivered one.
+// callback: the delivery is withheld, and it is RECORDED as withheld so a freed slot can NAK
+// it forward.
 func TestLiveSubGateWithholdsQoS12AndRecordsIt(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)

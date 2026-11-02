@@ -77,8 +77,8 @@ type mqttAdvanceExchangeAckRequest struct {
 	// Register is the exact in-flight slot occupant this advance re-phases, read at RegisterSeq.
 	// The slot member CASes it at RegisterSeq, so every predicate validated here against the
 	// read record is still true at commit. It is REQUIRED: an exchange advances only beside its
-	// slot (the write boundary refuses one advanced alone), and a retained send (R6) has no
-	// durable slot at all, so it is advanced by no acknowledgement.
+	// slot (the write boundary refuses one advanced alone). A retained exchange is no exception:
+	// since issue #107 7c it is register-backed and its acknowledgements advance its slot.
 	Register    *mqttInflightRecord
 	RegisterSeq uint64
 

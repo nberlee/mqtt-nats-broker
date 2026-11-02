@@ -434,7 +434,7 @@ var mqttTestRecordTxWithdrawGuardHookV atomic.Pointer[func(sess *mqttSession)]
 // validateSessStream verifies a $MQTT_sess stream can carry session records.
 // Derived from what this owner does: a per-subject CAS store (sess.save),
 // loadLastMsgFor reads, filtered forward scans, and exact-sequence CONFIRMED
-// deletes (the teardown release, session expiry, the CONNECT rollback). It
+// deletes (the teardown release, which session expiry also reaches through clear()). It
 // never purges, so DenyPurge is an audited NON-prerequisite here — a validator
 // that listed it would refuse legitimate deployments for a setting no operation
 // depends on.

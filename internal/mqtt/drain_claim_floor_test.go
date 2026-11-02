@@ -423,7 +423,7 @@ func TestPositivelyClassifiedEntriesWithoutASourceRestrictNothing(t *testing.T) 
 			name:       "retained replay",
 			ack:        &mqttPending{qos: 1, regNonce: "nonce-retained-replay"},
 			unresolved: false,
-			why:        "a retained send has no register and no stream source by construction (R6)",
+			why:        "a retained snapshot allocation has no register until its admission lands, and never a stream source",
 		},
 		{
 			name:       "live stream delivery",
@@ -573,7 +573,7 @@ func TestRollbackCancelsRatherThanSkipsAParkedAllocation(t *testing.T) {
 		t.Fatal("neither a cancelled nor a withdrawn delivery becomes a claim")
 	}
 	if deferredCancel != "ack.101" {
-		t.Fatalf("the withheld marker is reinstalled so a later first transmission still "+
-			"carries DUP=0, got %q", deferredCancel)
+		t.Fatalf("the withheld marker is reinstalled so a freed slot can still NAK the "+
+			"delivery forward, got %q", deferredCancel)
 	}
 }

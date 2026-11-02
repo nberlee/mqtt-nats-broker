@@ -124,10 +124,10 @@ func (sess *mqttSession) replayAllowanceLocked(replay map[uint16]*mqttPending) i
 	return avail
 }
 
-// resumeDeferredAllowanceLocked is how many deferred, never-transmitted deliveries the resume
-// pacing pass may re-offer after replaying `replayed` of its allowance: the remainder, and none
-// at all while the custody reconstruction is incomplete — a deferred delivery is NEW work, and
-// some occupancy is unknown.
+// resumeDeferredAllowanceLocked is how many deferred (withheld) deliveries the resume pacing
+// pass may re-offer after replaying `replayed` of its allowance: the remainder, and none at all
+// while the custody reconstruction is incomplete — the pass budgets a deferred delivery as NEW
+// work, and some occupancy is unknown.
 //
 // Lock held on entry.
 func (sess *mqttSession) resumeDeferredAllowanceLocked(replayAllowance, replayed int) int {

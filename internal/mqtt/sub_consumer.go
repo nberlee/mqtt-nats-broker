@@ -582,9 +582,8 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 				phaseSub.mqtt.phaseOwned = false
 				// Released LAST, in the same critical section: a delivery waiting
 				// on the gate re-reads every field above once it wakes, so the
-				// backlog JetStream pushed before the CONNACK is delivered as the
-				// first transmission it is, in order, with this filter's live
-				// options. See mqttSub.phaseGate.
+				// backlog JetStream pushed before the CONNACK is delivered now, in
+				// order, with this filter's live options. See mqttSub.phaseGate.
 				mqttReleasePhaseGateLocked(phaseSub)
 				adopted = true
 			}

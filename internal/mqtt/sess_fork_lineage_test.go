@@ -414,11 +414,11 @@ func testLandChildRecord(t *testing.T, e *testInflightEnv, mutate func(*mqttPers
 	return &child
 }
 
-// TestSessRawWritersStampLineage covers the two record writers that do not go through
-// saveWithDetail: the expiry sweep's disconnect stamp and the CONNECT rollback re-save.
+// TestSessRawWritersStampLineage covers the expiry sweep's disconnect stamp, a record writer
+// that does not go through saveWithDetail.
 //
-// Both build their bytes from a record they already hold, so both must set PWID from THAT
-// record's identity before minting their own. Getting the order wrong makes the write
+// It builds its bytes from a record it already holds, so it must set PWID from THAT
+// record's identity before minting its own. Getting the order wrong makes the write
 // parent ITSELF, which is indistinguishable from a first create and silently ends the
 // chain.
 func TestSessRawWritersStampLineage(t *testing.T) {

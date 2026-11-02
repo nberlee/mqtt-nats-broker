@@ -1732,10 +1732,10 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 	// onto the old subscription after it.
 	//
 	// A subscription leaving c.subs must not take an owed retained replay with it (issue #93).
-	// Its frames are MOVED to the replacement, which is the entry every later flush and
-	// every later teardown will find, so the replay is still delivered on a successful
-	// packet and the reservation is still released on a failed one — by the ordinary
-	// written and abandoned paths, with no special case here.
+	// Its frames are MOVED to the replacement, which is the entry the SUBACK tail's transfer
+	// to the replay driver and every later teardown will find, so the replay is still
+	// delivered on a successful packet and the reservation is still released on a failed
+	// one — by the ordinary transfer and abandoned paths, with no special case here.
 	displaced := c.detachDisplacedRetainedLocked(c.subs[string(sid)])
 	c.subs[string(sid)] = sub
 	c.mu.Unlock()

@@ -1311,10 +1311,8 @@ func TestForkRepairAnchorConjuncts(t *testing.T) {
 
 // TestForkRepairEmptyDeltaMintsNothing is test 12.
 //
-// This is the property that replaces the site-specific refusal an earlier design had at the
-// CONNECT rollback: grant terms are not carried fields, so a rollback of a CONNECT that
-// repaired nothing produces no capsule and no site has to know whether it might be undoing a
-// repair.
+// Grant terms are not carried fields, so a CONNECT that repaired nothing produces no capsule,
+// and no later writer has to know whether it might be undoing a repair.
 func TestForkRepairEmptyDeltaMintsNothing(t *testing.T) {
 	t.Parallel()
 	e := testNewRejectionEnv(t, "empty-delta")

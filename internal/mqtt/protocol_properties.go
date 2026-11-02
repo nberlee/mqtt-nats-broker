@@ -600,7 +600,8 @@ func (r *mqttReader) readProperties(ctx byte) (*mqttProperties, error) {
 		case mqttPropMaxPacketSize:
 			// The client is telling us the largest packet it will accept. We honor
 			// this on every server-generated packet: an outbound PUBLISH exceeding
-			// it is discarded (mqttEnqueuePublishMsgTo, serializeRetainedMsgsForSub),
+			// it is discarded (mqttPreparePublishMsgTo for a delivery; serializeRetainedMsgsForSub
+			// and the replay driver's verdict for a retained replay),
 			// and any other packet drops its Reason String or, failing that, is not
 			// sent (mqttEnqueueFittingProto). Stored as c.mqtt.maxPacketSize. Spec5
 			// [3.1.2.11.4].

@@ -856,8 +856,6 @@ func TestMQTTInflightDrainedQoS2ReleasesRegister(t *testing.T) {
 	testMQTTFlush(t, sub, nil, subr)
 }
 
-// A retained-message delivery has no JetStream backing and therefore no register,
-// which is R6's second half. It must not leave one behind, and must not be recovered.
 // TestMQTTInflightRetainedSendIsRegistered REPLACES TestMQTTInflightRetainedSendNotRegistered by
 // name, with its assertion reversed (issue #107 7c): a retained QoS 1 send is no longer an unregistered
 // write from the live retained slot. Its delivery stands as a register-backed exchange — the

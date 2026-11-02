@@ -238,13 +238,11 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// The connection's own verdict comes FIRST, before any lock and before
 	// sub.mqtt is touched: a resuming CONNECT installs live delivery interest
 	// before its CONNACK, and [MQTT-3.2.0-1] makes the CONNACK the first packet
-	// the client may see. A withheld delivery was never transmitted, so it is
-	// recorded the way an in-flight-cap withholding is, which is what makes the
-	// attempt that finally goes out a first send [MQTT-3.3.1-1]. See
-	// sess_restore_gate.go.
+	// the client may see. This attempt is withheld and not transmitted, so it is
+	// recorded the way an in-flight-cap withholding is, which lets a freed slot NAK
+	// it forward. See sess_restore_gate.go.
 	// Anything but Open blocks, and both blocking verdicts owe the same thing here:
-	// the marker is what makes the attempt that finally goes out a first
-	// transmission, whether the restore was refused or this wait simply ran out.
+	// the marker, whether the restore was refused or this wait simply ran out.
 	// Comparing against Withheld ALONE is a defect — a timed-out verdict would fall
 	// through and transmit before the CONNACK.
 	//
@@ -282,8 +280,9 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	// A resume-reconciliation subscription holds its consumer's interest before
 	// the CONNACK, so JetStream pushes the session's offline backlog into a
 	// window in which nothing may be transmitted yet. WAIT for the phase to
-	// release it rather than skipping: these are first transmissions, and
-	// skipping them would stall each until AckWait and then mark it DUP. The
+	// release it rather than skipping: skipping would stall each until AckWait.
+	// (DUP is not at stake either way: it is the exchange's transmitted state,
+	// issue #76.) The
 	// lock is released while waiting — the releasing goroutine needs it — and
 	// every check below is re-evaluated afterwards. See sess_resume_reconcile.go.
 	if sub.mqtt != nil && sub.mqtt.phaseGate != nil {
@@ -318,12 +317,11 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 	}
 	if sess.c != cc || sub.mqtt == nil || sub.mqtt.closed {
 		// A delivery the phase never released — the wait ran out, or the filter
-		// was reclaimed unadopted — was NEVER TRANSMITTED, so its redelivery is a
-		// first send however many attempts JetStream has counted. Record it the
-		// way an in-flight-cap withholding is recorded, which is what makes
-		// trackPublish clear DUP on the attempt that finally goes out
-		// [MQTT-3.3.1-1] (and lets a freed slot NAK it forward rather than
-		// waiting out AckWait).
+		// was reclaimed unadopted — was not transmitted on this attempt. Record it the
+		// way an in-flight-cap withholding is recorded, which lets a freed slot NAK it
+		// forward rather than waiting out AckWait. Its redelivery's DUP flag is its
+		// exchange's transmitted state (issue #76): DUP=0 for a delivery never
+		// attempted, DUP=1 for a resumed exchange that was.
 		//
 		// WHICH deliveries are still owed is not decided here. The owed-delivery
 		// predicate — and its sess.c == nil arm, which covers a RACE rather than a
@@ -1020,8 +1018,9 @@ type mqttPublishSection struct {
 // Session lock NOT held on entry.
 func (sess *mqttSession) openPublishSection(pc, cc *client, sub *subscription, pi uint16, qos byte, sseq uint64,
 	reply string, retainAsPub bool, subID int, originalTopic, msg, props []byte, life *mqttDeliveryLifecycle) *mqttPublishSection {
-	// The SEND SECTION. queueOutbound is a synchronous socket write with no deadline, so
-	// between here and its return a teardown, a denial, a recovery pass or a terminal
+	// The SEND SECTION. queueOutbound is a synchronous socket write: its write deadline bounds
+	// how long it can block, not whether anything happens meanwhile, so between here and its
+	// return a teardown, a denial, a recovery pass or a terminal
 	// acknowledgement can free this identifier and bumpPI can re-mint it — two PUBLISHes
 	// under one identifier, in order, on one socket. Reserved, those paths condemn the
 	// entry instead of removing it and the continuation runs at endSend (issue #89 WP5).
@@ -1165,8 +1164,8 @@ func (sess *mqttSession) transmitAcquired(sec *mqttPublishSection) {
 	prep.bindSection(sec.tok)
 	sec.wrote = sec.pc.mqttEnqueuePreparedPublishMsgTo(cc, sec.sub, prep)
 	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
-	// A refused transmission here is unreachable for an admitted frame (admission is
-	// monotone) and would in any case be a possibly-attempted exchange: nothing is disposed.
+	// A refused transmission here — a prevented write, or (unreachable for an admitted frame)
+	// one that no longer fits — is a possibly-attempted exchange: nothing is disposed.
 }
 
 func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, reply string, rmsg []byte) {
@@ -1323,9 +1322,10 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	//
 	// Nothing below may run — not the opener, not a map mutation, not a duplicate
 	// acknowledgement, and above all not the transmission — until this broker holds a
-	// non-revocable action on the slot that owns this identifier. The one exception is a
-	// live RETAINED exchange, which has no slot (R6) and reaches the transmission below with
-	// act == nil, authorized instead by its live in-memory owner in admitStoredPubRel.
+	// non-revocable action on the slot that owns this identifier. There is no exception:
+	// admitStoredPubRel admits only with an action, and a retained exchange's PUBREL is never
+	// stored on $MQTT_out — it is emitted from its own register (emitRetainedPubRel, issue
+	// #107 7c) — so the act == nil branches below are defensive.
 	//
 	// The discriminator is NOT an inference from the record's fields against the entry
 	// that happens to hold the identifier. Five plan revisions tried that and every one
@@ -1379,9 +1379,8 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// retransmission the client resolves with PUBCOMP — not issue #94's hazard of a PUBREL
 	// under an identifier a DIFFERENT exchange owns.
 	//
-	// A retained exchange has no slot and therefore no action (R6); it is authorized by
-	// the live in-memory owner identity of its incarnation and by the connection check
-	// below, so it is deliberately not fenced here.
+	// An admitted record always carries an action (see THE DURABLE ADMISSION above), so the
+	// act != nil guard is defensive: a nil action is refused before the write further down.
 	if act != nil {
 		if _, out := sess.proveAcceptedIncarnation(cc); out != mqttAcceptanceCurrent {
 			return
@@ -1411,8 +1410,8 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// state in admitStoredPubRel. Reapplying the older in-memory rule after acquiring an
 	// action can contradict the slot: it could acknowledge the canonical record merely
 	// because a stale entry remembers another sequence, leaving the slot naming a deleted
-	// canonical forever. The in-memory rule remains only for retained exchanges, which
-	// have no slot or action from which to make that decision.
+	// canonical forever. The in-memory rule is reached only by an admission without an
+	// action, which admitStoredPubRel never returns; it stays as a defensive branch.
 	if existing, ok := sess.pendingPubRel[pi]; act == nil && ok && existing != nil && existing.jsAckSubject != _EMPTY_ {
 		if sseq, _, _, _, _ := ackReplyInfo(reply); sseq != 0 && existing.sseq != 0 && sseq != existing.sseq {
 			// Read UNDER the lock. pubRelConsumer is written under sess.mu by teardown
@@ -1435,8 +1434,9 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			return
 		}
 	}
-	// THE SEND SECTION. mqttEnqueuePubResponse is a synchronous socket write with no
-	// deadline, so between here and its return a PUBCOMP for an EARLIER copy of this
+	// THE SEND SECTION. mqttEnqueuePubResponse is a synchronous socket write: its write
+	// deadline bounds how long it can block, not whether anything happens meanwhile, so
+	// between here and its return a PUBCOMP for an EARLIER copy of this
 	// same PUBREL can free the identifier and bumpPI can re-mint it — a new PUBLISH
 	// queued under an identifier whose PUBREL bytes are still going out. Opened in the
 	// SAME critical section as the tracking below, so nothing can free the identifier
@@ -1448,7 +1448,7 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	// token opened below. Decided before the opener, whose own unit would make every debt look
 	// standing; returning here leaves the record unacknowledged and the acquired action to the
 	// deferred drain, exactly as the opener's refusal does. Only this timer-driven path judges it:
-	// a retained exchange's PUBREL has no consumer and is never re-offered.
+	// a retained exchange's PUBREL is never stored on $MQTT_out and so never re-offered.
 	resend, answer := sess.pubRelResendLocked(cc, pi)
 	if resend {
 		sess.mu.Unlock()
@@ -1462,19 +1462,17 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 		sess.bindPubRelAnswerLocked(cc, pi)
 	}
 	if !sendOK {
-		// A transmission is already out under this identifier. Return WITHOUT
-		// acknowledging: the record stays pending and AckWait re-offers it once that
-		// write has returned, the same cost trackPublish's regPending decline accepts.
+		// The opener refused. Return WITHOUT acknowledging: the record stays pending and
+		// AckWait re-offers it, the same cost trackPublish's regPending decline accepts.
 		//
-		// WHICH POPULATION STILL REACHES THIS. A slot-backed exchange no longer does for a
-		// live PUBLISH: admission refuses that upstream, on the durable action token or on
-		// the hold's pubIdent, and leaves a redrive waiter the transmission's end wakes
-		// (issue #100). What is left here is the RETAINED exchange, which has no slot (R6) and
-		// so no admission to refuse it, and the opener's refusal is not specific to a
-		// PUBLISH — it fires for any live transmission under the identifier, a PUBREL's
-		// included. A continuation here would need a predicate recognising both kinds, so
-		// this population stays on AckWait and is stated as a residual in
-		// docs/CONFORMANCE.md rather than left implied by this comment.
+		// DEFENSIVE for an overlapping transmission: admission already excludes every one
+		// it can meet. A live PUBLISH section is refused upstream, on the durable action
+		// token or on the hold's pubIdent, with a redrive waiter the section's end wakes
+		// (issue #100); an earlier PUBREL keeps its action until after its own token ends,
+		// because its drain is deferred before its endPubRelSend; and the allocator never
+		// re-mints an identifier a token or a pending entry still holds. A retained
+		// exchange's PUBREL never reaches this callback (issue #107 7c). The opener's own
+		// connection and recovery guards can still refuse here.
 		sess.mu.Unlock()
 		return
 	}
@@ -1504,8 +1502,8 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 			return
 		}
 	} else {
-		// No acquired action and no slot: nothing may be written (issue #107 7c deleted the slot-less
-		// retained exchange this branch used to serve).
+		// No acquired action: nothing may be written. Unreachable while admitStoredPubRel admits
+		// only with an action; kept so a nil action can never reach the writer.
 		sess.mu.Unlock()
 		return
 	}
@@ -1513,16 +1511,13 @@ func mqttDeliverPubRelCb(sub *subscription, pc *client, _ *Account, subject, rep
 	sess.mu.Unlock()
 
 	// THE ACTION'S DRAIN was armed at admission, for the same reason. The durable claim spans
-	// the no-deadline socket write below, so it must be drained however this returns —
+	// the socket write below, so it must be drained however this returns —
 	// normally, early, or through a recovered panic. A drain that depended on reaching the
 	// end of the function would leave an abandoned action on any of those paths, which is
 	// the residual this mechanism exists to bound rather than manufacture.
 	//
 	// It runs AFTER endSend by defer ordering: the local send token is what the identifier's in-memory
 	// reservation keys on, and the durable action must outlive it rather than the reverse.
-	// A RETAINED exchange is admitted with NO action, because it has no slot for one to
-	// bind to (R6) — so both the drain and the write-entry transition are skipped, and its
-	// identifier is held by the retained reservation instead.
 	//
 	// WRITE ENTRY IS CONDITIONAL (issue #107 row 2, consult 28), for both classes: the holder must still
 	// be the live, un-released, un-drained holder of its token, and an ordinary one must hold the
@@ -1668,14 +1663,6 @@ func sparkbReplaceDeathTimestamp(msg []byte) []byte {
 	return buf.Bytes()
 }
 
-// Common function to mqtt delivery callbacks to serialize and send the message
-// to the `cc` client.
-// mqttEnqueuePublishMsgTo frames and queues an outbound PUBLISH to cc. It
-// returns false without sending when the packet would exceed the client's MQTT
-// 5.0 Maximum Packet Size; the caller is then responsible for completing the
-// message (for QoS1/2, acking the JS delivery so it is not redelivered).
-// subID is the subscription's v5 Subscription Identifier (0 = none), injected
-// into the properties block for a v5 receiver. Spec5 [3.8.2.1.2].
 // mqttPreparedPublish is an outbound PUBLISH that has passed ADMISSION — framed for this
 // receiver, Maximum Packet Size checked against the frame it will actually be sent in —
 // and is waiting for TRANSMISSION. The two phases are split so a QoS 1/2 sender can record
@@ -1792,15 +1779,17 @@ func (c *client) mqttPreparePublishMsgTo(cc *client, pi uint16, qos byte, dup, r
 }
 
 // mqttEnqueuePreparedPublishMsgTo performs TRANSMISSION of an admitted PUBLISH: the alias
-// framing and binding commit (atomic with the queue, under cc.mu), any retained frames
-// parked on the subscription, and the write itself. It returns false only if the frame no
-// longer fits, which admission's monotonicity makes unreachable for an admitted frame; a
-// caller that had recorded intent treats that as a possibly-attempted exchange all the
-// same, never as proof nothing was sent.
+// framing and binding commit (atomic with the queue, under cc.mu) and the write itself. It
+// flushes nothing staged on the subscription: the retained replay driver submits each admitted
+// retained frame through it explicitly (transmitRetained). It returns false when an ordinary
+// QoS 1/2 frame has no acquisition, when the authorized write is PREVENTED (a sealed output
+// gate, a missing socket, a lost acquisition — reachable during teardown), or when the frame
+// no longer fits, which admission's monotonicity makes unreachable for an admitted frame. A
+// caller that had recorded intent treats any of them as a possibly-attempted exchange, never as
+// proof nothing was sent.
 func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, p mqttPreparedPublish) bool {
-	// AN ORDINARY QoS 1/2 FRAME WITHOUT ITS ACQUISITION IS NOT WRITTEN AT ALL — not raw, not
-	// partially, not after the retained flush. Refused first, so nothing of this call reaches the
-	// transport and the buffered retained frames wait for the next write.
+	// AN ORDINARY QoS 1/2 FRAME WITHOUT ITS ACQUISITION IS NOT WRITTEN AT ALL — not raw and not
+	// partially. Refused first, so nothing of this call reaches the transport.
 	if p.requireAction && (p.out == nil || p.out.action == nil) {
 		return false
 	}
@@ -1878,7 +1867,7 @@ func (c *client) mqttEnqueuePreparedPublishMsgTo(cc *client, sub *subscription, 
 }
 
 // mqttEnqueueQoS0PublishMsgTo admits and transmits in one call a PUBLISH that bears NO
-// packet identifier and so records no durable send intent: QoS 0 and the retained sends.
+// packet identifier and so records no durable send intent: a QoS 0 delivery.
 // The identifier is the literal zero by construction — there is no parameter for one — which
 // is what lets the every-send-reserved guard prove this entry point cannot carry an
 // identifier outside a send section. A QoS 1/2 sender calls the two phases itself, with

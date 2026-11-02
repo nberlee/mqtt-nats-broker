@@ -10,11 +10,11 @@
 // Both a duplicate exactly-once delivery and a permanent wedge.
 //
 // So a PUBREL names its source: the durable that delivered it and that delivery's
-// stream sequence. Absent headers mean "no correlation", and that is a real,
-// current shape rather than a legacy one — a retained QoS 2 send is tracked with a
-// wholly empty pending entry (trackPublishRetained), so its PUBREC names no source
-// and the PUBREL is stored uncorrelated. Safe, because a delivery with no source
-// durable is not one a drain can be waiting on.
+// stream sequence. Absent headers mean "no correlation": a PUBREC whose entry names no
+// source durable stores its PUBREL uncorrelated. Safe, because a delivery with no source
+// durable is not one a drain can be waiting on. A retained QoS 2 exchange never stores one:
+// its PUBREL is the canonical record its PUBREC advance creates on $MQTT_inflight (issue
+// #107 7c).
 //
 // The deterministic Nats-Msg-Id exists for a different hazard. A superseded broker
 // can still perform its own (non-CAS) PUBREL store after a peer took over and
@@ -68,12 +68,8 @@ const (
 	// identity, proves current session custody, and atomically acquires a non-revocable
 	// action before transmitting.
 	//
-	// The retained case is where that gap bites hardest, and it is a stated residual rather
-	// than a property of this header. A retained QoS 2 send has no slot at all (R6): it
-	// mints its exchange nonce into the in-memory reservation and carries it here, so its
-	// authority is that reservation and nothing durable. After a restart the reservation is
-	// gone, so admission refuses the record rather than treating this syntactic identity as
-	// durable authority; see docs/CONFORMANCE.md.
+	// A record no slot answers for is refused, whatever this header says: the syntactic
+	// identity is never treated as durable authority.
 	mqttPubRelOwnerHeader = "Nmqtt-Q2Owner"
 )
 
@@ -163,8 +159,8 @@ func (r mqttPubRelAffineRef) valid() bool { return r.State == mqttPubRelAffineRe
 func (r mqttPubRelAffineRef) refused() bool { return r.State == mqttPubRelAffineRefMalformed }
 
 // mqttPubRelCorrelation is the source delivery a PUBREL completes. Ok is false for
-// an uncorrelated record — a retained or otherwise unbacked QoS 2 send names no
-// source durable, and a missing or malformed header parses the same way — which
+// an uncorrelated record — an unbacked QoS 2 send names no source durable, and a
+// missing or malformed header parses the same way — which
 // callers must treat as it says: no correlation, no source or drain interaction.
 type mqttPubRelCorrelation struct {
 	SrcDur string
@@ -302,10 +298,10 @@ func mqttExactUint16Header(hdr []byte, key string) bool {
 //     transmitted under;
 //   - the exchange owner must be valid, because the record is EVIDENCE about one exchange
 //     rather than a claim on an identifier;
-//   - the source correlation may be ABSENT — a retained send has no source at all — but a
-//     PARTIAL one is refused rather than silently read as uncorrelated, because
-//     uncorrelated IS the retained shape and admitting a partial one under that reading
-//     would give it a retained record's licence.
+//   - the source correlation may be ABSENT — an exchange with no source durable has none
+//     to name — but a PARTIAL one is refused rather than silently read as uncorrelated,
+//     because admitting it under that reading would give it an uncorrelated record's
+//     licence.
 //
 // The affine reference is deliberately NOT a clause here, and the boundary matters. A
 // MALFORMED reference does not stop the record being transmitted: the client is owed the
@@ -383,9 +379,9 @@ func mqttDecodeStoredPubRel(hdr []byte) (mqttStoredPubRelShape, error) {
 			out.pi, why)
 	case partialCorr:
 		// One correlation header without a usable pair. The parser folds this into
-		// "uncorrelated", which is right for ITS caller and wrong as an admission: an
-		// uncorrelated record is the RETAINED shape, and admitting a partial one under
-		// that reading would give it a retained record's licence.
+		// "uncorrelated", which is right for ITS caller and wrong as an admission:
+		// admitting a partial one under that reading would give it an uncorrelated
+		// record's licence.
 		return out, fmt.Errorf("stored PUBREL for packet identifier %d carries a partial source correlation",
 			out.pi)
 	}

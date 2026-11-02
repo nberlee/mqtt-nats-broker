@@ -53,14 +53,15 @@ type mqttPending struct {
 	// Meaningful on pendingPubRel entries only.
 	pubRelAffRef mqttPubRelAffineRef
 
-	// qos is this exchange's RECORDED QoS, and the wire QoS of every PUBLISH admitted
-	// for it. Ordinarily that is the value its in-flight register holds; a RETAINED
-	// send has no register at all (R6), so for one it is the QoS selected when the
-	// identifier was allocated. It is NOT a claim that a transmission happened: an
-	// admitted replacement donates the occupant's QoS to an allocation that may never
-	// have been transmitted (storeInflightRegister's same-source arm). This broker has no
-	// durable "was transmitted" fact: its one durable transmission fact is the opposite one,
-	// the allocation's unsent marker, which proves the PUBLISH never went out (issue #76, issue #90).
+	// qos is this exchange's RECORDED QoS, and the wire QoS of every PUBLISH admitted for
+	// it. Ordinarily that is the value its in-flight register holds; a RETAINED allocation
+	// has no register until its admission lands, so until then it is the QoS selected when
+	// the identifier was allocated, which the admission then records. It is NOT a claim
+	// that a transmission happened: an admitted replacement donates the occupant's QoS to
+	// an allocation that may never have been transmitted (storeInflightRegister's
+	// same-source arm). This broker has no durable "was transmitted" fact: its one durable
+	// transmission fact is the opposite one, the allocation's unsent marker, which proves
+	// the PUBLISH never went out (issue #76, issue #90).
 	//
 	// It is NOT recomputed from the subscription. A re-SUBSCRIBE may replace the
 	// filter's maximum QoS at any time ([MQTT-3.8.4-3]) and must not interrupt a
@@ -69,9 +70,9 @@ type mqttPending struct {
 	// handshake (2 -> 1) or drives a PUBREC whose slot transition the CAS then refuses
 	// (1 -> 2).
 	//
-	// Sourced ONLY from per-exchange evidence, and these three are the whole list: the
-	// QoS the register actually landed holding, the register's own QoS on recovery, or
-	// -- for a retained send, which has no register -- the QoS selected at identifier
+	// Sourced ONLY from per-exchange evidence, and these three are the whole list: the QoS
+	// the register actually landed holding, the register's own QoS on recovery, or -- for a
+	// retained allocation whose admission has not landed -- the QoS selected at identifier
 	// allocation. Subscription-level and drain-level QoS are NOT evidence about an
 	// individual exchange: one drain routinely holds both, since a QoS 1 publication
 	// through a QoS 2 subscription is transmitted at QoS 1.
@@ -83,11 +84,11 @@ type mqttPending struct {
 	qos byte
 
 	// regSeq is the stream sequence of this delivery's durable in-flight register on
-	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete
-	// targets regSeq exactly, because the register's subject is reused by later
-	// exchanges on the same identifier (R4). Zero/empty for a delivery with no
-	// register: a retained send (no JetStream backing at all). A slot-backed exchange
-	// recovered from a PUBREL record carries the whole-life owner slot's sequence here.
+	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete targets
+	// regSeq exactly, because the register's subject is reused by later exchanges on the
+	// same identifier (R4). Zero until a register lands: a retained allocation carries only
+	// its nonce until its admission is promoted. A slot-backed exchange recovered from a
+	// PUBREL record carries the whole-life owner slot's sequence here.
 	//
 	// regNonce is minted with the ALLOCATION, one step ahead of the store that writes
 	// it, so an allocation cancelled while its store is in flight can be named durably
@@ -232,7 +233,8 @@ type mqttPending struct {
 	// sequence, which is the freshness fence a stale terminal continuation is checked
 	// against (see reapRegisterWithVerdictGated).
 	//
-	// Zero for an entry with no durable slot: a retained send has none (R6).
+	// Zero for an entry with no durable slot yet: an allocation whose register has not
+	// landed, a retained one included until its admission is promoted.
 	slot mqttInflightSlotRef
 
 	// sendSettle is the continuation a removal path parked because a send section was
@@ -302,30 +304,20 @@ type mqttSendHold struct {
 	// would leak on the first and free an identifier the client still holds on the
 	// third.
 	owner uint64
-	// retainedGen names the session INCARNATION under which a still-unwritten buffered
-	// RETAINED PUBLISH allocated this identifier; empty when there is none. A retained
-	// send has no JetStream backing, so it has no in-flight register (R6) and the send
-	// sections the other two fields serve never covered it: it allocates in
-	// serializeRetainedMsgsForSub, is buffered on sub.mqtt.prm, and is written by a
-	// LATER queueOutbound. Across that span its only other reservation is the
+	// retainedGen is non-empty while a RETAINED SNAPSHOT holds this identifier: from its
+	// allocation in serializeRetainedMsgsForSub until the replay driver hands the hold to
+	// the send section that transmits the admitted copy (handRetainedHoldToSectionLocked)
+	// or the allocation is abandoned on proof that nothing was admitted under it
+	// (releaseRetainedSendAbandonedLocked). Across materialization and admission the
+	// snapshot has no register and no send section, and its only other reservation is the
 	// pendingPublish entry, which clear() destroys — so this is what carries the
-	// identifier through the discard (issue #93).
-	//
-	// The INCARNATION rather than a bool, and that is the whole subtlety. Written
-	// completion ends the reservation only while the allocating generation is still
-	// current: then pendingPublish is still there to carry custody on, or a PUBACK for
-	// this very frame removed it and the identifier is genuinely free. Past a clear()
-	// neither is true — the map was nilled and last_pi reset — so this hold is the
-	// identifier's ONLY reservation and the write returning does not free it. clear()
-	// re-mints the generation and an acknowledgement does not, which is exactly the
-	// discriminator, and it never errs toward releasing: no path nils pendingPublish
-	// without re-minting.
+	// identifier through a discard (issue #93). It records the allocating generation, but
+	// only its presence is read.
 	//
 	// Owner-scoped like pubCompOwed, for a different reason. Once the connection is no
 	// longer the session's, no ADDITIONAL identifier-bearing PUBLISH under this
 	// identifier can reach that socket — every route that could build one opens a
-	// reservation this session refuses on sess.c != cc — so the orphaned frame is one
-	// PUBLISH under one identifier on one socket and needs no reservation at all.
+	// reservation this session refuses on sess.c != cc — so the hold reserves nothing.
 	retainedGen string
 	// action is the LOCAL half of the PUBREL action claim: the durable half lives on the
 	// slot as ActionToken. Nil when no action is held.
@@ -385,8 +377,9 @@ type mqttSendHold struct {
 	// identifier's exclusion here, where bumpPI already looks through
 	// sendReservedLocked. Retaining the entry instead breaks three separate contracts:
 	// the drain's cancellation handoff, the real release at commitStagedReleases, and
-	// registerless retained frames, which can never obtain a durable confirmation and
-	// would leak their Receive Maximum charge forever.
+	// retained snapshot allocations abandoned before admission, which have no register to
+	// obtain a durable confirmation from and would leak their Receive Maximum charge
+	// forever.
 	//
 	// Like terminalOwed it reserves the IDENTIFIER ONLY and charges no capacity, so no
 	// capacity semantics change anywhere. Like action it is NOT owner-scoped: an
@@ -522,24 +515,25 @@ const (
 	mqttSendActionReleased
 )
 
-// mqttRetainedFrame is one buffered retained PUBLISH and the reservation that holds its
+// mqttRetainedFrame is one staged retained replay item and the reservation that holds its
 // packet identifier.
 //
-// The frame is FRAMED at SUBSCRIBE time, under the session lock, and written by a later
-// queueOutbound — either the SUBACK tail's flush or the first live delivery to this
-// subscription. The identifier is carried alongside because that later writer is what
-// discharges the reservation, and because a departing subscription has to release the
-// reservations of frames nobody will ever write.
+// It is SNAPSHOTTED at SUBSCRIBE time, under the session lock, staged on the subscription,
+// and transferred after the SUBACK to the session's replay driver, which writes a QoS 0
+// frame through the actionless writer and materializes, admits and transmits a QoS 1/2 one
+// (issue #107 7c). The identifier is carried alongside because the driver's transmission
+// takes over the reservation, and because a departing subscription has to release the
+// reservations of items nobody will ever admit.
 //
-// A QoS 0 retained frame allocates no identifier and carries pi == 0. That is the same
-// exclusion R6 makes for every QoS 0 send: nothing is reserved, so nothing is released.
+// A QoS 0 retained frame allocates no identifier and carries pi == 0: nothing is reserved,
+// so nothing is released.
 type mqttRetainedFrame struct {
 	header []byte
 	msg    []byte
 	pi     uint16
 	// nonce is the ALLOCATION this frame belongs to, copied from the entry
 	// trackPublishRetained just minted. It travels with the frame because the frame's
-	// disposition is what releases the entry, and by then a packet identifier is not
+	// disposition is what releases or admits the entry, and by then a packet identifier is not
 	// enough to name the exchange: clear() removes the entry and re-mints last_pi, so a
 	// disposition arriving afterwards would otherwise untrack whatever exchange now holds
 	// the identifier. That is the race issue #93's reservation exists for, and the nonce is

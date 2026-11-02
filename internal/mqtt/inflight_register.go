@@ -54,8 +54,8 @@
 // after an exact read proves the correlated PUBREL record exists; the record is evidence
 // and payload, not a second identifier claimant. Admission then CAS-acquires an action on
 // the slot before any slot-backed PUBREL write, and PUBCOMP advances it to terminal before
-// disposal. (A live retained exchange has no register and so no slot, R6; it is outside R2
-// and is authorized instead by the live in-memory owner identity of its incarnation.)
+// disposal. A retained exchange obeys R2 from its admission on: it is register-backed, and
+// its PUBREL is acquired on its own slot (issue #107 7c).
 // Recovery completes a publish-state handoff only from a PRESENT record matching the
 // slot's PI, nonce, source and affine identity. Source-only correlation proves no exchange
 // and is quarantined. A complete source does not finish an exchange whose PUBREL still
@@ -116,9 +116,9 @@
 // mqttPending.transmitted, set by the send section that wrote and by a PUBREC rollback,
 // seeded on resume from the marker's presence, and derived from the JetStream delivery
 // count NOWHERE. A delivery withheld by the in-flight cap is still never registered
-// (trackPublish returns before allocating). A retained-message send has no JetStream
-// backing at all, so it has no register, no marker and no transmitted bit (R2's slot-less
-// admission), and no post-restart redelivery.
+// (trackPublish returns before allocating). A retained QoS 1/2 send is no exception: its
+// admission writes the register and the unsent marker together, and a resume restores it
+// from them like any other exchange (issue #107 7c).
 //
 // # Cost
 //
@@ -4545,8 +4545,8 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 // Two kinds of register are voided here and the difference is only in what else has to
 // happen. An allocation whose store is still IN FLIGHT is withdrawn exactly as stageDrain
 // withdraws one — the tracking goes, a reservation holds the identifier until the store
-// settles, and a withheld marker keeps the eventual first transmission at DUP=0 if this packet
-// rolls back ([MQTT-3.3.1-1]) — and its cancellation is returned so a tombstone can be written
+// settles, and a withheld marker lets a freed slot NAK the delivery forward if this packet
+// rolls back — and its cancellation is returned so a tombstone can be written
 // promptly. A TRANSMITTED delivery's register needs none of that: its entry is left for the
 // teardown's REAP to remove, and only the verdict is recorded. Since issue #38 that removal is
 // no longer unconditional — the reap spares records above its enumeration watermark and
@@ -4635,9 +4635,9 @@ func (sess *mqttSession) voidRegistrationsLocked(durable string, lic mqttDestroy
 // verdict on one of them is a lie that any save in this packet would make durable, and
 // unvoiding afterwards cannot retract what a save already stored.
 //
-// The withheld marker each cancellation leaves in sess.deferred is what keeps DUP honest if
-// the staging is rolled back: nothing was transmitted, so the eventual first transmission
-// must carry DUP=0 ([MQTT-3.3.1-1]). Those markers are the caller's to preserve across a
+// The withheld marker each cancellation leaves in sess.deferred is what lets a freed slot NAK
+// the delivery forward if the staging is rolled back (DUP needs no marker: since issue #76 it is
+// the entry's transmitted bit). Those markers are the caller's to preserve across a
 // conversion — see convertDowngradeCandidatesLocked, which transfers the durable's LIVE
 // marker set around stageDrain because stageDrain owns that map and drops what it cannot
 // itself discover.
@@ -5038,10 +5038,10 @@ func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqt
 		}
 	}
 	// Withheld markers for this durable go too. This is the COMMITTED-teardown half of the
-	// rule stageDrain's cancellation relies on: a marker exists so a rolled-back
-	// UNSUBSCRIBE keeps DUP=0 for a never-transmitted delivery, and once the consumer is
-	// actually gone nothing will re-offer the sequence, so the marker has no first
-	// transmission left to protect.
+	// rule stageDrain's cancellation relies on: a marker exists so that after a rolled-back
+	// UNSUBSCRIBE a freed slot can NAK a withheld delivery forward, and once the
+	// consumer is actually gone nothing will re-offer the sequence, so the marker has
+	// nothing left to NAK.
 	for k := range sess.deferred {
 		if k.jsDur == durable {
 			delete(sess.deferred, k)
@@ -6247,10 +6247,12 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 			// before this retry loop: mutating the argument would not change the record
 			// that is about to be written at the occupant's exact sequence.
 			//
-			// What this does NOT do is keep the inherited exchange alive. A concurrent
-			// cancellation or a failed store still destroys or abandons it -- those are
-			// pre-existing lifecycle defects of this arm, filed as their own roadmap
-			// item, and no claim here may say otherwise.
+			// What the arm's two exits do with the inherited exchange: a concurrent
+			// cancellation does NOT destroy it — a register-only replacement that landed
+			// under a cancelled allocation stands and keeps its identifier excluded
+			// (confirmInflightRegister's cancelled arm). A store that definitively fails
+			// still abandons this attempt's in-memory entry (abandonInflightRegister): the
+			// occupant's record is not touched and its identifier stays excluded.
 			rec.QoS = cur.QoS
 		case mqttSlotDispAbandon, mqttSlotDispReapCompleteThenRetry:
 			// AN OCCUPANT NAMING ANOTHER DELIVERY, and the two proofs this arm — and only
@@ -6383,9 +6385,13 @@ func (sess *mqttSession) storeInflightRegister(c *client, pi uint16, qos byte, j
 // clears regPending, releasing the entry for transmission.
 //
 // If the entry has gone (a discard, a takeover, or a terminal path that ran while the
-// store was in flight) the register is deleted immediately: it names an identifier
-// nothing is tracking, and leaving it would make the next resume reserve an
-// identifier for a delivery that has no pending entry.
+// store was in flight) the send is refused and the register is disposed of by what
+// landed. A register-only replacement that inherited a possibly-transmitted occupant is
+// KEPT, with its identifier excluded: it is the only durable carrier of what the client may
+// hold. Anything else names an identifier nothing is tracking, so it is removed through the
+// confirmed delete, or failing that its cancellation tombstone or the nonce verdict —
+// leaving it would make the next resume reserve an identifier for a delivery that has no
+// pending entry.
 //
 // markerSeq and transmitted are the entry's send state as the boundary derived it from
 // the landed pair (rows 1 and 16): a marker captured at step 3 and transmitted=false, or
@@ -6398,8 +6404,9 @@ func (sess *mqttSession) confirmInflightRegister(c *client, l mqttLandedRegister
 	if ack == nil || !ack.regPending || ack.jsDur != jsDur || ack.sseq != sseq {
 		sess.mu.Unlock()
 		// The allocation was CANCELLED under us — a packet staging a drain, a
-		// discard, a takeover — so this register describes a delivery that will never be
-		// sent. Removing it is CONFIRMED and retried, unlike the ordinary terminal delete
+		// discard, a takeover — so this attempt will never send. Unless the arm below
+		// keeps an inherited, possibly-transmitted register, removing it is CONFIRMED and
+		// retried, unlike the ordinary terminal delete
 		// which may be fire-and-forget: there the record is reconcilable, because its
 		// source is still live and classifiable. Here the consumer is usually being deleted
 		// in the same breath, and a register whose consumer is gone is deliberately NOT read
@@ -6753,13 +6760,10 @@ func (sess *mqttSession) ownAllocationCancelled(pi uint16, nonce string) bool {
 // takeover can), and removing whatever now holds the identifier would take out state
 // this attempt has no claim on.
 //
-// The sequence is then recorded as DEFERRED, which is not bookkeeping tidiness: it is
-// what keeps the DUP flag honest. Nothing was transmitted here, so the eventual first
-// transmission must carry DUP=0 ([MQTT-3.3.1-1]) — but its AckWait redelivery arrives
-// with a JetStream delivery count above one, and trackPublish derives dup from that
-// count unless the sequence is known to have been withheld. This is the same state, for
-// the same reason, as a delivery withheld at the in-flight cap, so it uses the same
-// marker; the NAK it may attract simply retries the register sooner.
+// The sequence is then recorded as DEFERRED: the same state as a delivery withheld at the
+// in-flight cap, so it uses the same marker, and the NAK a freed slot may give it simply
+// retries the register sooner. Its eventual first transmission carries DUP=0 regardless:
+// since issue #76 DUP is the entry's transmitted bit, never the delivery count.
 //
 // lic is the licence of the admitting connection whose ladder gives up (its callers'
 // mqttLicenceOf(c), read before the session lock): a continuity record's withdrawal carries it.
@@ -7625,8 +7629,8 @@ func (sess *mqttSession) adoptAcquiredPublishAction(c *client, pi uint16, tok *m
 // Session lock NOT held on entry.
 func (sess *mqttSession) advancePublishTerminal(c *client, ack *mqttPending) bool {
 	if ack == nil || ack.slot.name.subject == _EMPTY_ || !ack.slot.slotOK() {
-		// No durable slot: a retained send (R6) has none, and there is nothing to
-		// advance. The disclosed residual, removed with the source-less retained slot.
+		// No durable slot, so nothing to advance. A retained exchange is not this case:
+		// since issue #107 7c it is register-backed and carries its slot like any other.
 		return true
 	}
 	if ack.slot.state == mqttInflightPublishTerminal {
@@ -8091,30 +8095,34 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 	if h != nil && h.token != _EMPTY_ {
 		// A transmission is already going out under this identifier — an earlier PUBREL
 		// copy, or the PUBLISH whose successful PUBREC replaced the entry while its
-		// write was still blocked. The caller returns WITHOUT acknowledging, so AckWait
-		// re-offers the record once that write has returned.
+		// write was still blocked. The ordinary delivery callback's admission excludes
+		// this overlap upstream, so for it the refusal is defensive (it returns without
+		// acknowledging and AckWait re-offers the record). A retained exchange's emission
+		// reaches it while its PUBLISH section is still releasing its token, and the
+		// PUBREL stays owed to the retained continuation worker, which retries it
+		// (emitRetainedPubRelOnce).
 		return _EMPTY_, false
 	}
-	// NO retained-term refusal here, and NO fence on a live pendingPublish entry. Durable
-	// SLOT-BACKED PUBREL admission has already acquired the exact owner-slot action before
-	// reaching this primitive; a live retained exchange has no slot (R6) and reaches this
-	// opener with no such action, authorized instead by its in-memory owner — which is
-	// exactly the overlap the passage below turns on. Reintroducing a broader, map-shaped
-	// refusal here would contradict that authority and break the legitimate retained and
-	// drain overlaps below.
+	// NO retained-term refusal here, and NO fence on a live pendingPublish entry. Both
+	// callers have already acquired the exact owner-slot action before reaching this
+	// primitive: the delivery callback through durable PUBREL admission, and a retained
+	// exchange's emission on its own register (emitRetainedPubRelOnce, issue #107 7c).
+	// Reintroducing a broader, map-shaped refusal here would contradict that authority and
+	// break the legitimate drain overlap below.
 	//
-	// A retained-only hold may therefore coexist with the PUBREL token and PUBCOMP debt this
-	// call is about to add. That is coherent: the owner matches so nothing is reset, and
+	// Were a retained-only hold to coexist with the PUBREL token and PUBCOMP debt this call
+	// is about to add, that would be coherent: the owner matches so nothing is reset, and
 	// endSend and consumePubRelAckLocked both ask the shared liveness predicate, so each term
 	// is removed only by the event that discharges it.
 	//
 	// Three refusals were tried here and all three were REFUTED — do not re-propose any:
 	//
-	//   - refusing on a live RETAINED term refuses the retained QoS 2 exchange's OWN PUBREL,
-	//     because the delivery-side flusher keeps the hold live until after it writes the
-	//     triggering live PUBLISH; the record then waits out AckWait where HEAD transmitted at
-	//     once. The compensating "retire the term at PUBREC" needed two further fixes and
-	//     still lost custody across a concurrent clear() in one ordering or the other;
+	//   - refusing on a live RETAINED term refused the retained QoS 2 exchange's OWN PUBREL
+	//     while retained frames were written by a flusher that kept the hold live past the
+	//     PUBLISH; the compensating "retire the term at PUBREC" needed two further fixes and
+	//     still lost custody across a concurrent clear(). Since issue #107 7c the hold is
+	//     handed to the send section before the PUBLISH is written, so the refusal would now
+	//     guard nothing;
 	//   - refusing on ANY live pendingPublish entry breaks a drain, which
 	//     legitimately recreates a CORRELATED PUBREL under a recovered entry's identifier
 	//     (measured: three drain tests timed out waiting for a PUBREL the client was owed);
@@ -8160,16 +8168,17 @@ func (sess *mqttSession) beginPubRelSendLocked(cc *client, pi uint16) (string, b
 	return token, true
 }
 
-// beginRetainedSendLocked reserves pi for ONE buffered retained PUBLISH, from this
-// allocation until the frame has been written or is provably unwritable. "Written" ends
-// the reservation only while the allocating incarnation is still current: past a clear()
-// this hold is the identifier's ONLY reservation and outlives the write. See
-// releaseRetainedSendWrittenLocked.
+// beginRetainedSendLocked reserves pi for ONE retained snapshot, from its allocation until
+// the replay driver hands the hold to the send section that transmits the admitted copy
+// (handRetainedHoldToSectionLocked), or the allocation is abandoned on proof that nothing was
+// admitted under it (releaseRetainedSendAbandonedLocked). Past a clear() this hold is the
+// identifier's ONLY reservation. The driver also re-takes it when a transmission attempt
+// leaves the PUBLISH still owed.
 //
-// Taken at ALLOCATION rather than at the flush, in the same sess.mu acquisition that runs
-// trackPublishRetained, so no goroutine ever observes the identifier allocated and
-// unreserved. That is also why the caller's own gate matters: serializeRetainedMsgsForSub
-// runs holding asm.sessLocked[sess.id], so no successor can rebind between the two.
+// Taken at ALLOCATION, in the same sess.mu acquisition that runs trackPublishRetained, so no
+// goroutine ever observes the identifier allocated and unreserved. That is also why the
+// caller's own gate matters: serializeRetainedMsgsForSub runs holding
+// asm.sessLocked[sess.id], so no successor can rebind between the two.
 //
 // Session lock held on entry.
 func (sess *mqttSession) beginRetainedSendLocked(cc *client, pi uint16) bool {
@@ -8207,25 +8216,23 @@ func (sess *mqttSession) beginRetainedSendLocked(cc *client, pi uint16) bool {
 	return true
 }
 
-// releaseRetainedSendAbandonedLocked ends the reservation of a retained frame that is
-// provably never going to be written — its subscription has left c.subs, or the frame was
-// discarded before it was ever buffered.
+// releaseRetainedSendAbandonedLocked ends the reservation of a retained snapshot that is
+// provably never going to be admitted — its subscription departed, the item was skipped
+// before it was staged, or every admission attempt under it was proven never landed.
 //
-// Unconditional, and the generation fence deliberately does NOT apply: no bytes reached
-// the client, so there is nothing for a re-minted identifier to collide with. Holding on
-// here would reserve the identifier against reallocation for the session's life while
-// nothing will ever write the frame (issue #93).
+// Unconditional: nothing was admitted and no bytes reached the client, so there is nothing
+// for a re-minted identifier to collide with. Holding on here would reserve the identifier
+// against reallocation for the session's life while nothing will ever transmit the item
+// (issue #93).
 //
-// IT ALSO RELEASES THE PENDING ENTRY, and this is the ONE site in the tree that may. A
-// retained send has no register and no source (R6), so no durable pair can ever say whether
-// its PUBLISH was transmitted, and abandonment is the only fact that proves it was not.
-// issue #93's departure property is what makes that proof total — every frame is WRITTEN by a
-// flusher, or DETACHED and then TRANSFERRED to a same-sid replacement or ABANDONED here,
-// never both and never neither — so a retained entry that has NOT been abandoned is
-// possibly-attempted and goes on reserving its identifier. Deciding it anywhere else means
-// inferring "never sent" from something that is not the proof, which is what
-// dropUnredeliverableRetained did on resume until issue #103 deleted it: having no way to
-// redeliver is a fact about this broker, never about what the client received.
+// IT ALSO RELEASES THE PENDING ENTRY, and for a snapshot allocation this is the site that
+// may. Before its admission lands the allocation has no register, so no durable pair can say
+// anything about it, and abandonment on that proof is the only fact that ends it. Once the
+// admission lands it is a register-backed Retained exchange whose end is decided by its
+// records — acknowledged, withdrawn unsent or abandoned (outbound_retained_withdraw.go,
+// outbound_retained_abandon.go) — never here. Inferring "never sent" from anything else is
+// what dropUnredeliverableRetained did on resume until issue #103 deleted it: having no way
+// to redeliver is a fact about this broker, never about what the client received.
 //
 // Keyed by the ALLOCATION, not the identifier. A disposition can arrive after a clear() has
 // removed the entry and reset last_pi, so an identifier-keyed untrack would remove whichever
@@ -8245,11 +8252,6 @@ func (sess *mqttSession) releaseRetainedSendAbandonedLocked(cc *client, pi uint1
 	sess.dropRetainedSendLocked(pi, h)
 }
 
-// dropRetainedSendLocked clears the retained term and removes the hold once it reserves
-// nothing more. The removal asks the shared predicate rather than re-spelling it, which
-// is what keeps a co-resident write token or PUBCOMP debt from being discarded with it.
-//
-// Session lock held on entry.
 // handRetainedHoldToSectionLocked ends a snapshot's retained hold on pi so a send section can open
 // over the same identifier (issue #107 7c): the retained hold would make the section refuse, and the
 // caller opens the section in this same critical section, so the identifier is never unreserved
@@ -8262,6 +8264,11 @@ func (sess *mqttSession) handRetainedHoldToSectionLocked(pi uint16) {
 	}
 }
 
+// dropRetainedSendLocked clears the retained term and removes the hold once it reserves
+// nothing more. The removal asks the shared predicate rather than re-spelling it, which
+// is what keeps a co-resident write token or PUBCOMP debt from being discarded with it.
+//
+// Session lock held on entry.
 func (sess *mqttSession) dropRetainedSendLocked(pi uint16, h *mqttSendHold) {
 	h.retainedGen = _EMPTY_
 	if !sess.sendHoldLiveLocked(h) {
@@ -8269,9 +8276,8 @@ func (sess *mqttSession) dropRetainedSendLocked(pi uint16, h *mqttSendHold) {
 	}
 }
 
-// abandonRetainedSends is endRetainedSends' counterpart for frames that will never be
-// written, and it is the reason the two verbs are separate: this one is not fenced by the
-// generation, and it is the one that releases the pending entry as well as the hold.
+// abandonRetainedSends releases the snapshot allocations of retained items that will never
+// be admitted: the hold and the pending entry together.
 //
 // It takes the frames' RESERVATIONS rather than their bare identifiers, because the entry it
 // releases is named by the allocation and not by the identifier — see
@@ -8361,14 +8367,13 @@ func (sess *mqttSession) markPubRelEnteredLocked(pi uint16, token string) {
 	}
 }
 
-// retainedHeldLocked reports whether this hold still reserves its identifier because a
-// buffered retained PUBLISH under it is unwritten, or was written past a clear() that
-// destroyed the pendingPublish entry which would otherwise have carried custody on.
+// retainedHeldLocked reports whether this hold still reserves its identifier for a retained
+// snapshot that has not yet been handed to its send section or abandoned.
 //
 // Owner-scoped like pubCompHeldLocked, and sound for a different reason: once the
 // connection is no longer the session's, no ADDITIONAL identifier-bearing PUBLISH under
-// this identifier can reach that socket, so the orphaned frame is one PUBLISH under one
-// identifier and reserves nothing. See mqttSendHold.retainedGen (issue #93).
+// this identifier can reach that socket, so the hold reserves nothing. See
+// mqttSendHold.retainedGen (issue #93).
 //
 // Session lock held on entry.
 func (sess *mqttSession) retainedHeldLocked(h *mqttSendHold) bool {
@@ -8416,8 +8421,8 @@ func (sess *mqttSession) inflightSubjectLocked(pi uint16) string {
 // pair is written, so a freshly allocated entry dropped here never paid for a register; the
 // one shape that arrives holding one is a RECOVERED never-transmitted entry, restored as a
 // live source and expired on a later delivery. Recovery's own exclusions cannot cover it,
-// because at recovery time nothing was being removed. A registerless retained send keeps its
-// existing behaviour untouched.
+// because at recovery time nothing was being removed. A retained exchange never arrives here:
+// every caller is a source delivery's callback, and a retained copy has no source delivery.
 //
 // It is ONE function rather than a sequence open-coded at each call site so the property has
 // something to test: the allocator-level regression drives exactly what production runs.
@@ -8898,22 +8903,14 @@ func (sess *mqttSession) endSendCore(c *client, pi uint16, token string,
 			// becomes allocatable — nothing has confirmed the slot gone. See
 			// mqttSendSettleOwesExclusion for why the acknowledgement kinds are not here.
 			//
-			// REGISTERLESS RETAINED SENDS ARE EXEMPT, and the test is the entry's own
-			// JetStream backing rather than its nonce: a retained send mints a nonce with
-			// no register behind it (R6), so binding an exclusion to that nonce would
-			// reserve an identifier against a durable slot that never existed.
-			//
-			// STRUCTURALLY UNREACHABLE TODAY, and stated as a defensive agreement rather
-			// than as a live case: a settlement is parked by condemnSendLocked, which
-			// requires a `sendNonce`, which only beginSendLocked installs, and that call
-			// matches the entry against a non-empty source durable. A retained send opens
-			// its section through beginRetainedSendLocked, which records `retainedGen` on
-			// the hold and no nonce on the entry, so it can never be condemned. The guard
-			// keeps the two from drifting; it is not evidence that a retained frame
-			// reaches here. TestMQTTDeferredSettlementExcludesOnlyARegisterBackedIdentifier
-			// pins that unreachability directly.
-			// Keyed on the entry's VALIDATED SLOT, not on source coordinates (issue #107 7c): a retained
-			// exchange is register-backed with no source durable, and its identifier is exactly as
+			// An entry with NO durable backing is exempt: binding an exclusion to a nonce no
+			// register carries would reserve an identifier against a slot that never existed.
+			// A retained snapshot allocation is that shape until its admission lands, and it
+			// cannot be condemned here anyway — its hold is not a send section and installs
+			// no `sendNonce` (TestMQTTDeferredSettlementExcludesOnlyARegisterBackedIdentifier).
+			// Keyed on the entry's VALIDATED SLOT as well as on source coordinates (issue #107
+			// 7c): an ADMITTED retained exchange is register-backed with no source durable,
+			// transmits through an ordinary send section, and its identifier is exactly as
 			// durable as an ordinary one's.
 			if mqttSendSettleOwesExclusion(settle.kind) && ((ack.jsDur != _EMPTY_ && ack.sseq != 0) || ack.slot.slotOK()) {
 				sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
@@ -10339,7 +10336,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	var reserve []mqttRecoveredInflightReg
 	// A custody contest can observe the exact slot deleted after the PUBREL scan. Keep
 	// that outcome through classification so the earlier scan cannot install a slot-less
-	// placeholder which a later callback might mistake for retained in-memory authority.
+	// placeholder for an exchange whose slot is already gone.
 	closedPubRelOwners := make(map[uint16]string)
 	noteCustodyClosed := func(in []mqttRecoveredInflightReg) {
 		for _, fr := range in {
@@ -11835,8 +11832,8 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	// The opaque ones reserve their identifier and nothing else: there is no source to
 	// enter in cpending, because the unreadable body is exactly what would have named
 	// it. The entry still carries its register sequence, which is what tells a later
-	// reader this reservation stands on a register rather than being the register-less
-	// shape a retained send has (R6).
+	// reader this reservation stands on a register rather than being an allocation whose
+	// register never landed.
 
 	for _, rv := range opaque {
 		if _, live := sess.pendingPublish[rv.rec.PI]; live {

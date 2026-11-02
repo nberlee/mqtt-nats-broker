@@ -700,12 +700,17 @@ type mqttSession struct {
 	// only for the duration of the invocation; nil otherwise.
 	resumeLineage map[string][]uint64
 
-	// deferred tracks QoS 1/2 deliveries withheld by trackPublish because the
-	// session was at its effective in-flight cap (Receive Maximum /
-	// MaxAckPending). Keyed by JS durable + stream sequence; the value is the
+	// deferred records QoS 1/2 delivery ATTEMPTS that reached a callback and were
+	// withheld, not transmitted: by trackPublish at the effective in-flight cap
+	// (Receive Maximum / MaxAckPending), by the restore or phase gate
+	// (recordWithheldDeliveryLocked), and for a cancelled or abandoned
+	// registration. Keyed by JS durable + stream sequence; the value is the
 	// latest delivery attempt's JS ack subject, NAK'd to force prompt
-	// redelivery when the client frees a slot (Spec5 [4.9]). In-memory only,
-	// naturally bounded by the consumers' MaxAckPending.
+	// redelivery when the client frees a slot (Spec5 [4.9]). A marker records the
+	// attempt only, never the exchange's history: a resumed exchange that was
+	// transmitted before can have a re-offer withheld too, and DUP is the entry's
+	// transmitted bit (issue #76). In-memory only, naturally bounded by the
+	// consumers' MaxAckPending.
 	deferred map[mqttDeferredKey]string
 
 	// "Last used" publish packet identifier (PI). starting point searching for the next available.

@@ -156,8 +156,8 @@ func (sess *mqttSession) openRestoreGate() {
 //
 // Waking them matters as much as blocking them: a parked delivery would otherwise
 // wait out its whole bound, find the session detached, and no longer be able to
-// record itself as never transmitted — so its redelivery would reach the client
-// marked DUP.
+// record itself as withheld — so its redelivery would wait out AckWait instead of
+// being NAKed forward.
 //
 // No lock held on entry.
 func (sess *mqttSession) abandonRestoreGate() {
@@ -179,9 +179,8 @@ const (
 	// Transmission is allowed.
 	mqttTransmissionOpen mqttTransmissionVerdict = iota
 	// mqttTransmissionWithheld: the restore RESOLVED without opening — the CONNECT
-	// was refused. The caller must not send the delivery, and — where its message
-	// class carries DUP — must record it as withheld so the attempt that finally
-	// goes out is still a first transmission [MQTT-3.3.1-1].
+	// was refused. The caller must not send the delivery, and — for a QoS 1/2
+	// delivery — must record it as withheld so a freed slot can NAK it forward.
 	mqttTransmissionWithheld
 	// mqttTransmissionTimedOut: the wait's bound expired while the restore was still
 	// working, so nothing is decided yet.
@@ -307,9 +306,9 @@ func (sess *mqttSession) refundSharedCharges(fromSubProto bool, charges []mqttSh
 }
 
 // recordWithheldDelivery records that a QoS 1/2 delivery reached its callback and
-// was NOT transmitted, so the attempt that finally goes out is a first send even
-// though JetStream has counted more than one ([MQTT-3.3.1-1]) — and so a freed
-// slot can NAK it forward instead of waiting out AckWait.
+// was NOT transmitted, so a freed slot can NAK it forward instead of waiting out
+// AckWait. (DUP is not this record's to decide: since issue #76 it is the entry's
+// transmitted bit, [MQTT-3.3.1-1].)
 //
 // One helper for both withholding reasons, deliberately: the reconciliation
 // phase's own gate and this connection's restore verdict owe the client exactly
@@ -335,8 +334,7 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 // it more.** A refusal wakes its callbacks and then returns, releasing the ownership
 // gate, so a rebind can win that race on ordinary scheduler delay and the woken
 // callback is then stale — the delivery stays owed, nothing records it, and its
-// redelivery both waits out AckWait instead of being NAKed forward and reaches the
-// client with DUP set on a first sight.
+// redelivery waits out AckWait instead of being NAKed forward.
 //
 // Two remedies were built and withdrawn, across three holistic rounds that each
 // faulted the previous one:
@@ -355,11 +353,10 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 //
 // So the guarantee is withdrawn rather than approximated a third time. HEAD already
 // treats this boundary as "defensive breadth rather than a pinned behavior" and
-// names the same consequence, the population that reaches it through a REFUSED
-// resume is new to this change, and the DUP derivation itself is issue #76's — an open
-// alpha blocker for deriving the MQTT flag from the JetStream delivery count. The
-// lost prompt NAK is not issue #76's, so it is stated as this change's own residual in
-// `docs/CONFORMANCE.md`. Closing it needs a real admission boundary, which is a
+// names the same consequence, and the population that reaches it through a REFUSED
+// resume is new to this change. The DUP flag is not at stake (since issue #76 it is the
+// entry's transmitted bit); the lost prompt NAK is, and it is stated as this change's
+// own residual in `docs/CONFORMANCE.md`. Closing it needs a real admission boundary, which is a
 // mechanism this item does not justify.
 //
 // **A marker is written only for a delivery that is still OWED**, and the
@@ -370,7 +367,7 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 //   - `!closed` covers a live delivery path — an ordinary restored subscription,
 //     and a reconciliation subscription that restoration has ADOPTED (adoption
 //     clears both `closed` and `phaseOwned`). Its durable survives, so the marker
-//     has a first transmission left to protect.
+//     has a redelivery left to NAK forward.
 //
 //   - `phaseOwned` covers a reconciliation subscription that has not been adopted
 //     yet: still closed, still owed.
@@ -389,10 +386,8 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 //     whose deletion is merely STAGED is not yet doomed, while one already deleted
 //     is. This function still records nothing in that window, deliberately: the
 //     marker it would write cannot survive to be consumed, because deferredNaksLocked
-//     DELETES the sess.deferred key before NAKing it and any acknowledgement in the
-//     interval consumes the very fact that would clear DUP. Such a delivery is
-//     re-offered by AckWait and carries DUP=1 until issue #76 moves the derivation off
-//     the JetStream delivery count. Stated in docs/CONFORMANCE.md.
+//     DELETES the sess.deferred key before NAKing it. Such a delivery is re-offered by
+//     AckWait, and its DUP flag is its exchange's transmitted state (issue #76).
 //
 // The doomed case is not hypothetical, and it is why the rule lives here rather
 // than at the call sites. The reconciliation phase's `undo` purges markers for the

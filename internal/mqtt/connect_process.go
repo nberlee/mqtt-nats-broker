@@ -1274,10 +1274,10 @@ restoreSession:
 		}
 		es.c = c
 		// Ownership has just moved, so every hold scoped to the PREDECESSOR — an
-		// unanswerable PUBCOMP debt, an unwritten retained frame — is now inert by the
-		// shared predicate and can be dropped. This is the only place a hold's owner
-		// changes, and clear()'s sweep runs strictly before it, so without this a
-		// never-flushed retained frame's entry survives every rebind.
+		// unanswerable PUBCOMP debt, a retained snapshot hold never handed to a send
+		// section — is now inert by the shared predicate and can be dropped. This is the
+		// only place a hold's owner changes, and clear()'s sweep runs strictly before it, so
+		// without this such a hold survives every rebind.
 		//
 		// HYGIENE, and nothing rests on it: an inert hold is invisible to
 		// sendReservedLocked, so it blocks no allocation and no transmission either way.
@@ -1327,14 +1327,11 @@ restoreSession:
 		es.q2AffReady = false
 		es.pubRelVerified = false
 		// A resumed session's retained (QoS 1/2) entries are deliberately NOT dropped here,
-		// and this is where they used to be. They cannot be redelivered — a retained send has
-		// no JetStream backing at all (R6) — but that is a fact about what this broker can
-		// still do, never evidence that the client completed the exchange, and dropping them
-		// freed both the identifier and a Receive Maximum slot while a QoS 2 client could
-		// still be holding the identifier awaiting PUBREL. The release now happens at the one
-		// site that PROVES the frame was never written, its abandonment
-		// (releaseRetainedSendAbandonedLocked), so resume has nothing left to decide and reads
-		// no transmission state at all (issue #103).
+		// and this is where they used to be (issue #103). An admitted retained exchange is
+		// register-backed and the resume restores it from its records (issue #107 7c); a
+		// snapshot allocation is released only by its abandonment on proof that nothing was
+		// admitted (releaseRetainedSendAbandonedLocked). Resume has nothing to decide here
+		// and reads no transmission state.
 		// What this session already had in flight, captured before any subscription
 		// is restored — the only point at which "pending" unambiguously means
 		// "pending from before the disconnect". resendPendingRedelivery NAKs exactly
@@ -1804,7 +1801,7 @@ restoreSession:
 	// connection whose Will the abort has already taken, and any previously bound client was
 	// displaced upstream — so there is no live consume here.
 	//
-	// Nothing is added before the failure CONNACK's own unbounded socket write returns:
+	// Nothing is added before the failure CONNACK's own socket write returns:
 	// phase 1 and both defers run strictly after it.
 	refuseDisposing := func(outcome mqttPreConnackOutcome, voc mqttDisposalVocabulary) {
 		abortAcceptedResume()
@@ -2574,9 +2571,9 @@ restoreSession:
 		// restore verdict its terminal — and specifically abandonRestoreGate, NOT
 		// abortAcceptedResume: the CONNACK is already written, so the Will may not be discarded
 		// ([MQTT-3.1.2-8]) and acceptance may not be cleared. Waking the withheld deliveries is
-		// what lets them record themselves as never transmitted; left parked they wait out
-		// their bound, find the session detached, and their redelivery reaches the client
-		// marked DUP.
+		// what lets them record themselves as withheld; left parked they wait out their
+		// bound, find the session detached, and their redelivery waits out AckWait instead
+		// of being NAKed forward.
 		refuseLeave := func(rerr error) error {
 			es.abandonRestoreGate()
 			c.Errorf("MQTT: refusing the resume of session %q after its shared-membership "+
@@ -2727,7 +2724,7 @@ restoreSession:
 	replayed := es.replayRecoveredRetained(c)
 
 	// The leave has settled and the owed retained replay is out, so the restore verdict may
-	// OPEN: every delivery it withheld goes out now, as the first transmission it is. Never
+	// OPEN: every delivery it withheld goes out now. Never
 	// skipped on a success, or the session's backlog would sit until AckWait. See
 	// sess_restore_gate.go. A replayed PUBLISH still owed after its budget has had this
 	// connection's close requested instead: the verdict is ABANDONED, so nothing it withheld

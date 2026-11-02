@@ -625,8 +625,8 @@ func (sess *mqttSession) publishHandoffCompatibleLocked(pi uint16, act *mqttSend
 }
 
 // pubRelWriteKindLocked is the exact kind a PUBREL transmission requires of the entry at the
-// moment of write entry: an acquired action writes through an Ordinary or Affine entry of its
-// own exchange, a slot-less retained exchange through its Retained entry.
+// moment of write entry: an acquired action writes through an Ordinary, Affine or Retained
+// entry of its own exchange.
 //
 // Lock held on entry.
 func (sess *mqttSession) pubRelWriteKindLocked(pi uint16, act *mqttSendAction) bool {

@@ -608,9 +608,9 @@ func TestPubRelOpenerCarriesTheExclusionAcrossAReplacement(t *testing.T) {
 //
 //   - a REGISTER-BACKED denial leaves the identifier EXCLUDED, because a durable record
 //     stands behind it;
-//   - a REGISTERLESS RETAINED send leaves it ALLOCATABLE, because a retained send has no
-//     durable slot at all (R6) and an exclusion bound to its minted nonce would reserve an
-//     identifier against a register that never existed.
+//   - a RETAINED SNAPSHOT allocation leaves it ALLOCATABLE, because until its admission
+//     lands it has no durable slot and an exclusion bound to its minted nonce would reserve
+//     an identifier against a register that never existed.
 //
 // Without the second arm the first would pass against an implementation that excluded
 // unconditionally, which is a different and wrong rule.
@@ -651,19 +651,18 @@ func TestMQTTDeferredSettlementExcludesOnlyARegisterBackedIdentifier(t *testing.
 			"subject empty", pi)
 	}
 
-	// THE REGISTERLESS ARM, and what it actually shows is STRUCTURAL. A retained send owns
-	// no register, and it turns out it cannot reach the deferred-settlement path at all: a
-	// settlement is parked by condemnSendLocked, which requires the entry's `sendNonce`,
-	// and only beginSendLocked installs one — a call that matches the entry against a
-	// non-empty source durable. A retained send opens its section through
-	// beginRetainedSendLocked, which records `retainedGen` on the HOLD and leaves the entry
-	// without a nonce.
+	// THE SNAPSHOT ARM, and what it actually shows is STRUCTURAL. A retained snapshot owns no
+	// register until its admission lands, and it cannot reach the deferred-settlement path at
+	// all: a settlement is parked by condemnSendLocked, which requires the entry's
+	// `sendNonce`, and only beginSendLocked installs one. The snapshot's reservation is
+	// beginRetainedSendLocked's, which records `retainedGen` on the HOLD and leaves the entry
+	// without a nonce. (An ADMITTED retained exchange does transmit through beginSendLocked,
+	// and endSendWith excludes its identifier on its validated slot, issue #107 7c.)
 	//
-	// So the exemption in endSendWith is a defensive agreement between two mechanisms, not a
-	// live case, and this asserts the fact that makes it so. Asserting it here is what stops
-	// the guard being read as evidence that a retained frame settles through that path —
-	// and it is the assertion that would fail first if a future change gave a retained entry
-	// a send nonce, which is exactly when that guard starts carrying weight.
+	// So the backing-less exemption in endSendWith is a defensive agreement between two
+	// mechanisms for this shape, not a live case, and this asserts the fact that makes it so.
+	// It is the assertion that would fail first if a future change gave a snapshot hold a send
+	// nonce, which is exactly when that guard starts carrying weight.
 	e.sess.mu.Lock()
 	rpi := e.sess.trackPublishRetained(1)
 	retainedOpened := rpi != 0 && e.sess.beginRetainedSendLocked(e.c, rpi)
@@ -677,9 +676,9 @@ func TestMQTTDeferredSettlementExcludesOnlyARegisterBackedIdentifier(t *testing.
 		t.Fatalf("fixture: the retained send must open its own section (pi=%d)", rpi)
 	}
 	if retainedNonce != _EMPTY_ {
-		t.Fatalf("a retained entry carries no send nonce, got %q: if it now does, the "+
-			"registerless exemption in endSendWith has become a LIVE case and needs its own "+
-			"end-to-end oracle", retainedNonce)
+		t.Fatalf("a retained snapshot entry carries no send nonce, got %q: if it now does, a "+
+			"pre-admission retained hold can reach endSendWith's deferred settlement and needs "+
+			"its own end-to-end oracle", retainedNonce)
 	}
 	if retainedCondemned {
 		t.Fatal("a retained send was condemned onto the deferred-settlement path: it has no " +
@@ -1136,8 +1135,8 @@ func TestMQTTExpiryOfARecoveredEntryReservesUntilItsDeleteIsProven(t *testing.T)
 //
 // The cold case is the one that bites: after a restart there is no resident send hold left to
 // carry the obligation, and `bumpPI` asks the send registry rather than the durable record.
-// The store's fail-closed behaviour over a retained terminal slot does not cover a
-// registerless retained send, which allocates without consulting any register at all (R6).
+// The store's fail-closed behaviour over a retained terminal slot does not cover a retained
+// snapshot allocation, which takes its identifier from bumpPI without consulting any register.
 //
 // Mutation: call releaseTerminalReservation instead of releaseRetainedTerminalReservation at
 // any of the three retained-reoffer sites. The exclusion assertion fails.

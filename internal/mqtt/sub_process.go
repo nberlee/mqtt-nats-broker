@@ -65,9 +65,8 @@ type mqttSub struct {
 	// than being skipped: the interest is installed before the CONNACK, so
 	// JetStream pushes the session's whole offline backlog into that window, and
 	// skipping it would hold every one of those messages until AckWait (30s by
-	// default) — turning an immediate resume delivery into a half-minute stall —
-	// and then re-send them with DUP set, on their FIRST transmission to the
-	// client. Waiting keeps them first deliveries, in order, at adoption speed.
+	// default) — turning an immediate resume delivery into a half-minute stall.
+	// Waiting keeps them prompt, in order, at adoption speed.
 	// Bounded by mqttPhaseGateWait so a CONNECT that dies without releasing
 	// cannot park a delivery goroutine; past it the delivery falls back to the
 	// closed-subscription skip and AckWait. nil once released (and on every
@@ -1568,8 +1567,8 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// that no longer names it, and only then delete.
 				// disposeNow: this site's failure semantics are unchanged — a failed
 				// claim cleanup aborts the unwind and leaves the path usable. Moving it
-				// to dispose-after-confirm is filed as its own §0 item, because the
-				// rollback around it has distinct failure semantics of its own.
+				// to dispose-after-confirm is issue #52's, because the rollback around it
+				// has distinct failure semantics of its own.
 				if u := sess.prepareQ2AffineUnwind(c, true); u.prepared {
 					outcome, udetail, serr := sess.saveClassifiedDetail(tok)
 					// serr never travels outward from here — every arm below logs it

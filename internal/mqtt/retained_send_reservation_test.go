@@ -13,12 +13,13 @@ import (
 
 // issue #93: a retained QoS 1/2 send reserves its packet identifier.
 //
-// A retained send is the one identifier-bearing transmission with no JetStream backing
-// and therefore no in-flight register (R6): it allocates in serializeRetainedMsgsForSub,
-// is buffered on sub.mqtt.prm, and is written by a LATER queueOutbound. Across that span
-// its only other reservation is the pendingPublish entry, and clear() destroys exactly
-// that while resetting last_pi — so without a hold in sendsInFlight the identifier is
-// handed straight back out while the displaced connection's write is still in the socket.
+// A retained QoS 1/2 snapshot allocates its identifier in serializeRetainedMsgsForSub, is
+// staged on sub.mqtt.prm, and is transferred after the SUBACK to the replay driver, which
+// materializes, admits and transmits it (issue #107 7c). Until its admission lands it has
+// no in-flight register, so across that span its only other reservation is the
+// pendingPublish entry, and clear() destroys exactly that while resetting last_pi — so
+// without a hold in sendsInFlight the identifier is handed straight back out while the item
+// is still owed.
 
 // testRetainedEnv is an inflight env whose client can actually own a session: the env's
 // own client comes from createInternalAccountClient, which never calls initClient, so it
@@ -113,14 +114,13 @@ func (e *testRetainedEnv) mints(t *testing.T, want uint16) bool {
 	return got == want
 }
 
-// The defect. A buffered retained frame's identifier must survive the discard that
-// destroys its pendingPublish entry, and — the half revision 3 of the plan got wrong —
-// must survive the WRITE that follows the discard too, because past a clear() the hold is
-// the identifier's only reservation.
+// The defect. A staged retained item's identifier must survive the discard that destroys
+// its pendingPublish entry, and must survive the SUBACK tail's transfer that follows the
+// discard too, because past a clear() the hold is the identifier's only reservation.
 //
-// The seam is what makes the interleaving reachable at all: queueOutbound returns far too
-// fast to be raced from a fixture, so a test without it would have to call the primitives
-// and would prove nothing about the flusher's wiring.
+// The seam is what makes the interleaving reachable at all: the tail returns far too fast
+// to be raced from a fixture, so a test without it would have to call the primitives and
+// would prove nothing about the tail's wiring.
 //
 // Deliberately NOT t.Parallel(): the seam is a process-global atomic and
 // TestParallelTestsTouchNoProcessGlobalState enforces that.
@@ -132,8 +132,8 @@ func TestMQTTRetainedSendHoldsItsIdentifierAcrossADiscard(t *testing.T) {
 		t.Fatal("a buffered retained frame must reserve its identifier the moment it is allocated")
 	}
 
-	// That the seam fires BEFORE any write is asserted STRUCTURALLY, by
-	// TestMQTTRetainedFlushSeamPrecedesEveryWrite, not from inside the hook. An earlier
+	// That the tail writes nothing and only consults the seam and transfers is asserted
+	// STRUCTURALLY, by TestMQTTRetainedFlushWritesNothing, not from inside the hook. An earlier
 	// version tried to observe it here with a counter the hook read and the test assigned
 	// afterwards — which observes nothing, and made a mutation that moves the seam below the
 	// first write appear to be caught when it was not. Holistic round 7 found that false
@@ -170,8 +170,8 @@ func TestMQTTRetainedSendHoldsItsIdentifierAcrossADiscard(t *testing.T) {
 		t.Fatalf("clear: %v", err)
 	}
 	if !e.reserved(pi) {
-		t.Fatal("clear() must not free a retained identifier whose frame is still unwritten: " +
-			"the write is in the socket and bumpPI would mint a second PUBLISH under it")
+		t.Fatal("clear() must not free a retained identifier whose item is still owed: " +
+			"bumpPI would mint a second PUBLISH under it")
 	}
 	if e.mints(t, pi) {
 		t.Fatal("bumpPI handed out the identifier of an unwritten retained frame across a discard")
@@ -184,11 +184,10 @@ func TestMQTTRetainedSendHoldsItsIdentifierAcrossADiscard(t *testing.T) {
 		t.Fatal("the retained flush did not return after the seam was released")
 	}
 
-	// The half a write-return release would get wrong. The write has returned, but the
-	// incarnation that allocated the frame is gone with the entry that would have carried
-	// custody on to PUBACK, so the hold stays.
+	// The transfer has returned, but the incarnation that allocated the item is gone with
+	// the entry that would have carried custody on, so the hold stays.
 	if !e.reserved(pi) {
-		t.Fatal("a retained frame written AFTER a clear() must keep its identifier reserved: " +
+		t.Fatal("a retained item transferred AFTER a clear() must keep its identifier reserved: " +
 			"the pendingPublish entry that would otherwise hold it was destroyed, and this " +
 			"connection's own delivery callbacks can still re-mint and write to its socket")
 	}
@@ -264,8 +263,8 @@ func TestMQTTRetainedFlushWritesNothing(t *testing.T) {
 	}
 }
 
-// The buffered span alone, with no flush at all. A reservation taken at the flush instead
-// of at the allocation would leave this window open, and it is a real window: the SUBACK
+// The staged span alone, with no transfer at all. A reservation taken at the transfer
+// instead of at the allocation would leave this window open, and it is a real window: the SUBACK
 // tail runs after the SUBACK write, and a concurrent CONNECT can discard in between.
 func TestMQTTRetainedSendHoldSurvivesTheBufferedSpan(t *testing.T) {
 	t.Parallel()
@@ -278,7 +277,7 @@ func TestMQTTRetainedSendHoldSurvivesTheBufferedSpan(t *testing.T) {
 		t.Fatalf("clear: %v", err)
 	}
 	if !e.reserved(pi) {
-		t.Fatal("a retained frame that has not been flushed at all must still reserve its identifier")
+		t.Fatal("a retained frame that has not been transferred at all must still reserve its identifier")
 	}
 	if e.mints(t, pi) {
 		t.Fatal("bumpPI handed out a buffered retained frame's identifier after a discard")
@@ -346,9 +345,8 @@ func TestMQTTRetainedSendReservationRefusesABusyIdentifier(t *testing.T) {
 	}
 }
 
-// The oversize discard is the one place a RESERVED retained frame is provably never even
-// buffered, so it releases unconditionally — the generation fence does not apply, because
-// no bytes reached the client.
+// The oversize skip is where a RESERVED retained item is provably never even staged, so it
+// releases unconditionally: no bytes reached the client.
 func TestMQTTRetainedOversizeFrameReleasesItsReservation(t *testing.T) {
 	t.Parallel()
 	e := testNewRetainedEnv(t, "retained-oversize")
@@ -919,7 +917,7 @@ func TestMQTTDirectClientSubsMutationsDetachRetainedFramesUnderLock(t *testing.T
 			// revisions collapsed the facts into one boolean each (so a second destructive
 			// statement rode the first one's detach), and accepted any detach earlier in the
 			// block (so moving the detach ABOVE the lock still passed while making the
-			// detachment race the flusher).
+			// detachment race the SUBACK tail's transfer).
 			//
 			// Same block is what "the same critical section" means for all three members:
 			// each takes the lock, mutates, and unlocks inside one block.
@@ -1061,7 +1059,7 @@ func TestMQTTDirectClientSubsMutationsDetachRetainedFramesUnderLock(t *testing.T
 					switch {
 					case !locked[target]:
 						t.Errorf("%s: %s mutates %s.subs destructively with no preceding %s.mu.Lock() "+
-							"in the same block: the detachment would race the retained flusher",
+							"in the same block: the detachment would race the SUBACK tail's transfer",
 							fset.Position(st.Pos()), qualified, target, target)
 					case detached[target] == 0:
 						t.Errorf("%s: %s removes a subscription from %s.subs with no unconsumed "+
@@ -1148,8 +1146,8 @@ func TestMQTTRebindSweepsInertSendHolds(t *testing.T) {
 				expr, _ := next.(*ast.ExprStmt)
 				if expr == nil || testCalleeName(exprCall(expr)) != sweep {
 					t.Errorf("%s: the CONNECT rebind moves session ownership and must sweep the "+
-						"predecessor's now-inert holds immediately afterwards, or a never-flushed "+
-						"retained frame's entry survives every rebind", fset.Position(as.Pos()))
+						"predecessor's now-inert holds immediately afterwards, or a retained "+
+						"snapshot hold never handed to a send section survives every rebind", fset.Position(as.Pos()))
 				}
 			}
 			return true

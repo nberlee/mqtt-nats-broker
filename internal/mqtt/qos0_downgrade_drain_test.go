@@ -12,12 +12,11 @@ import (
 // the defect two plan-review rounds found in the designs that preceded it.
 //
 // stageDrain OWNS sess.deferred for its durable: it deletes every entry (I5 — a withheld
-// delivery was never transmitted, so it is not drained) and re-installs only the
+// marker is not drained) and re-installs only the
 // cancellations it discovered itself in cpending. A withheld marker with NO registration —
 // a delivery withheld at the in-flight cap — is therefore invisible to it and would be
-// destroyed. That marker is what makes a later FIRST transmission carry DUP=0
-// ([MQTT-3.3.1-1]), since trackPublish otherwise derives dup from JetStream's delivery
-// count.
+// destroyed. That marker is what lets a freed slot NAK the delivery forward rather than
+// leave it to AckWait.
 //
 // HEAD's deferred QoS downgrade performs no I5 drop at all, so losing it would be a
 // REGRESSION introduced by the conversion rather than an inherited drain behavior. Hence
@@ -69,7 +68,7 @@ func TestConversionTransfersTheDurablesLiveWithheldMarkers(t *testing.T) {
 	if !present {
 		t.Fatal("the conversion must preserve a withheld marker that had no registration: " +
 			"stageDrain's I5 drop removes it, HEAD's downgrade teardown never did, and " +
-			"without it the delivery's eventual FIRST transmission carries DUP=1")
+			"without it a freed slot cannot NAK the delivery forward")
 	}
 	if mark != "ack.77" {
 		t.Fatalf("the marker must keep its ack subject, got %q", mark)
@@ -765,7 +764,7 @@ func TestForkedDowngradeSaveDiscardsTheCompletion(t *testing.T) {
 // window by the whole filter loop.
 //
 // The oracle is the SEND GATE's refusal, asserted positively, plus the withheld marker
-// that keeps the eventual first transmission's DUP clear.
+// that lets a freed slot NAK the delivery forward.
 func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "qos0-inflight-store")
@@ -843,14 +842,14 @@ func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 			"would hold an identifier for an exchange nothing on this side remembers")
 	}
 	if !marked || marker != "ack.71" {
-		t.Fatalf("the cancellation must leave a withheld marker so the eventual FIRST "+
-			"transmission carries DUP=0, got %q present=%v", marker, marked)
+		t.Fatalf("the cancellation must leave a withheld marker so a freed slot can NAK "+
+			"the delivery forward, got %q present=%v", marker, marked)
 	}
 }
 
-// TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup is T7b and T23 together, at
-// the level the guarantee actually lives: a marker survives a definite rollback, and
-// trackPublish then clears DUP on the transmission that finally goes out.
+// TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup is T7b and T23 together: a
+// marker survives a definite rollback, and the transmission that finally goes out carries
+// DUP=0.
 //
 // Both marker provenances are covered in one fixture, because the transfer does not
 // distinguish them and a test that covered only the cancelled one would miss the
@@ -859,9 +858,9 @@ func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 //   - one CANCELLED at staging, whose sequence is already out of cpending;
 //   - one withheld at the in-flight CAP, which never had a registration at all.
 //
-// The oracle is trackPublish's own dup return, not the marker's presence alone: the marker
-// exists to make a first transmission carry DUP=0 ([MQTT-3.3.1-1]), and asserting only
-// that the map entry survived would pass against a broker that never consulted it.
+// The marker's presence is asserted directly; it is what lets a freed slot NAK the
+// delivery forward. The DUP=0 check beside it is [MQTT-3.3.1-1] itself, and since issue
+// #76 it holds with or without the marker, because DUP is the entry's transmitted bit.
 func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 	t.Parallel()
 	_, c, sess, _ := drainTestSession(t, "qos0-marker-rollback")
@@ -911,7 +910,7 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 	sess.subs[sid] = 1 // the rollback restores the pre-packet membership
 	sess.mu.Unlock()
 
-	// Both markers must still be there, and each must clear DUP on its FIRST transmission.
+	// Both markers must still be there, and each FIRST transmission must carry DUP=0.
 	for _, tc := range []struct {
 		name string
 		sseq uint64
@@ -923,8 +922,8 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 		_, marked := sess.deferred[mqttDeferredKey{jsDur: dur, sseq: tc.sseq}]
 		sess.mu.Unlock()
 		if !marked {
-			t.Fatalf("%s: the marker must survive a rolled-back conversion, or its eventual "+
-				"first transmission arrives with DUP=1 against [MQTT-3.3.1-1]", tc.name)
+			t.Fatalf("%s: the marker must survive a rolled-back conversion, or a freed "+
+				"slot cannot NAK its redelivery forward", tc.name)
 		}
 		// A REDELIVERY of that sequence: JetStream's delivery count is above one, and it
 		// says nothing about DUP — a fresh allocation's entry is not transmitted.

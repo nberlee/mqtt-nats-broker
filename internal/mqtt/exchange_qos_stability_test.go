@@ -23,9 +23,9 @@ import (
 // against the broken code whenever the downgrade lost the race, and one that slept for
 // AckWait would be load-sensitive on exactly the machines that run it slowest.
 //
-// DUP is deliberately NOT used as an oracle anywhere in this file: it is derived from
-// the JetStream delivery count, so a redelivery carries DUP=1 whether or not this
-// mechanism works (issue #76).
+// DUP is deliberately NOT used as an oracle anywhere in this file: since issue #76 it is
+// the exchange's own transmitted state, which this mechanism does not decide, so it
+// would not discriminate whether the mechanism works.
 
 // testExchangeQoSAckSubject returns the JetStream ack subject of the delivery currently
 // outstanding under pi, which is what a test NAKs to schedule a re-offer.
