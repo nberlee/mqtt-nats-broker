@@ -74,6 +74,13 @@ CI gates on *new* failures only:
 |------|---------------|
 | `test_subscribe_identifiers` | Spec-permitted delivery choice. The suite requires overlapping subscriptions on one client to arrive as a single PUBLISH carrying every matching Subscription Identifier; the broker delivers one PUBLISH per matching subscription (MQTT 5.0 [3.8.4], matching EMQX / Mosquitto 2.1+ / NATS). |
 
+`test_subscribe_options` can fail on slow storage, where a retained message arrives after
+the test's 1 s wait (see "The SUBSCRIBE-time replay has no arrival bound" under "Retained
+delivery through the manifest";
+[issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156)). It is not
+baselined: it has not failed on CI's storage, and a baseline entry would hide a regression
+there.
+
 ### Broker behavior fixed to pass this suite
 
 - **Outbound flow control** (`test_flow_control1`): QoS 1/2 deliveries are throttled to
@@ -1371,6 +1378,16 @@ leaves:
   QoS 0 delivery waits on the gate; its memory is bounded by the NATS pending limits,
   beyond which the client library drops QoS 0 messages, and a departure drops the waiting
   ones.
+- **The SUBSCRIBE-time replay has no arrival bound.** A session's replay is serial, and each
+  QoS 1/2 item undergoes durable materialization and admission before it is sent, several
+  JetStream writes on the client's authority record. The replay yields to the client's
+  foreground operations and competes with the session's own retained reclaimer, and a step
+  that loses that record is re-run after a growing backoff. On slow storage a client's
+  fixed wait can therefore end before the last retained message arrives: Paho
+  `test_subscribe_options` (1 s) fails that way on a JetStream store on NFS with
+  `sync_interval: always`. The failures classified in
+  [issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156) were late arrivals;
+  the existing SKIP and SUBACK-before-reservation loss dispositions still apply.
 - **An obligation this connection cannot settle closes the connection**. A
   retained PUBLISH or PUBREL that cannot be acquired, bound or written, a withdrawal whose
   register delete is refused, a PUBREL entry whose installation is refused, and a replay

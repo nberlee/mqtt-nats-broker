@@ -889,11 +889,10 @@ confirmed finding's disposition, and never waive green CI.
   untagged `-race` failure reopens the third and this box, its full output investigated
   without presuming the same cause. Carried 2026-10-30.
 
-- [ ] Classify Paho `test_subscribe_options` on a slow store: with JetStream on NFS and
-  `sync_interval: always`, a `retainHandling=0` subscribe after a clean-start reconnect sees
-  2 of 3 retained messages within the test's 1 s, on the unchanged broker too; late or lost
-  is not yet known;
-  [issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156).
+- [x] Classified Paho `test_subscribe_options` on a slow store: the missing retained message
+  arrives late (serial durable replay contending on the client's authority record), not
+  lost; accepted as a latency residual in `docs/CONFORMANCE.md`, not fixed. Classified
+  2026-11-02; [issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156).
 
 ### 0.5 Small pre-alpha fixes
 
