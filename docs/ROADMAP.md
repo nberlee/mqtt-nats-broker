@@ -365,9 +365,9 @@ takeover.
 **Filing rule (2026-10-12 convergence triage).** A pre-existing finding met by another
 item's work does NOT open a new box in §0.3 or §0.4; every such box sends document-order
 selection backwards. It goes to its destination instead: an accepted behavioral gap to a
-stated residual in `docs/CONFORMANCE.md`, a verification observation to the
-[verification ledger](https://github.com/nberlee/mqtt-nats-broker/issues/136), an audit to
-§2, with a one-line note in the item that met it. The exceptions are Will or message LOSS
+stated residual in `docs/CONFORMANCE.md`, a verification observation to its own GitHub
+issue with a one-line box under §2 "Intermittent reds", an audit to §2, with a one-line note
+in the item that met it. The exceptions are Will or message LOSS
 on a common path, data corruption, and security, which get a §0.3 box. A finding whose
 dangerous mechanism is still unexcluded stays attached to its existing investigation until
 it is classified: "pre-existing" establishes provenance, not safety. Accepting a residual
@@ -781,13 +781,16 @@ write](https://github.com/nberlee/mqtt-nats-broker/issues/39).
 
 These entries preserve observations without pretending the implementation scope is
 known. Capture complete logs, obtain a deterministic reproduction or identify the
-failed test, and then close the investigation, accept it as a residual, or move it to the
-[verification ledger](https://github.com/nberlee/mqtt-nats-broker/issues/136). Only a
-confirmed loss, corruption or security mechanism becomes a new §0.3 finding (the filing
-rule at the top of §0.3). This section keeps only observations whose dangerous mechanism
-is still unexcluded; pure test-infrastructure and unattributed flake observations live in
-the ledger, whose entries satisfy the alpha gate only by an explicit accepted closure or a
-confirmed finding's disposition, and never waive green CI.
+failed test, and then close the investigation, accept it as a residual, or move it to its
+own GitHub issue with a box under §2 "Intermittent reds". Only a confirmed loss,
+corruption or security mechanism becomes a new §0.3 finding (the filing rule at the top of
+§0.3). This section keeps only observations whose dangerous mechanism is still unexcluded;
+pure test-infrastructure and unattributed flake observations go to §2 "Intermittent reds",
+whose boxes satisfy the alpha gate only by an explicit accepted closure or a confirmed
+finding's disposition, and never waive green CI. The earlier verification ledger is closed
+and kept as an archive
+([issue #136](https://github.com/nberlee/mqtt-nats-broker/issues/136)); the entries moved
+there below are recorded in it.
 
 - [x] Reproduce and fix a reconnect racing its own DISCONNECT with Session Expiry 0: the
   takeover persists the bound connection's ending override before its resume decision.
@@ -885,9 +888,10 @@ confirmed finding's disposition, and never waive green CI.
 
 - [x] Carried the four unexplained reds of the batching item's verification into the
   [verification ledger](https://github.com/nberlee/mqtt-nats-broker/issues/136), all
-  accepted as nonblocking on present evidence; a recurrence reopens its entry, and any
-  untagged `-race` failure reopens the third and this box, its full output investigated
-  without presuming the same cause. Carried 2026-10-30.
+  accepted as nonblocking on present evidence; a recurrence gets its own issue and a box
+  under §2 "Intermittent reds", citing its archived entry, and any untagged `-race` failure
+  reopens this box, its full output investigated without presuming the same cause. Carried
+  2026-10-30.
 
 - [x] Classified Paho `test_subscribe_options` on a slow store: the missing retained message
   arrives late (serial durable replay contending on the client's authority record), not
