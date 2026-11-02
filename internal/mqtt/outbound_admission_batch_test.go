@@ -23,6 +23,7 @@ import (
 	"go/parser"
 	"go/token"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -452,22 +453,57 @@ func testBumpSessionAuthority(sess *mqttSession) error {
 	return err
 }
 
-// testOnFirstBatchCommit wraps the first committed batch of the session (op-admit-publishes).
+// errTestBatchLostResponse is the lost response a wrap reports after its send landed, so a test
+// selects that attempt by its error rather than taking any refused attempt for it.
+var errTestBatchLostResponse = errors.New("the batch's response was lost")
+
+// testOnFirstBatchCommit wraps the session's first batch commit (op-admit-publishes) that wrap
+// actually has: a wrap whose send the store refuses — contention, under a slow run — has had no
+// commit to act on, so the next batch is wrapped instead. It returns the wrapped commit's
+// transaction once wrap has kept it.
 func testOnFirstBatchCommit(t *testing.T, sess *mqttSession,
-	wrap func(send func() (uint64, error)) (uint64, error)) *atomic.Int32 {
-	var n atomic.Int32
+	wrap func(send func() (uint64, error)) (uint64, error)) *atomic.Pointer[string] {
+	const armed, wrapping, kept = 0, 1, 2
+	var state atomic.Int32
+	var txn atomic.Pointer[string]
 	commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		if at.Attempt == nil || at.Attempt.ID != sess.id || at.Attempt.Op != "op-admit-publishes" {
 			return send()
 		}
-		if n.Add(1) == 1 {
-			return wrap(send)
+		if !state.CompareAndSwap(armed, wrapping) {
+			return send()
 		}
-		return send()
+		refused := false
+		seq, err := wrap(func() (uint64, error) {
+			s, e := send()
+			refused = e != nil
+			return s, e
+		})
+		if refused {
+			state.Store(armed)
+			return seq, err
+		}
+		tx := at.Attempt.Txn
+		txn.Store(&tx)
+		state.Store(kept)
+		return seq, err
 	}
 	sess.jsa.testTransitionCommit.Store(&commit)
 	t.Cleanup(func() { sess.jsa.testTransitionCommit.Store(nil) })
-	return &n
+	return &txn
+}
+
+// testIsLostBatch reports whether nonces are the participants of the latest attempt, and that
+// attempt lost its response.
+func testIsLostBatch(mu *sync.Mutex, evs *[]testBatchEvent, nonces []string) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	for i := len(*evs) - 1; i >= 0; i-- {
+		if e := (*evs)[i]; e.attempt {
+			return errors.Is(e.err, errTestBatchLostResponse) && slices.Equal(e.nonces, nonces)
+		}
+	}
+	return false
 }
 
 // testNothingBeforeTheVerdict fails if any attempt carrying a participant of attempt i was
@@ -497,8 +533,10 @@ func TestAdmissionBatchLostResponseSettlesEveryParticipantOnce(t *testing.T) {
 	rig := newTestBatchRig(t, "ab-lost", 1, nil)
 	sess := rig.sess()
 	var checked atomic.Int32
-	mu, evs := testRecordBatchOrder(t, func(nonces []string, v mqttTransitionVerdict) {
-		if checked.Add(1) == 1 {
+	var mu *sync.Mutex
+	var evs *[]testBatchEvent
+	mu, evs = testRecordBatchOrder(t, func(nonces []string, v mqttTransitionVerdict) {
+		if testIsLostBatch(mu, evs, nonces) && checked.Add(1) == 1 {
 			testCustodyAfterSettlement(t, sess, nonces, true)
 		}
 	})
@@ -506,7 +544,7 @@ func TestAdmissionBatchLostResponseSettlesEveryParticipantOnce(t *testing.T) {
 		if _, err := send(); err != nil {
 			return 0, err
 		}
-		return 0, errors.New("the batch's response was lost")
+		return 0, errTestBatchLostResponse
 	})
 	const n = 12
 	rig.backlog(n)
@@ -516,7 +554,7 @@ func TestAdmissionBatchLostResponseSettlesEveryParticipantOnce(t *testing.T) {
 	mu.Unlock()
 	first := -1
 	for i, e := range got {
-		if e.attempt && e.err != nil && len(e.nonces) > 1 {
+		if e.attempt && errors.Is(e.err, errTestBatchLostResponse) {
 			first = i
 			break
 		}
@@ -545,8 +583,10 @@ func TestAdmissionBatchSupersededReceiptIsALanding(t *testing.T) {
 	rig := newTestBatchRig(t, "ab-super", 1, nil)
 	sess := rig.sess()
 	var checked atomic.Int32
-	mu, evs := testRecordBatchOrder(t, func(nonces []string, v mqttTransitionVerdict) {
-		if checked.Add(1) == 1 {
+	var mu *sync.Mutex
+	var evs *[]testBatchEvent
+	mu, evs = testRecordBatchOrder(t, func(nonces []string, v mqttTransitionVerdict) {
+		if testIsLostBatch(mu, evs, nonces) && checked.Add(1) == 1 {
 			testCustodyAfterSettlement(t, sess, nonces, true)
 		}
 	})
@@ -557,7 +597,7 @@ func TestAdmissionBatchSupersededReceiptIsALanding(t *testing.T) {
 		if err := testBumpSessionAuthority(sess); err != nil {
 			t.Errorf("revising the authority: %v", err)
 		}
-		return 0, errors.New("the batch's response was lost")
+		return 0, errTestBatchLostResponse
 	})
 	const n = 12
 	rig.backlog(n)
@@ -566,7 +606,7 @@ func TestAdmissionBatchSupersededReceiptIsALanding(t *testing.T) {
 	got := append([]testBatchEvent(nil), (*evs)...)
 	mu.Unlock()
 	for i, e := range got {
-		if e.attempt && e.err != nil && len(e.nonces) > 1 {
+		if e.attempt && errors.Is(e.err, errTestBatchLostResponse) {
 			testNothingBeforeTheVerdict(t, got, i)
 			if v := got[i+1]; v.verdict != mqttTransitionSuperseded {
 				t.Fatalf("the lost batch resolved %v, want superseded", v.verdict)
@@ -1378,20 +1418,16 @@ func TestAdmissionBatchUnresolvedOutcomeAbandonsEveryParticipant(t *testing.T) {
 	rig := newTestBatchRig(t, "ab-unres", 1, nil)
 	sess := rig.sess()
 	mu, evs := testRecordBatchOrder(t, nil)
-	var lostHandle atomic.Pointer[mqttTransitionHandle]
-	testOnFirstBatchCommit(t, sess, func(send func() (uint64, error)) (uint64, error) {
+	lostTxn := testOnFirstBatchCommit(t, sess, func(send func() (uint64, error)) (uint64, error) {
 		if _, err := send(); err != nil {
 			return 0, err
 		}
-		return 0, errors.New("the batch's response was lost")
+		return 0, errTestBatchLostResponse
 	})
 	var forced atomic.Int32
 	sess.asm.mu.Lock()
 	sess.asm.testCustodyResolve = func(h *mqttTransitionHandle, step string) (mqttTransitionVerdict, bool) {
-		if lostHandle.Load() == nil {
-			lostHandle.Store(h)
-		}
-		if h == lostHandle.Load() && forced.Add(1) <= 2 {
+		if tx := lostTxn.Load(); tx != nil && h.attempt.Txn == *tx && forced.Add(1) <= 2 {
 			return mqttTransitionUnresolved, true
 		}
 		return 0, false
