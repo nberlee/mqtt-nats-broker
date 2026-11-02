@@ -911,6 +911,18 @@ func TestAcquisitionBatchDisplacedBrokerRecordsNoLaterIntent(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("fixture: A never acquired a multi-participant flush")
 	}
+	// What A wrote before its held flush was written under its own tenure and is not this test's
+	// subject: read it off now, while A is held, so the check below sees only later writes.
+	for {
+		b, pl, ok := testMQTTReadPacketReady(rA, 300*time.Millisecond)
+		if !ok {
+			break
+		}
+		if pt := b & mqttPacketMask; pt != mqttPacketPub {
+			t.Fatalf("fixture: A wrote packet type %x before the takeover, want only PUBLISH", pt)
+		}
+		rA.pos += pl // the whole packet is buffered: skip its body so the next read is a header
+	}
 	cB, rB := p.takeOver(t, func() { rel.Do(func() { close(release) }) })
 	testBatchReadAllOnceOn(t, cB, rB, n, 60*time.Second)
 	if k := intents.Load(); k != 0 {
