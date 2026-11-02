@@ -4655,10 +4655,18 @@ What it does NOT do:
   - a repaired **QoS 2** membership whose PUBREL provisioning then fails is no longer
     accepted-but-dead: `processSubs` runs before the success CONNACK now, and that
     failure refuses the CONNECT ([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54));
-  - **shared-subscription membership is excluded, by choice.** Widening
-    the repair set to shared membership is outside
-    [issue #29](https://github.com/nberlee/mqtt-nats-broker/issues/29)'s closed
-    scope and no roadmap entry schedules it; the exclusion stands.
+  - **shared-subscription membership and its acquisition-release verdicts are not
+    repaired** ([issue #159](https://github.com/nberlee/mqtt-nats-broker/issues/159)).
+    An acknowledged shared SUBSCRIBE or UNSUBSCRIBE on the losing branch is not
+    recovered: an addition or a changed grant is lost, and a removed membership may remain
+    in the survivor. Where the survivor names an acquisition whose release has already
+    completed, every resume is refused before a success CONNACK, because the generation's
+    ledger no longer lists that acquisition; repeated resumes do not repair it, and a clean
+    start discards the affected session state. This holds for a 3.1.1 client too, since the
+    reconciliation precedes its forced leave. The population is foreign-authored session
+    records (the same-base boundary below), not competing broker-authored conditional
+    writes. Issue #54 prevents an accepted-but-dead restoration; it neither recovers these
+    changes nor resolves that refusal;
 - **The verdict does not prove the survivor erased us.** A teardown claim is a full-body
   CAS off the same base, so a sibling can merely have become current after `clear()`
   deleted our record. What is established is only that the survivor is not demonstrably
@@ -4839,7 +4847,15 @@ What it does NOT do:
      `$MQTT.sess.<domainTk><cidHash>` carries none. Nothing validates record provenance
      at restore: `createOrRestoreSessionWithin` checks JSON, client ID, reserved membership,
      generation, the affine pair, teardown/retirement and overdue state, then adopts
-     `WID`/`PWID` exactly as given. The reserved-namespace guards deny `$MQTT.>` to MQTT
+     `WID`/`PWID` exactly as given. The open route is therefore any **foreign-authored**
+     write: an unconditional one, or a conditional one expecting the current sequence,
+     which applies as an ordinary successor while carrying lineage fields its author
+     chose. Elsewhere this corpus names that class "an unconditional foreign write"; a
+     publisher able to write one can write the other, so the shorthand changes no
+     conclusion. Only the admission-order claims — a foreign write superseding this
+     broker's own in-flight conditional write, and the teardown claim's claim-first
+     ordering — depend on the write carrying no expectation. The reserved-namespace
+     guards deny `$MQTT.>` to MQTT
      clients; they are not a guard against permitted NATS publication.
   3. **Untouched**, and the reasons differ per stream — do not collapse them.
      **Deletes** carry no per-subject expectation, so no admission closure speaks about

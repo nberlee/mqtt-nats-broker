@@ -1462,8 +1462,8 @@ them in order where a later lint change depends on an earlier cleanup.
   theirs) and delete the unreachable per-subscription phase-gate wait. Done 2026-11-02
   ([issue #158](https://github.com/nberlee/mqtt-nats-broker/issues/158)).
 
-- [ ] Decide whether fork repair carries shared-subscription membership now that issue #54
-  refuses the CONNECT its exclusion was about
+- [x] Decided fork repair keeps excluding shared-subscription membership: it names ledger
+  acquisitions, not a grant term; the loss is a stated residual. Done 2026-11-02
   ([issue #159](https://github.com/nberlee/mqtt-nats-broker/issues/159)).
 
 - [ ] Cover `commitUnsub` releasing under the wrong record token

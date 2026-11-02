@@ -195,11 +195,13 @@ func (e *mqttGrantEntry) sidState(sid string) mqttSidState {
 // mqttGrantSnap is the grant of ONE session record: the per-filter map plus the two
 // session-scoped members, so the capsule's whole payload has a single provenance.
 //
-// Shared-subscription membership is deliberately absent. It was excluded while a per-filter
-// shared restore could fail with the membership left durable and the CONNECT accepted — no
-// group join and no consumer, the accepted-but-dead state of issue #54 — so a re-asserted
-// membership would have repaired into that state. Since issue #54 such a CONNECT is refused
-// instead; the repair still does not carry shared membership.
+// Shared-subscription membership is deliberately absent, and so are its release verdicts
+// (issue #159). A SharedSubs value is not a replayable grant term: it names acquisitions
+// whose disposition is arbitrated across the session record, the generation's acquisition
+// ledger and the group record, and AcqReleases carries the verdicts that release them.
+// Carrying either would put this repair inside acquisition disposition, for the one route a
+// fork has — a foreign-authored record write (the same-base boundary in docs/CONFORMANCE.md).
+// What a fork therefore loses for shared filters is stated there as a residual.
 type mqttGrantSnap struct {
 	filters   map[string]mqttGrantEntry
 	regNonces map[string]struct{}

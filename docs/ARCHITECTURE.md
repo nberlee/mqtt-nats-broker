@@ -2332,13 +2332,14 @@ branches of one generation can hold different configs for one durable. Nothing e
 carried — `Will`, `ExpiryInterval`, `DisconnectedAt` and `Clean` are per-connection terms
 the reconnecting CONNECT establishes, `Origin`/`ID` are identity, `Gen`/`WID`/`PWID` are
 the anchor, `Q2Aff*` belongs to the affine path's own reclaim, `Teardown` is a marker, and
-`SharedSubs` is excluded. Subscription restoration runs before the success CONNACK
-([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)),
-so a per-filter failure refuses the CONNECT instead of leaving a durable membership with
-no join and no consumer. Widening the repair set to shared membership is outside
-[issue #29](https://github.com/nberlee/mqtt-nats-broker/issues/29)'s closed scope and
-no roadmap entry schedules it; the exclusion stands as a choice rather than a
-consequence.
+`SharedSubs` and `AcqReleases` are excluded
+([issue #159](https://github.com/nberlee/mqtt-nats-broker/issues/159)). A shared
+membership is not a replayable grant term: it names acquisitions whose disposition is
+arbitrated across the session record, the generation's acquisition ledger and the group
+record ("A group durable is held by arbitration, not counted by a scan"), and
+`AcqReleases` holds the verdicts that release them. Carrying either would put fork repair
+inside acquisition disposition, for the only route a fork has, a foreign-authored record
+write. What a fork loses for shared filters is a residual in `docs/CONFORMANCE.md`.
 
 **Seven mint sites, at the point the verdict is MADE.** Every disposition arm returns
 after its record transaction is released, so minting at the classification point is what

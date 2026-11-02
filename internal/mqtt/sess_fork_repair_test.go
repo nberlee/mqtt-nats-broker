@@ -1660,10 +1660,9 @@ func TestForkRepairCarriesNoWill(t *testing.T) {
 
 // TestForkRepairSharedMembershipIsNeverCarried is test 19 (M27).
 //
-// A per-filter shared restore can fail while the membership stays durable, so a re-asserted
-// SharedSubs membership would be durable while that failure leaves no group join and no
-// consumer — the accepted-but-dead state issue #54 already records. Repairing into that ordering
-// would extend an open finding rather than respect it.
+// A SharedSubs membership names acquisitions arbitrated on the shared ledger and group record,
+// so it is not a grant term the repair can re-assert; the exclusion is the scope decision of
+// issue #159, and what it leaves is a docs/CONFORMANCE.md residual.
 func TestForkRepairSharedMembershipIsNeverCarried(t *testing.T) {
 	t.Parallel()
 	e := testStageForkedGrant(t, "shared-excluded", nil,
