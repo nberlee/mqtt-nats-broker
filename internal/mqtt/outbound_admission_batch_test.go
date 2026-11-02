@@ -1743,9 +1743,28 @@ func TestAdmissionBatchRefusalHandsItsHeadToTheLadder(t *testing.T) {
 		mu.Unlock()
 	})
 	t.Cleanup(func() { mqttTestAdmissionBatchSingleHook.Set(nil) })
-	testOnFirstBatchCommit(t, sess, func(func() (uint64, error)) (uint64, error) {
+	// A batch is whatever one flush collected, so the backlog can arrive as a batch of two
+	// before the rest. A refused pair proves nothing about "the rest as a batch" (its rest is
+	// one delivery, admitted singly), so every batch is refused until one of at least three
+	// has been: the attempt hook records each refusal before that batch is settled, hence
+	// before any later commit consults it.
+	commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if at.Attempt == nil || at.Attempt.ID != sess.id || at.Attempt.Op != "op-admit-publishes" {
+			return send()
+		}
+		mu.Lock()
+		refused := false
+		for _, e := range *evs {
+			refused = refused || (e.attempt && e.err != nil && len(e.nonces) >= 3)
+		}
+		mu.Unlock()
+		if refused {
+			return send()
+		}
 		return 0, errors.New("refused for a reason that is not contention")
-	})
+	}
+	sess.jsa.testTransitionCommit.Store(&commit)
+	t.Cleanup(func() { sess.jsa.testTransitionCommit.Store(nil) })
 	const n = 12
 	rig.backlog(n)
 	rig.readInOrder(n)
