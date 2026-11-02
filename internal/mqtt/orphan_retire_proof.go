@@ -10,12 +10,13 @@
 // THE PROPERTY, and it is one rule rather than three site fixes:
 //
 //	Any orphan-sweep arm that can still destroy live session-generation state requires a
-//	valid retirement watermark whose Gen EQUALS the candidate generation. Without that
-//	proof, RETAIN.
+//	valid retirement watermark whose Gen EQUALS the candidate generation, or a valid
+//	permanent closure of that generation which carried an authorized discard. Without
+//	either proof, RETAIN.
 //
 // Everything the arms already required is KEPT — the complete reference walk, the
 // quarantine grace, the exact identity revalidation, issue #66's cutoff, the claim-before-hold
-// ordering, the consumer-instance relookup. The watermark is an ADDITIONAL licence, never
+// ordering, the consumer-instance relookup. The proof is an ADDITIONAL licence, never
 // a replacement for any of them.
 //
 // MarkerSeq SUPPLIES NO SECOND ARM HERE, and this is the one thing about the sweep that
@@ -26,17 +27,20 @@
 // incomparable sequence spaces. Only exact generation equality proves anything here.
 //
 // WHAT THAT COSTS, stated plainly because it is the trade this design accepts: a
-// PERMANENT, UNBOUNDED leak. The watermark is a single slot per client, so once a later
-// retirement replaces it the earlier generation's state can never again be proven
-// retired — retire G1, then create and retire G2, and G1's holds, registers and PUBREL
-// consumers are retained forever. There is no bounded variant available from current
-// facts: a dead generation with an absent record and a LIVE REMOTE generation with an
-// absent record are observationally identical to this pass, and waiting longer does not
-// distinguish them. An exact bound would need permanent per-generation retirement history
-// (which trades unbounded payload retention for unbounded metadata) or a distributed
-// liveness lease. Stream limits and MaxAge are not a solution, because their bound is
-// implemented by deleting the acknowledged payload. A leak is preferred to a loss, which
-// is the same trade course E already took. See docs/CONFORMANCE.md.
+// PERMANENT, UNBOUNDED leak for a generation with no discarding closure. The watermark is a
+// single slot per client, so once a later retirement replaces it the earlier generation can be
+// proven retired only through its own closure. A generation whose closure carried an
+// authorized discard — every receipted teardown, and every clean-start handoff's predecessor
+// — keeps that proof permanently: the closure is one create-only subject per generation,
+// never deleted while the recovery epoch stands, and a closed generation is never admitted
+// again (checkProposedGenerationIsFresh). A generation retired without one — a receiptless
+// teardown — is retained forever once the slot moves on: retire G1 that way, then create and
+// retire G2, and G1's holds, registers and PUBREL consumers stay. There is no bounded variant
+// for that population from current facts: a dead generation with an absent record and a LIVE
+// REMOTE generation with an absent record are observationally identical to this pass, and
+// waiting longer does not distinguish them. Stream limits and MaxAge are not a solution,
+// because their bound is implemented by deleting the acknowledged payload. A leak is preferred
+// to a loss, which is the same trade course E already took. See docs/CONFORMANCE.md.
 //
 // WHAT STILL RUNS WITHOUT PROOF is the non-destructive tail, and it is what keeps this
 // from being a blanket retain: once the payload is already ABSENT, removing the fence that
@@ -75,13 +79,15 @@ package mqtt
 type mqttRetireProof int
 
 const (
-	// mqttRetireUnproven: no valid watermark names this generation. Every destructive
-	// arm RETAINS. This is the ordinary outcome for a generation whose watermark slot
-	// has been replaced, and it is the leak.
+	// mqttRetireUnproven: no valid watermark names this generation and no valid discarding
+	// closure of it stands. Every destructive arm RETAINS. For a generation whose watermark
+	// slot has been replaced and which was closed without a discard, or never closed, that is
+	// the leak.
 	mqttRetireUnproven mqttRetireProof = iota
 
-	// mqttRetireProven: a valid watermark names exactly this generation, so the session
-	// that owned these names was durably discarded.
+	// mqttRetireProven: a valid watermark names exactly this generation, or its permanent
+	// closure carried an authorized discard, so the session that owned these names was
+	// durably discarded.
 	mqttRetireProven
 )
 
@@ -96,7 +102,8 @@ const (
 // indeterminate are never cached: each can be invalidated by a retirement landing
 // afterwards, and a finite window never arbitrates ownership.
 //
-// No lock held on entry; performs at most one JetStream read.
+// No lock held on entry; performs at most two JetStream reads: the watermark, then the
+// generation's closure when the watermark does not name it.
 func (as *mqttAccountSessionManager) retirementProvenFor(idHash, gen string) mqttRetireProof {
 	if idHash == _EMPTY_ || gen == _EMPTY_ {
 		// Nothing to key a proof by. Refusing is the same disposition every
@@ -107,11 +114,22 @@ func (as *mqttAccountSessionManager) retirementProvenFor(idHash, gen string) mqt
 		return mqttRetireProven
 	}
 	r, _, status := as.jsa.loadGenRetirement(as.domainTk, idHash)
-	if status != mqttRetirementValid || r.Gen != gen {
-		return mqttRetireUnproven
+	if status == mqttRetirementValid && r.Gen == gen {
+		as.retirementMemoAdd(idHash, gen)
+		return mqttRetireProven
 	}
-	as.retirementMemoAdd(idHash, gen)
-	return mqttRetireProven
+	// THE GENERATION'S OWN PERMANENT CLOSURE, when the single watermark slot does not name it.
+	// A closure that carried an authorized DISCARD is the per-generation retirement history the
+	// watermark cannot be: one subject per generation, create-only, its Discard member immutable,
+	// never deleted while the recovery epoch stands — and a closed generation is never admitted
+	// again (checkProposedGenerationIsFresh), so no broker serves these names. Only a VALID
+	// discarding closure proves; a preserving one kept its obligations, and absent, corrupt and
+	// indeterminate prove nothing.
+	if c, _, cst := as.jsa.loadGenClosureByHash(idHash, as.sessStreamEpoch, gen); cst == mqttOutboundValid && c.Discard {
+		as.retirementMemoAdd(idHash, gen)
+		return mqttRetireProven
+	}
+	return mqttRetireUnproven
 }
 
 // mqttRetirementMemoMax bounds the positive-only cache. When it is full the memo simply
@@ -132,11 +150,9 @@ func (as *mqttAccountSessionManager) retirementMemoHas(idHash, gen string) bool 
 
 // retirementMemoAdd remembers a proven retirement.
 //
-// The map is keyed by client-ID hash and holds ONE generation, which is exactly what the
-// durable watermark holds: remembering more would claim a history the single slot never
-// had. A later retirement for the same client simply replaces the entry, and the
-// generation it replaces goes back to being unprovable — which is the leak, faithfully
-// mirrored rather than papered over in memory.
+// The map is keyed by client-ID hash and holds ONE generation. That bounds it; it does not
+// mirror what is provable, which a replaced entry still is, through its closure when it had a
+// discarding one. A replaced entry costs a read on its next sighting, never a licence.
 func (as *mqttAccountSessionManager) retirementMemoAdd(idHash, gen string) {
 	as.mu.Lock()
 	defer as.mu.Unlock()

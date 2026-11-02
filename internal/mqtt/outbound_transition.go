@@ -116,6 +116,33 @@ func (jsa *mqttJSA) loadGenClosure(id, epoch, gen string) (*mqttGenClosure, uint
 	return c, smsg.Sequence, mqttOutboundValid
 }
 
+// loadGenClosureByHash is loadGenClosure for a reader that holds only the client-ID HASH — the
+// orphan sweep, whose candidates are named by hash and generation. The body's own client ID is
+// taken as the claimed identity, required to hash back to the subject's token, and the body is
+// then decoded with exactly the validation loadGenClosure applies (members, epoch, generation,
+// that identity). A body that names another client is CORRUPT, never absent: it answers for a
+// subject it does not belong to.
+func (jsa *mqttJSA) loadGenClosureByHash(idHash, epoch, gen string) (*mqttGenClosure, uint64, mqttOutboundLoadStatus) {
+	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttGenClosureSubject(idHash, gen))
+	if err != nil {
+		if isErrorOtherThan(err, JSNoMessageFoundErr) {
+			return nil, 0, mqttOutboundIndeterminate
+		}
+		return nil, 0, mqttOutboundAbsent
+	}
+	var claimed struct {
+		ID string `json:"id"`
+	}
+	if uerr := json.Unmarshal(smsg.Data, &claimed); uerr != nil || claimed.ID == _EMPTY_ || getHash(claimed.ID) != idHash {
+		return nil, smsg.Sequence, mqttOutboundCorrupt
+	}
+	c, derr := mqttDecodeGenClosure(smsg.Data, claimed.ID, epoch, gen)
+	if derr != nil {
+		return nil, smsg.Sequence, mqttOutboundCorrupt
+	}
+	return c, smsg.Sequence, mqttOutboundValid
+}
+
 // requireDiscardingClosure is the licence of every act a DISCARDED generation's retirement takes
 // without an entitlement (issue #107 7d): the generation's committed closure, read here, says Discard.
 //

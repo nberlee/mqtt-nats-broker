@@ -276,7 +276,7 @@ func (e *testRejectionEnv) holdSessionGate() {
 
 func (e *testRejectionEnv) releaseSessionGate() {
 	e.asm.mu.Lock()
-	delete(e.asm.sessLocked, e.sess.id)
+	e.asm.releaseSessGateLocked(e.sess.id)
 	e.asm.mu.Unlock()
 }
 

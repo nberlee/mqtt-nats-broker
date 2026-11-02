@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -552,7 +553,12 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 			return
 		}
 	}
-	defer asm.unlockSession(sess)
+	// Released ONCE, whichever comes first: the clean close's early release when its retirement
+	// is durably owned (below), or this defer. A second unlockSession could release a gate a
+	// successor CONNECT has acquired since. See destroyReleasing.
+	releaseGate := sync.OnceFunc(func() { asm.unlockSession(sess) })
+	defer releaseGate()
+	gateReleasedEarly := false
 
 	// An unresolved record write makes every teardown decision below unsafe: a
 	// stale sess.seq would drive a second failing disconnect save, a clear() that
@@ -749,12 +755,36 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 
 	// This needs to be done outside of any lock.
 	if doClean {
+		// THE WILL ACTION FIRST, while the gate is held and before clearInner opens its record
+		// transaction: the gated order is "end the record transaction, Will action, release the
+		// gate", and the teardown below may release the gate as soon as its retirement is durably
+		// owned. Every doClean arm owed this Will anyway — each falls through to mqttHandleWill —
+		// so moving it changes only its position relative to the deletions, which it never
+		// depended on. An armed or owed-now Will is PUBLISHED here; an owed-delayed one, capped by
+		// the zero expiry to fire at the close, is ENQUEUED due now, under the incarnation and
+		// record sequence captured HERE — after the destroy below re-mints them, a sequence of 0
+		// would be refused by the outbox. The trailing mqttHandleWill finds nothing to take.
+		//
+		// The ordering is LOCAL: another broker can read the marker and displace it before this
+		// Will is acted on, as the expiry path and the sweep already could.
+		sess.mu.Lock()
+		willSeq := sess.seq
+		sess.mu.Unlock()
+		if h := mqttTestCleanCloseWillHookV.Load(); h != nil {
+			(*h)(sess)
+		}
+		s.mqttHandleWill(c, &expiry, sessGen, willSeq, asm.sessStreamEpoch)
+
 		sess.mu.Lock()
 		ceilingTracker := sess.leases
 		sess.mu.Unlock()
-		if err := sess.clearInner(true, nil,
+		if err := sess.clearInnerReleasing(true, nil,
 			s.pendingDiscardFinisher(asm, sess, ceilingTracker),
-			s.armPendingDiscardWorker); err != nil {
+			s.armPendingDiscardWorker,
+			func() {
+				gateReleasedEarly = true
+				releaseGate()
+			}); err != nil {
 			// A LATE ambiguity — armed after the entry check the discard already passed —
 			// deleted nothing, so the discard is recoverable: park it and restore the
 			// residency removeSession took above. Without that the record, the consumers,
@@ -780,6 +810,13 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 				// re-parked either — nothing was refused, and re-parking would resurrect a
 				// discard obligation this object no longer holds.
 				c.Debugf("MQTT: discard of session %q stopped: %v", sess.id, err)
+			case gateReleasedEarly && (errors.Is(err, errMQTTClearDrainTimeout) ||
+				errors.Is(err, errMQTTClearRefusedUnresolved)):
+				// Unreachable by construction: both are produced before the claim, and the gate is
+				// released only after the discarding closure. Restoring residency here would
+				// install this retired object beside a successor that may already hold the gate.
+				c.Errorf("MQTT: discard of session %q reported %v after its gate was released; residency is not restored",
+					sess.id, err)
 			case errors.Is(err, errMQTTClearDrainTimeout):
 				// An admitted route or queued effect of this incarnation is still
 				// outstanding, so nothing was deleted — but the clean-session discard is

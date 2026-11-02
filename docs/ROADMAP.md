@@ -771,10 +771,11 @@ write](https://github.com/nberlee/mqtt-nats-broker/issues/39).
   longer replace passthrough clients' own; usage text no longer prints environment values.
   Done 2026-10-25; [issue #129](https://github.com/nberlee/mqtt-nats-broker/issues/129).
 
-- [ ] Answer a clean-start CONNECT without waiting on its predecessor's teardown: a
-  bounded, event-driven wait on the client-ID gate with a v5 CONNACK 0x89 when it runs
-  out, and the predecessor's reclamation moved off the gate under a durable retirement;
-  [issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155).
+- [x] Answer a clean-start CONNECT without waiting on its predecessor's teardown: the
+  gate wait is event-driven, bounded by the ownership deadline and answered 0x89; a clean
+  close releases the gate once its retirement is durably owned and the successor displaces
+  the marked record; the orphan sweep is also licensed by a discarding closure. Done
+  2026-11-01; [issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155).
 
 ### 0.4 Release-verification investigations
 
@@ -887,6 +888,12 @@ confirmed finding's disposition, and never waive green CI.
   accepted as nonblocking on present evidence; a recurrence reopens its entry, and any
   untagged `-race` failure reopens the third and this box, its full output investigated
   without presuming the same cause. Carried 2026-10-30.
+
+- [ ] Classify Paho `test_subscribe_options` on a slow store: with JetStream on NFS and
+  `sync_interval: always`, a `retainHandling=0` subscribe after a clean-start reconnect sees
+  2 of 3 retained messages within the test's 1 s, on the unchanged broker too; late or lost
+  is not yet known;
+  [issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156).
 
 ### 0.5 Small pre-alpha fixes
 

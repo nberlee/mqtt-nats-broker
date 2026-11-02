@@ -262,6 +262,36 @@ var mqttTestDrainRestorePreInstallHookV atomic.Pointer[func(durable string)]
 // Atomic for the same reason as the save hook above.
 var mqttTestTeardownClaimedHookV atomic.Pointer[func(sess *mqttSession, nonce string, markerSeq uint64)]
 
+// Test hooks for the client-ID gate wait (sess_gate_wait.go). Registered fires after a
+// CONNECT registered its wakeup channel and before it blocks, so a test can release the gate
+// knowing the release is the one that must wake it. Woken fires after the wait ended on a
+// release and before the CONNECT re-takes as.mu, which is the window in which a waiter can
+// block on the mutex past its deadline.
+var (
+	mqttTestGateWaitRegisteredHookV atomic.Pointer[func()]
+	mqttTestGateWaitWokenHookV      atomic.Pointer[func()]
+)
+
+// Test hook: when set, it is invoked by a clean close's teardown right after it released the
+// client-ID gate (destroyReleasing's onRetirementDurable), before the shared closing, the
+// deletions and the record release. A test parks the continuation there to connect a
+// successor in the window, and a non-nil error ends destroy at once with that error: an
+// abandoned continuation leaves exactly the durable state a crash at that point would, and a
+// residency-restoring sentinel reaches the close path's error arms after the release.
+var mqttTestTeardownGateReleasedHookV atomic.Pointer[func(sess *mqttSession) error]
+
+// Test hook: when set, it is invoked by a clean close immediately before its Will action, which
+// runs with the client-ID gate held and before the teardown opens its record transaction.
+var mqttTestCleanCloseWillHookV atomic.Pointer[func(sess *mqttSession)]
+
+// Test hook: when set, it is invoked with the arm a CONNECT took for a marked record:
+// displaced (mqttMarkedRecordDisplaceable held) or adopted (finishAdoptedTeardown inline).
+var mqttTestMarkedRecordArmHookV atomic.Pointer[func(clientID string, arm mqttMarkedRecordArm)]
+
+// Test hook: when set, it is invoked at the start of deleteTeardownTargets, before the first
+// deletion and the inbound QoS 2 hold walk, on every teardown route that reaches it.
+var mqttTestTeardownDeletesHookV atomic.Pointer[func(t *mqttTeardownTarget)]
+
 // Test hooks: when set and returning a non-nil error, loadLastMsgFor and
 // deleteMsg fail with it WITHOUT issuing the JetStream request, so the stream
 // is left exactly as it was and a retry can still succeed. Used to exercise the

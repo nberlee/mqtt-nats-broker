@@ -2126,14 +2126,14 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 		e.asm.testBeforeTeardownLock = func(string) {
 			if released.CompareAndSwap(false, true) {
 				e.asm.mu.Lock()
-				delete(e.asm.sessLocked, e.sess.id)
+				e.asm.releaseSessGateLocked(e.sess.id)
 				e.asm.mu.Unlock()
 			}
 		}
 		e.asm.mu.Unlock()
 		defer func() {
 			e.asm.mu.Lock()
-			delete(e.asm.sessLocked, e.sess.id)
+			e.asm.releaseSessGateLocked(e.sess.id)
 			e.asm.mu.Unlock()
 		}()
 
@@ -2182,7 +2182,7 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 		go func() {
 			time.Sleep(2 * mqttTeardownLockItvl)
 			e.asm.mu.Lock()
-			delete(e.asm.sessLocked, e.sess.id)
+			e.asm.releaseSessGateLocked(e.sess.id)
 			e.asm.mu.Unlock()
 		}()
 
@@ -2217,7 +2217,7 @@ func TestMQTTBoundRejectionGateRefused(t *testing.T) {
 		e.sess.mu.Unlock()
 		defer func() {
 			e.asm.mu.Lock()
-			delete(e.asm.sessLocked, e.sess.id)
+			e.asm.releaseSessGateLocked(e.sess.id)
 			e.asm.mu.Unlock()
 		}()
 

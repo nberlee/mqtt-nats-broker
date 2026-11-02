@@ -149,6 +149,14 @@ func (sess *mqttSession) clearWithSelfLease(noWait bool, selfLease *mqttLease) e
 // leaving the object admissible for the caller to retry.
 func (sess *mqttSession) clearInner(noWait bool, selfLease *mqttLease,
 	onCeiling func(), onCeilingSchedule func(*mqttIncarnationTracker, func())) error {
+	return sess.clearInnerReleasing(noWait, selfLease, onCeiling, onCeilingSchedule, nil)
+}
+
+// clearInnerReleasing is clearInner with destroy's onRetirementDurable callback threaded
+// through; see destroyReleasing. Only the clean close passes one.
+func (sess *mqttSession) clearInnerReleasing(noWait bool, selfLease *mqttLease,
+	onCeiling func(), onCeilingSchedule func(*mqttIncarnationTracker, func()),
+	onRetirementDurable func()) error {
 	sess.mu.Lock()
 	t := sess.leases
 	sess.mu.Unlock()
@@ -186,7 +194,7 @@ func (sess *mqttSession) clearInner(noWait bool, selfLease *mqttLease,
 		t.reopen()
 		return fmt.Errorf("refusing to discard session %q: %w", sess.id, perr)
 	}
-	return p.destroy(permit, noWait)
+	return p.destroyReleasing(permit, noWait, onRetirementDurable)
 }
 
 // mqttPreparedClear owns the record transaction prepareClear opened. Exactly one
@@ -487,6 +495,22 @@ func (p *mqttPreparedClear) abort() {
 // finalization writes, does not destroy at all.) Over any other load there is no receipt, and
 // the closing driver's licence decides whether the shared closing may run (issue #107 8b).
 func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) error {
+	return p.destroyReleasing(permit, noWait, nil)
+}
+
+// destroyReleasing is destroy with one addition: onRetirementDurable, when non-nil, is
+// invoked exactly once, as soon as the retirement is DURABLY OWNED — the teardown claim and its
+// receipt on $MQTT_sess, the retirement watermark naming this generation on $MQTT_teardown,
+// and the discarding closure with its recovery root on $MQTT_inflight — and before the shared
+// closing, the deletions and the record release. The clean close releases the client-ID gate
+// there, so a clean-start successor does not wait for the reclamation that follows: a CONNECT
+// that reads the marked record then finds every fact it needs to displace it
+// (mqttMarkedRecordDisplaceable), and what is left belongs to this continuation, the recovery
+// executor the closure rooted, and the orphan sweep the closure licenses.
+//
+// It is never invoked on a receiptless teardown: with no discarding closure there is no
+// durable owner for the rest, so that teardown keeps the gate to its end.
+func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait bool, onRetirementDurable func()) error {
 	sess, tok := p.sess, p.tok
 	defer permit.tr.resolveRetired()
 	// Released on EVERY exit path, including the error returns below, after which
@@ -673,6 +697,17 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 		// independently of it (issue #107 7d): the closure just committed is the licence of every
 		// step, and the prompt drive visits its root with the recovery executor itself.
 		sess.asm.kickRecoveryRoot(id, sess.asm.sessStreamEpoch, retiringGen)
+		// THE RETIREMENT IS NOW DURABLY OWNED. Everything below is named by retiringGen and acts
+		// on this removed, re-minted object or on durable state, exactly as finishAdoptedTeardown
+		// does with no gate from the expiry path and the sweep.
+		if onRetirementDurable != nil {
+			onRetirementDurable()
+			if h := mqttTestTeardownGateReleasedHookV.Load(); h != nil {
+				if herr := (*h)(sess); herr != nil {
+					return herr
+				}
+			}
+		}
 	}
 	// CLOSE THE SHARED ACQUISITIONS of the RETIRING generation, before the first deletion and
 	// before the record is released, through the ONE closing driver (issue #107 8b): only once the

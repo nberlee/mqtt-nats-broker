@@ -901,6 +901,9 @@ func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, c
 // the closing from the sealed acquisition ledger, before this and before the record goes
 // (closeSharedGeneration).
 func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait bool) error {
+	if h := mqttTestTeardownDeletesHookV.Load(); h != nil {
+		(*h)(t)
+	}
 	for _, dur := range t.durs {
 		if t.transferLogical {
 			break // retired by the recovery executor through its resource (issue #107 7d)

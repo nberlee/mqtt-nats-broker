@@ -125,8 +125,11 @@ type mqttAccountSessionManager struct {
 	sessions   map[string]*mqttSession // key is MQTT client ID
 	sessByHash map[string]*mqttSession // key is MQTT client ID hash
 	sessLocked map[string]struct{}     // key is MQTT client ID and indicate that a session can not be taken by a new client at this time
-	flappers   map[string]time.Time    // When connection connects with client ID already in use
-	flapTimer  *time.Timer             // Timer to perform some cleanup of the flappers map
+	// sessGateWaiters holds, per client ID, the channel the next release of its sessLocked gate
+	// closes; see sess_gate_wait.go.
+	sessGateWaiters map[string]chan struct{}
+	flappers        map[string]time.Time // When connection connects with client ID already in use
+	flapTimer       *time.Timer          // Timer to perform some cleanup of the flappers map
 	// Delayed Wills are no longer tracked in memory here: they live on the durable
 	// $MQTT_willq outbox and are driven by the claim loop. See will_outbox.go.
 	// Pending session-expiry timers, keyed by MQTT client ID hash, that clean up a
@@ -1875,7 +1878,7 @@ func (as *mqttAccountSessionManager) beforeResumeNaks(clientID string) {
 // No lock held on entry.
 func (as *mqttAccountSessionManager) unlockSession(sess *mqttSession) {
 	as.mu.Lock()
-	delete(as.sessLocked, sess.id)
+	as.releaseSessGateLocked(sess.id)
 	as.mu.Unlock()
 	as.handoffVoidVerdictsOnGateRelease(sess)
 }
@@ -2216,6 +2219,27 @@ RESTORE:
 	}
 
 	if ps.Teardown != nil {
+		// A RETIREMENT ALREADY DURABLY OWNED is displaced, not finished: the teardown that wrote
+		// this marker committed its receipt, its watermark and its discarding closure, so the
+		// rest of the generation belongs to that teardown's continuation, its recovery executor
+		// and the orphan sweep, and this CONNECT only writes over the marker. The create below is
+		// parentless, on a fresh generation, at the marker's sequence, so the accept batch's
+		// record CAS is what arbitrates it; Session Present is false. See
+		// sess_teardown_displace.go.
+		ok, why := mqttMarkedRecordDisplaceable(as.markedRecordFacts(ps, hash, smsg.Sequence))
+		if ok {
+			if h := mqttTestMarkedRecordArmHookV.Load(); h != nil {
+				(*h)(clientID, mqttMarkedRecordDisplaced)
+			}
+			sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), smsg.Sequence, _EMPTY_, _EMPTY_, opts)
+			sess.asm = as
+			sess.domainTk = as.domainTk
+			return sess, false, nil
+		}
+		jsa.c.Debugf("MQTT: finishing the claimed teardown of session %q inline: %s", clientID, why)
+		if h := mqttTestMarkedRecordArmHookV.Load(); h != nil {
+			(*h)(clientID, mqttMarkedRecordAdopted)
+		}
 		if err := as.finishAdoptedTeardown(ps, hash, smsg.Sequence, opts); err != nil {
 			if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
 				return nil, false, fmt.Errorf("finishing the claimed teardown of session %q: %w", clientID, err)

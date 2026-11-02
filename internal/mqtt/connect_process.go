@@ -494,19 +494,37 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 		}
 	}
 
+	// One absolute ownership budget for this CONNECT, anchored at issue #55's stop and constructed
+	// ABOVE the client-ID gate and the restoreSession label, so the gate wait below and every
+	// re-drive of the ownership protocol consume one allowance and none resets it. See
+	// outbound_connect_budget.go and ownBudgetAnchor above.
+	ownBudgetTotal := mqttConnectOwnershipBudget
+	asm.mu.RLock()
+	if asm.testOwnershipBudgetTotal > 0 {
+		ownBudgetTotal = asm.testOwnershipBudgetTotal
+	}
+	asm.mu.RUnlock()
+	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, ownBudgetTotal)
+
 	// Most of the session state is altered only in the readLoop so does not
 	// need locking. For things that can be access in the readLoop and in
 	// callbacks, we will use explicit locking.
 	// To prevent other clients to connect with the same client ID, we will
 	// add the client ID to a "locked" map so that the connect somewhere else
-	// is put on hold.
-	// This keep track of how many times this client is detecting that its
-	// client ID is in the locked map. After a short amount, the server will
-	// fail this inbound client.
-	locked := 0
+	// is put on hold until its holder releases it. See sess_gate_wait.go.
+	waited := false
 
 CHECK:
 	asm.mu.Lock()
+	// THE DEADLINE IS CHECKED FIRST, under as.mu, on every pass that followed a wait: a waiter
+	// can wake before its deadline and then block on as.mu past it, and a check anywhere later
+	// would let it take a gate that happens to be free, or sit out the flapper jail below,
+	// after its deadline. A first pass never waited and is bounded by the CONNECT deadline
+	// that already ran.
+	if waited && ownBudget.expired(time.Now()) {
+		asm.mu.Unlock()
+		return mqttRefuseGateHeld(c, cid, sendConnAck)
+	}
 	// Check if different applications keep trying to connect with the same
 	// client ID at the same time.
 	if tm, ok := asm.flappers[cid]; ok {
@@ -523,24 +541,40 @@ CHECK:
 			// not wait for the CONNACK and sends other protocols, the
 			// server would not have a fully setup client and may panic.
 			asm.mu.Unlock()
+			// A CONNECT that already waited on the gate sits the jail out only until its own
+			// absolute deadline, and a closed transport ends it at once: neither may extend a
+			// wait the deadline bounds.
+			jail := mqttSessJailDur.Get()
+			if waited {
+				jail = min(jail, ownBudget.remaining(time.Now()))
+			}
 			select {
 			case <-s.quitCh:
-			case <-time.After(mqttSessJailDur.Get()):
+			case <-c.mqtt.abortLatch():
+			case <-time.After(jail):
 			}
 			c.closeConnection(DuplicateClientID)
 			return ErrConnectionClosed
 		}
 	}
-	// If an existing session is in the process of processing some packet, we can't
-	// evict the old client just yet. So try again to see if the state clears, but
-	// if it does not, then we have no choice but to fail the new client instead of
-	// the old one.
+	// The gate is held: by the previous connection's close (its teardown), by another CONNECT
+	// for this client ID, or by a resolver. Wait for its RELEASE, bounded by this CONNECT's
+	// absolute ownership deadline, and answer a v5 client 0x89 if it never comes. The wakeup
+	// channel is registered in THIS critical section, the one that observed the gate held,
+	// which is what keeps a release from being lost (sess_gate_wait.go).
 	if _, ok := asm.sessLocked[cid]; ok {
+		released := asm.sessGateWaiterLocked(cid)
 		asm.mu.Unlock()
-		if locked++; locked == 10 {
-			return fmt.Errorf("other session with client ID %q is in the process of connecting", cid)
+		waited = true
+		switch mqttWaitSessGate(released, c.mqtt.abortLatch(), ownBudget.deadline()) {
+		case mqttGateWaitExpired:
+			return mqttRefuseGateHeld(c, cid, sendConnAck)
+		case mqttGateWaitAborted:
+			return ErrConnectionClosed
 		}
-		time.Sleep(100 * time.Millisecond)
+		if h := mqttTestGateWaitWokenHookV.Load(); h != nil {
+			(*h)()
+		}
 		goto CHECK
 	}
 
@@ -561,7 +595,7 @@ CHECK:
 	// And remove it on exit, regardless of error or not.
 	defer func() {
 		asm.mu.Lock()
-		delete(asm.sessLocked, cid)
+		asm.releaseSessGateLocked(cid)
 		// The resident session, read in the same critical section as the release, for the
 		// void-verdict re-check below: this is a gate release like unlockSession's and owes
 		// the same handoff, and reading the map here is what keeps it to a RESIDENT object
@@ -725,16 +759,7 @@ CHECK:
 
 	defer endAcceptTx()
 
-	// One absolute ownership budget for this CONNECT, anchored at issue #55's stop and constructed
-	// ABOVE the restoreSession label so it survives every re-drive unchanged: retries and cycles
-	// consume it, none resets it. See outbound_connect_budget.go and ownBudgetAnchor above.
-	ownBudgetTotal := mqttConnectOwnershipBudget
-	asm.mu.RLock()
-	if asm.testOwnershipBudgetTotal > 0 {
-		ownBudgetTotal = asm.testOwnershipBudgetTotal
-	}
-	asm.mu.RUnlock()
-	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, ownBudgetTotal)
+	// The ownership budget was constructed above the client-ID gate; see ownBudget there.
 	// The authority-step re-attempt allowance, per CONNECT and for the same reason: every drive
 	// and every re-drive of this frame draws on one allowance, so a restoration never replenishes
 	// it (see reconcileOwnershipStep).

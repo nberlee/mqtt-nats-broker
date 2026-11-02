@@ -8807,6 +8807,80 @@ this leaves is a stated residual (`docs/CONFORMANCE.md`, "A session object remov
 its reset keeps working while its work is unresolved", and
 [issue #138](https://github.com/nberlee/mqtt-nats-broker/issues/138), D1).
 
+### A clean close releases the client-ID gate once its retirement is durably owned
+
+A clean-start CONNECT for a client ID whose previous connection is closing finds the
+client-ID gate (`asm.sessLocked`) held by that close. Until
+[issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155) the close held it
+across its whole teardown — every claim, closure and deletion, the inbound QoS 2 hold
+walk included — and the CONNECT polled it ten times, 100 ms apart, and then closed
+without a CONNACK. Paho allows 0.3 s.
+
+**The gate wait** (`internal/mqtt/sess_gate_wait.go`) waits for the RELEASE. The wakeup
+channel is registered in the same `as.mu` critical section that observed the gate held,
+and every release closes it in the critical section that deletes the gate
+(`releaseSessGateLocked`, the one release path), so a release cannot be lost. The wait is
+bounded by the CONNECT's absolute ownership deadline, anchored where the CONNECT deadline
+stopped (see "The ownership protocol's deadline") and never restarted by a wakeup; the
+deadline is re-checked under `as.mu` first on every pass after a wait — before the
+flapper check and before the gate is taken — so a waiter delayed on the mutex past its
+deadline refuses rather than taking a gate that happens to be free or sitting out the
+flapper jail; a waiter that does meet the jail sits it out only until its deadline. The
+wait, and that jail, also end on the arriving connection's abort latch, which a transport
+close and a server shutdown fire. Exhausted, a v5 client is answered CONNACK 0x89 with
+the Reason String "session is still completing the previous connection's teardown"; a
+3.1.1 client is closed.
+
+**The close's order** for a session that ends at close (Session Expiry 0):
+
+1. **The Will action, first**, with the gate held and before the teardown opens its
+   record transaction — the gated order is "end the record transaction, Will action,
+   release the gate". Every arm of the clean discard owed the Will anyway, so this moves
+   it only relative to the deletions, which it never depended on. The Will is immediate
+   on this path: the DISCONNECT that sets the lifetime to zero also sets the expiry the
+   close classifies the Will with, so an owed-delayed disposition does not reach it. It
+   is acted on under the incarnation and record sequence captured before the teardown
+   re-mints them. The order is this broker's: another broker can adopt the marker before
+   the Will is acted on, as the expiry path and the sweep always could.
+2. **Drain, prepare, claim** (marker and receipt), **watermark**, **discarding closure**
+   and **recovery root**, as before.
+3. **Release the gate.** From here the retirement is durably owned: the receipt names the
+   exact ownership retired, the watermark fences the generation's releases, and the
+   closure roots its recovery executor and licenses the orphan sweep. Released once,
+   whichever comes first — this point or the close's own deferred release — so the
+   deferred release can never release a gate a successor has since taken. A receiptless
+   teardown (no SERVING authority at close) has no closure and so no durable owner for
+   the rest, and keeps the gate to its end.
+4. **The continuation**, without the gate: the shared closing, the classification, the
+   deletions and the hold walk, the affine prerequisites, the release gate and the record
+   release. It is the same work `finishAdoptedTeardown` already runs with no gate from
+   the expiry path and the sweep: every name is the retiring generation's, it acts on the
+   removed and re-minted object or on durable state, its deleters carry their own bounds
+   (issue #66, issue #38), and the record release is sequence-targeted and classified by
+   re-reading — a successor's record carries another generation, and
+   `condemnRetiredSurvivor` leaves it alone. The two error arms that restore residency
+   (`errMQTTClearDrainTimeout`, `errMQTTClearRefusedUnresolved`) are produced only before
+   the claim; after the release they are refused outright rather than reinstalling the
+   retired object beside a successor.
+
+**The successor displaces the marked record** (`internal/mqtt/sess_teardown_displace.go`)
+instead of finishing the teardown inline, when five facts are read: the record names only
+this session's resources; the teardown receipt stands; the watermark names this
+generation at or past the marker's sequence; the generation's closure stands with
+`Discard`; and the release gate both teardown routes apply authorizes. The closure and
+receipt are create-only and the release facts are about a closed generation, so none can
+regress before the successor's write lands. The successor is a parentless create on a
+fresh generation at the marker's sequence, with Session Present false, and the accept
+batch's record CAS at that exact sequence, the authority's reservation CAS and the
+permanent metadata slot arbitrate it: a continuation that released the record first makes
+the CAS fail and the CONNECT re-drives into a record-absent create. Anything short of the
+five facts, or an undecidable read, keeps the inline adoption.
+
+**After a crash in the continuation** the predecessor's consumers and exchanges are its
+recovery executor's, and its inbound QoS 2 holds and remaining registers are the orphan
+sweep's — licensed by the generation's closure even once the successor displaced the
+marker and its own retirement replaced the watermark slot (see "Orphan reconciliation").
+
 ### The incarnation completion lease
 
 Re-minting a generation protects the NEXT incarnation from the retiring one's late
@@ -9200,7 +9274,8 @@ non-destructive in themselves.**
   invalidated by a retirement landing afterwards.
 - **The orphan sweep's destruction licence** (`internal/mqtt/orphan_retire_proof.go`).
   Every sweep arm that can still destroy live session-generation state requires a valid
-  watermark whose generation EQUALS the candidate's; without it the state is RETAINED.
+  watermark whose generation EQUALS the candidate's, or the candidate generation's own
+  permanent closure carrying an authorized discard; without either the state is RETAINED.
   `mseq` supplies no second dimension there, and the reason is structural rather than
   conservative: the candidate generation belongs to a REMOTE party, so this pass has no
   `sess.seq` of its own to compare a marker against, and comparing `mseq` with a
@@ -14201,8 +14276,25 @@ a resume preserves the generation, so such a session still uses these very names
 destroying its state is payload LOSS rather than leakage. So:
 
 > Any arm of this pass that can still destroy live session-generation state requires a
-> valid retirement watermark whose generation EQUALS the candidate's. Without that proof,
+> valid retirement watermark whose generation EQUALS the candidate's, or a valid permanent
+> closure of that generation which carried an authorized discard. Without either proof,
 > RETAIN.
+
+**The closure is the per-generation retirement history the single watermark slot is not.**
+One subject per generation (`mqttGenClosureSubject`), create-only, its `Discard` member
+immutable, never deleted while the recovery epoch stands, written only by the act that ended
+the generation's authority: a receipted teardown after its claim and watermark, or a
+clean-start handoff's finalization in the batch that displaced the record. A closed
+generation is never admitted again — the transition boundary refuses any proposal of a
+generation with a standing closure, preserving or discarding, and refuses an unreadable one
+(`checkProposedGenerationIsFresh`) — so no broker serves these names. Only a VALID closure
+with `Discard` proves; a preserving closure kept its obligations, and absent, corrupt and
+indeterminate reads prove nothing. The sweep holds the client-ID hash, not the ID, so its
+reader (`loadGenClosureByHash`) takes the body's own client ID, requires it to hash back to
+the subject token, and decodes with the full closure validation. This is what keeps a
+generation reclaimable after a later retirement replaces the watermark slot — the case a
+clean close's early gate release makes reachable after a crash (see "A clean close releases
+the client-ID gate once its retirement is durably owned").
 
 One arm meets this differently since
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c-lc: the
@@ -14214,13 +14306,14 @@ batch. That is strictly stronger evidence that no live generation depends on the
 than the watermark, and unlike the watermark it is not a single slot a later generation's
 retirement overwrites, so it alone licenses that delete.
 
-Everything below is KEPT as well; the watermark is an ADDITIONAL licence and replaces
+Everything below is KEPT as well; the proof is an ADDITIONAL licence and replaces
 none of it. `mseq` gives no second dimension here — this pass holds no `sess.seq` for a
 remote generation, and cross-stream sequence comparison is meaningless — so the proof is
 exact generation equality alone. A valid MATCHING observation is remembered in a bounded
 positive-only memo; losing it to a restart or the bound costs a cleanup OPPORTUNITY and
 never a licence, which is what makes caching sound here and unsound for every negative
-outcome. The memo holds ONE generation per client because the durable watermark does.
+outcome. The memo holds ONE generation per client; that bounds it, and a replaced entry
+costs a read on its next sighting, never a licence.
 
 **Today's census of arms that mutate from this false-absence premise**, recorded as the
 current enumeration rather than as a claim that it stays complete: the `discarded` claim

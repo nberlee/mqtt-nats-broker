@@ -27,6 +27,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3485,30 +3486,122 @@ func TestMQTTLockedSession(t *testing.T) {
 	if err := asm.lockSession(sess, cli); err != nil {
 		t.Fatalf("Unable to lock session: %v", err)
 	}
-	defer asm.unlockSession(sess)
 
-	// Now try to connect another client that wants to use "sub".
-	// We can't use testMQTTConnect() because it is going to fail.
+	// A gate that stays held past the CONNECT's ownership deadline refuses the CONNECT
+	// at that deadline: a 3.1.1 client is closed without a CONNACK, a v5 client is told
+	// 0x89 Server Busy. The deadline is shortened so the refusal comes promptly.
+	const budget = 750 * time.Millisecond
+	asm.mu.Lock()
+	asm.testOwnershipBudgetTotal = budget
+	asm.mu.Unlock()
 	addr := net.JoinHostPort(o.MQTT.Host, fmt.Sprintf("%d", o.MQTT.Port))
 	c2, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("Error creating mqtt connection: %v", err)
 	}
 	defer c2.Close()
-	proto := mqttCreateConnectProto(ci)
-	if _, err := testMQTTWrite(c2, proto); err != nil {
+	start := time.Now()
+	if _, err := testMQTTWrite(c2, mqttCreateConnectProto(ci)); err != nil {
 		t.Fatalf("Error writing connect: %v", err)
 	}
 	if _, err := testMQTTRead(c2); err == nil {
 		t.Fatal("Expected connection to fail")
 	}
+	if took := time.Since(start); took < budget/2 || took > budget+3*time.Second {
+		t.Fatalf("the 3.1.1 refusal came after %v, want it at the %v deadline", took, budget)
+	}
 
-	// Now try again, but this time release the session while waiting
-	// to connect and it should succeed.
+	cv5, rv5 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: subClientID, cleanStart: false},
+		o.MQTT.Host, o.MQTT.Port)
+	defer cv5.Close()
+	sp, rc, props := testMQTTReadConnAckV5(t, rv5)
+	if rc != mqttReasonServerBusy || sp {
+		t.Fatalf("a v5 CONNECT behind a held gate was answered rc=%#x sp=%v, want 0x89 and no session", rc, sp)
+	}
+	if props == nil || props.reasonString != mqttReasonStrGateHeld {
+		t.Fatalf("the 0x89 CONNACK carried reason string %v, want %q", props, mqttReasonStrGateHeld)
+	}
+	if _, err := testMQTTRead(cv5); err == nil {
+		t.Fatal("the refused v5 connection was not closed after its CONNACK")
+	}
+
+	// Now try again, with the ordinary deadline, and release the session while
+	// waiting: the release wakes the CONNECT, which succeeds.
+	asm.mu.Lock()
+	asm.testOwnershipBudgetTotal = 0
+	asm.mu.Unlock()
 	time.AfterFunc(250*time.Millisecond, func() { asm.unlockSession(sess) })
 	c3, r3 := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c3.Close()
 	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+}
+
+// A CONNECT waiting on a held gate ends when a server shutdown closes its transport, rather
+// than waiting for a release or the rest of its ownership deadline. An ABORTED wait never
+// wakes on a release, so the release that follows the transport close must not reach it.
+func TestMQTTLockedSessionWaitEndsOnShutdown(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	ci := &mqttConnInfo{clientID: "sub-shutdown", cleanSess: false}
+	c, r := testMQTTConnect(t, ci, o.MQTT.Host, o.MQTT.Port)
+	defer c.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	asm := testMQTTGetGlobalASM(t, s)
+	cli := testMQTTGetClient(t, s, ci.clientID)
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		return asm.lockSession(cli.mqtt.sess, cli)
+	})
+
+	registered := make(chan struct{})
+	var once sync.Once
+	reg := func() { once.Do(func() { close(registered) }) }
+	prevReg := mqttTestGateWaitRegisteredHookV.Load()
+	mqttTestGateWaitRegisteredHookV.Store(&reg)
+	defer mqttTestGateWaitRegisteredHookV.Store(prevReg)
+	var wokeOnRelease atomic.Bool
+	woken := func() { wokeOnRelease.Store(true) }
+	prevWoken := mqttTestGateWaitWokenHookV.Load()
+	mqttTestGateWaitWokenHookV.Store(&woken)
+	defer mqttTestGateWaitWokenHookV.Store(prevWoken)
+
+	addr := net.JoinHostPort(o.MQTT.Host, fmt.Sprintf("%d", o.MQTT.Port))
+	c2, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Error creating mqtt connection: %v", err)
+	}
+	defer c2.Close()
+	if _, err := testMQTTWrite(c2, mqttCreateConnectProto(ci)); err != nil {
+		t.Fatalf("Error writing connect: %v", err)
+	}
+	select {
+	case <-registered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the CONNECT never started waiting on the held gate")
+	}
+	done := make(chan struct{})
+	go func() {
+		testMQTTShutdownServer(s)
+		close(done)
+	}()
+	// The shutdown closes the waiting connection's transport.
+	if err := c2.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("setting the read deadline: %v", err)
+	}
+	if _, err := c2.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the waiting connection received data instead of being closed")
+	}
+	// Only now is the gate released, so the resident client's teardown and the shutdown can
+	// finish; a wait that the transport close did not end would be woken by this release.
+	time.Sleep(200 * time.Millisecond)
+	asm.unlockSession(cli.mqtt.sess)
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the shutdown did not complete")
+	}
+	if wokeOnRelease.Load() {
+		t.Fatal("the waiting CONNECT outlived its closed transport and was woken by a later release")
+	}
 }
 
 func TestMQTTPersistRetainedMsg(t *testing.T) {

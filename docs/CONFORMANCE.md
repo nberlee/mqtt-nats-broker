@@ -151,24 +151,26 @@ CI gates on *new* failures only:
   unresolved move interval". Regression test: `TestSessionClearPurgesQoS2Hold`
   (`internal/mqtt/qos2_purge_test.go`).
 - **Reconnect after a discard of many held QoS 2 exchanges** (`test_keepalive` after
-  `test_flow_control2`): a Clean Start CONNECT for a client ID whose previous session is
-  still being torn down waits for that teardown. That is stated behavior, not a timing
-  promise, and it includes discarding every inbound QoS 2 hold. `test_flow_control2`
-  leaves 1024 holds behind at the default Receive Maximum, and `test_keepalive`'s setup
-  CONNECT's Paho client allows 0.3 s for the CONNACK (`getPacket` sets the socket timeout
-  to 0.3 s). The holds are arbitrated concurrently, at most `mqttQoS2DiscardWalkWidth` at
-  once (see ARCHITECTURE "The release claim"). **What remains:** discard work is still
-  linear in the number of held exchanges, and only its wall time shrinks, until the server
-  saturates. On a single-node file store on the same host the reconnect after 1024 holds
-  took 0.25 to 0.28 s when the CONNECT was sent the instant the DISCONNECT was read, and
-  about 0.05 s when it was sent 0.25 s later. That is under Paho's 0.3 s by a margin that
-  a slower runner or a replicated server may not keep, and the larger Receive Maximum
-  values a deployment can configure, up to 65535, scale it. A walk that meets an error
-  stops admitting holds and leaves the rest to the re-driven teardown or the orphan sweep.
-  The discard's wait for an in-flight release is a shared polling budget, not a wall-time
-  bound. Regression tests: `TestMQTTWalkBounded*`,
-  `TestQoS2DiscardArbitrationUsesTheBoundedWalk`,
-  `TestQoS2DiscardWalkUnderReleasingClaims` (`internal/mqtt/qos2_discard_walk_test.go`).
+  `test_flow_control2`, and the `cleanup()` CONNECTs of every test): a Clean Start
+  CONNECT for a client ID whose previous connection is closing no longer waits for that
+  connection's teardown. The close of a session that ends at close (Session Expiry 0)
+  releases the client-ID gate as soon as its retirement is durably owned — Will action,
+  drain, teardown claim and receipt, watermark, discarding closure — and the successor
+  displaces the marked record instead of finishing the teardown; the inbound QoS 2 hold
+  walk and the rest of the reclamation run after the successor's CONNACK
+  ([issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155); see ARCHITECTURE
+  "A clean close releases the client-ID gate once its retirement is durably owned").
+  **What remains:** the successor still waits for that durable prefix, a handful of
+  JetStream writes; for the whole teardown of a receiptless discard (a session whose
+  authority was not serving at close), which keeps the gate to its end; and for a finite
+  or never-expiring predecessor's close bookkeeping. The wait is for the release and is
+  bounded by the CONNECT's ownership deadline; past it a v5 client gets CONNACK 0x89 with
+  the Reason String "session is still completing the previous connection's teardown" and
+  a 3.1.1 client is closed. A client whose own CONNACK timeout is shorter than that
+  prefix on its storage still times out. Regression tests:
+  `TestMQTTCleanStartAnsweredDuringPredecessorTeardown`,
+  `TestMQTTCleanStartRedrivesWhenPredecessorReleasesFirst`, `TestMQTTLockedSession`
+  (`internal/mqtt/sess_teardown_gate_release_test.go`, `internal/mqtt/mqtt_test.go`).
 - **Retained replay after acknowledged retained QoS 1** (`test_subscribe_options`, and the
   0.3 s CONNACK timeouts it cascaded into `test_unsubscribe` and `test_user_properties`):
   a retained acknowledgement installs no source owner, and every ordinary-source sink
@@ -2406,14 +2408,16 @@ invalidate the supported-alpha conformance result.
 
 **[issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40) unit 2.**
 Every orphan-sweep arm that can still destroy live session-generation
-state now requires a valid retirement watermark whose generation EQUALS the candidate's,
-and without that proof it RETAINS. The reason is that the pass's own evidence cannot
+state now requires a valid retirement watermark whose generation EQUALS the candidate's, or
+a valid permanent closure of that generation which carried an authorized discard
+([issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155)), and without either
+proof it RETAINS. The reason is that the pass's own evidence cannot
 support the destruction: a complete `$MQTT_sess` walk plus this broker's residents
 establishes that nothing THIS BROKER can see names the generation, which a session live on
 ANOTHER broker with no record satisfies equally — and a resume preserves the generation, so
 such a session still uses those exact names. Destroying its state is payload LOSS.
 
-**Three resource classes are retained where no matching retirement is observable:**
+**Three resource classes are retained where neither proof is observable:**
 
 - a NONTERMINAL inbound QoS 2 hold on `$MQTT_qos2in`, carrying a full application payload,
   together with the `discarded` fence that is not written for it;
@@ -2421,14 +2425,15 @@ such a session still uses those exact names. Destroying its state is payload LOS
 - a `$MQTT_PUBREL_*` consumer on `$MQTT_out`, with every interest-retained PUBREL it
   holds.
 
-**The retention is PERMANENT and UNBOUNDED, and it is not conditioned on a rollout.** The
-watermark is a single slot per client, so once a later retirement replaces it the earlier
-generation can never again be proven retired: retire G1, then create and retire G2, and
-G1's state is unreclaimable for the life of the store. A restart, or eviction from the
-bounded positive-only memo, has the same effect for a generation whose watermark was
-observed but is no longer discoverable. A **valid watermark naming a DIFFERENT generation
-authorizes nothing**, which is the ordinary steady state for any client torn down more
-than once.
+**The retention is PERMANENT and UNBOUNDED for a generation without a discarding
+closure, and it is not conditioned on a rollout.** The watermark is a single slot per
+client, so once a later retirement replaces it the earlier generation can be proven retired
+only through its own closure. A generation whose closure carried a discard — every
+receipted teardown and every clean-start handoff's predecessor — stays reclaimable. A
+generation retired without one, a receiptless teardown, is unreclaimable for the life of
+the store once the slot moves on: retire G1 that way, then create and retire G2, and G1's
+state stays. A restart, or eviction from the bounded positive-only memo, costs only a read.
+A **valid watermark naming a DIFFERENT generation authorizes nothing** by itself.
 
 **Cleanup that does NOT need the proof still runs**, so this is not a blanket retain: once
 the payload is authoritatively absent, an unchanged exact-sequence release claim is
@@ -6017,9 +6022,12 @@ is the **failed success-CONNACK write**, whose channel is the thing that failed.
 
 **Exits EARLIER in the CONNECT stay silent, and that is a stated residual rather than an
 oversight.** A CONNECT refused before the accept save — an unresolved record state, or a
-post-clear failure that disposes the old client — returns without a CONNACK. Those exits
-precede the point at which this connection is bound and its session accepted, which is the
-boundary the signal is scoped to
+post-clear failure that disposes the old client — returns without a CONNACK. One earlier
+exit is answered: a CONNECT whose client-ID gate stays held past its ownership deadline
+gets v5 CONNACK 0x89
+([issue #155](https://github.com/nberlee/mqtt-nats-broker/issues/155)). Those exits
+precede the point at which this connection is bound and its session accepted, which is
+the boundary the signal is scoped to
 ([issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)).
 
 A **3.1.1** client still gets a bare close wherever it is refused: its CONNACK has no

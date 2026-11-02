@@ -369,7 +369,7 @@ func TestRetryUncertainSessionsIsSerializedAgainstConnect(t *testing.T) {
 		t.Fatal("the retry pass resolved a session a CONNECT was holding")
 	}
 	a.asm.mu.Lock()
-	delete(a.asm.sessLocked, sess.id)
+	a.asm.releaseSessGateLocked(sess.id)
 	a.asm.mu.Unlock()
 
 	// Released, it resolves — proving the pass does reach a never-expiring session.
