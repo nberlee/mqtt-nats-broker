@@ -4391,13 +4391,18 @@ func TestMQTTAckWaitConfigChange(t *testing.T) {
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "bar", qos: 1}}, []byte{1})
 	sendMsg("bar", "msg2")
 	testMQTTCheckPubMsgNoAck(t, c, r, "bar", mqttPubQos1, []byte("msg2"))
+	// The bound only has to tell the new AckWait (10 ms) from the preserved one (250 ms). One
+	// redelivery is the AckWait plus a delivery round trip, and that round trip alone is 40-95 ms
+	// under -race and has exceeded 190 ms on a loaded runner (issue #157), so one interval cannot
+	// tell them apart. Six can: under the preserved value the sixth is due 1500 ms after the
+	// delivery this clock starts behind, against about 400 ms under the new one.
+	const redeliveries = 6
 	start = time.Now()
-	testMQTTCheckPubMsgNoAck(t, c, r, "bar", mqttPubQos1|mqttPubFlagDup, []byte("msg2"))
-	// The bound only has to tell the new AckWait (10 ms) from the preserved one (250 ms): a
-	// redelivery's own round trip is 50-85 ms under -race, so 50 ms measured the race detector,
-	// not the value in force.
-	if dur := time.Since(start); dur > 150*time.Millisecond {
-		t.Fatalf("AckWait new value not used by new sub: %v", dur)
+	for i := 0; i < redeliveries; i++ {
+		testMQTTCheckPubMsgNoAck(t, c, r, "bar", mqttPubQos1|mqttPubFlagDup, []byte("msg2"))
+	}
+	if dur := time.Since(start); dur >= time.Second {
+		t.Fatalf("AckWait new value not used by new sub: %d redeliveries took %v", redeliveries, dur)
 	}
 	c.Close()
 }
