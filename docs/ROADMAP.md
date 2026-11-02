@@ -1440,6 +1440,17 @@ them in order where a later lint change depends on an earlier cleanup.
 - [x] Delete `-consumer-replicas`: consumers on the interest-retention streams inherit the
   stream's replica count, and the flag now fails startup as undefined. Done 2026-10-25.
 
+- [ ] Correct the code comments the dead-text cut found stale: the deleted CONNECT-accept
+  rollback ([issue #147](https://github.com/nberlee/mqtt-nats-broker/issues/147)), the
+  pre-register retained send ([issue #149](https://github.com/nberlee/mqtt-nats-broker/issues/149),
+  [issue #150](https://github.com/nberlee/mqtt-nats-broker/issues/150)), the removed
+  retained flush ([issue #152](https://github.com/nberlee/mqtt-nats-broker/issues/152)),
+  two contradicted claims ([issue #153](https://github.com/nberlee/mqtt-nats-broker/issues/153))
+  and claims stale beyond their pointer
+  ([issue #154](https://github.com/nberlee/mqtt-nats-broker/issues/154)). Comment-only,
+  except that #154's unstated retained-identifier residual is either stated in
+  `docs/CONFORMANCE.md` or dropped.
+
 ### Performance and resource audits
 
 - [x] Classify every bounded re-attempt loop (`bounded_reattempt_census_test.go`) and give
@@ -1770,6 +1781,16 @@ them in order where a later lint change depends on an earlier cleanup.
   cut analysis stays in git history, linked from its finding's GitHub issue where one fits.
   Done 2026-11-01.
 
+- [ ] Add the clean-start predecessor cleanup to `docs/CONFORMANCE.md`'s list of callers
+  of the teardown reap, or state why it is excluded
+  ([issue #148](https://github.com/nberlee/mqtt-nats-broker/issues/148)).
+
+- [ ] Settle what a cold peer resume does with a landed never-sent obligation: the
+  architecture says the peer's recovery withdraws it, `outbound_admit_continuity_test.go`
+  says it restores and continues it and asserts neither. Establish the behavior in code,
+  then align the doc and the test
+  ([issue #151](https://github.com/nberlee/mqtt-nats-broker/issues/151)).
+
 ### Before the first push
 
 - [x] Nothing is pushed to the GitHub remote until commit signing is set up and the
@@ -2076,6 +2097,13 @@ follow-ups](https://github.com/nberlee/mqtt-nats-broker/issues/50).
   access, so this needs a JetStream API answer that carries it); or refuse `0` when the
   JetStream is clustered. Not an alpha blocker: the setting works when given, and
   `docs/CONFORMANCE.md` states the limitation.
+
+- [ ] Refuse a pre-release delayed-drain record shape instead of repairing it:
+  `mqttPersistedDrainSeq.RegSeq` still repairs a record written before the field existed,
+  against the compatibility boundary. A zero `RegSeq` is also a value the broker writes
+  today, so the fix must first tell a shape the broker no longer writes from a current
+  zero. Not an alpha blocker
+  ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
 
 - [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
   A schedule may publish only into its own stream, so the ADR must preserve
