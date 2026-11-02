@@ -1558,6 +1558,10 @@ them in order where a later lint change depends on an earlier cleanup.
 - [x] Repair three pre-existing intermittent reds: two fixture repairs, and foreground
   priority held by one coordinator per client identifier. Done 2026-11-01.
 
+- [ ] Trace why `TestMQTTReconcileRegisterIdentityInvariant` intermittently loses its third
+  CONNECT ("connection closed"); reproduced on HEAD under load
+  ([issue #164](https://github.com/nberlee/mqtt-nats-broker/issues/164)).
+
 ### NATS platform follow-ups
 
 - [x] Move the pin and the floor to nats-server 2.15.2 and the toolchain to Go 1.27; the
