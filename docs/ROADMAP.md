@@ -1563,6 +1563,10 @@ them in order where a later lint change depends on an earlier cleanup.
   CONNECT ("connection closed"); reproduced on HEAD under load
   ([issue #164](https://github.com/nberlee/mqtt-nats-broker/issues/164)).
 
+- [ ] Trace why `TestWillPendingArmAbortsThePassOnATransientFactOutage` intermittently finds
+  a Will already decided "publish"; reproduced on HEAD under load
+  ([issue #165](https://github.com/nberlee/mqtt-nats-broker/issues/165)).
+
 ### NATS platform follow-ups
 
 - [x] Move the pin and the floor to nats-server 2.15.2 and the toolchain to Go 1.27; the
