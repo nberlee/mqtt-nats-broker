@@ -203,7 +203,7 @@ run_natstest() {
 # Pinned Eclipse Paho paho.mqtt.testing revision. Bump deliberately (and re-run
 # the baseline) rather than tracking a moving branch.
 PAHO_REPO="${PAHO_REPO:-https://github.com/eclipse-paho/paho.mqtt.testing}"
-PAHO_REF="${PAHO_REF:-9d7bb80bb8b9d9cfc0b52f8cb4c1916401281103}"
+PAHO_REF="${PAHO_REF:-fdab9d2b1ce125385135e5d9f282a0ad315268cc}"
 PAHO_TEST_TIMEOUT="${PAHO_TEST_TIMEOUT:-60}"
 
 run_paho() {
