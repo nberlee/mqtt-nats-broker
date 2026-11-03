@@ -1250,27 +1250,6 @@ func testMQTTHasWillState(t testing.TB, asm *mqttAccountSessionManager, want mqt
 	}
 }
 
-// withLongWillScan pins the claim-scan interval far above any delay a test
-// uses, so a Will that arrives on time proves the LOCAL FIRE TIMER delivered it
-// rather than a lucky scan tick. It must be called before the server starts:
-// the claim ticker begins with account-manager creation, so changing the
-// interval afterwards leaves tick phase in the assertion.
-//
-// mqttWillClaimInterval is a package global (mqtt_v5_test.go's init() drops it
-// to 50ms for the whole package), so a test using this must not run in
-// parallel. Nothing in this package calls t.Parallel.
-func withLongWillScan(t *testing.T) {
-	t.Helper()
-	prevInterval, prevLease := mqttWillClaimInterval.Get(), mqttWillClaimLease.Get()
-	mqttWillClaimInterval.Set(30 * time.Second)
-	// Keep the lease above the interval, as production does.
-	mqttWillClaimLease.Set(60 * time.Second)
-	t.Cleanup(func() {
-		mqttWillClaimInterval.Set(prevInterval)
-		mqttWillClaimLease.Set(prevLease)
-	})
-}
-
 // testWillTimerCount reports how many delayed-Will fire timers are armed.
 func testWillTimerCount(s *Server) int {
 	s.willDispatchMu.Lock()
@@ -1294,6 +1273,9 @@ func TestMQTTWillOutboxTimerLatency(t *testing.T) {
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/latency", opts: 0}})
+	// The long interval keeps ticks out, but not the initial pass, which can start late
+	// and fire or cancel the Will before its timer does.
+	testAwaitInitialWillScan(t, testMQTTGetAccountSessionManager(t, s, "tlsub"))
 
 	will := &mqttWill{topic: []byte("will/latency"), message: []byte("prompt"), qos: 0}
 	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tlpub", cleanStart: true, will: will,
@@ -1330,6 +1312,9 @@ func TestMQTTWillOutboxAmbiguousEnqueueAckTimer(t *testing.T) {
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/ambig", opts: 0}})
+	// The long interval keeps ticks out, but not the initial pass, which can start late
+	// and fire or cancel the Will before its timer does.
+	testAwaitInitialWillScan(t, testMQTTGetAccountSessionManager(t, s, "aesub"))
 
 	asm := testMQTTGetAccountSessionManager(t, s, "aesub")
 	// Perform the real store, then report a lost ack. The record IS durable and
@@ -1431,6 +1416,9 @@ func TestMQTTWillOutboxTimerReconnectCancels(t *testing.T) {
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/trc", opts: 0}})
+	// The long interval keeps ticks out, but not the initial pass, which can start late
+	// and fire or cancel the Will before its timer does.
+	testAwaitInitialWillScan(t, testMQTTGetAccountSessionManager(t, s, "trcsub"))
 
 	will := &mqttWill{topic: []byte("will/trc"), message: []byte("suppressed"), qos: 0}
 	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "trcpub", cleanStart: false, will: will,
@@ -1533,6 +1521,9 @@ func TestMQTTWillOutboxTimerOnCancelledRecord(t *testing.T) {
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/reload", opts: 0}})
+	// The long interval keeps ticks out, but not the initial pass, which can start late
+	// and fire or cancel the Will before its timer does.
+	testAwaitInitialWillScan(t, testMQTTGetAccountSessionManager(t, s, "rldsub"))
 
 	will := &mqttWill{topic: []byte("will/reload"), message: []byte("stale"), qos: 0}
 	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rldpub", cleanStart: false, will: will,
@@ -1603,11 +1594,16 @@ func TestMQTTWillOutboxTimerOnCancelledRecord(t *testing.T) {
 // The reap is simulated by deleting the record outright, which is what the claim
 // loop does to a terminal record.
 //
-// The claim interval is left at its normal value: the captured sweep runs at the end
-// of a conclusively completed pass, so suppressing the pass would suppress the very
-// mechanism under test. The 300-second delay is what keeps the timer from
-// self-releasing.
+// The pass under test is run by the test itself, at the point the interleaving needs
+// it: the captured sweep runs at the end of a conclusively completed pass, and
+// scanWillOutbox is the pass the claim loop runs. Left to the loop, a pass could also
+// complete between the reap and the premise check below and release the timer before
+// the test has established that the reap alone did not, so the loop is kept out: its
+// initial pass is awaited and its ticks are pinned beyond the test. The 300-second
+// delay is what keeps the timer from self-releasing.
 func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
+	withLongWillScan(t)
+
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1615,6 +1611,7 @@ func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "reapsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
+	testAwaitInitialWillScan(t, testMQTTGetAccountSessionManager(t, s, "reapsub"))
 
 	// Long delay: the timer cannot self-release by firing.
 	will := &mqttWill{topic: []byte("will/reap"), message: []byte("never"), qos: 0}
@@ -1650,6 +1647,7 @@ func TestMQTTWillOutboxTimerReleasedWhenRecordReaped(t *testing.T) {
 		t.Fatalf("timer count = %d before the sweep, want 1", n)
 	}
 
+	asm.scanWillOutbox(s)
 	checkFor(t, 15*time.Second, 25*time.Millisecond, func() error {
 		if n := testWillTimerCount(s); n != 0 {
 			return fmt.Errorf("%d fire timer(s) retained after the record was reaped; the completed scan never saw the subject, so only the captured sweep can release it", n)

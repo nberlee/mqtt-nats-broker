@@ -39,7 +39,7 @@ func TestMQTTWillOutboxReplicatedTerminalDoneStands(t *testing.T) {
 	// Will while the test is still asserting. Signalling the dispatch gate closed
 	// would ALSO refuse the publisher worker, which is the very thing the paired
 	// mutation has to be able to reach. Set before the broker starts, so the loop
-	// never has a short tick; its one initial pass runs over an empty outbox.
+	// never has a short tick.
 	prevInterval := mqttWillClaimInterval.Get()
 	mqttWillClaimInterval.Set(10 * time.Minute)
 	t.Cleanup(func() { mqttWillClaimInterval.Set(prevInterval) })
@@ -47,6 +47,11 @@ func TestMQTTWillOutboxReplicatedTerminalDoneStands(t *testing.T) {
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
 	asm := testMQTTGetGlobalASM(t, b.s)
+	// The loop's one initial pass must have RETURNED, over an outbox nothing has seeded
+	// yet, before the record exists. Under load it can start late, and a late pass meets
+	// the licensed, expired-lease record below: it reclaims, publishes, finalizes and
+	// deletes it, and the finalize under test then finds no record at all.
+	testAwaitInitialWillScan(t, asm)
 
 	// Assert on the EXTERNAL act, not on what the record ends up saying.
 	pubs := testCapturePublishes(t, asm)

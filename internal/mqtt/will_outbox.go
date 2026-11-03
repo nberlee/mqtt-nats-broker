@@ -913,7 +913,8 @@ func (as *mqttAccountSessionManager) cancelIfSuperseded(s *Server, subject strin
 }
 
 // mqttTestWillInitialScanDoneV runs once the claim loop's initial outbox scan has returned, so a
-// measurement of a broker start can wait for it. nil in production.
+// test can wait until no pass is in flight before it seeds a record, and a measurement of a
+// broker start can wait for it. nil in production.
 var mqttTestWillInitialScanDoneV atomic.Pointer[func(as *mqttAccountSessionManager)]
 
 // willClaimLoop periodically scans the account's outbox and drives due Wills to

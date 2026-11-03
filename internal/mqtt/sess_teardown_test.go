@@ -55,6 +55,11 @@ func testNewTeardownEnv(t *testing.T) (a, b *testTeardownEnv) {
 	if a.asm.jsa.id == b.asm.jsa.id {
 		t.Fatal("the two brokers must have distinct JSA identities")
 	}
+	// Both claim loops' initial passes have returned, over an outbox nothing has seeded
+	// yet, before any test can seed one: the brokers share the stream, so a late pass on
+	// EITHER would act on the test's records through seams the test never hooked.
+	testAwaitInitialWillScan(t, a.asm)
+	testAwaitInitialWillScan(t, b.asm)
 	return a, b
 }
 

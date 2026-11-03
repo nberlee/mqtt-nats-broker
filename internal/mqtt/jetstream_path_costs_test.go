@@ -158,24 +158,19 @@ type jsPathBench struct {
 	cs  *jsRequestCensus
 }
 
-// The worker seams are installed once, before any broker starts, so a broker's initial Will scan
-// and its tenure settlements are always seen.
-var (
-	jsPathSettling  atomic.Int64 // tenure settlement jobs running
-	jsPathWillScans atomic.Int64 // initial Will scans completed
-)
+// The worker seams are installed once, before any broker starts, so a broker's tenure
+// settlements are always seen. Initial Will scans are counted by willInitialScanCount
+// (will_claim_loop_fixture_test.go), whose hook is installed for the whole binary.
+var jsPathSettling atomic.Int64 // tenure settlement jobs running
 
 func jsPathInstallWorkerSeams(t *testing.T) {
 	start := func(gen, tenure string) bool { jsPathSettling.Add(1); return true }
 	done := func(gen, tenure string) { jsPathSettling.Add(-1) }
 	mqttTestTenureSettleStartV.Store(&start)
 	mqttTestTenureSettleDoneV.Store(&done)
-	scan := func(*mqttAccountSessionManager) { jsPathWillScans.Add(1) }
-	mqttTestWillInitialScanDoneV.Store(&scan)
 	t.Cleanup(func() {
 		mqttTestTenureSettleStartV.Store(nil)
 		mqttTestTenureSettleDoneV.Store(nil)
-		mqttTestWillInitialScanDoneV.Store(nil)
 	})
 }
 
@@ -185,13 +180,13 @@ func jsPathInstallWorkerSeams(t *testing.T) {
 type jsPathStartMark struct{ sweeps, scans int64 }
 
 func jsPathMarkStart() jsPathStartMark {
-	return jsPathStartMark{mqttOrphanSweepRuns.Load(), jsPathWillScans.Load()}
+	return jsPathStartMark{mqttOrphanSweepRuns.Load(), willInitialScanCount.Load()}
 }
 
 func jsPathWaitStarted(t *testing.T, m jsPathStartMark) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
-	for mqttOrphanSweepRuns.Load() <= m.sweeps || jsPathWillScans.Load() <= m.scans {
+	for mqttOrphanSweepRuns.Load() <= m.sweeps || willInitialScanCount.Load() <= m.scans {
 		if time.Now().After(deadline) {
 			t.Fatal("a broker start's startup sweep or initial Will scan did not complete within 30s")
 		}

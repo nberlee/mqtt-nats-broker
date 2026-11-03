@@ -1571,11 +1571,12 @@ them in order where a later lint change depends on an earlier cleanup.
   for its withheld delivery before reconnecting. Done 2026-11-03
   ([issue #164](https://github.com/nberlee/mqtt-nats-broker/issues/164)).
 
-- [ ] Trace why `TestWillPendingArmAbortsThePassOnATransientFactOutage` intermittently finds
-  a Will already decided "publish"; reproduced on HEAD under load
-  ([issue #165](https://github.com/nberlee/mqtt-nats-broker/issues/165)). Same family, once
-  under load: `TestMQTTWillOutboxReplicatedTerminalDoneStands`
-  ([issue #169](https://github.com/nberlee/mqtt-nats-broker/issues/169)).
+- [x] `TestWillPendingArmAbortsThePassOnATransientFactOutage` and
+  `TestMQTTWillOutboxReplicatedTerminalDoneStands` were fixtures: a claim loop's late initial
+  pass acted on the seeded records. The two-broker environment now awaits both initial passes,
+  and every Will test that seeds a record a scan could act on keeps the loops' ticks out.
+  Done 2026-11-03 ([issue #165](https://github.com/nberlee/mqtt-nats-broker/issues/165),
+  [issue #169](https://github.com/nberlee/mqtt-nats-broker/issues/169)).
 
 - [ ] Trace why `TestMQTTInboundPipeRegistrationsAndJoin`'s shutdown-abandoned store
   intermittently times out instead of returning `ErrServerNotRunning`; seen once under load

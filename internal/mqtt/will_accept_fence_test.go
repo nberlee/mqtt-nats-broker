@@ -1,11 +1,13 @@
 // The claimant side of acceptance facts: what a delayed Will's claimant does with
 // them, and what it persists about the decision it took.
 //
-// Every test here drives tryFireWill (or the enqueue's early cancel) DIRECTLY on a
-// planted record rather than waiting for the claim loop. FireAt is far in the future
-// throughout, which keeps the background loop out of the record: tryFireWill itself
-// does not test FireAt — dueness is the scan's question — so driving it directly is
-// the same code path the loop reaches, minus the timing.
+// Every test here drives tryFireWill (or the enqueue's early cancel, or a scan) DIRECTLY
+// on a planted record rather than waiting for the claim loop: tryFireWill itself does not
+// test FireAt — dueness is the scan's question — so driving it directly is the same code
+// path the loop reaches, minus the timing. Both brokers' background loops have to stay
+// out of a record a scan could act on (will_claim_loop_fixture_test.go): the environment
+// awaits their initial passes, and a test seeding such a record pins the interval with
+// withLongWillScan, or stops the loops outright with testQuietClaimLoop.
 
 package mqtt
 
@@ -14,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -79,6 +80,35 @@ func testCapturePublishes(t testing.TB, asm *mqttAccountSessionManager) *atomic.
 		asm.mu.Lock()
 		asm.testPublishWill = nil
 		asm.mu.Unlock()
+	})
+	return &n
+}
+
+// testHoldPublishes is testCapturePublishes for a test that reloads the record after
+// licensing a publish: the publisher worker runs on its own goroutine and, once its
+// publication returns, finalizes the record to done and deletes it, racing the reload.
+// Here the publication is COUNTED and then blocks until the test ends, so the record
+// stays licensed and publishing for every assertion. Cleanup releases the hold and
+// joins the worker before the hook is removed and the environment shuts down.
+func testHoldPublishes(t testing.TB, e *testTeardownEnv) *atomic.Int64 {
+	t.Helper()
+	var n atomic.Int64
+	release := make(chan struct{})
+	e.asm.mu.Lock()
+	e.asm.testPublishWill = func(*mqttWillOutbox) error {
+		n.Add(1)
+		<-release
+		return nil
+	}
+	e.asm.mu.Unlock()
+	t.Cleanup(func() {
+		e.asm.mu.Lock()
+		e.asm.testPublishWill = nil
+		e.asm.mu.Unlock()
+	})
+	t.Cleanup(func() {
+		close(release)
+		e.s.willWorkerWG.Wait()
 	})
 	return &n
 }
@@ -194,8 +224,9 @@ func TestWillClaimantSuppressesOnlyForAnAcceptanceBeforeItWasDue(t *testing.T) {
 		{"an acceptance after it fell due does not", true, time.Minute, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			withLongWillScan(t)
 			a, _ := testNewTeardownEnv(t)
-			pubs := testCapturePublishes(t, a.asm)
+			pubs := testHoldPublishes(t, a)
 			cid := "due-" + t.Name()
 			fireAt := testFarFuture()
 			origin := testSessStreamFloor(t, a.asm)
@@ -241,6 +272,7 @@ func TestWillClaimantSuppressesOnlyForAnAcceptanceBeforeItWasDue(t *testing.T) {
 // last part is what the second subtest pins.
 func TestWillEarlyCancelUsesTheSamePredicate(t *testing.T) {
 	t.Run("a qualifying acceptance licenses the cancel", func(t *testing.T) {
+		withLongWillScan(t)
 		a, _ := testNewTeardownEnv(t)
 		const cid = "early-cancel"
 		fireAt := testFarFuture()
@@ -284,6 +316,7 @@ func TestWillEarlyCancelUsesTheSamePredicate(t *testing.T) {
 // unique subjects, so the set only grows — and the SCAN must therefore keep looking
 // past a non-qualifying fact rather than stopping at the newest.
 func TestWillClaimantSeesAnEarlierAcceptanceAfterALaterOne(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "two-acceptances"
@@ -311,6 +344,7 @@ func TestWillClaimantSeesAnEarlierAcceptanceAfterALaterOne(t *testing.T) {
 // TestWillClaimantCrossEpoch is T11.
 func TestWillClaimantCrossEpoch(t *testing.T) {
 	t.Run("a current-epoch acceptance supersedes a Will from another incarnation", func(t *testing.T) {
+		withLongWillScan(t)
 		a, _ := testNewTeardownEnv(t)
 		const cid = "epoch-super"
 		fireAt := testFarFuture()
@@ -418,42 +452,6 @@ func TestWillRenewalPersistsTheFloorWithItsIncarnation(t *testing.T) {
 // T7 / T16: what a failure to read the evidence costs
 // ---------------------------------------------------------------------------
 
-// testQuietWillClaimLoop keeps the account's own claim loop out of a test that calls
-// scanWillOutbox itself and counts what one PASS reads: the package drops the claim interval to
-// 50ms, so the loop's ticker would scan the same records concurrently and its reads would be
-// counted as the test's pass (a fixture race, pre-existing: 5 of 20 runs). It must be called
-// before the environment starts, and the returned wait blocks until the loop's initial pass on
-// asm has returned.
-func testQuietWillClaimLoop(t *testing.T) func(asm *mqttAccountSessionManager) {
-	t.Helper()
-	// As withLongWillScan (a tagged file's) does: the ticker starts with the account manager, so
-	// the interval is pinned before the environment exists, and the lease kept above it.
-	prevInterval, prevLease := mqttWillClaimInterval.Get(), mqttWillClaimLease.Get()
-	mqttWillClaimInterval.Set(30 * time.Second)
-	mqttWillClaimLease.Set(60 * time.Second)
-	t.Cleanup(func() {
-		mqttWillClaimInterval.Set(prevInterval)
-		mqttWillClaimLease.Set(prevLease)
-	})
-	var seen sync.Map
-	done := func(as *mqttAccountSessionManager) { seen.Store(as, true) }
-	mqttTestWillInitialScanDoneV.Store(&done)
-	t.Cleanup(func() { mqttTestWillInitialScanDoneV.Store(nil) })
-	return func(asm *mqttAccountSessionManager) {
-		t.Helper()
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			if _, ok := seen.Load(asm); ok {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("fixture: the claim loop's initial pass never returned")
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-}
-
 // TestWillClaimantAbortsThePassOnATransientFactOutage is T7's transient half and T16.
 //
 // TWO expired records with the failure injected on the FIRST. A single-record test
@@ -462,9 +460,8 @@ func testQuietWillClaimLoop(t *testing.T) func(asm *mqttAccountSessionManager) {
 // discarded return was the defect — an outage cost one JetStream timeout per expired
 // record instead of one per pass.
 func TestWillClaimantAbortsThePassOnATransientFactOutage(t *testing.T) {
-	quiet := testQuietWillClaimLoop(t)
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
-	quiet(a.asm)
 	const cid = "abort-pass"
 	origin := testSessStreamFloor(t, a.asm)
 
@@ -513,9 +510,8 @@ func TestWillClaimantAbortsThePassOnATransientFactOutage(t *testing.T) {
 // test uses expired PUBLISHING records, so a mutation discarding the PENDING arm's result
 // survived it untouched. Two DUE PENDING records are what distinguish them.
 func TestWillPendingArmAbortsThePassOnATransientFactOutage(t *testing.T) {
-	quiet := testQuietWillClaimLoop(t)
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
-	quiet(a.asm)
 	const cid = "abort-pending"
 	origin := testSessStreamFloor(t, a.asm)
 
@@ -761,6 +757,7 @@ func TestWillClaimantBudgetExhaustionLicensesNothing(t *testing.T) {
 // recovery that rescanned and happened to find nothing publishes too. Here it would
 // find something, and the count proves it never looked.
 func TestWillRecoveryReusesThePersistedDecision(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "decision-reuse"
@@ -811,6 +808,7 @@ func TestWillRecoveryReusesThePersistedDecision(t *testing.T) {
 // the same WillID, which becomes unsafe once a claim can be UNLICENSED: it would
 // have committed done over a record another claimant was still scanning under.
 func TestWillFinalizeRequiresTheSameLicence(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	const cid = "finalize-licence"
 	rec := testWillFor(a.asm, cid, "fin-w", testFarFuture(), 1)
@@ -871,6 +869,7 @@ func TestWillFinalizeRequiresTheSameLicence(t *testing.T) {
 // claimants taken from one base diverge — A publishes externally while B durably
 // cancels the same Will generation.
 func TestWillUnconditionalWriteDivergesClaimants(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "cross-term"
@@ -929,9 +928,8 @@ func TestWillUnconditionalWriteDivergesClaimants(t *testing.T) {
 func TestWillUnconditionalWriteRefiresAPublishedWill(t *testing.T) {
 	// The fact reads counted below are the claimant's own: the account's claim loop scans the same
 	// record on its 50ms ticker and its reads would be counted too (1 of 10 under -race).
-	quiet := testQuietWillClaimLoop(t)
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
-	quiet(a.asm)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "terminal-regression"
 	fireAt := testFarFuture()
@@ -1049,14 +1047,11 @@ func TestWillTimingInvariantHolds(t *testing.T) {
 // already in the past was never an ownership window at all, whereas the sanctioned
 // duplicate needs one minted correctly and then EXPIRED.
 func TestWillClaimMintsAFreshLease(t *testing.T) {
-	// BOTH brokers' loops are quieted: they scan the same outbox, and the peer's has none of the
-	// hooks below, so its claims of these records go uncounted (observed in 3 of 10 unquieted
-	// runs). The fixture once saw one claim instead of two in a shard; that failure was not
-	// reproduced, and the peer's uncounted claim is the interference this removes.
-	quiet := testQuietWillClaimLoop(t)
-	a, b := testNewTeardownEnv(t)
-	quiet(a.asm)
-	quiet(b.asm)
+	// BOTH brokers' loops stay out: they scan the same outbox, and the peer's has none of the
+	// hooks below, so its claims of these records would go uncounted (observed in 3 of 10
+	// unquieted runs). The environment awaits both initial passes; the pin keeps the ticks out.
+	withLongWillScan(t)
+	a, _ := testNewTeardownEnv(t)
 	testCapturePublishes(t, a.asm)
 	const cid = "fresh-lease"
 	origin := testSessStreamFloor(t, a.asm)
@@ -1129,6 +1124,7 @@ func TestWillClaimMintsAFreshLease(t *testing.T) {
 // claim loop for a full scan budget, and every Will falling due meanwhile would fire
 // late on every replica without a local timer.
 func TestWillAheadPhaseIsBoundedByItsCaller(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	const cid = "ahead-bound"
 	origin := testSessStreamFloor(t, a.asm)
@@ -1167,6 +1163,7 @@ func TestWillAheadPhaseIsBoundedByItsCaller(t *testing.T) {
 // will immediately be thrown away — which on a large backlog is the difference
 // between leaving promptly and walking the whole account first.
 func TestWillAheadPhaseStopsOnShutdown(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	const cid = "ahead-shutdown"
 	origin := testSessStreamFloor(t, a.asm)
@@ -1224,6 +1221,7 @@ func TestWillAheadPhaseStopsOnShutdown(t *testing.T) {
 // budget generous enough to finish in one go, which is why the budget here is forced
 // to expire mid-history.
 func TestWillBudgetedScanMakesProgressAcrossPasses(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "scan-progress"
@@ -1316,6 +1314,7 @@ func TestWillBudgetedScanMakesProgressAcrossPasses(t *testing.T) {
 // broker that is shutting down. TestWillAheadPhaseStopsOnShutdown cannot cover this:
 // it shuts down BEFORE any work starts, so the pre-read check catches it there.
 func TestWillScanRefusesToActOnAnAnswerThatArrivedTooLate(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	const cid = "late-answer"
 	origin := testSessStreamFloor(t, a.asm)
@@ -1518,6 +1517,7 @@ func TestWillScanFloorAndEpochAreOneFact(t *testing.T) {
 // only the deadline. "The worker gate refuses the dispatch" is not protection: the
 // durable decision would still have been written, and recovery executes it later.
 func TestWillClaimantRefusesToLicenseAfterShutdown(t *testing.T) {
+	withLongWillScan(t)
 	a, b := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "shutdown-licence"
@@ -1568,6 +1568,7 @@ func TestWillClaimantRefusesToLicenseAfterShutdown(t *testing.T) {
 // read and the scan was written and deleted, because it caught the same condition one
 // step earlier and nothing could tell the two apart.
 func TestWillClaimantStopsBeforeScanningAfterShutdown(t *testing.T) {
+	withLongWillScan(t)
 	a, b := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "shutdown-prescan"
@@ -1696,7 +1697,7 @@ func TestWillClaimantChasesTheCutoffForALateAcceptance(t *testing.T) {
 func TestWillCutoffChaseIsBoundedAndStillDecides(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 	testQuietClaimLoop(t, a, b)
-	pubs := testCapturePublishes(t, a.asm)
+	pubs := testHoldPublishes(t, a)
 	const cid = "cutoff-churn"
 	fireAt := testFarFuture()
 
@@ -1744,7 +1745,7 @@ func TestWillCutoffChaseIsBoundedAndStillDecides(t *testing.T) {
 func TestWillAcceptanceAfterTheFinalCutoffIsMissed(t *testing.T) {
 	a, b := testNewTeardownEnv(t)
 	testQuietClaimLoop(t, a, b)
-	pubs := testCapturePublishes(t, a.asm)
+	pubs := testHoldPublishes(t, a)
 	const cid = "cutoff-residual"
 	fireAt := testFarFuture()
 
@@ -1798,6 +1799,7 @@ func TestWillAcceptanceAfterTheFinalCutoffIsMissed(t *testing.T) {
 // — which is why the sibling guard tests stage their shutdown on the SECOND sample and
 // this one stages it on the first.
 func TestWillCutoffChaseStopsBeforeResamplingAfterShutdown(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "chase-shutdown"
@@ -1980,6 +1982,7 @@ func TestWillScanStopsWhenShutdownArrivesDuringARenewal(t *testing.T) {
 // the stored number DOWNWARDS (a real current-epoch sequence replacing a large foreign
 // one), so a raw-value monotonicity check would be measuring the bug.
 func TestWillScanProgressPersistsDespiteAStaleForeignFloor(t *testing.T) {
+	withLongWillScan(t)
 	a, _ := testNewTeardownEnv(t)
 	pubs := testCapturePublishes(t, a.asm)
 	const cid = "stale-floor-progress"
