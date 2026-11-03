@@ -1472,7 +1472,9 @@ them in order where a later lint change depends on an earlier cleanup.
   ([issue #160](https://github.com/nberlee/mqtt-nats-broker/issues/160)).
 
 - [ ] Correct the code comments that name identifiers which no longer exist
-  ([issue #161](https://github.com/nberlee/mqtt-nats-broker/issues/161)).
+  ([issue #161](https://github.com/nberlee/mqtt-nats-broker/issues/161)), and the
+  `execDeferredConsumerDelete` comment naming a late cancellation the UNSUBSCRIBE route cannot
+  produce ([issue #167](https://github.com/nberlee/mqtt-nats-broker/issues/167)).
 
 ### Performance and resource audits
 
@@ -1567,7 +1569,13 @@ them in order where a later lint change depends on an earlier cleanup.
 
 - [ ] Trace why `TestWillPendingArmAbortsThePassOnATransientFactOutage` intermittently finds
   a Will already decided "publish"; reproduced on HEAD under load
-  ([issue #165](https://github.com/nberlee/mqtt-nats-broker/issues/165)).
+  ([issue #165](https://github.com/nberlee/mqtt-nats-broker/issues/165)). Same family, once
+  under load: `TestMQTTWillOutboxReplicatedTerminalDoneStands`
+  ([issue #169](https://github.com/nberlee/mqtt-nats-broker/issues/169)).
+
+- [ ] Trace why `TestMQTTInboundPipeRegistrationsAndJoin`'s shutdown-abandoned store
+  intermittently times out instead of returning `ErrServerNotRunning`; seen once under load
+  ([issue #168](https://github.com/nberlee/mqtt-nats-broker/issues/168)).
 
 ### NATS platform follow-ups
 
