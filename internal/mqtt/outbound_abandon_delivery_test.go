@@ -513,30 +513,49 @@ func TestF105AbandonWaitsForAnOpenSection(t *testing.T) {
 	}
 }
 
-// T35. The identifier predicates never adopted the duty predicate.
+// T35. The identifier rules read the identifier predicate, never the duty predicate.
+//
+// The rules are named, so each must be FOUND: a renamed or deleted rule fails here rather
+// than leaving the guard with nothing to inspect.
 //
 // Mutation M35: exclusivity switched to mqttExchangeDeliveryDutyEnded.
 func TestF105DutyPredicateStaysOutOfIdentifierRules(t *testing.T) {
 	t.Parallel()
-	forbidden := map[string]bool{"checkIdentifierExclusivity": true, "mqttIdentifierReleaseAllowed": true,
-		"composeReplacement": true, "mqttComposeReplacement": true}
+	rules := map[string]string{
+		"checkIdentifierExclusivity":   "outbound_transition.go",
+		"mqttReplacePublishTransition": "outbound_replace_compose.go",
+	}
 	fset := token.NewFileSet()
-	for _, name := range []string{"outbound_transition.go", "outbound_custody.go", "outbound_replace_compose.go"} {
-		f, err := parser.ParseFile(fset, name, nil, 0)
+	for rule, file := range rules {
+		f, err := parser.ParseFile(fset, file, nil, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
+		var found, readsPhaseEnded bool
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
-			if !ok || fd.Body == nil || !forbidden[fd.Name.Name] {
+			if !ok || fd.Body == nil || fd.Name.Name != rule {
 				continue
 			}
+			found = true
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				if id, ok := n.(*ast.Ident); ok && id.Name == "mqttExchangeDeliveryDutyEnded" {
-					t.Errorf("%s: %s reads the duty predicate", name, fd.Name.Name)
+				id, ok := n.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				switch id.Name {
+				case "mqttExchangeDeliveryDutyEnded":
+					t.Errorf("%s: %s reads the duty predicate", file, rule)
+				case "mqttExchangePhaseEnded":
+					readsPhaseEnded = true
 				}
 				return true
 			})
+		}
+		if !found {
+			t.Errorf("%s: identifier rule %s is not declared there; name the rule that replaced it", file, rule)
+		} else if !readsPhaseEnded {
+			t.Errorf("%s: %s no longer reads mqttExchangePhaseEnded", file, rule)
 		}
 	}
 	if mqttExchangePhaseEnded(mqttExchangeDeliveryAbandoned) {

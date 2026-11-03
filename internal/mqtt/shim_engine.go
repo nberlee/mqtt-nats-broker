@@ -1236,9 +1236,9 @@ func (c *client) doTLSServerHandshake(kind string, cfg *tls.Config, timeout floa
 
 // mqttWriteDeadline bounds EVERY MQTT application write. It restores a bound
 // this broker dropped rather than inventing a policy: upstream nats-server
-// installs opts.WriteDeadline on every flush (server/client.go:1842), CLEARS it
-// afterwards (:1844), and closes a client that misses it as
-// SlowConsumerWriteDeadline (:1962). The shim replaced upstream's writeLoop and
+// installs opts.WriteDeadline on every flush (server/client.go flushOutbound),
+// CLEARS it afterwards (same function), and closes a client that misses it as
+// SlowConsumerWriteDeadline (handleWriteTimeout). The shim replaced upstream's writeLoop and
 // outbound buffer with a synchronous write under wmu and a no-op writeLoop, and
 // the deadline went with them, leaving every PUBLISH, ack, CONNACK and courtesy
 // DISCONNECT able to block its writer for as long as a non-reading client lasts.

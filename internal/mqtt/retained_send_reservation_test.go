@@ -703,6 +703,11 @@ func TestMQTTAbandonmentReleasesOnlyItsOwnAllocation(t *testing.T) {
 	}
 }
 
+// The release half on its own: frames detached from a displaced subscription release their
+// reservations when they are released. A same-sid replacement in production does not take
+// this path; it transfers the frames to the replacement
+// (TestF105RetainedSameSidReplacementInheritsTheReplay). Here the detach and the release are
+// driven by hand, which is the teardown's sequence.
 func TestMQTTDetachedRetainedFramesCanBeAbandoned(t *testing.T) {
 	t.Parallel()
 	e := testNewRetainedEnv(t, "retained-replace")

@@ -167,13 +167,6 @@ func (as *mqttAccountSessionManager) retainedIndexedLive(subject string) bool {
 
 // ---- from sess_expiry.go ----
 
-// expireSession removes and clears a session whose Session Expiry Interval has
-// elapsed, unless it was cancelled (reconnect/takeover) or the account manager is
-// shutting down. Reuses the same removeSession + clear path as a clean disconnect.
-// A session not in the in-memory maps (timer re-armed by the startup sweep) is
-// re-verified against the persisted record first. Spec5 [3.1.2.11.2].
-//
-// No lock held on entry.
 // expireSession runs the expiry for idHash with no timer-instance proof: it is the
 // form a direct caller (a sweep decision, a test) uses, where no timer fired.
 func (as *mqttAccountSessionManager) expireSession(s *Server, idHash string) {

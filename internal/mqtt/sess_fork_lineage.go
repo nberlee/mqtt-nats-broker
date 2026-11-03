@@ -2,7 +2,7 @@
 // broker was acknowledged for.
 //
 // Every durable arbitration here is a per-subject JetStream CAS
-// (Nats-Expected-Last-Subject-Sequence). At the pinned nats-server v2.14.5 the check
+// (Nats-Expected-Last-Subject-Sequence). At the pinned nats-server v2.15.2 the check
 // runs once, before the proposal (checkMsgHeadersPreClusteredProposal,
 // server/jetstream_batching.go), against applied state plus an in-process map that
 // processStreamLeaderChange nils on every transition (server/jetstream_cluster.go); the
@@ -32,10 +32,10 @@
 // actually held — and it stays for a stated reason rather than by default.
 //
 // The reason it used to state was an evidence gap in the accepted CONNECT's writer, and
-// that gap is CLOSED. Every Raft-level fact behind it holds — at the pinned v2.14.5 no
-// Raft-level field preserves "these entries came from one ProposeMulti": entries are
-// pushed individually, popped as whatever prefix exists, regrouped by size thresholds,
-// and each group rechecks leadership on its own — but the consequence drawn from them
+// that gap is CLOSED. Every Raft-level fact behind it holds — at the pinned v2.15.2 no
+// Raft-level field preserves "these entries came from one ProposeMulti": the group is
+// enqueued atomically (ipQueue.pushMany), but runAsLeader regroups whatever it pops by
+// size thresholds into separate sendAppendEntry calls — but the consequence drawn from them
 // was false. Batch identity lives in the stream entry encoding and is enforced at
 // apply, so a committed prefix with no commit entry applies NOTHING, and
 // the accepting CONNECT's fact, receipt and record commit together or not at all. Measured by

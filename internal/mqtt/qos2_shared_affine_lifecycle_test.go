@@ -2242,7 +2242,7 @@ func TestQ2AffineReclaimSaveRejectedIsSettledAsForeign(t *testing.T) {
 	a.settleUntilContinuation(t, fired)
 
 	if dropped.Load() == 0 {
-		t.Fatal("the persist observation was never dropped, so processSessionPersist could have done the eviction below on its own")
+		t.Fatal("the persist observation was never dropped, so processSessionRecordDelivery could have done the eviction below on its own")
 	}
 	a.sess.mu.Lock()
 	gen, consumer, pending := a.sess.q2AffGen, a.sess.q2AffConsumer, a.sess.recordRejectionPendingLocked()
@@ -2365,7 +2365,7 @@ func TestQ2AffineReclaimRejectedByAGenerationPreservingWinnerKeepsItsClaim(t *te
 	a.settleUntilContinuation(t, fired)
 
 	if dropped.Load() == 0 {
-		t.Fatal("the persist observation was never dropped, so processSessionPersist could have evicted the session before the cleanup save ran")
+		t.Fatal("the persist observation was never dropped, so processSessionRecordDelivery could have evicted the session before the cleanup save ran")
 	}
 	// The cleanup CAS was rejected by the winner, so the assignment it owns must be
 	// untouched. A discard here is not recoverable: it is monotonic, and the
@@ -2938,7 +2938,7 @@ func TestQ2AffineForeignDispositionLeavesTheConsumerAlone(t *testing.T) {
 		return nil
 	})
 	if dropped.Load() == 0 {
-		t.Fatal("the persist observation was never dropped, so processSessionPersist did the eviction and the resolver's foreign branch was never exercised")
+		t.Fatal("the persist observation was never dropped, so processSessionRecordDelivery did the eviction and the resolver's foreign branch was never exercised")
 	}
 	if durs := a.b.affineConsumers(t, a.idHash); len(durs) != 1 {
 		t.Fatalf("a foreign disposition deleted a consumer the winning record decides the owner of, got %v", durs)
@@ -8481,7 +8481,7 @@ func TestQ2AffUnprovenRegisterPoisonsItsSibling(t *testing.T) {
 
 // TestQ2AffRefusalBackoffIsDerivedFromTheDeliveryCount pins the wire form and the curve,
 // because both are load-bearing and neither is visible from the end-to-end fixture below:
-// a payload nats-server cannot parse is treated as a PLAIN NAK (consumer.go:3186-3200), so
+// a payload nats-server cannot parse is treated as a PLAIN NAK (processNak, consumer.go), so
 // a typo here silently restores the storm this exists to bound.
 //
 // Paired mutation M45: return AckNak unchanged. The end-to-end pacing fixture then fails.

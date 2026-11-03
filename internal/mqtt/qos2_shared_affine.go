@@ -1263,22 +1263,22 @@ func buildQ2AffineConsumerConfig(idHash, gen string, ackWait time.Duration, maxA
 		//
 		// Sending zero does not MAKE the effective threshold zero: nats-server
 		// substitutes the stream's ConsumerLimits.InactiveThreshold whenever the
-		// request field is zero (consumer.go:658-669). validateOutStream refuses a
-		// nonzero limit at startup, and a contender re-checks it live because the
-		// limit can be imposed afterwards.
+		// request field is zero (setConsumerConfigDefaults, server/consumer.go).
+		// validateOutStream refuses a nonzero limit at startup, and a contender
+		// re-checks it live because the limit can be imposed afterwards.
 	}
 }
 
 // errQ2AffStorageImmutable is nats-server's flattened cause for a create-or-update
-// that would change a durable's storage type (server/consumer.go:2475, reached
-// through checkNewConsumerConfig and wrapped in the generic JSConsumerCreateErrF).
+// that would change a durable's storage type (server/consumer.go, raised by
+// checkNewConsumerConfig and wrapped in the generic JSConsumerCreateErrF).
 // Measured, not recalled: the API error carries ErrCode 10012 and this exact
 // Description.
 var errQ2AffStorageImmutable = errors.New("storage type can not be updated")
 
 // recoverQ2AffineStorageConflict makes ONE bounded attempt to complete a create
 // that JetStream refused because the durable already exists with the other
-// storage type. MemoryStorage is immutable (server/consumer.go:2474-2475), so the
+// storage type. MemoryStorage is immutable (checkNewConsumerConfig, server/consumer.go), so the
 // only way forward is to re-send the request built with the storage the durable
 // ACTUALLY has.
 //

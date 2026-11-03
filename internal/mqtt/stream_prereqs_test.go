@@ -779,7 +779,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		"AllowRollup":        {kind: dispRejected, errWant: "allow_rollup"},
 		"AllowAtomicPublish": {kind: dispWaived, reason: "the owner never emits batch headers, and client-controlled direct writes are excluded by the reserved-namespace deny plus the required ACL"},
 		"AllowBatchPublish":  {kind: dispWaived, reason: "the owner never emits batch headers, and client-controlled direct writes are excluded by the reserved-namespace deny plus the required ACL"},
-		"AllowMsgSchedules":  {kind: dispWaived, reason: "the owner never emits schedule headers; independently enableable under DiscardOld, so this is a waiver, not domination — note a DEPLOYED schedules-enabled stream necessarily carries AllowRollup (forced at creation, server/stream.go:1819-1822), which the shared shape rejects on readback"},
+		"AllowMsgSchedules":  {kind: dispWaived, reason: "the owner never emits schedule headers; independently enableable under DiscardOld, so this is a waiver, not domination — note a DEPLOYED schedules-enabled stream necessarily carries AllowRollup (forced at creation, checkStreamCfgLocked in server/stream.go), which the shared shape rejects on readback"},
 		"Duplicates":         {kind: dispWaived, reason: "this owner sets no Nats-Msg-Id, so a deduplication window is inert"},
 		// REJECTED for every validator, not waived: the account's recovery epoch
 		// lives in this map, and it is what makes the ten broker-owned streams one
@@ -789,7 +789,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		// than silently admitting a stream from another incarnation. Unrelated keys
 		// are still accepted; the audit is over this one key, not the whole map.
 		"Metadata":      {kind: dispRejected, errWant: mqttSessEpochMetaKey},
-		"DiscardNewPer": {kind: dispDominated, reason: "requires Discard=DiscardNew (rejected here: this owner requires DiscardOld), and has no owner-relevant effect apart from that prerequisite (server/stream.go:1784)"},
+		"DiscardNewPer": {kind: dispDominated, reason: "requires Discard=DiscardNew (rejected here: this owner requires DiscardOld), and has no owner-relevant effect apart from that prerequisite (checkStreamCfgLocked in server/stream.go)"},
 	}
 
 	// The CAS-register commons (sess, willq, willcancel, qos2in, qos2assign,
@@ -824,7 +824,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		d["ConsumerLimits.MaxAckPending"] = fieldDisposition{kind: dispRejected, errWant: "max_ack_pending"}
 		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "this owner never deletes messages; interest retention removes them with their consumers"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "this owner never purges"}
-		d["DiscardNewPer"] = fieldDisposition{kind: dispDominated, reason: "requires a finite MaxMsgsPer (rejected here: this owner requires it unlimited), and has no owner-relevant effect apart from that prerequisite (server/stream.go:1784)"}
+		d["DiscardNewPer"] = fieldDisposition{kind: dispDominated, reason: "requires a finite MaxMsgsPer (rejected here: this owner requires it unlimited), and has no owner-relevant effect apart from that prerequisite (checkStreamCfgLocked in server/stream.go)"}
 	}
 
 	switch stream {

@@ -1140,12 +1140,12 @@ func (sess *mqttSession) releaseSharedGroupTargetClassified(c *client, tok recor
 // charge, discharges the register-stream obligations and unsubscribes the deliver subject, and
 // it reports whether any of its record writes was rejected by its per-subject CAS.
 //
-// It is split from the delete for ONE caller's sake, and the reason is a correctness ordering
-// rather than tidiness: this half performs record writes, and those writes can leave the session
-// unresolved or arm the rejection marker. A caller that must not destroy another owner's durable
-// therefore needs to settle the ownership question BETWEEN the two halves — after every write it
-// is going to make, before the first thing it cannot undo. Callers with no such requirement
-// compose the two back to back through releaseSharedGroupTargetClassified and see no change.
+// The irreversible half is executeSharedReleases, kept separate because the two differ in kind:
+// this half performs record writes, which can leave the session unresolved or arm the rejection
+// marker, and a caller that had to settle ownership before destroying another owner's durable
+// would settle it between them. Its only caller, releaseSharedGroupTargetClassified, runs the
+// two back to back. (The 3.1.1 forced leave settles ownership between its own writes and
+// executeSharedReleases without going through this function.)
 //
 // sess.mu must NOT be held: this takes it.
 func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok recordTx,

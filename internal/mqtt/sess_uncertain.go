@@ -486,8 +486,8 @@ func classifyAttemptReadback(smsg *StoredMsg, lerr error, pw *mqttPendingWrite,
 		// no releaser and no successor — but it does NOT prove the attempt is dead
 		// either. In a clustered stream the
 		// expected-sequence check runs only BEFORE the proposal
-		// (`canConsistencyCheck := !isClustered`, nats-server v2.14.5
-		// server/stream.go:6247), so a proposal already accepted into the log applies
+		// (`canConsistencyCheck := !isClustered`, nats-server v2.15.2
+		// server/stream.go processJetStreamMsgWithBatch), so a proposal already accepted into the log applies
 		// whatever happened to the subject meanwhile — including an exact-sequence
 		// delete, which only clear() now issues. issue #34's conditional-write closure does
 		// not reach this:

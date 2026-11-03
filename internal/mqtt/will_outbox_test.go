@@ -1413,10 +1413,13 @@ func TestMQTTWillOutboxTimerShutdownDrains(t *testing.T) {
 // long, a timer is armed, the client reconnects inside the delay, and nothing is
 // published past FireAt.
 //
-// It does NOT cover the callback: reconnect cancellation stops and untracks the
-// timer, so the callback never runs. TestMQTTWillOutboxTimerOnCancelledRecord
-// covers that path, and TestMQTTWillOutboxTimerReleasedOnCancel covers the
-// release itself.
+// The reconnect only writes an acceptance fact; it does not stop the timer, and
+// with the scan pinned long no claim pass suppresses the record first. So the
+// callback DOES run at FireAt, and what keeps the Will unpublished is tryFireWill
+// finding the qualifying fact and cancelling the record (and releasing the timer).
+// TestMQTTWillOutboxTimerOnCancelledRecord covers a callback on an already
+// cancelled record, and TestMQTTWillOutboxTimerReleasedOnCancel covers the release
+// by the claim pass.
 func TestMQTTWillOutboxTimerReconnectCancels(t *testing.T) {
 	withLongWillScan(t)
 
@@ -1444,15 +1447,16 @@ func TestMQTTWillOutboxTimerReconnectCancels(t *testing.T) {
 		return nil
 	})
 
-	// Reconnect well inside the delay: this cancels the pending record.
+	// Reconnect well inside the delay: this records the acceptance fact that
+	// supersedes the pending record.
 	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "trcpub", cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
 	defer cw2.Close()
 	testMQTTReadConnAckV5(t, rw2)
 
 	// Wait past the original FireAt and confirm nothing is published. The timer
-	// was already stopped by the cancellation, and the scan is pinned to 30s, so
-	// neither dispatch source can deliver it.
+	// fires, and tryFireWill cancels the record on the acceptance fact instead of
+	// publishing; the scan is pinned to 30s, so it cannot deliver it either.
 	time.Sleep(3 * time.Second)
 	testMQTTExpectNothing(t, rs)
 }

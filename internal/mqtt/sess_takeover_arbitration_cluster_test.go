@@ -78,10 +78,11 @@ func TestMQTTTakeoverCreateRaceReplicated(t *testing.T) {
 	//   - THIS repository proves the broker-visible PROPERTY on the real Replicas=3 path:
 	//     one winner, a DEFINITE loser, and the winner's bytes surviving.
 	//   - NATS SERVER owns and tests the pre-proposal MECHANISM. The in-process rejection
-	//     is jetstream_batching.go:779 (v2.14.5); its direct guard coverage is
-	//     jetstream_batching_test.go:1576-1586 ("expect-per-subj-in-process"), and
-	//     jetstream_cluster_4_test.go:5158-5164 seeds expectedPerSubjectInProcess on an R3
-	//     stream and requires the publish to be rejected with the constant-sequence error.
+	//     is checkMsgHeadersPreClusteredProposal's expectedPerSubjectInProcess check
+	//     (jetstream_batching.go, v2.15.2); its direct guard coverage is the
+	//     "expect-per-subj-in-process" case in jetstream_batching_test.go, and
+	//     jetstream_cluster_4_test.go seeds expectedPerSubjectInProcess on an R3 stream and
+	//     requires the publish to be rejected with the constant-sequence error.
 	//   - NEITHER makes this repository able to force that internal interleaving
 	//     deterministically, which is a limit on what a test here can OBSERVE — not a gap
 	//     in the broker's behaviour, and so not a conformance residual.

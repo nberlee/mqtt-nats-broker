@@ -424,10 +424,11 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 // CONNECT rebinds early, a resolver by its JetStream timeouts), so the wait is bounded too.
 //
 //   - Acquired: the competing operation finished; probe normally.
-//   - REBOUND: a takeover owns this connection's fate now. Apply the takeover's own Will
-//     rule here — the identical call it makes a few lines later, so whichever side notices
-//     the displacement first applies the same rule and the other's is a no-op — and report
-//     displacement, which closes the connection without a packet.
+//   - REBOUND: a takeover owns this connection's fate now. Apply the armed half of the
+//     takeover's Will rule here, so whichever side notices the displacement first discards
+//     an armed Will and the other's discard is a no-op (the owed-delayed half is the
+//     takeover tail's alone), and report displacement, which closes the connection without
+//     a packet.
 //   - Still ours after the spin: nothing is displacing us that we can see, so this is an
 //     ordinary no-verdict outcome and says 0x89.
 //
