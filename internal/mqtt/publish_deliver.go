@@ -430,7 +430,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 
 	// In this callback we handle only QoS-published messages to QoS
 	// subscriptions. Ignore if either is 0, will be delivered by the other
-	// callback, mqttDeliverMsgCbQos1.
+	// callback, mqttDeliverMsgCbQoS0.
 	var qos byte
 	if h != nil {
 		qos = h.qos
@@ -1553,7 +1553,7 @@ func (c *client) mqttWriteAuthorizedPubRel(pi uint16, ticket *mqttWriteEntry, tr
 // character (# or +) with Topic Names beginning with a $ character, Spec
 // [MQTT-4.7.2-1]. We will return true if there is a violation.
 //
-// Session or subMu lock must be held on entry to protect access to sub.mqtt.
+// Session or subsMu lock must be held on entry to protect access to sub.mqtt.
 func mqttMustIgnoreForReservedSub(sub *subscription, subject string) bool {
 	// If the subject does not start with $ nothing to do here.
 	if !sub.mqtt.reserved || len(subject) == 0 || subject[0] != mqttReservedPre {

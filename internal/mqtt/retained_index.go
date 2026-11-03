@@ -37,7 +37,7 @@ import (
 // decides which subjects are candidates; values are always served from the cache or an
 // authoritative load.
 
-// mqttRetainedObserverHeartbeat is the observer's IdleHeartbeat. A lost tail delivery is
+// mqttRetainedObserverHeartbeat is the observer's idle Heartbeat. A lost tail delivery is
 // noticed within one interval, a consumer that no longer exists within three, and a reset
 // is attempted at most once per interval.
 const mqttRetainedObserverHeartbeat = 5 * time.Second

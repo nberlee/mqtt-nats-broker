@@ -636,7 +636,7 @@ var testLongLivedBoundedContainers = map[string]int{
 //     outbound_retained_replay_emit.go:553): done when retainedReclaim is not running and has
 //     nothing pending. Its retry goroutine (outbound_retained_replay_emit.go:741) starts only on
 //     an unreadable manifest, and the goroutine scan below refuses it.
-//   - outbound_custody_session.go:299 / :323, the custody observer (go runCustodyObserver), hinted
+//   - outbound_custody_session.go:326 / :336, the custody dispatcher (go startCustodyDispatcher), hinted
 //     by the acknowledgement advances (outbound_ack_advance.go:452, :578): done when
 //     sess.custodyObserving is false and no hint is left.
 //   - retained_terminal_cleanup.go:115 (a terminal slot over a live source),

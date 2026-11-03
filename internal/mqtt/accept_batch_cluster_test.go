@@ -7,9 +7,9 @@
 // for the server's apply-layer contract -- a committed batch prefix with no commit
 // entry stores nothing -- lives in test/depproof, inside an isolated nats-server
 // checkout. What this test adds is that the BROKER's accepted CONNECT really goes
-// through that contract: one batch, both messages, and at the moment the commit is
-// acknowledged the acceptance fact and the session record are both on the stream with
-// the attempt's own bytes.
+// through that contract: one batch, all three members, and at the moment the commit is
+// acknowledged the acceptance fact, the COMMITTED ownership receipt and the session
+// record are all on the stream with the attempt's own bytes.
 //
 // The observation is a MOMENT, not an invariant. The session record's subject is a
 // MaxMsgsPer:1 register, so a later legitimate save -- a repair save, a lifetime grant,
@@ -17,15 +17,15 @@
 // record" is simply false over time. What is true, and what mqttAcceptFactLanded's
 // stated meaning needs, is that the record committed WITH the fact. That is a claim
 // about the store boundary, so it is asserted at the store boundary: the seam fires
-// inside storeAcceptBatch, before the caller adopts the sequence and before anything
+// inside commitMetadataAttempt, before the caller adopts the sequence and before anything
 // else can write the subject. The accept transaction the CONNECT holds is what keeps
 // the window closed to a local successor.
 //
 // The paired mutation is m-accept-split-write (test/depproof/run.sh --broker): the one
-// batch becomes two independent conditional writes, and the second is suppressed
-// through the counterfactual phase below while the caller is still handed an
-// acknowledgement it cannot tell from a real commit. That must make the assertion here
-// fail with a torn pair.
+// batch becomes independent conditional writes, and the fact is acknowledged on its own
+// while the receipt and the record are suppressed through the counterfactual phase below,
+// while the caller is still handed an acknowledgement it cannot tell from a real commit.
+// That must make the assertion here fail with a torn batch.
 
 package mqtt
 
@@ -46,8 +46,8 @@ const acceptBatchTornMarker = "ACCEPT-BATCH-TORN"
 // mqttAcceptStoreSplitRecordPending is the counterfactual phase: the acceptance fact
 // has been INDEPENDENTLY acknowledged and the session record has not been written yet.
 //
-// Production never fires it, and cannot: storeAcceptBatch issues one atomic batch, so
-// no such moment exists between the two messages. It is declared here, next to the
+// Production never fires it, and cannot: commitMetadataAttempt issues one atomic batch, so
+// no such moment exists between its members. It is declared here, next to the
 // assertion it exists to break, because the mutation needs an interception point
 // rather than a notification -- an observer returning an error at this phase is what
 // suppresses the record write. Declaring it in production would be declaring a moment
@@ -58,7 +58,8 @@ const mqttAcceptStoreSplitRecordPending mqttAcceptStorePhase = 200
 // commits its acceptance fact and its session record together, over a real R3
 // $MQTT_sess, and the acknowledgement it returns names the record.
 //
-// Named to be picked up by the `^TestMQTTAcceptBatchReplicated` filter.
+// test/depproof/run.sh selects it by its exact name (accept_test) for the
+// m-accept-split-write row.
 func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 	c := testNewJetStreamCluster(t, 3)
 	b := c.startBroker(t, 0)
@@ -197,7 +198,7 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 }
 
 // MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here
-// and redirects storeAcceptBatch to it. The helper is written into this file rather
-// than kept in the harness script so the counterfactual is read next to the assertion
-// it has to break, and it is absent from a clean tree, so nothing unused is carried in
+// and redirects commitMetadataAttempt's batch request to it. The helper is written into
+// this file rather than kept in the harness script so the counterfactual is read next to
+// the assertion it has to break, and it is absent from a clean tree, so nothing unused is carried in
 // production or in the ordinary test build.

@@ -228,8 +228,8 @@ func TestNoPackageGlobalIsAssignedFromAGoroutine(t *testing.T) {
 	}
 }
 
-// parallelSafetyExemptMarker exempts one `go` statement from the escaped-writer
-// check. It must be followed by the reason the write cannot outlive the test.
+// testFunc is one test-file function as testFuncGraph records it: what it calls,
+// whether it calls t.Parallel(), and the process global it touches directly.
 type testFunc struct {
 	file     string
 	calls    map[string]bool

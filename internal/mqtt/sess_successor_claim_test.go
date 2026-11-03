@@ -929,11 +929,11 @@ func TestF084WillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
 //     TestF084RemotePersistWillPhaseIsUngated;
 //   - the LICENSED takeover discards through discardTakenOverClient, which is not a
 //     record-derived disposal and is pinned by the positive oracle;
-//   - B2, settleBoundRejectionGated's rebound arm, calls mqttDiscardWillOnTakeover on the
-//     DISPLACED connection directly. It is not a disposal at all: it applies the licensed
-//     takeover's own rule early, so that whichever side notices the displacement first
-//     applies it and the other's call is a no-op. It reaches no prepared disposition and
-//     so cannot fire this probe; it is asserted by
+//   - B2, settleBoundRejectionGated's rebound arm, calls mqttDiscardArmedWill on the
+//     DISPLACED connection directly. It is not a disposal at all: it applies the armed
+//     half of the licensed takeover's Will rule early, so that whichever side notices the
+//     displacement first discards an armed Will and the other's discard is a no-op. It
+//     reaches no prepared disposition and so cannot fire this probe; it is asserted by
 //     TestF084BoundRejectionLocalReplacementDiscards;
 //   - R5 discards the ARRIVING connection's Will in mqttAbortAcceptedConnect, which is
 //     excluded by design (no session was granted) and pinned by the two-Will fixture.

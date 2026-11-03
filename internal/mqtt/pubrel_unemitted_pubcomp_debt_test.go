@@ -66,8 +66,8 @@ func testF116Deliver(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, 
 	testDeliverPubRelCorrelated(t, e, seed.pi, seed.reply(n), seed.nonce, testRealPubRelSrcDur, seed.sseq)
 }
 
-// testF116SwapToHold makes the resident PUBREL entry a Hold copy, which write entry refuses, and
-// returns the original so the caller can put it back.
+// testF116SwapToHoldLocked makes the resident PUBREL entry a Hold copy, which write entry
+// refuses, and returns the original so the caller can put it back.
 //
 // Lock held on entry.
 func testF116SwapToHoldLocked(e *testInflightEnv, pi uint16) *mqttPending {

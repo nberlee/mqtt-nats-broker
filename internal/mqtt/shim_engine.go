@@ -168,7 +168,7 @@ type WebsocketOpts struct {
 	AllowedOrigins []string
 }
 
-// Info is the subset of NATS-server ServerInfo the MQTT core consults.
+// Info is the subset of NATS-server Info (server/server.go) the MQTT core consults.
 type Info struct {
 	AuthRequired bool
 }
@@ -427,7 +427,8 @@ func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
 	if s.dialClient == nil {
 		// No per-client identity exists in this mode, so there is nothing to
 		// enforce and nothing to snapshot: the client IS the service credential.
-		// createMQTTClient has already stamped mqttOriginServiceIdentity.
+		// The client keeps the zero origin, mqttOriginClient, and mqttAuthzApplies
+		// is false here for the same reason: there is no dialClient.
 		if c.nrc == nil {
 			c.nrc = s.nrc
 		}
@@ -984,7 +985,8 @@ func (c *client) willDestinationAccount() (string, bool) {
 	return c.authzSvcAccount, true
 }
 
-// pubAllowedLocked is pubAllowedFullCheck with c.mu held.
+// pubAllowedLocked is the shim's counterpart of upstream nats-server's
+// pubAllowedFullCheck with hasLock set: the publish permission check, c.mu held.
 //
 // Where an identity governs, an absent or invalidated snapshot is not a weaker
 // answer than a deny -- it is no answer, and it refuses.

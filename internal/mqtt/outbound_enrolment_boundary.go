@@ -313,7 +313,7 @@ func mqttCreatedResourceMember(a *mqttTransitionAttempt, e mqttTransitionMember,
 	}
 	r, rerr := mqttDecodeOutboundResource(e.body, a.ID, a.Epoch, toks[2], toks[3])
 	if rerr != nil {
-		return nil // checkTransitionMember reports it in its own words
+		return nil // mqttCheckTransitionMember reports it in its own words
 	}
 	return r
 }
@@ -366,7 +366,7 @@ func mqttSealsLedgerOutsideAClosure(t *mqttAuthorityTransition, idHash string) (
 		}
 		l := &mqttGenLedger{}
 		if err := json.Unmarshal(e.body, l); err != nil {
-			continue // checkTransitionMember reports an unreadable member in its own words
+			continue // checkInventoryMembers reports an unreadable member in its own words
 		}
 		if l.State == mqttGenLedgerSealed {
 			return l.Gen, true

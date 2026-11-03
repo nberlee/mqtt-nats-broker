@@ -23,8 +23,8 @@ import (
 	"time"
 )
 
-// residentReconnect resumes a session and returns the CONNACK's reason code instead of
-// asserting success, which is what lets a test assert a REFUSAL.
+// testSharedResidentReconnect resumes a session and returns the CONNACK's reason code
+// instead of asserting success, which is what lets a test assert a REFUSAL.
 func testSharedResidentReconnect(t *testing.T, b *testSharedBroker, id string, expiry uint32) (net.Conn, *mqttReader, byte, *mqttProperties) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{

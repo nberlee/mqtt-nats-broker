@@ -519,7 +519,7 @@ func TestMQTTPubCompDoesNotDestroyARetainedReservation(t *testing.T) {
 // reservation, because otherwise the identifier stays reserved against reallocation for the
 // session's life while nothing will ever write it. (The other departure, a same-sid
 // replacement, TRANSFERS instead and releases nothing —
-// TestMQTTRetainedFramesDetachOnSameSidReplacement and the deadlock test cover that.)
+// TestF105RetainedSameSidReplacementInheritsTheReplay and the deadlock test cover that.)
 func TestMQTTAbandonedRetainedFrameReleasesItsHold(t *testing.T) {
 	t.Parallel()
 	e := testNewRetainedEnv(t, "retained-abandon")

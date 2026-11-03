@@ -1390,7 +1390,7 @@ func TestMQTTTopicAndSubjectConversion(t *testing.T) {
 
 func TestMQTTFilterConversion(t *testing.T) {
 	t.Parallel()
-	// Similar to TopicConversion test except that wildcards are OK here.
+	// Similar to TestMQTTTopicAndSubjectConversion except that wildcards are OK here.
 	// So testing only those.
 	for _, test := range []struct {
 		name        string
@@ -3972,10 +3972,6 @@ func TestMQTTReconnectForcesRedeliveryWithDUP(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c, rpi)
 }
 
-// Re-subscribing a QoS 1/2 filter at QoS 0 deletes its JS consumer; the
-// consumer's pending (unacknowledged) deliveries must be purged too, otherwise
-// their packet identifiers leak and permanently count against the in-flight cap
-// for the life of the session (as mqttProcessUnsubs already does).
 // TestMQTTQoS0DowngradeDrainsPendingInsteadOfPurging replaces
 // TestMQTTQoS0DowngradePurgesPending, whose assertion encoded the DEFECT rather than the
 // intended behavior: it required a QoS 0 re-SUBSCRIBE to purge the pending maps, which

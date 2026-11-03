@@ -31,8 +31,6 @@ import (
 	"time"
 )
 
-// testCountArbitrations counts "after-ownership-cas" firings, which is exactly one per
-// ownership verdict.
 // testSharedRefusalReason performs the resume and reports the CONNACK reason code it was
 // refused with, plus whether the CONNECT was ACCEPTED.
 //
@@ -107,6 +105,8 @@ func testSharedRefusalReason(t *testing.T, b *testSharedBroker, id string, expir
 	return c, reason, reasonStr, false
 }
 
+// testCountArbitrations counts "after-ownership-cas" firings, which is exactly one per
+// ownership verdict.
 func testCountArbitrations(t *testing.T) *atomic.Int32 {
 	t.Helper()
 	var n atomic.Int32

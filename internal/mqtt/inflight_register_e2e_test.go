@@ -368,7 +368,7 @@ func TestMQTTInflightStaleRegisterLeavesNoPhantomSlot(t *testing.T) {
 // identifier and re-sends the payload of an exchange already past PUBREC. The client
 // would then hold the same message under two identifiers, and complete only one.
 //
-// Mutation check: remove the recorrelateSourceLocked call from the unproven-ack branch
+// Mutation check: remove the retireSourceLocked call from the unproven-ack branch
 // of mqttProcessPublishReceived and a second PUBLISH arrives below.
 func TestMQTTInflightUnprovenSourceAckSendsNoSecondPublish(t *testing.T) {
 	t.Parallel()
@@ -1572,6 +1572,19 @@ func testInflightWarmAndTarget(t *testing.T, o *Options, subID, pubID string) (s
 	return sub, subr, pub, pubr
 }
 
+// testInflightSession returns the resident session for clientID.
+func testInflightSession(t *testing.T, s *Server, clientID string) *mqttSession {
+	t.Helper()
+	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	asm.mu.RLock()
+	sess := asm.sessions[clientID]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatalf("no resident session for %q", clientID)
+	}
+	return sess
+}
+
 // testMQTTWaitSendSectionClosed blocks until the send section this identifier is under has
 // been RELEASED, which is the only barrier that orders a reader against the delivery
 // callback.
@@ -1587,19 +1600,6 @@ func testInflightWarmAndTarget(t *testing.T, o *Options, subID, pubID string) (s
 // region, so a cleared token proves the outcome is already visible — while leaving every
 // assertion about WHAT that outcome is to the caller. Waiting on the asserted fields
 // themselves would turn a broker defect into a timeout with no state to read.
-// testInflightSession returns the resident session for clientID.
-func testInflightSession(t *testing.T, s *Server, clientID string) *mqttSession {
-	t.Helper()
-	asm := testMQTTGetAccountSessionManager(t, s, clientID)
-	asm.mu.RLock()
-	sess := asm.sessions[clientID]
-	asm.mu.RUnlock()
-	if sess == nil {
-		t.Fatalf("no resident session for %q", clientID)
-	}
-	return sess
-}
-
 func testMQTTWaitSendSectionClosed(t *testing.T, sess *mqttSession, pi uint16) {
 	t.Helper()
 	if sess == nil || pi == 0 {

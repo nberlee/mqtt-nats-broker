@@ -37,7 +37,7 @@ import (
 //     identity and its permitted purpose. A continuation cannot repurpose an entry into a duty
 //     it was never predeclared for.
 //  3. A new exchange or resource CANNOT OMIT its required inventory coverage. (Landed with the
-//     composers that produce it; see the note at checkInventoryCoverage.)
+//     composers that produce it; see the note at mqttCheckInventoryCoverage.)
 //
 // # The invariant the recovery cursor rests on
 //

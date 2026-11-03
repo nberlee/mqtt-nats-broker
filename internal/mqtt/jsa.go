@@ -33,7 +33,7 @@ import (
 )
 
 type mqttJSAResponse struct {
-	reply string // will be used to map to the original request in jsa.NewRequestExMulti
+	reply string // will be used to map to the original request in jsa.newRequestExMultiSubjects
 	value any
 }
 
@@ -1215,7 +1215,7 @@ func isJSErrCausedBy(err error, id ErrorIdentifier, cause error) bool {
 // Process JS API replies.
 //
 // Runs on ONE goroutine. Every reply for this account arrives on the single
-// wildcard subscription `jsa.rplyr+">"` created in createSubscriptions, and
+// wildcard subscription `jsa.rplyr+">"` created in mqttCreateAccountSessionManager, and
 // nats-go dispatches a subscription's messages serially, so two invocations
 // never race for the same reply subject. That is what makes the load-then-delete
 // below safe without being atomic: the entry is consumed exactly once because
@@ -1227,7 +1227,7 @@ func isJSErrCausedBy(err error, id ErrorIdentifier, cause error) bool {
 // the one execution model this function is NOT safe under.
 //
 // Splitting the wildcard into per-kind subscriptions -- floated in
-// createSubscriptions -- keeps that safety only under all four of:
+// mqttCreateAccountSessionManager -- keeps that safety only under all four of:
 //
 //   - the parts form an EXHAUSTIVE, non-overlapping partition of the reply
 //     prefix. Non-overlap alone gives "at most one" matching callback, not

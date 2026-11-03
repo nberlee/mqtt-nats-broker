@@ -275,7 +275,7 @@ func testQ2AffSyntheticWinnerWith(t *testing.T, b *testQ2AffBroker, id string,
 // Deliberately NOT `!q2AffSourceGone(claim)`. That production predicate is fail-CLOSED: it
 // returns false both when the source is present and when the stream or the message could
 // not be read (see its body). Negating a fail-closed predicate is not positive evidence, so
-// an indeterminate read would let a refusal fixture succeed even though confirmAck had
+// an indeterminate read would let a refusal fixture succeed even though the confirmed ack had
 // already committed — the ack-versus-record distinction again, one level up. Here every
 // error fails, and only a message that loads counts as present.
 // Takes an account manager rather than a broker so the cluster fixture can hold every
@@ -395,7 +395,7 @@ func testQ2AffAssertNotReleased(t *testing.T, b *testQ2AffBroker, moves *testQ2A
 			t.Fatalf("the claim on %q moved to phase %v, want %v", subject, claim.Phase, want)
 		}
 		// The SOURCE itself, on every poll, and by a POSITIVE load. confirmSourceAckAndRecord
-		// calls confirmAck BEFORE writing SourceAcked, so a claim reading
+		// confirms the ack (submitSourceAck) BEFORE writing SourceAcked, so a claim reading
 		// `SourceAcked == false` does not prove the irreversible ack never committed — and
 		// if that CAS then fails, the foreign-materialized and on-behalf paths fall back to
 		// their default `deferred` result, so the disposition does not prove it either.

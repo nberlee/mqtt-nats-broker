@@ -644,10 +644,10 @@ func (jsa *mqttJSA) storeInflightCAS(subject string, expectSeq uint64, r *mqttIn
 	//
 	// A holistic review disproved the per-caller version: I had validated at the store path
 	// and the mark helpers and then claimed "every production register write is validated",
-	// which was false — claimRecoveredSharedInflight copies a loaded record, rewrites its
-	// custody and writes it directly, so a resume actively re-wrote an unsupported shape at
-	// a new sequence. Every writer funnels through here, so this is the only place the
-	// claim can be true.
+	// which was false — claimRecoveredSharedInflight (since deleted) copied a loaded record,
+	// rewrote its custody and wrote it directly, so a resume actively re-wrote an unsupported
+	// shape at a new sequence. Every writer funnels through here, so this is the only place
+	// the claim can be true.
 	//
 	// Refusing is the right failure: an unsupported record would be refused by the phase
 	// gate on the way out again, which can leave the identifier unrecoverable. Better never
@@ -2967,14 +2967,16 @@ func mqttSlotAdmitsDisposition(cur *mqttInflightRecord, ref *mqttInflightSlotRef
 	return mqttInflightTransitionAllowed(d, cur.State)
 }
 
-// reapRegisterWithVerdictGated is reapRegisterWithVerdict for the one caller that has no
-// record in hand: it loads the slot once, applies the phase gate, and deletes only if the
-// occupant is still this exchange and the disposition is permitted from the state found.
+// reapRegisterGatedOutcome is reapRegisterWithVerdict for a caller that has no record in
+// hand, reporting what it found as a classified outcome: it loads the slot once, applies the
+// phase gate, and deletes only if the occupant is still this exchange and the disposition is
+// permitted from the state found. reapRegisterWithVerdictGated is its boolean form.
 //
-// An absent subject reports success — there is nothing to delete and nothing can read an
-// absent register as an owed delivery. A mismatched occupant also reports success and is
-// PRESERVED, the same reading releaseInflightRegisterByIdentity gives. An indeterminate
-// read fails closed: it is not an absence and not a licence to delete.
+// An absent subject reports mqttReapAbsent — there is nothing to delete and nothing can read
+// an absent register as an owed delivery. A mismatched occupant reports mqttReapPreservedOther
+// and is PRESERVED, the same reading releaseInflightRegisterByIdentity gives, and a record
+// that moved since ref observed it reports mqttReapPreservedMoved. An indeterminate read fails
+// closed with mqttReapRefused: it is not an absence and not a licence to delete.
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, nonce string, mustConfirm bool,
@@ -3157,26 +3159,6 @@ func mqttSlotAcquisitionBaseHolds(ref mqttInflightSlotRef, cur *mqttInflightReco
 	return true
 }
 
-// mqttSlotDestructionAdmitted is the ONE admission rule for removing a slot, shared by the
-// loading gate above and by reapLoadedRegister for callers that already hold the record, so
-// the two doors can never disagree about what licenses a delete:
-//
-//   - the phase must permit the disposition;
-//   - a destructive disposition must name the transmission the record carries (C-I);
-//   - and ANY live action withholds it, ours included (C-IV arm 2).
-//   - and a RELEASE must additionally spend an authority bound to the observation it was
-//     computed from (issue #100's C-IV consolidation). The phase, the counter and the
-//     live-action veto together answer "this delete is not blocked"; they never answer
-//     "a release is licensed", and the second question is the one the authority settles.
-//
-// `rel` is that authority. The zero value carries mqttSlotWithhold, so a caller that
-// obtained none refuses rather than inherits a licence, and the token re-checks its own
-// binding against the record and sequence in hand — an authority computed for a different
-// observation cannot be spent here.
-//
-// `subject` and `seq` are the observation the caller holds. A non-release disposition — a
-// mark, a custody write, a phase advance, a replacement — is unaffected: those are separate
-// permissions and are deliberately not gated on a release authority.
 // mqttSlotGuardsAdmitted is mqttSlotDestructionAdmitted WITHOUT the release-authority
 // clause: the phase, the transmission counter and the live-action veto, and nothing else.
 //
@@ -3200,6 +3182,26 @@ func mqttSlotGuardsAdmitted(cur *mqttInflightRecord, ref *mqttInflightSlotRef,
 	return true
 }
 
+// mqttSlotDestructionAdmitted is the ONE admission rule for removing a slot, shared by the
+// loading gate above and by reapLoadedRegister for callers that already hold the record, so
+// the two doors can never disagree about what licenses a delete:
+//
+//   - the phase must permit the disposition;
+//   - a destructive disposition must name the transmission the record carries (C-I);
+//   - and ANY live action withholds it, ours included (C-IV arm 2).
+//   - and a RELEASE must additionally spend an authority bound to the observation it was
+//     computed from (issue #100's C-IV consolidation). The phase, the counter and the
+//     live-action veto together answer "this delete is not blocked"; they never answer
+//     "a release is licensed", and the second question is the one the authority settles.
+//
+// `rel` is that authority. The zero value carries mqttSlotWithhold, so a caller that
+// obtained none refuses rather than inherits a licence, and the token re-checks its own
+// binding against the record and sequence in hand — an authority computed for a different
+// observation cannot be spent here.
+//
+// `subject` and `seq` are the observation the caller holds. A non-release disposition — a
+// mark, a custody write, a phase advance, a replacement — is unaffected: those are separate
+// permissions and are deliberately not gated on a release authority.
 func mqttSlotDestructionAdmitted(cur *mqttInflightRecord, ref *mqttInflightSlotRef,
 	d mqttInflightDisposition, subject string, seq uint64, rel mqttSlotRelease) bool {
 
@@ -3401,26 +3403,6 @@ func mqttErrorf(c *client, format string, args ...any) {
 	}
 }
 
-// persistVoidedRegs writes the void-register verdicts to the session record when the record
-// is not already known to carry them, and reports whether it now provably does.
-//
-// Two things about the ordering are deliberate. The nonce set is mutated BEFORE the fence is
-// taken (voidRegNonceLocked), which inverts the usual discipline, and it is safe here for a
-// reason that does not generalise: the mutation is purely additive on this path, and a
-// concurrent fence holder observing the addition and persisting it early is the desired
-// result, not a half-applied transaction — the verdict is a fact about the register that
-// exists whether or not the record mentions it yet.
-//
-// And the addition can lose a race it cannot see: a readLoop transaction that has already
-// marshalled its record commits without the new entry, while this off-readLoop writer was
-// refused the fence. So durability is tracked by a revision counter rather than assumed from
-// "I just tried to save". The revision captured before saving is the one that may later be
-// declared durable, never the set's current revision: an addition that lands after the
-// marshal must stay unsaved, and one that lands before it is merely re-saved later, which
-// costs nothing. Only saveLanded licenses the claim — an ambiguous write is resolved by a
-// readback.
-//
-// Session lock NOT held on entry.
 // voidVerdictsDurable reports whether every void verdict this session has staged is durably
 // credited — that is, whether the revision counter and the credited-revision watermark agree.
 //
@@ -3459,6 +3441,26 @@ func (sess *mqttSession) voidVerdictsDurable() bool {
 	return true
 }
 
+// persistVoidedRegs writes the void-register verdicts to the session record when the record
+// is not already known to carry them, and reports whether it now provably does.
+//
+// Two things about the ordering are deliberate. The nonce set is mutated BEFORE the fence is
+// taken (voidRegNonceLocked), which inverts the usual discipline, and it is safe here for a
+// reason that does not generalise: the mutation is purely additive on this path, and a
+// concurrent fence holder observing the addition and persisting it early is the desired
+// result, not a half-applied transaction — the verdict is a fact about the register that
+// exists whether or not the record mentions it yet.
+//
+// And the addition can lose a race it cannot see: a readLoop transaction that has already
+// marshalled its record commits without the new entry, while this off-readLoop writer was
+// refused the fence. So durability is tracked by a revision counter rather than assumed from
+// "I just tried to save". The revision captured before saving is the one that may later be
+// declared durable, never the set's current revision: an addition that lands after the
+// marshal must stay unsaved, and one that lands before it is merely re-saved later, which
+// costs nothing. Only saveLanded licenses the claim — an ambiguous write is resolved by a
+// readback.
+//
+// Session lock NOT held on entry.
 func (sess *mqttSession) persistVoidedRegs(c *client) bool {
 	sess.mu.Lock()
 	rev, saved := sess.voidedRegsRev, sess.voidedRegsSavedRev
@@ -4789,8 +4791,8 @@ func (sess *mqttSession) stageDeferredDeleteLocked(c *client, cc *ConsumerConfig
 // pending registrations. What is left is the plain consumers this packet destroys (including
 // the case where draining is not permitted at all) and the shared group durables, whose
 // membership the same write removes. A shared filter's durables are derived from the session
-// key rather than from cons, exactly as removeJSCons derives them: a persisted membership can
-// exist with no local join.
+// key rather than from cons, exactly as releaseUnsubSharedTargets derives them: a persisted
+// membership can exist with no local join.
 //
 // sess.mu must be held.
 func (sess *mqttSession) stageUnsubCancellationsLocked(c *client, filters []*mqttFilter,
@@ -5079,12 +5081,14 @@ func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqt
 // cancel arm alone where the consumer is being converted into a drain rather than
 // abandoned. What
 // this adds is promptness — a tombstone lets the register go now rather than at the next
-// resume — plus a durable home for a cancellation that arrived too late to be staged.
+// resume — plus a durable home for a cancellation the staging did not carry.
 //
-// It reports whether every cancellation is durable, which callers log. They do NOT withhold
-// the consumer delete on a false answer: for a late cancellation the membership is gone
-// either way, so keeping the durable makes no identifier recoverable and leaves an
-// unreferenced consumer nothing reaps.
+// It reports whether every cancellation is durable, which callers log. The plain and shared
+// teardowns do NOT withhold the consumer's release on a false answer: for such a cancellation
+// the membership is gone either way, so keeping the durable makes no identifier recoverable
+// and leaves an unreferenced consumer nothing reaps. The 3.1.1 forced leave is the exception:
+// it releases no group consumer until its ownership is settled and every staged void verdict
+// is durably credited (voidVerdictsDurable).
 //
 // tok is the caller's open transaction, and it is what makes the record-borne fallback
 // PROVABLE: these paths hold their packet's fence, so a transaction of our own would simply
@@ -5660,7 +5664,7 @@ func (as *mqttAccountSessionManager) inflightSourceState(r *mqttInflightRecord) 
 	return mqttInflightSourceLive
 }
 
-// storeInflightRegister makes a freshly allocated identifier durable, and is the
+// runInflightAdmission makes a freshly allocated identifier durable, and is the
 // gate every first transmission passes through (R1).
 //
 // Returns true only once a register naming (jsDur, sseq) under pi is confirmed at a
@@ -6651,7 +6655,7 @@ func (sess *mqttSession) settleLandedRegister(c *client, l mqttLandedRegister, s
 // MARKER-OPAQUE reservation (N-7.2): the identifier stays reserved, nothing may be sent or
 // settled under it, the source mapping is dropped, and the session's identifier space is
 // marked incomplete so no NEW identifier is minted until a resume reads the pair whole.
-// recNonce is the exchange the durable record actually carries — ours for a landed pair,
+// ev.nonce is the exchange the durable record actually carries — ours for a landed pair,
 // the occupant's when a same-delivery replacement was withheld — so the reservation names
 // the record a resume will find.
 //
@@ -8636,10 +8640,10 @@ func (sess *mqttSession) adoptIdentifierExclusionLocked(pi uint16, subject, nonc
 // exclusion effective everywhere at once rather than site by site.
 //
 // Every one of the six places that deletes a hold asks this predicate first —
-// releaseTerminalCleanupHold, dropRetainedSendLocked, endPubCompDebtLocked,
+// releaseTerminalCleanupHold, dropRetainedSendLocked, consumePubRelAckLocked,
 // sweepDeadSendHoldsLocked, endPublishSend and retireActionLocked_ — so an exclusion makes
 // the hold undeletable at all of them BY CONSTRUCTION, with no per-site guard. The comment
-// on endPubCompDebtLocked says why the predicate was built that way: a PUBCOMP would
+// in consumePubRelAckLocked says why the predicate was built that way: a PUBCOMP would
 // otherwise delete the whole hold and with it a buffered retained PUBLISH's only
 // reservation (issue #93). Only the INSTALL side needs a per-site audit.
 //
@@ -9786,7 +9790,8 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	// client has already answered with PUBREC. They are neither ordinary PUBLISH
 	// registers nor opaque — reserving them as opaque would withhold the session's whole
 	// outbound flow, and restoring them as PUBLISH entries could retransmit an answered
-	// payload — so they get their own disposition (see settlePastPubRecSlots).
+	// payload — so they get their own disposition (the past-PUBREC classification below,
+	// before the in-memory apply).
 	var pastPubRec []mqttRecoveredInflightReg
 	// routeB is the cross-stream crash cut in which the exact PUBREL record landed but
 	// the owner slot did not yet move out of PUBLISH. It is paired with the record now,

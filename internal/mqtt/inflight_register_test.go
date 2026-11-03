@@ -23,6 +23,13 @@ import (
 // Naming, identity and codec
 // ---------------------------------------------------------------------------
 
+func testRegisterSourceReply(r *mqttInflightRecord) {
+	r.SourceAckReply = _EMPTY_
+	if mqttOrdinarySourceRegister(r) {
+		r.SourceAckReply = testInflightAckSubject(r.Dur, r.Seq, 1)
+	}
+}
+
 // freshRegisterLineage stamps a fixture register as a FRESH allocation: its lineage is its
 // own nonce, which is exactly what storeInflightRegister writes for a create-only pair.
 //
@@ -33,13 +40,6 @@ import (
 //
 // A fixture that really does mean an heir sets Lin itself, to the PREDECESSOR's lineage, and
 // does not come through here. That difference is the thing the inheritance tests observe.
-func testRegisterSourceReply(r *mqttInflightRecord) {
-	r.SourceAckReply = _EMPTY_
-	if mqttOrdinarySourceRegister(r) {
-		r.SourceAckReply = testInflightAckSubject(r.Dur, r.Seq, 1)
-	}
-}
-
 func freshRegisterLineage(r *mqttInflightRecord) *mqttInflightRecord {
 	if mqttOrdinarySourceRegister(r) && r.SourceAckReply == _EMPTY_ {
 		r.SourceAckReply = testInflightAckSubject(r.Dur, r.Seq, 1)
@@ -388,8 +388,8 @@ func (e *testInflightEnv) peer(t *testing.T, node, clientID string) (*mqttAccoun
 	return asm, sess, c
 }
 
-// ackSubject builds a JetStream ack reply subject for a (durable, sequence) with a
-// given delivery count, the shape trackPublish parses.
+// testInflightAckSubject builds a JetStream ack reply subject for a (durable, sequence)
+// with a given delivery count, the shape trackPublish parses.
 func testInflightAckSubject(dur string, sseq uint64, deliveries int) string {
 	return fmt.Sprintf("$JS.ACK.%s.%s.%d.%d.%d.0.0", mqttStreamName, dur, deliveries, sseq, sseq)
 }
@@ -4246,9 +4246,8 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
 // the identifier is held by the custody ledger until the exchange's durable ending, and removing
-// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
-// TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
-// ledger holds nothing for the identifier.
+// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing); each release
+// below therefore also asserts that the ledger holds nothing for the identifier.
 //
 // The revision a save captures precedes its marshal, so a verdict recorded by a concurrent
 // teardown after that capture is durable nowhere when the save lands — and a release keyed
@@ -4315,9 +4314,8 @@ func TestMQTTInflightSchedulingEntryWaitsForASerializedVerdict(t *testing.T) {
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
 // the identifier is held by the custody ledger until the exchange's durable ending, and removing
-// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
-// TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
-// ledger holds nothing for the identifier.
+// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing); each release
+// below therefore also asserts that the ledger holds nothing for the identifier.
 //
 // A securing tombstone retires the nonce while the original store is still out. When that
 // store then settles through ABANDONMENT (its retries exhausted, its reconcile unreadable),
@@ -4535,9 +4533,8 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
 // the identifier is held by the custody ledger until the exchange's durable ending, and removing
-// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing,
-// TestF105ForgettingMetadataReleasesNothing); each release below therefore also asserts that the
-// ledger holds nothing for the identifier.
+// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing); each release
+// below therefore also asserts that the ledger holds nothing for the identifier.
 // The Receive Maximum 1 behaviour this test was once named for — a void verdict retires and
 // no second delivery is admitted while the first is outstanding — is
 // TestF105CustodyMetadataRemovalReleasesNothing.

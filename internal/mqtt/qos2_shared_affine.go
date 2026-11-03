@@ -3511,57 +3511,6 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 	sess.markerSendWindowHook(pi, mqttMarkerSendWrote)
 }
 
-// mqttFinishQ2AffineDelivery completes the affine side of one assignment: record
-// AffineDone, then ack the copy WITH CONFIRMATION, then reap if the source side
-// is proven too.
-//
-// The order is the whole point, and it is the opposite of the intuitive one.
-// Acking first and recording after leaves a crash window in which the claim says
-// `materialized` and the copy is simply GONE — which is indistinguishable from a
-// copy that was dropped because its consumer was destroyed. That ambiguity is
-// what previously required a per-broker "I saw the consumer disappear" flag, and
-// an in-memory flag cannot survive the broker handoff that makes the ambiguity
-// matter. Recording first removes the ambiguity from the data itself: an absent
-// copy under a claim that never reached AffineDone was never acked by the
-// JETSTREAM delivery — and every broker reads that the same way.
-//
-// That is a fact about the copy acknowledgement, and it is NOT a proof that the
-// client missed the message. mqttProcessPublishReceived stores the correlated
-// PUBREL before it reaches this function, so a client can have answered PUBREC
-// and still leave an absent copy under a claim with no AffineDone. What the
-// ordering buys is a reading every broker agrees on; what it does not buy is
-// certainty about the client. See the Lost field's comment and
-// docs/CONFORMANCE.md.
-//
-// The inverted window is benign and self-correcting: AffineDone recorded but the
-// copy not yet acked leaves the copy live, the claim un-reapable (see reapable),
-// and the redelivered copy disposed of by the delivery gate's terminal branch.
-// carriedCopy fences the write to the INCARNATION the delivery gate attributed, by
-// naming the copy subject the delivery actually carried and requiring the record now
-// on claimSubject to name that same copy. Re-reading whatever claim occupies the
-// subject now is exactly the mistake issue #69 closes: a replacement election would
-// otherwise be told a delivery it never made is complete.
-// Winner and generation are deliberately NOT asserted — AffineDone is owner
-// independent, a statement about a copy the gate already attributed — but the
-// incarnation is, because the copy belongs to one.
-// It reports TWO facts, because its two callers are licensed by different ones and
-// collapsing them would give one of them the wrong answer:
-//
-//   - recorded: AffineDone is durable. That is what the PUBREC path needs, because the
-//     in-flight register exists to let recovery reconstruct this exchange, and once the
-//     fact is on the claim the register has nothing left to carry.
-//   - acked: the copy's acknowledgement is CONFIRMED. That is what the retired-source
-//     path needs, because a retirement exists to suppress redelivery and clearing it on
-//     an unproven ack would leave the copy re-offerable with the state that governs it
-//     already gone — the same reasoning settleRetiredSource applies to its own entry.
-//
-// The first return is load-bearing on the PUBREC path. The correlated PUBREL is stored before this runs
-// and the pending entry is already gone, so the in-flight register is the ONLY
-// remaining carrier of the claim and its incarnation: deleting it after a failed
-// transition destroys the one thing a restart could reconstruct the retirement from,
-// leaving the copy stalled with no route to completion. False therefore means "keep
-// the register" — the identifier is spent either way, so retaining it costs a record
-// the next resume resolves, while dropping it costs the delivery.
 // proveQ2AffCopyDelivered records AffineDone for the claim that owns carriedCopy and
 // returns that claim ONLY when the fact is durably on it. nil means "not proven", and
 // no caller may acknowledge anything on a nil.
@@ -3587,6 +3536,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 // without a second transition site. warnf is passed in so each caller keeps its own
 // logging: the delivery path logs through its *client, the sweep through its *Server,
 // and neither's output changes.
+//
 // pubRecProven is the CALLER'S positive fact and is never inferred here. This function
 // is a transition funnel, not evidence: only a caller holding a resolved (claim subject,
 // copy subject) carrier read off a stored PUBREL may pass true, because that record is
@@ -3646,6 +3596,59 @@ func (as *mqttAccountSessionManager) proveQ2AffCopyDelivered(claimSubject, carri
 	return updated
 }
 
+// mqttFinishQ2AffineDelivery completes the affine side of one assignment: record
+// AffineDone, then ack the copy WITH CONFIRMATION, then reap if the source side
+// is proven too.
+//
+// The order is the whole point, and it is the opposite of the intuitive one.
+// Acking first and recording after leaves a crash window in which the claim says
+// `materialized` and the copy is simply GONE — which is indistinguishable from a
+// copy that was dropped because its consumer was destroyed. That ambiguity is
+// what previously required a per-broker "I saw the consumer disappear" flag, and
+// an in-memory flag cannot survive the broker handoff that makes the ambiguity
+// matter. Recording first removes the ambiguity from the data itself: an absent
+// copy under a claim that never reached AffineDone was never acked by the
+// JETSTREAM delivery — and every broker reads that the same way.
+//
+// That is a fact about the copy acknowledgement, and it is NOT a proof that the
+// client missed the message. mqttProcessPublishReceived stores the correlated
+// PUBREL before it reaches this function, so a client can have answered PUBREC
+// and still leave an absent copy under a claim with no AffineDone. What the
+// ordering buys is a reading every broker agrees on; what it does not buy is
+// certainty about the client. See the Lost field's comment and
+// docs/CONFORMANCE.md.
+//
+// The inverted window is benign and self-correcting: AffineDone recorded but the
+// copy not yet acked leaves the copy live, the claim un-reapable (see reapable),
+// and the redelivered copy disposed of by the delivery gate's terminal branch.
+//
+// carriedCopy fences the write to the INCARNATION the delivery gate attributed, by
+// naming the copy subject the delivery actually carried and requiring the record now
+// on claimSubject to name that same copy. Re-reading whatever claim occupies the
+// subject now is exactly the mistake issue #69 closes: a replacement election would
+// otherwise be told a delivery it never made is complete.
+// Winner and generation are deliberately NOT asserted — AffineDone is owner
+// independent, a statement about a copy the gate already attributed — but the
+// incarnation is, because the copy belongs to one.
+//
+// It reports TWO facts, because its two callers are licensed by different ones and
+// collapsing them would give one of them the wrong answer:
+//
+//   - recorded: AffineDone is durable. That is what the PUBREC path needs, because the
+//     in-flight register exists to let recovery reconstruct this exchange, and once the
+//     fact is on the claim the register has nothing left to carry.
+//   - acked: the copy's acknowledgement is CONFIRMED. That is what the retired-source
+//     path needs, because a retirement exists to suppress redelivery and clearing it on
+//     an unproven ack would leave the copy re-offerable with the state that governs it
+//     already gone — the same reasoning settleRetiredSource applies to its own entry.
+//
+// The first return is load-bearing on the PUBREC path. The correlated PUBREL is stored before this runs
+// and the pending entry is already gone, so the in-flight register is the ONLY
+// remaining carrier of the claim and its incarnation: deleting it after a failed
+// transition destroys the one thing a restart could reconstruct the retirement from,
+// leaving the copy stalled with no route to completion. False therefore means "keep
+// the register" — the identifier is spent either way, so retaining it costs a record
+// the next resume resolves, while dropping it costs the delivery.
 func (c *client) mqttFinishQ2AffineDelivery(claimSubject, carriedCopy, ackSubject string) (recorded, acked bool) {
 	as := c.mqtt.asm
 	if as == nil || c.mqtt.sess == nil {

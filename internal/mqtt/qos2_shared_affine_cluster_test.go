@@ -332,8 +332,9 @@ func TestQ2AffineCrossBrokerAffinity(t *testing.T) {
 // Asserted: neither member receives a PUBLISH; through BOTH brokers the claim stays at
 // `claimed`, carries no terminal fact and is never source-acked; and — independently of the
 // claim — the SOURCE MESSAGE is still on `$MQTT_msgs`. That last one is not redundant:
-// `confirmAck` commits before the `SourceAcked` CAS, so `SourceAcked == false` alone cannot
-// distinguish "never acked" from "acked, record not yet updated". What the refusal strands
+// `confirmSourceAckAndRecord` commits the ack before its `SourceAcked` CAS, so
+// `SourceAcked == false` alone cannot distinguish "never acked" from "acked, record not
+// yet updated". What the refusal strands
 // is issue #68's; this fixture's business is that nothing was released against a store response.
 //
 // Discriminating mutation: verify only on a REJECTED create-only CAS (mutation 1).
@@ -460,8 +461,9 @@ func TestQ2AffClusterCopyLossOnDeletedConsumer(t *testing.T) {
 				t.Fatalf("the copy on %q reads %v, want absent: the store kept something after all", claim.CopySubject, st)
 			}
 			// The source itself, independently of the claim, and by a POSITIVE load through
-			// THIS broker: `confirmAck` commits BEFORE the SourceAcked CAS, so an unreleased
-			// source is what proves the ack never happened. Not `!q2AffSourceGone`, which is
+			// THIS broker: `confirmSourceAckAndRecord` commits the ack BEFORE the SourceAcked
+			// CAS, so an unreleased source is what proves the ack never happened. Not
+			// `!q2AffSourceGone`, which is
 			// fail-closed and answers false both when the source is present and when it could
 			// not be read — the single-broker fixtures were corrected first and this one was
 			// left behind, which is the whole reason the propagation is now swept.

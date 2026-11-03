@@ -54,7 +54,7 @@ func newTestPubRelClaimRig(t *testing.T, id string) *testPubRelClaimRig {
 	return rig
 }
 
-// subscribeQoS2 sends a QoS 2 SUBSCRIBE and returns its SUBACK return code.
+// testPubRelSubscribeQoS2 sends a QoS 2 SUBSCRIBE and returns its SUBACK return code.
 func testPubRelSubscribeQoS2(t *testing.T, c net.Conn, r *mqttReader, filter string) byte {
 	t.Helper()
 	w := newMQTTWriter(0)

@@ -1471,10 +1471,11 @@ them in order where a later lint change depends on an earlier cleanup.
   closes, or a crash can strand its identifier. Done 2026-11-03
   ([issue #160](https://github.com/nberlee/mqtt-nats-broker/issues/160)).
 
-- [ ] Correct the code comments that name identifiers which no longer exist
-  ([issue #161](https://github.com/nberlee/mqtt-nats-broker/issues/161)), and the
-  `execDeferredConsumerDelete` comment naming a late cancellation the UNSUBSCRIBE route cannot
-  produce ([issue #167](https://github.com/nberlee/mqtt-nats-broker/issues/167)).
+- [x] Corrected the comments naming identifiers that no longer exist, by census over every
+  Go file (stale doc heads and stranded docs included), and stated the teardown purge as
+  the obligation it discharges rather than a late-cancellation history. Done 2026-11-03
+  ([issue #161](https://github.com/nberlee/mqtt-nats-broker/issues/161),
+  [issue #167](https://github.com/nberlee/mqtt-nats-broker/issues/167)).
 
 ### Performance and resource audits
 

@@ -933,11 +933,11 @@ func (c *client) mqttProcessPubComp(pi uint16) {
 	// PUBCOMP that will actually acknowledge removes the entry.
 	//
 	// Untracking up front and withholding afterwards destroys the very evidence the
-	// withholding protects: qos12InflightForCap counts pendingPubRel against Receive
-	// Maximum, so a removed-then-withheld entry frees its packet identifier, bumpPI
-	// re-mints it after a wrap, a different PUBREL is tracked under it, and when the
-	// original redelivers mqttDeliverPubRelCb's duplicate branch sees another sequence
-	// on that identifier and acknowledges the original away.
+	// withholding protects: bumpPI treats an identifier with a pendingPubRel entry as in
+	// use, so a removed-then-withheld entry the custody ledger does not hold frees its
+	// packet identifier, bumpPI re-mints it after a wrap, a different PUBREL is tracked
+	// under it, and when the original redelivers mqttDeliverPubRelCb's duplicate branch
+	// sees another sequence on that identifier and acknowledges the original away.
 	var (
 		jsDur      string
 		sseq       uint64

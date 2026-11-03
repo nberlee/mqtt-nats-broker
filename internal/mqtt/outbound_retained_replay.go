@@ -69,7 +69,6 @@ func newMQTTRetainedReplay(sub *subscription) *mqttRetainedReplay {
 	return &mqttRetainedReplay{sub: sub, gate: make(chan struct{}), depart: make(chan struct{})}
 }
 
-// retireLocked closes the gate and unlinks the object. Connection lock held on entry.
 // departLocked records the departure of the object's subscription, once.
 //
 // Connection lock held on entry.
@@ -81,6 +80,7 @@ func (r *mqttRetainedReplay) departLocked() {
 	close(r.depart)
 }
 
+// retireLocked closes the gate and unlinks the object. Connection lock held on entry.
 func (r *mqttRetainedReplay) retireLocked() {
 	if r.retired {
 		return

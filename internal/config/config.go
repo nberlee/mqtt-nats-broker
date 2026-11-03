@@ -48,7 +48,7 @@ type Config struct {
 
 	// Shutdown.
 	// DrainDelay is the grace period after SIGTERM before the broker disconnects
-	// MQTT clients. Readiness flips to NotReady immediately; the delay lets a
+	// MQTT clients. /readyz answers 503 immediately; the delay lets a
 	// load balancer / k8s Service deregister this instance before existing
 	// connections are cut. 0 = drain immediately (correct for single-instance and
 	// non-orchestrated deploys).

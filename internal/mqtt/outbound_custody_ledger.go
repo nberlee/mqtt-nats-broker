@@ -827,7 +827,6 @@ func (l *mqttCustodyLedger) touchAdmission(gen, nonce string) {
 	}
 }
 
-// hasExchange reports whether the lineage is charged, for the hint path's quick exit.
 // holdsAdmission reports whether the admission of allocation nonce is still held: its attempts
 // are not all settled, so an attempt that LANDED behind a lost response has not yet been adopted
 // as the exchange it carries.
@@ -878,6 +877,7 @@ func (l *mqttCustodyLedger) endAdmissionsFor(lin string) bool {
 	return ended
 }
 
+// hasExchange reports whether the lineage is charged, for the hint path's quick exit.
 func (l *mqttCustodyLedger) hasExchange(gen, lin string) bool {
 	if !l.forGen(gen) {
 		return false

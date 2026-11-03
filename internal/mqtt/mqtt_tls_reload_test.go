@@ -112,7 +112,7 @@ func tlsReloadClient(client *tls.Certificate, trust ...*tlsGeneration) *tls.Conf
 	}
 	cfg := &tls.Config{RootCAs: pool, ServerName: "localhost", MinVersion: tls.VersionTLS12}
 	if client != nil {
-		// See TestMQTTTLSRejectsUntrustedClientCert: Certificates would send nothing
+		// See TestMQTTTLSBadCertRejected: Certificates would send nothing
 		// when the server's request names another CA.
 		cfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return client, nil }
 	}

@@ -547,7 +547,7 @@ func mqttValidateGenRetirement(r *mqttGenRetirement, idHash string) error {
 }
 
 // storeGenRetirementCAS writes r to subject expecting expectSeq as the subject's
-// current last sequence (0 = create-only), mirroring storeWillCancelCAS.
+// current last sequence (0 = create-only), mirroring storeQoS2RelClaimCAS.
 func (jsa *mqttJSA) storeGenRetirementCAS(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error) {
 	b, _ := json.Marshal(r)
 	bb := bytes.Buffer{}

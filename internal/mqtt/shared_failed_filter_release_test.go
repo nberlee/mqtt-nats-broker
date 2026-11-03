@@ -281,8 +281,8 @@ func (x *testSharedReleaseEnv) assertVerdictPending(t *testing.T, what string, m
 
 // seedJoin seeds everything a shared join leaves on the session for one durable: the
 // ack-budget charge, one TRANSMITTED pending delivery holding a packet identifier and a
-// register nonce, and the deliver-subject subscription. withCons additionally seeds resident
-// cons entries — which a FAILED filter would NOT have, so it is off for the common shape.
+// register nonce, and the deliver-subject subscription. consSids additionally seeds resident
+// cons entries — which a FAILED filter would NOT have, so it is empty for the common shape.
 func (x *testSharedReleaseEnv) seedJoin(t *testing.T, target mqttSharedGroupNames, pi uint16,
 	nonce string, consSids ...string) *subscription {
 
@@ -761,7 +761,7 @@ func TestSharedFailedFilterRollbackBarriersTheAbandonedJoin(t *testing.T) {
 		name string
 		// alsoHold is a second membership of this session, or empty.
 		alsoHold string
-		// consFor seeds a resident cons entry for the OWED target, so a cons-keyed barrier
+		// consForOwed seeds a resident cons entry for the OWED target, so a cons-keyed barrier
 		// would find it. Off for T6, which is the shape that has none.
 		consForOwed bool
 	}{

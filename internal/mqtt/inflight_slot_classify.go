@@ -29,9 +29,10 @@ package mqtt
 //     classification and IN THE ORDER THE LADDER REQUIRES — suppression before abandonment,
 //     every cleanup at an exact observed
 //     sequence, and a fresh observation after any retry. They are not interchangeable
-//     "pre-steps": mqttSlotAdoptRetirement installs the source suppression FIRST precisely so
-//     that a re-offer meets the suppression rather than allocating a second identifier, and an
-//     orchestrator that ran them in a different order would be a different protocol.
+//     "pre-steps": the mqttSlotDispAdoptRetirement arm installs the source suppression FIRST
+//     precisely so that a re-offer meets the suppression rather than allocating a second
+//     identifier, and an orchestrator that ran them in a different order would be a different
+//     protocol.
 //   - it does not decide the marker. A replacement's MODE is mqttDecideMarker's answer, asked
 //     only once the disposition gate has passed, which is why the replace disposition below is
 //     an instruction to ask rather than an answer.

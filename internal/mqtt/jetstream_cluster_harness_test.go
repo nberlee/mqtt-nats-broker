@@ -9,7 +9,7 @@
 // across a real Raft leader failover.
 //
 // It deliberately does NOT use the single-node pairing registry
-// (testEmbeddedNATSByDir) or testMQTTShutdownServer: those own the 1:1
+// (testEmbedded) or testMQTTShutdownServer: those own the 1:1
 // shim-Server-to-embedded-nats model and their restart idiom would corrupt
 // cluster state. Cluster nodes and cluster-backed brokers are torn down by their
 // own t.Cleanup closures registered here.

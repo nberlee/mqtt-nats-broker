@@ -197,8 +197,6 @@ func (sess *mqttSession) clearInnerReleasing(noWait bool, selfLease *mqttLease,
 	return p.destroyReleasing(permit, noWait, onRetirementDurable)
 }
 
-// mqttPreparedClear owns the record transaction prepareClear opened. Exactly one
-// of abort or destroy consumes it.
 // resetForReuseLocked re-mints this object as a FRESH incarnation for a caller that
 // REUSES it as a new session: it empties every per-incarnation map and verdict, re-mints
 // the generation under the retirement permit, and installs freshGen and newSeq as the
@@ -369,6 +367,8 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	sess.sweepDeadSendHoldsLocked()
 }
 
+// mqttPreparedClear owns the record transaction prepareClear opened. Exactly one
+// of abort or destroy consumes it.
 type mqttPreparedClear struct {
 	sess *mqttSession
 	tok  recordTx

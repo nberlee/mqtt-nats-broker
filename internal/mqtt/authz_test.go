@@ -144,7 +144,9 @@ func isJSNotFound(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "no message found")
 }
 
-// authzBroker is startAuthzBroker plus the *Server, for tests that read streams.
+// authzBroker starts a NATS server from conf and a broker that dials each MQTT client's
+// credentials against it, and returns the broker's URL and its *Server, for tests that
+// read streams.
 func authzBroker(t *testing.T, conf string) (broker string, s *Server) {
 	t.Helper()
 	path := t.TempDir() + "/authz.conf"

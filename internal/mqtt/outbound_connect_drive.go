@@ -211,7 +211,7 @@ type mqttOwnershipResult struct {
 const mqttOwnershipMaxSteps = 8
 
 // mqttOwnershipStepReattempts is the per-CONNECT allowance of authority-step RE-ATTEMPTS
-// (reconcileOwnershipStep): shared by every step of every drive and re-drive of one CONNECT, so
+// (mqttReconcileOwnershipStep): shared by every step of every drive and re-drive of one CONNECT, so
 // the work one CONNECT may do is mqttOwnershipMaxSteps transitions per drive plus at most this
 // many re-attempts overall. A re-attempt is admitted only after the previous attempt is proven
 // never to have landed, so each one replaces a transition that did not happen rather than

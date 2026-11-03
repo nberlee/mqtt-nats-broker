@@ -50,7 +50,7 @@ func testF105ClosingBatch(t *testing.T, e *testF105Env, prev *mqttOutboundAuthor
 	return err
 }
 
-// testF105Closure builds a closure naming a root address.
+// testF105ClosureRecord builds a closure naming a root address.
 func testF105ClosureRecord(e *testF105Env, txn string, discard bool, shard, ord uint64) *mqttGenClosure {
 	return &mqttGenClosure{
 		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: txn, Discard: discard,
@@ -419,7 +419,7 @@ func testF105EnrolClosing(t *testing.T, e *testF105Env, tr *mqttAuthorityTransit
 //
 // Sealing is the closing act: the enrolment rules derive the root's bound from the seal the batch
 // installs, so a seal with no closure is a seal no root was allocated against. And it wedges the
-// generation — mqttEnrolSharedDurables refuses an already-sealed ledger, so the normal composers
+// generation — mqttSealGenLedgerMember refuses an already-sealed ledger, so the normal composers
 // can never close it, the inventory cannot be reopened, and no root will ever exist for the
 // recovery pass to find. A generation that can neither close nor be recovered is exactly what the
 // enrolment exists to prevent.

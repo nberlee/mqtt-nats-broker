@@ -716,7 +716,7 @@ func (as *mqttAccountSessionManager) getCachedRetainedMsg(subject string) *mqttR
 // If `copyMsgBytes` is true, then the `rm.Msg` bytes are copied (because it
 // references some buffer that is not owned by the caller).
 //
-// Note: currently `onlyReplace` and `cloneMsgBytes` always have the same
+// Note: currently `onlyReplace` and `copyMsgBytes` always have the same
 // value (all `true` or all `false`) however we use different booleans to
 // better express the intent.
 func (as *mqttAccountSessionManager) setCachedRetainedMsg(subject string, rm *mqttRetainedMsg, onlyReplace, copyMsgBytes bool) {
@@ -855,7 +855,7 @@ func (c *client) mqttHandlePubRetain(pp *mqttPublish, origin string) error {
 			asm.jsa.sendMsg(key, msg)
 		}
 
-	} else { // isRetained
+	} else { // retainMQTT
 		// Spec [MQTT-3.3.1-5]. Store the retained message with its QoS.
 		//
 		// When coming from a publish protocol, `pp` is referencing a stack

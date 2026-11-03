@@ -379,7 +379,7 @@ func testForcedLeaveWaitFired(t *testing.T, fired <-chan struct{}) {
 
 // TestForcedLeaveMalformedMembershipKeyIsRefusedBeforeTheConnack pins the preflight.
 //
-// mqttSharedDurablesForKey returns nil for a key it cannot parse, so a leave that met one used
+// mqttSharedDurablesFor returns nil for a key it cannot parse, so a leave that met one used
 // to remove the membership from the record while its delete loop iterated nothing — the durable
 // lost its last reference with no diagnostic. Retaining just that key does not help either: a
 // key that names no durable cannot make the last-holder scan report anything held, so the same

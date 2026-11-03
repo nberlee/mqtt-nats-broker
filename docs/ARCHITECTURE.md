@@ -3345,7 +3345,8 @@ transition preserves facts already proven, and a claim may be deleted only when
 `Discarded` deliberately does **not** imply `SourceAcked`: reaping a discarded
 claim whose group ack never committed would let the source redelivery elect a
 fresh winner. For the same reason the group ack is proven by a JetStream double
-ack (`jsa.confirmAck`), not by the ordinary fire-and-forget `sendAck`.
+ack: `confirmSourceAckAndRecord` records `SourceAcked` only once `submitSourceAck`
+reports it confirmed, never on the ordinary fire-and-forget `sendAck`.
 
 A fifth field, `Lost`, records the one outcome that is neither completion nor a
 permitted discard: the affine consumer was destroyed out of band, and interest
@@ -6184,7 +6185,7 @@ or below our base, or moved to a body that is merely valid-shaped,
 (`mqttSettleWillOnTakeover`, which destroys only an armed Will) are licensed only by
 an in-process, causal, same-client-ID replacement in which this broker holds **both** the
 connecting client and a **non-nil** displaced client, under the client-ID ownership gate.
-That is `discardTakenOverClient`, whose two callers are the ordinary `processConnect`
+That is `discardTakenOverClient`, whose two callers are the ordinary `mqttProcessConnect`
 takeover and the re-drive's T1b. No persisted record shape is positive successor evidence.
 
 The rule is structural rather than asserted: `mqttDisposalTakenOver` has one reader,
@@ -7662,10 +7663,16 @@ The invariants, in the order they matter:
   a 3.1.1 forced shared leave, a SUBSCRIBE rollback) withdraws
   that consumer's in-flight registrations first, and its own save carries both facts.
   The drained sids are exempt because stageDrain already did it and their consumer
-  survives. What the teardown itself then finds can only be a registration that arrived
-  after the staging, for which the tombstone is written and the obligation is otherwise
-  left to the convergence points — the consumer is deleted anyway, since keeping an
-  unreferenced durable nothing reaps makes no identifier recoverable.
+  survives. What the teardown's own purge then returns is owed whatever its history: a
+  register it may settle (one whose send section was still open at the staging and has
+  since ended unsent, for example), or an allocation whose register store is still in
+  flight. The latter can postdate the staging only where the staging closed no delivery
+  (the forced leave); behind the barrier below it cannot. Its tombstone is attempted, and
+  an unsecured one keeps its identifier reserved and leaves the obligation to the
+  convergence points. A plain or shared teardown releases the consumer to its retirement
+  owner anyway, since keeping an unreferenced durable nothing reaps makes no identifier
+  recoverable; the forced leave instead releases no group consumer until its ownership is
+  settled and every staged void verdict is durably credited.
 - **The delivery barrier comes down before the snapshot.** Staging is only a moment in
   time otherwise: the delivery callback stays live until the packet commits, so a
   message arriving after the snapshot allocates an identifier whose cancellation misses
@@ -9989,7 +9996,7 @@ CONNECT's authority steps (claim, prepare-handoff, finalize, cancel, close) cont
 the old connection's acknowledgement advances too. A blind loop would be wrong for them:
 the ownership operations are not idempotent retries — a claim or a preparation refuses the
 very state its own landed success creates, a finalize or cancel loses its target once it
-has acted. So `reconcileOwnershipStep` resolves a failed attempt from the handle
+has acted. So `mqttReconcileOwnershipStep` resolves a failed attempt from the handle
 `commitOp` froze before sending: landed, or landed and since superseded, is a transition
 that HAPPENED and the executor continues from the durable state; an unresolved attempt is
 settled by taking its outcome subject (`abortTransition`, create-only, which loses to a

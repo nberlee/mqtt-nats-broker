@@ -359,7 +359,7 @@ var (
 	// would tell it to stop reconnecting under a session nobody demonstrably took.
 	//
 	// It is a separate value rather than a reuse of mqttDisposalForked because the NAME
-	// is read at the call site as the claim being made. See processConnect's post-reset
+	// is read at the call site as the claim being made. See mqttProcessConnect's post-reset
 	// clear() arm.
 	mqttDisposalTeardownIncomplete = mqttDisposalVocabulary{
 		reason:      mqttReasonServerBusy,

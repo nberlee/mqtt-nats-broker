@@ -89,8 +89,8 @@ var censusIngressMethods = map[string]string{
 	"createStream":            "create a stream",
 	"updateStream":            "update a stream configuration",
 
-	// Acks, which mutate durable consumer state. confirmAck's own doc is the
-	// evidence: it waits "until the consumer state has advanced".
+	// Acks, which mutate durable consumer state. mqttJSAAckConfirm's own doc is the
+	// evidence: a confirmed ack is answered "once it has been applied".
 	"sendAck": "acknowledge a delivery, fire and forget",
 	"sendMsg": "publish without interpreting a response",
 

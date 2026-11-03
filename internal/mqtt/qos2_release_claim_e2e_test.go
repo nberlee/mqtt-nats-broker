@@ -18,7 +18,7 @@ import (
 // is "was this message delivered", which no amount of record inspection can settle.
 // The unit-level tables live in qos2_release_claim_test.go.
 
-// setPreClaim installs the load..claim seam, which is the only way to park a
+// testQoS2SetPreClaim installs the load..claim seam, which is the only way to park a
 // releaser exactly where a real race lands.
 func testQoS2SetPreClaim(t *testing.T, b *testQoS2Broker, fn func(holdSubject, gen string, holdSeq uint64) error) {
 	t.Helper()

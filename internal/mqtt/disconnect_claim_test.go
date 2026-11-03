@@ -77,7 +77,7 @@ func TestMQTTDisplacementClaimsTheOneDisconnect(t *testing.T) {
 	}
 
 	// The first contender: a real remote persist, observed by the real subscription, which
-	// hands the eviction to processSessionPersist's classifying worker. The whole route is
+	// hands the eviction to processSessionRecordDelivery's classifying worker. The whole route is
 	// asynchronous now, but the worker's notification still precedes its
 	// `go closeConnection`, so a closed connection proves the notification was attempted.
 	e.remoteRecordWrite(t, "node2", "dispclaim")

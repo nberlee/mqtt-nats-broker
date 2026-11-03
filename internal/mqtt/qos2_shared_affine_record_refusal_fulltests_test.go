@@ -94,7 +94,7 @@ func TestQ2AffOrphanedSharedQoS2RecordRefusesRestore(t *testing.T) {
 				testMQTTExpectDisconnect(t, c)
 				c.Close()
 				// A CLEAN START attempt is refused identically, and deliberately:
-				// createOrRestoreSession runs before processConnect's clean-session
+				// createOrRestoreSessionWithin runs before mqttProcessConnect's clean-session
 				// check, and the discard it would take derives shared durable names
 				// from the record's own keys.
 				requireIntact(fmt.Sprintf("after the refused connect (cleanStart=%v)", cleanStart))

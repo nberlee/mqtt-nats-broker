@@ -95,7 +95,7 @@ func TestMQTTWillOutboxReconnectCancelsCrossReplica(t *testing.T) {
 	})
 
 	// Reconnect the same client ID on broker B (the other replica) before the
-	// delay: mqttProcessConnect -> cancelWillOutbox must suppress it.
+	// delay: its acceptance fact must suppress it.
 	cw2, rw2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "rcxpub", cleanStart: true}, oB.MQTT.Host, oB.MQTT.Port)
 	defer cw2.Close()
 	testMQTTReadConnAckV5(t, rw2)
@@ -720,7 +720,7 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	}
 }
 
-// TestMQTTWillOutboxNewerDisconnectedRecordFires: the takeover fence must FIRE a
+// TestMQTTWillOutboxNoAcceptanceMeansTheWillFires: the takeover fence must FIRE a
 // Will when the client's session record has moved on but NO acceptance of that
 // client predates the Will falling due — the no-loss direction.
 //
@@ -1013,20 +1013,19 @@ func TestMQTTWillOutboxTakeoverLateEnqueue(t *testing.T) {
 		t.Fatal("A's enqueue was never reached after disconnect")
 	}
 
-	// Take over the same client on B. B's synchronous cancelWillOutbox completes
-	// before this CONNACK; both cancels run on the still-empty outbox.
+	// Take over the same client on B. B's acceptance fact is committed before this
+	// CONNACK, while the outbox is still empty, so nothing has a pending record to cancel.
 	cwB, rwB := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "tlepub", cleanStart: false,
 		props: mqttV5ConnPropsSessionExpiry(60)}, oB.MQTT.Host, oB.MQTT.Port)
 	defer cwB.Close() // keep B connected (DisconnectedAt == 0) through the assertions
 	testMQTTReadConnAckV5(t, rwB)
 
 	// A's observation is dropped (above), so no cancel of A's can race the released
-	// enqueue: B's synchronous cancel has already completed before its CONNACK, and
-	// the outbox is still empty.
+	// enqueue: B's acceptance fact is already committed, and the outbox is still empty.
 
 	// Release A's real create: it lands pending carrying A's (older) OriginSessionSeq,
-	// and enqueueDelayedWill's earlyCancelIfSuperseded re-reads B's live session
-	// (newer sequence, DisconnectedAt == 0) and cancels it.
+	// and enqueueDelayedWill's earlyCancelIfSuperseded finds B's later acceptance fact and
+	// cancels it.
 	doRelease()
 	// The real create landed: from here "record absent" means cancelled-then-reaped.
 	select {
@@ -1506,12 +1505,12 @@ func TestMQTTWillOutboxTimerReleasedOnCancel(t *testing.T) {
 	})
 }
 
-// TestMQTTWillOutboxTimerOnCancelledRecord covers the fire path the two
-// cancellation tests above never reach. A normal reconnect stops and untracks
-// the timer, so its callback does not run; here the record is CAS-cancelled
-// directly, bypassing cancelWillOutbox, so the timer stays armed and the
-// callback really does execute after FireAt. It must publish nothing and release
-// its own token.
+// TestMQTTWillOutboxTimerOnCancelledRecord covers the fire path on a record that
+// was cancelled without its timer being released. Suppression through
+// cancelIfSuperseded (the enqueue-time check, or the claim pass after a reconnect
+// writes its acceptance fact) also untracks the timer; here the record is
+// CAS-cancelled directly, bypassing it, so the timer stays armed and the callback
+// really does execute after FireAt. It must publish nothing and release its own token.
 //
 // Note what this does NOT prove. The callback reloads the record rather than
 // trusting its enqueue-time snapshot, but that is defence in depth, not the
@@ -1563,7 +1562,7 @@ func TestMQTTWillOutboxTimerOnCancelledRecord(t *testing.T) {
 		return nil
 	})
 
-	// Cancel the record durably WITHOUT going through cancelWillOutbox, so
+	// Cancel the record durably WITHOUT going through cancelIfSuperseded, so
 	// cancelWillTimer is never called and the timer stays armed.
 	testLicenseWill(rec, mqttWillCancelled, mqttWillDecisionCancel, 1)
 	if _, err := asm.jsa.storeWillOutboxCAS(subject, seq, rec); err != nil {

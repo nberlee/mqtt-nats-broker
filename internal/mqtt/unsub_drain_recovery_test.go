@@ -875,14 +875,6 @@ func TestSharedSubRollbackRefusedAtEntry(t *testing.T) {
 	}
 }
 
-// TestPersistedRecordOmitsAnEmptyDrain pins I3 at the record level: an entry exists
-// in the record if and only if its durable must survive.
-//
-// finishDrainIfEmpty deletes the durable with no further write, on the strength of
-// the save that cleared the last claim having also removed the entry. If an empty
-// drain were persisted instead, that save would leave the record naming a consumer
-// which is then deleted — and a crash in between strands a reference to a durable
-// that no longer exists, so a resume restores a drain nothing can deliver for.
 // TestPersistedRecordOmitsOnlyAMarkedDrain pins which fact authorizes the builder to leave a
 // drain out of the record, and it is deliberately BOTH directions.
 //
@@ -1345,7 +1337,7 @@ func testMQTTResidentSessionOrNil(asm *mqttAccountSessionManager, id string) *mq
 // resolver must not settle an ambiguity whose writer is still mid-transaction.
 //
 // save() publishes seqUncertain BEFORE it returns, so between that and the writer's
-// classifySave/retainOnUncertain there is a window in which the session looks
+// classifySave/retainOnLanded there is a window in which the session looks
 // resolvable but is not. Resolving inside it is silently destructive twice over: the
 // writer then reads its own ambiguous error as DEFINITE (isSeqUncertain is false
 // again) and rolls back a mutation that may have landed, and any continuation it
@@ -2006,8 +1998,8 @@ func TestDrainRecoveryRefusesAPubRelForAnotherIdentifier(t *testing.T) {
 // that would ACT on one has to skip it anyway. It is wrong, and the caller it breaks is a
 // destructive one. secureQ2AffPubRelProofs walks the stored PUBRELs of a generation about
 // to be torn down, precisely to notice affine PUBREC proofs that are about to be destroyed
-// with the consumer that retains them; mqttQ2AffProofWalk asks the same question for a
-// loss report. A record the decoder refuses can still carry a perfectly good affine
+// with the consumer that retains them; reconcileQ2AffPubRelProofs asks the same question
+// for a loss report. A record the decoder refuses can still carry a perfectly good affine
 // reference, and dropping it would have made the teardown destroy that proof unread while
 // reporting nothing.
 //

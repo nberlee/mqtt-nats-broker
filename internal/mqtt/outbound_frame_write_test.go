@@ -36,7 +36,11 @@ type testFrameConn struct {
 	failAt   int // fail once this many bytes have been accepted; 0 means never
 	closed   bool
 	writeErr error
-	onWrite  func()
+	// onWrite, when set, runs inside the transport write — which is the only place an execution
+	// can be observed MID-FLIGHT. Without it "outstanding" is only ever sampled before and
+	// after, and a guard that marked an acquisition finished the moment it was consumed would
+	// pass.
+	onWrite func()
 }
 
 func (c *testFrameConn) Write(b []byte) (int, error) {
@@ -59,9 +63,6 @@ func (c *testFrameConn) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// onWrite, when set, runs inside the transport write — which is the only place an execution
-// can be observed MID-FLIGHT. Without it "outstanding" is only ever sampled before and after,
-// and a guard that marked an acquisition finished the moment it was consumed would pass.
 func (c *testFrameConn) Close() error                     { c.closed = true; return nil }
 func (c *testFrameConn) SetWriteDeadline(time.Time) error { return nil }
 

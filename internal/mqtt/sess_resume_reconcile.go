@@ -903,7 +903,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 //
 // It returns the vocabulary ITS OWN ROUTE computed, never one a caller
 // re-derives: the two routes reach it differently — disposalForDirectRejection
-// reads the record for the 10071 arm, mqttDisposalForRepairSave maps the
+// reads the record for the 10071 arm, mqttDisposalForLineage maps the
 // resolver's verdict for the 10164 arm — and the 10071 route MINTS THE FORK
 // GRANT, which must happen inside the caller's transaction. A caller re-deriving
 // would need a second read and would have to know which route ran.

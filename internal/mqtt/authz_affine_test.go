@@ -767,7 +767,7 @@ func affineDenyFreesTheIdentifier(t *testing.T) {
 	}
 
 	// The assertion this arm exists for. If the terminal denial left the restored
-	// entry in pendingPublish, qos12InflightForCap is still 1 of 1 and this delivery
+	// entry in pendingPublish, receiveMaxOccupancyLocked is still 1 of 1 and this delivery
 	// is withheld forever -- with no error, no log the client sees, and nothing that
 	// another disconnect would not have hidden.
 	testMQTTPublishV5(t, pubc, 1, 2, "other/msg", []byte("allowed"))

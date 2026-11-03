@@ -788,7 +788,7 @@ type testPeerLandedTransition struct {
 	phase mqttExchangePhase
 }
 
-// testPeerRecordTransitions arms both brokers' transition seams to record every committed
+// recordTransitions arms both brokers' transition seams to record every committed
 // transition that writes the generation's closure or moves the obligation's exchange.
 func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountSessionManager) func() []testPeerLandedTransition {
 	t.Helper()

@@ -269,10 +269,10 @@ func TestMQTTUnsubAckSuppressedWhenDisplaced(t *testing.T) {
 // enqueue.
 //
 // The ownership sample releases sess.mu, and the enqueue takes c.mu afterwards.
-// `processSessionPersist` holds neither, so in that interval it can notify and detach — and
-// an UNSUBACK appended after that DISCONNECT violates [MQTT-3.14.4-1]. Which reason code
-// that notification carries depends on what the observed record proved and is not this
-// fixture's question (issue #86); the ORDERING is.
+// `evictDisplacedOnRemotePersist` holds neither, so in that interval it can notify and
+// detach — and an UNSUBACK appended after that DISCONNECT violates [MQTT-3.14.4-1]. Which
+// reason code that notification carries depends on what the observed record proved and is
+// not this fixture's question (issue #86); the ORDERING is.
 // What closes the window is the second gate: the DISCONNECT claim is read inside the
 // enqueue's own c.mu critical section, so the refusal is atomic with the write.
 //
@@ -353,9 +353,9 @@ func TestMQTTUnsubAckSuppressedByADisplacementInTheWindow(t *testing.T) {
 //
 // The packet's transaction is closed long before a deferred settlement runs, and a
 // write under a closed token is refused at entry — silently, since none of these
-// cleanup calls is checked for an outcome. Threading the token into commitUnsub is not
-// enough on its own: it reaches the shared release through removeJSCons, a closure
-// defined OUTSIDE it that captured the packet's `tok` and kept using it after the
+// cleanup calls is checked for an outcome. Threading the token into commitUnsub was not
+// enough on its own: it reached the shared release through removeJSCons, a closure (since
+// deleted) defined OUTSIDE it that captured the packet's `tok` and kept using it after the
 // signature changed. That is the shape this test exists to catch, and only a test that
 // asserts a DURABLE EFFECT can: the group durable of a shared subscription is deleted
 // by that nested path once the record no longer names the membership.

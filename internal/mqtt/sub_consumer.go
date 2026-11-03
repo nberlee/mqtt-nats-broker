@@ -24,10 +24,10 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// cleanupFailedSubClassified is cleanupFailedSub reporting whether any record write it
-// performed was rejected by the per-subject CAS. Same reason as
-// releaseSharedConsumerClassified: this runs on a failed filter and returns normally, so a
-// swallowed rejection would open the gate as quiet.
+// cleanupFailedSubClassified is the cleanup processSubs performs for a failed filter,
+// reporting whether any record write it performed was rejected by the per-subject CAS. Same
+// reason as releaseSharedConsumerClassified: this runs on a failed filter and returns
+// normally, so a swallowed rejection would open the gate as quiet.
 func (sess *mqttSession) cleanupFailedSubClassified(c *client, tok recordTx, fromSubProto bool, sub *subscription, cc *ConsumerConfig, jssub *subscription) bool {
 	var casRejected bool
 
@@ -722,14 +722,14 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 }
 
 // execDeferredConsumerDelete performs the irreversible teardown of a plain
-// QoS1/2 consumer whose session entry was already removed (QoS downgrade to 0):
-// mark its delivery subscription closed, purge its pending QoS 1/2 deliveries
-// (so the packet identifiers do not leak against the in-flight cap), delete the
-// durable, and unsubscribe the delivery subject. deleteConsumer is asynchronous,
-// so an in-flight delivery callback could re-populate the maps after the purge;
-// the closed flag (guarded by sess.mu and sess.subsMu, same as delivery) makes
-// mqttDeliverMsgCbQoS12 skip instead while leaving sub.mqtt valid for an
-// already-committed enqueue.
+// QoS1/2 consumer whose membership a confirmed record no longer names (an
+// UNSUBSCRIBE, a QoS 0 downgrade on a SUBSCRIBE or a CONNECT restore, a rolled-back
+// SUBSCRIBE's created consumer): mark its delivery subscription closed, purge its
+// pending QoS 1/2 deliveries (so the packet identifiers do not leak against the
+// in-flight cap), hand the consumer to the retirement owner, and unsubscribe the
+// delivery subject. The closed flag (guarded by sess.mu and sess.subsMu, same as
+// delivery) makes mqttDeliverMsgCbQoS12 skip rather than allocate while leaving
+// sub.mqtt valid for an already-committed enqueue.
 func (sess *mqttSession) execDeferredConsumerDelete(c *client, tok recordTx, sid string, cc *ConsumerConfig, reason string) {
 	_ = sess.execDeferredConsumerDeleteClassified(c, tok, sid, cc, reason)
 }
@@ -772,13 +772,16 @@ func (sess *mqttSession) execDeferredConsumerDeleteClassified(c *client, tok rec
 	sess.mu.Unlock()
 	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
 
-	// Anything the purge found here arrived AFTER this packet staged its cancellations
-	// (a delivery already in the callback when the durable's subscription was closed),
-	// so its cancellation missed the membership-removal write. Keeping the consumer
-	// would not redeem that: the membership is gone either way, so a register that lands
+	// The purge ran in the same section that closed the delivery, so nothing allocates
+	// behind it. What it returned is owed here whatever its history, and the two halves
+	// are different obligations: regs are registers this teardown may settle (above),
+	// cancels are allocations whose register store is still in flight. Securing those is
+	// an ATTEMPT — a tombstone, else the session record's verdicts — and it can fail;
+	// then their identifiers stay reserved and the obligation is left to the convergence
+	// points. The consumer is released regardless. Keeping it would not redeem an
+	// unsecured cancellation: the membership is gone either way, so a register that lands
 	// has nothing to redeliver through whether the durable lives or not — and an
-	// unreferenced durable nothing reaps is worse than none. So it is reported and the
-	// obligation is left to the convergence points.
+	// unreferenced durable nothing reaps is worse than none.
 	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels, mqttLicenceOf(c))
 	casRejected = casRejected || cancelCAS
 	if !secured {
@@ -1174,8 +1177,9 @@ func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok 
 		}
 	}
 	casRejected := sess.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
-	// As in execDeferredConsumerDelete: anything found here arrived after the staging,
-	// and keeping the durable would not make its identifier recoverable.
+	// As in execDeferredConsumerDelete: what the purge returned is owed whatever its history,
+	// securing the cancellations is an attempt whose failure leaves their identifiers
+	// reserved, and the release proceeds either way.
 	secured, cancelCAS := sess.secureRegCancellationsClassified(c, tok, cancels, mqttLicenceOf(c))
 	casRejected = casRejected || cancelCAS
 	if !secured && c != nil {
@@ -1186,18 +1190,6 @@ func (sess *mqttSession) discardSharedGroupTargetStateClassified(c *client, tok 
 	return casRejected
 }
 
-// discardSharedGroupTargetLocalState is the part of a group-target release that touches only
-// process-local state: it closes the delivery so nothing more is transmitted on it, refunds the
-// ack-budget charge, and unsubscribes the deliver subject.
-//
-// It performs NO record write, which is why a caller that must order its writes against
-// something irreversible can call it freely at any point. Separated for that caller's sake: the
-// 3.1.1 forced leave collects every target's pending state in one pass and issues ONE aggregate
-// register/record write pair, because a per-target write pair cannot be made safe — an ambiguous
-// first write causes `persistRecord` to refuse every later one at entry, and resolving the first
-// credits only its own revision.
-//
-// sess.mu must NOT be held: this takes it.
 // closeSharedGroupTargetDeliveryLocked marks one group target's delivery closed, so nothing more
 // is transmitted on it and no callback repopulates its pending state.
 //

@@ -1709,11 +1709,11 @@ func testQ2AffAssertPathReclaimed(t *testing.T, b *testQ2AffBroker, sess *mqttSe
 		what, gen, consumer, ready, durables, after, before)
 }
 
-// testQ2AffAmbiguousProvisioning drives a shared QoS 2 SUBSCRIBE whose AFFINE
-// PROVISIONING save is made ambiguous, confirms that it is that save and no
-// other that went ambiguous, and settles it. It returns the broker, the session,
-// the still-open connection, the id hash and the pre-packet MaxAckPending charge,
-// so a caller asserts only about the affine delta.
+// testQ2AffAmbig is a shared QoS 2 SUBSCRIBE whose AFFINE PROVISIONING save
+// testQ2AffArmAmbiguousProvisioning made ambiguous, having confirmed that it is
+// that save and no other that went ambiguous; settle settles it. It carries the
+// broker, the session, the still-open connection, the id hash and the pre-packet
+// MaxAckPending charge, so a caller asserts only about the affine delta.
 type testQ2AffAmbig struct {
 	b      *testQ2AffBroker
 	sess   *mqttSession
@@ -2994,8 +2994,10 @@ func testQ2AffForeignStoreWith(t *testing.T, peer *mqttAccountSessionManager, id
 
 // testQ2AffDropPersistObservations makes this broker never learn of a remote
 // persist for one client ID — the state a lost core-NATS notification leaves.
-// Without it processSessionPersist evicts the session on its own, and every
-// assertion about what the settlement did would hold for the wrong reason.
+// Without it processSessionRecordDelivery feeds the persist to
+// deliverSessionRecordObservation, which evicts the session on its own, and every
+// assertion about what the settlement did would hold for the wrong reason. (The
+// ownership backstop, reconcileResidentOwnership, is not disabled here.)
 func testQ2AffDropPersistObservations(t *testing.T, b *testQ2AffBroker, idHash string) *atomic.Int64 {
 	t.Helper()
 	dropped := &atomic.Int64{}
@@ -3423,8 +3425,6 @@ func TestQ2AffEveryWriteCarriesItsExpectation(t *testing.T) {
 	b.completeExchange(t, c, r, pi)
 }
 
-// affDurableFor is the affine consumer durable for one incarnation, which
-// mqttQ2AffineNames returns as its third value.
 // testQ2AffSelfConsistent makes a seeded claim describe a shape a real election
 // could have produced: it mints an incarnation if the fixture did not choose one and
 // derives CopySubject from the record's OWN winner, generation, claim hash and
@@ -3482,6 +3482,8 @@ func testQ2AffSessionClient(b *testQ2AffBroker, sess *mqttSession) *client {
 	return c
 }
 
+// affDurableFor is the affine consumer durable for one incarnation, which
+// mqttQ2AffineNames returns as its third value.
 func affDurableFor(idHash, gen string) string {
 	_, _, durable := mqttQ2AffineNames(idHash, gen)
 	return durable
@@ -5011,7 +5013,7 @@ type testQ2AffContenderStage struct {
 	release func(t *testing.T)
 }
 
-// stageContender wires the seams, stages the winner, seeds the claim and
+// testQ2AffStageContender wires the seams, stages the winner, seeds the claim and
 // publishes. record and consumer deviate the staged record and durable; either
 // may be nil. perturb runs after staging and before the publish, which is where a
 // fixture changes the stream or installs its own seam.
@@ -5170,7 +5172,9 @@ func (st *testQ2AffContenderStage) assertNoCreate(t *testing.T, what string) {
 	}
 }
 
-// assertCopyAbsent proves nothing was materialized. Used with assertNoSourceAck.
+// assertCopyAbsent checks the record shows nothing materialized: the claim is still
+// claimed, SourceAcked is unset, and the copy lookup does not report the copy present (an
+// unknown lookup passes). Used with assertNoCreate.
 func (st *testQ2AffContenderStage) assertCopyAbsent(t *testing.T, what string) {
 	t.Helper()
 	claim := testQ2AffLoadClaim(t, st.b, st.subject)
@@ -7834,7 +7838,7 @@ func TestQ2AffRestoredPendingCarriesItsIncarnation(t *testing.T) {
 // have been refused by the owner check instead, and would have proved nothing about this.
 //
 // Paired mutations, one per subcase, and they are what tell the two legs apart:
-//   - drop the affinePairContradictedBySource block in recoverInflightRegisters: the
+//   - drop the affinePairProvenBySource block in recoverInflightRegistersOnce: the
 //     internally consistent forgery is then installed and its PUBREC records AffineDone
 //     on the victim.
 //   - drop the claim.CopySubject == carriedCopy clause in q2AffClaimForCarriedCopy: the

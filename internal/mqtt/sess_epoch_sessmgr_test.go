@@ -113,9 +113,9 @@ func newJS(t *testing.T, nc *nats.Conn) (jetstream.JetStream, context.Context) {
 }
 
 // TestSessionManagerEpochResolution (plan test 14a/14c): a fresh bring-up stamps a
-// valid nuid: epoch on $MQTT_sess, resolves it into as.sessStreamEpoch, creates a
-// conformant $MQTT_willcancel, and a second getOrCreate reuses the manager and epoch
-// without a config update.
+// valid nuid: epoch on $MQTT_sess, resolves it into as.sessStreamEpoch, creates
+// $MQTT_teardown, and a second getOrCreateMQTTAccountSessionManager reuses the
+// manager and epoch without a config update.
 func TestSessionManagerEpochResolution(t *testing.T) {
 	t.Parallel()
 	s, c, nc := newBringUpServer(t)
@@ -373,7 +373,3 @@ func TestSessionManagerEpochMissingFailsInit(t *testing.T) {
 		})
 	}
 }
-
-// TestSessionManagerWillCancelStreamValidation (plan test 15): a pre-existing
-// $MQTT_willcancel with an incompatible configuration fails manager initialization
-// with recreate guidance rather than being mutated in place.

@@ -217,9 +217,8 @@ func mqttExchangePhaseEnded(p mqttExchangePhase) bool {
 // (mqttExchangePhaseEnded), the broker abandoned its delivery (DeliveryAbandoned), or its
 // generation was discarded (Discarded, issue #107 7d). It answers
 // the DUTY question only — whether recovery owes this exchange anything further — and is
-// deliberately NOT the identifier question: identifier exclusivity, replacement and
-// mqttIdentifierReleaseAllowed keep reading mqttExchangePhaseEnded, so an abandoned exchange's
-// identifier stays closed.
+// deliberately NOT the identifier question: identifier exclusivity and replacement keep
+// reading mqttExchangePhaseEnded, so an abandoned exchange's identifier stays closed.
 func mqttExchangeDeliveryDutyEnded(p mqttExchangePhase) bool {
 	return mqttExchangePhaseEnded(p) || p == mqttExchangeDeliveryAbandoned || p == mqttExchangeDiscarded
 }
@@ -373,7 +372,7 @@ type mqttExchangeAbandonment struct {
 }
 
 // mqttExchangeAbandonmentMembers is every member either arm may carry; which are REQUIRED depends
-// on the arm (mqttExchangeAbandonmentRequired).
+// on the arm (mqttExchangeAbandonmentOrdinaryRequired, mqttExchangeAbandonmentRetainedRequired).
 var mqttExchangeAbandonmentMembers = map[string]struct{}{
 	"reason": {}, "tenure": {}, "alloc": {}, "acq": {}, "dur": {}, "seq": {}, "reply": {},
 	"payload": {},

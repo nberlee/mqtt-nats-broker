@@ -1034,8 +1034,6 @@ func testQualifiedFuncName(fn *ast.FuncDecl) string {
 	return fn.Name.Name
 }
 
-// testCalleeName reports the called function's own name, for both plain and method
-// calls, and empty for anything else.
 // testDefersSendEnd reports whether a defer statement ends a send section: a direct
 // `defer endSend(...)`, or a deferred function literal whose body calls endPublishSend,
 // endPubRelSend (issue #118: the PUBREL end reads its emission flag at exit) or endSend.
@@ -1183,6 +1181,8 @@ func testSectionBoundTransmitters(t *testing.T) map[string]bool {
 	return bound
 }
 
+// testCalleeName reports the called function's own name, for both plain and method
+// calls, and empty for anything else.
 func testCalleeName(call *ast.CallExpr) string {
 	switch fn := call.Fun.(type) {
 	case *ast.Ident:
@@ -2071,8 +2071,6 @@ func TestMQTTInflightClearSweepsOnlyDeadHolds(t *testing.T) {
 	}
 }
 
-// testReadyForPubRelDelivery wires the session so the delivery callback and the PUBCOMP
-// handler both run: a bound connection, a PUBREL consumer, and no gate withholding.
 // testPersistAcceptedRecord gives the fixture the durable precondition PRODUCTION always
 // has by the time a stored PUBREL can be delivered: an accepted session record at the head
 // of $MQTT_sess, whose stream sequence and write identity are the ones this session object
@@ -2101,6 +2099,8 @@ func testPersistAcceptedRecord(t *testing.T, e *testInflightEnv) {
 	}
 }
 
+// testReadyForPubRelDelivery wires the session so the delivery callback and the PUBCOMP
+// handler both run: a bound connection, a PUBREL consumer, and no gate withholding.
 func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 	t.Helper()
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
@@ -2137,10 +2137,10 @@ func testReadyForPubRelDelivery(t *testing.T, e *testInflightEnv) {
 	// exchange must establish that slot, or it exercises the refusal path and nothing else
 	// (feedback_fixture_must_reach_its_route).
 	//
-	// One `pubrel_ready` slot per identifier, keyed by subject, carrying the same exchange
-	// nonce testDeliverPubRel puts in the record's owner header. The store is a map so the
-	// action CAS can actually land: an immutable stub would make every acquisition fail and
-	// the fixture would pass for the wrong reason.
+	// One `pubrel_ready` slot per identifier, keyed by subject, carrying the exchange nonce
+	// testSeedPubRelReadySlot writes, which a delivered PUBREL names in its owner header to
+	// reach it. The store is a map so the action CAS can actually land: an immutable stub
+	// would make every acquisition fail and the fixture would pass for the wrong reason.
 	// The store assigns MONOTONIC sequences and the delete addresses BY SEQUENCE, exactly
 	// as JetStream does. A fixture that returned a constant sequence and swallowed deletes
 	// would make every freshness fence trivially satisfied and every terminal deletion a

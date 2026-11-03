@@ -22,7 +22,7 @@ import (
 // the periodic per-account maintenance does for group durables now that no walk of the
 // session records decides their fate.
 //
-//   - sweepSharedConsumer classifies one `$MQTT_SHARED_` consumer the orphaned-consumer sweep
+//   - sweepSharedConsumers classifies each `$MQTT_SHARED_` consumer the orphaned-consumer sweep
 //     found against its GROUP RECORD — a record that exists — and deletes it only under that
 //     record's authority: the incarnation is retiring (finish the retirement), or it is
 //     DERIVED retired (a delayed create that landed after retirement). Everything else is

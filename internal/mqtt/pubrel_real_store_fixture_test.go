@@ -29,9 +29,10 @@ import "testing"
 // but its delivery subscription is deliberately not installed, so no delivery races the ones a
 // test drives by hand; admission is reached only through testDeliverPubRelAs.
 
-// testRealPubRelSource is the source correlation the seeded exchange carries: the same
-// (durable, sequence) the map-world fixtures used, whose source message does not exist, so the
-// source side is provably complete for terminal cleanup unless a test stores one.
+// testRealPubRelSrcDur and testRealPubRelSrcSeq are the source correlation the seeded exchange
+// carries: the same (durable, sequence) the map-world fixtures used, whose source message does
+// not exist, so the source side is provably complete for terminal cleanup unless a test stores
+// one.
 const (
 	testRealPubRelSrcDur = "SRC"
 	testRealPubRelSrcSeq = uint64(41)

@@ -95,14 +95,14 @@ func (f *testOwedDelayedFixture) connectOld(id string, delay uint32) (net.Conn, 
 	return cw, sess, oc
 }
 
-// baseline is the session's (gen, seq) as the displaced connection left it.
+// testOwedDelayedBaseline is the session's (gen, seq) as the displaced connection left it.
 func testOwedDelayedBaseline(sess *mqttSession) (string, uint64) {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	return sess.gen, sess.seq
 }
 
-// willState reads the client's Will slot.
+// testOwedDelayedWillState reads the client's Will slot.
 func testOwedDelayedWillState(c *client) (bool, mqttWillDisposition, int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -112,7 +112,7 @@ func testOwedDelayedWillState(c *client) (bool, mqttWillDisposition, int64) {
 	return c.mqtt.cp.will != nil, c.mqtt.willDisposition, c.mqtt.closeObservedAt
 }
 
-// waitPastDeadline sleeps until closeObservedAt + delay has passed by a margin.
+// testOwedDelayedWaitPast sleeps until closeObservedAt + delay has passed by a margin.
 func testOwedDelayedWaitPast(closeAt int64, delay uint32) {
 	due := time.Unix(0, closeAt).Add(time.Duration(delay)*time.Second + 300*time.Millisecond)
 	if d := time.Until(due); d > 0 {
@@ -145,7 +145,7 @@ func (f *testOwedDelayedFixture) awaitConn(ch <-chan net.Conn) net.Conn {
 	}
 }
 
-// testOwedDelayedTakeoverAfterReturn drives the acceptance criterion's ordering: the
+// takeoverAfterReturn drives the acceptance criterion's ordering: the
 // takeover rebinds and parks before deciding the Will, the displaced connection then closes,
 // classifies its Will owed-delayed, and its teardown RETURNS through the lost-owner exit,
 // and only then does the takeover decide. between runs after the teardown returned and

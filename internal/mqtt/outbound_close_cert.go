@@ -376,7 +376,7 @@ func (sess *mqttSession) clearCertifiedRegister(c *client, subject string) (bool
 	return false, nil, 0, 0
 }
 
-// advanceResidentAfterClearance moves a resident entry that still references the cleared
+// advanceResidentAfterClearanceLocked moves a resident entry that still references the cleared
 // register's pre-clearance sequence onto the sequence the clearance landed at, exactly as the
 // holder's own drain write-back does.
 //

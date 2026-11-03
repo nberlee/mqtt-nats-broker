@@ -684,11 +684,12 @@ func (sess *mqttSession) resolutionAfterContinuations(res mqttUncertainResolutio
 	return res
 }
 
-// clearUncertainty marks the session resolved at seq, adopting the lineage AND the record bytes the
-// proven bytes carry alongside it — the same pairing every other adoption site makes, because
-// a sequence without its identity leaves the next save parenting itself to a record that is no
-// longer the base, and an identity without its bytes leaves the next fork's delta measured
-// against a record two writes back. See sess_fork_lineage.go and sess_fork_repair.go.
+// clearUncertaintyLocked marks the session resolved at seq, adopting the lineage AND the
+// record bytes the proven bytes carry alongside it — the same pairing every other adoption
+// site makes, because a sequence without its identity leaves the next save parenting itself
+// to a record that is no longer the base, and an identity without its bytes leaves the next
+// fork's delta measured against a record two writes back. See sess_fork_lineage.go and
+// sess_fork_repair.go.
 func (sess *mqttSession) clearUncertaintyLocked(seq uint64, wid, pwid string, body []byte) {
 	sess.mu.Lock()
 	sess.seqUncertain = false

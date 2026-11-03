@@ -23,7 +23,7 @@
 // clear() had reset the sequence. The two halves closed the same stomp from opposite
 // ends: the write is now refused, and the path that produced it no longer runs.
 //
-// THE LOOP IS THE CONTRACT, not any enumeration of processConnect's branches. Three
+// THE LOOP IS THE CONTRACT, not any enumeration of mqttProcessConnect's branches. Three
 // review rounds each found one more reachable path through that control flow, so the
 // design deliberately does not depend on having enumerated them:
 //
@@ -200,7 +200,7 @@ func (rd *mqttRecordReDrive) admitCreateRetry() error {
 // still-attached client runs: the Will drop, the flappers entry, the one DISCONNECT
 // this connection is owed, and the close.
 //
-// Extracted so the ordinary takeover in processConnect and the re-drive's T1b cannot
+// Extracted so the ordinary takeover in mqttProcessConnect and the re-drive's T1b cannot
 // drift apart — they are the same event, and a client displaced by a re-drive is
 // entitled to the same explanation as one displaced by an ordinary reconnect. The
 // vocabulary is deliberately TAKEN OVER, not foreign-disposed: another connection for

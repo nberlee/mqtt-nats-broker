@@ -327,7 +327,7 @@ func testE2ELandCompetingWrite(t *testing.T, sess *mqttSession, idHash string) {
 // broker is real, resident, and holds the surviving record — the FIXTURE knows that, and
 // the displaced client's Will is nonetheless PUBLISHED, because the fork verdict withholds
 // the takeover claim and the connection ends through ordinary close bookkeeping instead of
-// mqttDiscardWillOnTakeover.
+// mqttSettleWillOnTakeover.
 //
 // That the competitor is genuine here is precisely what makes this the residual rather
 // than a defect: nothing durable distinguishes this from a replay or a stranger, so the

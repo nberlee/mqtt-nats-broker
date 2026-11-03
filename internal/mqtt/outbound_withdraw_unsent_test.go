@@ -108,8 +108,8 @@ func (f *testWithdrawFix) ref(t *testing.T) *mqttInflightSlotRef {
 	return mqttSlotRefFromRecord(f.subject, seq, cur)
 }
 
-// requireEnded asserts the obligation reached the withdrawal's durable ending and its register is
-// gone.
+// requireWithdrawnAndGone asserts the obligation reached the withdrawal's durable ending and its
+// register is gone.
 func (f *testWithdrawFix) requireWithdrawnAndGone(t *testing.T) {
 	t.Helper()
 	if x := f.exchange(t); x.Phase != mqttExchangeWithdrawnUnsent {

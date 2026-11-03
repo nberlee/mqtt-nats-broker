@@ -494,11 +494,6 @@ func mqttPropertyAllowed(prop, ctx byte) bool {
 	return false
 }
 
-// readProperties parses an MQTT 5.0 properties block from the reader for the
-// given context (packet type or mqttPropsContextWill). The whole packet is
-// already buffered by the dispatch loop, so the var-int length must complete.
-// It validates length, identifiers, packet-context, and illegal duplicates.
-// Returns nil (no error) when the block is present but empty.
 // readPropString reads a UTF-8 Encoded String property value and enforces the
 // well-formedness rules of Spec5 [MQTT-1.5.4-1]/[MQTT-1.5.4-2] (valid UTF-8, no
 // U+0000). Ill-formed values are a Malformed Packet; without this check the
@@ -514,6 +509,11 @@ func (r *mqttReader) readPropString(field string) (string, error) {
 	return s, nil
 }
 
+// readProperties parses an MQTT 5.0 properties block from the reader for the
+// given context (packet type or mqttPropsContextWill). The whole packet is
+// already buffered by the dispatch loop, so the var-int length must complete.
+// It validates length, identifiers, packet-context, and illegal duplicates.
+// Returns nil (no error) when the block is present but empty.
 func (r *mqttReader) readProperties(ctx byte) (*mqttProperties, error) {
 	plen, complete, err := r.readVarInt()
 	if err != nil {

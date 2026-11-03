@@ -17,13 +17,14 @@ import "fmt"
 
 // Exchange-owned custody and capacity (issue #107, absorbing issue #108).
 //
-// THE DEFECT: capacity is derived from the scheduling maps. qos12InflightForCap counts
-// pendingPublish and, at Receive Maximum, pendingPubRel — so REMOVING A MAP ENTRY RELEASES
-// CAPACITY, and two metadata routes do exactly that. forgetVoidedReg drops a parked entry
-// because its verdict retires, and releaseSettledVoidReservationsLocked has the same
-// metadata-to-capacity release. A peer may already have transmitted that allocation; a
-// tombstone proves neither non-transmission nor completion. At Receive Maximum 1 the result
-// is a second delivery admitted while the first is still outstanding.
+// THE DEFECT: capacity was derived from the scheduling maps. The former qos12InflightForCap
+// counted pendingPublish and, at Receive Maximum, pendingPubRel — so REMOVING A MAP ENTRY
+// RELEASED CAPACITY, and two metadata routes did exactly that. forgetVoidedReg drops a
+// parked entry because its verdict retires, and releaseSettledVoidReservationsLocked frees
+// settled reservations; under that accounting each was a metadata-to-capacity release. A
+// peer may already have transmitted that allocation; a tombstone proves neither
+// non-transmission nor completion. At Receive Maximum 1 the result was a second delivery
+// admitted while the first was still outstanding.
 //
 // The correction is a change of OWNER, not an added check. The durable exchange ledger owns
 // the charge; the scheduling maps become indexes. Metadata operations may forget scheduling

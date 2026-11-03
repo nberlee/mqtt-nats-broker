@@ -66,7 +66,7 @@ const mqttUserInfoTimeout = 2 * time.Second
 
 // mqttIdentity is one connection's authenticated identity, taken once and never
 // refreshed. Its validity is the per-client NATS connection's validity, not a
-// clock: see mqttBindClientIdentity.
+// clock: see armIdentityInvalidation.
 type mqttIdentity struct {
 	user    string
 	account string

@@ -16,9 +16,10 @@ ownership plus applied-before-serving enforce the header across elections
 
 **Can an accepted CONNECT's atomic batch commit half of itself?** The R-batch row below,
 which used to be a written refutation and is now measured. Every accepted CONNECT
-commits its acceptance fact and its session record as one `AllowAtomicPublish` batch on
-`$MQTT_sess`, and `mqttAcceptFactLanded` reads an acknowledgement of that batch as "the
-record committed with the fact". A FIFO prefix of the batch really can be committed
+commits three members - its acceptance fact, the proposal's COMMITTED receipt and its
+session record - as one `AllowAtomicPublish` batch on `$MQTT_sess`, and
+`mqttAcceptFactLanded` reads an acknowledgement of that batch as "the record committed
+with the fact". A FIFO prefix of the batch really can be committed
 without its commit entry - the Raft layer preserves nothing about a batch - but such a
 prefix applies NOTHING, and that is what the fixture and its mutation measure.
 

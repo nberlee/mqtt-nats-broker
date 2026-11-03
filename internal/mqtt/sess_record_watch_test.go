@@ -26,7 +26,7 @@ var errMQTTTestLostResponse = errors.New("mqtt test: the store landed but its re
 // prove the watch converged a session would pass just as well if only the backstop
 // did, which is the mutually-masking shape these seams exist to prevent.
 
-// watchEnv is a rejection env with BOTH channels off by default, so each test turns
+// testNewWatchEnv is a rejection env with BOTH channels off by default, so each test turns
 // on exactly the one it is about.
 func testNewWatchEnv(t *testing.T, clientID string) *testRejectionEnv {
 	t.Helper()

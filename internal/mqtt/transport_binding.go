@@ -143,7 +143,7 @@ func mqttBindConnection(cid uint64) *mqttConnBinding {
 // mayWrite reports whether an action holding this binding may still emit bytes.
 //
 // Checked by the writer under its own write lock, so a sealer cannot slip between the check
-// and the write: see certifyClosed, which crosses that lock precisely to establish that
+// and the write: see mqttCertifyClosed, which crosses that lock precisely to establish that
 // every delayed writer has observed the seal.
 func (b *mqttConnBinding) mayWrite() bool { return b.gate.open() }
 

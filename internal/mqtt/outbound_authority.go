@@ -1103,8 +1103,6 @@ func mqttValidateOutboundAuthority(a *mqttOutboundAuthority, wantID, wantEpoch s
 	return nil
 }
 
-// mqttValidateHandoffIntent refuses an intent that cannot name what it proposes to
-// displace, or whose retirement names a different predecessor from the intent itself.
 // mqttValidateAffineDescriptor is the ONE definition of a well-formed affine target, used by every
 // record that carries one: the retirement request that selects it, the resource the closing batch
 // enrols, and the readiness assertion that licenses its seal.
@@ -1187,6 +1185,8 @@ func mqttValidateHandoffIntentFor(idHash string, i *mqttHandoffIntent) error {
 	return nil
 }
 
+// mqttValidateHandoffIntent refuses an intent that cannot name what it proposes to
+// displace, or whose retirement names a different predecessor from the intent itself.
 func mqttValidateHandoffIntent(i *mqttHandoffIntent) error {
 	if i == nil {
 		return fmt.Errorf("handoff intent is absent")

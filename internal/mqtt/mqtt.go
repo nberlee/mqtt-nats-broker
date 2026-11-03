@@ -546,8 +546,8 @@ type mqtt struct {
 	r    *mqttReader
 	cp   *mqttConnectProto
 	pp   *mqttPublish
-	asm  *mqttAccountSessionManager // quick reference to account session manager, immutable after processConnect()
-	sess *mqttSession               // quick reference to session, immutable after processConnect()
+	asm  *mqttAccountSessionManager // quick reference to account session manager, immutable after mqttProcessConnect()
+	sess *mqttSession               // quick reference to session, immutable after mqttProcessConnect()
 	cid  string                     // client ID
 
 	// tracker is the incarnation this connection was BOUND to (issue #40 unit 1; see
@@ -750,7 +750,7 @@ type mqtt struct {
 	// other access goes through the pipe's own mutex.
 	inPipe *mqttInboundPipe
 
-	// inAbort is the connection's ABORT LATCH: closed exactly once (inAbortOnce) when the
+	// inAbort is the connection's ABORT LATCH: closed exactly once (fireAbort) when the
 	// connection's transport is closed (closeTransport), when an inbound job's failure
 	// reaches the emission head, or when the readLoop exits. It belongs to the connection
 	// rather than to the pipe because a close can come first: a pipe created afterwards

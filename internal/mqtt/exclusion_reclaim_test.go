@@ -135,8 +135,8 @@ func (r *exclusionReclaimRig) runPass() {
 	r.sess.runExclusionReclaim(mqttExclusionReclaimDelay)
 }
 
-// awaitArmedCallback waits for the armed continuation to fire at least once, which is how a
-// fixture distinguishes "a flag was set" from "the worker ran".
+// awaitLoad waits for the reclamation pass to have read subject at least atLeast times, which
+// is how a fixture distinguishes "a flag was set" from "the worker ran".
 func (r *exclusionReclaimRig) awaitLoad(subject string, atLeast int, why string) {
 	r.t.Helper()
 	deadline := time.Now().Add(4 * time.Second)

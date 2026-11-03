@@ -469,7 +469,7 @@ type mqttRetiredSource struct {
 // the source has to outlive the identifier's bookkeeping, which is the same shape the
 // affine path already uses (its claim's AffineDone flag) and for the same reason.
 //
-// The set is drained by mqttSourceRetired, which is why it cannot grow with traffic: an
+// The set is drained by settleRetiredSource, which is why it cannot grow with traffic: an
 // entry costs one map slot until the first delivery attempt whose acknowledgement is
 // CONFIRMED, and it is only ever created when an acknowledgement could not be proven.
 //
@@ -1134,11 +1134,6 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	mqttTestRestorePauseHook("resume-naks-done")
 }
 
-// trackAsPubRel is invoked in 2 cases: (a) when we receive a PUBREC and we need
-// to change from tracking the PI as a PUBLISH to a PUBREL; and (b) when we
-// attempt to deliver the PUBREL to record the JS ack subject for it.
-//
-// Lock held on entry
 // pubRelDurable is the PUBREL consumer's durable name, or empty when none is installed.
 // sess.mu must be held.
 func (sess *mqttSession) pubRelDurable() string {
@@ -1148,6 +1143,11 @@ func (sess *mqttSession) pubRelDurable() string {
 	return sess.pubRelConsumer.Durable
 }
 
+// trackAsPubRel is invoked in 2 cases: (a) when we receive a PUBREC and we need
+// to change from tracking the PI as a PUBLISH to a PUBREL; and (b) when we
+// attempt to deliver the PUBREL to record the JS ack subject for it.
+//
+// Lock held on entry
 func (sess *mqttSession) trackAsPubRel(pi uint16, jsAckSubject string) {
 	if sess.recoveryPIHeldLocked(pi) {
 		return

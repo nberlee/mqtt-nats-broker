@@ -270,7 +270,7 @@ func (sess *mqttSession) armSubGate(c *client) *mqttSubGate {
 	return g
 }
 
-// resolveSubGate performs this gate's ONE terminal transition, on the exact instance the
+// resolve performs this gate's ONE terminal transition, on the exact instance the
 // packet armed.
 //
 // Idempotent, and it has to be: mqttProcessSubs installs it as a defer so that every error
@@ -330,7 +330,8 @@ func (sess *mqttSession) subGateFor(cc *client) *mqttSubGate {
 // every condition the caller checked before this must be re-evaluated afterwards.
 //
 // QoS 0 does not call this — it has no redelivery, so parking a NATS delivery goroutine for
-// it would buy nothing; it consults transmissionBlocksQoS0 instead.
+// it would buy nothing; it consults restoreGateBlocksQoS0, and for a shared subscription
+// subGateBlocksQoS0, instead.
 func (sess *mqttSession) awaitTransmissionGates(cc *client) mqttTransmissionVerdict {
 	return sess.awaitTransmissionGatesThen(cc, nil)
 }
@@ -547,7 +548,7 @@ type mqttWillFence struct {
 	seq uint64
 }
 
-// mqttCaptureWillFenceLocked samples the fence. Must be called before the reset.
+// mqttCaptureWillFence samples the fence. Must be called before the reset.
 //
 // sess.mu must NOT be held.
 func (sess *mqttSession) mqttCaptureWillFence() *mqttWillFence {

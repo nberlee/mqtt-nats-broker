@@ -356,8 +356,8 @@ type mqttDrain struct {
 	// would enrol it as started.
 	staged bool
 	// charged records whether THIS process added this durable's MaxAckPending to
-	// tmaxack, so finishDrain refunds exactly what was charged. A restored drain is
-	// never charged, matching restored consumers.
+	// tmaxack, so a refund (retirement, or recovery's drop) returns exactly what was
+	// charged. A restored drain is never charged, matching restored consumers.
 	charged bool
 
 	// retired is TERMINAL: this drain has been through retirement, so its sid is
@@ -468,7 +468,7 @@ func (d *mqttDrain) persisted() *mqttPersistedDrain {
 }
 
 // mqttDrainFromPersisted rebuilds a drain from the session record. Restored drains
-// start uncharged (matching restored consumers, so finishDrain refunds nothing and
+// start uncharged (matching restored consumers, so no refund returns anything and
 // an adoption cannot double-charge) and every phase starts at drainPublish —
 // recovery reconstructs the real phase from the persisted intent plus the stored
 // PUBREL records, BEFORE any source interest exists.
@@ -1307,24 +1307,6 @@ func (sess *mqttSession) restoreDrainLocked(sid string, d *mqttDrain) {
 // Completion (I1: persist before ack)
 // ---------------------------------------------------------------------------
 
-// recordDrainReleaseRequest persists the POSITIVE, identity-bound record that this
-// drained delivery has release work outstanding against one exact exchange, and CONFIRMS
-// the save before returning true (L4, issue #100).
-//
-// It captures the target from the slot ITSELF rather than from anything remembered: the
-// subject the identifier names, and the nonce and transmission counter the occupant
-// currently carries. `RegSeq` is not consulted — it is a hint and may never select or
-// authorize a deletion (issue #38).
-//
-// AN AMBIGUOUS SAVE RETAINS THE REQUEST, and the retry may never RECAPTURE the identity.
-// It re-attempts the originally captured target even if the slot has since moved, because
-// recapturing would silently convert an unresolved old request into a fresh request
-// against a stranger's exchange. A moved target is settled by supersession, not by
-// re-aiming.
-//
-// Returns false when nothing durable was recorded, which withholds the whole finalize.
-//
-// Session lock NOT held on entry.
 // drainOwnsSource reports whether a drain owns removed's source delivery — the question the
 // PUBACK path asks to decide whether the drain's finalize, and not the handler, completes it —
 // without finalizing anything.
@@ -1380,6 +1362,24 @@ func (sess *mqttSession) retireDrainReleaseRequest(jsDur string, sseq uint64, ol
 	}
 }
 
+// recordDrainReleaseRequest persists the POSITIVE, identity-bound record that this
+// drained delivery has release work outstanding against one exact exchange, and CONFIRMS
+// the save before returning true (L4, issue #100).
+//
+// It captures the target from the slot ITSELF rather than from anything remembered: the
+// subject the identifier names, and the nonce and transmission counter the occupant
+// currently carries. `RegSeq` is not consulted — it is a hint and may never select or
+// authorize a deletion (issue #38).
+//
+// AN AMBIGUOUS SAVE RETAINS THE REQUEST, and the retry may never RECAPTURE the identity.
+// It re-attempts the originally captured target even if the slot has since moved, because
+// recapturing would silently convert an unresolved old request into a fresh request
+// against a stranger's exchange. A moved target is settled by supersession, not by
+// re-aiming.
+//
+// Returns false when nothing durable was recorded, which withholds the whole finalize.
+//
+// Session lock NOT held on entry.
 func (sess *mqttSession) recordDrainReleaseRequest(c *client, jsDur string, sseq uint64,
 	subject string, cur *mqttInflightRecord) bool {
 
@@ -2294,13 +2294,6 @@ func (sess *mqttSession) finalizeDrainSource(c *client, removed *mqttPending) bo
 	return sess.finalizeDrainDelivery(c, removed.jsDur, removed.sseq, removed.jsAckSubject)
 }
 
-// qos2DrainDurables lists the draining durables that may owe a PUBREL. It is both
-// the test for "does this resume need the PUBREL path" and, when establishing that
-// path fails, exactly the set whose source interest must be withheld: without
-// PUBREL delivery a QoS 2 drain cannot complete an exchange, and must not be given
-// the chance to start resending one.
-//
-// No lock held on entry.
 // drainOwesPubRelLocked reports whether this drain owes PUBREL handling: recreating a
 // PUBREL, establishing PUBREL delivery on resume, or being withheld when that fails.
 //
@@ -2359,6 +2352,13 @@ func (sess *mqttSession) drainOwesPubRelLocked(d *mqttDrain) bool {
 	return false
 }
 
+// qos2DrainDurables lists the draining durables that may owe a PUBREL. It is both
+// the test for "does this resume need the PUBREL path" and, when establishing that
+// path fails, exactly the set whose source interest must be withheld: without
+// PUBREL delivery a QoS 2 drain cannot complete an exchange, and must not be given
+// the chance to start resending one.
+//
+// No lock held on entry.
 func (sess *mqttSession) qos2DrainDurables() []string {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -2397,7 +2397,7 @@ func (sess *mqttSession) needsPubRelDelivery() bool {
 	return false
 }
 
-// drainDurables lists the draining durables, for teardown paths that must delete
+// drainDurablesLocked lists the draining durables, for teardown paths that must delete
 // them alongside the ordinary consumers.
 //
 // sess.mu must be held.
@@ -3636,7 +3636,7 @@ const (
 	// only when an operator removes the record.
 	mqttDrainHeldUnusableIdentity
 	// mqttDrainHeldPastPubRecIntent: the drain carries a past-PUBREC intent. Released
-	// when the drain is RETIRED — see drainRetirableLocked and the two sweeps.
+	// when the drain is RETIRED — see mqttDrain.retirable and the two sweeps.
 	mqttDrainHeldPastPubRecIntent
 	// mqttDrainHeldRemovalOutstanding: an owned retirement transition has marked this
 	// drain's reference for omission and its save has not been proven either way. The
@@ -3736,7 +3736,7 @@ func (sess *mqttSession) drainSidHoldLocked(sid string) mqttDrainHold {
 	return hold
 }
 
-// drainRetirableLocked reports whether a drain owes nothing further, so retiring it takes
+// retirable reports whether a drain owes nothing further, so retiring it takes
 // nothing with it.
 //
 // DURABLY empty, not merely unclaimed, and the difference is the whole reason this is not

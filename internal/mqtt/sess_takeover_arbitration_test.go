@@ -243,7 +243,7 @@ func TestSessCleanStartCreateIsParentlessAndConcedes(t *testing.T) {
 
 	// The authored-record fork is NOT given up, and this is the discrimination: a
 	// child-shaped record written through the production path by the other broker is not a
-	// fork, while a body CLAIMING that same parent is (TestSessAuthoredForkStillClassifies).
+	// fork, while a body CLAIMING that same parent is (TestMQTTAuthoredForkStillClassifies).
 	// Neither verdict says who holds the session — this is lineage only (issue #86).
 	sessB := testFreshSession(b, cid)
 	sessB.mu.Lock()

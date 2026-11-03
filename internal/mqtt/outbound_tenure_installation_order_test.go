@@ -144,7 +144,7 @@ func testF105_8bLedgerState(e *testF105Env, gen string) (mqttOutboundLoadStatus,
 func TestF105_8bClosingLicenceMatrix(t *testing.T) {
 	type row struct {
 		name     string
-		setup    func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool // returns authAbsent
+		setup    func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool // returns neverAuthorized
 		licensed bool
 	}
 	rows := []row{

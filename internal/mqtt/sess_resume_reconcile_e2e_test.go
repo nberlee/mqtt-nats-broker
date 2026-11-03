@@ -3431,7 +3431,7 @@ func TestMQTTReconcileClearedSessionTakesRequestedLifetime(t *testing.T) {
 //
 // Review finding: keeping the requested terms in memory while the write was
 // unresolved meant the close path snapshotted THEM into the deferred disconnect
-// (mqttDeferDisconnect), and applyDeferredDisconnect acts on that snapshot — so
+// (mqttDeferDisconnectEx), and applyDeferredDisconnect acts on that snapshot — so
 // a requested interval of 0 whose outcome was unknown discarded a persistent
 // session on nothing but a hopeful write. The parked action therefore carries the
 // CONFIRMED lifetime, and only a settlement that proves the grant durable
@@ -3583,7 +3583,7 @@ func TestMQTTReconcileAmbiguousGrantAppliesOnlyOnProof(t *testing.T) {
 // while its outcome was unknown.
 //
 // Review finding: the not-landed case was fixed by keeping the CONFIRMED terms,
-// but that left the landed case inconsistent — mqttDeferDisconnect had already
+// but that left the landed case inconsistent — mqttDeferDisconnectEx had already
 // snapshotted the old interval, and applyDeferredDisconnect decides discard and
 // timer behavior from that snapshot rather than from the session, so the
 // outcome depended on whether the close or the readback ran first.

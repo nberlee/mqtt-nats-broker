@@ -1591,13 +1591,6 @@ func TestPersistedIdentityCensusEncodingsAreConsistent(t *testing.T) {
 	censusAssertRetainedCarriers(t, manifest["mqttRetainedMsg"])
 }
 
-// censusAssertRetainedCarriers is rule 3: it checks each declared carrier of
-// `mqttRetainedMsg` against the bytes `mqttEncodeRetainedMessage` actually produces.
-//
-// The payload is deliberately NON-EMPTY. An empty `Msg` is the tombstone shape, which
-// `mqttEncodeRetainedMessage` treats as a deletion and for which it suppresses the expiry
-// headers — so a zero-value round-trip would find several sentinels missing and conclude
-// they were not persisted at all.
 // censusRetainedProps is a GENUINELY VALID MQTT 5.0 properties block, and it has to be.
 //
 // Props is dispositioned structuredBlob with mqttValidateForwardProps as its decoder, and
@@ -1618,6 +1611,13 @@ func censusRetainedProps() []byte {
 	return append([]byte{byte(len(body))}, body...)
 }
 
+// censusAssertRetainedCarriers is rule 3: it checks each declared carrier of
+// `mqttRetainedMsg` against the bytes `mqttEncodeRetainedMessage` actually produces.
+//
+// The payload is deliberately NON-EMPTY. An empty `Msg` is the tombstone shape, which
+// `mqttEncodeRetainedMessage` treats as a deletion and for which it suppresses the expiry
+// headers — so a zero-value round-trip would find several sentinels missing and conclude
+// they were not persisted at all.
 func censusAssertRetainedCarriers(t *testing.T, disp map[string]censusDisposition) {
 	t.Helper()
 

@@ -622,7 +622,7 @@ type mqttAccountSessionManager struct {
 	// testAckAdvance wraps the acknowledgement advance: a hook can refuse it, report a landed
 	// batch as lost, or land a racing write before calling write(). Nil in production.
 	testWithdrawUnsent func(req *mqttWithdrawUnsentRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
-	// testAbandonDelivery wraps the abandon-delivery write (abandonDeniedDelivery) exactly as
+	// testAbandonDelivery wraps the abandon-delivery write (opAbandonDeniedDelivery) exactly as
 	// testWithdrawUnsent wraps the withdrawal. Nil in production.
 	testAbandonDelivery func(req *mqttAbandonDeliveryRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
 	// testCustodyResolve may override a custody attempt's settlement at one step: after the
@@ -1163,10 +1163,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 
 	// We create all subscriptions before starting the go routine that will do
 	// sends otherwise we could get races.
-	// Note that using two different clients (one for the subs, one for the
-	// sends) would cause other issues such as registration of recent subs in
-	// the "sub" client would be invisible to the check for GW routed replies
-	// (shouldMapReplyForGatewaySend) since the client there would be the "sender".
 
 	jsa := &as.jsa
 	sid := int64(1)

@@ -184,9 +184,10 @@ func TestMQTTInflightDrainOwnedRegisterIsNeverConsumedByTheSourceArm(t *testing.
 // TestMQTTInflightLostSourceConsumeReleasesTheReceiveMaximumSlot states the release as a
 // NUMBER rather than as the absence of an entry.
 //
-// The durable delete alone frees nothing the client is spending: qos12InflightForCap
-// counts len(pendingPublish), so the capacity only comes back when the apply phase retires
-// the live entry the consumed register backed. A fixture with empty memory would pass
+// The durable delete alone frees nothing the client is spending: receiveMaxOccupancyLocked
+// counts the live exchange (here the custody ledger's charge for the admitted entry), so the
+// capacity only comes back when the apply phase retires the live entry the consumed register
+// backed. A fixture with empty memory would pass
 // whether or not that retirement happened, which is why a matching same-object entry is
 // seeded first.
 //

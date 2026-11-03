@@ -722,12 +722,6 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	return send()
 }
 
-// mqttCheckTransitionKindRules enforces what each operation requires of the authority it
-// displaces and the body it installs.
-//
-// The enum alone establishes nothing: it is the rules here that make "admitted before
-// closure" a property of the mechanism rather than of its callers. Every rule is stated as
-// what the operation needs, so a kind added without one fails closed at the default.
 // mqttCheckDisposalLicence requires every disposal decision this transition introduces to be made
 // under the serving entitlement it names (issue #107 7c-lc).
 //
@@ -1073,6 +1067,12 @@ func mqttCheckEndingPreservesAuthority(t *mqttAuthorityTransition, what string) 
 	return nil
 }
 
+// mqttCheckTransitionKindRules enforces what each operation requires of the authority it
+// displaces and the body it installs.
+//
+// The enum alone establishes nothing: it is the rules here that make "admitted before
+// closure" a property of the mechanism rather than of its callers. Every rule is stated as
+// what the operation needs, so a kind added without one fails closed at the default.
 func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 	a := t.Attempt
 	// OWNERSHIP TRANSITIONS CARRY NOTHING, with ONE narrow exception. See
@@ -2085,13 +2085,6 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	return nil
 }
 
-// mqttCheckObligationMember validates an exchange or action member against the transition
-// carrying it.
-//
-// Attribution is by DECODE, not by subject shape: the subject says which client, generation
-// and exchange a body claims to be about, and the decoders refuse a body that disagrees with
-// its own name. That is what stops a transition installing a well-named obligation whose
-// contents belong to something else.
 // mqttKindEndsEarlierGeneration reports whether a kind may carry a register or exchange member of
 // a generation other than the attempt's: the kinds that END an existing obligation, because a
 // G1 obligation must reach its end while G2 serves (an advance writes no authority at all,
@@ -2104,6 +2097,13 @@ func mqttKindEndsEarlierGeneration(k mqttTransitionKind) bool {
 		k == mqttTransitionDiscardExchange
 }
 
+// mqttCheckObligationMember validates an exchange or action member against the transition
+// carrying it.
+//
+// Attribution is by DECODE, not by subject shape: the subject says which client, generation
+// and exchange a body claims to be about, and the decoders refuse a body that disagrees with
+// its own name. That is what stops a transition installing a well-named obligation whose
+// contents belong to something else.
 func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls string,
 	e mqttTransitionMember) error {
 

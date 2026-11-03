@@ -843,8 +843,8 @@ func TestReapIncarnationRegistersResamplesAZeroWatermark(t *testing.T) {
 // TestFinalizeDrainDeliveryAddressesByPacketIdentifier pins the addressing decision ON THE
 // PRODUCTION PATH, which is what holistic review round 2 required.
 //
-// The earlier M7b test called drainRegisterSubject directly, so a regression that pointed
-// finalizeDrainDelivery back at deleteInflightRegisterConfirmed(regSeq) — leaving the
+// An earlier test called the former drainRegisterSubject helper directly, so a regression that
+// pointed finalizeDrainDelivery back at deleteInflightRegisterConfirmed(regSeq) — leaving the
 // helper intact but unused — would have passed it. That is
 // feedback_fixture_must_reach_its_route exactly: a green test that never reaches the code
 // it names.

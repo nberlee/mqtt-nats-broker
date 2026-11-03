@@ -147,9 +147,9 @@ func (s *Server) mqttWSListenerConfig(o *MQTTOpts) *wsListenerConfig {
 	return cfg
 }
 
-// This is similar to createClient() but has some modifications specifi to MQTT clients.
-// The comments have been kept to minimum to reduce code size. Check createClient() for
-// more details.
+// This is similar to nats-server's createClient() (server/server.go) but has some
+// modifications specific to MQTT clients. The comments have been kept to minimum to reduce
+// code size. Check nats-server's createClient() for more details.
 //
 // ws is nil for the TCP listeners and the listener's handshake configuration for the
 // WebSocket one; plain marks the plaintext listener beside TLS, whose connections never

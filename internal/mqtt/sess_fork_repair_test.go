@@ -1169,8 +1169,8 @@ const testForkEnvDeltaFilter = "fork/env/delta"
 //
 // It also checks the capsule was stored EXACTLY ONCE, which the capsule itself cannot show:
 // every store replaces the map entry with a fresh pointer, so a second mint leaves state
-// indistinguishable from a single one. Callers arm the counter with
-// testCountForkedGrantStores; a caller that does not is unaffected.
+// indistinguishable from a single one. The counter, forkedGrantStores, is kept per
+// account manager on every store, so no caller arms it and every caller is checked.
 func testAssertMinted(t *testing.T, e *testRejectionEnv) *mqttForkedGrant {
 	t.Helper()
 	if n := e.asm.forkedGrantStores.Load(); n > 1 {

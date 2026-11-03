@@ -24,7 +24,7 @@ import (
 //
 // Every fixture here is a REAL record over a real JetStream; observations are
 // either real peer saves (delivered on the real subscription) or synthetic
-// deliveries into processSessionPersist, which decouple the observed sequence
+// deliveries into deliverSessionRecordObservation, which decouple the observed sequence
 // from the planted record — the state a lost/late core-NATS notification leaves.
 
 // testNewEvictEnv is testNewForkEnv with the record-watch drop DISARMED: these
@@ -319,7 +319,7 @@ func (e *testRejectionEnv) parkEvictWorker(t *testing.T, afterLoad bool) (parked
 	return parked, release
 }
 
-// awaitClosed bounds the asynchronous `go closeConnection` tail.
+// testAwaitConnClosed bounds the asynchronous `go closeConnection` tail.
 func testAwaitConnClosed(t *testing.T, b *testBoundConn) {
 	t.Helper()
 	deadline := time.Now().Add(testRejectionWait)

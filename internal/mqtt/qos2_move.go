@@ -170,8 +170,8 @@ const (
 	// mqttQoS2HoldCASHeaderMax bounds the expected-sequence CAS header on the HOLD
 	// form. Exact, not an estimate: the hold write is always create-only, so the
 	// expectation is always the single digit 0. The header is NOT stripped before
-	// storage (removeHeaderIfPrefixPresent runs only on the mirror/source/restore
-	// paths), so it counts toward the stored message size.
+	// storage (nats-server's removeHeaderIfPrefixPresent runs only on the mirror,
+	// source and message-scheduling paths), so it counts toward the stored message size.
 	mqttQoS2HoldCASHeaderMax = len(JSExpectedLastSubjSeq) + 1 + 1 + 2
 )
 

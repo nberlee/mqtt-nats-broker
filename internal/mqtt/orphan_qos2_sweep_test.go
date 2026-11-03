@@ -22,6 +22,10 @@ type testOrphanEnv struct {
 	sess *mqttSession
 }
 
+// sweepAffineClaims drives ONE assignment-reconciliation pass. One, deliberately: the
+// live-generation arm has no quarantine gate, so a fixture that needed a second pass
+// would be asserting the opposite of what the arm promises.
+//
 // sweepAffineClaims is kept in the mixed sweep fixture so that file remains
 // buildable in the supported suite. Only tests which first require the
 // experimental shared-QoS-2 tag call it.
@@ -318,9 +322,10 @@ func (e *testOrphanEnv) claimPresent(t *testing.T, holdSubject string) bool {
 	return smsg != nil
 }
 
-// sweepNow runs the inbound half against a clock far enough ahead that every grace
-// has elapsed. Store times are assigned by JetStream and cannot be backdated, so
-// moving `now` forward is how a test ages a record.
+// sweepInbound runs one inbound pass: collect the candidates, build the session
+// references, reconcile. A grace is a stable-observation span on this broker's
+// monotonic clock, not a record age (orphan_qos2_sweep.go), so a test shortens it
+// with setGraces rather than aging a record.
 func (e *testOrphanEnv) sweepInbound(t *testing.T) {
 	t.Helper()
 	cands, err := e.asm.collectInboundQoS2Candidates(e.s)
@@ -334,9 +339,6 @@ func (e *testOrphanEnv) sweepInbound(t *testing.T) {
 	e.asm.reconcileInboundQoS2(e.s, cands, refs)
 }
 
-// testAged is a cluster-clock reference far enough ahead that every grace has
-// elapsed. Production takes this from sweepClockRef; a test supplies it directly,
-// which is also what keeps these assertions independent of how fast the suite runs.
 // settle runs the two inbound passes eligibility requires. The first records each
 // candidate's identity in quarantine and authorizes nothing; only a later
 // authoritative pass over an unchanged identity may act. Tests that assert a single

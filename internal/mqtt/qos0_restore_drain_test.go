@@ -1582,8 +1582,9 @@ func TestMQTTRestoreAmbiguousLandedSaveKeepsTheStagedDrain(t *testing.T) {
 //
 // The guard is kept: it is cheap, it fails closed, and the alternative is a success CONNACK
 // over a record this broker cannot speak for. But it is a HELPER CONTRACT with no
-// demonstrated producer, not a covered route, and testQoS0OverLiveConsTwoHalves is left
-// behind because it is what a future attempt should start from.
+// demonstrated producer, not a covered route. The two-half fixture, the former
+// testQoS0OverLiveConsTwoHalves, was deleted as unreachable; a future attempt starts
+// from its git history.
 
 // TestMQTTRestoreDefiniteFailureWithdrawsTheTransmittedVerdicts is T7b, and it is a
 // DIFFERENT contract from T7's.

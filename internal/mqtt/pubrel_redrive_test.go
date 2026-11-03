@@ -83,7 +83,6 @@ func testRequireNoRedrive(t *testing.T, obs *nats.Subscription, why string) {
 	}
 }
 
-// testRedriveWaiters returns the waiter set for one identifier.
 // publishTransmissionStandsLocalOnly is the local half alone, for the tests that are about
 // the marker rather than about the combined question.
 func (sess *mqttSession) publishTransmissionStandsLocalOnly(pi uint16) bool {
@@ -92,6 +91,7 @@ func (sess *mqttSession) publishTransmissionStandsLocalOnly(pi uint16) bool {
 	return sess.publishSectionLiveLocked(pi)
 }
 
+// testRedriveWaiters returns the waiter set for one identifier.
 func testRedriveWaiters(e *testInflightEnv, pi uint16) map[mqttPubRelRedriveKey]mqttPubRelRedriveWaiter {
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()

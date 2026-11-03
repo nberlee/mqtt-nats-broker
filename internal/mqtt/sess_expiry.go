@@ -322,7 +322,7 @@ func (as *mqttAccountSessionManager) expireSessionFired(s *Server, idHash string
 	// for the incarnation it resolved, and taking it first is what keeps a fire
 	// against a RETIRING incarnation from holding the client-ID gate while a
 	// retirement waits: a refused acquisition re-arms and returns without ever
-	// touching the gate. tryAcquire never parks, for the same reason.
+	// touching the gate. The tracker's acquire never parks, for the same reason.
 	//
 	// The tracker pointer is READ UNDER sess.mu: setIncarnationLocked replaces it
 	// there, so sampling it unlocked is a data race with a concurrent re-mint — and

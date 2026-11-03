@@ -142,7 +142,7 @@ func (jsa *mqttJSA) resolveTransition(t *mqttAuthorityTransition) mqttTransition
 // once its accept save IS the outbound-ownership metadata commit (issue #107 cutover): the permanent
 // acceptance fact, the COMMITTED ownership receipt, and the session record, committed as ONE
 // atomic three-member batch (handoff_metadata.go compose). A caller counting the record advance
-// across a CONNECT accept observes this, not mqttAcceptBatchSize.
+// across a CONNECT accept observes this.
 const mqttAcceptOwnershipBatchSize = 3
 
 // ---- from transport_binding.go ----

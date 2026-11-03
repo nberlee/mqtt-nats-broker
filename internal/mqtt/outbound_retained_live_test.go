@@ -30,8 +30,9 @@ import (
 
 // Retained QoS 1/2 through the manifest, end to end through real clients (issue #107 7c).
 
-// testRetainedSubscriber publishes one retained message, connects a persistent subscriber and
-// returns everything a test needs to inspect its retained exchange.
+// testRetainedRig is one server holding one retained message (testRetainedRigUp) and, once the
+// test's persistent subscriber is connected and attach has run, everything a test needs to
+// inspect that subscriber's retained exchange.
 type testRetainedRig struct {
 	s       *Server
 	o       *Options

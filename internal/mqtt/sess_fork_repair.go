@@ -518,7 +518,7 @@ func (g *mqttForkedGrant) isEmpty() bool {
 // a teardown re-mint no longer reaches this question at all — the write-lineage audit made
 // it PARENTLESS, so lineage concedes before a repair is considered — and its protection
 // remains the teardown claim protocol rather than this repair. The invariant is "a nil
-// parent means unrepairable", never "grantSnapParent always names sess.pwid".
+// parent means unrepairable", never "grantBodyParent always names sess.pwid".
 //
 // sess.mu must NOT be held.
 func (sess *mqttSession) buildForkedGrantLocked(ackWID, ackPWID string) *mqttForkedGrant {

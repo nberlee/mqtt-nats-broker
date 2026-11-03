@@ -1963,8 +1963,6 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace ti
 	}
 }
 
-// mqttQoS2RelClaimLabel names a claim for a log line, including the one that could
-// not be decoded — a nil claim is a state this path handles, not an impossibility.
 // settleRetiredAffineRegister collects a RETIRED affine in-flight register of a LIVE
 // session generation, together with the copy and the assignment claim it names.
 //
@@ -2278,6 +2276,8 @@ func (as *mqttAccountSessionManager) forgetResidentRetirement(name *mqttInflight
 	}
 }
 
+// mqttQoS2RelClaimLabel names a claim for a log line, including the one that could
+// not be decoded — a nil claim is a state this path handles, not an impossibility.
 func mqttQoS2RelClaimLabel(c *mqttQoS2RelClaim) string {
 	if c == nil {
 		return "unreadable"

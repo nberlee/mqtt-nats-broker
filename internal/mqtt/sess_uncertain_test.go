@@ -76,6 +76,12 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 	return b
 }
 
+func testAmbiguousBody(sess *mqttSession, content string) []byte {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return testAmbiguousBodyLocked(sess, content)
+}
+
 // testAmbiguousBodyLocked is an opaque competing attempt's bytes carrying the identity
 // every real save stamps: a fresh write identity parented to the record this session holds,
 // AND the session's generation. content names the fixture so a failure says which attempt it
@@ -91,12 +97,6 @@ func testRecordBody(t testing.TB, sess *mqttSession) []byte {
 // sess.mu must be held, as it is at every site that arms an ambiguity from inside
 // another operation's critical section. testAmbiguousBody is the form for a caller that
 // holds nothing.
-func testAmbiguousBody(sess *mqttSession, content string) []byte {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	return testAmbiguousBodyLocked(sess, content)
-}
-
 func testAmbiguousBodyLocked(sess *mqttSession, content string) []byte {
 	b, _ := json.Marshal(&struct {
 		Content string `json:"competing"`

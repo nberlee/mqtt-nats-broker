@@ -159,22 +159,6 @@ func (e *mqttInflightShapeError) Error() string { return e.why }
 
 func mqttShapeErr(why string) error { return &mqttInflightShapeError{why: why} }
 
-// mqttValidateInflightShape is THE legal-shape matrix, and it is deliberately one
-// function rather than checks spread across the readers.
-//
-// Every earlier attempt at this subsystem failed by classifying owner state at the point
-// of use, where the set of legal shapes was never closed and entries changed class in
-// place underneath the classification. So legality is decided in exactly one place: a
-// record either satisfies this function or it is refused, and no reader forms its own
-// opinion.
-//
-// STRUCTURAL only. It proves the field combination is one this broker emits; it does not
-// prove the named source, copy, PUBREL record, consumer durable or session acceptance
-// exist. Those are CONTEXTUAL and are proved by a separate layer — and BOTH must pass
-// before acting. Same division mqttParsePubRelAffineRef already draws against
-// q2AffClaimUsableForDecision.
-//
-// Returns nil when the shape is legal.
 // mqttDecodeInflightRecord is the ONE way a persisted register becomes a record, and it
 // exists because validating at the recovery scan alone left every other reader trusting the
 // bytes.
@@ -376,6 +360,22 @@ func mqttJSONKeysOfType(t reflect.Type) map[string]struct{} {
 	return keys
 }
 
+// mqttValidateInflightShape is THE legal-shape matrix, and it is deliberately one
+// function rather than checks spread across the readers.
+//
+// Every earlier attempt at this subsystem failed by classifying owner state at the point
+// of use, where the set of legal shapes was never closed and entries changed class in
+// place underneath the classification. So legality is decided in exactly one place: a
+// record either satisfies this function or it is refused, and no reader forms its own
+// opinion.
+//
+// STRUCTURAL only. It proves the field combination is one this broker emits; it does not
+// prove the named source, copy, PUBREL record, consumer durable or session acceptance
+// exist. Those are CONTEXTUAL and are proved by a separate layer — and BOTH must pass
+// before acting. Same division mqttParsePubRelAffineRef already draws against
+// q2AffClaimUsableForDecision.
+//
+// Returns nil when the shape is legal.
 func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	if r == nil {
 		return mqttShapeErr("no record")

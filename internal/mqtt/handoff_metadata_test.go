@@ -235,10 +235,6 @@ func testF105Prepare(t *testing.T, e *testF105Env, i *mqttHandoffIntent) {
 	}
 }
 
-// testF105RecordSeq is the session record's standing sequence, which every metadata attempt
-// must CAS against. The environment's own CONNECT already wrote a record, so an attempt
-// frozen at base zero is a create against an occupied subject — a fixture error, not a
-// mechanism one.
 // testF105Prop views a handoff intent as the proposal the metadata half commits. The two
 // shapes share ONE protocol, so every call goes through the constructor rather than filling
 // the view in by hand — the kind is the constructor's to set.
@@ -251,6 +247,10 @@ func testF105Prop(t *testing.T, i *mqttHandoffIntent) mqttOwnershipProposal {
 	return p
 }
 
+// testF105RecordSeq is the session record's standing sequence, which every metadata attempt
+// must CAS against. The environment's own CONNECT already wrote a record, so an attempt
+// frozen at base zero is a create against an occupied subject — a fixture error, not a
+// mechanism one.
 func testF105RecordSeq(t *testing.T, e *testF105Env) uint64 {
 	t.Helper()
 	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(_EMPTY_, getHash(e.id)))

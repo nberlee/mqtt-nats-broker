@@ -127,7 +127,7 @@ const (
 //
 // voc travels WITH the outcome rather than being derived by the caller, because the two
 // routes to Foreign/Forked compute it differently — disposalForDirectRejection reads the
-// record for the 10071 arm, mqttDisposalForRepairSave maps the resolver's verdict for the
+// record for the 10071 arm, mqttDisposalForLineage maps the resolver's verdict for the
 // 10164 arm — and a caller re-deriving it would have to know which route ran.
 type mqttGroupOwnershipVerdict struct {
 	outcome mqttGroupOwnership

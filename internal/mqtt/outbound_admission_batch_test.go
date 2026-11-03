@@ -434,7 +434,8 @@ func testCustodyAfterSettlement(t *testing.T, sess *mqttSession, nonces []string
 	}
 }
 
-// bumpAuthority commits one write of the session's authority record at the sequence it reads.
+// testBumpSessionAuthority commits one write of the session's authority record at the
+// sequence it reads.
 func testBumpSessionAuthority(sess *mqttSession) error {
 	jsa, as := sess.jsa, sess.asm
 	al := jsa.loadOutboundAuthority(sess.id, as.sessStreamEpoch)
@@ -1161,7 +1162,7 @@ func TestAdmissionBatchExpiryIsReducedOnce(t *testing.T) {
 	}
 }
 
-// testRunAfterX arranges a run of the subscriber's callback that processes A (fresh) and then B:
+// runAfterX arranges a run of the subscriber's callback that processes A (fresh) and then B:
 // X is published and processed alone, its processing held until queued() reports that wait has
 // passed, so A and whatever B is (published by prepare) queue behind it. beforeB runs inside B's
 // offer, before anything of B is decided, when B's stream sequence is bSeq.
@@ -1380,7 +1381,7 @@ func TestAdmissionBatchFlushesBeforeADeclinedReofferIsAcknowledged(t *testing.T)
 	}
 }
 
-// testBatchReadAll reads PUBLISHes until every one of the n payloads m0..m<n-1> arrived, answering
+// readAllOnce reads PUBLISHes until every one of the n payloads m0..m<n-1> arrived, answering
 // each, and fails if any payload arrived twice as a first transmission (DUP clear).
 func (rig *testBatchRig) readAllOnce(n int, within time.Duration) {
 	rig.t.Helper()
@@ -1659,8 +1660,8 @@ func (p *testBatchPeers) takeOver(t *testing.T, release func()) (net.Conn, *mqtt
 	return cB.c, cB.r
 }
 
-// readAllOnceOn reads PUBLISHes on one connection until all n payloads arrived, answering each, and
-// fails if any payload arrives twice as a first transmission.
+// testBatchReadAllOnceOn reads PUBLISHes on one connection until all n payloads arrived,
+// answering each, and fails if any payload arrives twice as a first transmission.
 func testBatchReadAllOnceOn(t *testing.T, c net.Conn, r *mqttReader, n int, within time.Duration) {
 	t.Helper()
 	first := map[string]int{}

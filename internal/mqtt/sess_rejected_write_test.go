@@ -152,10 +152,10 @@ func (e *testRejectionEnv) markerPending(sess *mqttSession) bool {
 	return sess.recordRejectionPendingLocked()
 }
 
-// countProbes counts session-record SAVE ATTEMPTS at the save-entry hook, which fires
-// before the uncertainty refusal and before the store. Several claims can only be made
-// on this counter: a probe that is refused at entry stores nothing, disposes nothing
-// and would be invisible to any state-shaped assertion.
+// testCountSessSaves counts session-record SAVE ATTEMPTS at the save-entry hook, which
+// fires before the uncertainty refusal and before the store. Several claims can only be
+// made on this counter: a probe that is refused at entry stores nothing, disposes
+// nothing and would be invisible to any state-shaped assertion.
 func testCountSessSaves(t *testing.T) (*atomic.Int64, func()) {
 	t.Helper()
 	var n atomic.Int64
@@ -166,7 +166,7 @@ func testCountSessSaves(t *testing.T) (*atomic.Int64, func()) {
 	return &n, restore
 }
 
-// forceContendedRejection makes THIS session's next saves fail as production-shaped
+// testForceContendedRejection makes THIS session's next saves fail as production-shaped
 // 10164s with the record genuinely UNTOUCHED, which is the sustained-contention state:
 // JetStream returns 10164 while a write for the subject is in process upstream, so a
 // readback finds the base sequence and can conclude nothing.
@@ -328,8 +328,9 @@ func TestMQTTRejectedRecordStaleMarkerIsNotProbed(t *testing.T) {
 // TestMQTTRejectedRecordInFenceRecheck is MU8's paired test: the pre-fence sample is a
 // check-then-act, and only a re-read INSIDE the fence sees a save that landed since.
 // The window seam is what makes that reachable — the pass skips a session whose fence is
-// open, so nothing outside can otherwise open this window — and T*StaleMarker above
-// cannot discriminate it, because its staleness is visible to the outer sample too.
+// open, so nothing outside can otherwise open this window — and
+// TestMQTTRejectedRecordStaleMarkerIsNotProbed above cannot discriminate it, because its
+// staleness is visible to the outer sample too.
 func TestMQTTRejectedRecordInFenceRecheck(t *testing.T) {
 	e := testNewRejectionEnv(t, "rejrecheck")
 	e.dropPersistObservations(t, e.idHash)
@@ -1201,9 +1202,9 @@ func TestMQTTRejectedRecordNotificationDropped(t *testing.T) {
 }
 
 // TestMQTTRejectedRecordNotificationDelivered is the paired POSITIVE: the identical
-// takeover with the seam disarmed is evicted by processSessionPersist alone, with no
-// pass run at all. Without it the test above could not tell "settled by the new
-// mechanism" from "the notification would have done it anyway".
+// takeover with the seam disarmed is evicted by processSessionRecordDelivery alone,
+// with no pass run at all. Without it the test above could not tell "settled by the
+// new mechanism" from "the notification would have done it anyway".
 func TestMQTTRejectedRecordNotificationDelivered(t *testing.T) {
 	t.Parallel()
 	e := testNewRejectionEnv(t, "rejdeliver")

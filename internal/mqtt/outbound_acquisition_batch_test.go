@@ -193,7 +193,7 @@ func testNoTokenOn(t *testing.T, sess *mqttSession, subjects []string, within ti
 	})
 }
 
-// testFlushWith reports the first recorded flush with more than one participant.
+// multiFlush reports the first recorded flush with more than one participant.
 func (r *testAcqRecorder) multiFlush() []uint16 {
 	r.mu.Lock()
 	defer r.mu.Unlock()

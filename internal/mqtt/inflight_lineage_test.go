@@ -814,14 +814,6 @@ var mqttLineageWriterManifest = map[string]string{
 	"storePendingFenceCAS": "boundary: validates the create-only fence form (its own lineage), decides nothing",
 }
 
-// TestMQTTLineageWriterCensus is an INDEPENDENT SCAN, not an enumeration of the writers this
-// change happened to touch.
-//
-// The distinction is the whole point. A hand-maintained list of "the writers I know about"
-// cannot prevent its own drift: it proves nothing about the writer somebody adds next. So
-// the scan reads the SOURCE for every register-persisting call site, and every discovered
-// site must have a disposition — with no restriction to functions the manifest already
-// names, which is exactly the escape hatch the existing coverage check leaves open.
 // itoaLineage keeps the count messages readable without pulling strconv into a file whose
 // other assertions are all structural.
 func itoaLineage(n int) string {
@@ -836,6 +828,14 @@ func itoaLineage(n int) string {
 	return string(b)
 }
 
+// TestMQTTLineageWriterCensus is an INDEPENDENT SCAN, not an enumeration of the writers this
+// change happened to touch.
+//
+// The distinction is the whole point. A hand-maintained list of "the writers I know about"
+// cannot prevent its own drift: it proves nothing about the writer somebody adds next. So
+// the scan reads the SOURCE for every register-persisting call site, and every discovered
+// site must have a disposition — with no restriction to functions the manifest already
+// names, which is exactly the escape hatch the existing coverage check leaves open.
 func TestMQTTLineageWriterCensus(t *testing.T) {
 	t.Parallel()
 	sites, files, unresolved := censusScanSinkFamilies(t, mqttLineageWriteSinks)

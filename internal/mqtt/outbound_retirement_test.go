@@ -23,9 +23,6 @@ import (
 	"testing"
 )
 
-// testF105Resource builds a resource whose dependents are named by nonce alone, each in the
-// SOURCE-REPLAY role. Most fixtures do not care which role they hold, and spelling one out
-// everywhere would bury the cases that do; testF105ResourceEdges is for those.
 // testF105Edge is the ordinary source-replay edge for one obligation.
 func testF105Edge(nonce string) mqttResourceEdge {
 	return mqttResourceEdge{Nonce: nonce, Role: mqttRoleSourceReplay}
@@ -44,6 +41,9 @@ func testF105EdgeFor(r *mqttOutboundResource, nonce string) mqttResourceEdge {
 	return mqttResourceEdge{Nonce: nonce, Role: role}
 }
 
+// testF105Resource builds a resource whose dependents are named by nonce alone, each in the
+// SOURCE-REPLAY role. Most fixtures do not care which role they hold, and spelling one out
+// everywhere would bury the cases that do; testF105ResourceEdges is for those.
 func testF105Resource(state mqttResourceState, nonces []string) *mqttOutboundResource {
 	// A NIL LIST IS PASSED THROUGH AS NIL. The validator refuses a null dependent list, and a
 	// helper that quietly turned nil into [] would make that rule untestable.

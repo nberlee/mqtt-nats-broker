@@ -762,7 +762,7 @@ CHECK:
 	// The ownership budget was constructed above the client-ID gate; see ownBudget there.
 	// The authority-step re-attempt allowance, per CONNECT and for the same reason: every drive
 	// and every re-drive of this frame draws on one allowance, so a restoration never replenishes
-	// it (see reconcileOwnershipStep).
+	// it (see mqttReconcileOwnershipStep).
 	stepReattempts := mqttOwnershipStepReattempts
 	// stepAllow admits ONE re-attempt of an ownership authority step whose attempt positively
 	// never landed. It bounds STARTING another attempt — the absolute deadline and the
@@ -1243,7 +1243,7 @@ restoreSession:
 				// generation and set its sequence to 0, so consuming against it would hand
 				// enqueueDelayedWill a zero origin sequence, which its validation refuses —
 				// sacrificing the delay and publishing a delayed Will immediately for a
-				// session that only failed to tear itself down. willFence carries the
+				// session that only failed to tear itself down. capsule.fence carries the
 				// RETIRING incarnation, which is the one the Will belongs to. issue #86.
 				// The capsule carries the displaced client, its parked action and the
 				// retiring incarnation's Will fence, so this arm discharges all five
@@ -1424,8 +1424,9 @@ restoreSession:
 
 	es.mu.Lock()
 	es.rmax = rmax
-	// A new connection cancels any pending delayed Will (cancelWill below);
-	// drop its persisted copy with the save that follows. Spec5 [MQTT-3.1.2-8].
+	// A new connection cancels any pending delayed Will (the acceptance fact the
+	// save below commits suppresses it); drop its persisted copy with that save.
+	// Spec5 [MQTT-3.1.2-8].
 	es.will = nil
 	es.mu.Unlock()
 
@@ -2465,10 +2466,11 @@ restoreSession:
 			// have that shape. This is also the form collectSharedPendingPurge already uses, so
 			// it deletes a variant rather than adding a mechanism.
 			casRejected := es.deleteInflightRegistersClassified(c, tok, regs, mqttLicenceOf(c))
-			// The staged cancellations are already in this CONNECT's record; anything the purge
-			// just found arrived after that write, and the group durables below stay while such a
-			// cancellation is unaccounted for — an unexplained register costs an identifier for
-			// the life of the session, a surviving durable only costs resources.
+			// The staged cancellations are already in this CONNECT's record; any cancellation the
+			// purge just found is an allocation made after that write (this staging closes no
+			// delivery), and the group durables below stay while such a cancellation is
+			// unaccounted for — an unexplained register costs an identifier for the life of the
+			// session, a surviving durable only costs resources.
 			// ONE secure call, so "one aggregate pair" is literally true: the staging's own
 			// cancellations and anything the purge just found go together. Two calls was the
 			// remnant of the per-target shape and a holistic round pointed out that it made the

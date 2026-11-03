@@ -329,7 +329,7 @@ func testClosePredecessorAuthority(t *testing.T, asm *mqttAccountSessionManager,
 	}
 }
 
-// testResidentSession reports the session currently mapped for a client ID, and whether
+// testReDriveResident reports the session currently mapped for a client ID, and whether
 // anything is bound to it. Both halves matter: R3 forbids leaving a re-minted object
 // resident, and T2 forbids leaving the connecting client attached to one.
 func testReDriveResident(asm *mqttAccountSessionManager, cid string) (*mqttSession, bool) {
@@ -1051,18 +1051,11 @@ func TestReDriveT2HandsOverTheAcceptTransaction(t *testing.T) {
 // Test 4 / M3: a superseded RELEASE re-drives too
 // ---------------------------------------------------------------------------
 
-// TestSupersededReleaseReDrivesTheCleanStart stages the OTHER superseded arm: the claim
-// is WON, and the exact-sequence release then finds the marker REPLACED by a newer write.
+// The retired TestSupersededReleaseReDrivesTheCleanStart staged the OTHER superseded arm:
+// the claim was WON, and the exact-sequence release then found the marker REPLACED by a
+// newer write. Unlike the claim arm it had run the deletions first, so its sentinel could
+// not promise "nothing was deleted".
 //
-// "Superseded" is a fact about the marker, not about who holds the session: a rival write
-// landed after our claim, and nothing here demonstrates that its author still holds
-// anything (issue #86). What the re-drive rests on is our own claim's sequence no longer being
-// current, which is enough on its own.
-//
-// It matters separately because the two arms say different things about what happened.
-// The claim arm deleted nothing; this one ran the deletions first — legitimately, since
-// the claim was won — so the sentinel must not promise "nothing was deleted", and the
-// CONNECT must still re-drive rather than create at the base clear() reset.
 // TestSupersededReleaseReDrivesTheCleanStart was RETIRED in the issue #107 cutover (Codex
 // consult 10). It staged the pre-issue #107 claim-then-release flow: a teardown WON its marker
 // (mqttTestTeardownClaimedHookV), a rival then replaced the marker, and the separate
@@ -1770,7 +1763,7 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 
 // TestOverdueMovedWinnerReDrivesInsideTheRestore is test 3(g).
 //
-// An overdue record never reaches processConnect's clean-start decision: the restore
+// An overdue record never reaches mqttProcessConnect's clean-start decision: the restore
 // intercepts it and discards it there, which is transition T0. Two things must hold that
 // the outer transitions do not cover — the base-0 create is PARENTLESS, inheriting
 // nothing from the record that discard retired, and the re-drive budget is the CONNECT's,

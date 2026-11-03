@@ -535,7 +535,7 @@ func TestEmbeddedRegistryReclaimsARestartedShim(t *testing.T) {
 // reference counting fit an idiom that cannot hand its reference over: a shim
 // that has been shut down is not using the server any more, whatever it forgot
 // to say.
-// The signal is shutdownDone, NOT isRunning. BeginShutdown clears running
+// The signal is shutdownDone, NOT s.running. BeginShutdown clears running
 // synchronously and then drains in the background, and Shutdown returns after
 // ShutdownDrainTimeout whether or not that finished — so a shim can be
 // not-running while it is still persisting sessions and Wills. Reaping on

@@ -104,9 +104,6 @@ func (e *testOrphanEnv) claimOn(t *testing.T, subject string) *mqttQ2AffClaim {
 	return c
 }
 
-// sweepAffineClaims drives ONE assignment-reconciliation pass. One, deliberately: the
-// live-generation arm has no quarantine gate, so a fixture that needed a second pass
-// would be asserting the opposite of what the arm promises.
 // countClaimLoads installs a COUNTING wrapper over the claim load that delegates to the
 // real one, and returns a reader for the count on subject.
 //

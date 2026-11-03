@@ -207,7 +207,7 @@ func TestMQTTParentlessCreateSettlesToUnsettledBothOrientations(t *testing.T) {
 // testAssertSettlesToUnsettled rejects a real save, settles it through the production
 // path, and asserts the verdict AND the vocabulary it maps to.
 //
-// The vocabulary comes from mqttDisposalForRejection applied to the verdict the
+// The vocabulary comes from mqttDisposalForLineage applied to the verdict the
 // settlement actually returned, never from a constant chosen here: that is what makes
 // this fail if a consult path stops reaching the classifier, or maps its result to the
 // wrong claim.

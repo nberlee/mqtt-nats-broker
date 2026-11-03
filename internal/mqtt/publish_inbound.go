@@ -1007,7 +1007,7 @@ func (is mqttIssued) complete() error {
 //
 // msgId, when non-empty, is a Nats-Msg-Id for the $MQTT_msgs store so a repeated
 // store of the same logical message is deduplicated by JetStream. Only the
-// inbound QoS 2 PUBREL release passes one (see mqttInitiateMsgDeliveryDedup); it
+// inbound QoS 2 PUBREL release passes one (see mqttInboundRelease.issue); it
 // is NOT set on the live fan-out's behalf, which is at-least-once regardless.
 //
 // The retained update is part of the publication's outcome (issue #64): an error from it is
@@ -1347,7 +1347,7 @@ func (s *Server) mqttStoreQoS2MsgOnce(c *client, pp *mqttPublish, noLocal string
 // every hold purge now carries. Which bound each arm uses, and what that does and does not
 // license, are stated once in issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131) — it is not one
 // watermark for all four arms, so do not summarise it as one here.
-// Both callers run on the inbound QoS 2 path, well after processConnect installed
+// Both callers run on the inbound QoS 2 path, well after mqttProcessConnect installed
 // c.mqtt.sess (which the delivery path already dereferences unguarded), and a
 // re-mint only ever happens on a discard, which ends the connection.
 func (c *client) mqttQoS2InternalSubject(pi uint16) string {

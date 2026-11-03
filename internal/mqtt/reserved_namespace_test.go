@@ -355,7 +355,7 @@ func TestMQTTInternalSubsReleasedOnClientClose(t *testing.T) {
 	})
 }
 
-// testReservedSessionRecord seeds a session record carrying a subscription in
+// testReservedSessionRecordEx seeds a session record carrying a subscription in
 // the reserved namespace, as a broker predating the namespace deny would have
 // persisted. Returns the client ID.
 func testReservedSessionRecordEx(t *testing.T, s *Server, o *Options, seed func(*mqttAccountSessionManager, *mqttSession)) string {
@@ -420,11 +420,11 @@ func testWaitSessionRecordSettled(t *testing.T, s *Server, asm *mqttAccountSessi
 }
 
 // testEvictResidentSession removes a session from BOTH residency indexes, which is
-// what makes the next CONNECT go through createOrRestoreSession at all:
-// processConnect takes the resident path when it finds the client ID, so a fixture
-// left resident never reaches the restore boundary under test. addSession and
-// removeSession keep sessions and sessByHash in step, so clearing one index alone
-// leaves the other holding a stale object.
+// what makes the next CONNECT go through createOrRestoreSessionWithin at all:
+// mqttProcessConnect takes the resident path when it finds the client ID, so a
+// fixture left resident never reaches the restore boundary under test. addSession
+// and removeSession keep sessions and sessByHash in step, so clearing one index
+// alone leaves the other holding a stale object.
 func testEvictResidentSession(t *testing.T, asm *mqttAccountSessionManager, cid string) {
 	t.Helper()
 	asm.mu.Lock()
@@ -569,7 +569,7 @@ func testReservedProbeASM(t *testing.T, s *Server, o *Options) *mqttAccountSessi
 // the connection without answering it.
 //
 // testMQTTExpectDisconnect is the deliberate oracle: testMQTTReadConnAckV5 fatals on
-// EOF, so it cannot express "closed", and testExpectNoConnAck accepts a read timeout,
+// EOF, so it cannot express "closed", and testMQTTExpectNothing accepts a read timeout,
 // which a CONNECT wedged before the validator would satisfy. This one tells a real
 // EOF/reset apart from a timeout.
 func testReservedRefusedConnect(t *testing.T, o *Options, cid string, cleanStart bool) {
@@ -873,7 +873,7 @@ func TestMQTTReservedRecordRefusesRestore(t *testing.T) {
 			requireIntact("after the refused resume")
 
 			// A CLEAN START attempt is refused identically. Stated consequence, not an
-			// oversight: createOrRestoreSession runs before processConnect's
+			// oversight: createOrRestoreSessionWithin runs before mqttProcessConnect's
 			// clean-session check, and the discard it would take derives shared
 			// durable names from the record's own keys and deletes consumers — the
 			// same migration under another name. Recreating the streams is the only

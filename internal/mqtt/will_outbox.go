@@ -372,6 +372,13 @@ func mqttWillIdentTk(s string) bool {
 	return true
 }
 
+// errMQTTWillDestinationUnavailable is deliverWillRecord's account-fence refusal:
+// the service connection is down, or is bound to an account other than the one this
+// Will's authorization was decided against. It is a statement about the DESTINATION,
+// never about the Will, which is what makes it the one refusal worth re-attempting
+// when the destination comes back.
+var errMQTTWillDestinationUnavailable = errors.New("the Will's authorized destination account is not currently established")
+
 // validateWillOutboxBody checks the format invariants a delayed-Will outbox
 // record carries on its own, independent of where it is stored. This is the
 // pre-release format contract: every field a decision is taken on must be
@@ -382,13 +389,6 @@ func mqttWillIdentTk(s string) bool {
 // It applies at the persist and decode boundaries only. An outbox record used
 // purely as a publication vehicle — mqttPublishOwedWill's, and the deferred-close
 // immediate publication's — is built in memory, handed straight to
-// errMQTTWillDestinationUnavailable is deliverWillRecord's account-fence refusal:
-// the service connection is down, or is bound to an account other than the one this
-// Will's authorization was decided against. It is a statement about the DESTINATION,
-// never about the Will, which is what makes it the one refusal worth re-attempting
-// when the destination comes back.
-var errMQTTWillDestinationUnavailable = errors.New("the Will's authorized destination account is not currently established")
-
 // deliverWillRecord (which reads message fields alone) and never persisted, so it
 // carries no identity and is deliberately not validated.
 //

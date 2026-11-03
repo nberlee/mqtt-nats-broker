@@ -302,7 +302,7 @@ func testQoS2PubRelFailureSuppressesPubComp(t *testing.T, name string,
 	testQoS2SendPubRel(t, cp, pi)
 
 	// No PUBCOMP: the exchange is unfinished, so the client's send-quota slot
-	// stays occupied (both are gated on the same sendPubComp flag).
+	// stays occupied (both follow the release job's one answer, j.resp.send).
 	if b, _, ok := testMQTTReadPacketReady(rp, testMQTTTimeout); ok {
 		t.Fatalf("Expected no PUBCOMP after a %s failure, got packet type %v", name, b&mqttPacketMask)
 	}

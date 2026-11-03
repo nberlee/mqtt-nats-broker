@@ -1990,7 +1990,7 @@ func TestF097OpaqueAndRereadFailureStayConservative(t *testing.T) {
 // WP3 edit 7: the admission classifier probes a CANCELLED occupant's marker before it classifies
 // ---------------------------------------------------------------------------
 
-// testF088CancelledOccupant is T17's inherited same-delivery occupant on identifier 11, carrying an
+// testF088CancelledOcc is T17's inherited same-delivery occupant on identifier 11, carrying an
 // OCCUPANT cancellation. INPUT, STATED: the occupant is seeded (an admission batch landed directly,
 // its cancellation then written at the raw register boundary as the copy-and-CAS fallback writes
 // it); markerAbsent consumes its unsent marker first (possibly attempted). The next allocation of

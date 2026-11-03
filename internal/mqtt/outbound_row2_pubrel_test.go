@@ -459,7 +459,7 @@ func TestF105Row2AnEndedEntitlementAcquiresNothingAndEndsTheDelivery(t *testing.
 // read, and the resolving read of the unacquired holder.
 const testRow2OneDispatchReads = 3
 
-// testRow2Acquired acquires the seeded ready slot's PUBREL through the production helper.
+// testRow2AcquiredPubRel acquires the seeded ready slot's PUBREL through the production helper.
 func testRow2AcquiredPubRel(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed) (*mqttSendAction, *mqttInflightRecord) {
 	t.Helper()
 	ref, cur, _ := testRow2Ref(t, e, seed.subject)

@@ -1,10 +1,11 @@
 // Repository-owned dependency regression for the accepted-CONNECT atomic-batch write
 // path (mqtt-nats-broker, docs/ROADMAP.md §0.2).
 //
-// Every accepted CONNECT commits the acceptance fact and the session record as ONE
-// AllowAtomicPublish batch on $MQTT_sess (mqttJSA.storeAcceptBatch). The broker reads
-// an acknowledgement of that batch as "the record committed WITH the fact", and the
-// roadmap finding this fixture answers argued the opposite from four Raft-layer facts:
+// Every accepted CONNECT commits the acceptance fact and the session record, with the
+// COMMITTED receipt beside them, as ONE AllowAtomicPublish batch on $MQTT_sess
+// (mqttJSA.commitMetadataAttempt). The broker reads an acknowledgement of that batch as
+// "the record committed WITH the fact", and the roadmap finding this fixture answers
+// argued the opposite from four Raft-layer facts:
 // ProposeMulti pushes entries individually, runAsLeader pops whatever prefix exists,
 // each group rechecks leadership independently, and a batch has no Raft-level identity
 // -- concluding that a FIFO prefix split can commit the fact without the record.

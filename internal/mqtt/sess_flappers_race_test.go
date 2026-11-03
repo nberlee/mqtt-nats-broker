@@ -251,7 +251,7 @@ func TestDeferredDisconnectUngatedParkKeepsTheJail(t *testing.T) {
 	if owner == nil {
 		t.Fatal("the session is not bound to a client, so the gate cannot be taken as its owner")
 	}
-	// Retried: processConnect releases the gate in a deferred function that runs after
+	// Retried: mqttProcessConnect releases the gate in a deferred function that runs after
 	// the CONNACK is on the wire, so the fixture can arrive while the accepting
 	// CONNECT still holds it.
 	var gateErr error

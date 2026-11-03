@@ -28,7 +28,6 @@ import (
 // production decoders, together with the consumer's existence.
 
 // waitHolders polls the group record until it serves wantInc with wantHolders, or fails.
-// nil wantLive asserts the group serves nobody (live == null).
 func waitHolders(t *testing.T, b *testSharedBroker, what string, wantInc, wantHolders uint64) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

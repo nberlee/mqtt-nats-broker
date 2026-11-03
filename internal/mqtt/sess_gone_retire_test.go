@@ -21,7 +21,7 @@ import (
 //
 // None of these tests is parallel: several install process-global hooks.
 
-// testPlantGoneLicence writes a valid retirement watermark for this client whose marker
+// plantGoneLicence writes a valid retirement watermark for this client whose marker
 // sequence exceeds the session's acknowledged record sequence — the licence itself.
 //
 // markerAbove says whether the marker should REACH past our sequence. False builds the

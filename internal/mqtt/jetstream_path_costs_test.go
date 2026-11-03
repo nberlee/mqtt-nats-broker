@@ -736,8 +736,8 @@ func (c *jsPathClient) readPublishPI() (byte, uint16) {
 	return qos, pi
 }
 
-// disconnectedAt waits for a session record to record its disconnection, read on the test's own
-// JetStream connection (classed test: by the census).
+// waitDisconnectedAt waits for a session record to record its disconnection, read on the
+// test's own JetStream connection (classed test: by the census).
 func (b *jsPathBench) waitDisconnectedAt(t *testing.T, id string) {
 	t.Helper()
 	asm := b.rig.asm(t)

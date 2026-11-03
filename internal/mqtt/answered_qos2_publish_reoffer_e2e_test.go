@@ -123,7 +123,7 @@ func f115Handoff(pi uint16) func(sess *mqttSession) bool {
 	}
 }
 
-// parkReoffer holds the NEXT delivery callback of this session before its lock, and reports
+// f115Park holds the NEXT delivery callback of this session before its lock, and reports
 // when that callback has returned. release lets it go.
 type f115Park struct {
 	parked   chan struct{}

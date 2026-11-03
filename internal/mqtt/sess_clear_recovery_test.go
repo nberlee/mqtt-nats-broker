@@ -51,7 +51,7 @@ func testExpiringEnv(t *testing.T, clientID, filter string) (*testDeferredEnv, i
 	return e, disconnectedAt
 }
 
-// fireExpiry arms the timer entry expireSession consumes and then runs it on this
+// testFireExpiry arms the timer entry expireSession consumes and then runs it on this
 // goroutine. The entry must exist: without it expireSession returns before doing anything,
 // and a test asserting "nothing was discarded" would pass vacuously.
 func testFireExpiry(t *testing.T, e *testDeferredEnv) {
@@ -66,8 +66,9 @@ func testFireExpiry(t *testing.T, e *testDeferredEnv) {
 	e.asm.expireSession(e.s, e.sess.idHash)
 }
 
-// armAtClearWindow arms an ambiguous write at one of clear()'s two decision points, as an
-// off-readLoop register store settling there would. Reports whether the window opened.
+// testArmAtClearWindow arms an ambiguous write at one of clear()'s two decision points,
+// as an off-readLoop register store settling there would. Reports whether the window
+// opened.
 func testArmAtClearWindow(t *testing.T, e *testDeferredEnv, window string) func() bool {
 	t.Helper()
 	armed := false
@@ -491,7 +492,7 @@ func TestMQTTExpiryDeclinesRecoveryForAnyOtherParkedShape(t *testing.T) {
 // expireSession reads "the record's sequence is higher than ours" as a remote owner. That
 // is ALSO true for our own ambiguous write that landed with its response lost, so the
 // shortcut evicted the continuation-bearing object and ran the teardown from a transient
-// object with no pendingWrite and no uncertainReverts — losing exactly what the recovery
+// object with no pendingWrite and no deferredDisconnect — losing exactly what the recovery
 // exists to keep. Sequence is not identity; only the digest classifier can tell the two
 // apart, so the decision is deferred to it.
 //

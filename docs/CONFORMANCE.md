@@ -2795,7 +2795,8 @@ existence to the acknowledgement that follows it. The interleaving, worked:
    (`mqttQ2AffClaimAttempts`), each attempt a further round trip.
 3. An operator, or any other client of the JetStream API, deletes
    `$MQTT_Q2AFF_<hash>_<gen>`. Interest retention takes the proven copy with it.
-4. The broker's `confirmAck` commits, irreversibly releasing the group source.
+4. The broker's confirmed group ack (`confirmSourceAckAndRecord`) commits, irreversibly
+   releasing the group source.
 
 **The window spans step 1 to step 4, and step 2 is part of it.** How much of step 2
 depends

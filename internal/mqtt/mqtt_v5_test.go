@@ -1092,22 +1092,6 @@ func TestMQTTv5WillDelay(t *testing.T) {
 	})
 }
 
-// PARTLY UNMET, and the split matters. A Will ought to be subject to the
-// publisher's publish permissions when it fires: denied topic dropped, allowed
-// topic delivered.
-//
-// For an IMMEDIATE Will that largely holds, but not because the broker checks:
-// the live publish rides the dying client's own c.nrc, so NATS drops a denied one
-// (a non-retained QoS 0 immediate Will is therefore fully covered). Its QoS 1/2
-// and retained persistence still bypass, because those ride the service
-// connection.
-//
-// For a DELAYED, takeover or uncertainty-replayed Will nothing holds:
-// pubAllowedFullCheck is hardcoded to true, so none is ever withheld, and the
-// replay publishes through the internal client on the service connection -- live
-// fan-out included. issue #81; this orphan comment is kept because it states the
-// requirement the fix must satisfy.
-
 // testMQTTConnectRetryV5 is testMQTTConnectRetry for a v5 CONNECT: it dials and
 // sends the CONNECT, retrying on transient errors (useful while a cluster's JS
 // assets are being set up). The returned reader is positioned to read the CONNACK.
@@ -4848,9 +4832,9 @@ func TestMQTTv5MessageExpiryPendingReconciledOnResume(t *testing.T) {
 // The fixture needs two pending entries and a resumed maximum of one, so it delivers both
 // under a maximum of TWO and resumes at ONE (a lowered maximum on a resumed session is a
 // supported shape; see trackPublish). One source is reaped. The pass's budget is then
-// effectiveMaxAck (1) minus the slots held by entries it is NOT NAKing — the reserved one —
-// which is zero, so the survivor is NOT redelivered promptly and the client, which holds
-// two identifiers, is sent nothing.
+// replayAllowanceLocked: the negotiated maximum (1) minus the slots held by entries it is
+// NOT NAKing — the reserved one — which is zero, so the survivor is NOT redelivered
+// promptly and the client, which holds two identifiers, is sent nothing.
 //
 // Mutation M3 (capture the budget at the top of the pass instead of at the point it is
 // used) counts the reserved entry in neither term, budgets one NAK, and the survivor
@@ -7044,11 +7028,6 @@ func testMQTTPlantSessionRecord(t testing.TB, js nats.JetStreamContext, domainTk
 	return ack.Sequence
 }
 
-// testMQTTRunReconcile mirrors processSessionPersist's synchronous bookkeeping
-// (register/advance the per-client watermark and increment inFlight) and returns
-// the shared *sessionReconcileState plus a runner that executes the worker to
-// completion. Registering several workers before running any lets a test drive a
-// deterministic worker-completion order.
 // testMQTTSuppressRecordWatch stops the session-record watch from observing records
 // this test PLANTS.
 //
@@ -7065,6 +7044,11 @@ func testMQTTSuppressRecordWatch(t testing.TB, asm *mqttAccountSessionManager) {
 	asm.mu.Unlock()
 }
 
+// testMQTTRunReconcile mirrors deliverSessionRecordObservation's synchronous bookkeeping
+// (register/advance the per-client watermark and increment inFlight) and returns
+// the shared *sessionReconcileState plus a runner that executes the worker to
+// completion. Registering several workers before running any lets a test drive a
+// deterministic worker-completion order.
 func testMQTTRunReconcile(t testing.TB, asm *mqttAccountSessionManager, s *Server, idHash string, observedSeq uint64) (*sessionReconcileState, func()) {
 	t.Helper()
 	asm.mu.Lock()
