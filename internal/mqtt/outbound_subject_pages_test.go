@@ -141,7 +141,7 @@ func testPagesSubjects(filter, prefix string, n int) []string {
 }
 
 // testPagesExchangeBody is a valid exchange body, verified through the production decoder.
-func testPagesExchangeBody(t *testing.T, e *testF105Env, gen, nonce string, pi uint16, phase mqttExchangePhase) []byte {
+func testPagesExchangeBody(t *testing.T, e *testOutboundEnv, gen, nonce string, pi uint16, phase mqttExchangePhase) []byte {
 	t.Helper()
 	x := &mqttOutboundExchange{ID: e.id, Epoch: e.epoch, Gen: gen, Nonce: nonce, PI: pi, QoS: 1,
 		Phase: phase, AdmitTxn: "txn-seeded", Tenure: "tenure-seeded"}
@@ -157,7 +157,7 @@ func testPagesExchangeBody(t *testing.T, e *testF105Env, gen, nonce string, pi u
 
 // testPagesAdmit runs one exchange admission claiming pi through the production commit path, and
 // returns the admitted nonce with the commit's answer.
-func testPagesAdmit(t *testing.T, e *testF105Env, txn string, pi uint16) (string, error) {
+func testPagesAdmit(t *testing.T, e *testOutboundEnv, txn string, pi uint16) (string, error) {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if al.rec == nil {
@@ -167,7 +167,7 @@ func testPagesAdmit(t *testing.T, e *testF105Env, txn string, pi uint16) (string
 		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 		PI: pi, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 	}
-	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+	tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 	if terr != nil {
 		t.Fatalf("assembling admission %q failed: %v", txn, terr)
 	}
@@ -176,7 +176,7 @@ func testPagesAdmit(t *testing.T, e *testF105Env, txn string, pi uint16) (string
 }
 
 // testPagesExchangePresent reports whether an exchange subject holds a record.
-func testPagesExchangePresent(t *testing.T, e *testF105Env, gen, nonce string) bool {
+func testPagesExchangePresent(t *testing.T, e *testOutboundEnv, gen, nonce string) bool {
 	t.Helper()
 	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(getHash(e.id), gen, nonce))
 	if err != nil {
@@ -196,8 +196,8 @@ func testPagesExchangePresent(t *testing.T, e *testF105Env, gen, nonce string) b
 // each case also asserts that an admission requests NO exchange page and is decided by the
 // inventory alone: free identifiers admit whatever the scripted pages say, and the collision of
 // (b), planted with its duty as an admission writes it, is refused.
-func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-subject-pages")
+func TestExchangeWalkReadsEveryPage(t *testing.T) {
+	e, done := testNewEnv(t, "f105-subject-pages")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	gen := auth.Gen
@@ -268,7 +268,7 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 			testPagesExchangeBody(t, e, gen, collision, 12, mqttExchangePublish)); err != nil {
 			t.Fatalf("storing the outstanding exchange: %v", err)
 		}
-		testF112PlantAdmittedDuty(t, jsa, e.id, e.epoch, gen, collision)
+		testPlantAdmittedDuty(t, jsa, e.id, e.epoch, gen, collision)
 		subs := append(testPagesSubjects(filter, "b", total-1), mqttExchangeSubject(getHash(e.id), gen, collision))
 		sort.Strings(subs)
 		if subs[len(subs)-1] != mqttExchangeSubject(getHash(e.id), gen, collision) {
@@ -379,8 +379,8 @@ func TestF105ExchangeWalkReadsEveryPage(t *testing.T) {
 // competing admission lands after the first's enumeration and every boundary check have passed
 // (testTransitionPresend runs after all of them), and the first's batch is refused by the store's
 // CAS and commits nothing.
-func TestF105ExchangeWalkConcurrentCreatorIsFencedByTheAuthorityCAS(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-subject-pages-cas")
+func TestExchangeWalkConcurrentCreatorIsFencedByTheAuthorityCAS(t *testing.T) {
+	e, done := testNewEnv(t, "f105-subject-pages-cas")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	gen := auth.Gen
@@ -421,9 +421,9 @@ func TestF105ExchangeWalkConcurrentCreatorIsFencedByTheAuthorityCAS(t *testing.T
 	}
 }
 
-// testPagesEnvWithServer is testF105NewEnv that also returns the server, for a fixture that
+// testPagesEnvWithServer is testNewEnv that also returns the server, for a fixture that
 // publishes straight into the store.
-func testPagesEnvWithServer(t *testing.T, clientID string) (*testF105Env, *Server, func()) {
+func testPagesEnvWithServer(t *testing.T, clientID string) (*testOutboundEnv, *Server, func()) {
 	t.Helper()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -441,15 +441,15 @@ func testPagesEnvWithServer(t *testing.T, clientID string) (*testF105Env, *Serve
 		stop()
 		t.Fatal("the account has no recovery epoch, so nothing here can be attributed")
 	}
-	testF105ClearMintedAuthority(t, asm, clientID, stop)
-	return &testF105Env{asm: asm, id: clientID, epoch: epoch}, s, stop
+	testClearMintedAuthority(t, asm, clientID, stop)
+	return &testOutboundEnv{asm: asm, id: clientID, epoch: epoch}, s, stop
 }
 
 // R-PAGE. A generation whose exchange history passes the server's subject-page size, seeded
 // directly into the store (successive admissions would scan the history quadratically). With the
 // REAL enumeration: (a) an admission on a free identifier succeeds; (b) an outstanding exchange
 // placed on a verified later page makes an admission claiming its identifier refused, naming it.
-func TestF105ExchangeWalkPastTheServerPageSize(t *testing.T) {
+func TestExchangeWalkPastTheServerPageSize(t *testing.T) {
 	const seeded = 100_001
 	e, srv, done := testPagesEnvWithServer(t, "f105-subject-pages-real")
 	defer done()
@@ -527,7 +527,7 @@ func TestF105ExchangeWalkPastTheServerPageSize(t *testing.T) {
 	// admission's enumeration is the inventory, and the subject pages below pin only that the
 	// planted record sits past the server's page boundary, where a subject walk would have had to
 	// reach it.
-	testF112PlantAdmittedDuty(t, &e.asm.jsa, e.id, e.epoch, gen, late)
+	testPlantAdmittedDuty(t, &e.asm.jsa, e.id, e.epoch, gen, late)
 	first, err = e.asm.jsa.streamSubjectsCompletePage(mqttInflightStreamName, filter, 0)
 	if err != nil {
 		t.Fatalf("re-reading the first page: %v", err)

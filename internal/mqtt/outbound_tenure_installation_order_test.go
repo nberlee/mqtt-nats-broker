@@ -28,7 +28,7 @@ import (
 // is outbound_tenure_per_acceptance_e2e_test.go. Mutation ledger: mutation-ledger-8b.md.
 
 // T4u: the composer refuses to install an OLDER tenure over a newer one. Mutation M-comp-order.
-func TestF105_8bComposerRefusesAnOlderInstallation(t *testing.T) {
+func Test8bComposerRefusesAnOlderInstallation(t *testing.T) {
 	x := testNewBoundaryEnv(t)
 	x.install(t, testTenure(10))
 	b, err := mqttComposeSharedInstall(x.epoch, x.id, x.gen, testTenure(7), x.ledger(t))
@@ -40,7 +40,7 @@ func TestF105_8bComposerRefusesAnOlderInstallation(t *testing.T) {
 // T4v: the write boundary refuses an installation that does not ADVANCE the tenure, isolated on
 // EQUAL sequences (the general decreasing-sequence rule cannot fire) with a different nonce, so
 // only the install-specific ordering rule can refuse it. Mutation M-val-order.
-func TestF105_8bValidatorRefusesANonAdvancingInstallation(t *testing.T) {
+func Test8bValidatorRefusesANonAdvancingInstallation(t *testing.T) {
 	x := testNewBoundaryEnv(t)
 	x.install(t, testTenure(10))
 	b, err := mqttComposeSharedInstall(x.epoch, x.id, x.gen, testTenure(11), x.ledger(t))
@@ -57,7 +57,7 @@ func TestF105_8bValidatorRefusesANonAdvancingInstallation(t *testing.T) {
 
 // T5c: a join never creates a ledger — the composer refuses one over absence. Mutation
 // M-join-comp.
-func TestF105_8bComposerRefusesAJoinOverAbsence(t *testing.T) {
+func Test8bComposerRefusesAJoinOverAbsence(t *testing.T) {
 	x := testNewBoundaryEnv(t)
 	b, err := mqttComposeSharedJoin(x.epoch, x.id, x.gen, x.qkey, mqttNewInflightNonce(), testTenure(3),
 		mqttSharedGroupLoad{status: mqttOutboundAbsent}, mqttSharedLedgerLoad{status: mqttOutboundAbsent},
@@ -70,7 +70,7 @@ func TestF105_8bComposerRefusesAJoinOverAbsence(t *testing.T) {
 // T5v: the write boundary refuses a join whose ledger prior is absent, whatever composed it:
 // a join legal against generation G's installed ledger is re-targeted at a generation with no
 // ledger and handed in directly. Mutation M-join-val.
-func TestF105_8bValidatorRefusesAJoinOverAbsence(t *testing.T) {
+func Test8bValidatorRefusesAJoinOverAbsence(t *testing.T) {
 	x := testNewBoundaryEnv(t)
 	tenure := testTenure(3)
 	x.install(t, tenure)
@@ -92,7 +92,7 @@ func TestF105_8bValidatorRefusesAJoinOverAbsence(t *testing.T) {
 
 // T5a: an exhausted acquisition meeting an absent ledger is UNRESOLVED and writes nothing — the
 // abort never recreates a ledger. Mutation M-abort-init.
-func TestF105_8bAbortOverAbsenceWritesNothing(t *testing.T) {
+func Test8bAbortOverAbsenceWritesNothing(t *testing.T) {
 	e := testNewInflightEnv(t, "f105-8b-abort-absent")
 	e.sess.mu.Lock()
 	id, gen, epoch := e.sess.id, e.sess.gen, e.sess.sharedEpoch()
@@ -114,8 +114,8 @@ func TestF105_8bAbortOverAbsenceWritesNothing(t *testing.T) {
 	}
 }
 
-// testF105_8bPreserve closes the bootstrapped SERVING generation with a PRESERVING closure.
-func testF105_8bPreserve(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) {
+// test8bPreserve closes the bootstrapped SERVING generation with a PRESERVING closure.
+func test8bPreserve(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) {
 	t.Helper()
 	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
 		auth.OwnerTxn); err != nil {
@@ -123,15 +123,15 @@ func testF105_8bPreserve(t *testing.T, e *testF105Env, auth *mqttOutboundAuthori
 	}
 }
 
-// testF105_8bInstallEmpty creates the generation's ledger the one legal way, empty.
-func testF105_8bInstallEmpty(t *testing.T, e *testF105Env, gen string) {
+// test8bInstallEmpty creates the generation's ledger the one legal way, empty.
+func test8bInstallEmpty(t *testing.T, e *testOutboundEnv, gen string) {
 	t.Helper()
 	if _, err := e.asm.jsa.installSharedTenure(e.id, e.epoch, gen, testTenure(2)); err != nil {
 		t.Fatalf("installing an empty ledger: %v", err)
 	}
 }
 
-func testF105_8bLedgerState(e *testF105Env, gen string) (mqttOutboundLoadStatus, bool, int) {
+func test8bLedgerState(e *testOutboundEnv, gen string) (mqttOutboundLoadStatus, bool, int) {
 	l := e.asm.jsa.loadSharedLedger(e.id, e.epoch, gen)
 	if l.status != mqttOutboundValid {
 		return l.status, false, 0
@@ -141,44 +141,44 @@ func testF105_8bLedgerState(e *testF105Env, gen string) (mqttOutboundLoadStatus,
 
 // T13: the closing driver's licence, row by row (consult 122). Mutations M-preserve-licence (the
 // emptiness requirement dropped for an unsealed non-discarding case) and M-sealed-resume.
-func TestF105_8bClosingLicenceMatrix(t *testing.T) {
+func Test8bClosingLicenceMatrix(t *testing.T) {
 	type row struct {
 		name     string
-		setup    func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool // returns neverAuthorized
+		setup    func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool // returns neverAuthorized
 		licensed bool
 	}
 	rows := []row{
-		{"discarding closure over a listed acquisition", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
+		{"discarding closure over a listed acquisition", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
 			testPlantSharedAcq(t, e, auth.Gen, "g8b-disc")
 			testDiscardClose(t, e)
 			return false
 		}, true},
-		{"preserving closure over an absent ledger", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
-			testF105_8bPreserve(t, e, auth)
+		{"preserving closure over an absent ledger", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
+			test8bPreserve(t, e, auth)
 			return false
 		}, true},
-		{"preserving closure over an empty ledger", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
-			testF105_8bInstallEmpty(t, e, auth.Gen)
-			testF105_8bPreserve(t, e, auth)
+		{"preserving closure over an empty ledger", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
+			test8bInstallEmpty(t, e, auth.Gen)
+			test8bPreserve(t, e, auth)
 			return false
 		}, true},
-		{"preserving closure over a listed acquisition", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
+		{"preserving closure over a listed acquisition", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
 			testPlantSharedAcq(t, e, auth.Gen, "g8b-pres")
-			testF105_8bPreserve(t, e, auth)
+			test8bPreserve(t, e, auth)
 			return false
 		}, false},
-		{"serving with no closure, empty ledger", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
-			testF105_8bInstallEmpty(t, e, auth.Gen)
+		{"serving with no closure, empty ledger", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
+			test8bInstallEmpty(t, e, auth.Gen)
 			return false
 		}, false},
-		{"authority read absent, absent ledger", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
+		{"authority read absent, absent ledger", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
 			return true
 		}, true},
-		{"authority read absent, listed acquisition", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
+		{"authority read absent, listed acquisition", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
 			testPlantSharedAcq(t, e, auth.Gen, "g8b-abs")
 			return true
 		}, false},
-		{"corrupt ledger behind a discarding closure", func(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) bool {
+		{"corrupt ledger behind a discarding closure", func(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) bool {
 			testDiscardClose(t, e)
 			if _, err := e.asm.jsa.storeMsg(mqttSharedLedgerSubject(getHash(e.id), auth.Gen), 0, []byte(`{"epoch":`)); err != nil {
 				t.Fatalf("planting a corrupt ledger: %v", err)
@@ -188,14 +188,14 @@ func TestF105_8bClosingLicenceMatrix(t *testing.T) {
 	}
 	for i, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "f105-8b-licence-"+string(rune('a'+i)))
+			e, done := testNewEnv(t, "f105-8b-licence-"+string(rune('a'+i)))
 			defer done()
 			auth, _ := e.bootstrap(t, "txn-1")
 			gen := auth.Gen
 			absent := r.setup(t, e, auth)
-			_, sealedBefore, _ := testF105_8bLedgerState(e, gen)
+			_, sealedBefore, _ := test8bLedgerState(e, gen)
 			err := e.asm.jsa.closeRetiringGeneration(e.id, e.epoch, gen, absent)
-			st, sealed, n := testF105_8bLedgerState(e, gen)
+			st, sealed, n := test8bLedgerState(e, gen)
 			if r.licensed {
 				if err != nil {
 					t.Fatalf("a licensed closing withheld: %v", err)
@@ -219,19 +219,19 @@ func TestF105_8bClosingLicenceMatrix(t *testing.T) {
 // released from the SEALED set; and a closing that fails after sealing that late join is finished
 // by the next driver, which resumes from the sealed ledger. Mutations S2b (release from the
 // pre-seal load) and M-sealed-resume.
-func TestF105_8bLateJoinIsReleasedFromTheSealedSet(t *testing.T) {
+func Test8bLateJoinIsReleasedFromTheSealedSet(t *testing.T) {
 	for _, crash := range []bool{false, true} {
 		name := "completes"
 		if crash {
 			name = "fails after the seal, then resumes"
 		}
 		t.Run(name, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "f105-8b-latejoin")
+			e, done := testNewEnv(t, "f105-8b-latejoin")
 			defer done()
 			auth, _ := e.bootstrap(t, "txn-1")
 			gen := auth.Gen
-			testF105_8bInstallEmpty(t, e, gen)
-			testF105_8bPreserve(t, e, auth)
+			test8bInstallEmpty(t, e, gen)
+			test8bPreserve(t, e, auth)
 			var joined atomic.Bool
 			hook := func(g string) {
 				if g == gen && joined.CompareAndSwap(false, true) {
@@ -248,7 +248,7 @@ func TestF105_8bLateJoinIsReleasedFromTheSealedSet(t *testing.T) {
 				if _, err := e.asm.jsa.sealSharedLedger(e.id, e.epoch, gen); err != nil {
 					t.Fatalf("sealing as the crashed driver did: %v", err)
 				}
-				if _, sealed, n := testF105_8bLedgerState(e, gen); !sealed || n != 1 {
+				if _, sealed, n := test8bLedgerState(e, gen); !sealed || n != 1 {
 					t.Fatalf("the crashed driver's ledger must be sealed listing the late join: sealed=%v n=%d", sealed, n)
 				}
 			}
@@ -265,27 +265,27 @@ func TestF105_8bLateJoinIsReleasedFromTheSealedSet(t *testing.T) {
 // T13e: the stated residue. A join that lands after the empty observation but BEFORE the seal,
 // with the closing failing in between, leaves an open listed ledger behind a preserving closure;
 // the next driver withholds on it (docs/CONFORMANCE.md).
-func TestF105_8bLateJoinBeforeTheSealWithholds(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-8b-residue")
+func Test8bLateJoinBeforeTheSealWithholds(t *testing.T) {
+	e, done := testNewEnv(t, "f105-8b-residue")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	gen := auth.Gen
-	testF105_8bInstallEmpty(t, e, gen)
-	testF105_8bPreserve(t, e, auth)
+	test8bInstallEmpty(t, e, gen)
+	test8bPreserve(t, e, auth)
 	testPlantSharedAcq(t, e, gen, "g8b-residue")
 	err := e.asm.jsa.closeRetiringGeneration(e.id, e.epoch, gen, false)
 	if !errors.Is(err, errMQTTClosingUnlicensed) {
 		t.Fatalf("a preserving closure over an open listed ledger returned %v: want the withhold", err)
 	}
-	if _, sealed, _ := testF105_8bLedgerState(e, gen); sealed {
+	if _, sealed, _ := test8bLedgerState(e, gen); sealed {
 		t.Fatal("the withheld closing sealed the ledger")
 	}
 }
 
 // A1a: the fast path's receipt binding refuses a carried authority whose tenure is not the one the
 // receipt authorizes, before anything is sent. Mutation A-fast-bind.
-func TestF105_8bFastCloseRefusesAMismatchedReceipt(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-8b-fastbind")
+func Test8bFastCloseRefusesAMismatchedReceipt(t *testing.T) {
+	e, done := testNewEnv(t, "f105-8b-fastbind")
 	defer done()
 	auth, seq := e.bootstrap(t, "txn-1")
 	ret := &mqttRetirementRequest{
@@ -303,16 +303,16 @@ func TestF105_8bFastCloseRefusesAMismatchedReceipt(t *testing.T) {
 // A1b: the transition boundary refuses a close-teardown whose closure does not discard, on an
 // otherwise-valid transition (a discarding retirement standing, no affine member). Mutation
 // A-fast-validate.
-func TestF105_8bCloseTeardownMustDiscard(t *testing.T) {
+func Test8bCloseTeardownMustDiscard(t *testing.T) {
 	mk := func(discard bool) *mqttAuthorityTransition {
-		tr := testF105Transition()
+		tr := testTransition()
 		tr.Attempt.Kind = mqttTransitionCloseTeardown
 		tr.Auth.State = mqttAuthorityClosed
 		tr.Closure = &mqttGenClosure{
-			ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Txn: tr.Attempt.Txn, Discard: discard,
+			ID: testID, Epoch: testEpoch, Gen: testGen, Txn: tr.Attempt.Txn, Discard: discard,
 		}
 		tr.Retire = &mqttRetirementRequest{
-			Gen: testF105Gen, Tenure: tr.Prev.Tenure, OwnerTxn: tr.Prev.OwnerTxn,
+			Gen: testGen, Tenure: tr.Prev.Tenure, OwnerTxn: tr.Prev.OwnerTxn,
 			SessWID: "wid-x", SessSeq: 1, Reason: mqttRetireSessionEnd, Discard: true,
 		}
 		return tr
@@ -325,11 +325,11 @@ func TestF105_8bCloseTeardownMustDiscard(t *testing.T) {
 	}
 }
 
-// testF105_8bDropFirstCloseOutcome arms the request seam so that the FIRST close-teardown
+// test8bDropFirstCloseOutcome arms the request seam so that the FIRST close-teardown
 // attempt's outcome subject can never be written or read: its batch cannot commit, its
 // resolution stays unresolved, and its abort fails. Later attempts are untouched. It returns a
 // counter of close-teardown compositions that reached the send.
-func testF105_8bDropFirstCloseOutcome(t *testing.T, e *testF105Env) *atomic.Int32 {
+func test8bDropFirstCloseOutcome(t *testing.T, e *testOutboundEnv) *atomic.Int32 {
 	t.Helper()
 	var first atomic.Pointer[string]
 	var sent atomic.Int32
@@ -357,8 +357,8 @@ func testF105_8bDropFirstCloseOutcome(t *testing.T, e *testF105Env) *atomic.Int3
 // A2: the fast path never composes a second close while its first attempt is unresolved — the
 // abort failed and the resolution stays unresolved — it returns the error. Mutation
 // A-fast-recompose (restore the fall-through into the full episode).
-func TestF105_8bFastCloseDoesNotRecomposeWhileUnresolved(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-8b-fastunres")
+func Test8bFastCloseDoesNotRecomposeWhileUnresolved(t *testing.T) {
+	e, done := testNewEnv(t, "f105-8b-fastunres")
 	defer done()
 	auth, seq := e.bootstrap(t, "txn-1")
 	ret := &mqttRetirementRequest{
@@ -371,8 +371,8 @@ func TestF105_8bFastCloseDoesNotRecomposeWhileUnresolved(t *testing.T) {
 	if rerr != nil {
 		t.Fatal(rerr)
 	}
-	testF105_8bPlantReceipt(t, e, auth.Gen, rcpt)
-	sent := testF105_8bDropFirstCloseOutcome(t, e)
+	test8bPlantReceipt(t, e, auth.Gen, rcpt)
+	sent := test8bDropFirstCloseOutcome(t, e)
 	err := e.asm.jsa.closeTeardownGenerationFast(e.id, e.epoch, e.asm.domainTk, auth.Gen, auth, seq, ret)
 	if err == nil {
 		t.Fatal("an unresolved fast close reported success")
@@ -383,8 +383,8 @@ func TestF105_8bFastCloseDoesNotRecomposeWhileUnresolved(t *testing.T) {
 }
 
 // A2b: the full episode does not recompose either. Mutation A-ep-recompose.
-func TestF105_8bCloseEpisodeDoesNotRecomposeWhileUnresolved(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-8b-epunres")
+func Test8bCloseEpisodeDoesNotRecomposeWhileUnresolved(t *testing.T) {
+	e, done := testNewEnv(t, "f105-8b-epunres")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	ret := mqttRetirementRequest{
@@ -395,8 +395,8 @@ func TestF105_8bCloseEpisodeDoesNotRecomposeWhileUnresolved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	testF105_8bPlantReceipt(t, e, auth.Gen, rcpt)
-	sent := testF105_8bDropFirstCloseOutcome(t, e)
+	test8bPlantReceipt(t, e, auth.Gen, rcpt)
+	sent := test8bDropFirstCloseOutcome(t, e)
 	if err := e.asm.jsa.closeTeardownGeneration(e.id, e.epoch, e.asm.domainTk, auth.Gen); err == nil {
 		t.Fatal("an unresolved close episode reported success")
 	}
@@ -407,18 +407,18 @@ func TestF105_8bCloseEpisodeDoesNotRecomposeWhileUnresolved(t *testing.T) {
 
 // A3: a teardown close meeting a PRESERVING closure of its generation refuses rather than
 // reporting the discard done. Mutation A-nondiscard.
-func TestF105_8bCloseEpisodeRefusesAPreservingClosure(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-8b-nondiscard")
+func Test8bCloseEpisodeRefusesAPreservingClosure(t *testing.T) {
+	e, done := testNewEnv(t, "f105-8b-nondiscard")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105_8bPreserve(t, e, auth)
+	test8bPreserve(t, e, auth)
 	if err := e.asm.jsa.closeTeardownGeneration(e.id, e.epoch, e.asm.domainTk, auth.Gen); err == nil {
 		t.Fatal("a teardown close reported a preserving closure as its discard")
 	}
 }
 
-// testF105_8bPlantReceipt stores a teardown receipt for gen directly, create-only.
-func testF105_8bPlantReceipt(t *testing.T, e *testF105Env, gen string, r *mqttSessTeardownReceipt) {
+// test8bPlantReceipt stores a teardown receipt for gen directly, create-only.
+func test8bPlantReceipt(t *testing.T, e *testOutboundEnv, gen string, r *mqttSessTeardownReceipt) {
 	t.Helper()
 	body, err := json.Marshal(r)
 	if err != nil {
@@ -433,7 +433,7 @@ func testF105_8bPlantReceipt(t *testing.T, e *testF105Env, gen string, r *mqttSe
 // closed at ANOTHER generation; never a standing proposal (it may still finalize or cancel back
 // to this generation), never this generation, never an indeterminate or corrupt read. Mutation
 // M-never-served (an indeterminate read, or a proposal, taken as proof).
-func TestF105_8bNeverServedEvidence(t *testing.T) {
+func Test8bNeverServedEvidence(t *testing.T) {
 	const gen = "gen-retiring"
 	at := func(st mqttAuthorityState, g string) mqttAuthorityLoad {
 		return mqttAuthorityLoad{status: mqttOutboundValid, rec: &mqttOutboundAuthority{State: st, Gen: g}}

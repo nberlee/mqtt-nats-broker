@@ -34,7 +34,7 @@ import (
 // at the counter the record carries — never finished by execution, and never unrecorded.
 //
 // Mutations: M10 (adoption reports acquired), M7c/M7b (abandonment not recorded on discovery).
-func TestF105Row2PublishLostResponseIsAbandonedAtTheRecordsCounter(t *testing.T) {
+func TestRow2PublishLostResponseIsAbandonedAtTheRecordsCounter(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-lost", 2)
 	lost := testLoseNextAcquisitionResponse(t, s.e)
@@ -68,7 +68,7 @@ func TestF105Row2PublishLostResponseIsAbandonedAtTheRecordsCounter(t *testing.T)
 // back, proves the token and records the acquisition ABANDONED at the record's counter.
 //
 // Mutation: M7c (abandonment not recorded on late discovery).
-func TestF105Row2PublishUnresolvedLostResponseIsAbandonedWhenReconciled(t *testing.T) {
+func TestRow2PublishUnresolvedLostResponseIsAbandonedWhenReconciled(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-unresolved", 2)
 	lost := testLoseNextAcquisitionResponse(t, s.e)
@@ -118,7 +118,7 @@ func TestF105Row2PublishUnresolvedLostResponseIsAbandonedWhenReconciled(t *testi
 // tenure that is not its own.
 //
 // Mutation: M9 (the acquisition reads the serving authority instead of the connection's own).
-func TestF105Row2PublishAcquisitionEndsWithTheConnectionsEntitlement(t *testing.T) {
+func TestRow2PublishAcquisitionEndsWithTheConnectionsEntitlement(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-ended", 2)
 	ent, ok := s.e.c.outboundEntitlement()
@@ -177,7 +177,7 @@ func TestF105Row2PublishAcquisitionEndsWithTheConnectionsEntitlement(t *testing.
 //
 // Mutation: M3b (the class gate answers ordinary for shared/affine — the delivery then never
 // arrives, since a slot without an exchange acquires nothing through the authority).
-func TestF105Row2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
+func TestRow2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 	noActions := func(t *testing.T, sess *mqttSession, gen, lin string) {
 		t.Helper()
 		subs, whole, err := sess.jsa.streamSubjectsComplete(mqttInflightStreamName,
@@ -208,7 +208,7 @@ func TestF105Row2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 		return sess, gen, reg
 	}
 
-	// The shared QoS 1 leg is REPLACED BY NAME by TestF105Row2SharedQoS1PublishIsAnAcquiredAction:
+	// The shared QoS 1 leg is REPLACED BY NAME by TestRow2SharedQoS1PublishIsAnAcquiredAction:
 	// since 7a a shared delivery is ordinary, so the slot-only class is the experimental affine one.
 	t.Run("affine QoS 2", func(t *testing.T) {
 		testRequireExperimentalSharedQoS2(t)
@@ -242,7 +242,7 @@ func TestF105Row2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 //
 // Mutations: M1 (the shared branch admits through the pre-issue #107 writer: no exchange), M9 (shared
 // stays slot-only: no action record, the exchange never reaches Terminal).
-func TestF105Row2SharedQoS1PublishIsAnAcquiredAction(t *testing.T) {
+func TestRow2SharedQoS1PublishIsAnAcquiredAction(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -302,7 +302,7 @@ func TestF105Row2SharedQoS1PublishIsAnAcquiredAction(t *testing.T) {
 //
 // Mutations: M8 (ordinary QoS 1/2 written raw — the guard never holds the acquisition), M5
 // (consume not consulted — the duplicate is written).
-func TestF105Row2OrdinaryPublishExecutesItsAcquisitionOnce(t *testing.T) {
+func TestRow2OrdinaryPublishExecutesItsAcquisitionOnce(t *testing.T) {
 	for _, qos := range []byte{1, 2} {
 		qos := qos
 		t.Run(fmt.Sprintf("QoS %d", qos), func(t *testing.T) {
@@ -369,7 +369,7 @@ func TestF105Row2OrdinaryPublishExecutesItsAcquisitionOnce(t *testing.T) {
 // T6 (alias on). With an outbound Topic Alias the frame is built under the connection lock at
 // transmission, so the reference is HEAD's raw emitter on a twin connection with the same alias
 // state: the authorized write must put the identical bytes on the wire, and commit the alias.
-func TestF105Row2OrdinaryAliasedPublishIsTheRawEmittersFrame(t *testing.T) {
+func TestRow2OrdinaryAliasedPublishIsTheRawEmittersFrame(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-alias", 2)
 	s.e.c.mqtt.proto, s.e.c.mqtt.outTopicAliasMax = mqttProtoLevel5, 10
@@ -409,7 +409,7 @@ func TestF105Row2OrdinaryAliasedPublishIsTheRawEmittersFrame(t *testing.T) {
 // acquisition never consumed — and the section's end then records it ABANDONED.
 //
 // Mutation: M6 (the gate check removed — the frame is written past the seal).
-func TestF105Row2SealedGatePreventsTheAuthorizedPublish(t *testing.T) {
+func TestRow2SealedGatePreventsTheAuthorizedPublish(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-sealed", 2)
 	s.acquire(t)
@@ -434,7 +434,7 @@ func TestF105Row2SealedGatePreventsTheAuthorizedPublish(t *testing.T) {
 // and not the retained frames buffered ahead of it, which stay buffered for the next write.
 //
 // Mutation: M13b (missing-action ordinary traffic routed to the raw writer).
-func TestF105Row2OrdinaryPublishWithoutItsAcquisitionWritesNothing(t *testing.T) {
+func TestRow2OrdinaryPublishWithoutItsAcquisitionWritesNothing(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-noaction", 2)
 	sub := testRow2Sub()
@@ -460,7 +460,7 @@ func TestF105Row2OrdinaryPublishWithoutItsAcquisitionWritesNothing(t *testing.T)
 // outstanding to both.
 //
 // Mutation: M7b (abandonment not recorded at the section's end).
-func TestF105Row2IntentFailedPublishIsAbandonedInTheGuard(t *testing.T) {
+func TestRow2IntentFailedPublishIsAbandonedInTheGuard(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-intent", 2)
 	s.acquire(t)
@@ -481,7 +481,7 @@ func TestF105Row2IntentFailedPublishIsAbandonedInTheGuard(t *testing.T) {
 // acquisition ABANDONED in the frame guard.
 //
 // Mutation: M7b' (abandonment not recorded on the in-section drain).
-func TestF105Row2OversizeDisposedPublishIsAbandonedInTheGuard(t *testing.T) {
+func TestRow2OversizeDisposedPublishIsAbandonedInTheGuard(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-oversize", 2)
 	s.e.c.mqtt.maxPacketSize = 5
@@ -501,7 +501,7 @@ func TestF105Row2OversizeDisposedPublishIsAbandonedInTheGuard(t *testing.T) {
 // alone — the guard is fresh, so consumption would have admitted it — and nothing is written.
 //
 // Mutation: M16 (drainPublishAction does not close the output).
-func TestF105Row2DrainedPublishSectionAdmitsNoSavedRequest(t *testing.T) {
+func TestRow2DrainedPublishSectionAdmitsNoSavedRequest(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "row2-pub-closed", 2)
 	s.acquire(t)

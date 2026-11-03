@@ -77,20 +77,20 @@ const (
 const mqttChunkMaxBytes = 64 * 1024
 
 func mqttManifestSubject(idHash, gen, payloadID string) string {
-	return mqttF105SubjectPrefix() + mqttManifestClassTk + "." + idHash + "." + gen + "." + payloadID
+	return mqttOutboundRecordSubjectPrefix() + mqttManifestClassTk + "." + idHash + "." + gen + "." + payloadID
 }
 
 func mqttChunkSubject(idHash, gen, payloadID string, ord uint64) string {
-	return mqttF105SubjectPrefix() + mqttChunkClassTk + "." + idHash + "." + gen + "." +
+	return mqttOutboundRecordSubjectPrefix() + mqttChunkClassTk + "." + idHash + "." + gen + "." +
 		payloadID + "." + mqttFormatOrdinal(ord)
 }
 
 func mqttIsManifestSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttManifestClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttManifestClassTk+".")
 }
 
 func mqttIsChunkSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttChunkClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttChunkClassTk+".")
 }
 
 // mqttManifestState is how far one materialization has got.
@@ -247,13 +247,13 @@ func mqttValidateRetainedManifest(m *mqttRetainedManifest, wantID, wantEpoch, wa
 		return fmt.Errorf("retained manifest names %q/%q/%q/%q, not %q/%q/%q/%q",
 			m.ID, m.Epoch, m.Gen, m.Payload, wantID, wantEpoch, wantGen, wantPayload)
 	}
-	if !mqttF105IdentTk(m.Payload) {
+	if !mqttOutboundIdentTk(m.Payload) {
 		return fmt.Errorf("retained manifest carries a malformed payload identity %q", m.Payload)
 	}
-	if !mqttF105IdentTk(m.Inc) {
+	if !mqttOutboundIdentTk(m.Inc) {
 		return fmt.Errorf("retained manifest carries a malformed cleanup incarnation %q", m.Inc)
 	}
-	if !mqttF105IdentTk(m.Tenure) {
+	if !mqttOutboundIdentTk(m.Tenure) {
 		return fmt.Errorf("retained manifest carries a malformed producing tenure %q", m.Tenure)
 	}
 	// AN ADMISSION NAMES AN EXCHANGE, and only a payload that was whole could have taken one.
@@ -368,7 +368,7 @@ var mqttChunkMembers = map[string]struct{}{"ord": {}, "inc": {}, "data": {}}
 // mqttDecodeRetainedChunk reads a chunk that the caller knows belongs to a named
 // materialization, and refuses one that does not.
 func mqttDecodeRetainedChunk(data []byte, wantOrd uint64, wantInc string) (*mqttRetainedChunk, error) {
-	if !mqttF105IdentTk(wantInc) {
+	if !mqttOutboundIdentTk(wantInc) {
 		// AN EMPTY ARGUMENT IS NOT A PERMISSION. A blank token here used to mean "do not
 		// check", which is the shape this lane refuses everywhere else: a caller that wants
 		// whatever stands at an address says so by NAME, through the discovery decoder below.
@@ -412,7 +412,7 @@ func mqttValidateRetainedChunk(c *mqttRetainedChunk, wantOrd uint64, wantInc str
 	if c == nil {
 		return fmt.Errorf("retained chunk is absent")
 	}
-	if !mqttF105IdentTk(c.Inc) {
+	if !mqttOutboundIdentTk(c.Inc) {
 		return fmt.Errorf("retained chunk %d carries a malformed materialization %q", c.Ord, c.Inc)
 	}
 	// THE MATERIALIZATION IS CHECKED WHEREVER THE CALLER KNOWS IT. A caller that does not — a
@@ -729,7 +729,7 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mq
 
 // mqttParseManifestSubject reads a manifest subject's generation and payload identity.
 func mqttParseManifestSubject(subject, wantIDHash string) (string, string, error) {
-	rest, ok := strings.CutPrefix(subject, mqttF105SubjectPrefix()+mqttManifestClassTk+".")
+	rest, ok := strings.CutPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttManifestClassTk+".")
 	if !ok {
 		return _EMPTY_, _EMPTY_, fmt.Errorf("subject is not a retained manifest")
 	}
@@ -745,7 +745,7 @@ func mqttParseManifestSubject(subject, wantIDHash string) (string, string, error
 	if !mqttValidSessGen(toks[1]) {
 		return _EMPTY_, _EMPTY_, fmt.Errorf("malformed generation token %q", toks[1])
 	}
-	if !mqttF105IdentTk(toks[2]) {
+	if !mqttOutboundIdentTk(toks[2]) {
 		return _EMPTY_, _EMPTY_, fmt.Errorf("malformed payload token %q", toks[2])
 	}
 	return toks[1], toks[2], nil
@@ -753,7 +753,7 @@ func mqttParseManifestSubject(subject, wantIDHash string) (string, string, error
 
 // mqttParseChunkSubject reads a chunk subject's generation, payload identity and ordinal.
 func mqttParseChunkSubject(subject, wantIDHash string) (string, string, uint64, error) {
-	rest, ok := strings.CutPrefix(subject, mqttF105SubjectPrefix()+mqttChunkClassTk+".")
+	rest, ok := strings.CutPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttChunkClassTk+".")
 	if !ok {
 		return _EMPTY_, _EMPTY_, 0, fmt.Errorf("subject is not a retained chunk")
 	}
@@ -769,7 +769,7 @@ func mqttParseChunkSubject(subject, wantIDHash string) (string, string, uint64, 
 	if !mqttValidSessGen(toks[1]) {
 		return _EMPTY_, _EMPTY_, 0, fmt.Errorf("malformed generation token %q", toks[1])
 	}
-	if !mqttF105IdentTk(toks[2]) {
+	if !mqttOutboundIdentTk(toks[2]) {
 		return _EMPTY_, _EMPTY_, 0, fmt.Errorf("malformed payload token %q", toks[2])
 	}
 	ord, oerr := mqttParseOrdinal(toks[3])

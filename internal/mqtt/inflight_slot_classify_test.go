@@ -58,7 +58,7 @@ func testSlotPresent(cur *mqttInflightRecord) mqttSlotObservation {
 	}
 }
 
-func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
+func TestSlotClassifierAnswersEveryArm(t *testing.T) {
 	t.Parallel()
 	want := testSlotIntent()
 
@@ -275,12 +275,12 @@ func TestF105SlotClassifierAnswersEveryArm(t *testing.T) {
 	}
 }
 
-// TestF105SlotClassifierPrecedenceIsTheLadders pins the three orderings that are load-bearing.
+// TestSlotClassifierPrecedenceIsTheLadders pins the three orderings that are load-bearing.
 //
 // Each case is a record that satisfies TWO arms at once. An implementation with every arm
 // correct and the order wrong passes the table above and fails here, which is the whole reason
 // these are separate.
-func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
+func TestSlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 	t.Parallel()
 	want := testSlotIntent()
 
@@ -343,12 +343,12 @@ func TestF105SlotClassifierPrecedenceIsTheLadders(t *testing.T) {
 	})
 }
 
-// TestF105SlotMarkerIsAskedForExactlyOneDisposition pins which arm needs the second read.
+// TestSlotMarkerIsAskedForExactlyOneDisposition pins which arm needs the second read.
 //
 // Reading the marker for an arm that does not need it is a wasted round trip; NOT reading it
 // for the arm that does is the defect where a batch's shape gets taken for the store's answer,
 // which a mutation found in the replacement boundary.
-func TestF105SlotMarkerIsAskedForExactlyOneDisposition(t *testing.T) {
+func TestSlotMarkerIsAskedForExactlyOneDisposition(t *testing.T) {
 	t.Parallel()
 	all := []mqttSlotDisposition{
 		mqttSlotDispRefuse, mqttSlotDispCreate, mqttSlotDispReplace,
@@ -364,7 +364,7 @@ func TestF105SlotMarkerIsAskedForExactlyOneDisposition(t *testing.T) {
 	}
 }
 
-// TestF105SlotClassifierDrivesTheLiveLadder drives the REAL storeInflightRegister through one
+// TestSlotClassifierDrivesTheLiveLadder drives the REAL storeInflightRegister through one
 // planted occupant per shape and asserts the observable outcome.
 //
 // Its predecessor compared the arm the ladder took against the disposition the classifier
@@ -375,7 +375,7 @@ func TestF105SlotMarkerIsAskedForExactlyOneDisposition(t *testing.T) {
 //
 // Every case asserts the store DECLINED — none of these shapes may transmit — and that the
 // planted occupant is untouched where the disposition says it must be.
-func TestF105SlotClassifierDrivesTheLiveLadder(t *testing.T) {
+func TestSlotClassifierDrivesTheLiveLadder(t *testing.T) {
 	drive := func(t *testing.T, clientID string, plant func(e *testInflightEnv, subject string, pi uint16)) (*testInflightEnv, string, bool) {
 		t.Helper()
 		e := testNewInflightEnv(t, clientID)

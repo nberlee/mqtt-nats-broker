@@ -24,14 +24,14 @@ import (
 // THE FLOOR, END TO END (issue #114): real clients, real deliveries, the custody dispatcher's floor
 // unit doing the work.
 
-type testF112Sub struct {
+type testSub struct {
 	c    net.Conn
 	r    *mqttReader
 	sess *mqttSession
 }
 
-// testF112Subscribe connects a persistent QoS 1 subscriber and returns it with its resident session.
-func testF112Subscribe(t *testing.T, s *Server, o *Options, cid, topic string, resume bool) *testF112Sub {
+// testSubscribe connects a persistent QoS 1 subscriber and returns it with its resident session.
+func testSubscribe(t *testing.T, s *Server, o *Options, cid, topic string, resume bool) *testSub {
 	t.Helper()
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, resume)
@@ -46,11 +46,11 @@ func testF112Subscribe(t *testing.T, s *Server, o *Options, cid, topic string, r
 	if sess == nil {
 		t.Fatalf("no resident session for %q", cid)
 	}
-	return &testF112Sub{c: c, r: r, sess: sess}
+	return &testSub{c: c, r: r, sess: sess}
 }
 
-// testF112Deliver publishes n QoS 1 messages and has the subscriber acknowledge each.
-func testF112Deliver(t *testing.T, o *Options, sub *testF112Sub, topic string, n int) {
+// testFloorDeliver publishes n QoS 1 messages and has the subscriber acknowledge each.
+func testFloorDeliver(t *testing.T, o *Options, sub *testSub, topic string, n int) {
 	t.Helper()
 	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "f112-pub-" + mqttNewInflightNonce(), cleanSess: true},
 		o.MQTT.Host, o.MQTT.Port)
@@ -63,8 +63,8 @@ func testF112Deliver(t *testing.T, o *Options, sub *testF112Sub, topic string, n
 	}
 }
 
-// testF112SessLedger reads the session's generation ledger.
-func testF112SessLedger(t *testing.T, sess *mqttSession) *mqttGenLedger {
+// testSessLedger reads the session's generation ledger.
+func testSessLedger(t *testing.T, sess *mqttSession) *mqttGenLedger {
 	t.Helper()
 	sess.mu.Lock()
 	gen, id, jsa, asm := sess.gen, sess.id, sess.jsa, sess.asm
@@ -79,22 +79,22 @@ func testF112SessLedger(t *testing.T, sess *mqttSession) *mqttGenLedger {
 // T15. A healthy, continuously connected subscriber advances its floor with no reconnect and no
 // census requested: its own completions arm the floor unit, which resolves the duties from the
 // inventory, reclaims and deletes them, and prunes the ended-lineage veto.
-func TestF112AHealthySessionAdvancesItsFloorWithoutAReconnect(t *testing.T) {
+func TestAHealthySessionAdvancesItsFloorWithoutAReconnect(t *testing.T) {
 	const n = 600
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
-	sub := testF112Subscribe(t, s, o, "f112-t15", "f112/t15", false)
+	sub := testSubscribe(t, s, o, "f112-t15", "f112/t15", false)
 	defer sub.c.Close()
 
-	testF112Deliver(t, o, sub, "f112/t15", n)
+	testFloorDeliver(t, o, sub, "f112/t15", n)
 
 	// One periodic re-arm of the floor fits inside the deadline: the floor yields to deliveries, so
 	// what is left at the burst's end is retired at rest, after at most one tick (+20% jitter).
 	deadline := time.Now().Add(mqttFloorTick*6/5 + 30*time.Second)
 	var led *mqttGenLedger
 	for time.Now().Before(deadline) {
-		led = testF112SessLedger(t, sub.sess)
+		led = testSessLedger(t, sub.sess)
 		if led != nil && led.Lo > n-mqttFloorSlack && led.Del == led.Lo {
 			break
 		}

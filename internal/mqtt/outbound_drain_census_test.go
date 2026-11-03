@@ -53,7 +53,7 @@ var mqttDrainEntrySites = map[string]mqttOutputSite{
 	"shim_public.go|runShutdown|finishOwedActions":                             {1, "the shutdown sequence, after the send barriers drained"},
 }
 
-func TestF105DrainEntriesCannotRunDuringAWrite(t *testing.T) {
+func TestDrainEntriesCannotRunDuringAWrite(t *testing.T) {
 	names := map[string]struct{}{"startActionDrain": {}, "scheduleActionReconcile": {},
 		"noteOwedAction": {}, "finishOwedActions": {}}
 	entries, err := os.ReadDir(".")

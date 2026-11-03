@@ -48,12 +48,12 @@ const mqttCloseCertClassTk = "cert"
 // connection served. One connection acquires under exactly one generation (its entitlement is
 // set once and refused on replacement), so the generation scopes it without ambiguity.
 func mqttCloseCertSubject(idHash, gen, run, conn string) string {
-	return mqttF105SubjectPrefix() + mqttCloseCertClassTk + "." + idHash + "." + gen + "." + run + "." + conn
+	return mqttOutboundRecordSubjectPrefix() + mqttCloseCertClassTk + "." + idHash + "." + gen + "." + run + "." + conn
 }
 
 // mqttCloseCertWalkFilter enumerates one generation's certificates, and only those.
 func mqttCloseCertWalkFilter(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttCloseCertClassTk + "." + idHash + "." + gen + ".*.*"
+	return mqttOutboundRecordSubjectPrefix() + mqttCloseCertClassTk + "." + idHash + "." + gen + ".*.*"
 }
 
 // mqttDurableCloseCert is the persisted certificate: which connection, of which broker run,
@@ -83,7 +83,7 @@ func mqttValidateDurableCloseCert(c *mqttDurableCloseCert, wantID, wantEpoch, wa
 		return fmt.Errorf("closure certificate names %q/%q/%q connection %q/%q, not %q/%q/%q connection %q/%q",
 			c.ID, c.Epoch, c.Gen, c.Run, c.Conn, wantID, wantEpoch, wantGen, wantRun, wantConn)
 	}
-	if !mqttF105IdentTk(c.Gen) || !mqttF105IdentTk(c.Run) || !mqttF105IdentTk(c.Conn) {
+	if !mqttOutboundIdentTk(c.Gen) || !mqttOutboundIdentTk(c.Run) || !mqttOutboundIdentTk(c.Conn) {
 		return fmt.Errorf("closure certificate carries a token that cannot name a subject")
 	}
 	return nil
@@ -93,7 +93,7 @@ func mqttValidateDurableCloseCert(c *mqttDurableCloseCert, wantID, wantEpoch, wa
 // positively answered that none stands. An unreadable or foreign body is an ERROR, never an
 // absence — and neither is a licence, which is the caller's whole obligation.
 func (jsa *mqttJSA) loadDurableCloseCert(id, epoch, gen, run, conn string) (*mqttDurableCloseCert, error) {
-	if !mqttF105IdentTk(gen) || !mqttF105IdentTk(run) || !mqttF105IdentTk(conn) {
+	if !mqttOutboundIdentTk(gen) || !mqttOutboundIdentTk(run) || !mqttOutboundIdentTk(conn) {
 		return nil, fmt.Errorf("a closure certificate is named by generation, run and connection tokens, "+
 			"and %q/%q/%q cannot all name one", gen, run, conn)
 	}
@@ -294,7 +294,7 @@ func (sess *mqttSession) clearCertifiedActionToken(c *client, subject string, se
 	id, idHash, gen := sess.id, sess.idHash, sess.gen
 	sess.mu.Unlock()
 	epoch := as.sessStreamEpoch
-	if !mqttF105IdentTk(pre.Lin) {
+	if !mqttOutboundIdentTk(pre.Lin) {
 		return mqttCertifiedClearWithheld, 0
 	}
 	amsg, aerr := sess.jsa.loadLastMsgFor(mqttInflightStreamName, mqttActionSubject(idHash, gen, pre.Lin, pre.Acq))
@@ -424,7 +424,7 @@ func (sess *mqttSession) clearCertifiedTokensForResume(c *client) {
 	sess.mu.Lock()
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
-	if idHash == _EMPTY_ || !mqttF105IdentTk(gen) {
+	if idHash == _EMPTY_ || !mqttOutboundIdentTk(gen) {
 		return
 	}
 	certs, whole, err := sess.jsa.streamSubjectsComplete(mqttInflightStreamName, mqttCloseCertWalkFilter(idHash, gen))

@@ -31,7 +31,7 @@ import (
 // charge was released at the abandonment, Spec5 §4.9, and must not come back).
 //
 // Mutation M2: terminal duties skipped by the traversal -> the identifier is handed out.
-func TestF105ResumeKeepsAnAbandonedExchangesIdentifier(t *testing.T) {
+func TestResumeKeepsAnAbandonedExchangesIdentifier(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "t2-abandoned", 1)
 	if r := f.deny(); r != mqttAbandonDone {
@@ -74,7 +74,7 @@ func TestF105ResumeKeepsAnAbandonedExchangesIdentifier(t *testing.T) {
 // authorizes nothing: no actionable PUBREL entry is installed from it.
 //
 // Mutation M5: the PUBREL scan installs ordinary work.
-func TestF105ResumePubRelRecordAloneAuthorizesNothing(t *testing.T) {
+func TestResumePubRelRecordAloneAuthorizesNothing(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "t6-pubrel-alone")
 	testReadyForRealPubRelDelivery(t, e)
@@ -94,7 +94,7 @@ func TestF105ResumePubRelRecordAloneAuthorizesNothing(t *testing.T) {
 
 // T13 (M17a): a takeover on another broker that lands between the resume's walk and its apply —
 // its notification withheld — refuses the resume: no sendable entry is installed.
-func TestF105ResumeRefusedWhenTheEntitlementIsSupersededMidWalk(t *testing.T) {
+func TestResumeRefusedWhenTheEntitlementIsSupersededMidWalk(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "t13-remote", 1)
 	testRestart(f.e)
@@ -122,7 +122,7 @@ func TestF105ResumeRefusedWhenTheEntitlementIsSupersededMidWalk(t *testing.T) {
 // T13 (M17b): the local binding check. A same-object rebind during the walk — the session now
 // bound to another connection — refuses the stale resume's apply. (A production CONNECT cannot
 // schedule this; the client-ID gate holds through restoration. It is the check's unit test.)
-func TestF105ResumeRefusedAfterALocalRebindMidWalk(t *testing.T) {
+func TestResumeRefusedAfterALocalRebindMidWalk(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "t13-local", 1)
 	testRestart(f.e)
@@ -150,7 +150,7 @@ func TestF105ResumeRefusedAfterALocalRebindMidWalk(t *testing.T) {
 // T19, the withdrawal cut: the withdrawal (exchange WithdrawnUnsent, register tombstone) committed
 // and the broker died before the register delete. The resume finishes it: the identifier is free
 // and nothing is restored.
-func TestF105ResumeFinishesAWithdrawalCutBeforeItsDelete(t *testing.T) {
+func TestResumeFinishesAWithdrawalCutBeforeItsDelete(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "t19-withdraw-cut", 1)
 	testEndExchangeRemotely(t, f)
@@ -180,7 +180,7 @@ func TestF105ResumeFinishesAWithdrawalCutBeforeItsDelete(t *testing.T) {
 //
 // Mutations M14 (entitlement equality added to opAdvanceExchangeAck -> the captured PUBACK is
 // refused) and M15a (the ack advance's Acq fence removed -> the wrong acquisition lands).
-func TestF105OwnerIndependentAckLandsAfterATakeover(t *testing.T) {
+func TestOwnerIndependentAckLandsAfterATakeover(t *testing.T) {
 	t.Parallel()
 	t.Run("captured PUBACK completes", func(t *testing.T) {
 		t.Parallel()
@@ -216,7 +216,7 @@ func TestF105OwnerIndependentAckLandsAfterATakeover(t *testing.T) {
 // T13 (M30): a refused resume leaves the drains exactly as they stood. The drain recomputation is
 // COMPUTED during the walk and APPLIED only after apply's authority and binding checks, so a
 // resume superseded before apply installs no drain observation.
-func TestF105RefusedResumeInstallsNoDrainObservation(t *testing.T) {
+func TestRefusedResumeInstallsNoDrainObservation(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "t13-drain")
 	testReadyForRealPubRelDelivery(t, e)
@@ -261,7 +261,7 @@ func TestF105RefusedResumeInstallsNoDrainObservation(t *testing.T) {
 // after driveAcceptToServingAuthority) and is recorded in the plan as verified by reading.
 //
 // Mutation M8: the admission batch's authority CAS dropped -> (c) lands under a superseded tenure.
-func TestF105DelayedAdmissionAgainstTheSuccessorsFinalize(t *testing.T) {
+func TestDelayedAdmissionAgainstTheSuccessorsFinalize(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name       string

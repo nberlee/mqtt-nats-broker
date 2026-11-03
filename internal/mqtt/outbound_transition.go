@@ -740,7 +740,7 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 // false later. It carries no tenure, and it is refused for any generation not discarded.
 func mqttCheckDisposalLicence(t *mqttAuthorityTransition, discarding func(gen string) error) error {
 	for _, e := range t.Extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
 			continue
 		}
 		var r mqttOutboundResource
@@ -833,11 +833,11 @@ func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransit
 	// for any reference it liked — which is the hole this whole permission was carved out of.
 	enrolled := map[string]struct{}{}
 	for _, e := range t.Extra {
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok || cls != mqttResourceClassTk || e.expect != 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) == 4 {
 			enrolled[toks[3]] = struct{}{}
 		}
@@ -851,12 +851,12 @@ func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransit
 		if mqttIsShardSubject(e.subj) || mqttIsRootSubject(e.subj) {
 			continue
 		}
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok {
 			return fmt.Errorf("a %s transition carries member %q, which is no obligation class",
 				a.Kind, e.subj)
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		switch cls {
 		case mqttResourceClassTk:
 			if len(toks) != 4 || toks[1] != idHash || toks[2] != gen {
@@ -1222,7 +1222,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				// admitting the class is not admitting the content.
 				continue
 			}
-			if !mqttResourceIsF105Class(e.subj) {
+			if !mqttIsOutboundResourceSubject(e.subj) {
 				return fmt.Errorf("a dispose-resource transition carries member %q, which is "+
 					"neither a resource nor its inventory", e.subj)
 			}
@@ -1269,7 +1269,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				// not a resource, so it is not counted as one below.
 				continue
 			}
-			if !mqttResourceIsF105Class(e.subj) {
+			if !mqttIsOutboundResourceSubject(e.subj) {
 				return fmt.Errorf("a provision-resource transition carries member %q, which is "+
 					"neither a resource nor its inventory", e.subj)
 			}
@@ -1365,14 +1365,14 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				return fmt.Errorf("an advance-exchange transition carries member %q create-only, "+
 					"which would install an obligation rather than advance one", e.subj)
 			}
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
 				exchanges++
 				continue
 			}
 			// A HOLD RELEASE (issue #107 7c-lc): an ending releases its source and canonical-PUBREL
 			// edges in its own batch. checkResourceOverwrites confines such a member to exactly the
 			// release this batch's endings justify.
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttResourceClassTk {
 				continue
 			}
 			if _, perr := mqttParseInflightSubject(e.subj); perr == nil {
@@ -1402,7 +1402,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			if e.expect == 0 {
 				return fmt.Errorf("a release-holds transition carries member %q create-only: it creates nothing", e.subj)
 			}
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttResourceClassTk {
 				continue
 			}
 			if mqttIsDutySubject(e.subj) {
@@ -1428,13 +1428,13 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				return fmt.Errorf("a discard-exchange transition carries member %q create-only, which "+
 					"would install an obligation rather than end one", e.subj)
 			}
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
 				exchanges++
 				continue
 			}
 			// The discarded obligation's hold releases, confined by checkResourceOverwrites to
 			// exactly the edges this ending releases.
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttResourceClassTk {
 				continue
 			}
 			return fmt.Errorf("a discard-exchange transition carries member %q, which is neither the "+
@@ -1463,8 +1463,8 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				return fmt.Errorf("a withdraw-unsent transition carries member %q create-only, which "+
 					"would install an obligation rather than end one", e.subj)
 			}
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
-				toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+				toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 				if len(toks) != 4 {
 					return fmt.Errorf("a withdraw-unsent transition carries a malformed exchange %q", e.subj)
 				}
@@ -1474,7 +1474,7 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 			}
 			// The withdrawn obligation's hold releases (issue #107 7c-lc), confined by
 			// checkResourceOverwrites to exactly the edges this ending releases.
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttResourceClassTk {
 				continue
 			}
 			if name, perr := mqttParseInflightSubject(e.subj); perr == nil {
@@ -1520,8 +1520,8 @@ func mqttCheckTransitionKindRules(t *mqttAuthorityTransition) error {
 				return fmt.Errorf("an abandon-delivery transition carries member %q create-only, which "+
 					"would install an obligation rather than dispose of one", e.subj)
 			}
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
-				toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttExchangeClassTk {
+				toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 				if len(toks) != 4 {
 					return fmt.Errorf("an abandon-delivery transition carries a malformed exchange %q", e.subj)
 				}
@@ -1921,13 +1921,13 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 		return fmt.Errorf("transition %q carries member %q, which is not on the outbound in-flight stream",
 			a.Txn, e.subj)
 	}
-	if mqttIsF105ArbitrationSubject(e.subj) {
+	if mqttIsOutboundArbitrationSubject(e.subj) {
 		return fmt.Errorf("transition %q carries member %q, which is an arbitration record this writer owns",
 			a.Txn, e.subj)
 	}
 	// The obligation classes an admission installs are carried BY DESIGN, and are checked
 	// against this transition's own identity rather than merely permitted.
-	if cls, ok := mqttF105ObligationClass(e.subj); ok {
+	if cls, ok := mqttOutboundObligationClass(e.subj); ok {
 		return mqttCheckObligationMember(a, idHash, closureGen, cls, e)
 	}
 	// THE DIRECTORY CLASSES ARE ADMITTED ONLY BY A CLOSING TRANSITION, and only far enough to
@@ -1950,7 +1950,7 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	// Here it is only confirmed to be this client's and to decode. It is keyed by the physical
 	// NAME and NOT by generation, so — unlike a register — it is not checked against a.Gen.
 	if mqttIsNameOwnershipSubject(e.subj) {
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 3 {
 			return fmt.Errorf("transition %q carries a malformed ownership subject %q", a.Txn, e.subj)
 		}
@@ -1970,7 +1970,7 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 		}
 		return nil
 	}
-	if mqttIsF105Subject(e.subj) {
+	if mqttIsOutboundRecordSubject(e.subj) {
 		return fmt.Errorf("transition %q carries member %q, which is under the arbitration "+
 			"prefix but is no record class this broker writes", a.Txn, e.subj)
 	}
@@ -2107,7 +2107,7 @@ func mqttKindEndsEarlierGeneration(k mqttTransitionKind) bool {
 func mqttCheckObligationMember(a *mqttTransitionAttempt, idHash, closureGen, cls string,
 	e mqttTransitionMember) error {
 
-	toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+	toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 	switch cls {
 	case mqttRelClassTk:
 		return mqttCheckRetainedRelMember(a, idHash, e)
@@ -2242,7 +2242,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 
 	pred := make(map[string]mqttExchangePhase)
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
 			continue
 		}
 		// A create-only member installs a NEW exchange and has nothing to be compared
@@ -2250,7 +2250,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 		if e.expect == 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return nil, fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
 		}
@@ -2418,10 +2418,10 @@ func (jsa *mqttJSA) checkSupersededPredecessors(a *mqttTransitionAttempt, extra 
 	freshPI := map[uint16]struct{}{}
 	var superseded []*mqttOutboundExchange
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}
@@ -2463,10 +2463,10 @@ func (jsa *mqttJSA) batchExchangeState(a *mqttTransitionAttempt,
 
 	out := map[string]*mqttOutboundExchange{}
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return nil, fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
 		}
@@ -2522,10 +2522,10 @@ func (jsa *mqttJSA) checkCreatedExchanges(a *mqttTransitionAttempt, extra []mqtt
 		_ = key
 	}
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk || e.expect != 0 {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttExchangeClassTk || e.expect != 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
 		}
@@ -2588,7 +2588,7 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 	// below can exempt a continued obligation without exempting a fresh one.
 	replaces := map[string]bool{}
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) {
+		if mqttIsOutboundRecordSubject(e.subj) {
 			continue
 		}
 		if name, perr := mqttParseInflightSubject(e.subj); perr == nil {
@@ -2666,10 +2666,10 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 	// standing obligation it collided with had never occupied that subject.
 	admitted := map[string]struct{}{}
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk || e.expect != 0 {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttExchangeClassTk || e.expect != 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) == 4 {
 			admitted[toks[2]+"."+toks[3]] = struct{}{}
 		}
@@ -2711,10 +2711,10 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 	}
 
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttExchangeClassTk || e.expect != 0 {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttExchangeClassTk || e.expect != 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}
@@ -2802,11 +2802,11 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 	claimed := map[string]string{}
 	gens := map[string]map[uint16]struct{}{}
 	for _, e := range extra {
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk || e.expect != 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}
@@ -2899,7 +2899,7 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, prev *mqttOutboundAuthority,
 	extra []mqttTransitionMember) error {
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk || e.expect != 0 {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttResourceClassTk || e.expect != 0 {
 			continue
 		}
 		// AND ONLY TWO KINDS MAY DO IT. Provisioning is new work and requires a serving
@@ -2917,7 +2917,7 @@ func (jsa *mqttJSA) checkCreatedResources(a *mqttTransitionAttempt, prev *mqttOu
 				"provision-resource transition provisions one, and only a closing transition "+
 				"enrols one", a.Txn, a.Kind, e.subj)
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return fmt.Errorf("transition %q carries a malformed resource subject %q", a.Txn, e.subj)
 		}
@@ -3074,7 +3074,7 @@ func mqttCheckRetirementPairing(a *mqttTransitionAttempt, extra []mqttTransition
 	}
 	paired := map[ownKey]bool{}
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
 			continue
 		}
 		var r mqttOutboundResource
@@ -3138,10 +3138,10 @@ func (jsa *mqttJSA) checkActionMembers(a *mqttTransitionAttempt, extra []mqttTra
 	acquired := map[string]uint64{}
 
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttActionClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttActionClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 5 {
 			return fmt.Errorf("transition %q carries a malformed action subject %q", a.Txn, e.subj)
 		}
@@ -3290,11 +3290,11 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 	createdX := map[string]*mqttOutboundExchange{}
 	endedHere := map[string]*mqttOutboundExchange{}
 	for _, e := range extra {
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}
@@ -3327,7 +3327,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 	// validators: this states the resource cardinality and nothing about them.
 	disposed := 0
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttResourceClassTk && e.expect != 0 {
+		if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttResourceClassTk && e.expect != 0 {
 			disposed++
 		}
 	}
@@ -3482,14 +3482,14 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 	}
 
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttResourceClassTk {
 			continue
 		}
 		// Create-only provisions a new incarnation and has nothing to compare against.
 		if e.expect == 0 {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return fmt.Errorf("transition %q carries a malformed resource subject %q", a.Txn, e.subj)
 		}

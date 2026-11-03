@@ -28,9 +28,9 @@ import (
 // first enrolment that seals directly and allocates no root — and a composer never produces one.
 // A rule proven only through the composer is a rule the boundary never had to make.
 
-// testF105ClosingBatch submits a closing transition with the given extra members, under a
+// testClosingBatch submits a closing transition with the given extra members, under a
 // closure the caller shapes.
-func testF105ClosingBatch(t *testing.T, e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64,
+func testClosingBatch(t *testing.T, e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn string, closure *mqttGenClosure, members ...mqttTransitionMember) error {
 	t.Helper()
 	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
@@ -50,15 +50,15 @@ func testF105ClosingBatch(t *testing.T, e *testF105Env, prev *mqttOutboundAuthor
 	return err
 }
 
-// testF105ClosureRecord builds a closure naming a root address.
-func testF105ClosureRecord(e *testF105Env, txn string, discard bool, shard, ord uint64) *mqttGenClosure {
+// testClosureRecord builds a closure naming a root address.
+func testClosureRecord(e *testOutboundEnv, txn string, discard bool, shard, ord uint64) *mqttGenClosure {
 	return &mqttGenClosure{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: txn, Discard: discard,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: txn, Discard: discard,
 		RootShard: shard, RootOrd: ord,
 	}
 }
 
-func testF105Member(t *testing.T, subj string, expect uint64, v any) mqttTransitionMember {
+func testMember(t *testing.T, subj string, expect uint64, v any) mqttTransitionMember {
 	t.Helper()
 	body, err := json.Marshal(v)
 	if err != nil {
@@ -67,10 +67,10 @@ func testF105Member(t *testing.T, subj string, expect uint64, v any) mqttTransit
 	return mqttTransitionMember{subj: subj, expect: expect, body: body}
 }
 
-// TestF105ClosureAllocatesAReachableRoot is the positive baseline: one batch leaves the closure,
+// TestClosureAllocatesAReachableRoot is the positive baseline: one batch leaves the closure,
 // a sealed ledger, the shard header and a root the closure's own address names.
-func TestF105ClosureAllocatesAReachableRoot(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-enrol-happy")
+func TestClosureAllocatesAReachableRoot(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-enrol-happy")
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
@@ -79,7 +79,7 @@ func TestF105ClosureAllocatesAReachableRoot(t *testing.T) {
 		t.Fatalf("closing the generation: %v", err)
 	}
 
-	closed, _, status := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen)
+	closed, _, status := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen)
 	if status != mqttOutboundValid {
 		t.Fatalf("the closure does not stand: status %v", status)
 	}
@@ -98,10 +98,10 @@ func TestF105ClosureAllocatesAReachableRoot(t *testing.T) {
 	if rerr != nil || root == nil {
 		t.Fatalf("the recovery root does not stand: %v", rerr)
 	}
-	if root.Gen != testF105Gen || root.ID != e.id || root.Epoch != e.epoch {
+	if root.Gen != testGen || root.ID != e.id || root.Epoch != e.epoch {
 		t.Fatalf("the root names %q/%q/%q", root.ID, root.Epoch, root.Gen)
 	}
-	led, _, lerr := e.asm.jsa.loadGenLedger(e.id, e.epoch, testF105Gen)
+	led, _, lerr := e.asm.jsa.loadGenLedger(e.id, e.epoch, testGen)
 	if lerr != nil || led == nil || led.State != mqttGenLedgerSealed {
 		t.Fatalf("the ledger is not sealed: %v %+v", lerr, led)
 	}
@@ -109,34 +109,34 @@ func TestF105ClosureAllocatesAReachableRoot(t *testing.T) {
 		t.Fatalf("the root is bounded at %d and the ledger sealed at %d", root.Bound, led.SealedHi)
 	}
 	// AND THE GATE FINDS IT BY ADDRESS.
-	reach, gerr := e.asm.recoveryRootReachable(e.id, e.epoch, testF105Gen, closed)
+	reach, gerr := e.asm.recoveryRootReachable(e.id, e.epoch, testGen, closed)
 	if gerr != nil || !reach {
 		t.Fatalf("the gate does not reach the root it was handed the address of: %v %v", reach, gerr)
 	}
 }
 
-// TestF105EveryClosureSealsAndRoots pins the two arms that ONLY boundary rule 1 can reject: a
+// TestEveryClosureSealsAndRoots pins the two arms that ONLY boundary rule 1 can reject: a
 // closure carrying no ledger, header or root member at all, over a generation whose ledger stands
 // OPEN, and the same over a generation with no ledger yet. Both satisfy every other rule
 // vacuously, so nothing else is able to refuse them.
-func TestF105EveryClosureSealsAndRoots(t *testing.T) {
+func TestEveryClosureSealsAndRoots(t *testing.T) {
 	t.Run("open ledger, no members", func(t *testing.T) {
-		e, cleanup := testF105NewEnv(t, "client-f105-enrol-open")
+		e, cleanup := testNewEnv(t, "client-f105-enrol-open")
 		defer cleanup()
 		auth, seq := e.bootstrap(t, "txn-boot")
 		// An OPEN ledger with one duty, so the generation genuinely has an inventory.
-		if err := testF105SubmitInventory(t, e, "txn-alloc",
-			testF105LedgerMember(t, e, 0, &mqttGenLedger{
+		if err := testSubmitInventory(t, e, "txn-alloc",
+			testLedgerMember(t, e, 0, &mqttGenLedger{
 				Lo: 1, Del: 1,
-				ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 1,
+				ID: e.id, Epoch: e.epoch, Gen: testGen, State: mqttGenLedgerOpen, Hi: 1,
 			}),
-			testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-a", mqttDutyNotYetActionable)),
+			testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyCleanup, "inc-a", mqttDutyNotYetActionable)),
 		); err != nil {
 			t.Fatalf("planting an open inventory: %v", err)
 		}
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-		err := testF105ClosingBatch(t, e, al.rec, al.seq, "txn-close",
-			testF105ClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1))
+		err := testClosingBatch(t, e, al.rec, al.seq, "txn-close",
+			testClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1))
 		if err == nil {
 			t.Fatal("a closure that seals nothing was accepted")
 		}
@@ -148,11 +148,11 @@ func TestF105EveryClosureSealsAndRoots(t *testing.T) {
 	})
 
 	t.Run("absent ledger, no members", func(t *testing.T) {
-		e, cleanup := testF105NewEnv(t, "client-f105-enrol-absent")
+		e, cleanup := testNewEnv(t, "client-f105-enrol-absent")
 		defer cleanup()
 		auth, seq := e.bootstrap(t, "txn-boot")
-		err := testF105ClosingBatch(t, e, auth, seq, "txn-close",
-			testF105ClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1))
+		err := testClosingBatch(t, e, auth, seq, "txn-close",
+			testClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1))
 		if err == nil {
 			t.Fatal("a closure over a generation with no ledger sealed nothing and was accepted")
 		}
@@ -162,14 +162,14 @@ func TestF105EveryClosureSealsAndRoots(t *testing.T) {
 	})
 
 	t.Run("sealed ledger, no root", func(t *testing.T) {
-		e, cleanup := testF105NewEnv(t, "client-f105-enrol-noroot")
+		e, cleanup := testNewEnv(t, "client-f105-enrol-noroot")
 		defer cleanup()
 		auth, seq := e.bootstrap(t, "txn-boot")
-		err := testF105ClosingBatch(t, e, auth, seq, "txn-close",
-			testF105ClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1),
-			testF105LedgerMember(t, e, 0, &mqttGenLedger{
+		err := testClosingBatch(t, e, auth, seq, "txn-close",
+			testClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1),
+			testLedgerMember(t, e, 0, &mqttGenLedger{
 				Lo: 1, Del: 1,
-				ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				ID: e.id, Epoch: e.epoch, Gen: testGen,
 				State: mqttGenLedgerSealed, Hi: 0, SealedHi: 0,
 			}),
 		)
@@ -182,20 +182,20 @@ func TestF105EveryClosureSealsAndRoots(t *testing.T) {
 	})
 }
 
-// TestF105RootMembersAreRefusedOutsideAClosingTransition establishes that a transition writing no
+// TestRootMembersAreRefusedOutsideAClosingTransition establishes that a transition writing no
 // closure may not carry a directory member at all.
-func TestF105RootMembersAreRefusedOutsideAClosingTransition(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-root-outside")
+func TestRootMembersAreRefusedOutsideAClosingTransition(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-root-outside")
 	defer cleanup()
 	e.bootstrap(t, "txn-boot")
 
 	shard := mqttDirShardFor(getHash(e.id))
 	root := &mqttRecoveryRoot{
-		Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+		Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testGen,
 		SweepStart: 1, Resume: 1, Bound: 0,
 	}
-	err := testF105SubmitInventory(t, e, "txn-smuggle",
-		testF105Member(t, mqttRootSubject(shard, 1), 0, root))
+	err := testSubmitInventory(t, e, "txn-smuggle",
+		testMember(t, mqttRootSubject(shard, 1), 0, root))
 	if err == nil {
 		t.Fatal("a dispose-resource transition carried a recovery root and was accepted")
 	}
@@ -209,24 +209,24 @@ func TestF105RootMembersAreRefusedOutsideAClosingTransition(t *testing.T) {
 	}
 }
 
-// TestF105RootBoundEqualsTheSealTheBatchInstalls makes the pre-batch and post-batch bounds DIFFER,
+// TestRootBoundEqualsTheSealTheBatchInstalls makes the pre-batch and post-batch bounds DIFFER,
 // so a root bounded at the earlier one is refused rather than accidentally equal.
-func TestF105RootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-root-bound")
+func TestRootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-root-bound")
 	defer cleanup()
 	e.bootstrap(t, "txn-boot")
 
 	// One duty already allocated, so the ledger stands OPEN at 1; the closing batch seals at 2.
-	if err := testF105SubmitInventory(t, e, "txn-alloc",
-		testF105LedgerMember(t, e, 0, &mqttGenLedger{
+	if err := testSubmitInventory(t, e, "txn-alloc",
+		testLedgerMember(t, e, 0, &mqttGenLedger{
 			Lo: 1, Del: 1,
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 1,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, State: mqttGenLedgerOpen, Hi: 1,
 		}),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-a", mqttDutyNotYetActionable)),
+		testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyCleanup, "inc-a", mqttDutyNotYetActionable)),
 	); err != nil {
 		t.Fatalf("planting an open inventory: %v", err)
 	}
-	led, ledSeq, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, testF105Gen)
+	led, ledSeq, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, testGen)
 	if led == nil || led.Hi != 1 {
 		t.Fatalf("the planted ledger is not open at 1: %+v", led)
 	}
@@ -235,17 +235,17 @@ func TestF105RootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	// The batch seals at 1 and the root is bounded at 0 — the pre-inventory bound, which is the
 	// mutation this test exists to kill. Nothing else differs, so only the bound rule can refuse.
-	err := testF105ClosingBatch(t, e, al.rec, al.seq, "txn-close",
-		testF105ClosureRecord(e, "txn-close", false, shard, 1),
-		testF105LedgerMember(t, e, ledSeq, &mqttGenLedger{
+	err := testClosingBatch(t, e, al.rec, al.seq, "txn-close",
+		testClosureRecord(e, "txn-close", false, shard, 1),
+		testLedgerMember(t, e, ledSeq, &mqttGenLedger{
 			Lo: 1, Del: 1,
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			State: mqttGenLedgerSealed, Hi: 1, SealedHi: 1,
 		}),
-		testF105Member(t, mqttShardSubject(shard), 0,
+		testMember(t, mqttShardSubject(shard), 0,
 			&mqttDirShard{Shard: shard, Hi: 1, Next: 1, Cycle: 1, Horizon: 1}),
-		testF105Member(t, mqttRootSubject(shard, 1), 0, &mqttRecoveryRoot{
-			Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+		testMember(t, mqttRootSubject(shard, 1), 0, &mqttRecoveryRoot{
+			Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testGen,
 			SweepStart: 1, Resume: 1, Bound: 0,
 		}),
 	)
@@ -257,10 +257,10 @@ func TestF105RootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
 	}
 }
 
-// TestF105HeaderAllocationPreservesTraversalState starts from distinct non-default traversal
+// TestHeaderAllocationPreservesTraversalState starts from distinct non-default traversal
 // state and asserts all three fields survive an allocation untouched.
-func TestF105HeaderAllocationPreservesTraversalState(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-header-preserve")
+func TestHeaderAllocationPreservesTraversalState(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-header-preserve")
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
@@ -290,35 +290,35 @@ func TestF105HeaderAllocationPreservesTraversalState(t *testing.T) {
 	}
 }
 
-// TestF105AnArbitraryBatchCannotForgeAnEnrolment walks the structural refusals, each arm built so
+// TestAnArbitraryBatchCannotForgeAnEnrolment walks the structural refusals, each arm built so
 // only the rule under test can reject it.
-func TestF105AnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
-	shardOf := func(e *testF105Env) uint64 { return mqttDirShardFor(getHash(e.id)) }
+func TestAnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
+	shardOf := func(e *testOutboundEnv) uint64 { return mqttDirShardFor(getHash(e.id)) }
 
 	// A helper that closes with a caller-shaped header and root.
-	try := func(t *testing.T, name string, mutate func(e *testF105Env, hdr *mqttDirShard,
+	try := func(t *testing.T, name string, mutate func(e *testOutboundEnv, hdr *mqttDirShard,
 		root *mqttRecoveryRoot, closure *mqttGenClosure), want string) {
 
 		t.Helper()
-		e, cleanup := testF105NewEnv(t, "client-f105-forge-"+name)
+		e, cleanup := testNewEnv(t, "client-f105-forge-"+name)
 		defer cleanup()
 		auth, seq := e.bootstrap(t, "txn-boot")
 		shard := shardOf(e)
 		hdr := &mqttDirShard{Shard: shard, Hi: 1, Next: 1, Cycle: 1, Horizon: 1}
 		root := &mqttRecoveryRoot{
-			Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+			Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testGen,
 			SweepStart: 1, Resume: 1, Bound: 0,
 		}
-		closure := testF105ClosureRecord(e, "txn-close", false, shard, 1)
+		closure := testClosureRecord(e, "txn-close", false, shard, 1)
 		mutate(e, hdr, root, closure)
-		err := testF105ClosingBatch(t, e, auth, seq, "txn-close", closure,
-			testF105LedgerMember(t, e, 0, &mqttGenLedger{
+		err := testClosingBatch(t, e, auth, seq, "txn-close", closure,
+			testLedgerMember(t, e, 0, &mqttGenLedger{
 				Lo: 1, Del: 1,
-				ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				ID: e.id, Epoch: e.epoch, Gen: testGen,
 				State: mqttGenLedgerSealed, Hi: 0, SealedHi: 0,
 			}),
-			testF105Member(t, mqttShardSubject(shard), 0, hdr),
-			testF105Member(t, mqttRootSubject(root.Shard, root.Ord), 0, root),
+			testMember(t, mqttShardSubject(shard), 0, hdr),
+			testMember(t, mqttRootSubject(root.Shard, root.Ord), 0, root),
 		)
 		if err == nil {
 			t.Fatalf("%s: the batch was accepted", name)
@@ -329,33 +329,33 @@ func TestF105AnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
 	}
 
 	t.Run("header moves Hi by two", func(t *testing.T) {
-		try(t, "hi-by-two", func(_ *testF105Env, hdr *mqttDirShard, root *mqttRecoveryRoot, _ *mqttGenClosure) {
+		try(t, "hi-by-two", func(_ *testOutboundEnv, hdr *mqttDirShard, root *mqttRecoveryRoot, _ *mqttGenClosure) {
 			hdr.Hi, root.Ord = 2, 2
 		}, "a first allocation creates ordinal 1")
 	})
 	t.Run("header rewrites the traversal position", func(t *testing.T) {
-		try(t, "rewrites-next", func(_ *testF105Env, hdr *mqttDirShard, _ *mqttRecoveryRoot, _ *mqttGenClosure) {
+		try(t, "rewrites-next", func(_ *testOutboundEnv, hdr *mqttDirShard, _ *mqttRecoveryRoot, _ *mqttGenClosure) {
 			hdr.Next, hdr.Horizon, hdr.Cycle = 1, 1, 7
 		}, "a first allocation creates ordinal 1 and a first cycle over it")
 	})
 	t.Run("closure names another address", func(t *testing.T) {
-		try(t, "wrong-address", func(_ *testF105Env, _ *mqttDirShard, _ *mqttRecoveryRoot, c *mqttGenClosure) {
+		try(t, "wrong-address", func(_ *testOutboundEnv, _ *mqttDirShard, _ *mqttRecoveryRoot, c *mqttGenClosure) {
 			c.RootOrd = 2
 		}, "and allocates")
 	})
 	t.Run("root names another generation", func(t *testing.T) {
-		try(t, "wrong-gen", func(_ *testF105Env, _ *mqttDirShard, root *mqttRecoveryRoot, _ *mqttGenClosure) {
+		try(t, "wrong-gen", func(_ *testOutboundEnv, _ *mqttDirShard, root *mqttRecoveryRoot, _ *mqttGenClosure) {
 			root.Gen = "0000000000000000000000"
 		}, "allocates a root naming")
 	})
 	t.Run("root cursor is not at birth", func(t *testing.T) {
-		try(t, "cursor", func(_ *testF105Env, _ *mqttDirShard, root *mqttRecoveryRoot, _ *mqttGenClosure) {
+		try(t, "cursor", func(_ *testOutboundEnv, _ *mqttDirShard, root *mqttRecoveryRoot, _ *mqttGenClosure) {
 			root.Bound, root.Resume = 3, 2
 		}, "a cursor that is not at birth")
 	})
 }
 
-// testF105EnrolClosing completes a hand-built closing transition so it satisfies the enrolment
+// testEnrolClosing completes a hand-built closing transition so it satisfies the enrolment
 // rules, deriving the same members the production composer derives.
 //
 // Every closure seals and roots (issue #107, row 6), so a fixture that hand-wrote only the closure is
@@ -366,7 +366,7 @@ func TestF105AnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
 //
 // It preserves whatever the fixture already put in Extra, because several of them carry members
 // of their own and the enrolment is additive.
-func testF105EnrolClosing(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition) *mqttAuthorityTransition {
+func testEnrolClosing(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition) *mqttAuthorityTransition {
 	t.Helper()
 	if tr.Closure == nil {
 		return tr
@@ -414,7 +414,7 @@ func testF105EnrolClosing(t *testing.T, e *testF105Env, tr *mqttAuthorityTransit
 	return tr
 }
 
-// TestF105ALedgerIsSealedOnlyInAClosingBatch is holistic round 10's finding, and the worst of the
+// TestALedgerIsSealedOnlyInAClosingBatch is holistic round 10's finding, and the worst of the
 // no-closure bypasses because its consequence is PERMANENT.
 //
 // Sealing is the closing act: the enrolment rules derive the root's bound from the seal the batch
@@ -423,7 +423,7 @@ func testF105EnrolClosing(t *testing.T, e *testF105Env, tr *mqttAuthorityTransit
 // can never close it, the inventory cannot be reopened, and no root will ever exist for the
 // recovery pass to find. A generation that can neither close nor be recovered is exactly what the
 // enrolment exists to prevent.
-func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
+func TestALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		expect uint64
@@ -432,7 +432,7 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 		{"open moved to sealed", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			e, cleanup := testF105NewEnv(t, "client-f105-seal-"+strings.ReplaceAll(tc.name, " ", "-"))
+			e, cleanup := testNewEnv(t, "client-f105-seal-"+strings.ReplaceAll(tc.name, " ", "-"))
 			defer cleanup()
 			auth, seq := e.bootstrap(t, "txn-boot")
 
@@ -440,15 +440,15 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 			if expect != 0 {
 				// Give the generation a real OPEN ledger first, so the second arm is a genuine
 				// OPEN-to-SEALED move rather than another create.
-				if err := testF105SubmitInventory(t, e, "txn-open",
-					testF105LedgerMember(t, e, 0, &mqttGenLedger{
+				if err := testSubmitInventory(t, e, "txn-open",
+					testLedgerMember(t, e, 0, &mqttGenLedger{
 						Lo: 1, Del: 1,
-						ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+						ID: e.id, Epoch: e.epoch, Gen: testGen,
 						State: mqttGenLedgerOpen, Hi: 0,
 					})); err != nil {
 					t.Fatalf("opening the ledger: %v", err)
 				}
-				_, lseq := testF105LoadLedger(t, e)
+				_, lseq := testLoadLedger(t, e)
 				expect = lseq
 				auth2 := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 				auth, seq = auth2.rec, auth2.seq
@@ -467,9 +467,9 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 					OwnerTxn: auth.OwnerTxn,
 				},
 				Extra: []mqttTransitionMember{
-					testF105LedgerMember(t, e, expect, &mqttGenLedger{
+					testLedgerMember(t, e, expect, &mqttGenLedger{
 						Lo: 1, Del: 1,
-						ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+						ID: e.id, Epoch: e.epoch, Gen: testGen,
 						State: mqttGenLedgerSealed, Hi: 0, SealedHi: 0,
 					}),
 				},
@@ -487,7 +487,7 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 	}
 }
 
-// TestF105AnAffineResourceIsBornOnlyInAClosingBatch is holistic round 9's finding.
+// TestAnAffineResourceIsBornOnlyInAClosingBatch is holistic round 9's finding.
 //
 // The born-PENDING rule and the discarding-disposition rule are both keyed on the batch's
 // CLOSURE, so a batch that writes no closure was never asked either question. That let a
@@ -496,13 +496,13 @@ func TestF105ALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 // the recovery pass would authorize and delete the consumer with no readiness and no discard
 // licence behind it — defeating the structural exclusion of affine cleanup from preserving
 // closures.
-func TestF105AnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-affine-noclosure")
+func TestAnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-affine-noclosure")
 	defer cleanup()
 	auth, seq := e.bootstrap(t, "txn-boot")
 
-	_, _, durable := mqttQ2AffineNames(getHash(e.id), testF105Gen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, durable := mqttQ2AffineNames(getHash(e.id), testGen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
 	for _, tc := range []struct {
 		name string
@@ -513,8 +513,8 @@ func TestF105AnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &mqttOutboundResource{
-				ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: "inc-aff-" + tc.name,
-				Kind: mqttResourceAffineConsumer, Name: durable, AffGen: testF105Gen,
+				ID: e.id, Epoch: e.epoch, Gen: testGen, Inc: "inc-aff-" + tc.name,
+				Kind: mqttResourceAffineConsumer, Name: durable, AffGen: testGen,
 				PubRelDur: pubRelDur, State: mqttResourceLive, Prov: tc.prov,
 				Deps: []mqttResourceEdge{},
 			}
@@ -537,20 +537,20 @@ func TestF105AnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 				},
 				Extra: []mqttTransitionMember{
 					{
-						subj:   mqttResourceSubject(getHash(e.id), testF105Gen, r.Inc),
+						subj:   mqttResourceSubject(getHash(e.id), testGen, r.Inc),
 						expect: 0, body: body,
 					},
 					// The cleanup duty and an OPEN ledger ride along, because the affine
 					// coverage rule refuses a resource with no duty naming it — without them
 					// this batch is refused for a different reason and never reaches the rule
 					// under test.
-					testF105DutyMember(t, e, 0, &mqttDutyEntry{
-						ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: 1,
+					testDutyMember(t, e, 0, &mqttDutyEntry{
+						ID: e.id, Epoch: e.epoch, Gen: testGen, Ord: 1,
 						Kind: mqttDutyCleanup, Ref: r.Inc, State: mqttDutyPending,
 					}),
-					testF105LedgerMember(t, e, 0, &mqttGenLedger{
+					testLedgerMember(t, e, 0, &mqttGenLedger{
 						Lo: 1, Del: 1,
-						ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+						ID: e.id, Epoch: e.epoch, Gen: testGen,
 						State: mqttGenLedgerOpen, Hi: 1,
 					}),
 				},
@@ -570,7 +570,7 @@ func TestF105AnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 	}
 }
 
-// TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement is holistic round 11's finding.
+// TestAnAffineEnrolmentIsBoundToTheStandingRetirement is holistic round 11's finding.
 //
 // The discard disposition says the generation's obligations are abandoned. It does NOT say which
 // consumer that licenses deleting — and everything the executor acts on is derived from the
@@ -578,17 +578,17 @@ func TestF105AnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 // the cleanup duty and the root, and substitutes another correctly DERIVED affine target, would
 // send the pass to discard that generation's assignments and delete its consumer: possibly the
 // SUCCESSOR'S. Trusting the acceptance's choice of target is not a licence to change it.
-func TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-affine-binding")
+func TestAnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-affine-binding")
 	defer cleanup()
 
 	const mine, theirs = "0123456789abcdefghijkq", "0123456789abcdefghijkz"
 	_, _, mineDur := mqttQ2AffineNames(getHash(e.id), mine)
 	_, _, theirsDur := mqttQ2AffineNames(getHash(e.id), theirs)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
 	retire := &mqttRetirementRequest{
-		Gen: testF105Gen, Discard: true,
+		Gen: testGen, Discard: true,
 		AffineDurable: mineDur, AffineGen: mine, PubRelDurable: pubRelDur,
 	}
 	attempt := &mqttTransitionAttempt{
@@ -601,13 +601,13 @@ func TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 			t.Fatalf("marshalling the resource: %v", err)
 		}
 		return mqttTransitionMember{
-			subj:   mqttResourceSubject(getHash(e.id), testF105Gen, r.Inc),
+			subj:   mqttResourceSubject(getHash(e.id), testGen, r.Inc),
 			expect: 0, body: body,
 		}
 	}
 	base := func(affGen, name string) *mqttOutboundResource {
 		return &mqttOutboundResource{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: "inc-aff",
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Inc: "inc-aff",
 			Kind: mqttResourceAffineConsumer, Name: name, AffGen: affGen,
 			PubRelDur: pubRelDur, State: mqttResourceLive, Prov: mqttProvisioningPending,
 			Deps: []mqttResourceEdge{},
@@ -616,10 +616,10 @@ func TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 	tr := func(members ...mqttTransitionMember) *mqttAuthorityTransition {
 		return &mqttAuthorityTransition{
 			Prev: &mqttOutboundAuthority{
-				ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
-				Intent: &mqttHandoffIntent{Gen: testF105Gen2, Retire: retire},
+				ID: e.id, Epoch: e.epoch, Gen: testGen,
+				Intent: &mqttHandoffIntent{Gen: testGen2, Retire: retire},
 			},
-			Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Discard: true},
+			Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Discard: true},
 			Extra:   members,
 		}
 	}
@@ -661,7 +661,7 @@ func TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 
 }
 
-// TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord is holistic round 13's finding, and it
+// TestAMalformedAffineGenerationIsRefusedAtEveryRecord is holistic round 13's finding, and it
 // is a consistency defect the readiness derivation CREATED.
 //
 // A derived name is derived from whatever string the field holds, so `AffGen: "x"` with a name
@@ -672,23 +672,23 @@ func TestF105AnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 // evidence can never be written strands the generation exactly as an unsupported shape does, so it
 // is refused at the RESOURCE, at the RETIREMENT REQUEST that selects the target, and on the
 // READINESS record itself.
-func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-malformed-affgen")
+func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-malformed-affgen")
 	defer cleanup()
 
 	const bad = "x"
 	_, _, badDur := mqttQ2AffineNames(getHash(e.id), bad)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
 	// (1) THE RESOURCE. Its name is correctly DERIVED from the malformed generation, so only a
 	// well-formedness rule refuses it.
 	badRes := &mqttOutboundResource{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: "inc-aff",
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Inc: "inc-aff",
 		Kind: mqttResourceAffineConsumer, Name: badDur, AffGen: bad,
 		PubRelDur: pubRelDur, State: mqttResourceLive, Prov: mqttProvisioningPending,
 		Deps: []mqttResourceEdge{},
 	}
-	if err := mqttValidateOutboundResource(badRes, e.id, e.epoch, testF105Gen, "inc-aff"); err == nil {
+	if err := mqttValidateOutboundResource(badRes, e.id, e.epoch, testGen, "inc-aff"); err == nil {
 		t.Fatal("an affine resource carrying a malformed affine generation was accepted, so its " +
 			"cleanup duty could never be finished")
 	} else if !strings.Contains(err.Error(), "malformed affine generation") {
@@ -697,10 +697,10 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 
 	// (2) THE RETIREMENT REQUEST that selects the target, which is the earliest record carrying it.
 	intent := &mqttHandoffIntent{
-		ID: "intent-bad", PrevGen: testF105Gen, PrevTenure: "ten", PrevOwnerTxn: "own",
-		PrevSessWID: "wid", PrevSessSeq: 1, Gen: testF105Gen2, Tenure: "ten2", CleanReq: true,
+		ID: "intent-bad", PrevGen: testGen, PrevTenure: "ten", PrevOwnerTxn: "own",
+		PrevSessWID: "wid", PrevSessSeq: 1, Gen: testGen2, Tenure: "ten2", CleanReq: true,
 		Retire: &mqttRetirementRequest{
-			Gen: testF105Gen, Tenure: "ten", OwnerTxn: "own", SessWID: "wid", SessSeq: 1,
+			Gen: testGen, Tenure: "ten", OwnerTxn: "own", SessWID: "wid", SessSeq: 1,
 			Reason: mqttRetireCleanStart, Discard: true,
 			AffineGen: bad, AffineDurable: badDur, PubRelDurable: pubRelDur,
 		},
@@ -722,14 +722,14 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	}{
 		{"missing", _EMPTY_},
 		{"another generation's", func() string {
-			_, _, d := mqttPubRelNames(getHash(e.id), testF105Gen2)
+			_, _, d := mqttPubRelNames(getHash(e.id), testGen2)
 			return d
 		}()},
 	} {
 		bad := *intent.Retire
-		bad.AffineGen = testF105Gen2
+		bad.AffineGen = testGen2
 		_, _, bad.AffineDurable = func() (string, string, string) {
-			return mqttQ2AffineNames(getHash(e.id), testF105Gen2)
+			return mqttQ2AffineNames(getHash(e.id), testGen2)
 		}()
 		bad.PubRelDurable = tc.pubRel
 		badIntent := *intent
@@ -742,7 +742,7 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 
 	// (3b) AND A WRONG AFFINE DURABLE, derived for no generation at all.
 	wrongDur := *intent.Retire
-	wrongDur.AffineGen = testF105Gen2
+	wrongDur.AffineGen = testGen2
 	wrongDur.AffineDurable = "$MQTT_Q2AFF_not_derived"
 	wrongIntent := *intent
 	wrongIntent.Retire = &wrongDur
@@ -753,7 +753,7 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	// (3) A HALF-NAMED TARGET: a generation with no durable, or the reverse, names nothing usable.
 	half := *intent.Retire
 	half.AffineDurable = _EMPTY_
-	half.AffineGen = testF105Gen2
+	half.AffineGen = testGen2
 	halfIntent := *intent
 	halfIntent.Retire = &half
 	if err := mqttValidateHandoffIntentFor(getHash(e.id), &halfIntent); err == nil {
@@ -763,8 +763,8 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	// (4) AND THE WELL-FORMED DESCRIPTOR IS ACCEPTED at both, so the rules above refuse a shape
 	// rather than the feature.
 	good := *intent.Retire
-	good.AffineGen = testF105Gen2
-	_, _, goodDur := mqttQ2AffineNames(getHash(e.id), testF105Gen2)
+	good.AffineGen = testGen2
+	_, _, goodDur := mqttQ2AffineNames(getHash(e.id), testGen2)
 	good.AffineDurable = goodDur
 	_, _, good.PubRelDurable = mqttPubRelNames(getHash(e.id), good.Gen)
 	okIntent := *intent
@@ -773,9 +773,9 @@ func TestF105AMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 		t.Fatalf("a well-formed affine descriptor was refused: %v", err)
 	}
 	okRes := *badRes
-	okRes.AffGen = testF105Gen2
+	okRes.AffGen = testGen2
 	okRes.Name = goodDur
-	if err := mqttValidateOutboundResource(&okRes, e.id, e.epoch, testF105Gen, "inc-aff"); err != nil {
+	if err := mqttValidateOutboundResource(&okRes, e.id, e.epoch, testGen, "inc-aff"); err != nil {
 		t.Fatalf("a well-formed affine resource was refused: %v", err)
 	}
 }

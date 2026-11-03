@@ -353,7 +353,7 @@ func TestAcquisitionBatchBoundaryPairsEveryParticipant(t *testing.T) {
 		}
 		var acts, toks []int
 		for i, e := range at.Extra {
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttActionClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttActionClassTk {
 				acts = append(acts, i)
 			} else if _, perr := mqttParseInflightSubject(e.subj); perr == nil {
 				toks = append(toks, i)
@@ -407,7 +407,7 @@ func TestAcquisitionBatchRefusesTwoActionsForOneExchange(t *testing.T) {
 		}
 		var act *mqttTransitionMember
 		for i, e := range at.Extra {
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttActionClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttActionClassTk {
 				act = &at.Extra[i]
 				break
 			}
@@ -450,7 +450,7 @@ func TestAcquisitionBatchComposesEveryParticipant(t *testing.T) {
 		acts := map[string]bool{}
 		toks := map[string]bool{}
 		for _, e := range at.Extra {
-			if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttActionClassTk {
+			if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttActionClassTk {
 				parts := strings.Split(e.subj, ".")
 				acts[parts[len(parts)-2]+"."+parts[len(parts)-1]] = true
 				continue

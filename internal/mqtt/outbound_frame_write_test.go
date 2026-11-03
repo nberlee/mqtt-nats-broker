@@ -79,13 +79,13 @@ func testFrameClient(t *testing.T, failAt int) (*client, *testFrameConn, *mqttCo
 // testFrameAction is an action bound to the given binding, which is what the boundary requires.
 func testFrameAction(b *mqttConnBinding, acq uint64) *mqttOutboundAction {
 	return &mqttOutboundAction{
-		ID: "client-frame", Epoch: "epoch-1", Gen: testF105Gen, Nonce: "exchange-1", Acq: acq,
+		ID: "client-frame", Epoch: "epoch-1", Gen: testGen, Nonce: "exchange-1", Acq: acq,
 		Kind: mqttActionPublish, PI: 7, Run: b.run, Conn: b.conn, Tenure: "tenure-1",
 		AcqTxn: "txn-acq",
 	}
 }
 
-func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
+func TestFrameWriteConsumesItsActionOnce(t *testing.T) {
 	c, tc, bind := testFrameClient(t, 0)
 	act := testFrameAction(bind, 1)
 
@@ -130,7 +130,7 @@ func TestF105FrameWriteConsumesItsActionOnce(t *testing.T) {
 	}
 }
 
-func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
+func TestFrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 	t.Run("a sealed gate PREVENTS, and is not an error", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
 		bind.gate.seal()
@@ -194,7 +194,7 @@ func TestF105FrameWriteDistinguishesItsThreeOutcomes(t *testing.T) {
 	})
 }
 
-func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
+func TestFrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 	t.Run("no action at all", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
 		// THERE IS NO MISSING-AUTHORITY FALLBACK. A caller without an action is refused,
@@ -272,7 +272,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 	})
 }
 
-// TestF105FrameGuardAnswersOutstandingLocally pins the one fact a local caller genuinely knows.
+// TestFrameGuardAnswersOutstandingLocally pins the one fact a local caller genuinely knows.
 //
 // Outstanding is the caller's obligation and a caller that cannot answer must say TRUE, because
 // an unknown action is an outstanding one. What this connection CAN establish is narrower and
@@ -281,7 +281,7 @@ func TestF105FrameWriteRefusesUnauthorizedOutput(t *testing.T) {
 //
 // Consumption and drain are separate, and this is where that separation is visible: the action
 // is consumed the moment the frame starts, and only FINISHED makes it non-outstanding.
-func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
+func TestFrameGuardAnswersOutstandingLocally(t *testing.T) {
 	c, _, bind := testFrameClient(t, 0)
 	act := testFrameAction(bind, 1)
 
@@ -318,13 +318,13 @@ func TestF105FrameGuardAnswersOutstandingLocally(t *testing.T) {
 	}
 }
 
-// TestF105FrameGuardReportsOutstandingDuringExecution is MUT-F7's oracle.
+// TestFrameGuardReportsOutstandingDuringExecution is MUT-F7's oracle.
 //
 // Consumption and drain are separate facts, and every other test here samples outstanding only
 // BEFORE and AFTER a frame — where a guard that marked an acquisition finished the moment it
 // was consumed gives exactly the same answers. The difference is visible only from inside the
 // execution, so that is where this looks.
-func TestF105FrameGuardReportsOutstandingDuringExecution(t *testing.T) {
+func TestFrameGuardReportsOutstandingDuringExecution(t *testing.T) {
 	c, tc, bind := testFrameClient(t, 0)
 	act := testFrameAction(bind, 1)
 

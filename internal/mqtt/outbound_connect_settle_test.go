@@ -29,10 +29,10 @@ import (
 // issue #107 8a unit properties: own versus foreign identity, the settlement continuation, the
 // verdict latch, and the writer-lock rule certification rests on.
 
-// TestF105DecisionSettlesAForeignProposalByItsVerdict: a standing proposal that is not this
+// TestDecisionSettlesAForeignProposalByItsVerdict: a standing proposal that is not this
 // acceptance's current one is settled — never finalized or abandoned as though it were its own —
 // and once bound, its slot's verdict selects the continuation. Mutations M1, M2.
-func TestF105DecisionSettlesAForeignProposalByItsVerdict(t *testing.T) {
+func TestDecisionSettlesAForeignProposalByItsVerdict(t *testing.T) {
 	// A RESUME handoff: it preserves the generation and installs a new tenure.
 	g0 := mqttNewSessGen()
 	foreign := &mqttHandoffIntent{ID: "foreign", Gen: g0, Tenure: "t1", PrevGen: g0, PrevTenure: "t0",
@@ -77,10 +77,10 @@ func TestF105DecisionSettlesAForeignProposalByItsVerdict(t *testing.T) {
 	}
 }
 
-// TestF105DriverLatchesAVerdictReadOnTheExhaustingReload: an ABORTED verdict first read on the
+// TestDriverLatchesAVerdictReadOnTheExhaustingReload: an ABORTED verdict first read on the
 // reload that exhausts the budget is the one the expiry disposes — latched before the budget is
 // asked. Mutation M15.
-func TestF105DriverLatchesAVerdictReadOnTheExhaustingReload(t *testing.T) {
+func TestDriverLatchesAVerdictReadOnTheExhaustingReload(t *testing.T) {
 	b, _ := mqttNewOwnershipBudget(time.Unix(1000, 0), time.Second)
 	clock := time.Unix(1000, 0)
 	now := func() time.Time { return clock }
@@ -102,10 +102,10 @@ func TestF105DriverLatchesAVerdictReadOnTheExhaustingReload(t *testing.T) {
 	}
 }
 
-// TestF105DriverCarriesAnObservedVerdictThroughAnExecutorError: a verdict the executor
+// TestDriverCarriesAnObservedVerdictThroughAnExecutorError: a verdict the executor
 // established before failing at the deadline is disposed by that verdict, not as UNRESOLVED.
 // Mutation M20.
-func TestF105DriverCarriesAnObservedVerdictThroughAnExecutorError(t *testing.T) {
+func TestDriverCarriesAnObservedVerdictThroughAnExecutorError(t *testing.T) {
 	b, _ := mqttNewOwnershipBudget(time.Now(), time.Hour)
 	obs := &mqttOwnObservation{}
 	exec := func(mqttOwnershipStep) (mqttConnectOwnershipInput, error) {
@@ -123,9 +123,9 @@ func TestF105DriverCarriesAnObservedVerdictThroughAnExecutorError(t *testing.T) 
 	}
 }
 
-// TestF105ForeignCloseDoesNotMakeTheAcceptanceALoser: closing a FOREIGN aborted reservation is
+// TestForeignCloseDoesNotMakeTheAcceptanceALoser: closing a FOREIGN aborted reservation is
 // a settlement act, after which the acceptance reserves over the closure. Mutation M6.
-func TestF105ForeignCloseDoesNotMakeTheAcceptanceALoser(t *testing.T) {
+func TestForeignCloseDoesNotMakeTheAcceptanceALoser(t *testing.T) {
 	b, _ := mqttNewOwnershipBudget(time.Now(), time.Hour)
 	gf := mqttNewSessGen()
 	foreign := &mqttOutboundAuthority{State: mqttAuthorityReserving, Gen: gf, Tenure: "tf",
@@ -213,14 +213,14 @@ func TestCloseConnectionNeverRunsUnderWriteLock(t *testing.T) {
 	}
 }
 
-// TestF105DisposalPhasesOnlyAppend: every disposing arm of mqttProcessConnect hands its Will
+// TestDisposalPhasesOnlyAppend: every disposing arm of mqttProcessConnect hands its Will
 // and its close to the CONNECT's defers, and since issue #107 8a one CONNECT can run more than one
 // disposal (a stale resident at its top, then a disposing arm later). So the deferred phases
 // may only be APPENDED to, never replaced — a replaced phase is a Will that is never
 // discharged, already extracted from an object no teardown will find again (H-5). The one
 // writer is registerDisposalPhases; a SOURCE guard, as for issue #86, because the property is
 // where the assignments sit, not what any single run observes. Mutation M35.
-func TestF105DisposalPhasesOnlyAppend(t *testing.T) {
+func TestDisposalPhasesOnlyAppend(t *testing.T) {
 	file, lines, start, end := censusFuncSource(t, "Server", "mqttProcessConnect")
 	regStart, regEnd := -1, -1
 	for i := start; i < end; i++ {

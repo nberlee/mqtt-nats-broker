@@ -794,8 +794,8 @@ func TestMQTTMarkInflightRegisterCancelledClassifiesEveryArm(t *testing.T) {
 			// read, and since the unsent ending a cancellation of an ORDINARY obligation first reads
 			// the exchange, the placeholder is withdrawn: with no store the cancellation classifies
 			// exactly as before, which is what these arms pin. The ordinary route with a store is
-			// TestF105WithdrawCancellationTombstoneEndsTheObligation (evidence standing) and
-			// TestF105CancellationWithoutEvidenceStoresTheStandaloneTombstone (none).
+			// TestWithdrawCancellationTombstoneEndsTheObligation (evidence standing) and
+			// TestCancellationWithoutEvidenceStoresTheStandaloneTombstone (none).
 			rig.sess.jsa = nil
 			got, _ := rig.sess.markInflightRegisterCancelled(nil, pi, "$MQTT_abc", 500, 8, ourNonce, mqttTestLicence(rig.sess, nil))
 			if got != tc.want {

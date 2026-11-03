@@ -139,7 +139,7 @@ func testResumeOnPeer(t *testing.T, s *testRow2PubSection, clientID string,
 
 // P: the certificate of a connection that acquired is persisted, naming the connection and the
 // generation it acquired under.
-func TestF105CertificateOfAnAcquiringConnectionIsPersisted(t *testing.T) {
+func TestCertificateOfAnAcquiringConnectionIsPersisted(t *testing.T) {
 	s := testRow2OpenSection(t, "cert-persist", 1)
 	s.acquire(t)
 	b := s.e.c.outBind
@@ -154,7 +154,7 @@ func TestF105CertificateOfAnAcquiringConnectionIsPersisted(t *testing.T) {
 
 // P-none: a connection that never attempted an acquisition persists nothing, because it can have
 // left no token for a certificate to clear.
-func TestF105CertificateOfANeverAcquiringConnectionIsNotPersisted(t *testing.T) {
+func TestCertificateOfANeverAcquiringConnectionIsNotPersisted(t *testing.T) {
 	c, _, b := testFrameClient(t, 0)
 	mqttCertifyClosed(c, b, "refused")
 	if b.closeCert() == nil {
@@ -166,7 +166,7 @@ func TestF105CertificateOfANeverAcquiringConnectionIsNotPersisted(t *testing.T) 
 }
 
 // P-late: a connection already certified when it registers an acquisition persists then.
-func TestF105LateRegistrationOnACertifiedConnectionPersists(t *testing.T) {
+func TestLateRegistrationOnACertifiedConnectionPersists(t *testing.T) {
 	e := testNewInflightEnv(t, "cert-late")
 	c, _, b := testFrameClient(t, 0)
 	got := testObserveCertPersist(t, b, false)
@@ -181,7 +181,7 @@ func TestF105LateRegistrationOnACertifiedConnectionPersists(t *testing.T) {
 }
 
 // One generation per connection: a second context naming another generation is refused.
-func TestF105AcquisitionRegistersOneGenerationPerConnection(t *testing.T) {
+func TestAcquisitionRegistersOneGenerationPerConnection(t *testing.T) {
 	e := testNewInflightEnv(t, "cert-onegen")
 	_, _, b := testFrameClient(t, 0)
 	if err := b.registerAcquisition(e.asm.jsa.newCertPersistCtx(e.sess.id, e.asm.sessStreamEpoch, e.sess.gen)); err != nil {
@@ -193,7 +193,7 @@ func TestF105AcquisitionRegistersOneGenerationPerConnection(t *testing.T) {
 }
 
 // R1a: the TORN WRITER, with no later helper, persists its own certificate.
-func TestF105TornWriterPersistsItsCertificate(t *testing.T) {
+func TestTornWriterPersistsItsCertificate(t *testing.T) {
 	e := testNewInflightEnv(t, "cert-torn")
 	c, _, b := testFrameClient(t, 3)
 	if err := b.registerAcquisition(e.asm.jsa.newCertPersistCtx(e.sess.id, e.asm.sessStreamEpoch, e.sess.gen)); err != nil {
@@ -211,7 +211,7 @@ func TestF105TornWriterPersistsItsCertificate(t *testing.T) {
 
 // R1b: an already-SEALED, uncertified binding is certified and persisted by the external
 // certifier that completes it.
-func TestF105ExternalCertifierPersistsASealedBinding(t *testing.T) {
+func TestExternalCertifierPersistsASealedBinding(t *testing.T) {
 	e := testNewInflightEnv(t, "cert-sealed")
 	c, _, b := testFrameClient(t, 0)
 	if err := b.registerAcquisition(e.asm.jsa.newCertPersistCtx(e.sess.id, e.asm.sessStreamEpoch, e.sess.gen)); err != nil {
@@ -229,7 +229,7 @@ func TestF105ExternalCertifierPersistsASealedBinding(t *testing.T) {
 // P-elig: eligibility is registered BEFORE the acquisition's batch is sent, so an acquisition
 // whose answer never comes back still has its connection's certificate persisted. Certified from
 // INSIDE the commit, before the batch is sent.
-func TestF105AcquisitionRegistersItsCertificateBeforeItsBatch(t *testing.T) {
+func TestAcquisitionRegistersItsCertificateBeforeItsBatch(t *testing.T) {
 	s := testRow2OpenSection(t, "cert-elig", 1)
 	b := s.e.c.outBind
 	got := testObserveCertPersist(t, b, false)
@@ -257,7 +257,7 @@ func TestF105AcquisitionRegistersItsCertificateBeforeItsBatch(t *testing.T) {
 // Rc: a successor's resume clears the token a certified connection left standing, at the
 // recovery boundary — before any acquisition could run — and writes nothing but the end of
 // custody: not the phase, not the counter, not the unsent marker (Rc-unsent).
-func TestF105ResumeClearsACertifiedConnectionsToken(t *testing.T) {
+func TestResumeClearsACertifiedConnectionsToken(t *testing.T) {
 	s, pre, _ := testCertifiedStandingToken(t, "cert-rc", 1, true)
 	var atWalk *mqttInflightRecord
 	reached := false
@@ -280,7 +280,7 @@ func TestF105ResumeClearsACertifiedConnectionsToken(t *testing.T) {
 }
 
 // Rc-absent: with no durable certificate, the token stands.
-func TestF105ResumeWithoutACertificateLeavesTheToken(t *testing.T) {
+func TestResumeWithoutACertificateLeavesTheToken(t *testing.T) {
 	s, pre, _ := testCertifiedStandingToken(t, "cert-absent", 1, false)
 	testResumeOnPeer(t, s, "cert-absent", nil)
 	cur, _, err := s.e.asm.loadInflightRecord(s.subject)
@@ -290,7 +290,7 @@ func TestF105ResumeWithoutACertificateLeavesTheToken(t *testing.T) {
 }
 
 // Rc-wrong: a certificate of ANOTHER connection of the same run and generation licenses nothing.
-func TestF105ResumeIgnoresAnotherConnectionsCertificate(t *testing.T) {
+func TestResumeIgnoresAnotherConnectionsCertificate(t *testing.T) {
 	s, pre, _ := testCertifiedStandingToken(t, "cert-wrong", 1, false)
 	b := s.e.c.outBind
 	other := &mqttDurableCloseCert{ID: s.e.sess.id, Epoch: s.e.asm.sessStreamEpoch, Gen: s.e.sess.gen,
@@ -306,7 +306,7 @@ func TestF105ResumeIgnoresAnotherConnectionsCertificate(t *testing.T) {
 }
 
 // Rc-absent (b): a body at the right subject naming another generation is unusable, not a licence.
-func TestF105ResumeRefusesAForeignCertificateBody(t *testing.T) {
+func TestResumeRefusesAForeignCertificateBody(t *testing.T) {
 	s, pre, _ := testCertifiedStandingToken(t, "cert-foreign", 1, false)
 	b := s.e.c.outBind
 	if _, err := s.e.asm.jsa.storeMsg(mqttCloseCertSubject(s.e.sess.idHash, s.e.sess.gen, b.run, b.conn),
@@ -324,7 +324,7 @@ func TestF105ResumeRefusesAForeignCertificateBody(t *testing.T) {
 // Rc-stale: a register that moves between the licence and the write is never rebased onto. The
 // first submission carries the ORIGINAL sequence and is rejected; the clearance then re-reads and
 // proves its licence again before the submission that lands.
-func TestF105CertifiedClearanceNeverRebases(t *testing.T) {
+func TestCertifiedClearanceNeverRebases(t *testing.T) {
 	s, pre, preSeq := testCertifiedStandingToken(t, "cert-stale", 1, true)
 	var seqs []uint64
 	var mu sync.Mutex
@@ -366,7 +366,7 @@ func TestF105CertifiedClearanceNeverRebases(t *testing.T) {
 // The fixture reconnects the same session on a new connection and leaves the first section's
 // in-process state behind (its hold and its open section), which is what the holder's process
 // no longer has after it is gone: only the durable token and the certificate decide.
-func TestF105AcquisitionClearsACertifiedConnectionsToken(t *testing.T) {
+func TestAcquisitionClearsACertifiedConnectionsToken(t *testing.T) {
 	s, pre, _ := testCertifiedStandingToken(t, "cert-revisit", 1, false)
 	e := s.e
 	c3 := e.s.createInternalAccountClient()
@@ -413,7 +413,7 @@ func TestF105AcquisitionClearsACertifiedConnectionsToken(t *testing.T) {
 
 // Rc-resident: the resident reference follows the clearance only from the exact pre-clearance
 // sequence; an entry another writer already moved keeps its fact.
-func TestF105ClearanceWriteBackIsConditionedOnTheExactSequence(t *testing.T) {
+func TestClearanceWriteBackIsConditionedOnTheExactSequence(t *testing.T) {
 	s := testRow2OpenSection(t, "cert-resident", 1)
 	pre := &mqttInflightRecord{PI: s.pi, Nonce: "nonce-1", ActionToken: "tok-1"}
 	mk := func(seq uint64) *mqttPending {
@@ -437,7 +437,7 @@ func TestF105ClearanceWriteBackIsConditionedOnTheExactSequence(t *testing.T) {
 
 // Rc-resident (lost response): a clearance whose answer is lost is recognized by the identical
 // body it left, and adopted at the sequence it landed at.
-func TestF105CertifiedClearanceAdoptsALostResponse(t *testing.T) {
+func TestCertifiedClearanceAdoptsALostResponse(t *testing.T) {
 	s, pre, preSeq := testCertifiedStandingToken(t, "cert-lost", 1, true)
 	s.e.asm.mu.Lock()
 	s.e.asm.testInflightStore = func(subject string, expect uint64, r *mqttInflightRecord) (uint64, error) {
@@ -461,7 +461,7 @@ func TestF105CertifiedClearanceAdoptsALostResponse(t *testing.T) {
 
 // The kind table: a PUBLISH token survives a successful PUBREC into either past-PUBREC phase; a
 // PUBREL token stands in pubrel_ready and pubrel_terminal; nothing else.
-func TestF105CertifiedClearanceKindTable(t *testing.T) {
+func TestCertifiedClearanceKindTable(t *testing.T) {
 	for _, tc := range []struct {
 		kind mqttActionKind
 		st   mqttInflightState
@@ -503,7 +503,7 @@ func testAtWalk(t *testing.T, s *testRow2PubSection, clientID string, subjects .
 
 // Rc-qos2: a PUBLISH token survives a successful PUBREC into pubrel_intended, and the certificate
 // of its connection still clears it there.
-func TestF105ResumeClearsAPublishTokenThatSurvivedPubRec(t *testing.T) {
+func TestResumeClearsAPublishTokenThatSurvivedPubRec(t *testing.T) {
 	s, pre, _ := testCertifiedStandingTokenAfter(t, "cert-qos2", 2, true, func(s *testRow2PubSection) {
 		held, hsmsg, err := s.e.asm.loadInflightRecord(s.subject)
 		if err != nil || held == nil || held.ActionToken == _EMPTY_ {
@@ -528,7 +528,7 @@ func TestF105ResumeClearsAPublishTokenThatSurvivedPubRec(t *testing.T) {
 }
 
 // Rc-many: every certified register of the generation is cleared by one resume.
-func TestF105ResumeClearsEveryCertifiedToken(t *testing.T) {
+func TestResumeClearsEveryCertifiedToken(t *testing.T) {
 	s, pre, _ := testCertifiedStandingTokenAfter(t, "cert-many", 1, true, func(s *testRow2PubSection) {
 		for i := uint64(1); i <= 3; i++ {
 			pi := s.e.trackAdmitted(t, testRealPubRelSrcDur, testRealPubRelSrcSeq+i, 1)
@@ -562,7 +562,7 @@ func TestF105ResumeClearsEveryCertifiedToken(t *testing.T) {
 
 // Rc-pubrel: in pubrel_terminal the token is the only thing keeping its exchange pending-drain,
 // so the clearance and the terminal advance land as one.
-func TestF105ResumeClearsAPendingDrainPubRelAtomically(t *testing.T) {
+func TestResumeClearsAPendingDrainPubRelAtomically(t *testing.T) {
 	e := testNewInflightEnv(t, "cert-pubrel")
 	testReadyForRealPubRelDelivery(t, e)
 	testStampAcceptedConnection(t, e)
@@ -629,7 +629,7 @@ func testClearedBody(pre *mqttInflightRecord) mqttInflightRecord {
 // Rc-revisit (PUBREL): a PUBREL acquisition that meets a token a durably certified connection
 // left standing clears it and acquires — the retained replay's PUBREL emission reaches the
 // acquisition with no token check of its own.
-func TestF105PubRelAcquisitionClearsACertifiedConnectionsToken(t *testing.T) {
+func TestPubRelAcquisitionClearsACertifiedConnectionsToken(t *testing.T) {
 	e := testNewInflightEnv(t, "cert-pubrel-revisit")
 	testReadyForRealPubRelDelivery(t, e)
 	testStampAcceptedConnection(t, e)
@@ -685,7 +685,7 @@ func TestF105PubRelAcquisitionClearsACertifiedConnectionsToken(t *testing.T) {
 // H-1: a connection number is unique only within one server, so two servers in one process —
 // or a replacement server — reuse it. A certificate persisted for an EARLIER connection that
 // happened to carry the same number must not end the token of a live connection carrying it now.
-func TestF105CertificateOfAnEqualNumberedConnectionLicensesNothing(t *testing.T) {
+func TestCertificateOfAnEqualNumberedConnectionLicensesNothing(t *testing.T) {
 	s := testRow2OpenSection(t, "cert-samecid", 1)
 	s.acquire(t)
 	pre, _, _ := s.e.asm.loadInflightRecord(s.subject)

@@ -60,7 +60,7 @@ func testPlantDeferredAction(t *testing.T, e *testRejectionEnv, delayed bool) *m
 	return action
 }
 
-// TestF084ForeignDisposalDischargesParkedWill is R2.
+// TestForeignDisposalDischargesParkedWill is R2.
 //
 // disposeForeignStateLocked used to call takeDeferredDisconnect() and DROP the action on
 // the floor: a connection that closed while its record write was unresolved parked its
@@ -69,7 +69,7 @@ func testPlantDeferredAction(t *testing.T, e *testRejectionEnv, delayed bool) *m
 //
 // The assertion is POSITIVE — the Will reaches the wire — because "no publication" is what
 // the broken behavior also produces.
-func TestF084ForeignDisposalDischargesParkedWill(t *testing.T) {
+func TestForeignDisposalDischargesParkedWill(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084r2")
 	watch := e.watchDelivery(t, "will/topic")
 	action := testPlantDeferredAction(t, e, false)
@@ -99,7 +99,7 @@ func TestF084ForeignDisposalDischargesParkedWill(t *testing.T) {
 	}
 }
 
-// TestF084ForeignDisposalDischargeWritesNoRecord pins the WILL-ONLY property of
+// TestForeignDisposalDischargeWritesNoRecord pins the WILL-ONLY property of
 // dischargeDeferredWill, which is why applyDeferredDisconnect could not be reused.
 //
 // That helper applies the whole deferred teardown — clear or save, expiry scheduling,
@@ -109,7 +109,7 @@ func TestF084ForeignDisposalDischargesParkedWill(t *testing.T) {
 // fence already so acquiring it self-deadlocks.
 //
 // Kills M16's substitution independently of the ordering half.
-func TestF084ForeignDisposalDischargeWritesNoRecord(t *testing.T) {
+func TestForeignDisposalDischargeWritesNoRecord(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084r2nw")
 	watch := e.watchDelivery(t, "will/topic")
 	testPlantDeferredAction(t, e, false)
@@ -136,7 +136,7 @@ func TestF084ForeignDisposalDischargeWritesNoRecord(t *testing.T) {
 	}
 }
 
-// TestF084ForeignDisposalUnderOpenTransaction is the deadlock regression.
+// TestForeignDisposalUnderOpenTransaction is the deadlock regression.
 //
 // The disposal must be able to run from a caller that already holds a record transaction on
 // this goroutine — which mqttProcessSubs and the CONNECT paths do. dischargeDeferredWill
@@ -145,7 +145,7 @@ func TestF084ForeignDisposalDischargeWritesNoRecord(t *testing.T) {
 //
 // It carries a PARKED ACTION deliberately: without one the discharge is never reached and
 // the mutant survives through a no-op.
-func TestF084ForeignDisposalUnderOpenTransaction(t *testing.T) {
+func TestForeignDisposalUnderOpenTransaction(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084deadlock")
 	watch := e.watchDelivery(t, "will/topic")
 	testPlantDeferredAction(t, e, false)
@@ -173,7 +173,7 @@ func TestF084ForeignDisposalUnderOpenTransaction(t *testing.T) {
 	}
 }
 
-// TestF084RefusedDisposalTouchesNoWill is M14's paired fixture.
+// TestRefusedDisposalTouchesNoWill is M14's paired fixture.
 //
 // The identity check must precede anything irreversible. When the session was rebound while
 // this verdict was being reached, the disposal is not ours — and neither is the Will, which
@@ -181,7 +181,7 @@ func TestF084ForeignDisposalUnderOpenTransaction(t *testing.T) {
 //
 // The oracle is the Will's OWN STATE, not `applied == false`: a fixture asserting only the
 // return value would pass against a broker that consumed the Will before checking.
-func TestF084RefusedDisposalTouchesNoWill(t *testing.T) {
+func TestRefusedDisposalTouchesNoWill(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084refused")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	b.armWill()
@@ -220,13 +220,13 @@ func TestF084RefusedDisposalTouchesNoWill(t *testing.T) {
 	}
 }
 
-// TestF084LicenceSeparatesDiscardFromConsume is the licence table, and the pair is what
+// TestLicenceSeparatesDiscardFromConsume is the licence table, and the pair is what
 // makes it discriminating.
 //
 // A broker that simply never discards a Will passes the consume row; one that always
 // discards passes the discard row. Only both together pin the rule that the LICENCE — not
 // the vocabulary, and not the verdict's name — decides.
-func TestF084LicenceSeparatesDiscardFromConsume(t *testing.T) {
+func TestLicenceSeparatesDiscardFromConsume(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		licensed bool
@@ -251,11 +251,11 @@ func TestF084LicenceSeparatesDiscardFromConsume(t *testing.T) {
 	}
 }
 
-// TestF084ParkedActionOutranksLiveWill pins the precedence, which is not arbitrary: parking
+// TestParkedActionOutranksLiveWill pins the precedence, which is not arbitrary: parking
 // is what MOVED the Will off the connection, so the two cannot both be owed. Acting on the
 // live connection instead would publish nothing (its Will is already gone) and strand the
 // action.
-func TestF084ParkedActionOutranksLiveWill(t *testing.T) {
+func TestParkedActionOutranksLiveWill(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084rank")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	testPlantDeferredAction(t, e, false)
@@ -272,13 +272,13 @@ func TestF084ParkedActionOutranksLiveWill(t *testing.T) {
 	}
 }
 
-// TestF084DelayedParkedWillReachesTheOutbox is the delayed half of R2, and the reason the
+// TestDelayedParkedWillReachesTheOutbox is the delayed half of R2, and the reason the
 // negatives assert an OWNERSHIP TRANSITION rather than a publication.
 //
 // "Consume normally" does not mean "the Will appears on the wire": a delayed Will is
 // enqueued against its ORIGINAL deadline and a qualifying acceptance fact may later suppress
 // it. What the broker owes is the enqueue.
-func TestF084DelayedParkedWillReachesTheOutbox(t *testing.T) {
+func TestDelayedParkedWillReachesTheOutbox(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084delayed")
 	action := testPlantDeferredAction(t, e, true)
 	e.sess.mu.Lock()
@@ -314,14 +314,14 @@ func TestF084DelayedParkedWillReachesTheOutbox(t *testing.T) {
 	}
 }
 
-// TestF084RemotePersistEvictionDischargesWill is R4, and it fails against the pre-issue #86
+// TestRemotePersistEvictionDischargesWill is R4, and it fails against the pre-issue #86
 // broker outright.
 //
 // The remote-persist eviction detaches the client inside its as.mu section and then closes
 // it. A DETACHED client's close publishes only an IMMEDIATE Will — mqttPublishOwedWill
 // returns unless the disposition is mqttWillOwedNow — so an ARMED Will on that connection
 // was never published and never enqueued. The tail performed no Will action at all.
-func TestF084RemotePersistEvictionDischargesWill(t *testing.T) {
+func TestRemotePersistEvictionDischargesWill(t *testing.T) {
 	e := testNewEvictEnv(t, "f084r4")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	b.armWill()
@@ -341,14 +341,14 @@ func TestF084RemotePersistEvictionDischargesWill(t *testing.T) {
 	}
 }
 
-// TestF084BoundRejectionNilRebindOwesNothing is M7's paired fixture, and the nil case is
+// TestBoundRejectionNilRebindOwesNothing is M7's paired fixture, and the nil case is
 // the ONLY one where the two predicates differ.
 //
 // settleBoundRejectionGated's spin used to ask `sess.c != c`, which is also true when
 // sess.c is NIL — and nil is what a resolver or a record-derived disposal leaves behind,
 // neither of which demonstrates a successor. Discarding there suppressed a Will on the
 // strength of somebody else's disposal.
-func TestF084BoundRejectionNilRebindOwesNothing(t *testing.T) {
+func TestBoundRejectionNilRebindOwesNothing(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084nil")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	b.armWill()
@@ -383,12 +383,12 @@ func TestF084BoundRejectionNilRebindOwesNothing(t *testing.T) {
 	}
 }
 
-// TestF084BoundRejectionLocalReplacementDiscards is the other half of the pair, and without
+// TestBoundRejectionLocalReplacementDiscards is the other half of the pair, and without
 // it a broker that simply never discards passes the fixture above.
 //
 // A DIFFERENT, NON-NIL local client bound to this session is the licensed evidence: a real
 // in-process replacement holds the session, and its takeover owns the Will's fate.
-func TestF084BoundRejectionLocalReplacementDiscards(t *testing.T) {
+func TestBoundRejectionLocalReplacementDiscards(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084local")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	b.armWill()
@@ -450,14 +450,14 @@ func testTakeoverClaimSites(t *testing.T, name string) []string {
 	return sites
 }
 
-// TestF084VocabulariesSayDifferentThings pins the CLAIM TEXTS as literals.
+// TestVocabulariesSayDifferentThings pins the CLAIM TEXTS as literals.
 //
 // Every other assertion in this change compares a claim against a vocabulary VALUE, which
 // is the right shape for a call-site test and is unfalsifiable about the text itself: a
 // mutation that rewrites the constant moves the expectation and the observation together.
 // The literals live here, once, so a broker cannot quietly start telling an unsettled
 // client that its session was taken over.
-func TestF084VocabulariesSayDifferentThings(t *testing.T) {
+func TestVocabulariesSayDifferentThings(t *testing.T) {
 	if mqttDisposalTakenOver.reasonStr != "session taken over by a new connection" {
 		t.Fatalf("the takeover claim's text changed: %q", mqttDisposalTakenOver.reasonStr)
 	}
@@ -488,7 +488,7 @@ func TestF084VocabulariesSayDifferentThings(t *testing.T) {
 	}
 }
 
-// TestF084OnlyOneReaderOfTheTakeoverClaim is the invariant issue #86 rests on, asserted where a
+// TestOnlyOneReaderOfTheTakeoverClaim is the invariant issue #86 rests on, asserted where a
 // reader can see it: the takeover vocabulary is reachable from exactly one notifier, and
 // that notifier from exactly one tail.
 //
@@ -496,7 +496,7 @@ func TestF084VocabulariesSayDifferentThings(t *testing.T) {
 // fixtures can only cover the routes they know about, and a NEW route added later would
 // pass every one of them while still claiming a takeover it cannot prove. That is the
 // enumeration defect this finding was filed for; this is the property that replaces it.
-func TestF084OnlyOneReaderOfTheTakeoverClaim(t *testing.T) {
+func TestOnlyOneReaderOfTheTakeoverClaim(t *testing.T) {
 	readers := testTakeoverClaimSites(t, "mqttDisposalTakenOver")
 	// Its definition in sess_fork_lineage.go, and mqttNotifyTakenOver. Nothing else.
 	if len(readers) != 2 {
@@ -513,7 +513,7 @@ func TestF084OnlyOneReaderOfTheTakeoverClaim(t *testing.T) {
 	}
 }
 
-// TestF084RemotePersistEvictionEnqueuesDelayedWill is R4's delayed half, and the only place
+// TestRemotePersistEvictionEnqueuesDelayedWill is R4's delayed half, and the only place
 // the capsule's EPOCH is observable.
 //
 // An immediate Will is published straight through and carries no epoch, so the fixture
@@ -521,7 +521,7 @@ func TestF084OnlyOneReaderOfTheTakeoverClaim(t *testing.T) {
 // with its fence baseline attached, and that record is what pins it. The expiry likewise
 // has to come from the CONNECTION rather than the session: this route holds no ownership
 // gate and can detach between the two updates a v5 DISCONNECT makes.
-func TestF084RemotePersistEvictionEnqueuesDelayedWill(t *testing.T) {
+func TestRemotePersistEvictionEnqueuesDelayedWill(t *testing.T) {
 	e := testNewEvictEnv(t, "f084r4d")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 
@@ -590,7 +590,7 @@ func TestF084RemotePersistEvictionEnqueuesDelayedWill(t *testing.T) {
 	}
 }
 
-// TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked pins residual W9.
+// TestDeferredWillImmediatePublishFailureIsLoggedNotReparked pins residual W9.
 //
 // On the already-due branch the discharge publishes through the outbox's client-free
 // publisher, and a failure there is LOGGED with the action already consumed — nothing
@@ -598,7 +598,7 @@ func TestF084RemotePersistEvictionEnqueuesDelayedWill(t *testing.T) {
 // already deresidented the session, so a re-parked action sits where no pass can reach it.
 //
 // The fixture exists so that residual is a pinned behavior rather than an unexamined one.
-func TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked(t *testing.T) {
+func TestDeferredWillImmediatePublishFailureIsLoggedNotReparked(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084w9")
 	testPlantDeferredAction(t, e, false)
 	e.sess.mu.Lock()
@@ -636,7 +636,7 @@ func TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked(t *testing.T
 	}
 }
 
-// TestF084ConnectDisposalsAllUseThePhasedHelper is the ordering regression the holistic
+// TestConnectDisposalsAllUseThePhasedHelper is the ordering regression the holistic
 // review asked for, and it is a SOURCE assertion because the ordering it protects is a
 // property of where code sits, not of what any single run observes.
 //
@@ -648,7 +648,7 @@ func TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked(t *testing.T
 // it would have to observe a fence held across an enqueue's retries, which is a timing
 // property; the durable fact is that every disposing arm of mqttProcessConnect goes through
 // the one helper that hands phase 2 to the defers.
-func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
+func TestConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 	file, lines, start, end := censusFuncSource(t, "Server", "mqttProcessConnect")
 
 	// EVERY primitive that can begin a disposal, not just the two the first draft knew
@@ -721,7 +721,7 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 	}
 }
 
-// TestF084TeardownIncompleteConsumesAgainstTheRetiringIncarnation pins the Will fence.
+// TestTeardownIncompleteConsumesAgainstTheRetiringIncarnation pins the Will fence.
 //
 // The post-reset teardown-incomplete arm disposes an object whose clear() has already
 // re-minted its generation and set its sequence to 0. Consuming a DELAYED Will against
@@ -732,7 +732,7 @@ func TestF084ConnectDisposalsAllUseThePhasedHelper(t *testing.T) {
 // The oracle is the outbox record's own fields: a NONZERO origin sequence and the generation
 // the Will was armed under. Asserting only "a record exists" would pass against the zero
 // baseline, and asserting only "no immediate publication" would pass against no Will at all.
-func TestF084TeardownIncompleteConsumesAgainstTheRetiringIncarnation(t *testing.T) {
+func TestTeardownIncompleteConsumesAgainstTheRetiringIncarnation(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084fence")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 
@@ -833,7 +833,7 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 	return w.c.buf.Write(p)
 }
 
-// TestF084WillExpiryIsReadAtConsumptionNotSnapshotted pins the interval's ownership.
+// TestWillExpiryIsReadAtConsumptionNotSnapshotted pins the interval's ownership.
 //
 // The Session Expiry Interval is CONNECTION-owned and stays mutable through an MQTT 5
 // DISCONNECT override. A disposal that snapshots it in phase 1 and consumes in phase 2 —
@@ -844,7 +844,7 @@ func (w *syncWriter) Write(p []byte) (int, error) {
 //
 // The fixture moves the value BETWEEN the phases and asserts the outbox FireAt follows the
 // NEW one. A snapshot-based implementation caps at the old interval and fails.
-func TestF084WillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
+func TestWillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084expiry")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 
@@ -899,7 +899,7 @@ func TestF084WillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
 	}
 }
 
-// TestF084WillPhaseOrderingIsObserved is the BEHAVIOURAL oracle for the phase-2 ordering,
+// TestWillPhaseOrderingIsObserved is the BEHAVIOURAL oracle for the phase-2 ordering,
 // and it is what the source guard above cannot be.
 //
 // That guard recognises three primitive names inside one function. A renamed wrapper, an
@@ -926,7 +926,7 @@ func TestF084WillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
 //   - R4, the remote-persist eviction, calls dischargeDeferredWill/mqttHandleWill directly
 //     from its tail. Its CONTRACT is the inverse of this one — no ownership gate is held
 //     there at all — so it fires the same probe and is asserted by
-//     TestF084RemotePersistWillPhaseIsUngated;
+//     TestRemotePersistWillPhaseIsUngated;
 //   - the LICENSED takeover discards through discardTakenOverClient, which is not a
 //     record-derived disposal and is pinned by the positive oracle;
 //   - B2, settleBoundRejectionGated's rebound arm, calls mqttDiscardArmedWill on the
@@ -934,10 +934,10 @@ func TestF084WillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
 //     half of the licensed takeover's Will rule early, so that whichever side notices the
 //     displacement first discards an armed Will and the other's discard is a no-op. It
 //     reaches no prepared disposition and so cannot fire this probe; it is asserted by
-//     TestF084BoundRejectionLocalReplacementDiscards;
+//     TestBoundRejectionLocalReplacementDiscards;
 //   - R5 discards the ARRIVING connection's Will in mqttAbortAcceptedConnect, which is
 //     excluded by design (no session was granted) and pinned by the two-Will fixture.
-func TestF084WillPhaseOrderingIsObserved(t *testing.T) {
+func TestWillPhaseOrderingIsObserved(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084order")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	b.armWill()
@@ -978,7 +978,7 @@ func TestF084WillPhaseOrderingIsObserved(t *testing.T) {
 	}
 }
 
-// TestF084RemotePersistWillPhaseIsUngated is R4's half of the ordering oracle, and its
+// TestRemotePersistWillPhaseIsUngated is R4's half of the ordering oracle, and its
 // expectations are the INVERSE of the gated paths'.
 //
 // That inversion is the point. R4 decides under as.mu, detaches inside that section, and
@@ -988,7 +988,7 @@ func TestF084WillPhaseOrderingIsObserved(t *testing.T) {
 //
 // What it shares with the gated paths is the fence: the record transaction must be CLOSED
 // before the Will action, because the discharge and the consume both do JetStream work.
-func TestF084RemotePersistWillPhaseIsUngated(t *testing.T) {
+func TestRemotePersistWillPhaseIsUngated(t *testing.T) {
 	e := testNewEvictEnv(t, "f084r4ord")
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	b.armWill()
@@ -1031,14 +1031,14 @@ func TestF084RemotePersistWillPhaseIsUngated(t *testing.T) {
 	}
 }
 
-// TestF084RemotePersistEvictionDischargesParkedAction covers R4's PARKED-ACTION arm, which
+// TestRemotePersistEvictionDischargesParkedAction covers R4's PARKED-ACTION arm, which
 // the armed-Will fixtures above do not reach — and which a mutation disabling it therefore
 // survived until this existed.
 //
 // The two arms are different code and different consequences. With a parked deferred close,
 // the eviction owes that action's Will against its ORIGINAL deadline, not the connection's
 // live one; before issue #86 it owed nothing and the action was dropped.
-func TestF084RemotePersistEvictionDischargesParkedAction(t *testing.T) {
+func TestRemotePersistEvictionDischargesParkedAction(t *testing.T) {
 	e := testNewEvictEnv(t, "f084r4park")
 	watch := e.watchDelivery(t, "will/topic")
 	testPlantDeferredAction(t, e, false)

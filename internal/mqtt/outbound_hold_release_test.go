@@ -53,7 +53,7 @@ func testRequireHolds(t *testing.T, jsa *mqttJSA, x *mqttOutboundExchange, stand
 // T1 at the operation surface: an acknowledgement ending leaves exactly its holds standing,
 // release-owed, and a release-holds batch over it then releases exactly them; over a non-ending it
 // releases nothing. The index names exactly what admission took.
-func TestF105AckEndingLeavesItsHoldsOwed(t *testing.T) {
+func TestAckEndingLeavesItsHoldsOwed(t *testing.T) {
 	for name, tc := range map[string]struct {
 		qos   byte
 		incs  []string
@@ -68,14 +68,14 @@ func TestF105AckEndingLeavesItsHoldsOwed(t *testing.T) {
 		"QoS 2 pending drain, drain": {2, []string{"inc-src", "inc-rel"}, []mqttExchangePhase{mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain, mqttExchangeTerminal}, true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "f105-holds-"+strings.ReplaceAll(strings.ToLower(name), " ", "-"))
+			e, done := testNewEnv(t, "f105-holds-"+strings.ReplaceAll(strings.ToLower(name), " ", "-"))
 			defer done()
 			e.bootstrap(t, "txn-1")
-			testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-			testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
-			nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, tc.qos, tc.incs...)
+			testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+			testPlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
+			nonce, _, _, _ := testAdmitQoS(t, e, "txn-adm", 7, tc.qos, tc.incs...)
 
-			x, _ := testF105LoadExchange(t, e, testF105Gen, nonce)
+			x, _ := testLoadExchange(t, e, testGen, nonce)
 			want := []mqttExchangeHold{{Inc: "inc-src", Role: mqttRoleSourceReplay}}
 			if tc.qos == 2 {
 				want = append(want, mqttExchangeHold{Inc: "inc-rel", Role: mqttRoleCanonicalPubRel})
@@ -86,16 +86,16 @@ func TestF105AckEndingLeavesItsHoldsOwed(t *testing.T) {
 			testRequireHolds(t, &e.asm.jsa, x, true)
 
 			for _, to := range tc.steps {
-				if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, to); err != nil {
+				if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, to); err != nil {
 					t.Fatalf("advancing to %d was refused: %v", to, err)
 				}
 			}
-			end, _ := testF105LoadExchange(t, e, testF105Gen, nonce)
+			end, _ := testLoadExchange(t, e, testGen, nonce)
 			if !mqttHoldsEqual(end.Holds, want) {
 				t.Fatalf("the holds index changed across the protocol: %v", end.Holds)
 			}
 			testRequireHolds(t, &e.asm.jsa, end, true)
-			if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil,
+			if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{nonce}, nil,
 				mqttNewInflightNonce(), nil); err != nil {
 				t.Fatalf("the release-holds batch was refused: %v", err)
 			}
@@ -106,12 +106,12 @@ func TestF105AckEndingLeavesItsHoldsOwed(t *testing.T) {
 
 // T1, the acknowledgement arrow: a PUBACK ends the obligation and leaves its source hold standing,
 // release-owed.
-func TestF105AckEndingLeavesItsHoldOwed(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-holds-ack")
+func TestAckEndingLeavesItsHoldOwed(t *testing.T) {
+	e, done := testNewEnv(t, "f105-holds-ack")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
 		Gen: auth.Gen, Nonce: nonce, To: mqttExchangeTerminal, Acq: reg.Acq,
@@ -119,7 +119,7 @@ func TestF105AckEndingLeavesItsHoldOwed(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("the PUBACK advance was refused: %v", err)
 	}
-	end, _ := testF105LoadExchange(t, e, auth.Gen, nonce)
+	end, _ := testLoadExchange(t, e, auth.Gen, nonce)
 	if end.Phase != mqttExchangeTerminal {
 		t.Fatalf("the exchange stands at %d, want terminal", end.Phase)
 	}
@@ -128,7 +128,7 @@ func TestF105AckEndingLeavesItsHoldOwed(t *testing.T) {
 
 // T1, through a real session: a proven-unsent withdrawal releases the obligation's holds, and an
 // abandonment — which is not an ending — releases nothing.
-func TestF105WithdrawalReleasesAndAbandonmentKeepsTheHolds(t *testing.T) {
+func TestWithdrawalReleasesAndAbandonmentKeepsTheHolds(t *testing.T) {
 	t.Parallel()
 	for _, qos := range []byte{1, 2} {
 		f := testWithdrawAdmitted(t, "holds-withdraw-q"+string('0'+qos), qos)
@@ -152,22 +152,22 @@ func TestF105WithdrawalReleasesAndAbandonmentKeepsTheHolds(t *testing.T) {
 // testHoldsLegitEnding composes a legitimate terminal ending of a QoS 1 obligation holding
 // inc-src — an acknowledgement's, so without a release — and returns it uncommitted with the
 // stored exchange.
-func testHoldsLegitEnding(t *testing.T, e *testF105Env, txn string) (*mqttAuthorityTransition, *mqttOutboundExchange) {
+func testHoldsLegitEnding(t *testing.T, e *testOutboundEnv, txn string) (*mqttAuthorityTransition, *mqttOutboundExchange) {
 	t.Helper()
-	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm-"+txn, 7, 1, "inc-src")
-	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, nonce)
+	nonce, _, _, _ := testAdmitQoS(t, e, "txn-adm-"+txn, 7, 1, "inc-src")
+	cur, curSeq := testLoadExchange(t, e, testGen, nonce)
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	tr, err := mqttAdvanceExchangeTransition(al.rec, al.seq, txn, "op-"+txn, cur, curSeq, mqttExchangeTerminal)
 	if err != nil {
 		t.Fatalf("composing the ending: %v", err)
 	}
 	// With its slot re-phase (the PUBACK's), so the only thing a test removes is the release.
-	return testWithSlotMember(t, &e.asm.jsa, tr, testF105Gen, nonce, mqttExchangeTerminal), cur
+	return testWithSlotMember(t, &e.asm.jsa, tr, testGen, nonce, mqttExchangeTerminal), cur
 }
 
 // testHoldsResourceMember returns the index of tr's member on resource inc, or -1.
-func testHoldsResourceMember(e *testF105Env, tr *mqttAuthorityTransition, inc string) int {
-	subj := mqttResourceSubject(getHash(e.id), testF105Gen, inc)
+func testHoldsResourceMember(e *testOutboundEnv, tr *mqttAuthorityTransition, inc string) int {
+	subj := mqttResourceSubject(getHash(e.id), testGen, inc)
 	for i, m := range tr.Extra {
 		if m.subj == subj {
 			return i
@@ -177,7 +177,7 @@ func testHoldsResourceMember(e *testF105Env, tr *mqttAuthorityTransition, inc st
 }
 
 // T2: the property, submitted DIRECTLY to the write boundary with every composer bypassed.
-func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
+func TestEndingWithoutReleaseIsRefused(t *testing.T) {
 	refused := func(t *testing.T, err error, why string) {
 		t.Helper()
 		if err == nil {
@@ -189,23 +189,23 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 	}
 
 	t.Run("an acknowledgement ending without its release commits", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-holds-t2a")
+		e, done := testNewEnv(t, "f105-holds-t2a")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		tr, cur := testHoldsLegitEnding(t, e, "txn-bare")
 		if _, err := e.asm.jsa.commitAuthorityTransition(tr); err != nil {
 			t.Fatalf("the acknowledgement ending was refused: %v", err)
 		}
-		end, _ := testF105LoadExchange(t, e, testF105Gen, cur.Nonce)
+		end, _ := testLoadExchange(t, e, testGen, cur.Nonce)
 		testRequireHolds(t, &e.asm.jsa, end, true)
 	})
 
 	t.Run("an acknowledgement ending with its release is refused", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-holds-t2b")
+		e, done := testNewEnv(t, "f105-holds-t2b")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		tr, cur := testHoldsLegitEnding(t, e, "txn-ok")
 		if err := e.asm.jsa.appendHoldReleases(tr, cur, mqttExchangeTerminal); err != nil {
 			t.Fatalf("composing the release: %v", err)
@@ -215,51 +215,51 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 	})
 
 	t.Run("a release without an ending", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-holds-t2c")
+		e, done := testNewEnv(t, "f105-holds-t2c")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
-		err := testF105ReleaseDependency(t, e, "inc-src", nonce, "txn-rel")
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
+		err := testReleaseDependency(t, e, "inc-src", nonce, "txn-rel")
 		refused(t, err, "does not move that obligation into an ending")
 	})
 
 	t.Run("a release against a stored ending", func(t *testing.T) {
 		// An ended exchange whose hold still stands is release-owed, and only a release-holds
 		// batch releases it: the standalone dependency release of another kind is refused.
-		e, done := testF105NewEnv(t, "f105-holds-t2d")
+		e, done := testNewEnv(t, "f105-holds-t2d")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
-		x, xSeq := testF105LoadExchange(t, e, testF105Gen, nonce)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
+		x, xSeq := testLoadExchange(t, e, testGen, nonce)
 		ended := *x
 		ended.Phase = mqttExchangeRejected
 		b, _ := json.Marshal(&ended)
 		msg, hdr := mqttFrameBatchWrite(xSeq, b, _EMPTY_, 0, false)
-		if _, err := e.asm.jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testF105Gen, nonce), hdr, msg); err != nil {
+		if _, err := e.asm.jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testGen, nonce), hdr, msg); err != nil {
 			t.Fatalf("planting the contradiction: %v", err)
 		}
-		err := testF105ReleaseDependency(t, e, "inc-src", nonce, "txn-rel")
+		err := testReleaseDependency(t, e, "inc-src", nonce, "txn-rel")
 		refused(t, err, "does not move that obligation into an ending")
 	})
 
 	// UNDER A RELEASING KIND the resource member is a hold release and nothing else (P-4, M22),
 	// here a release-holds batch over a stored acknowledgement ending.
-	for name, edit := range map[string]func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int){
-		"an added edge": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
+	for name, edit := range map[string]func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, i int){
+		"an added edge": func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, i int) {
 			var r mqttOutboundResource
 			_ = json.Unmarshal(tr.Extra[i].body, &r)
 			r.Deps = append(r.Deps, mqttResourceEdge{Nonce: mqttNewInflightNonce(), Role: mqttRoleSourceReplay})
 			tr.Extra[i].body, _ = json.Marshal(&r)
 		},
-		"a state change": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
+		"a state change": func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, i int) {
 			var r mqttOutboundResource
 			_ = json.Unmarshal(tr.Extra[i].body, &r)
 			r.State, r.AuthTxn = mqttResourceDeleteAuthorized, tr.Attempt.Txn
 			tr.Extra[i].body, _ = json.Marshal(&r)
 		},
-		"a provisioning change": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
+		"a provisioning change": func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, i int) {
 			var r mqttOutboundResource
 			_ = json.Unmarshal(tr.Extra[i].body, &r)
 			// TOGGLED, so the edit is a change whatever the fixture planted.
@@ -270,19 +270,19 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 			}
 			tr.Extra[i].body, _ = json.Marshal(&r)
 		},
-		"a resource create": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
-			fresh := &mqttOutboundResource{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: "inc-new",
+		"a resource create": func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, i int) {
+			fresh := &mqttOutboundResource{ID: e.id, Epoch: e.epoch, Gen: testGen, Inc: "inc-new",
 				Kind: mqttResourceSourceConsumer, Name: "$MQTT_inc-new", State: mqttResourceLive,
 				Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
 				ProvTenure: e.asm.jsa.loadOutboundAuthority(e.id, e.epoch).rec.Tenure}
 			b, _ := json.Marshal(fresh)
 			tr.Extra = append(tr.Extra, mqttTransitionMember{
-				subj: mqttResourceSubject(getHash(e.id), testF105Gen, "inc-new"), expect: 0, body: b})
+				subj: mqttResourceSubject(getHash(e.id), testGen, "inc-new"), expect: 0, body: b})
 		},
-		"a release of an obligation this batch does not end": func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, i int) {
+		"a release of an obligation this batch does not end": func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, i int) {
 			// A second obligation on the same resource; drop ITS edge too, under this ending.
-			other := testF105AdmitOn(t, e, "txn-adm-other", 8, "inc-src")
-			r, seq := testF105LoadResource(t, e, "inc-src")
+			other := testAdmitOn(t, e, "txn-adm-other", 8, "inc-src")
+			r, seq := testBoundaryLoadResource(t, e, "inc-src")
 			var keep []mqttResourceEdge
 			for _, d := range r.Deps {
 				if d.Nonce != other {
@@ -305,10 +305,10 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 		},
 	} {
 		t.Run("release kind refuses "+name, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "f105-holds-k-"+strings.ReplaceAll(name, " ", "-"))
+			e, done := testNewEnv(t, "f105-holds-k-"+strings.ReplaceAll(name, " ", "-"))
 			defer done()
 			e.bootstrap(t, "txn-1")
-			testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+			testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 			ending, cur := testHoldsLegitEnding(t, e, "txn-k")
 			if _, err := e.asm.jsa.commitAuthorityTransition(ending); err != nil {
 				t.Fatalf("fixture: the acknowledgement ending was refused: %v", err)
@@ -323,14 +323,14 @@ func TestF105EndingWithoutReleaseIsRefused(t *testing.T) {
 				t.Fatalf("a release kind carried %s", name)
 			}
 			// AND NOTHING LANDED.
-			end, _ := testF105LoadExchange(t, e, testF105Gen, cur.Nonce)
+			end, _ := testLoadExchange(t, e, testGen, cur.Nonce)
 			testRequireHolds(t, &e.asm.jsa, end, true)
 		})
 	}
 }
 
 // T3: the index is derived from the admitted edges, in both directions.
-func TestF105HoldsMatchAdmittedEdges(t *testing.T) {
+func TestHoldsMatchAdmittedEdges(t *testing.T) {
 	for name, edit := range map[string]func(x *mqttOutboundExchange){
 		"missing": func(x *mqttOutboundExchange) { x.Holds = nil },
 		"extra": func(x *mqttOutboundExchange) {
@@ -341,17 +341,17 @@ func TestF105HoldsMatchAdmittedEdges(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "f105-holds-t3-"+strings.ReplaceAll(name, " ", "-"))
+			e, done := testNewEnv(t, "f105-holds-t3-"+strings.ReplaceAll(name, " ", "-"))
 			defer done()
 			auth, authSeq := e.bootstrap(t, "txn-1")
-			src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-			adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
+			src, srcSeq := testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+			adm := testAdmission(e, auth, authSeq, "txn-adm", 7,
 				[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 			tr, err := mqttAdmitPublishTransition(adm)
 			if err != nil {
 				t.Fatalf("composing the admission: %v", err)
 			}
-			subj := mqttExchangeSubject(getHash(e.id), testF105Gen, adm.Exchange.Nonce)
+			subj := mqttExchangeSubject(getHash(e.id), testGen, adm.Exchange.Nonce)
 			for i := range tr.Extra {
 				if tr.Extra[i].subj != subj {
 					continue
@@ -370,19 +370,19 @@ func TestF105HoldsMatchAdmittedEdges(t *testing.T) {
 	}
 
 	t.Run("immutable after admission", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-holds-t3-immutable")
+		e, done := testNewEnv(t, "f105-holds-t3-immutable")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
-		nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src", "inc-rel")
-		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, nonce)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
+		nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src", "inc-rel")
+		cur, curSeq := testLoadExchange(t, e, testGen, nonce)
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		tr, err := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-pr", "op-pr", cur, curSeq, mqttExchangePubRecObserved)
 		if err != nil {
 			t.Fatal(err)
 		}
-		tr = testWithSlotMember(t, &e.asm.jsa, tr, testF105Gen, nonce, mqttExchangePubRecObserved)
+		tr = testWithSlotMember(t, &e.asm.jsa, tr, testGen, nonce, mqttExchangePubRecObserved)
 		var x mqttOutboundExchange
 		_ = json.Unmarshal(tr.Extra[0].body, &x)
 		x.Holds = x.Holds[:1]
@@ -411,19 +411,19 @@ func testSealMember(t *testing.T, jsa *mqttJSA, id, epoch, gen, inc string) mqtt
 }
 
 // H-2: an ending batch may not carry a SEPARATE resource member, here another resource's seal.
-func TestF105EndingBatchCarriesNoUnrelatedResource(t *testing.T) {
+func TestEndingBatchCarriesNoUnrelatedResource(t *testing.T) {
 	t.Run("advance", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-holds-h2-adv")
+		e, done := testNewEnv(t, "f105-holds-h2-adv")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		testF105PlantUnsealedResource(t, e, "inc-other", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantUnsealedResource(t, e, "inc-other", mqttResourceSourceConsumer)
 		tr, cur := testHoldsLegitEnding(t, e, "txn-h2")
-		tr = testF105WithHoldReleases(t, e, tr, cur, mqttExchangeTerminal)
-		tr.Extra = append(tr.Extra, testSealMember(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, "inc-other"))
+		tr = testWithHoldReleases(t, e, tr, cur, mqttExchangeTerminal)
+		tr.Extra = append(tr.Extra, testSealMember(t, &e.asm.jsa, e.id, e.epoch, testGen, "inc-other"))
 		_, err := e.asm.jsa.commitAuthorityTransition(tr)
 		testRequireRefusal(t, err, "a resource member is an edge change")
-		if r, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-other"); r.Prov == mqttProvisioningSealed {
+		if r, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-other"); r.Prov == mqttProvisioningSealed {
 			t.Fatal("an ending batch sealed an unrelated resource")
 		}
 	})
@@ -460,17 +460,17 @@ func TestF105EndingBatchCarriesNoUnrelatedResource(t *testing.T) {
 
 // H-3: an ADMISSION batch — ordinary, and a pair replacement — may not carry a separate resource
 // member either: outside dispose-resource a resource overwrite is an edge change.
-func TestF105AdmissionBatchCarriesNoUnrelatedResource(t *testing.T) {
+func TestAdmissionBatchCarriesNoUnrelatedResource(t *testing.T) {
 	t.Run("ordinary admission", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-holds-h3-adm")
+		e, done := testNewEnv(t, "f105-holds-h3-adm")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		testF105PlantUnsealedResource(t, e, "inc-other", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantUnsealedResource(t, e, "inc-other", mqttResourceSourceConsumer)
 		var refusal error
 		hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 			if tr.Attempt.Kind == mqttTransitionAdmitExchange {
-				tr.Extra = append(tr.Extra, testSealMember(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, "inc-other"))
+				tr.Extra = append(tr.Extra, testSealMember(t, &e.asm.jsa, e.id, e.epoch, testGen, "inc-other"))
 				_, refusal = send()
 				return 0, refusal
 			}
@@ -486,17 +486,17 @@ func TestF105AdmissionBatchCarriesNoUnrelatedResource(t *testing.T) {
 		})
 		e.asm.jsa.testTransitionCommit.Store(nil)
 		testRequireRefusal(t, refusal, "a resource member is an edge change")
-		if r, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-other"); r.Prov == mqttProvisioningSealed {
+		if r, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-other"); r.Prov == mqttProvisioningSealed {
 			t.Fatal("an admission sealed an unrelated resource")
 		}
 	})
 	t.Run("pair replacement", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-holds-h3-pair")
+		r, done := testNewReplEnv(t, "f105-holds-h3-pair")
 		defer done()
-		testF105PlantUnsealedResource(t, r.testF105Env, "inc-other", mqttResourceSourceConsumer)
+		testPlantUnsealedResource(t, r.testOutboundEnv, "inc-other", mqttResourceSourceConsumer)
 		adm := r.replacingFor(t, mqttReplacePair, "txn-h3-pair")
 		adm.Exchange = &mqttOutboundExchange{
-			ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: adm.Register.Lin,
+			ID: r.id, Epoch: r.epoch, Gen: testGen, Nonce: adm.Register.Lin,
 			PI: r.pi, QoS: r.occ.QoS, Phase: mqttExchangePublish,
 			AdmitTxn: "txn-h3-pair", Tenure: adm.Auth.Tenure,
 		}
@@ -507,7 +507,7 @@ func TestF105AdmissionBatchCarriesNoUnrelatedResource(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tr.Extra = append(tr.Extra, testSealMember(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, "inc-other"))
+		tr.Extra = append(tr.Extra, testSealMember(t, &r.asm.jsa, r.id, r.epoch, testGen, "inc-other"))
 		_, err = r.asm.jsa.commitAuthorityTransition(tr)
 		testRequireRefusal(t, err, "a resource member is an edge change")
 	})

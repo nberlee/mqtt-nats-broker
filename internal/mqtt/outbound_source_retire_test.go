@@ -104,7 +104,7 @@ func testRequireSourceRetired(t *testing.T, e *testInflightEnv, gen, inc, name s
 }
 
 // T8: an AMBIGUOUS delete records nothing; a delete whose response was lost repeats harmlessly.
-func TestF105RetirementCrashWindows(t *testing.T) {
+func TestRetirementCrashWindows(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "retire-crash")
 	cl := testClaimedSourceConsumer(t, e, "retire.crash")
@@ -153,7 +153,7 @@ func TestF105RetirementCrashWindows(t *testing.T) {
 }
 
 // T9: a delayed CREATE resurrecting a RETIRED name is swept, and nothing can adopt it.
-func TestF105LateCreateAfterCleanupIsSwept(t *testing.T) {
+func TestLateCreateAfterCleanupIsSwept(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "retire-late")
 	cl := testClaimedSourceConsumer(t, e, "retire.late")
@@ -180,7 +180,7 @@ func TestF105LateCreateAfterCleanupIsSwept(t *testing.T) {
 }
 
 // T10: a route naming a consumer with no ownership of this generation deletes NOTHING.
-func TestF105RouteWithholdsWithoutOwnership(t *testing.T) {
+func TestRouteWithholdsWithoutOwnership(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "retire-noown")
 	name := e.sess.idHash + "_" + nuid.Next()
@@ -204,7 +204,7 @@ func TestF105RouteWithholdsWithoutOwnership(t *testing.T) {
 
 // T7c: a disposal that loses the authority CAS, or whose response is lost, is re-attempted and lands
 // once.
-func TestF105DisposalRequestContention(t *testing.T) {
+func TestDisposalRequestContention(t *testing.T) {
 	t.Parallel()
 	for _, lost := range []bool{false, true} {
 		e := testNewInflightEnv(t, fmt.Sprintf("retire-cont-%v", lost))
@@ -241,7 +241,7 @@ func TestF105DisposalRequestContention(t *testing.T) {
 }
 
 // T7d: a claim whose attempts all "failed" may still have landed — every handle is arbitrated.
-func TestF105ClaimLandsAfterTimeout(t *testing.T) {
+func TestClaimLandsAfterTimeout(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "retire-claim")
 	// RESIDENT, as a CONNECTed session is: the retirement owner stops for a session object that
@@ -301,7 +301,7 @@ func TestF105ClaimLandsAfterTimeout(t *testing.T) {
 }
 
 // T13: readiness refuses a consumer whose EFFECTIVE configuration carries an inactivity threshold.
-func TestF105ReadinessRefusesEffectiveThreshold(t *testing.T) {
+func TestReadinessRefusesEffectiveThreshold(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "ready-thr")
 	cl := testClaimedSourceConsumer(t, e, "ready.thr")
@@ -323,7 +323,7 @@ func TestF105ReadinessRefusesEffectiveThreshold(t *testing.T) {
 }
 
 // T14: the PUBREL ensure refuses when the session's generation and the serving authority's differ.
-func TestF105PubRelGenerationMismatchRefused(t *testing.T) {
+func TestPubRelGenerationMismatchRefused(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "pubrel-gen")
 	e.c.mqtt = &mqtt{asm: e.asm, sess: e.sess}
@@ -343,7 +343,7 @@ func TestF105PubRelGenerationMismatchRefused(t *testing.T) {
 
 // T6 / T7, end to end: an UNSUBSCRIBE and a QoS 0 downgrade with nothing outstanding retire the
 // consumer through the owner — the route was reached, and the whole retirement lands.
-func TestF105RoutesRetireTheSource(t *testing.T) {
+func TestRoutesRetireTheSource(t *testing.T) {
 	for _, route := range []string{"unsubscribed", "downgraded"} {
 		t.Run(route, func(t *testing.T) {
 			o := testMQTTDefaultOptions()
@@ -404,7 +404,7 @@ func TestF105RoutesRetireTheSource(t *testing.T) {
 
 // T7: a fresh consumer whose CREATE fails after its claim is disposed of, and a SUBSCRIBE whose
 // local subscription fails after its CREATE too.
-func TestF105FailedProvisioningIsDisposed(t *testing.T) {
+func TestFailedProvisioningIsDisposed(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -455,7 +455,7 @@ func testPlantPubRelOwnership(t *testing.T, e *testOrphanEnv, name, gen string, 
 
 // T12 (consult 14 finding 2): a RETIRED PUBREL name is reclaimed with NO retirement watermark — the
 // single-slot proof a later generation overwrites, and a restart forgets — while a LIVE one is kept.
-func TestF105RetiredPubRelSweptWithoutTheWatermark(t *testing.T) {
+func TestRetiredPubRelSweptWithoutTheWatermark(t *testing.T) {
 	e := testNewOrphanEnv(t, "t12-pubrel")
 	e.setGraces(t, 0, 0)
 	idHash := getHash("t12-pubrel-client")
@@ -479,12 +479,12 @@ func TestF105RetiredPubRelSweptWithoutTheWatermark(t *testing.T) {
 // T2b: an acknowledgement ending whose response is lost leaves the exchange ended and its hold
 // release-owed, with the pending duty that records the debt: never an ended obligation whose
 // release nothing durable remembers.
-func TestF105EndingLostResponseLeavesTheReleaseOwed(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-holds-lost")
+func TestEndingLostResponseLeavesTheReleaseOwed(t *testing.T) {
+	e, done := testNewEnv(t, "f105-holds-lost")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, _, _ := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		if tr.Attempt.Op == "op-ack" {
 			if _, err := send(); err != nil {
@@ -495,12 +495,12 @@ func TestF105EndingLostResponseLeavesTheReleaseOwed(t *testing.T) {
 		return send()
 	}
 	e.asm.jsa.testTransitionCommit.Store(&hook)
-	_, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal)
+	_, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal)
 	e.asm.jsa.testTransitionCommit.Store(nil)
 	if err == nil {
 		t.Fatal("fixture: the lost response must surface as an error")
 	}
-	x, _ := testF105LoadExchange(t, e, testF105Gen, nonce)
+	x, _ := testLoadExchange(t, e, testGen, nonce)
 	if x.Phase != mqttExchangeTerminal {
 		t.Fatalf("fixture: the ending must have landed, phase %d", x.Phase)
 	}
@@ -511,7 +511,7 @@ func TestF105EndingLostResponseLeavesTheReleaseOwed(t *testing.T) {
 	if testDutyTerminal(t, e, duty) {
 		t.Fatal("the duty of a release-owed obligation stands terminal")
 	}
-	if err := e.asm.jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}, duty,
+	if err := e.asm.jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}, duty,
 		mqttNewInflightNonce()); err != nil {
 		t.Fatalf("resolving the owed duty: %v", err)
 	}
@@ -520,7 +520,7 @@ func TestF105EndingLostResponseLeavesTheReleaseOwed(t *testing.T) {
 
 // T7, the drain route: a drained delivery's PUBACK clears the drain's last claim, the drain retires,
 // and its consumer is retired through the owner — the route reached, the retirement whole.
-func TestF105DrainRetirementRetiresTheSource(t *testing.T) {
+func TestDrainRetirementRetiresTheSource(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -569,7 +569,7 @@ func TestF105DrainRetirementRetiresTheSource(t *testing.T) {
 // T7d-2: a claim attempt that has NOT landed when custody starts — an ownership read answers absent
 // — is aborted by the arbitration, so its delayed batch can never land afterwards. A custody that
 // trusted the negative read (M20) would leave the late claim to land unowned.
-func TestF105DelayedClaimIsAbortedNotTrusted(t *testing.T) {
+func TestDelayedClaimIsAbortedNotTrusted(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "retire-delayed")
 	e.asm.mu.Lock()
@@ -626,7 +626,7 @@ func TestF105DelayedClaimIsAbortedNotTrusted(t *testing.T) {
 // a foreground authority operation is announced — observed at the gate, not inferred from timing —
 // and proceeds once it is released. (An attempt admitted just before an announcement may still
 // commit after it; that is the protocol's stated allowance and is not this test's claim.)
-func TestF105SourceRetirementWaitsForTheForeground(t *testing.T) {
+func TestSourceRetirementWaitsForTheForeground(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "retire-fg")
 	e.asm.mu.Lock()

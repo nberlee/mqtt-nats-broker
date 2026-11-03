@@ -495,11 +495,11 @@ func TestSharedProvenUnsentPurgeWithdrawsTheExchange(t *testing.T) {
 //
 // Mutation M19: opAcquireAction skips the pair rule -> the action record is written.
 func TestAcquireActionRefusesAnInconsistentSharedPair(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-acq-pair")
+	e, done := testNewEnv(t, "f105-acq-pair")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	forged := *reg
 	forged.Dur = mqttSharedDurableOf(testValidSharedAcq())
 	_, act, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{

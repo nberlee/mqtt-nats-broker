@@ -21,13 +21,13 @@ import (
 	"time"
 )
 
-// TestF105SealedGateStillCertifies is the regression for the certificate-completion deadlock
+// TestSealedGateStillCertifies is the regression for the certificate-completion deadlock
 // (plan §4.4). A torn writer seals the gate under wmu via sealOutput and NOTHING else — it may
 // crash, or simply not have reached its own completeCertification yet. An external certifier
 // (a teardown) meeting that already-sealed gate must still COMPLETE the certificate, not block
 // forever waiting for a completion the bare seal never owed. The old mqttCertifyClosed hung on
 // <-b.established here.
-func TestF105SealedGateStillCertifies(t *testing.T) {
+func TestSealedGateStillCertifies(t *testing.T) {
 	c := &client{}
 	b := mqttNewConnBinding("run-1", "conn-1")
 
@@ -54,10 +54,10 @@ func TestF105SealedGateStillCertifies(t *testing.T) {
 	}
 }
 
-// TestF105WriterAndExternalCertifierConverge pins that the torn-writer completion and an
+// TestWriterAndExternalCertifierConverge pins that the torn-writer completion and an
 // external certifier converge on ONE certificate rather than one blocking on the other:
 // whichever crosses the barrier first records it, the other adopts the same one.
-func TestF105WriterAndExternalCertifierConverge(t *testing.T) {
+func TestWriterAndExternalCertifierConverge(t *testing.T) {
 	c := &client{}
 	b := mqttNewConnBinding("run-1", "conn-1")
 
@@ -98,9 +98,9 @@ func TestF105WriterAndExternalCertifierConverge(t *testing.T) {
 	}
 }
 
-// TestF105CompleteCertificationIsIdempotent pins that a second completion neither replaces the
+// TestCompleteCertificationIsIdempotent pins that a second completion neither replaces the
 // certificate nor double-closes `established`.
-func TestF105CompleteCertificationIsIdempotent(t *testing.T) {
+func TestCompleteCertificationIsIdempotent(t *testing.T) {
 	b := mqttNewConnBinding("run-1", "conn-1")
 
 	first := completeCertification(b, "first")

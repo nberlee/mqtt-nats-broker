@@ -9445,7 +9445,7 @@ existing readers of the watermark treat retirement as generation-wide and irreve
 All live on `$MQTT_inflight`, because a JetStream atomic batch is **per stream** and the
 authority must commit together with the exchange mutation it authorizes. They are kept out
 of
-the register machinery's reach by a leading `f105` class token, which can satisfy neither
+the register machinery's reach by a leading `ob` class token, which can satisfy neither
 the
 client-hash nor the generation validator; closure and outcome subjects also carry a token
 count the register parser refuses. The authority subject carries the same count as a
@@ -10664,7 +10664,7 @@ while its frame is being written**. This is a property of the control flow: ever
 into the drain is the acquiring goroutine before it hands the holder off, the delivery
 callback's deferred drain after the synchronous write returned, or a reconcile/shutdown
 pass that only a drain which already ran can enrol.
-`TestF105DrainEntriesCannotRunDuringAWrite` records that call-site set, method values
+`TestDrainEntriesCannotRunDuringAWrite` records that call-site set, method values
 included; an unchanged count cannot prove an unchanged ordering, which the token-retention
 test carries. The durable token therefore stands for the whole write, and a peer's
 acquisition of the same exchange is refused for as long as the bytes may be going out.
@@ -11279,7 +11279,7 @@ did: its response is lost, every readback of its register fails and its custody 
 stays unresolved, so the ladder gives up and `abandonInflightRegister` drops the entry and
 the source mapping. Without a record of it, the source's next offer would be a stranger to
 the session and be admitted again, under another identifier and another lineage, while the
-first stood at `Publish`; witness W5b (`TestF097ContinuityW5bLandedThenUnreadable`) is
+first stood at `Publish`; witness W5b (`TestContinuityW5bLandedThenUnreadable`) is
 that shape.
 
 **The continuity record** (`outbound_admit_continuity.go`). An abandonment whose admission
@@ -12033,8 +12033,8 @@ being the cancellation fact itself. **Cost:** a resume reads `[Lo, Hi]` — what
 outstanding plus what the floor has not yet retired — not the generation's history
 ("The inventory floor",
 [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114)).
-`TestF112ResumeReadsFromTheFloor` pins that it reads exactly the span, and
-`TestF105ResumeInventoryReadsEveryOrdinal` that a floor at 1 reads every ordinal.
+`TestResumeReadsFromTheFloor` pins that it reads exactly the span, and
+`TestResumeInventoryReadsEveryOrdinal` that a floor at 1 reads every ordinal.
 
 **Ownership is the connection's entitlement, and the register claim decides nothing.** The
 property, applied to every ordinary mutation: > A mutation is **owner-dependent** when its
@@ -13229,7 +13229,7 @@ would ask the consumer lookup on an empty name, each holding foreground authorit
 full API timeout, starving this session's retained replay worker and holding the
 identifier for the session's life. A successful PUBREC is ONE advance: the exchange to
 PubRecObserved, the register `publish -> pubrel_ready` carrying `rel_subj`/`rel_id`, the
-create-only CANONICAL PUBREL (`f105.rel.<idHash>.<gen>.<nonce>`, class `rel`) on
+create-only CANONICAL PUBREL (`ob.rel.<idHash>.<gen>.<nonce>`, class `rel`) on
 `$MQTT_inflight`, and the manifest at its read sequence, unchanged and READY — so a copy
 cleanup has closed forbids a late `rel`. The PUBREL is acquired on the register and
 written directly; nothing is stored on `$MQTT_out`. A duplicate PUBREC acquires a new
@@ -13872,7 +13872,7 @@ successor's acquisition. The process that owned the connection had established,
 positively, that the connection could never emit again; the certificate makes that fact
 durable and lets it end the token.
 
-**The record.** `$MQTT.inflight.f105.cert.<idHash>.<gen>.<run>.<conn>` on
+**The record.** `$MQTT.inflight.ob.cert.<idHash>.<gen>.<run>.<conn>` on
 `$MQTT_inflight`, body `{id, epoch, gen, run, conn}`: which connection of which broker
 run, serving which client generation, can emit nothing more. The connection token is
 MINTED per connection, with the server-local number only as a prefix: one process may
@@ -14133,9 +14133,9 @@ section and in the mechanism sections above. These are its boundaries:
   goes through `writeAuthorizedFrame`, refused rather than written raw without one. The
   structural check parses the package and refuses any raw transport write that is
   neither a boundary nor a recorded site, and
-  `TestF105OutputBypassSetIsTheTwoMixedSites` requires the recorded set to EQUAL the two
+  `TestOutputBypassSetIsTheTwoMixedSites` requires the recorded set to EQUAL the two
   mixed sites by key and count. A count cannot say which traffic a site carries, so
-  `TestF105SupportedObligationsNeverLeaveThroughAMixedSite` watches the frames at both
+  `TestSupportedObligationsNeverLeaveThroughAMixedSite` watches the frames at both
   sites across live delivery, retransmission, retained replay, shared delivery and the
   resends of a resumed session and a restarted server, and sees no QoS 1/2 PUBLISH and
   no PUBREL.

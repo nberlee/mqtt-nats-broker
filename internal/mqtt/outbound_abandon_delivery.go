@@ -70,11 +70,11 @@ func mqttValidateRetainedAbandonment(f *mqttExchangeAbandonment) error {
 	switch {
 	case !mqttValidRetainedAbandonReason(f.Reason):
 		return fmt.Errorf("the retained abandonment fact carries reason %q, which this broker does not abandon for", f.Reason)
-	case !mqttF105IdentTk(f.Tenure):
+	case !mqttOutboundIdentTk(f.Tenure):
 		return fmt.Errorf("the abandonment fact carries a malformed tenure %q", f.Tenure)
-	case !mqttF105IdentTk(f.Alloc):
+	case !mqttOutboundIdentTk(f.Alloc):
 		return fmt.Errorf("the abandonment fact carries a malformed allocation %q", f.Alloc)
-	case !mqttF105IdentTk(f.Payload):
+	case !mqttOutboundIdentTk(f.Payload):
 		return fmt.Errorf("the retained abandonment fact names payload %q, which is not a material identity", f.Payload)
 	case f.Dur != _EMPTY_ || f.Seq != 0 || f.Reply != _EMPTY_:
 		return fmt.Errorf("the retained abandonment fact carries source coordinates %q/%d: a retained "+
@@ -295,10 +295,10 @@ func (jsa *mqttJSA) checkAbandonmentRegister(a *mqttTransitionAttempt, extra []m
 	}
 	paired := false
 	for _, x := range extra {
-		if cls, ok := mqttF105ObligationClass(x.subj); !ok || cls != mqttExchangeClassTk {
+		if cls, ok := mqttOutboundObligationClass(x.subj); !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(x.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(x.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}

@@ -19,7 +19,7 @@ import "testing"
 // answers its fail-closed value — Unknown, no completion, no settlement, no restoration match, not
 // cached — and counts the refusal. The behavioural tests assert the count stays zero on every
 // assembled route; this pins that each sink would refuse were the routing ever wrong.
-func TestF105RetainedRegisterIsRefusedAtEveryOrdinarySink(t *testing.T) {
+func TestRetainedRegisterIsRefusedAtEveryOrdinarySink(t *testing.T) {
 	e := testNewInflightEnv(t, "ret-sinks")
 	rec := &mqttInflightRecord{PI: 3, QoS: 1, State: mqttInflightPublish, Nonce: mqttNewInflightNonce(),
 		Payload: mqttNewInflightNonce(), Digest: mqttMaterialDigest([]byte("x"))}
@@ -60,7 +60,7 @@ func TestF105RetainedRegisterIsRefusedAtEveryOrdinarySink(t *testing.T) {
 // empty name, which a server with permissions never answers. A zero sequence alone is refused
 // too: it would read as Complete against any ack floor. holdTerminalSourceLocked takes the
 // coordinate form and installs no owner.
-func TestF105SourcelessCoordinatesAreRefusedAtEveryOrdinarySink(t *testing.T) {
+func TestSourcelessCoordinatesAreRefusedAtEveryOrdinarySink(t *testing.T) {
 	e := testNewInflightEnv(t, "sourceless-sinks")
 	const pi = 3
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)

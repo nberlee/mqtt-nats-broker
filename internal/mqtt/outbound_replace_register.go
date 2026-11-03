@@ -86,7 +86,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 	// rather than from what its composer meant.
 	markers := map[string]mqttTransitionMember{}
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) {
+		if mqttIsOutboundRecordSubject(e.subj) {
 			continue
 		}
 		if name, merr := mqttParseInflightMarkerSubject(e.subj); merr == nil {
@@ -109,10 +109,10 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 	// marker rewrite the store itself would accept — after which recovery reads a matching
 	// marker, calls a possibly-transmitted delivery a first transmission, and puts DUP=0 on a
 	// retransmission, the one direction [MQTT-3.3.1-1] forbids.
-	// TestF105MarkerMembersAreShapedAndCreateOnly is that shape, and it is this rule's oracle.
+	// TestMarkerMembersAreShapedAndCreateOnly is that shape, and it is this rule's oracle.
 	replacing := map[string]struct{}{}
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) || e.expect == 0 {
+		if mqttIsOutboundRecordSubject(e.subj) || e.expect == 0 {
 			continue
 		}
 		if name, perr := mqttParseInflightSubject(e.subj); perr == nil {
@@ -133,7 +133,7 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 	}
 
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) || e.expect == 0 {
+		if mqttIsOutboundRecordSubject(e.subj) || e.expect == 0 {
 			continue
 		}
 		name, perr := mqttParseInflightSubject(e.subj)
@@ -519,10 +519,10 @@ type mqttAcquiredAction struct {
 func mqttAcquiredActionsIn(a *mqttTransitionAttempt, extra []mqttTransitionMember) map[string]mqttAcquiredAction {
 	acquired := map[string]mqttAcquiredAction{}
 	for _, e := range extra {
-		if cls, ok := mqttF105ObligationClass(e.subj); !ok || cls != mqttActionClassTk {
+		if cls, ok := mqttOutboundObligationClass(e.subj); !ok || cls != mqttActionClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 5 {
 			continue
 		}
@@ -553,7 +553,7 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 	acquired := mqttAcquiredActionsIn(a, extra)
 	tokened := map[string]struct{}{}
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) || e.expect == 0 {
+		if mqttIsOutboundRecordSubject(e.subj) || e.expect == 0 {
 			continue
 		}
 		if _, perr := mqttParseInflightSubject(e.subj); perr != nil {
@@ -646,7 +646,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 		// elsewhere), and a bare re-phase on another kind would record a client answer with no
 		// phase move beside it.
 		for _, e := range extra {
-			if mqttIsF105Subject(e.subj) || e.expect == 0 {
+			if mqttIsOutboundRecordSubject(e.subj) || e.expect == 0 {
 				continue
 			}
 			if _, perr := mqttParseInflightSubject(e.subj); perr != nil {
@@ -674,11 +674,11 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 	var xchGen, xchNonce, xchSubj string
 	var xchExpect uint64
 	for _, e := range extra {
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return fmt.Errorf("transition %q carries a malformed exchange subject %q", a.Txn, e.subj)
 		}
@@ -694,7 +694,7 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 
 	slots := 0
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) {
+		if mqttIsOutboundRecordSubject(e.subj) {
 			continue
 		}
 		name, perr := mqttParseInflightSubject(e.subj)
@@ -980,11 +980,11 @@ func mqttBatchExchangeDispositions(a *mqttTransitionAttempt,
 
 	admits, ends = map[string]struct{}{}, map[string]struct{}{}
 	for _, e := range extra {
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}
@@ -1092,10 +1092,10 @@ func (jsa *mqttJSA) checkWithdrawalRegister(a *mqttTransitionAttempt, extra []mq
 	}
 	paired := false
 	for _, x := range extra {
-		if cls, ok := mqttF105ObligationClass(x.subj); !ok || cls != mqttExchangeClassTk {
+		if cls, ok := mqttOutboundObligationClass(x.subj); !ok || cls != mqttExchangeClassTk {
 			continue
 		}
-		toks := strings.Split(x.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(x.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			continue
 		}

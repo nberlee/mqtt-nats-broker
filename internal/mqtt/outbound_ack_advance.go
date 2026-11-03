@@ -44,7 +44,7 @@ import (
 //
 // An acknowledgement observes output that was already authorised, so this records no new work
 // and needs no current entitlement — and a CLOSED generation's obligation must still reach its
-// end under whoever serves now (TestF105ClosedGenerationsObligationStillEnds). That is why the
+// end under whoever serves now (TestClosedGenerationsObligationStillEnds). That is why the
 // op reads the STANDING authority only for the ownership its receipt records, and writes none
 // (mqttAttemptAuthorityFree: its members are fenced by their own CAS; the one exception is
 // mqttFenceAdvanceOnAuthority's), and why the register-member generation may lag the
@@ -350,7 +350,7 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	// arrow fences on its copy's manifest (checkRetainedRelMembers, checkRetainedManifestArbitration).
 	var retainedExtra []mqttTransitionMember
 	if reg.retainedSource() && slotTo == mqttInflightPubRelReady && reg.State != mqttInflightPubRelReady {
-		if !mqttF105IdentTk(r.RelID) {
+		if !mqttOutboundIdentTk(r.RelID) {
 			return nil, fmt.Errorf("a retained PUBREC advance of exchange %q requires the identity its canonical "+
 				"PUBREL is created with", cur.Nonce)
 		}

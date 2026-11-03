@@ -87,7 +87,7 @@ const (
 	// costliest work step — a cleanup's resource read, delete and completion batch (1 + 3), or a
 	// discard step's reads and act (3) — plus the cursor write from the reserve. Every visit's
 	// first entry therefore fits, so a visit always classifies at least one entry and the census
-	// can never starve its own executor (TestF105RecoveryEntryUnitCoversTheCostliestEntry).
+	// can never starve its own executor (TestRecoveryEntryUnitCoversTheCostliestEntry).
 	mqttRecoveryMinimumUnit = 16
 )
 

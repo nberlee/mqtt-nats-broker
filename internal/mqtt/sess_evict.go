@@ -492,7 +492,7 @@ func (as *mqttAccountSessionManager) evictDisplacedOnRemotePersist(s *Server, cI
 			// mqttForeignDisposition.applyWill and would otherwise be the hole in a claim
 			// that every disposal is observed. Its CONTRACT is the inverse of theirs: the
 			// record token and every lock are released by here, and no ownership gate is
-			// held at all — see TestF084RemotePersistWillPhaseIsUngated.
+			// held at all — see TestRemotePersistWillPhaseIsUngated.
 			if h := mqttTestWillPhaseProbeV.Load(); h != nil && (d.action != nil || d.ec != nil) {
 				(*h)(d.sess, as)
 			}

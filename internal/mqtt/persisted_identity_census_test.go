@@ -358,7 +358,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 		// THE RETAINED ARM (issue #107 7c): exclusive with Dur/Seq, so a register names a copy or a
 		// source delivery, never both.
 		"Payload": {kind: identityLocal, encoding: encJSON,
-			reason: "the retained copy's payload token, naming its manifest $MQTT.inflight.f105.pay.<hash>.<gen>." +
+			reason: "the retained copy's payload token, naming its manifest $MQTT.inflight.ob.pay.<hash>.<gen>." +
 				"<payload> in this SAME stream, so no other stream's recreation can strand it. Immutable for the " +
 				"register's life; the admission binds it to the manifest's `admitted`, and the close, the " +
 				"abandonment fact and the reclaimer read it only as that copy's name"},
@@ -1349,8 +1349,8 @@ type censusOracleRow struct {
 	reason string
 }
 
-// censusF066Sample is issue #70's fourteen-row table, transcribed row for row.
-var censusF066Sample = []censusOracleRow{
+// censusSample is issue #70's fourteen-row table, transcribed row for row.
+var censusSample = []censusOracleRow{
 	{
 		holder: mqttTeardownStreamName, what: "stream Metadata + body MarkerSeq", issuer: mqttSessStreamName,
 		satisfiedBy: []string{"mqttGenRetirement.MarkerSeq"},
@@ -1421,13 +1421,13 @@ var censusF066Sample = []censusOracleRow{
 	},
 }
 
-// TestPersistedIdentityCensusRediscoversF066Sample applies the oracle. Every row of
+// TestPersistedIdentityCensusRediscoversSample applies the oracle. Every row of
 // issue #70's sample must already be carried by the census — either by a named manifest
 // entry whose issuer agrees, or by an explicitly named artifact family with a reason.
 //
 // A row may be DEFERRED to a family; it may not be silently absent, and it may not be
 // satisfied by an entry that disagrees about which stream issues the identity.
-func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
+func TestPersistedIdentityCensusRediscoversSample(t *testing.T) {
 	t.Parallel()
 	manifest := censusManifest()
 
@@ -1442,12 +1442,12 @@ func TestPersistedIdentityCensusRediscoversF066Sample(t *testing.T) {
 	// They are back, with the admission half that writes them, so the row is back too.
 	// ActionClaim/ActionClaimSeq still have no row of their own: they are members of the
 	// arbitration relation the ClaimSeq row carries, not a second coupling to $MQTT_sess.
-	if len(censusF066Sample) != 15 {
+	if len(censusSample) != 15 {
 		t.Fatalf("the oracle carries %d rows; issue #70's sample has 15. A row was dropped or added "+
-			"without re-reading the dossier", len(censusF066Sample))
+			"without re-reading the dossier", len(censusSample))
 	}
 
-	for _, row := range censusF066Sample {
+	for _, row := range censusSample {
 		label := fmt.Sprintf("%s / %s", row.holder, row.what)
 		if len(row.satisfiedBy) == 0 && row.family == "" {
 			t.Errorf("%s: the oracle row is neither satisfied by a manifest entry nor assigned to an "+

@@ -26,25 +26,25 @@ import (
 // globals. Each hook filters on THIS test's subject before doing anything, so tests
 // running beside them (other files' parallel tests) are untouched.
 
-// f060RetainedSubject is the $MQTT_rmsgs subject a topic's retained record lands on.
-func f060RetainedSubject(topic string) string {
+// retainedSubject is the $MQTT_rmsgs subject a topic's retained record lands on.
+func retainedSubject(topic string) string {
 	return mqttRetainedMsgsStreamSubject + strings.ReplaceAll(topic, "/", ".")
 }
 
-// f060OnwardSubject is the $MQTT_msgs subject a topic's QoS 1/2 copy lands on.
-func f060OnwardSubject(topic string) string {
+// onwardSubject is the $MQTT_msgs subject a topic's QoS 1/2 copy lands on.
+func onwardSubject(topic string) string {
 	return mqttStreamSubjectPrefix + strings.ReplaceAll(topic, "/", ".")
 }
 
-var errF060RetainedInjected = errors.New("f060: retained store refused by test")
+var errRetainedInjected = errors.New("f060: retained store refused by test")
 
-// f060FailRetained makes every retained store for topic fail before it is issued.
-func f060FailRetained(t *testing.T, topic string) func() {
+// failRetained makes every retained store for topic fail before it is issued.
+func failRetained(t *testing.T, topic string) func() {
 	t.Helper()
-	want := f060RetainedSubject(topic)
+	want := retainedSubject(topic)
 	restore := setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
 		if subject == want {
-			return errF060RetainedInjected
+			return errRetainedInjected
 		}
 		return nil
 	})
@@ -52,8 +52,8 @@ func f060FailRetained(t *testing.T, topic string) func() {
 	return restore
 }
 
-// f060ObserveResults records what mqttInitiateMsgDeliveryJSA returned for topic.
-func f060ObserveResults(t *testing.T, topic string) func() []error {
+// observeResults records what mqttInitiateMsgDeliveryJSA returned for topic.
+func observeResults(t *testing.T, topic string) func() []error {
 	t.Helper()
 	var mu sync.Mutex
 	var got []error
@@ -74,8 +74,8 @@ func f060ObserveResults(t *testing.T, topic string) func() []error {
 	}
 }
 
-// f060WaitResult waits for the first observed result.
-func f060WaitResult(t *testing.T, results func() []error) error {
+// waitResult waits for the first observed result.
+func waitResult(t *testing.T, results func() []error) error {
 	t.Helper()
 	var first error
 	checkFor(t, 10*time.Second, 20*time.Millisecond, func() error {
@@ -89,8 +89,8 @@ func f060WaitResult(t *testing.T, results func() []error) error {
 	return first
 }
 
-// f060SendPubV5 writes a v5 PUBLISH with explicit DUP and RETAIN flags.
-func f060SendPubV5(t *testing.T, c net.Conn, qos byte, pi uint16, dup, retain bool, topic string, payload []byte) {
+// sendPubV5 writes a v5 PUBLISH with explicit DUP and RETAIN flags.
+func sendPubV5(t *testing.T, c net.Conn, qos byte, pi uint16, dup, retain bool, topic string, payload []byte) {
 	t.Helper()
 	flags := qos << 1
 	if dup {
@@ -115,10 +115,10 @@ func f060SendPubV5(t *testing.T, c net.Conn, qos byte, pi uint16, dup, retain bo
 	}
 }
 
-// f060ExpectRefusedV5 asserts the publisher was NOT given final success: no PUBACK or
+// expectRefusedV5 asserts the publisher was NOT given final success: no PUBACK or
 // PUBCOMP arrives, and the broker announces the close with a DISCONNECT, whose reason
 // code is returned. The connection is then gone.
-func f060ExpectRefusedV5(t *testing.T, c net.Conn, r *mqttReader) byte {
+func expectRefusedV5(t *testing.T, c net.Conn, r *mqttReader) byte {
 	t.Helper()
 	for {
 		b, pl, ok := testMQTTReadPacketReady(r, testMQTTTimeout)
@@ -143,8 +143,8 @@ func f060ExpectRefusedV5(t *testing.T, c net.Conn, r *mqttReader) byte {
 	}
 }
 
-// f060Watch connects a 3.1.1 witness subscribed to topic at qos.
-func f060Watch(t *testing.T, o *Options, id, topic string, qos byte) (net.Conn, *mqttReader) {
+// retainedFailureWatch connects a 3.1.1 witness subscribed to topic at qos.
+func retainedFailureWatch(t *testing.T, o *Options, id, topic string, qos byte) (net.Conn, *mqttReader) {
 	t.Helper()
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	t.Cleanup(func() { c.Close() })
@@ -154,10 +154,10 @@ func f060Watch(t *testing.T, o *Options, id, topic string, qos byte) (net.Conn, 
 	return c, r
 }
 
-// f060ExpectRetained asserts a fresh subscriber is served payload as topic's retained
+// expectRetained asserts a fresh subscriber is served payload as topic's retained
 // message. A literal SUBSCRIBE loads the stream, so a record that landed without the
 // local seed (an ambiguous store) is still found.
-func f060ExpectRetained(t *testing.T, o *Options, id, topic string, payload []byte) {
+func expectRetained(t *testing.T, o *Options, id, topic string, payload []byte) {
 	t.Helper()
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
@@ -166,8 +166,8 @@ func f060ExpectRetained(t *testing.T, o *Options, id, topic string, payload []by
 	testMQTTCheckPubMsg(t, c, r, topic, mqttPubFlagRetain, payload)
 }
 
-// f060ExpectNoRetained asserts a fresh subscriber is served nothing for topic.
-func f060ExpectNoRetained(t *testing.T, o *Options, id, topic string) {
+// expectNoRetained asserts a fresh subscriber is served nothing for topic.
+func expectNoRetained(t *testing.T, o *Options, id, topic string) {
 	t.Helper()
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
@@ -176,9 +176,9 @@ func f060ExpectNoRetained(t *testing.T, o *Options, id, topic string) {
 	testMQTTExpectNothing(t, r)
 }
 
-// f060ConnectPersistentV5 connects a v5 publisher whose session survives a close, so a
+// connectPersistentV5 connects a v5 publisher whose session survives a close, so a
 // refused exchange is still there to re-send.
-func f060ConnectPersistentV5(t *testing.T, o *Options, id string) (net.Conn, *mqttReader) {
+func connectPersistentV5(t *testing.T, o *Options, id string) (net.Conn, *mqttReader) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, props: mqttV5ConnPropsSessionExpiry(300)},
 		o.MQTT.Host, o.MQTT.Port)
@@ -200,18 +200,18 @@ func TestRetainedStoreFailureQoS0ClosesV5(t *testing.T) {
 	testMQTTReadConnAckV5(t, rp)
 	testMQTTSendPubV5Raw(t, cp, 0, 0, true, "f060q0/ok", nil, []byte("kept"))
 	testMQTTExpectNothing(t, rp)
-	f060ExpectRetained(t, o, "f060q0-ok-check", "f060q0/ok", []byte("kept"))
+	expectRetained(t, o, "f060q0-ok-check", "f060q0/ok", []byte("kept"))
 
 	const topic = "f060q0/fail"
-	c0, r0 := f060Watch(t, o, "f060q0-live", topic, 0)
-	results := f060ObserveResults(t, topic)
-	restore := f060FailRetained(t, topic)
+	c0, r0 := retainedFailureWatch(t, o, "f060q0-live", topic, 0)
+	results := observeResults(t, topic)
+	restore := failRetained(t, topic)
 
 	testMQTTSendPubV5Raw(t, cp, 0, 0, true, topic, nil, []byte("lost"))
-	if reason := f060ExpectRefusedV5(t, cp, rp); reason != mqttReasonUnspecifiedError {
+	if reason := expectRefusedV5(t, cp, rp); reason != mqttReasonUnspecifiedError {
 		t.Fatalf("DISCONNECT reason = 0x%x, want 0x%x", reason, mqttReasonUnspecifiedError)
 	}
-	if err := f060WaitResult(t, results); !errors.Is(err, errMQTTRetainedStoreUnconfirmed) || !errors.Is(err, errF060RetainedInjected) {
+	if err := waitResult(t, results); !errors.Is(err, errMQTTRetainedStoreUnconfirmed) || !errors.Is(err, errRetainedInjected) {
 		t.Fatalf("delivery result = %v, want the unconfirmed retained update", err)
 	}
 	// The live fan-out preceded the store and cannot be retracted: the residual,
@@ -219,7 +219,7 @@ func TestRetainedStoreFailureQoS0ClosesV5(t *testing.T) {
 	testMQTTCheckPubMsgNoAck(t, c0, r0, topic, 0, []byte("lost"))
 
 	restore()
-	f060ExpectNoRetained(t, o, "f060q0-fail-check", topic)
+	expectNoRetained(t, o, "f060q0-fail-check", topic)
 }
 
 // T1b. A 3.1.1 client has no DISCONNECT from the server; the close is the signal.
@@ -229,7 +229,7 @@ func TestRetainedStoreFailureQoS0Closes311(t *testing.T) {
 	defer testMQTTShutdownServer(s)
 
 	const topic = "f060q0v4/fail"
-	f060FailRetained(t, topic)
+	failRetained(t, topic)
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: "f060q0v4-pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c.Close()
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
@@ -246,12 +246,12 @@ func TestRetainedStoreFailureQoS1WithholdsPubAck(t *testing.T) {
 
 	t.Run("replacement", func(t *testing.T) {
 		const topic = "f060q1/fail"
-		c1, r1 := f060Watch(t, o, "f060q1-durable", topic, 1)
-		restore := f060FailRetained(t, topic)
+		c1, r1 := retainedFailureWatch(t, o, "f060q1-durable", topic, 1)
+		restore := failRetained(t, topic)
 
-		cp, rp := f060ConnectPersistentV5(t, o, "f060q1-pub")
-		f060SendPubV5(t, cp, 1, 7, false, true, topic, []byte("v1"))
-		if reason := f060ExpectRefusedV5(t, cp, rp); reason != mqttReasonUnspecifiedError {
+		cp, rp := connectPersistentV5(t, o, "f060q1-pub")
+		sendPubV5(t, cp, 1, 7, false, true, topic, []byte("v1"))
+		if reason := expectRefusedV5(t, cp, rp); reason != mqttReasonUnspecifiedError {
 			t.Fatalf("DISCONNECT reason = 0x%x, want 0x%x", reason, mqttReasonUnspecifiedError)
 		}
 		// The $MQTT_msgs store was still attempted: the QoS 1 subscriber's copy comes
@@ -259,30 +259,30 @@ func TestRetainedStoreFailureQoS1WithholdsPubAck(t *testing.T) {
 		testMQTTCheckPubMsg(t, c1, r1, topic, mqttPubQos1, []byte("v1"))
 
 		restore()
-		f060ExpectNoRetained(t, o, "f060q1-check-1", topic)
+		expectNoRetained(t, o, "f060q1-check-1", topic)
 
 		// The re-send on the surviving session is the re-attempt.
-		cp2, rp2 := f060ConnectPersistentV5(t, o, "f060q1-pub")
-		f060SendPubV5(t, cp2, 1, 7, true, true, topic, []byte("v1"))
+		cp2, rp2 := connectPersistentV5(t, o, "f060q1-pub")
+		sendPubV5(t, cp2, 1, 7, true, true, topic, []byte("v1"))
 		if reason, _ := testMQTTReadPubAckV5(t, rp2, 7); reason != mqttReasonSuccess {
 			t.Fatalf("re-send PUBACK reason = 0x%x, want success", reason)
 		}
-		f060ExpectRetained(t, o, "f060q1-check-2", topic, []byte("v1"))
+		expectRetained(t, o, "f060q1-check-2", topic, []byte("v1"))
 	})
 
 	t.Run("tombstone", func(t *testing.T) {
 		const topic = "f060q1/tomb"
-		cs, rs := f060ConnectPersistentV5(t, o, "f060q1t-seed")
-		f060SendPubV5(t, cs, 1, 1, false, true, topic, []byte("old"))
+		cs, rs := connectPersistentV5(t, o, "f060q1t-seed")
+		sendPubV5(t, cs, 1, 1, false, true, topic, []byte("old"))
 		testMQTTReadPubAckV5(t, rs, 1)
-		f060ExpectRetained(t, o, "f060q1t-check-1", topic, []byte("old"))
+		expectRetained(t, o, "f060q1t-check-1", topic, []byte("old"))
 
-		f060FailRetained(t, topic)
-		cp, rp := f060ConnectPersistentV5(t, o, "f060q1t-pub")
-		f060SendPubV5(t, cp, 1, 2, false, true, topic, nil)
-		f060ExpectRefusedV5(t, cp, rp)
+		failRetained(t, topic)
+		cp, rp := connectPersistentV5(t, o, "f060q1t-pub")
+		sendPubV5(t, cp, 1, 2, false, true, topic, nil)
+		expectRefusedV5(t, cp, rp)
 		// The deletion did not happen, and the publisher was not told it did.
-		f060ExpectRetained(t, o, "f060q1t-check-2", topic, []byte("old"))
+		expectRetained(t, o, "f060q1t-check-2", topic, []byte("old"))
 	})
 }
 
@@ -295,30 +295,30 @@ func TestRetainedStoreFailureJoinsOnwardFailure(t *testing.T) {
 	const topic = "f060both/fail"
 	errOnward := errors.New("f060: onward store refused by test")
 	var reachedRetained, reachedOnward atomic.Bool
-	retainedSubj, onwardSubj := f060RetainedSubject(topic), f060OnwardSubject(topic)
+	retainedSubj, onwardSubj := retainedSubject(topic), onwardSubject(topic)
 	t.Cleanup(setMQTTTestStoreMsgHook(func(subject string, _ int, _ []byte) error {
 		switch subject {
 		case retainedSubj:
 			reachedRetained.Store(true)
-			return errF060RetainedInjected
+			return errRetainedInjected
 		case onwardSubj:
 			reachedOnward.Store(true)
 			return errOnward
 		}
 		return nil
 	}))
-	results := f060ObserveResults(t, topic)
+	results := observeResults(t, topic)
 
-	f060Watch(t, o, "f060both-durable", topic, 1) // so the onward store is attempted with interest
-	cp, rp := f060ConnectPersistentV5(t, o, "f060both-pub")
-	f060SendPubV5(t, cp, 1, 3, false, true, topic, []byte("x"))
-	f060ExpectRefusedV5(t, cp, rp)
+	retainedFailureWatch(t, o, "f060both-durable", topic, 1) // so the onward store is attempted with interest
+	cp, rp := connectPersistentV5(t, o, "f060both-pub")
+	sendPubV5(t, cp, 1, 3, false, true, topic, []byte("x"))
+	expectRefusedV5(t, cp, rp)
 
-	err := f060WaitResult(t, results)
+	err := waitResult(t, results)
 	if !reachedRetained.Load() || !reachedOnward.Load() {
 		t.Fatalf("both stores must be attempted: retained=%v onward=%v", reachedRetained.Load(), reachedOnward.Load())
 	}
-	for _, want := range []error{errMQTTRetainedStoreUnconfirmed, errF060RetainedInjected, errOnward} {
+	for _, want := range []error{errMQTTRetainedStoreUnconfirmed, errRetainedInjected, errOnward} {
 		if !errors.Is(err, want) {
 			t.Fatalf("delivery result %v does not carry %v", err, want)
 		}
@@ -343,7 +343,7 @@ func TestRetainedStoreAmbiguousIsNotAcknowledged(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			topic := "f060amb/" + tc.name
-			want := f060RetainedSubject(topic)
+			want := retainedSubject(topic)
 			var seenSeq atomic.Uint64
 			restore := setMQTTTestStoreMsgResultHook(func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 				if subject != want {
@@ -362,49 +362,49 @@ func TestRetainedStoreAmbiguousIsNotAcknowledged(t *testing.T) {
 			t.Cleanup(restore)
 
 			id := "f060amb-" + tc.name
-			cp, rp := f060ConnectPersistentV5(t, o, id)
-			f060SendPubV5(t, cp, 1, 9, false, true, topic, []byte("X"))
-			f060ExpectRefusedV5(t, cp, rp)
+			cp, rp := connectPersistentV5(t, o, id)
+			sendPubV5(t, cp, 1, 9, false, true, topic, []byte("X"))
+			expectRefusedV5(t, cp, rp)
 			if seenSeq.Load() == 0 {
 				t.Fatal("the result hook never saw the landed retained store")
 			}
 			restore()
 			// It landed, so it is served.
-			f060ExpectRetained(t, o, id+"-check-1", topic, []byte("X"))
+			expectRetained(t, o, id+"-check-1", topic, []byte("X"))
 
 			// Another publisher stores Y; the first re-sends X; X wins (last arrival).
-			co, ro := f060ConnectPersistentV5(t, o, id+"-other")
-			f060SendPubV5(t, co, 1, 1, false, true, topic, []byte("Y"))
+			co, ro := connectPersistentV5(t, o, id+"-other")
+			sendPubV5(t, co, 1, 1, false, true, topic, []byte("Y"))
 			testMQTTReadPubAckV5(t, ro, 1)
-			f060ExpectRetained(t, o, id+"-check-2", topic, []byte("Y"))
+			expectRetained(t, o, id+"-check-2", topic, []byte("Y"))
 
-			cp2, rp2 := f060ConnectPersistentV5(t, o, id)
-			f060SendPubV5(t, cp2, 1, 9, true, true, topic, []byte("X"))
+			cp2, rp2 := connectPersistentV5(t, o, id)
+			sendPubV5(t, cp2, 1, 9, true, true, topic, []byte("X"))
 			if reason, _ := testMQTTReadPubAckV5(t, rp2, 9); reason != mqttReasonSuccess {
 				t.Fatalf("re-send PUBACK reason = 0x%x, want success", reason)
 			}
-			f060ExpectRetained(t, o, id+"-check-3", topic, []byte("X"))
+			expectRetained(t, o, id+"-check-3", topic, []byte("X"))
 		})
 	}
 
 	t.Run("tombstone", func(t *testing.T) {
 		const topic = "f060amb/tomb"
-		cs, rs := f060ConnectPersistentV5(t, o, "f060ambt-seed")
-		f060SendPubV5(t, cs, 1, 1, false, true, topic, []byte("old"))
+		cs, rs := connectPersistentV5(t, o, "f060ambt-seed")
+		sendPubV5(t, cs, 1, 1, false, true, topic, []byte("old"))
 		testMQTTReadPubAckV5(t, rs, 1)
 
-		want := f060RetainedSubject(topic)
+		want := retainedSubject(topic)
 		t.Cleanup(setMQTTTestStoreMsgResultHook(func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error) {
 			if subject == want && err == nil {
 				return nil, errLost
 			}
 			return resp, err
 		}))
-		cp, rp := f060ConnectPersistentV5(t, o, "f060ambt-pub")
-		f060SendPubV5(t, cp, 1, 2, false, true, topic, nil)
-		f060ExpectRefusedV5(t, cp, rp)
+		cp, rp := connectPersistentV5(t, o, "f060ambt-pub")
+		sendPubV5(t, cp, 1, 2, false, true, topic, nil)
+		expectRefusedV5(t, cp, rp)
 		// The deletion landed, though the publisher was not told it did.
-		f060ExpectNoRetained(t, o, "f060ambt-check", topic)
+		expectNoRetained(t, o, "f060ambt-check", topic)
 	})
 }
 
@@ -421,18 +421,18 @@ func TestRetainedStoreAttemptedWhenLiveFanOutFails(t *testing.T) {
 	mqttTestFanOutFailV.Store(&h)
 	t.Cleanup(func() { mqttTestFanOutFailV.Store(nil) })
 
-	cp, rp := f060ConnectPersistentV5(t, o, "f060fan-pub")
-	f060SendPubV5(t, cp, 1, 4, false, true, topic, []byte("kept"))
+	cp, rp := connectPersistentV5(t, o, "f060fan-pub")
+	sendPubV5(t, cp, 1, 4, false, true, topic, []byte("kept"))
 	if reason, _ := testMQTTReadPubAckV5(t, rp, 4); reason != mqttReasonSuccess {
 		t.Fatalf("PUBACK reason = 0x%x, want success", reason)
 	}
-	f060ExpectRetained(t, o, "f060fan-check", topic, []byte("kept"))
+	expectRetained(t, o, "f060fan-check", topic, []byte("kept"))
 
 	// Control: QoS 0 with the live send failing reports the failed fan-out.
-	results := f060ObserveResults(t, topic0)
-	f060SendPubV5(t, cp, 0, 0, false, true, topic0, []byte("gone"))
-	f060ExpectRefusedV5(t, cp, rp)
-	if err := f060WaitResult(t, results); !errors.Is(err, errMQTTWillFanOutFailed) {
+	results := observeResults(t, topic0)
+	sendPubV5(t, cp, 0, 0, false, true, topic0, []byte("gone"))
+	expectRefusedV5(t, cp, rp)
+	if err := waitResult(t, results); !errors.Is(err, errMQTTWillFanOutFailed) {
 		t.Fatalf("QoS 0 result = %v, want %v", err, errMQTTWillFanOutFailed)
 	}
 }
@@ -444,10 +444,10 @@ func TestRetainedStoreFailureQoS2WithholdsPubComp(t *testing.T) {
 	pi := uint16(41)
 	subject := b.holdSubject(t, pi)
 
-	f060SendPubV5(t, b.cp, 2, pi, false, true, b.topic, []byte("held"))
+	sendPubV5(t, b.cp, 2, pi, false, true, b.topic, []byte("held"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
 
-	restore := f060FailRetained(t, b.topic)
+	restore := failRetained(t, b.topic)
 	testQoS2SendPubRel(t, b.cp, pi)
 	b.expectNoPubComp(t)
 	testQoS2ExpectClientGone(t, b.s, b.pubID)
@@ -458,14 +458,14 @@ func TestRetainedStoreFailureQoS2WithholdsPubComp(t *testing.T) {
 	if rec, _, err := b.jsa.loadQoS2Record(subject); err != nil || rec == nil || rec.state != mqttQoS2Held {
 		t.Fatalf("the hold must survive a release whose retained update failed: rec=%v err=%v", rec, err)
 	}
-	f060ExpectNoRetained(t, b.o, "f060q2-check-1", b.topic)
+	expectNoRetained(t, b.o, "f060q2-check-1", b.topic)
 
 	cp2, rp2 := b.reconnectPublisher(t)
 	testQoS2SendPubRel(t, cp2, pi)
 	if reason, _ := testMQTTReadPubCompV5(t, rp2, pi); reason != mqttReasonSuccess {
 		t.Fatalf("re-sent PUBREL: PUBCOMP reason 0x%x, want success", reason)
 	}
-	f060ExpectRetained(t, b.o, "f060q2-check-2", b.topic, []byte("held"))
+	expectRetained(t, b.o, "f060q2-check-2", b.topic, []byte("held"))
 	testMQTTExpectNothing(t, b.rs)
 }
 
@@ -481,8 +481,8 @@ func TestRetainedStoreFailureDelayedWillStaysPublishing(t *testing.T) {
 			testShortenWillLease(t, asm, time.Second)
 
 			topic := fmt.Sprintf("f060will/q%d", qos)
-			results := f060ObserveResults(t, topic)
-			restore := f060FailRetained(t, topic)
+			results := observeResults(t, topic)
+			restore := failRetained(t, topic)
 
 			will := &mqttWill{topic: []byte(topic), message: []byte("bye"), qos: qos, retain: true}
 			id := fmt.Sprintf("f060will-%d", qos)
@@ -491,7 +491,7 @@ func TestRetainedStoreFailureDelayedWillStaysPublishing(t *testing.T) {
 			testMQTTReadConnAckV5(t, rw)
 			cw.Close()
 
-			err := f060WaitResult(t, results)
+			err := waitResult(t, results)
 			if !errors.Is(err, errMQTTRetainedStoreUnconfirmed) {
 				t.Fatalf("Will delivery result = %v, want the unconfirmed retained update", err)
 			}
@@ -513,15 +513,15 @@ func TestRetainedStoreFailureDelayedWillStaysPublishing(t *testing.T) {
 				}
 				return nil
 			})
-			f060ExpectRetained(t, o, id+"-check", topic, []byte("bye"))
+			expectRetained(t, o, id+"-check", topic, []byte("bye"))
 		})
 	}
 }
 
-// f060AuthzRevokeOnce returns a pause that closes the publisher's per-client NATS
+// authzRevokeOnce returns a pause that closes the publisher's per-client NATS
 // connection once, then waits for the snapshot to be invalidated, as the late-fence
 // fixtures in authz_test.go do.
-func f060AuthzRevokeOnce(t *testing.T, dialed func(string) *nats.Conn, id string) func() {
+func authzRevokeOnce(t *testing.T, dialed func(string) *nats.Conn, id string) func() {
 	t.Helper()
 	nc := dialed(id)
 	if nc == nil {
@@ -545,8 +545,8 @@ func TestRetainedFenceAbandonIsReported(t *testing.T) {
 		t.Fatalf("publisher: %v", err)
 	}
 	const topic = "f060fence/x"
-	results := f060ObserveResults(t, topic)
-	pause := f060AuthzRevokeOnce(t, dialed, "f060fence-pub")
+	results := observeResults(t, topic)
+	pause := authzRevokeOnce(t, dialed, "f060fence-pub")
 	mqttTestRetainedFencePauseV.Store(&pause)
 	t.Cleanup(func() { mqttTestRetainedFencePauseV.Store(nil) })
 
@@ -554,7 +554,7 @@ func TestRetainedFenceAbandonIsReported(t *testing.T) {
 	// Wait for the outcome, but judge the two halves separately and the write first,
 	// so a fence that is gone (the store proceeds) and a fence whose abandonment is not
 	// reported each fail on their own assertion.
-	result := f060WaitResult(t, results)
+	result := waitResult(t, results)
 	mqttTestRetainedFencePauseV.Store(nil)
 
 	// The fence: no retained copy was written.
@@ -586,13 +586,13 @@ func TestDerivedSparkplugFenceAbandonIsReported(t *testing.T) {
 		t.Fatalf("publisher: %v", err)
 	}
 	const topic = "spBv1.0/other/NBIRTH/f060"
-	results := f060ObserveResults(t, topic)
-	pause := f060AuthzRevokeOnce(t, dialed, "f060spb-pub")
+	results := observeResults(t, topic)
+	pause := authzRevokeOnce(t, dialed, "f060spb-pub")
 	mqttTestDerivedSendPauseV.Store(&pause)
 	t.Cleanup(func() { mqttTestDerivedSendPauseV.Store(nil) })
 
 	pub.Publish(topic, 0, false, []byte("no")).WaitTimeout(5 * time.Second)
-	if err := f060WaitResult(t, results); !errors.Is(err, errMQTTServiceEpochMoved) {
+	if err := waitResult(t, results); !errors.Is(err, errMQTTServiceEpochMoved) {
 		t.Fatalf("delivery result = %v, want %v", err, errMQTTServiceEpochMoved)
 	}
 }
@@ -606,14 +606,14 @@ func TestRetainedFailureSurvivesOnwardFence(t *testing.T) {
 		t.Fatalf("publisher: %v", err)
 	}
 	const topic = "f060of/x"
-	results := f060ObserveResults(t, topic)
-	f060FailRetained(t, topic)
-	pause := f060AuthzRevokeOnce(t, dialed, "f060of-pub")
+	results := observeResults(t, topic)
+	failRetained(t, topic)
+	pause := authzRevokeOnce(t, dialed, "f060of-pub")
 	mqttTestDurableWritePauseV.Store(&pause)
 	t.Cleanup(func() { mqttTestDurableWritePauseV.Store(nil) })
 
 	pub.Publish(topic, 1, true, []byte("no")).WaitTimeout(5 * time.Second)
-	err = f060WaitResult(t, results)
+	err = waitResult(t, results)
 	for _, want := range []error{errMQTTRetainedStoreUnconfirmed, errMQTTServiceEpochMoved} {
 		if !errors.Is(err, want) {
 			t.Fatalf("delivery result %v does not carry %v", err, want)

@@ -118,7 +118,7 @@ func testCustodyKick(sess *mqttSession) {
 //
 // Mutation M1: capacity counts the maps and ignores the ledger -> B admitted at once. W2 C3: the
 // ledger's charge released inside forgetVoidedReg's parked branch -> B admitted at once.
-func TestF105CustodyMetadataRemovalReleasesNothing(t *testing.T) {
+func TestCustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-metadata", 1)
 	sess := f.e.sess
@@ -232,7 +232,7 @@ func testCustodyCountExchanges(t *testing.T, e *testInflightEnv, gen string) int
 // committed batch and the re-resolution says Landed, so the exchange is charged.
 //
 // Mutation M4a: Unresolved treated as NeverLanded without the abort -> B admitted while A stands.
-func TestF105CustodyLostAdmissionResponseStaysCharged(t *testing.T) {
+func TestCustodyLostAdmissionResponseStaysCharged(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-lost-response")
 	testReadyForRealPubRelDelivery(t, e)
@@ -270,7 +270,7 @@ func TestF105CustodyLostAdmissionResponseStaysCharged(t *testing.T) {
 // T4b. A batch that composed (so it has a handle) and was refused before it committed, on every
 // attempt: the abort wins, every attempt is NeverLanded, and when the ladder ends the
 // reservation is gone.
-func TestF105CustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
+func TestCustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-refused")
 	testReadyForRealPubRelDelivery(t, e)
@@ -314,7 +314,7 @@ func TestF105CustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 //
 // Mutation M4b: a NeverLanded settlement deletes the exchange entry of the attempt's lineage ->
 // B admitted.
-func TestF105CustodyLateSettlementKeepsTheLandedExchange(t *testing.T) {
+func TestCustodyLateSettlementKeepsTheLandedExchange(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-late-settlement")
 	testReadyForRealPubRelDelivery(t, e)
@@ -365,7 +365,7 @@ func TestF105CustodyLateSettlementKeepsTheLandedExchange(t *testing.T) {
 // charged and the admission goes.
 //
 // Mutation M4c: the reconciler skips admission targets -> the admission remains past the bound.
-func TestF105CustodyReconcilerSettlesAnUnresolvedAdmission(t *testing.T) {
+func TestCustodyReconcilerSettlesAnUnresolvedAdmission(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-reconciler")
 	testReadyForRealPubRelDelivery(t, e)
@@ -411,7 +411,7 @@ func TestF105CustodyReconcilerSettlesAnUnresolvedAdmission(t *testing.T) {
 // reservation holds across the retry, and exactly one exchange is charged when it lands.
 //
 // Mutation M23: the removal rule ignores ladderDone -> B admitted while the retry is pending.
-func TestF105CustodyReservationSpansTheLadder(t *testing.T) {
+func TestCustodyReservationSpansTheLadder(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-ladder")
 	testReadyForRealPubRelDelivery(t, e)
@@ -465,7 +465,7 @@ func TestF105CustodyReservationSpansTheLadder(t *testing.T) {
 // Mutation M24: finishAdmission not run on a refusal return -> B withheld past the bound.
 // Mutation M24b: the conversion skips its nonce check -> the ladder is reached / a reservation
 // exists.
-func TestF105CustodyRefusalWithoutSubmissionReleases(t *testing.T) {
+func TestCustodyRefusalWithoutSubmissionReleases(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-no-handle")
 	testReadyForRealPubRelDelivery(t, e)
@@ -522,7 +522,7 @@ func TestF105CustodyRefusalWithoutSubmissionReleases(t *testing.T) {
 // hold — and after an exclusion over it actually lifted.
 //
 // Mutation M5: the allocator ignores heldPIs -> both fail.
-func TestF105CustodyAllocatorSkipsALedgerHeldIdentifier(t *testing.T) {
+func TestCustodyAllocatorSkipsALedgerHeldIdentifier(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-allocator", 1)
 	sess := f.e.sess
@@ -565,7 +565,7 @@ func TestF105CustodyAllocatorSkipsALedgerHeldIdentifier(t *testing.T) {
 //
 // Mutation M7a: the ledger is not replaced with the generation -> old charges remain.
 // Mutation M7b: forGen made to accept any generation -> the late landing is charged.
-func TestF105CustodyLateCallbackOfAnOldGeneration(t *testing.T) {
+func TestCustodyLateCallbackOfAnOldGeneration(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-old-gen")
 	testReadyForRealPubRelDelivery(t, e)
@@ -626,7 +626,7 @@ func TestF105CustodyLateCallbackOfAnOldGeneration(t *testing.T) {
 // generation's.
 //
 // Mutation M7b: forGen made to accept any generation -> the late census charges the fresh ledger.
-func TestF105CustodyLateCensusOfAnOldGeneration(t *testing.T) {
+func TestCustodyLateCensusOfAnOldGeneration(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-old-census", 1)
 	sess := f.e.sess
@@ -672,7 +672,7 @@ func TestF105CustodyLateCensusOfAnOldGeneration(t *testing.T) {
 //
 // Mutation M8/M17a: the resume does not rebuild from the exchanges -> uncharged after resume.
 // Mutation M17b: the door's scheduling removal releases the ledger entry -> uncharged live.
-func TestF105CustodyDestructionWithoutEvidenceKeepsItsCharge(t *testing.T) {
+func TestCustodyDestructionWithoutEvidenceKeepsItsCharge(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-no-evidence", 1)
 	sess := f.e.sess
@@ -738,7 +738,7 @@ func TestF105CustodyDestructionWithoutEvidenceKeepsItsCharge(t *testing.T) {
 // after a committed one is what releases it, with no delivery offered to drive a pass.
 //
 // Mutation M14: the hint after the withdrawal removed -> held past the bound.
-func TestF105CustodyWithdrawalHintReleases(t *testing.T) {
+func TestCustodyWithdrawalHintReleases(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-withdraw-hint", 1)
 	sess := f.e.sess
@@ -760,7 +760,7 @@ func TestF105CustodyWithdrawalHintReleases(t *testing.T) {
 // T16. A failed resume census withholds capacity and allocation; a later pass restores both.
 //
 // Mutation M16: incompleteness ignored by the capacity function -> B admitted.
-func TestF105CustodyIncompleteCensusWithholds(t *testing.T) {
+func TestCustodyIncompleteCensusWithholds(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-incomplete")
 	testReadyForRealPubRelDelivery(t, e)
@@ -800,7 +800,7 @@ func TestF105CustodyIncompleteCensusWithholds(t *testing.T) {
 //
 // Mutation M19: the pass does not re-read uncertain subjects -> withheld past the bound.
 // Mutation CAP: charges() drops the uncertain subjects -> capacity 5 before the re-read.
-func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
+func TestCustodyUncertainSubjectRecovers(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-uncertain", 1)
 	sess := f.e.sess
@@ -861,7 +861,7 @@ func TestF105CustodyUncertainSubjectRecovers(t *testing.T) {
 //
 // Mutation M21a: a failed ledger read taken as an empty inventory -> complete.
 // Mutation M21b: the census recomputes uncertainty from scratch -> allocation reopens.
-func TestF105CustodyCensusShapesStayConservative(t *testing.T) {
+func TestCustodyCensusShapesStayConservative(t *testing.T) {
 	// NOT parallel: installs a process-global load hook.
 	e := testNewInflightEnv(t, "custody-census-shapes")
 	testReadyForRealPubRelDelivery(t, e)
@@ -936,7 +936,7 @@ func TestF105CustodyCensusShapesStayConservative(t *testing.T) {
 // pendingPubRel -> (c). M20a: replay budgeted as new work -> (a). M20b: the budget term not
 // reduced by the replay -> (b'). M20c: the RM term drops PUBRELs -> (c'). M20d/e: incompleteness
 // zeroes the replay / is ignored for deferred -> (d).
-func TestF105CustodyCapacityComputation(t *testing.T) {
+func TestCustodyCapacityComputation(t *testing.T) {
 	t.Parallel()
 	gen := mqttNewSessGen()
 	mk := func(maxp, rmax uint16) *mqttSession {
@@ -1008,7 +1008,7 @@ func TestF105CustodyCapacityComputation(t *testing.T) {
 // that has ended.
 //
 // Mutation M18: targets ordered by key rather than lastObserved -> the later key is never taken.
-func TestF105CustodyReobservationIsFair(t *testing.T) {
+func TestCustodyReobservationIsFair(t *testing.T) {
 	t.Parallel()
 	gen := mqttNewSessGen()
 	l := newMQTTCustodyLedger(gen)
@@ -1040,7 +1040,7 @@ func TestF105CustodyReobservationIsFair(t *testing.T) {
 // generation enters through forGen, and only the conversion and recovery mark an entry custody.
 //
 // Mutation M12: a direct delete from the ledger inserted elsewhere -> this fails.
-func TestF105CustodyLedgerIsEncapsulated(t *testing.T) {
+func TestCustodyLedgerIsEncapsulated(t *testing.T) {
 	t.Parallel()
 	fields := map[string]bool{"heldAdmissions": true, "heldExchanges": true, "uncertainSubjects": true,
 		"heldPIs": true, "reconstructionIncomplete": true, "observeTick": true, "ledgerGen": true}
@@ -1145,7 +1145,7 @@ func mqttTestExprString(e ast.Expr) string {
 // computation; the allow-list names the non-capacity readers.
 //
 // Mutation M13: a len(sess.pendingPublish) comparison re-added to the delivery gate -> fails.
-func TestF105CustodyNoMapLengthCapacity(t *testing.T) {
+func TestCustodyNoMapLengthCapacity(t *testing.T) {
 	t.Parallel()
 	allowed := map[string]bool{
 		"capacityAvailableLocked": true, "replayAllowanceLocked": true,
@@ -1203,7 +1203,7 @@ func (e *testInflightEnv) linOf(t *testing.T, pi uint16) string {
 //
 // Mutation M2: the charge released with the scheduling entry -> B admitted while the advance is
 // held.
-func TestF105CustodyPubAckReleasesAfterTheAdvance(t *testing.T) {
+func TestCustodyPubAckReleasesAfterTheAdvance(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-puback", 1)
 	sess := f.e.sess
@@ -1248,7 +1248,7 @@ func TestF105CustodyPubAckReleasesAfterTheAdvance(t *testing.T) {
 // (pending drain), and released only when the drain completes the exchange.
 //
 // Mutation M3: pending-drain counted releasable -> B admitted before the drain.
-func TestF105CustodyPendingDrainHoldsTheCharge(t *testing.T) {
+func TestCustodyPendingDrainHoldsTheCharge(t *testing.T) {
 	t.Parallel()
 	w, act := testPendingDrainWorld(t, "custody-pending-drain")
 	sess := w.e.sess
@@ -1272,7 +1272,7 @@ func TestF105CustodyPendingDrainHoldsTheCharge(t *testing.T) {
 // ordinals, the same canonical tuple.
 //
 // Mutation M11: the acquisition does not advance the ordinal -> fewer than two records land.
-func TestF105CustodySuccessivePubRelEmissionsAreDistinctAcquisitions(t *testing.T) {
+func TestCustodySuccessivePubRelEmissionsAreDistinctAcquisitions(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-pubrel-twice")
 	testReadyForRealPubRelDelivery(t, e)
@@ -1312,7 +1312,7 @@ func TestF105CustodySuccessivePubRelEmissionsAreDistinctAcquisitions(t *testing.
 // observation, and the exchange still at PubRecObserved keeps its charge.
 //
 // Mutation M15: a hint releases the lineage directly -> the charge is gone.
-func TestF105CustodyHintNeverReleases(t *testing.T) {
+func TestCustodyHintNeverReleases(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "custody-hint")
 	testReadyForRealPubRelDelivery(t, e)
@@ -1341,7 +1341,7 @@ func TestF105CustodyHintNeverReleases(t *testing.T) {
 // that identifier directly, which is the state a same-delivery re-offer reaches the ladder with.
 //
 // Mutation M9: the superseded lineage not hinted -> its charge stays past the bound.
-func TestF105CustodyPairReplacementMovesOneCharge(t *testing.T) {
+func TestCustodyPairReplacementMovesOneCharge(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-pair", 1)
 	sess := f.e.sess
@@ -1388,7 +1388,7 @@ func testCustodyEnsureExchange(l *mqttCustodyLedger, gen, lin string, pi uint16)
 // has room, the hint's observation failed, and the store has since recovered.
 //
 // Mutation M47: exhaustion returns 0 without requesting a pass -> the space never reopens.
-func TestF105CustodyExhaustionRequestsObservation(t *testing.T) {
+func TestCustodyExhaustionRequestsObservation(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "custody-exhaustion", 1)
 	sess := f.e.sess
@@ -1502,7 +1502,7 @@ func testCustodyQuiet(t *testing.T, sess *mqttSession) {
 // Publish stays charged: the request observes, it never releases.
 //
 // Mutation M54: the retained capacity-zero return requests no pass -> downgraded past the bound.
-func TestF105CustodyRetainedCapacityRequestsObservation(t *testing.T) {
+func TestCustodyRetainedCapacityRequestsObservation(t *testing.T) {
 	t.Parallel()
 	t.Run("ended-exchange-failed-observation", func(t *testing.T) {
 		t.Parallel()

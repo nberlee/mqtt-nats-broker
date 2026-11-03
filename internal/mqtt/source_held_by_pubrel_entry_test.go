@@ -15,7 +15,7 @@ package mqtt
 
 import "testing"
 
-// TestF115SourceRepresentedByAPubRelEntryIsNotAdmitted pins the predicate behind issue #117's
+// TestSourceRepresentedByAPubRelEntryIsNotAdmitted pins the predicate behind issue #117's
 // shape B, entry shape by entry shape: a source delivery whose exchange is represented by a
 // PUBREL-phase entry is declined by trackPublish on the unmapped path, and nothing is
 // allocated for it. Each shape is the one a real route installs — the PUBREC successor, the
@@ -24,7 +24,7 @@ import "testing"
 //
 // The negative cases are the ones the predicate must not swallow: a sourceless (retained)
 // exchange, and a source on the experimental slot-only class, which keeps its own order.
-func TestF115SourceRepresentedByAPubRelEntryIsNotAdmitted(t *testing.T) {
+func TestSourceRepresentedByAPubRelEntryIsNotAdmitted(t *testing.T) {
 	const (
 		srcDur  = "f115-src"
 		relDur  = "f115-pubrel"

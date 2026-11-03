@@ -20,24 +20,24 @@ import (
 	"testing"
 )
 
-// testF105Root builds a recovery root for the fixture client, in the shard it hashes to.
-func testF105Root(start, resume, bound, unresolved uint64) *mqttRecoveryRoot {
-	shard := mqttDirShardFor(getHash(testF105ID))
+// testRoot builds a recovery root for the fixture client, in the shard it hashes to.
+func testRoot(start, resume, bound, unresolved uint64) *mqttRecoveryRoot {
+	shard := mqttDirShardFor(getHash(testID))
 	return &mqttRecoveryRoot{
-		Shard: shard, Ord: 1, ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen,
+		Shard: shard, Ord: 1, ID: testID, Epoch: testEpoch, Gen: testGen,
 		SweepStart: start, Resume: resume, Bound: bound, Unresolved: unresolved,
 	}
 }
 
-func testF105SealedLedger(hi uint64) *mqttGenLedger {
+func testSealedLedger(hi uint64) *mqttGenLedger {
 	return &mqttGenLedger{
 		Lo: 1, Del: 1,
-		ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen,
+		ID: testID, Epoch: testEpoch, Gen: testGen,
 		State: mqttGenLedgerSealed, Hi: hi, SealedHi: hi,
 	}
 }
 
-// TestF105SweepCursorClearsAnOrdinalThatLaterCompletes is consult 5's counterexample, and the
+// TestSweepCursorClearsAnOrdinalThatLaterCompletes is consult 5's counterexample, and the
 // defect the four-field cursor exists to fix.
 //
 // The first design kept ONE accumulated minimum: "the lowest ordinal I could not finish", updated
@@ -48,9 +48,9 @@ func testF105SealedLedger(hi uint64) *mqttGenLedger {
 //
 // With the accumulator kept apart from the restart point and RESET when the next sweep begins, a
 // duty resolved this time round simply never enters the accumulator.
-func TestF105SweepCursorClearsAnOrdinalThatLaterCompletes(t *testing.T) {
+func TestSweepCursorClearsAnOrdinalThatLaterCompletes(t *testing.T) {
 	// Sweep 1 over a generation with ten duties: everything examined, ordinal 7 unresolved.
-	r := testF105Root(1, 1, 10, 0)
+	r := testRoot(1, 1, 10, 0)
 	r, err := mqttAdvanceSweep(r, mqttSweepOutcome{Examined: 10, LowestUnresolved: 7})
 	if err != nil {
 		t.Fatalf("advancing the first sweep: %v", err)
@@ -82,7 +82,7 @@ func TestF105SweepCursorClearsAnOrdinalThatLaterCompletes(t *testing.T) {
 	if r.Unresolved != 0 {
 		t.Fatalf("a resolved ordinal entered the accumulator: %+v", r)
 	}
-	if !mqttRootRetires(r, testF105SealedLedger(10)) {
+	if !mqttRootRetires(r, testSealedLedger(10)) {
 		t.Fatalf("a clean sweep through a sealed bound did not retire: %+v", r)
 	}
 
@@ -98,20 +98,20 @@ func TestF105SweepCursorClearsAnOrdinalThatLaterCompletes(t *testing.T) {
 	}
 }
 
-// TestF105SweepCompletesOnePastItsBound pins the off-by-one.
+// TestSweepCompletesOnePastItsBound pins the off-by-one.
 //
 // Resume names THE NEXT ORDINAL TO EXAMINE, so reaching Bound still leaves that entry
 // unprocessed. The completed position is Bound+1, and treating Bound as completion would retire
 // a generation with its last duty never looked at.
-func TestF105SweepCompletesOnePastItsBound(t *testing.T) {
-	atBound := testF105Root(1, 5, 5, 0)
+func TestSweepCompletesOnePastItsBound(t *testing.T) {
+	atBound := testRoot(1, 5, 5, 0)
 	if mqttSweepFinished(atBound) {
 		t.Fatalf("a sweep resuming AT its bound was called finished, leaving ordinal 5 unexamined")
 	}
-	if mqttRootRetires(atBound, testF105SealedLedger(5)) {
+	if mqttRootRetires(atBound, testSealedLedger(5)) {
 		t.Fatalf("a generation retired with its last duty unexamined")
 	}
-	past := testF105Root(1, 6, 5, 0)
+	past := testRoot(1, 6, 5, 0)
 	if !mqttSweepFinished(past) {
 		t.Fatalf("a sweep one past its bound was not finished: %+v", past)
 	}
@@ -119,7 +119,7 @@ func TestF105SweepCompletesOnePastItsBound(t *testing.T) {
 	// AND ADVANCING NEVER OVERSHOOTS. A batch reporting more examined than remain clamps at the
 	// completed position rather than running past it, which would put the cursor in a state its
 	// own validator refuses.
-	r, err := mqttAdvanceSweep(testF105Root(1, 1, 3, 0), mqttSweepOutcome{Examined: 128})
+	r, err := mqttAdvanceSweep(testRoot(1, 1, 3, 0), mqttSweepOutcome{Examined: 128})
 	if err != nil {
 		t.Fatalf("advancing past the bound: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestF105SweepCompletesOnePastItsBound(t *testing.T) {
 	}
 }
 
-// TestF105RetirementNeedsTheSealedBoundItActuallySwept is the second cut consult 5 found, and it
+// TestRetirementNeedsTheSealedBoundItActuallySwept is the second cut consult 5 found, and it
 // also removes a prohibition revision 2 stated wrongly.
 //
 // THE UNSAFE CASE: a sweep captures an OPEN high-water of 100, an admission creates 101, closure
@@ -141,24 +141,24 @@ func TestF105SweepCompletesOnePastItsBound(t *testing.T) {
 //
 // What separates them is the EQUALITY, not the state at capture — which is why no "captured
 // while sealed" flag exists.
-func TestF105RetirementNeedsTheSealedBoundItActuallySwept(t *testing.T) {
+func TestRetirementNeedsTheSealedBoundItActuallySwept(t *testing.T) {
 	// Swept through 100; the generation sealed at 101. The entry at 101 was never examined.
-	short := testF105Root(1, 101, 100, 0)
+	short := testRoot(1, 101, 100, 0)
 	if !mqttSweepFinished(short) {
 		t.Fatalf("the fixture's sweep is not finished: %+v", short)
 	}
-	if mqttRootRetires(short, testF105SealedLedger(101)) {
+	if mqttRootRetires(short, testSealedLedger(101)) {
 		t.Fatalf("a generation retired on a bound below its sealed high-water, so ordinal 101 " +
 			"was never visited")
 	}
 	// CAUGHT UP, not completed — and it has a name of its own precisely so the two are not
 	// confused.
-	if !mqttRootCaughtUp(short, testF105SealedLedger(101)) {
+	if !mqttRootCaughtUp(short, testSealedLedger(101)) {
 		t.Fatalf("a finished sweep that cannot retire was not reported caught up")
 	}
 
 	// The same sweep, against a generation that sealed at exactly the captured bound.
-	if !mqttRootRetires(short, testF105SealedLedger(100)) {
+	if !mqttRootRetires(short, testSealedLedger(100)) {
 		t.Fatalf("a clean sweep whose captured bound equals the sealed high-water did not retire")
 	}
 
@@ -166,7 +166,7 @@ func TestF105RetirementNeedsTheSealedBoundItActuallySwept(t *testing.T) {
 	// its inventory, so there is no bound for a coverage proof to be about.
 	open := &mqttGenLedger{
 		Lo: 1, Del: 1,
-		ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen,
+		ID: testID, Epoch: testEpoch, Gen: testGen,
 		State: mqttGenLedgerOpen, Hi: 100,
 	}
 	if mqttRootRetires(short, open) {
@@ -177,30 +177,30 @@ func TestF105RetirementNeedsTheSealedBoundItActuallySwept(t *testing.T) {
 	}
 
 	// AND AN UNRESOLVED ORDINAL BLOCKS RETIREMENT even with the bounds agreeing.
-	dirty := testF105Root(1, 101, 100, 42)
-	if mqttRootRetires(dirty, testF105SealedLedger(100)) {
+	dirty := testRoot(1, 101, 100, 42)
+	if mqttRootRetires(dirty, testSealedLedger(100)) {
 		t.Fatalf("a generation retired with ordinal 42 unresolved")
 	}
 }
 
-// TestF105SweepRollRefusesABoundThatWentBackwards pins the one thing that would make a sweep
+// TestSweepRollRefusesABoundThatWentBackwards pins the one thing that would make a sweep
 // report itself finished without examining anything.
-func TestF105SweepRollRefusesABoundThatWentBackwards(t *testing.T) {
-	finished := testF105Root(1, 11, 10, 0)
+func TestSweepRollRefusesABoundThatWentBackwards(t *testing.T) {
+	finished := testRoot(1, 11, 10, 0)
 	if _, err := mqttRollSweep(finished, 5); err == nil {
 		t.Fatalf("the next sweep started at 11 against a bound of 5, which it would report " +
 			"finished without examining anything")
 	}
 	// AND AN UNFINISHED SWEEP DOES NOT ROLL. Rolling mid-sweep would reset the accumulator and
 	// lose every unresolved ordinal the sweep had found so far.
-	if _, err := mqttRollSweep(testF105Root(1, 5, 10, 3), 10); err == nil {
+	if _, err := mqttRollSweep(testRoot(1, 5, 10, 3), 10); err == nil {
 		t.Fatalf("a sweep rolled before it finished, discarding its accumulator")
 	}
 }
 
-// TestF105RecoveryRecordsRefuseUnsupportedBodies pins the two record shapes.
-func TestF105RecoveryRecordsRefuseUnsupportedBodies(t *testing.T) {
-	shard := mqttDirShardFor(getHash(testF105ID))
+// TestRecoveryRecordsRefuseUnsupportedBodies pins the two record shapes.
+func TestRecoveryRecordsRefuseUnsupportedBodies(t *testing.T) {
+	shard := mqttDirShardFor(getHash(testID))
 
 	t.Run("shard", func(t *testing.T) {
 		for name, tc := range map[string]struct {
@@ -246,15 +246,15 @@ func TestF105RecoveryRecordsRefuseUnsupportedBodies(t *testing.T) {
 			r  *mqttRecoveryRoot
 			ok bool
 		}{
-			"a fresh sweep":    {testF105Root(1, 1, 10, 0), true},
-			"a finished sweep": {testF105Root(1, 11, 10, 0), true},
-			"one unresolved":   {testF105Root(1, 11, 10, 4), true},
+			"a fresh sweep":    {testRoot(1, 1, 10, 0), true},
+			"a finished sweep": {testRoot(1, 11, 10, 0), true},
+			"one unresolved":   {testRoot(1, 11, 10, 4), true},
 
-			"resuming before its sweep began":         {testF105Root(5, 3, 10, 0), false},
-			"resuming past the completed position":    {testF105Root(1, 12, 10, 0), false},
-			"an unresolved ordinal it never examined": {testF105Root(1, 5, 10, 7), false},
-			"an unresolved ordinal below its sweep":   {testF105Root(5, 11, 10, 2), false},
-			"a sweep starting at zero":                {testF105Root(0, 1, 10, 0), false},
+			"resuming before its sweep began":         {testRoot(5, 3, 10, 0), false},
+			"resuming past the completed position":    {testRoot(1, 12, 10, 0), false},
+			"an unresolved ordinal it never examined": {testRoot(1, 5, 10, 7), false},
+			"an unresolved ordinal below its sweep":   {testRoot(5, 11, 10, 2), false},
+			"a sweep starting at zero":                {testRoot(0, 1, 10, 0), false},
 		} {
 			err := mqttValidateRecoveryRoot(tc.r, tc.r.Shard, tc.r.Ord)
 			if tc.ok && err != nil {
@@ -268,7 +268,7 @@ func TestF105RecoveryRecordsRefuseUnsupportedBodies(t *testing.T) {
 		// A ROOT FILED IN THE WRONG SHARD is unreachable by every sweep that looks for that
 		// client's work where its hash says it should be. Refused rather than tolerated,
 		// because the cost is silent: nothing ever reports the work as missing.
-		misfiled := testF105Root(1, 1, 10, 0)
+		misfiled := testRoot(1, 1, 10, 0)
 		misfiled.Shard = (misfiled.Shard + 1) % mqttDirShards
 		if err := mqttValidateRecoveryRoot(misfiled, misfiled.Shard, misfiled.Ord); err == nil {
 			t.Fatalf("a root filed in the wrong shard was accepted")
@@ -276,9 +276,9 @@ func TestF105RecoveryRecordsRefuseUnsupportedBodies(t *testing.T) {
 	})
 }
 
-// TestF105DirectoryShardingIsStableAndAddressable pins the two properties a sweep depends on.
-func TestF105DirectoryShardingIsStableAndAddressable(t *testing.T) {
-	for _, id := range []string{"a", "client-one", testF105ID, "", "a much longer client id"} {
+// TestDirectoryShardingIsStableAndAddressable pins the two properties a sweep depends on.
+func TestDirectoryShardingIsStableAndAddressable(t *testing.T) {
+	for _, id := range []string{"a", "client-one", testID, "", "a much longer client id"} {
 		h := getHash(id)
 		first := mqttDirShardFor(h)
 		if first >= mqttDirShards {
@@ -292,8 +292,8 @@ func TestF105DirectoryShardingIsStableAndAddressable(t *testing.T) {
 	}
 }
 
-// testF105PlantRoot enrols a generation for recovery, directly, and returns its sequence.
-func testF105PlantRoot(t *testing.T, e *testF105Env, r *mqttRecoveryRoot) uint64 {
+// testPlantRoot enrols a generation for recovery, directly, and returns its sequence.
+func testPlantRoot(t *testing.T, e *testOutboundEnv, r *mqttRecoveryRoot) uint64 {
 	t.Helper()
 	body, err := json.Marshal(r)
 	if err != nil {
@@ -307,16 +307,16 @@ func testF105PlantRoot(t *testing.T, e *testF105Env, r *mqttRecoveryRoot) uint64
 	return resp.Sequence
 }
 
-// testF105EnvRoot builds a root for the env's own client, in the shard it hashes to.
-func testF105EnvRoot(e *testF105Env, start, resume, bound, unresolved uint64) *mqttRecoveryRoot {
+// testEnvRoot builds a root for the env's own client, in the shard it hashes to.
+func testEnvRoot(e *testOutboundEnv, start, resume, bound, unresolved uint64) *mqttRecoveryRoot {
 	return &mqttRecoveryRoot{
 		Shard: mqttDirShardFor(getHash(e.id)), Ord: 1,
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+		ID: e.id, Epoch: e.epoch, Gen: testGen,
 		SweepStart: start, Resume: resume, Bound: bound, Unresolved: unresolved,
 	}
 }
 
-// TestF105SweepCountsMissingAndMalformedEntriesAsOutstanding is D5's rule, which is the one a
+// TestSweepCountsMissingAndMalformedEntriesAsOutstanding is D5's rule, which is the one a
 // sweep is most tempted to get wrong.
 //
 // "Missing or malformed entries are INCONSISTENCIES, not completed work." A sweep that skipped
@@ -327,27 +327,27 @@ func testF105EnvRoot(e *testF105Env, start, resume, bound, unresolved uint64) *m
 // The other half is equally deliberate: `Resume` MAY pass such an entry while the accumulator
 // retains it. Blocking on it instead would let one inconsistency starve every later duty in the
 // generation, which is a denial of service the design never asked for.
-func TestF105SweepCountsMissingAndMalformedEntriesAsOutstanding(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-sweep-gaps")
+func TestSweepCountsMissingAndMalformedEntriesAsOutstanding(t *testing.T) {
+	e, done := testNewEnv(t, "f105-sweep-gaps")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
 	// Four duties: 1 terminal, 2 missing, 3 malformed, 4 still pending.
-	if err := testF105SubmitInventory(t, e, "txn-alloc",
-		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 4)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyProvision, "inc-xb", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 3, mqttDutyProvision, "inc-xc", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 4, mqttDutyProvision, "inc-xd", mqttDutyPending)),
+	if err := testSubmitInventory(t, e, "txn-alloc",
+		testLedgerMember(t, e, 0, testInventoryLedger(e, mqttGenLedgerOpen, 4)),
+		testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
+		testDutyMember(t, e, 0, testDuty(e, 2, mqttDutyProvision, "inc-xb", mqttDutyPending)),
+		testDutyMember(t, e, 0, testDuty(e, 3, mqttDutyProvision, "inc-xc", mqttDutyPending)),
+		testDutyMember(t, e, 0, testDuty(e, 4, mqttDutyProvision, "inc-xd", mqttDutyPending)),
 	); err != nil {
 		t.Fatalf("allocating four duties: %v", err)
 	}
 	// 1 REACHES terminal in the store rather than being allocated there: an allocation may never
 	// start terminal, and what this test is about is what the SWEEP does with the record.
-	testF105PlantDuty(t, e, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
+	testPlantDuty(t, e, testDuty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
 	// Remove 2 outright and corrupt 3, which is what a sweep must not read as done.
 	gone, gerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttDutySubject(getHash(e.id), testF105Gen, 2))
+		mqttDutySubject(getHash(e.id), testGen, 2))
 	if gerr != nil || gone == nil {
 		t.Fatalf("reading duty 2 before removing it: %v", gerr)
 	}
@@ -355,16 +355,16 @@ func TestF105SweepCountsMissingAndMalformedEntriesAsOutstanding(t *testing.T) {
 		t.Fatalf("removing duty 2: %v", err)
 	}
 	bad, berr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttDutySubject(getHash(e.id), testF105Gen, 3))
+		mqttDutySubject(getHash(e.id), testGen, 3))
 	if berr != nil || bad == nil {
 		t.Fatalf("reading duty 3 before corrupting it: %v", berr)
 	}
 	msg, hdr := mqttFrameBatchWrite(bad.Sequence, []byte(`{"not":"a duty"}`), _EMPTY_, 0, false)
-	if _, err := e.asm.jsa.storeMsg(mqttDutySubject(getHash(e.id), testF105Gen, 3), hdr, msg); err != nil {
+	if _, err := e.asm.jsa.storeMsg(mqttDutySubject(getHash(e.id), testGen, 3), hdr, msg); err != nil {
 		t.Fatalf("corrupting duty 3: %v", err)
 	}
 
-	root := testF105EnvRoot(e, 1, 1, 4, 0)
+	root := testEnvRoot(e, 1, 1, 4, 0)
 	swept, out, err := e.asm.jsa.sweepOneBatch(root)
 	if err != nil {
 		t.Fatalf("sweeping: %v", err)
@@ -412,16 +412,16 @@ func TestF105SweepCountsMissingAndMalformedEntriesAsOutstanding(t *testing.T) {
 	}
 }
 
-// TestF105SweepBatchIsBounded pins the 128.
-func TestF105SweepBatchIsBounded(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-sweep-bound")
+// TestSweepBatchIsBounded pins the 128.
+func TestSweepBatchIsBounded(t *testing.T) {
+	e, done := testNewEnv(t, "f105-sweep-bound")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
 	// A generation claiming far more duties than one batch may read. The entries are not
 	// planted: every ordinal then reads as MISSING, which is exactly the outstanding
 	// classification this test wants and needs no ceremony to produce.
-	root := testF105EnvRoot(e, 1, 1, 1000, 0)
+	root := testEnvRoot(e, 1, 1, 1000, 0)
 	swept, out, err := e.asm.jsa.sweepOneBatch(root)
 	if err != nil {
 		t.Fatalf("sweeping: %v", err)
@@ -447,7 +447,7 @@ func TestF105SweepBatchIsBounded(t *testing.T) {
 	}
 }
 
-// TestF105SweepCursorIsPersistedUnderCAS pins the one thing that keeps two brokers from
+// TestSweepCursorIsPersistedUnderCAS pins the one thing that keeps two brokers from
 // overwriting each other's progress.
 //
 // Claims reduce duplicate work and CANNOT exclude it — a paused claimant resuming after its
@@ -455,13 +455,13 @@ func TestF105SweepBatchIsBounded(t *testing.T) {
 // than exceptional. What must not happen is a stale worker writing its older cursor over a newer
 // one, which would re-walk ordinals already established terminal or, worse, move the accumulator
 // backwards.
-func TestF105SweepCursorIsPersistedUnderCAS(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-sweep-cas")
+func TestSweepCursorIsPersistedUnderCAS(t *testing.T) {
+	e, done := testNewEnv(t, "f105-sweep-cas")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
-	root := testF105EnvRoot(e, 1, 1, 10, 0)
-	seq := testF105PlantRoot(t, e, root)
+	root := testEnvRoot(e, 1, 1, 10, 0)
+	seq := testPlantRoot(t, e, root)
 
 	// Broker A advances and persists.
 	a, err := mqttAdvanceSweep(root, mqttSweepOutcome{Examined: 5, LowestUnresolved: 3})
@@ -492,7 +492,7 @@ func TestF105SweepCursorIsPersistedUnderCAS(t *testing.T) {
 	}
 }
 
-// TestF105RecoveryRecordsCannotRideInAnAuthorityBatch pins a separation that is currently true
+// TestRecoveryRecordsCannotRideInAnAuthorityBatch pins a separation that is currently true
 // by construction, which is exactly why it needs a test.
 //
 // The shard header and the recovery roots are NOT obligation classes and NOT arbitration
@@ -504,12 +504,12 @@ func TestF105SweepCursorIsPersistedUnderCAS(t *testing.T) {
 // update into an authority batch. Doing so would let a transition advance a sweep past ordinals
 // nobody examined, which loses work silently — the cursor authorizes nothing, so nothing would
 // refuse it on authorization grounds.
-func TestF105RecoveryRecordsCannotRideInAnAuthorityBatch(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-root-not-a-member")
+func TestRecoveryRecordsCannotRideInAnAuthorityBatch(t *testing.T) {
+	e, done := testNewEnv(t, "f105-root-not-a-member")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
-	root := testF105EnvRoot(e, 1, 1, 10, 0)
+	root := testEnvRoot(e, 1, 1, 10, 0)
 	body, err := json.Marshal(root)
 	if err != nil {
 		t.Fatalf("marshalling the root: %v", err)
@@ -523,7 +523,7 @@ func TestF105RecoveryRecordsCannotRideInAnAuthorityBatch(t *testing.T) {
 		"a recovery root": {subj: mqttRootSubject(root.Shard, root.Ord), expect: 0, body: body},
 		"a shard header":  {subj: mqttShardSubject(root.Shard), expect: 0, body: shardBody},
 	} {
-		if err := testF105SubmitInventory(t, e, "txn-smuggle-"+mqttNewInflightNonce(), m); err == nil {
+		if err := testSubmitInventory(t, e, "txn-smuggle-"+mqttNewInflightNonce(), m); err == nil {
 			t.Fatalf("%s was carried inside an authority transition", name)
 		}
 	}
@@ -531,12 +531,12 @@ func TestF105RecoveryRecordsCannotRideInAnAuthorityBatch(t *testing.T) {
 	// AND THE SAME RECORDS ARE WRITABLE DIRECTLY, which is the point of the separation rather
 	// than an accident of it — without this the test would pass against a broker that simply
 	// could not write them at all.
-	if seq := testF105PlantRoot(t, e, root); seq == 0 {
+	if seq := testPlantRoot(t, e, root); seq == 0 {
 		t.Fatalf("a recovery root could not be written outside a transition")
 	}
 }
 
-// TestF105SweepNeverPassesANotYetActionableDuty closes the composition the other tests only
+// TestSweepNeverPassesANotYetActionableDuty closes the composition the other tests only
 // cover transitively.
 //
 // mqttDutyResolved says NOT_YET_ACTIONABLE is unresolved, and the sweep reports unresolved
@@ -548,23 +548,23 @@ func TestF105RecoveryRecordsCannotRideInAnAuthorityBatch(t *testing.T) {
 // A cleanup duty predeclared with its resource is exactly that entry. It is not open work — its
 // resource still has dependents — and it is emphatically not finished. A sweep that advanced
 // past it would retire a generation still owing the cleanup.
-func TestF105SweepNeverPassesANotYetActionableDuty(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-sweep-notyet")
+func TestSweepNeverPassesANotYetActionableDuty(t *testing.T) {
+	e, done := testNewEnv(t, "f105-sweep-notyet")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
-	if err := testF105SubmitInventory(t, e, "txn-alloc",
-		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 2)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 2, mqttDutyCleanup, "inc-1",
+	if err := testSubmitInventory(t, e, "txn-alloc",
+		testLedgerMember(t, e, 0, testInventoryLedger(e, mqttGenLedgerOpen, 2)),
+		testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyPending)),
+		testDutyMember(t, e, 0, testDuty(e, 2, mqttDutyCleanup, "inc-1",
 			mqttDutyNotYetActionable)),
 	); err != nil {
 		t.Fatalf("allocating the pair: %v", err)
 	}
 	// As above: 1 reaches terminal in the store, because an allocation may never start there.
-	testF105PlantDuty(t, e, testF105Duty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
+	testPlantDuty(t, e, testDuty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
 
-	root := testF105EnvRoot(e, 1, 1, 2, 0)
+	root := testEnvRoot(e, 1, 1, 2, 0)
 	swept, out, err := e.asm.jsa.sweepOneBatch(root)
 	if err != nil {
 		t.Fatalf("sweeping: %v", err)
@@ -590,13 +590,13 @@ func TestF105SweepNeverPassesANotYetActionableDuty(t *testing.T) {
 		t.Fatalf("the next sweep starts at %d, past the cleanup it still owes", rolled.SweepStart)
 	}
 	// AND THE GENERATION DOES NOT RETIRE, even sealed at exactly the swept bound.
-	if mqttRootRetires(next, testF105SealedLedger(2)) {
+	if mqttRootRetires(next, testSealedLedger(2)) {
 		t.Fatalf("a generation retired while a predeclared cleanup was still owed")
 	}
 }
 
-// testF105PlantRootAt rewrites a root at its standing sequence.
-func testF105PlantRootAt(t *testing.T, e *testF105Env, r *mqttRecoveryRoot) {
+// testPlantRootAt rewrites a root at its standing sequence.
+func testPlantRootAt(t *testing.T, e *testOutboundEnv, r *mqttRecoveryRoot) {
 	t.Helper()
 	_, seq, err := e.asm.jsa.loadRecoveryRoot(r.Shard, r.Ord)
 	if err != nil {
@@ -607,8 +607,8 @@ func testF105PlantRootAt(t *testing.T, e *testF105Env, r *mqttRecoveryRoot) {
 	}
 }
 
-// testF105PlantShard writes a shard header covering ordinals up to hi.
-func testF105PlantShard(t *testing.T, e *testF105Env, shard, hi uint64) {
+// testPlantShard writes a shard header covering ordinals up to hi.
+func testPlantShard(t *testing.T, e *testOutboundEnv, shard, hi uint64) {
 	t.Helper()
 	// A HEADER CARRIES ITS CYCLE AND ITS HORIZON, and a planted one is no exception: the record
 	// is refused on read without them. The horizon is the high-water this cycle began at, which

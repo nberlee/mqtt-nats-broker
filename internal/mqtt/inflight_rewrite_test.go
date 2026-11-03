@@ -1472,10 +1472,10 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"by its exact sequence",
 		"reconcileOrphanInflight": "the account-wide sweep's candidate router, which holds no session to consult",
 		"deleteRetiredPositionsUpTo": "removes a duty entry the issue #114 floor RETIRED, never a register. A duty subject " +
-			"carries the f105 class token, which no register parser can place and no void verdict can " +
+			"carries the ob class token, which no register parser can place and no void verdict can " +
 			"name; the entry is LOADED and decoded before the delete, by the exact sequence read",
 		"deleteReclaimedExchange": "removes an exchange record the issue #114 floor RECLAIMED, never a register. An " +
-			"exchange subject carries the f105 class token, which no register parser can place and no " +
+			"exchange subject carries the ob class token, which no register parser can place and no " +
 			"void verdict can name; it is read first and deleted by the exact sequence read, and only " +
 			"once the register subject no longer names its lineage (the reclamation predicate)",
 		"deleteInflightMarker": "the UNSENT MARKER's exact-sequence delete (issue #76). A marker carries no cancellation " +
@@ -1483,7 +1483,7 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"property — so there is nothing here to strand; the sequence comes only from an observation the " +
 			"marker boundary admitted",
 		"deleteChunkInterval": "removes issue #107 retained MATERIAL, never a register. A chunk subject carries the " +
-			"f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
+			"ob class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
 			"register parser can place it and no void verdict can name it. The record is LOADED and " +
 			"its materialization checked before the delete, so what is taken is identified rather than " +
 			"addressed",
@@ -1491,14 +1491,14 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"authorized for, and only once every chunk is CONFIRMED removed. Same class as the chunks: not a " +
 			"register, so there is no verdict to strand",
 		"disposeRetainedRel": "removes a RETAINED exchange's CANONICAL PUBREL record (`rel`, issue #107 7c), never a " +
-			"register. A rel subject carries the f105 class token, which satisfies neither mqttValidIDHashToken " +
+			"register. A rel subject carries the ob class token, which satisfies neither mqttValidIDHashToken " +
 			"nor mqttValidSessGen, so no register parser can place it and no void verdict can name it. " +
 			"It is LOADED and its identity (the register's rel_id, the identifier) checked before the delete, " +
 			"by the exact sequence read, once its exchange is terminal at PUBCOMP. Same class as the chunks " +
 			"and the manifest",
 		"retireRecoveryRoot": "removes an issue #107 RECOVERY ROOT, never a register, by the EXACT sequence it was " +
 			"read at and only after its completion certificate is CONFIRMED to stand. A root subject carries " +
-			"the f105 class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
+			"the ob class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
 			"register parser can place it and no void verdict can name it — there is nothing here to " +
 			"strand. Same class as the retained material's chunk and manifest deletes",
 		"disposeSettledAffineRegister": "routes through the property where an identity-fenced session is resident, " +

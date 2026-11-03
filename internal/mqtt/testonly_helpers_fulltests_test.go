@@ -98,7 +98,7 @@ func (jsa *mqttJSA) sweepOneBatch(r *mqttRecoveryRoot) ([]mqttSweptDuty, mqttSwe
 // construction: one generation holds at most as many exchanges as it has outstanding
 // obligations, and each names its own subject.
 func mqttExchangeWalkFilter(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + gen + ".*"
+	return mqttOutboundRecordSubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + gen + ".*"
 }
 
 // mqttExchangeAbandonmentEqual compares two facts by VALUE. A durable record is never compared

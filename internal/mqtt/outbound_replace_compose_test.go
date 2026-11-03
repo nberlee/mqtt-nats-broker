@@ -32,7 +32,7 @@ import (
 // (mqttLineageForWrite), because that is what the composer is handed on the production route and
 // what it requires to agree with its own derivation. A mode with no derivation keeps the
 // allocation's nonce, so only the missing mode is wrong with it.
-func (r *testF105ReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, txn string) *mqttReplacingAdmission {
+func (r *testReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, txn string) *mqttReplacingAdmission {
 	t.Helper()
 	al := r.asm.jsa.loadOutboundAuthority(r.id, r.epoch)
 	reg := &mqttInflightRecord{
@@ -48,7 +48,7 @@ func (r *testF105ReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, t
 	// allocates a duty ordinal like any other admission; a register-only replacement continues
 	// its predecessor's obligation and allocates nothing, which is why the composer is given
 	// the ledger in both cases and uses it in only one.
-	led, ledSeq, lerr := r.asm.jsa.loadGenLedger(r.id, r.epoch, testF105Gen)
+	led, ledSeq, lerr := r.asm.jsa.loadGenLedger(r.id, r.epoch, testGen)
 	if lerr != nil {
 		t.Fatalf("reading the generation ledger: %v", lerr)
 	}
@@ -60,8 +60,8 @@ func (r *testF105ReplEnv) replacingFor(t *testing.T, mode mqttReplacementMode, t
 	}
 }
 
-func TestF105ComposedRegisterOnlyReplacementCommits(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-comp-inherit")
+func TestComposedRegisterOnlyReplacementCommits(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-comp-inherit")
 	defer done()
 	r.deleteMarker(t)
 
@@ -105,13 +105,13 @@ func TestF105ComposedRegisterOnlyReplacementCommits(t *testing.T) {
 	}
 }
 
-func TestF105ComposedPairReplacementCommits(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-comp-pair")
+func TestComposedPairReplacementCommits(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-comp-pair")
 	defer done()
 
 	adm := r.replacingFor(t, mqttReplacePair, "txn-comp-pair")
 	adm.Exchange = &mqttOutboundExchange{
-		ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: adm.Register.Lin,
+		ID: r.id, Epoch: r.epoch, Gen: testGen, Nonce: adm.Register.Lin,
 		PI: r.pi, QoS: r.occ.QoS, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-comp-pair", Tenure: adm.Auth.Tenure,
 	}
@@ -138,14 +138,14 @@ func TestF105ComposedPairReplacementCommits(t *testing.T) {
 	}
 }
 
-func TestF105ComposerRefusesAMixedReplacement(t *testing.T) {
+func TestComposerRefusesAMixedReplacement(t *testing.T) {
 	t.Run("register-only carrying an exchange", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-comp-mixed")
+		r, done := testNewReplEnv(t, "f105-comp-mixed")
 		defer done()
 		r.deleteMarker(t)
 		adm := r.replacingFor(t, mqttReplaceRegisterOnly, "txn-comp-mixed")
 		adm.Exchange = &mqttOutboundExchange{
-			ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: adm.Register.Lin,
+			ID: r.id, Epoch: r.epoch, Gen: testGen, Nonce: adm.Register.Lin,
 			PI: r.pi, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: "x", Tenure: adm.Auth.Tenure,
 		}
 		// A continued obligation already holds its edges; admitting a second would duplicate
@@ -158,11 +158,11 @@ func TestF105ComposerRefusesAMixedReplacement(t *testing.T) {
 	})
 
 	t.Run("pair carrying a pending-drain predecessor", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-comp-pd")
+		r, done := testNewReplEnv(t, "f105-comp-pd")
 		defer done()
 		adm := r.replacingFor(t, mqttReplacePair, "txn-comp-pd")
 		adm.Exchange = &mqttOutboundExchange{
-			ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: adm.Register.Lin,
+			ID: r.id, Epoch: r.epoch, Gen: testGen, Nonce: adm.Register.Lin,
 			PI: r.pi, QoS: r.occ.QoS, Phase: mqttExchangePublish,
 			AdmitTxn: "txn-comp-pd", Tenure: adm.Auth.Tenure,
 		}
@@ -177,7 +177,7 @@ func TestF105ComposerRefusesAMixedReplacement(t *testing.T) {
 	})
 
 	t.Run("no mode at all", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-comp-nomode")
+		r, done := testNewReplEnv(t, "f105-comp-nomode")
 		defer done()
 		adm := r.replacingFor(t, 0, "txn-comp-nomode")
 		// The mode is the marker boundary's answer. This mechanism does not guess one.

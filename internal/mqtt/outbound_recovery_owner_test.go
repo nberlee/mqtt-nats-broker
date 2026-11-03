@@ -439,11 +439,11 @@ func TestConsult73PubCompSecondRecoveryGate(t *testing.T) {
 				return err == nil && cur != nil && cur.ActionToken == _EMPTY_
 			})
 			before, sm := e.loadRegister(t, seed.pi)
-			obs := testF105ObservePubComp(t, e.sess)
+			obs := testObservePubComp(t, e.sess)
 			var terminalizations atomic.Int64
-			testF105SetAckAdvance(t, e.sess, func(req *mqttAdvanceExchangeAckRequest,
+			testSetAckAdvance(t, e.sess, func(req *mqttAdvanceExchangeAckRequest,
 				write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-				if testF105IsPubCompAdvance(req, seed.lin) {
+				if testIsPubCompAdvance(req, seed.lin) {
 					terminalizations.Add(1)
 				}
 				return write()

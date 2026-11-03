@@ -47,7 +47,7 @@ func testWithoutSlotMembers(tr *mqttAuthorityTransition) *mqttAuthorityTransitio
 // NOR marker: a marker without its register is already refused, so removing only the register
 // would be refused for that reason and prove nothing about this rule.
 func TestExchangeAdmittedOnlyWithItsRegister(t *testing.T) {
-	e, done := testF105NewEnv(t, "companion-register")
+	e, done := testNewEnv(t, "companion-register")
 	defer done()
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	jsa := &e.asm.jsa
@@ -80,11 +80,11 @@ func TestExchangeAdmittedOnlyWithItsRegister(t *testing.T) {
 // TestExchangeAdvancedOnlyWithItsSlot is Rule B: the acknowledgement batch with its slot
 // re-phase removed is exactly what the deleted exchange-only advance wrote.
 func TestExchangeAdvancedOnlyWithItsSlot(t *testing.T) {
-	e, done := testF105NewEnv(t, "companion-slot")
+	e, done := testNewEnv(t, "companion-slot")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	jsa := &e.asm.jsa
 
 	compose := func() *mqttAuthorityTransition {
@@ -114,7 +114,7 @@ func TestExchangeAdvancedOnlyWithItsSlot(t *testing.T) {
 		!strings.Contains(err.Error(), "with no slot member beside it") {
 		t.Fatalf("an exchange advanced with no slot member was not refused by its own rule: %v", err)
 	}
-	if x, _ := testF105LoadExchange(t, e, auth.Gen, nonce); x.Phase != mqttExchangePublish {
+	if x, _ := testLoadExchange(t, e, auth.Gen, nonce); x.Phase != mqttExchangePublish {
 		t.Fatalf("the refused advance moved the exchange to phase %d", x.Phase)
 	}
 	// The control: the same acknowledgement WITH its slot re-phase lands.
@@ -125,7 +125,7 @@ func TestExchangeAdvancedOnlyWithItsSlot(t *testing.T) {
 
 // testAuthorizedResource provisions a source-consumer resource through the surface and
 // drives it to DELETE_AUTHORIZED, returning the ordinal of its predeclared cleanup duty.
-func testAuthorizedResource(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority, inc string) uint64 {
+func testAuthorizedResource(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority, inc string) uint64 {
 	t.Helper()
 	jsa := &e.asm.jsa
 	if _, err := jsa.opProvisionResource(e.id, e.epoch, "txn-prov-"+inc, "op-prov", auth.Gen, auth.Tenure,
@@ -155,7 +155,7 @@ func testAuthorizedResource(t *testing.T, e *testF105Env, auth *mqttOutboundAuth
 
 // testCleanupCompletionBatch composes resource r's cleanup completion as completeCleanupAndResolve
 // does, with the duty member supplied by the caller (nil for none).
-func testCleanupCompletionBatch(t *testing.T, e *testF105Env, r *mqttOutboundResource, rseq uint64,
+func testCleanupCompletionBatch(t *testing.T, e *testOutboundEnv, r *mqttOutboundResource, rseq uint64,
 	duty *mqttTransitionMember) *mqttAuthorityTransition {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -188,7 +188,7 @@ func testCleanupCompletionBatch(t *testing.T, e *testF105Env, r *mqttOutboundRes
 }
 
 // testTerminalDutyMember is the member that ends the duty at ord in gen.
-func testTerminalDutyMember(t *testing.T, e *testF105Env, gen string, ord uint64) mqttTransitionMember {
+func testTerminalDutyMember(t *testing.T, e *testOutboundEnv, gen string, ord uint64) mqttTransitionMember {
 	t.Helper()
 	cur, curSeq, err := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, gen, ord)
 	if err != nil || cur == nil {
@@ -206,7 +206,7 @@ func testTerminalDutyMember(t *testing.T, e *testF105Env, gen string, ord uint64
 // so the unrelated duty in (2) names a resource that is itself made cleanup-complete first: that
 // duty then passes every existing check, and only Rule C can refuse the batch.
 func TestCleanupCompletedOnlyWithItsDuty(t *testing.T) {
-	e, done := testF105NewEnv(t, "companion-duty")
+	e, done := testNewEnv(t, "companion-duty")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	jsa := &e.asm.jsa
@@ -267,7 +267,7 @@ func TestCleanupCompletedOnlyWithItsDuty(t *testing.T) {
 	}
 	gd := &mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: otherGen, Ord: ordA, Kind: mqttDutyCleanup,
 		Ref: "inc-a", State: mqttDutyNotYetActionable}
-	testF105PlantNewDuty(t, e, gd)
+	testPlantNewDuty(t, e, gd)
 	foreign := testTerminalDutyMember(t, e, otherGen, ordA)
 	ra, sa = load("inc-a")
 	refused("the same incarnation in another generation", testCleanupCompletionBatch(t, e, ra, sa, &foreign))

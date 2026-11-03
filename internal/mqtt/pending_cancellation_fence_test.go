@@ -29,9 +29,9 @@ import (
 // issue #90 / issue #99 (consult C4, plan rev 20): the pending cancellation fence and its dedicated
 // disposal rule, witnessed on the real store. T33-T35, T37-T39 and T41.
 
-// testF088WriteFence runs the REAL producer for allocation nonce on pi and returns the fence it
+// testWriteFence runs the REAL producer for allocation nonce on pi and returns the fence it
 // wrote, asserting the written provenance.
-func testF088WriteFence(t *testing.T, e *testInflightEnv, pi uint16, dur string, sseq uint64, nonce string) (*mqttInflightRecord, uint64) {
+func testWriteFence(t *testing.T, e *testInflightEnv, pi uint16, dur string, sseq uint64, nonce string) (*mqttInflightRecord, uint64) {
 	t.Helper()
 	if err := e.sess.markInflightRegisterCancelledPending(e.c, mqttRegCancellation{
 		pi: pi, nonce: nonce, durable: dur, sseq: sseq, reply: testInflightAckSubject(dur, sseq, 1),
@@ -46,9 +46,9 @@ func testF088WriteFence(t *testing.T, e *testInflightEnv, pi uint16, dur string,
 	return rec, smsg.Sequence
 }
 
-// testF088ColdResume persists the session record, restores a session object from it in the same
+// testColdResume persists the session record, restores a session object from it in the same
 // generation (a cold resume), and runs recovery on it.
-func testF088ColdResume(t *testing.T, e *testInflightEnv) *mqttSession {
+func testColdResume(t *testing.T, e *testInflightEnv) *mqttSession {
 	t.Helper()
 	if err := testSessSave(t, e.sess); err != nil {
 		t.Fatalf("persist the session record: %v", err)
@@ -73,7 +73,7 @@ func testF088ColdResume(t *testing.T, e *testInflightEnv) *mqttSession {
 // pass ever receives it.
 //
 // Deliberately NOT parallel: the claim-pass witness is a package-level seam.
-func TestF088PendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
+func TestPendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		affine bool
@@ -92,7 +92,7 @@ func TestF088PendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 			e.sess.mu.Lock()
 			pi := e.sess.bumpPI()
 			e.sess.mu.Unlock()
-			fence, fseq := testF088WriteFence(t, e, pi, dur, 4, mqttNewInflightNonce())
+			fence, fseq := testWriteFence(t, e, pi, dur, 4, mqttNewInflightNonce())
 			if mqttDurIsSlotOnlyClass(fence.Dur) != tc.affine {
 				t.Fatalf("fixture: the fence's class is wrong: %q", fence.Dur)
 			}
@@ -120,7 +120,7 @@ func TestF088PendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 			}
 			e.asm.mu.Unlock()
 
-			restored := testF088ColdResume(t, e)
+			restored := testColdResume(t, e)
 			mu.Lock()
 			gotDeleted, gotClaimed := append([]uint64(nil), deleted...), claimed
 			mu.Unlock()
@@ -155,7 +155,7 @@ func TestF088PendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 }
 
 // T34. The provenance is enforced at the boundary, for every class.
-func TestF088PendingFenceProvenanceIsEnforcedAtTheBoundary(t *testing.T) {
+func TestPendingFenceProvenanceIsEnforcedAtTheBoundary(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f088-t34")
 	e.acceptUnderServingAuthority(t)
@@ -246,7 +246,7 @@ func TestF088PendingFenceProvenanceIsEnforcedAtTheBoundary(t *testing.T) {
 		fe.sess.mu.Lock()
 		fpi := fe.sess.bumpPI()
 		fe.sess.mu.Unlock()
-		fence, fseq := testF088WriteFence(t, fe, fpi, fdur, 6, mqttNewInflightNonce())
+		fence, fseq := testWriteFence(t, fe, fpi, fdur, 6, mqttNewInflightNonce())
 		cleared := *fence
 		cleared.Cancelled, cleared.CancelOrigin = false, _EMPTY_
 		cleared.State = mqttInflightPublishTerminal
@@ -344,11 +344,11 @@ func TestF088PendingFenceProvenanceIsEnforcedAtTheBoundary(t *testing.T) {
 	})
 }
 
-// testF088CopiedFreshTombstone builds T35's record: a freshly ADMITTED ordinary QoS 1 register
+// testCopiedFreshTombstone builds T35's record: a freshly ADMITTED ordinary QoS 1 register
 // (exchange at Publish, Lin == Nonce, Acq 0), whose marker an intent consumed, cancelled by the
 // copy-and-CAS fallback. Its body equals the sparse fence form field for field except its
 // provenance, which says `occupant`.
-func testF088CopiedFreshTombstone(t *testing.T, clientID string) (*testWithdrawFix, *mqttInflightRecord, uint64) {
+func testCopiedFreshTombstone(t *testing.T, clientID string) (*testWithdrawFix, *mqttInflightRecord, uint64) {
 	t.Helper()
 	f := testWithdrawAdmitted(t, clientID, 1)
 	ml := f.e.asm.jsa.loadOccupantMarkerLoad(f.subject)
@@ -374,11 +374,11 @@ func testF088CopiedFreshTombstone(t *testing.T, clientID string) (*testWithdrawF
 
 // T35. A copied fresh-admission tombstone is NOT a fence: the provenance, not the body, decides.
 // Route subtests: the classifier, the door and recovery each refuse to treat it as a fence.
-func TestF088CopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
+func TestCopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 	t.Parallel()
 	t.Run("authority and a late PUBACK", func(t *testing.T) {
 		t.Parallel()
-		f, rec, rseq := testF088CopiedFreshTombstone(t, "f088-t35")
+		f, rec, rseq := testCopiedFreshTombstone(t, "f088-t35")
 		rel := f.e.sess.mintSlotRelease(f.subject, rec, rseq)
 		if rel.auth == mqttSlotPendingFenceAuthority {
 			t.Fatal("an occupant cancellation was given the pending-fence authority")
@@ -401,7 +401,7 @@ func TestF088CopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 	})
 	t.Run("classifier", func(t *testing.T) {
 		t.Parallel()
-		f, rec, rseq := testF088CopiedFreshTombstone(t, "f088-t35-classifier")
+		f, rec, rseq := testCopiedFreshTombstone(t, "f088-t35-classifier")
 		obs := mqttSlotObservation{resp: mqttSlotSubjectPresent, occupant: rec, seq: rseq,
 			subjectNamesOccupant: true, cancelMarker: mqttSlotMarkerAbsent}
 		v := mqttClassifyInflightSlot(obs, mqttAllocationIntent{pi: f.pi, dur: f.e.sess.idHash + "_other", sseq: 9,
@@ -415,7 +415,7 @@ func TestF088CopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 	})
 	t.Run("door", func(t *testing.T) {
 		t.Parallel()
-		f, rec, rseq := testF088CopiedFreshTombstone(t, "f088-t35-door")
+		f, rec, rseq := testCopiedFreshTombstone(t, "f088-t35-door")
 		// The ordinary never-transmitted request FIRST: it is the one the door's dedicated fence
 		// mapping (mqttDoorDisposition, M45c's site) could divert; the direct fence request is the
 		// fence authority's alone. Each evaluation is reported on its own (non-fatal), so a deletion
@@ -431,7 +431,7 @@ func TestF088CopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 	})
 	t.Run("recovery", func(t *testing.T) {
 		t.Parallel()
-		f, _, rseq := testF088CopiedFreshTombstone(t, "f088-t35-recovery")
+		f, _, rseq := testCopiedFreshTombstone(t, "f088-t35-recovery")
 		// REACH (the recovery partition): the record leaves the fence partition by exactly one of
 		// its two exits for it - diverted to the fence drop list (a delete attempted at its
 		// sequence) or passed on to the ordinary classification (recovery's cancellation
@@ -450,7 +450,7 @@ func TestF088CopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 			return f.e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
 		}
 		f.e.asm.mu.Unlock()
-		restored := testF088ColdResume(t, f.e)
+		restored := testColdResume(t, f.e)
 		if !classified.Load() && !dropAttempted.Load() {
 			t.Fatal("witness: recovery's partition never evaluated the occupant cancellation")
 		}
@@ -469,7 +469,7 @@ func TestF088CopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 // T37. A Cancelled register written WITHOUT its provenance (raw store write, test-only) is an
 // unsupported shape: refused at decode, reserved by recovery as unreadable, refused by the door.
 // Nothing is inferred from its sparsity.
-func TestF088UnmarkedCancelledRegisterIsRefused(t *testing.T) {
+func TestUnmarkedCancelledRegisterIsRefused(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f088-t37")
 	e.sess.mu.Lock()
@@ -496,7 +496,7 @@ func TestF088UnmarkedCancelledRegisterIsRefused(t *testing.T) {
 		mqttLicenceOf(e.c)); out != mqttReapRefused {
 		t.Fatalf("the door must refuse an unreadable record, got %v", out)
 	}
-	restored := testF088ColdResume(t, e)
+	restored := testColdResume(t, e)
 	if _, after, _ := e.asm.loadInflightRecord(subject); after == nil || after.Sequence != smsg.Sequence {
 		t.Fatal("recovery must keep an unreadable record, never interpret or migrate it")
 	}
@@ -511,9 +511,9 @@ func TestF088UnmarkedCancelledRegisterIsRefused(t *testing.T) {
 // T38. An `occupant` tombstone whose exchange read reports ABSENT is not a fence: not disposed of
 // by provenance, not withdrawn, register preserved (the P-d2 refusal). Real-store witness: the
 // exchange message is deleted, so the read genuinely answers absent.
-func TestF088FalseExchangeAbsenceDoesNotMakeAFence(t *testing.T) {
+func TestFalseExchangeAbsenceDoesNotMakeAFence(t *testing.T) {
 	t.Parallel()
-	f, rec, rseq := testF088CopiedFreshTombstone(t, "f088-t38")
+	f, rec, rseq := testCopiedFreshTombstone(t, "f088-t38")
 	xsubj := mqttExchangeSubject(f.e.sess.idHash, f.gen, f.lin)
 	testDeleteSubject(t, f.e, xsubj)
 	if x, _, err := f.e.asm.jsa.loadOutboundExchange(f.e.sess.id, f.e.asm.sessStreamEpoch, f.gen, f.lin); x != nil || !mqttExchangeReadAbsent(err) {
@@ -529,7 +529,7 @@ func TestF088FalseExchangeAbsenceDoesNotMakeAFence(t *testing.T) {
 	}
 	// AND ON RESUME (P-d2): recovery reserves the exchange-less occupant cancellation as a shape it
 	// does not continue - never diverted as a fence, never restored acting on its bit.
-	restored := testF088ColdResume(t, f.e)
+	restored := testColdResume(t, f.e)
 	if after, aseq := f.register(t); after == nil || aseq != rseq {
 		t.Fatalf("recovery must keep the register, got %+v at %d", after, aseq)
 	}
@@ -555,7 +555,7 @@ func TestF088FalseExchangeAbsenceDoesNotMakeAFence(t *testing.T) {
 // T39. The fence is observed at S; a successor replaces it at S2 before the delete. The exact-
 // sequence delete removes nothing of the successor, the successor survives, and the identifier's
 // exclusion is not lifted. Driven through recovery's drop of the fence.
-func TestF088PendingFenceDisposalPreservesASuccessor(t *testing.T) {
+func TestPendingFenceDisposalPreservesASuccessor(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f088-t39")
 	e.acceptUnderServingAuthority(t)
@@ -563,7 +563,7 @@ func TestF088PendingFenceDisposalPreservesASuccessor(t *testing.T) {
 	e.sess.mu.Lock()
 	pi := e.sess.bumpPI()
 	e.sess.mu.Unlock()
-	fence, fseq := testF088WriteFence(t, e, pi, dur, 4, mqttNewInflightNonce())
+	fence, fseq := testWriteFence(t, e, pi, dur, 4, mqttNewInflightNonce())
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	successor := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: dur, Seq: 5, QoS: 1,
 		Nonce: mqttNewInflightNonce(), Claim: fence.Claim, SourceAckReply: testInflightAckSubject(dur, 5, 1)})
@@ -584,7 +584,7 @@ func TestF088PendingFenceDisposalPreservesASuccessor(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	restored := testF088ColdResume(t, e)
+	restored := testColdResume(t, e)
 	if !raced {
 		t.Fatal("fixture: the fence's delete was never reached, so no successor raced it")
 	}
@@ -603,7 +603,7 @@ func TestF088PendingFenceDisposalPreservesASuccessor(t *testing.T) {
 // T41. The settlement invariant (C6): a cancellation before admission opening, or after opening
 // but before the ladder's entry check, leaves NO permanently unsettled admission; the ordinary
 // caller's deferred finishAdmissionCustody runs.
-func TestF088CancellationBeforeOpeningLeavesNoUnsettledPlaceholder(t *testing.T) {
+func TestCancellationBeforeOpeningLeavesNoUnsettledPlaceholder(t *testing.T) {
 	t.Parallel()
 	// THE STRUCTURAL HALF: no early return was added to the opening or ahead of the deferred
 	// settlement by this change. The return statements of the two opening functions are frozen
@@ -611,7 +611,7 @@ func TestF088CancellationBeforeOpeningLeavesNoUnsettledPlaceholder(t *testing.T)
 	// admission body the deferred finishAdmissionCustody is the statement right after the
 	// opening's own refusal, with no return before it but that refusal's.
 	t.Run("structural", func(t *testing.T) {
-		_, funcs, _ := f088ScanProvenance(t)
+		_, funcs, _ := scanProvenance(t)
 		returns := func(fn string) int {
 			fd := funcs[fn]
 			if fd == nil {

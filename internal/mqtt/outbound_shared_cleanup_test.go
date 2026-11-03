@@ -29,15 +29,15 @@ import (
 // the one property the closing composer still owes and that has nothing to do with shared
 // durables: the closing batch SEALS its generation's inventory.
 
-// TestF105AClosureCarriesTheSealedLedger is holistic round 8's finding, pinned at the boundary.
+// TestAClosureCarriesTheSealedLedger is holistic round 8's finding, pinned at the boundary.
 //
 // The seal is the closing act. A batch carrying an otherwise valid enrolment beside a ledger body
 // still OPEN closes the generation with its inventory unsealed, and then a later disposal —
 // deliberately permitted to name an earlier generation — allocates into an inventory this act was
 // supposed to have shut. What the release gate reads off that generation would be a snapshot
 // again, which is the thing the enrolment exists to stop being.
-func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-closure-seal")
+func TestAClosureCarriesTheSealedLedger(t *testing.T) {
+	e, done := testNewEnv(t, "f105-closure-seal")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -59,7 +59,7 @@ func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
 	}
 	unsealed := []mqttTransitionMember{{subj: seal.subj, expect: seal.expect, body: body}}
 
-	_, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
+	_, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close-open", Op: "op-close",
 			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
@@ -95,7 +95,7 @@ func TestF105AClosureCarriesTheSealedLedger(t *testing.T) {
 	// about closing enrolments in general.
 	if oerr := func() error {
 		l := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-		_, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, &mqttAuthorityTransition{
+		_, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, &mqttAuthorityTransition{
 			Attempt: &mqttTransitionAttempt{
 				ID: e.id, Epoch: e.epoch, Txn: "txn-close-sealed", Op: "op-close",
 				Kind: mqttTransitionCloseAdmit, PrevTxn: l.rec.OwnerTxn, Rev: l.rec.Rev + 1,

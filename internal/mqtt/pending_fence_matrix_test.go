@@ -572,7 +572,7 @@ func t36Row07FailedOccupantMarkingThenCrash(t *testing.T) {
 	if !staged {
 		t.Fatal("fixture: the void verdict must stage")
 	}
-	restored := testF088ColdResume(t, f.e) // the save carries VoidedRegs; nothing tombstoned the register
+	restored := testColdResume(t, f.e) // the save carries VoidedRegs; nothing tombstoned the register
 	if x := f.exchange(); x == nil || x.Phase != mqttExchangeWithdrawnUnsent {
 		t.Fatalf("recovery's genuine-cancellation arm must withdraw the unmarked register, got %+v", x)
 	}
@@ -999,7 +999,7 @@ func t36Row17CrashAfterDisposalNoVerdict(t *testing.T) {
 	if _, err := held(); err == nil {
 		t.Fatal("the held post-fence batch must be refused once the disposal's advance landed")
 	}
-	restored := testF088ColdResume(t, f.e)
+	restored := testColdResume(t, f.e)
 	if rec, smsg := f.register(t); smsg != nil && rec != nil && rec.Nonce == f.nonce && !rec.Cancelled {
 		t.Fatalf("no late landing may stand for the cancelled allocation: %+v", rec)
 	}

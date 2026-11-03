@@ -80,7 +80,7 @@ func testAcquisitionTokenOf(tr *mqttAuthorityTransition) string {
 		return _EMPTY_
 	}
 	for _, m := range tr.Extra {
-		if mqttIsF105Subject(m.subj) || m.expect == 0 {
+		if mqttIsOutboundRecordSubject(m.subj) || m.expect == 0 {
 			continue
 		}
 		if _, perr := mqttParseInflightSubject(m.subj); perr != nil {
@@ -99,7 +99,7 @@ func testAcquisitionTokenOf(tr *mqttAuthorityTransition) string {
 func testRequireLandedAcquisition(t *testing.T, e *testInflightEnv, tr *mqttAuthorityTransition) {
 	t.Helper()
 	for _, m := range tr.Extra {
-		if mqttIsF105Subject(m.subj) || m.expect == 0 {
+		if mqttIsOutboundRecordSubject(m.subj) || m.expect == 0 {
 			continue
 		}
 		name, perr := mqttParseInflightSubject(m.subj)

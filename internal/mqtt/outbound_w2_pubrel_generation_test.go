@@ -40,7 +40,7 @@ import (
 // POSITIVE CONTROL in the same world: a G2 QoS 2 delivery's own PUBREL IS transmitted through the
 // same callback and counted by the same counter, so a zero above is the callback's answer, not a
 // counter that cannot count.
-func TestF105APubRelOfADiscardedGenerationIsNeverTransmittedByItsSuccessor(t *testing.T) {
+func TestAPubRelOfADiscardedGenerationIsNeverTransmittedByItsSuccessor(t *testing.T) {
 	// Not parallel: parking the recovery drivers and the PUBREL seams are process-wide.
 	testDiscardParkAll(t)
 	const cid = "f105-wd4-pubrel-gen"
@@ -64,13 +64,13 @@ func TestF105APubRelOfADiscardedGenerationIsNeverTransmittedByItsSuccessor(t *te
 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
 	_, sess := testResidentSession(t, s, cid)
-	p := testF113Capture(t, sess, pi)
+	p := testCapture(t, sess, pi)
 	epoch := p.asm.sessStreamEpoch
 
 	// G's STORED canonical PUBREL, read back from G's own PUBREL subject.
 	relSubjG, deliverG, _ := mqttPubRelNames(p.idHash, p.gen)
 	var storedSeq uint64
-	recs, _, ok := f099RealPubRelScan(p.asm, relSubjG)
+	recs, _, ok := realPubRelScan(p.asm, relSubjG)
 	for _, rec := range recs {
 		if ok && rec.shapeErr == nil && rec.pi == pi && rec.owner.Nonce == p.nonce {
 			storedSeq = rec.seq
@@ -189,7 +189,7 @@ func TestF105APubRelOfADiscardedGenerationIsNeverTransmittedByItsSuccessor(t *te
 	if m, err := acks.NextMsg(100 * time.Millisecond); err == nil {
 		t.Fatalf("G2's PUBREL callback acknowledged G's stored PUBREL (%q on %q)", m.Data, m.Subject)
 	}
-	if recs, _, ok := f099RealPubRelScan(p.asm, relSubjG); !ok || len(recs) == 0 {
+	if recs, _, ok := realPubRelScan(p.asm, relSubjG); !ok || len(recs) == 0 {
 		t.Fatalf("G's stored PUBREL is gone after the refused delivery (%d records, ok=%v)", len(recs), ok)
 	}
 

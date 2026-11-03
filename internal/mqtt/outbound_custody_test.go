@@ -17,8 +17,8 @@ package mqtt
 
 import "testing"
 
-// TestF105TerminalPendingDrainStillHoldsItsCharge pins the phase that exists for this.
-func TestF105TerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
+// TestTerminalPendingDrainStillHoldsItsCharge pins the phase that exists for this.
+func TestTerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
 	for name, tc := range map[string]struct {
 		phase       mqttExchangePhase
 		outstanding bool
@@ -31,7 +31,7 @@ func TestF105TerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
 		"terminal, still emitting": {mqttExchangeTerminal, true, mqttChargeHeldPendingDrain},
 		"terminal, drained":        {mqttExchangeTerminal, false, mqttChargeReleasable},
 	} {
-		x := testF105Exchange(2, tc.phase)
+		x := testExchange(2, tc.phase)
 		got, err := mqttExchangeCharge(x, tc.outstanding)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -42,7 +42,7 @@ func TestF105TerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
 	}
 }
 
-// TestF105UnreadableObligationsOccupyCapacity pins that an obligation this broker cannot
+// TestUnreadableObligationsOccupyCapacity pins that an obligation this broker cannot
 // interpret counts against Receive Maximum, and that an unreadable ACTION is not billed as a
 // further obligation.
 //
@@ -53,7 +53,7 @@ func TestF105TerminalPendingDrainStillHoldsItsCharge(t *testing.T) {
 //
 // Stated against the live gate: the resume's custody reconstruction over real records, read
 // back through capacityAvailableLocked with Receive Maximum the binding budget.
-func TestF105UnreadableObligationsOccupyCapacity(t *testing.T) {
+func TestUnreadableObligationsOccupyCapacity(t *testing.T) {
 	t.Parallel()
 	readable := testWithdrawAdmitted(t, "custody-unreadable-occupy", 2)
 	e := readable.e

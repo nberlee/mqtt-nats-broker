@@ -45,9 +45,9 @@ func (e *testOrphanEnv) forgetWithoutLicence(t *testing.T) {
 	e.dropSessionRecord(t)
 }
 
-// TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement is the
+// TestOrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement is the
 // negative, over the inbound hold class, with the payload asserted exactly.
-func TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement(t *testing.T) {
+func TestOrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-retain-hold")
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "live-remote-payload")
@@ -81,10 +81,10 @@ func TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement(t *
 	}
 }
 
-// TestF036OrphanSweepReclaimsWithMatchingRetirement is the POSITIVE CONTROL for the hold
+// TestOrphanSweepReclaimsWithMatchingRetirement is the POSITIVE CONTROL for the hold
 // class: with the licence present the pass reclaims exactly as before, so the gate is a
 // gate rather than a switch that turned reclamation off.
-func TestF036OrphanSweepReclaimsWithMatchingRetirement(t *testing.T) {
+func TestOrphanSweepReclaimsWithMatchingRetirement(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-reclaim-hold")
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "retired-payload")
@@ -96,14 +96,14 @@ func TestF036OrphanSweepReclaimsWithMatchingRetirement(t *testing.T) {
 	}
 }
 
-// TestF036OrphanSweepDifferentGenerationWatermarkAuthorizesNothing is the arm that makes
+// TestOrphanSweepDifferentGenerationWatermarkAuthorizesNothing is the arm that makes
 // the proof exact-match rather than merely "a watermark exists".
 //
 // A valid watermark naming a DIFFERENT generation is the ordinary steady state once a
 // client has been torn down more than once: the single slot names the latest retirement.
 // It says nothing about the candidate generation, and reading it as a licence would
 // destroy the state of every generation whose slot has since been replaced.
-func TestF036OrphanSweepDifferentGenerationWatermarkAuthorizesNothing(t *testing.T) {
+func TestOrphanSweepDifferentGenerationWatermarkAuthorizesNothing(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-othergen-hold")
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "other-generation-payload")
@@ -122,10 +122,10 @@ func TestF036OrphanSweepDifferentGenerationWatermarkAuthorizesNothing(t *testing
 	}
 }
 
-// TestF036OrphanSweepCorruptWatermarkAuthorizesNothing covers the two remaining negative
+// TestOrphanSweepCorruptWatermarkAuthorizesNothing covers the two remaining negative
 // statuses. Neither is absence and neither is proof: a watermark this broker cannot
 // interpret may name any retirement at all, and an unreadable stream says nothing.
-func TestF036OrphanSweepCorruptWatermarkAuthorizesNothing(t *testing.T) {
+func TestOrphanSweepCorruptWatermarkAuthorizesNothing(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status mqttRetirementStatus
@@ -167,12 +167,12 @@ func TestF036OrphanSweepCorruptWatermarkAuthorizesNothing(t *testing.T) {
 	}
 }
 
-// TestF036OrphanSweepRereadsANegativeRetirementObservation pins the cache boundary from
+// TestOrphanSweepRereadsANegativeRetirementObservation pins the cache boundary from
 // the sweep's side: only the monotone matching observation is remembered.
 //
 // A pass that observed no licence must not have cached that, or the state would be
 // retained forever once a retirement finally lands.
-func TestF036OrphanSweepRereadsANegativeRetirementObservation(t *testing.T) {
+func TestOrphanSweepRereadsANegativeRetirementObservation(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-reread-hold")
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "reread-payload")
@@ -195,11 +195,11 @@ func TestF036OrphanSweepRereadsANegativeRetirementObservation(t *testing.T) {
 	}
 }
 
-// TestF036OrphanSweepRetainsAnUnlicensedRegister and its control cover the second gated
+// TestOrphanSweepRetainsAnUnlicensedRegister and its control cover the second gated
 // arm. A register belonging to a live remote generation still holds that client's packet
 // identifier and its Receive Maximum slot; deleting it restores the exchange, on a crash,
 // as an ordinary live delivery.
-func TestF036OrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
+func TestOrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 	e := testNewInflightEnv(t, "f036-retain-register")
 	subject := e.seedOrphanRegisterWithoutLicence(t, 21)
 	zero := time.Duration(0)
@@ -215,7 +215,7 @@ func TestF036OrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 	}
 }
 
-// TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer and its control cover the third
+// TestOrphanSweepRetainsAnUnlicensedPubRelConsumer and its control cover the third
 // gated arm — the one keyed differently from the other two, by the name's ownership record
 // rather than by refs.hasInbound. Deleting the consumer drops every interest-retained PUBREL
 // it holds.
@@ -226,7 +226,7 @@ func TestF036OrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 // ownership record claims, and it CARRIES a matching watermark: that is what separates the
 // landed gate from re-licensing the delete by the watermark (consult 14's rejected option C).
 // The control runs in the SAME passes, so a pass that retains everything fails it.
-func TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
+func TestOrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-retain-pubrel")
 	e.setGraces(t, 0, 0)
 	unowned := e.unownedPubRelConsumer(t, "f036-pubrel-live-remote")
@@ -247,7 +247,7 @@ func TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
 	}
 }
 
-// TestF036OrphanSweepReapsATerminalTombstoneWithoutProof is the other half of the safe
+// TestOrphanSweepReapsATerminalTombstoneWithoutProof is the other half of the safe
 // tail, and it is the half whose ORDER matters.
 //
 // A terminal tombstone needs no retirement proof: the exchange it belongs to already
@@ -273,7 +273,7 @@ func TestF036OrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
 // here rather than asserted falsely.
 //
 // Mutation: reordering the absence read before the delete must fail this test.
-func TestF036OrphanSweepReapsATerminalTombstoneWithoutProof(t *testing.T) {
+func TestOrphanSweepReapsATerminalTombstoneWithoutProof(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-tombstone")
 	e.setGraces(t, 0, 0)
 	gen := nuid.Next()
@@ -302,7 +302,7 @@ func TestF036OrphanSweepReapsATerminalTombstoneWithoutProof(t *testing.T) {
 	}
 }
 
-// TestF036OrphanSweepRetiresClaimAfterHoldAlreadyGone is the SAFE TAIL: the arm that
+// TestOrphanSweepRetiresClaimAfterHoldAlreadyGone is the SAFE TAIL: the arm that
 // deliberately runs WITHOUT a retirement proof.
 //
 // Once the payload is authoritatively absent, removing the fence that protected it
@@ -313,7 +313,7 @@ func TestF036OrphanSweepReapsATerminalTombstoneWithoutProof(t *testing.T) {
 //
 // Without this arm the gate would be a blanket retain: every claim whose generation can
 // no longer be proven retired would accumulate beside a hold that is already gone.
-func TestF036OrphanSweepRetiresClaimAfterHoldAlreadyGone(t *testing.T) {
+func TestOrphanSweepRetiresClaimAfterHoldAlreadyGone(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-safetail")
 	e.setGraces(t, 0, 0)
 	gen := nuid.Next()

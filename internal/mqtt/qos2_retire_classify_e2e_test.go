@@ -76,7 +76,7 @@ func testPubRelSessionFacts(t *testing.T, b *testQoS2Broker) (gen string, seq ui
 	return sess.gen, sess.seq
 }
 
-// TestF036PubRelRefusesUnderAMatchingRetirement is the first dimension: a valid watermark
+// TestPubRelRefusesUnderAMatchingRetirement is the first dimension: a valid watermark
 // naming THIS incarnation.
 //
 // The hold is one the discard never enumerated, so nothing competes for the claim and
@@ -85,7 +85,7 @@ func testPubRelSessionFacts(t *testing.T, b *testQoS2Broker) (gen string, seq ui
 // Mutations that must fail this: dropping the Gen == sessGen arm; using the exchange's
 // rec.gen instead of the session generation; moving the classifier after the onward
 // store.
-func TestF036PubRelRefusesUnderAMatchingRetirement(t *testing.T) {
+func TestPubRelRefusesUnderAMatchingRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-match")
 	pi := uint16(41)
@@ -120,7 +120,7 @@ func TestF036PubRelRefusesUnderAMatchingRetirement(t *testing.T) {
 	}
 }
 
-// TestF036PubRelRefusesUnderASupersedingMarkerSequence is the second dimension, and the
+// TestPubRelRefusesUnderASupersedingMarkerSequence is the second dimension, and the
 // reason the classification cannot be generation equality alone.
 //
 // The watermark names a DIFFERENT generation — retire G1, then create and retire G2, and
@@ -130,7 +130,7 @@ func TestF036PubRelRefusesUnderAMatchingRetirement(t *testing.T) {
 //
 // Mutations that must fail this: dropping the MarkerSeq > sess.seq arm; requiring
 // generation equality; turning the || into &&.
-func TestF036PubRelRefusesUnderASupersedingMarkerSequence(t *testing.T) {
+func TestPubRelRefusesUnderASupersedingMarkerSequence(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-superseded")
 	pi := uint16(42)
@@ -155,14 +155,14 @@ func TestF036PubRelRefusesUnderASupersedingMarkerSequence(t *testing.T) {
 	}
 }
 
-// TestF036PubRelProceedsUnderANonReachingRetirement is the POSITIVE CONTROL, and without
+// TestPubRelProceedsUnderANonReachingRetirement is the POSITIVE CONTROL, and without
 // it every mutation above could be "killed" by a classifier that simply refuses
 // everything.
 //
 // A valid watermark for another generation whose marker does NOT reach past our own
 // record is evidence about a retirement this incarnation outlived. The release must
 // deliver.
-func TestF036PubRelProceedsUnderANonReachingRetirement(t *testing.T) {
+func TestPubRelProceedsUnderANonReachingRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-outlived")
 	pi := uint16(43)
@@ -185,9 +185,9 @@ func TestF036PubRelProceedsUnderANonReachingRetirement(t *testing.T) {
 	b.consumeOne(t, "outlived-payload")
 }
 
-// TestF036PubRelProceedsWithNoRetirement is the other positive control: the ordinary
+// TestPubRelProceedsWithNoRetirement is the other positive control: the ordinary
 // case, where no watermark exists at all.
-func TestF036PubRelProceedsWithNoRetirement(t *testing.T) {
+func TestPubRelProceedsWithNoRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-absent")
 	pi := uint16(44)
@@ -201,7 +201,7 @@ func TestF036PubRelProceedsWithNoRetirement(t *testing.T) {
 	b.consumeOne(t, "ordinary-payload")
 }
 
-// TestF036PubRelFailsClosedOnAnUnreadableRetirement is the THIRD outcome, and it is
+// TestPubRelFailsClosedOnAnUnreadableRetirement is the THIRD outcome, and it is
 // wire-distinguishable from the other refusal: no PUBCOMP at all, and BOTH records
 // retained.
 //
@@ -213,7 +213,7 @@ func TestF036PubRelProceedsWithNoRetirement(t *testing.T) {
 // the message); making it answer 0x92 instead of suppressing the PUBCOMP (this test's
 // no-PUBCOMP assertion fails while the delivery assertion still passes, which is what
 // makes the two mutations separately detectable).
-func TestF036PubRelFailsClosedOnAnUnreadableRetirement(t *testing.T) {
+func TestPubRelFailsClosedOnAnUnreadableRetirement(t *testing.T) {
 	// NOT t.Parallel(): setMQTTTestRetirementLoadHook is a process-global atomic, so a
 	// parallel sibling's classifier would read THIS test's corrupt watermark and refuse
 	// a release it was asserting proceeds. A hook must not outlive — or reach outside —
@@ -251,7 +251,7 @@ func TestF036PubRelFailsClosedOnAnUnreadableRetirement(t *testing.T) {
 	}
 }
 
-// TestF036PubRelFailsClosedWhileOurOwnWriteIsUnresolved is the third input to the
+// TestPubRelFailsClosedWhileOurOwnWriteIsUnresolved is the third input to the
 // unresolved arm, and it is a distinct fact from an unreadable watermark.
 //
 // While a write of ours is unresolved, sess.seq still holds the PRE-WRITE base. A
@@ -262,7 +262,7 @@ func TestF036PubRelFailsClosedOnAnUnreadableRetirement(t *testing.T) {
 //
 // Mutation: permitting seqUncertain to proceed must fail this test. Without it that
 // mutation SURVIVES, because every other case has a resolved session.
-func TestF036PubRelFailsClosedWhileOurOwnWriteIsUnresolved(t *testing.T) {
+func TestPubRelFailsClosedWhileOurOwnWriteIsUnresolved(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-uncertain")
 	pi := uint16(50)
@@ -305,14 +305,14 @@ func TestF036PubRelFailsClosedWhileOurOwnWriteIsUnresolved(t *testing.T) {
 	}
 }
 
-// TestF036PubRelClassifiesBeforeTheOnwardStore proves the ORDERING rather than the
+// TestPubRelClassifiesBeforeTheOnwardStore proves the ORDERING rather than the
 // outcome, and it asserts REACH as well as order — a bare "did they happen in this
 // sequence" check whose flags both default to false would pass against a classifier that
 // never ran at all.
 //
 // Mutations that must fail this: moving the classifier before the release claim; moving
 // it after the onward store.
-func TestF036PubRelClassifiesBeforeTheOnwardStore(t *testing.T) {
+func TestPubRelClassifiesBeforeTheOnwardStore(t *testing.T) {
 	// NOT t.Parallel(): setMQTTTestQoS2RetireSampledHook is a process-global atomic, so
 	// a parallel sibling's classification would set this test's ordering flags and this
 	// test's callback would fire inside that sibling. Same reason as the corrupt case.
@@ -363,7 +363,7 @@ func TestF036PubRelClassifiesBeforeTheOnwardStore(t *testing.T) {
 	}
 }
 
-// TestF036PubRelMemoizesOnlyTheMatchingRetirement pins the cache boundary.
+// TestPubRelMemoizesOnlyTheMatchingRetirement pins the cache boundary.
 //
 // A valid MATCHING observation is monotone — a generation never becomes rightful again,
 // and the single slot can lose the fact's discoverability but not the fact — so it may be
@@ -377,7 +377,7 @@ func TestF036PubRelClassifiesBeforeTheOnwardStore(t *testing.T) {
 //
 // Mutations that must fail this: memoizing a negative result (the second release
 // proceeds and the witness receives the message).
-func TestF036PubRelMemoizesOnlyTheMatchingRetirement(t *testing.T) {
+func TestPubRelMemoizesOnlyTheMatchingRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-memo")
 

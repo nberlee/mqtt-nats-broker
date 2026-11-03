@@ -819,7 +819,7 @@ there below are recorded in it.
   pre-existing when comparing suites. Moved 2026-10-12;
   [issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120).
 
-- [x] Moved `TestF097DispatcherIsFairUnderContinuousHints`'s untraced intermittent failure
+- [x] Moved `TestDispatcherIsFairUnderContinuousHints`'s untraced intermittent failure
   to the verification ledger; closure is a traced mechanism, then a dispatcher fix with
   this test as its witness or a measurement correction justified by that trace. Never
   loosen the assertion; treat it as pre-existing when comparing suites. Moved 2026-10-12;
@@ -1811,9 +1811,8 @@ them in order where a later lint change depends on an earlier cleanup.
   deploy READMEs are published as they are.
 
 - [x] Every finding is a GitHub issue, and every reference to one points at its issue: #3
-  to #145, label `finding`, and no mapping file (the issue titles are the mapping). Test
-  and helper identifiers carrying a number without the hyphen (`TestF088...`) keep it by
-  decision. Done 2026-11-01.
+  to #145, label `finding`, and no mapping file (the issue titles are the mapping). Done
+  2026-11-01; no identifier carries a finding number since 2026-11-03.
 
 - [x] Cut the dead text from `docs/ROADMAP.md`, `docs/CONFORMANCE.md`,
   `docs/ARCHITECTURE.md` and `docs/known-upstream-issues.md`: each keeps only text that

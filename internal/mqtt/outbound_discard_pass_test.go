@@ -30,7 +30,7 @@ import (
 // testDiscardClose closes the environment's SERVING generation DISCARDING through the production
 // route — a Clean-Start handoff's prepare, metadata commit and finalize — after the test admitted
 // what it needs into it, and returns the closed generation.
-func testDiscardClose(t *testing.T, e *testF105Env) string {
+func testDiscardClose(t *testing.T, e *testOutboundEnv) string {
 	t.Helper()
 	jsa := &e.asm.jsa
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -38,11 +38,11 @@ func testDiscardClose(t *testing.T, e *testF105Env) string {
 		t.Fatalf("fixture: no serving authority to close: %v", al.status)
 	}
 	first := al.rec
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	intent := &mqttHandoffIntent{
 		ID: "intent-discard", PrevGen: first.Gen, PrevTenure: first.Tenure,
 		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: testF105Gen2, Tenure: "tenure-discard", CleanReq: true,
+		Gen: testGen2, Tenure: "tenure-discard", CleanReq: true,
 		Retire: &mqttRetirementRequest{
 			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
 			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
@@ -68,7 +68,7 @@ func testDiscardClose(t *testing.T, e *testF105Env) string {
 }
 
 // testDiscardDutyOrd finds the ordinal of an obligation's exchange duty.
-func testDiscardDutyOrd(t *testing.T, e *testF105Env, gen, nonce string) uint64 {
+func testDiscardDutyOrd(t *testing.T, e *testOutboundEnv, gen, nonce string) uint64 {
 	t.Helper()
 	led, _, err := e.asm.jsa.loadGenLedger(e.id, e.epoch, gen)
 	if err != nil || led == nil {
@@ -87,7 +87,7 @@ func testDiscardDutyOrd(t *testing.T, e *testF105Env, gen, nonce string) uint64 
 // testDiscardResolveDutyRaw plants an obligation's exchange duty as already RESOLVED — the shape a
 // delivery the broker abandoned, or an ending whose cleanup crashed, leaves before the discard —
 // written raw, because what is under test is the census reading it, not the act that resolves it.
-func testDiscardResolveDutyRaw(t *testing.T, e *testF105Env, gen, nonce string) {
+func testDiscardResolveDutyRaw(t *testing.T, e *testOutboundEnv, gen, nonce string) {
 	t.Helper()
 	ord := testDiscardDutyOrd(t, e, gen, nonce)
 	d, seq, err := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, gen, ord)
@@ -103,14 +103,14 @@ func testDiscardResolveDutyRaw(t *testing.T, e *testF105Env, gen, nonce string) 
 }
 
 // testDiscardCertified reports whether the generation certified complete.
-func testDiscardCertified(e *testF105Env, gen string) bool {
+func testDiscardCertified(e *testOutboundEnv, gen string) bool {
 	cert, err := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, gen)
 	return err == nil && cert != nil
 }
 
 // testDiscardSweepUntilCertified runs passes, checking after EACH that a certificate never stands
 // while inv fails, until the generation certifies or the bound runs out.
-func testDiscardSweepUntilCertified(t *testing.T, e *testF105Env, gen string, inv func() error) {
+func testDiscardSweepUntilCertified(t *testing.T, e *testOutboundEnv, gen string, inv func() error) {
 	t.Helper()
 	for i := 0; i < 8*mqttDirShards; i++ {
 		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
@@ -130,7 +130,7 @@ func testDiscardSweepUntilCertified(t *testing.T, e *testF105Env, gen string, in
 
 // T3a: in a discarded generation an abandoned delivery is owed its discard, not resolved as a duty
 // that "owes no further delivery" (M10).
-func TestF105DiscardedAbandonedDeliveryOwesItsDiscard(t *testing.T) {
+func TestDiscardedAbandonedDeliveryOwesItsDiscard(t *testing.T) {
 	f := testAbandonAdmitted(t, "f105-discard-t3a", 1)
 	f.deny()
 	f.requireAbandoned(t)
@@ -147,16 +147,16 @@ func TestF105DiscardedAbandonedDeliveryOwesItsDiscard(t *testing.T) {
 
 // T3b: an obligation whose duty already RESOLVED while it still holds is found by the census, ended,
 // and only then does the generation certify (M15).
-func TestF105DiscardCensusFindsAResolvedObligation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-census")
+func TestDiscardCensusFindsAResolvedObligation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-census")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, _, _ := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	gen := testDiscardClose(t, e)
 	testDiscardResolveDutyRaw(t, e, gen, nonce)
 	testDiscardSweepUntilCertified(t, e, gen, func() error {
-		x, _ := testF105LoadExchange(t, e, gen, nonce)
+		x, _ := testLoadExchange(t, e, gen, nonce)
 		if x.Phase != mqttExchangeDiscarded {
 			return fmt.Errorf("the resolved obligation stands at phase %d", x.Phase)
 		}
@@ -168,18 +168,18 @@ func TestF105DiscardCensusFindsAResolvedObligation(t *testing.T) {
 // T4d / T4e: an obligation that ENDED, whose duty resolved, still owes its canonical PUBREL (rel
 // only) or its register (register only) in a discarded generation; neither certifies past it, and
 // each is deleted by the census (M7a, M7b). The ending itself is preserved.
-func TestF105DiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
+func TestDiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 	for _, which := range []string{"rel only", "register only"} {
 		t.Run(which, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "f105-discard-left-"+map[string]string{"rel only": "rel", "register only": "reg"}[which])
+			e, done := testNewEnv(t, "f105-discard-left-"+map[string]string{"rel only": "rel", "register only": "reg"}[which])
 			defer done()
 			e.bootstrap(t, "txn-1")
-			testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-			nonce, regSubj, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
-			if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+			testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+			nonce, regSubj, _, _ := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+			if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
 				t.Fatalf("ending the obligation: %v", err)
 			}
-			relSubj := mqttRetainedRelSubject(getHash(e.id), testF105Gen, nonce)
+			relSubj := mqttRetainedRelSubject(getHash(e.id), testGen, nonce)
 			if which == "rel only" {
 				// The ending re-phased the register in its own batch, so it stands at a new
 				// sequence: read it, rather than reuse the admission's.
@@ -190,7 +190,7 @@ func TestF105DiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, rmsg.Sequence, true); err != nil {
 					t.Fatalf("removing the register: %v", err)
 				}
-				b, _ := json.Marshal(&mqttRetainedRel{ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+				b, _ := json.Marshal(&mqttRetainedRel{ID: e.id, Epoch: e.epoch, Gen: testGen,
 					Nonce: nonce, PI: 7, Identity: mqttNewInflightNonce()})
 				msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
 				if _, err := e.asm.jsa.storeMsg(relSubj, hdr, msg); err != nil {
@@ -210,7 +210,7 @@ func TestF105DiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 				if standing(regSubj) {
 					return errors.New("the register still stands")
 				}
-				if x, _ := testF105LoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeTerminal {
+				if x, _ := testLoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeTerminal {
 					return fmt.Errorf("the ending was rewritten to %d", x.Phase)
 				}
 				return nil
@@ -222,16 +222,16 @@ func TestF105DiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 // T4f: a root whose prefix holds more resolved, edge-free obligations than one visit's budget can
 // classify still certifies — every visit classifies at least one entry — and a SHUTDOWN at any point
 // of a visit never lets the cursor pass an entry it did not classify (M7c, M20).
-func TestF105DiscardCensusSurvivesBudgetAndShutdown(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-budget")
+func TestDiscardCensusSurvivesBudgetAndShutdown(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-budget")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	const n = 140
 	nonces := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		inc := fmt.Sprintf("inc-%03d", i)
-		testF105PlantResource(t, e, inc, mqttResourceSourceConsumer)
-		nonce, _, _, _ := testF105AdmitQoS(t, e, fmt.Sprintf("txn-adm-%03d", i), uint16(i+1), 1, inc)
+		testPlantResource(t, e, inc, mqttResourceSourceConsumer)
+		nonce, _, _, _ := testAdmitQoS(t, e, fmt.Sprintf("txn-adm-%03d", i), uint16(i+1), 1, inc)
 		nonces = append(nonces, nonce)
 	}
 	gen := testDiscardClose(t, e)
@@ -240,7 +240,7 @@ func TestF105DiscardCensusSurvivesBudgetAndShutdown(t *testing.T) {
 	}
 	allDiscarded := func() error {
 		for _, nonce := range nonces {
-			if x, _ := testF105LoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeDiscarded {
+			if x, _ := testLoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeDiscarded {
 				return fmt.Errorf("obligation %q stands at phase %d", nonce, x.Phase)
 			}
 		}
@@ -269,7 +269,7 @@ func TestF105DiscardCensusSurvivesBudgetAndShutdown(t *testing.T) {
 }
 
 // T9: a reachable root is durable recovery ownership only under a DISCARDING closure (M9).
-func TestF105ReleaseGateRootArmNeedsADiscard(t *testing.T) {
+func TestReleaseGateRootArmNeedsADiscard(t *testing.T) {
 	sealed := &mqttGenLedger{Lo: 1, Del: 1, State: mqttGenLedgerSealed, Hi: 3, SealedHi: 3}
 	base := func(discard mqttFactState) mqttAdoptedReleaseFacts {
 		return mqttAdoptedReleaseFacts{Closed: &mqttGenClosure{}, Ledger: sealed, Discard: discard, RootEnrolled: true}
@@ -300,16 +300,16 @@ func TestF105ReleaseGateRootArmNeedsADiscard(t *testing.T) {
 
 // T12: a discarded generation's PUBREL consumer is not disposed of while an enrolled affine
 // consumer's readiness — the PUBREC proofs secured — does not stand (M8).
-func TestF105DiscardedPubRelWaitsForAffineReadiness(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-affine")
+func TestDiscardedPubRelWaitsForAffineReadiness(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-affine")
 	defer done()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, aff := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
-	if gen != testF105Gen {
-		t.Fatalf("fixture: closed %q, the planting helpers write %q", gen, testF105Gen)
+	gen, aff := testDiscardingCloseWithAffine(t, e, affGen, durable)
+	if gen != testGen {
+		t.Fatalf("fixture: closed %q, the planting helpers write %q", gen, testGen)
 	}
-	testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
+	testPlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
 	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: gen}
 	if ok, _ := e.asm.pubRelDisposalPrerequisites(root); ok {
 		t.Fatal("the PUBREL consumer may be disposed of before the affine readiness stands")
@@ -317,7 +317,7 @@ func TestF105DiscardedPubRelWaitsForAffineReadiness(t *testing.T) {
 	d := mqttSweptDuty{Entry: &mqttDutyEntry{Kind: mqttDutyCleanup, Ref: "inc-rel"}}
 	v := mqttDutyVerdict{Disposition: mqttDutyOwesWork, Work: mqttDutyWorkDispose}
 	e.asm.performDiscardWork(e.asm.server(), root, d, v, newMqttRecoveryBudget())
-	if r, _ := testF105LoadResource(t, e, "inc-rel"); r.Disposal != nil {
+	if r, _ := testBoundaryLoadResource(t, e, "inc-rel"); r.Disposal != nil {
 		t.Fatalf("the PUBREL consumer was disposed of before the readiness: %+v", r.Disposal)
 	}
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{ID: e.id, Epoch: e.epoch, Gen: gen,
@@ -325,15 +325,15 @@ func TestF105DiscardedPubRelWaitsForAffineReadiness(t *testing.T) {
 		t.Fatalf("asserting the readiness: %v", err)
 	}
 	e.asm.performDiscardWork(e.asm.server(), root, d, v, newMqttRecoveryBudget())
-	if r, _ := testF105LoadResource(t, e, "inc-rel"); r.Disposal == nil || r.Disposal.Reason != mqttDisposalGenerationDiscarded {
+	if r, _ := testBoundaryLoadResource(t, e, "inc-rel"); r.Disposal == nil || r.Disposal.Reason != mqttDisposalGenerationDiscarded {
 		t.Fatalf("with the readiness standing the PUBREL consumer was not disposed of: %+v", r.Disposal)
 	}
 }
 
 // T13: the prompt worker's allowance, quantum and order, measured apart from what a visit does
 // (M18, M19).
-func TestF105RecoveryKickIsBoundedAndFair(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-kick")
+func TestRecoveryKickIsBoundedAndFair(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-kick")
 	defer done()
 	var mu sync.Mutex
 	var order []string
@@ -404,7 +404,7 @@ func TestF105RecoveryKickIsBoundedAndFair(t *testing.T) {
 
 // T7: an AMBIGUOUS physical delete records nothing — the resource stands DeleteAuthorized and its
 // duty open — and the next visit repeats it and completes (continuation 4).
-func TestF105DiscardAmbiguousDeleteIsRepeated(t *testing.T) {
+func TestDiscardAmbiguousDeleteIsRepeated(t *testing.T) {
 	release := testDiscardParkAll(t)
 	f := testDiscardTearDown(t, "discard-ambiguous", 1, false)
 	var mu sync.Mutex
@@ -435,7 +435,7 @@ func TestF105DiscardAmbiguousDeleteIsRepeated(t *testing.T) {
 
 // T8: a late CREATE resurrecting a name the discard retired is the RETIRED-name orphan the plain
 // sweep reaps.
-func TestF105DiscardRetiredNameOrphanIsSwept(t *testing.T) {
+func TestDiscardRetiredNameOrphanIsSwept(t *testing.T) {
 	f := testDiscardTearDown(t, "discard-orphan", 1, false)
 	checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
 		return f.retired(t, mqttOwnedStreamMsgs, mqttStreamName, f.src)
@@ -453,8 +453,8 @@ func TestF105DiscardRetiredNameOrphanIsSwept(t *testing.T) {
 
 // T15: a discarding generation's named durable that no resource names is left standing and
 // reported, never deleted unauthorized.
-func TestF105DiscardLeavesAnUnenrolledDurable(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-unenrolled")
+func TestDiscardLeavesAnUnenrolledDurable(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-unenrolled")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	gen := testDiscardClose(t, e)
@@ -475,14 +475,14 @@ func TestF105DiscardLeavesAnUnenrolledDurable(t *testing.T) {
 // T4 at the reap: a discarding teardown's register reap SPARES the retained register — its
 // exchange's discard cleanup deletes it after the canonical PUBREL — and still reaps an ordinary
 // one; the census then retires the retained obligation and its register before certifying (M6).
-func TestF105DiscardReapSparesRetainedRegisters(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-retained")
+func TestDiscardReapSparesRetainedRegisters(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-retained")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	m, mSeq := testRetainedMaterialize(t, e, auth, "pay-d", "inc-pay", []byte("retained-discard"), 2)
 	ret := testRetainedAdmit(t, e, auth, 11, m, mSeq)
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	_, ordSubj, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	_, ordSubj, _, _ := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 	idHash := getHash(e.id)
 	retSubj := mqttInflightSubject(idHash, auth.Gen, 11)
 	standing := func(subj string) bool {
@@ -503,7 +503,7 @@ func TestF105DiscardReapSparesRetainedRegisters(t *testing.T) {
 		if standing(retSubj) {
 			return errors.New("the retained register still stands")
 		}
-		if x, _ := testF105LoadExchange(t, e, gen, ret.Lin); x.Phase != mqttExchangeDiscarded {
+		if x, _ := testLoadExchange(t, e, gen, ret.Lin); x.Phase != mqttExchangeDiscarded {
 			return fmt.Errorf("the retained obligation stands at phase %d", x.Phase)
 		}
 		return nil
@@ -513,13 +513,13 @@ func TestF105DiscardReapSparesRetainedRegisters(t *testing.T) {
 // The unit arithmetic: a budget holding exactly one entry unit above the reserve performs the
 // costliest discard step of a census entry — its classification with the canonical PUBREL and the
 // register, and the delete (M7c).
-func TestF105RecoveryEntryUnitCoversTheCostliestEntry(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-unit")
+func TestRecoveryEntryUnitCoversTheCostliestEntry(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-unit")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
-	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, _, _ := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending the obligation: %v", err)
 	}
 	gen := testDiscardClose(t, e)
@@ -541,8 +541,8 @@ func TestF105RecoveryEntryUnitCoversTheCostliestEntry(t *testing.T) {
 // A consumer a route already DECIDED about while the generation served keeps that decision: the
 // discard retires it from its record and never asks for another (M13). Its name is a real
 // provisioned one, so the pass reaches it through its own cleanup duty.
-func TestF105DiscardRetiresADecidedConsumer(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-decided")
+func TestDiscardRetiresADecidedConsumer(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-decided")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	if _, err := e.asm.jsa.opProvisionResource(e.id, e.epoch, "txn-prov", "op-prov", auth.Gen,
@@ -571,8 +571,8 @@ func TestF105DiscardRetiresADecidedConsumer(t *testing.T) {
 // same obligations and consumers — converge: every obligation discarded exactly once, every
 // consumer retired, one certificate. Each act is a CAS'd transition or an act on a RETIRED name or
 // an exact sequence, so a duplicate is refused or harmless (run under -race).
-func TestF105DiscardConcurrentDriversConverge(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-discard-concurrent")
+func TestDiscardConcurrentDriversConverge(t *testing.T) {
+	e, done := testNewEnv(t, "f105-discard-concurrent")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	if _, err := e.asm.jsa.opProvisionResource(e.id, e.epoch, "txn-prov", "op-prov", auth.Gen,
@@ -582,7 +582,7 @@ func TestF105DiscardConcurrentDriversConverge(t *testing.T) {
 	const n = 12
 	nonces := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		nonce, _, _, _ := testF105AdmitQoS(t, e, fmt.Sprintf("txn-adm-%02d", i), uint16(i+1), 1, "inc-src")
+		nonce, _, _, _ := testAdmitQoS(t, e, fmt.Sprintf("txn-adm-%02d", i), uint16(i+1), 1, "inc-src")
 		nonces = append(nonces, nonce)
 	}
 	gen := testDiscardClose(t, e)
@@ -604,11 +604,11 @@ func TestF105DiscardConcurrentDriversConverge(t *testing.T) {
 		t.Fatal("concurrent drivers never certified the generation")
 	}
 	for _, nonce := range nonces {
-		if x, _ := testF105LoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeDiscarded {
+		if x, _ := testLoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeDiscarded {
 			t.Fatalf("obligation %q stands at phase %d", nonce, x.Phase)
 		}
 	}
-	r, _ := testF105LoadResource(t, e, "inc-src")
+	r, _ := testBoundaryLoadResource(t, e, "inc-src")
 	if r.State != mqttResourceCleanupComplete || len(r.Deps) != 0 || r.Disposal == nil {
 		t.Fatalf("the consumer was not retired once: %+v", r)
 	}

@@ -124,7 +124,7 @@ func (jsa *mqttJSA) checkRetainedAdmission(a *mqttTransitionAttempt, extra []mqt
 				}
 			}
 		default:
-			if mqttIsF105Subject(e.subj) {
+			if mqttIsOutboundRecordSubject(e.subj) {
 				continue
 			}
 			if r, derr := mqttDecodeInflightRecord(e.body); derr == nil && r.retainedSource() && r.Lin == m.Admitted {
@@ -385,7 +385,7 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 				return fmt.Errorf("transition %q creates exchange %q naming retained owner %q without that "+
 					"owner's copy naming it admitted", a.Txn, x.Nonce, x.RetainedOwner)
 			}
-		case !mqttIsF105Subject(e.subj) && e.expect == 0:
+		case !mqttIsOutboundRecordSubject(e.subj) && e.expect == 0:
 			name, perr := mqttParseInflightSubject(e.subj)
 			if perr != nil {
 				continue
@@ -398,7 +398,7 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 				return fmt.Errorf("transition %q creates retained register %q without its copy %q naming exchange %q as admitted",
 					a.Txn, e.subj, rec.Payload, rec.Lin)
 			}
-		case mqttResourceIsF105Class(e.subj):
+		case mqttIsOutboundResourceSubject(e.subj):
 			var r struct {
 				Gen  string             `json:"gen"`
 				Name string             `json:"name"`
@@ -422,7 +422,7 @@ func checkRetainedAdmissionCoverage(a *mqttTransitionAttempt, extra []mqttTransi
 
 // mqttIsExchangeMember reports whether a member subject is an issue #107 exchange record.
 func mqttIsExchangeMember(subj string) bool {
-	cls, ok := mqttF105ObligationClass(subj)
+	cls, ok := mqttOutboundObligationClass(subj)
 	return ok && cls == mqttExchangeClassTk
 }
 
@@ -439,7 +439,7 @@ func mqttRetainedEdgeStood(extra []mqttTransitionMember, e mqttTransitionMember,
 		return false
 	}
 	for _, x := range extra {
-		if cls, ok := mqttF105ObligationClass(x.subj); ok && cls == mqttExchangeClassTk && x.expect == 0 &&
+		if cls, ok := mqttOutboundObligationClass(x.subj); ok && cls == mqttExchangeClassTk && x.expect == 0 &&
 			strings.HasSuffix(x.subj, "."+d.Nonce) {
 			return false // this batch creates the exchange: the edge is its admission's
 		}

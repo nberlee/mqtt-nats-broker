@@ -21,11 +21,11 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// testF105AdmitQoS admits ONE outbound PUBLISH obligation at the given QoS and returns the
+// testAdmitQoS admits ONE outbound PUBLISH obligation at the given QoS and returns the
 // exchange nonce, the register subject, and the register record with the sequence it stands at.
-// It is testF105AdmitOn with the QoS as a parameter, because the acknowledgement arrows differ
+// It is testAdmitOn with the QoS as a parameter, because the acknowledgement arrows differ
 // by QoS: a PUBACK ends a QoS 1 delivery at terminal, a PUBREC a QoS 2 one at PUBREC-observed.
-func testF105AdmitQoS(t *testing.T, e *testF105Env, txn string, pi uint16, qos byte,
+func testAdmitQoS(t *testing.T, e *testOutboundEnv, txn string, pi uint16, qos byte,
 	incs ...string) (string, string, *mqttInflightRecord, uint64) {
 	t.Helper()
 	reg := freshRegisterLineage(&mqttInflightRecord{
@@ -38,7 +38,7 @@ func testF105AdmitQoS(t *testing.T, e *testF105Env, txn string, pi uint16, qos b
 	}
 	deps := make([]mqttAdmitDependency, 0, len(incs))
 	for _, inc := range incs {
-		deps = append(deps, mqttAdmitDependency{Inc: inc, Role: testF105AdmissionRole(t, e, inc)})
+		deps = append(deps, mqttAdmitDependency{Inc: inc, Role: testAdmissionRole(t, e, inc)})
 	}
 	if _, err := e.asm.jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
@@ -148,7 +148,7 @@ func testAdvanceLive(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string,
 // canonical PUBREL tuple, the shape a PUBREL acquisition leaves once its action drained. For a
 // fixture whose PUBCOMP is the subject and whose generation no longer serves, so no acquisition
 // can take the slot there (an acquisition needs the serving authority of the exchange's own
-// generation); it is the same register plant testF105PrepareTokenBase makes.
+// generation); it is the same register plant testPrepareTokenBase makes.
 func testReadyPubRelSlot(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string) {
 	t.Helper()
 	x, _, xerr := jsa.loadOutboundExchange(id, epoch, gen, nonce)
@@ -243,12 +243,12 @@ func testWithSlotMember(t *testing.T, jsa *mqttJSA, tr *mqttAuthorityTransition,
 // A PUBACK moves the QoS 1 exchange to terminal AND re-phases its slot to publish_terminal, in
 // ONE batch. The two records state one fact — the client answered — and this is the operation
 // that keeps them from ever disagreeing.
-func TestF105AckAdvanceMovesExchangeAndSlotAtomically(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-atomic")
+func TestAckAdvanceMovesExchangeAndSlotAtomically(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-atomic")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, subj, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
 	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
@@ -258,7 +258,7 @@ func TestF105AckAdvanceMovesExchangeAndSlotAtomically(t *testing.T) {
 		t.Fatalf("the atomic acknowledgement advance was refused: %v", err)
 	}
 
-	end, _ := testF105LoadExchange(t, e, auth.Gen, nonce)
+	end, _ := testLoadExchange(t, e, auth.Gen, nonce)
 	if end.Phase != mqttExchangeTerminal {
 		t.Fatalf("the exchange stands at phase %d after PUBACK, want terminal", end.Phase)
 	}
@@ -271,12 +271,12 @@ func TestF105AckAdvanceMovesExchangeAndSlotAtomically(t *testing.T) {
 // A successful PUBREC moves the QoS 2 exchange to PUBREC-observed and re-phases its slot to
 // pubrel_intended, and — unlike the terminal arrow — PRESERVES a live action token and is not
 // bound to the answered transmission (a PUBREC may land on a retransmission).
-func TestF105AckAdvancePubRecPreservesTokenAndIsNotAcqBound(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-pubrec")
+func TestAckAdvancePubRecPreservesTokenAndIsNotAcqBound(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-pubrec")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 2, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, subj, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 2, "inc-src")
 
 	// Acquire an output-custody token, so the slot carries a LIVE action when the PUBREC lands.
 	token := mqttNewInflightNonce()
@@ -299,7 +299,7 @@ func TestF105AckAdvancePubRecPreservesTokenAndIsNotAcqBound(t *testing.T) {
 		t.Fatalf("the PUBREC advance over a live token was refused: %v", err)
 	}
 
-	end, _ := testF105LoadExchange(t, e, auth.Gen, nonce)
+	end, _ := testLoadExchange(t, e, auth.Gen, nonce)
 	if end.Phase != mqttExchangePubRecObserved {
 		t.Fatalf("the exchange stands at phase %d after PUBREC, want PUBREC-observed", end.Phase)
 	}
@@ -315,12 +315,12 @@ func TestF105AckAdvancePubRecPreservesTokenAndIsNotAcqBound(t *testing.T) {
 // The terminal arrow refuses a live action token: its holder may still be writing the
 // transmission the acknowledgement answers, and terminalising over it would license disposing
 // of an exchange the client never finished with.
-func TestF105AckAdvanceTerminalRefusesLiveToken(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-livetoken")
+func TestAckAdvanceTerminalRefusesLiveToken(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-livetoken")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, subj, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
 	token := mqttNewInflightNonce()
 	if _, _, err := e.asm.jsa.opAcquireAction(&mqttAcquireActionRequest{
@@ -343,12 +343,12 @@ func TestF105AckAdvanceTerminalRefusesLiveToken(t *testing.T) {
 
 // The terminal arrow is bound to the ONE transmission the acknowledgement answers: a PUBACK
 // naming a transmission the slot has moved past records a client answer that never happened.
-func TestF105AckAdvanceTerminalIsBoundToTheAnsweredTransmission(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-acqbound")
+func TestAckAdvanceTerminalIsBoundToTheAnsweredTransmission(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-acqbound")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
 	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
@@ -362,12 +362,12 @@ func TestF105AckAdvanceTerminalIsBoundToTheAnsweredTransmission(t *testing.T) {
 // A stale register read loses: the exact-sequence CAS is what makes the re-phase and the
 // exchange advance one consistent act, so a read superseded by an acquisition in between must
 // not commit.
-func TestF105AckAdvanceLosesAStaleRegisterRead(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-stale")
+func TestAckAdvanceLosesAStaleRegisterRead(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-stale")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
 	// An acquisition moves the register after the read above; the stale (reg, seq) is now the
 	// second broker observing the same acknowledgement.
@@ -390,14 +390,14 @@ func TestF105AckAdvanceLosesAStaleRegisterRead(t *testing.T) {
 // The builder refuses a slot member that names a different obligation than the exchange it
 // advances: the two are one acknowledgement, so a re-phase can never ride beside a phase move
 // for another obligation.
-func TestF105AckAdvanceBuilderRefusesAMismatchedSlot(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-mismatch")
+func TestAckAdvanceBuilderRefusesAMismatchedSlot(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-mismatch")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
-	cur, curSeq := testF105LoadExchange(t, e, auth.Gen, nonce)
+	cur, curSeq := testLoadExchange(t, e, auth.Gen, nonce)
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	foreign := *reg
 	foreign.Lin = mqttNewInflightNonce() // a different obligation than the exchange's
@@ -413,12 +413,12 @@ func TestF105AckAdvanceBuilderRefusesAMismatchedSlot(t *testing.T) {
 
 // A pending-drain ending carries the exchange ALONE: its output is still outstanding, so the
 // slot cannot terminalise, and asking the acknowledgement op to re-phase it is refused.
-func TestF105AckAdvancePendingDrainCarriesNoSlot(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-drain")
+func TestAckAdvancePendingDrainCarriesNoSlot(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-drain")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 
 	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
@@ -434,12 +434,12 @@ func TestF105AckAdvancePendingDrainCarriesNoSlot(t *testing.T) {
 // the only acknowledgement that ends a QoS 2 delivery still at PUBLISH is a PUBREC the client
 // refused, and it must leave the exchange at Rejected so recovery never resends the payload under
 // a fresh identifier (consult 18, arm-level owed item #1).
-func TestF105AckAdvanceFailedPubRecRejectsTheQoS2Exchange(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-rejected")
+func TestAckAdvanceFailedPubRecRejectsTheQoS2Exchange(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-rejected")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce, subj, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 7, 2, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce, subj, reg, seq := testAdmitQoS(t, e, "txn-adm", 7, 2, "inc-src")
 
 	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
@@ -449,7 +449,7 @@ func TestF105AckAdvanceFailedPubRecRejectsTheQoS2Exchange(t *testing.T) {
 		t.Fatalf("the failed-PUBREC advance to Rejected was refused: %v", err)
 	}
 
-	end, _ := testF105LoadExchange(t, e, auth.Gen, nonce)
+	end, _ := testLoadExchange(t, e, auth.Gen, nonce)
 	if end.Phase != mqttExchangeRejected {
 		t.Fatalf("the exchange stands at phase %d after a failed PUBREC, want rejected", end.Phase)
 	}
@@ -462,15 +462,15 @@ func TestF105AckAdvanceFailedPubRecRejectsTheQoS2Exchange(t *testing.T) {
 // A closed generation's obligation still ends: a PUBREC on G1's connection advances the G1
 // exchange and re-phases its G1 slot under G2's serving authority, with the register member
 // naming G1 while the transition is G2's — the generation exemption this row relies on.
-func TestF105AckAdvanceCrossGenerationEndsAClosedObligation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ack-crossgen")
+func TestAckAdvanceCrossGenerationEndsAClosedObligation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ack-crossgen")
 	defer done()
 	auth, authSeq := e.bootstrap(t, "txn-1")
-	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7,
+	src, srcSeq := testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	adm := testAdmission(e, auth, authSeq, "txn-adm", 7,
 		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
 	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
+	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, atr))
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
@@ -479,43 +479,43 @@ func TestF105AckAdvanceCrossGenerationEndsAClosedObligation(t *testing.T) {
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
 			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: atr.Auth.Rev + 1,
-			Gen: testF105Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
+			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
 		Prev: atr.Auth, PrevSeq: admSeq,
 		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Tenure: auth.Tenure,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
 			State: mqttAuthorityClosed, Rev: atr.Auth.Rev + 1, Txn: "txn-close", OwnerTxn: auth.OwnerTxn,
 		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
+		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
 	}
-	closeSeq, clerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing))
+	closeSeq, clerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
-	e.claim(t, closing.Auth, closeSeq, "txn-g2", testF105Gen2, "tenure-g2")
+	e.claim(t, closing.Auth, closeSeq, "txn-g2", testGen2, "tenure-g2")
 
-	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, 7)
+	regSubj := mqttInflightSubject(getHash(e.id), testGen, 7)
 	reg, smsg, lerr := e.asm.jsa.loadInflightRecord(regSubj)
 	if lerr != nil || reg == nil || smsg == nil {
 		t.Fatalf("G1's register does not load back: %v", lerr)
 	}
-	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.rec.Gen != testF105Gen2 {
+	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.rec.Gen != testGen2 {
 		t.Fatalf("the serving authority is at %q, want the successor", al.rec.Gen)
 	}
 
 	if _, err := e.asm.jsa.opAdvanceExchangeAck(&mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-ack", Op: "op-ack",
-		Gen: testF105Gen, Nonce: adm.Exchange.Nonce, To: mqttExchangePubRecObserved, Acq: reg.Acq,
+		Gen: testGen, Nonce: adm.Exchange.Nonce, To: mqttExchangePubRecObserved, Acq: reg.Acq,
 		Register: reg, RegisterSeq: smsg.Sequence,
 	}); err != nil {
 		t.Fatalf("a closed generation's obligation could not record its PUBREC under the successor: %v", err)
 	}
 
-	end, _ := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
+	end, _ := testLoadExchange(t, e, testGen, adm.Exchange.Nonce)
 	if end.Phase != mqttExchangePubRecObserved {
 		t.Fatalf("the G1 exchange stands at phase %d, want PUBREC-observed", end.Phase)
 	}
-	if end.Gen != testF105Gen {
+	if end.Gen != testGen {
 		t.Fatalf("advancing under the successor re-attributed the obligation to generation %q", end.Gen)
 	}
 	slot, _, _ := e.asm.jsa.loadInflightRecord(regSubj)
@@ -533,7 +533,7 @@ func TestF105AckAdvanceCrossGenerationEndsAClosedObligation(t *testing.T) {
 //
 // Mutation M3: restore "explicit absence means a legacy register" (slot-only), and both arms move
 // the slot. Mutation M5: map the terminal arm's refusal to the slot-only path, and arm (b) does.
-func TestF105AckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
+func TestAckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
 	t.Parallel()
 	for _, arm := range []string{"successful PUBREC", "PUBACK"} {
 		arm := arm

@@ -43,7 +43,7 @@ func testArmTransitionSeam(t *testing.T, jsa *mqttJSA,
 
 // testReconcileSession is the minimal session the ownership helper and executor steps act
 // through: its client identity and the account's JetStream assistant.
-func testReconcileSession(e *testF105Env) *mqttSession {
+func testReconcileSession(e *testOutboundEnv) *mqttSession {
 	return &mqttSession{id: e.id, jsa: &e.asm.jsa, asm: e.asm}
 }
 
@@ -64,23 +64,23 @@ func testCountingAllow(n int) (func() error, *int) {
 // retained handle that the transition happened, return its transaction, and never issue a second
 // one (which each operation would refuse, being no idempotent retry). Mutation M-C2: treat every
 // handle error as never-landed, and the re-attempt either appears or is refused.
-func TestF105OwnershipStepLostResponseIsResolved(t *testing.T) {
+func TestOwnershipStepLostResponseIsResolved(t *testing.T) {
 	type step struct {
 		name  string
 		kind  mqttTransitionKind
-		setup func(t *testing.T, e *testF105Env) func(txn string) (mqttOpOutcome, error)
+		setup func(t *testing.T, e *testOutboundEnv) func(txn string) (mqttOpOutcome, error)
 	}
 	steps := []step{
-		{"claim", mqttTransitionReserveCreation, func(t *testing.T, e *testF105Env) func(string) (mqttOpOutcome, error) {
-			p := testF105CreationProp(t, "c2-claim")
+		{"claim", mqttTransitionReserveCreation, func(t *testing.T, e *testOutboundEnv) func(string) (mqttOpOutcome, error) {
+			p := testCreationProp(t, "c2-claim")
 			return func(txn string) (mqttOpOutcome, error) {
 				return e.asm.jsa.opClaimClient(e.id, e.epoch, txn, p.Gen, p.Tenure, p.ID)
 			}
 		}},
-		{"finalize claim", mqttTransitionFinalizeCreation, func(t *testing.T, e *testF105Env) func(string) (mqttOpOutcome, error) {
-			p := testF105CreationProp(t, "c2-fin-claim")
-			testF105StandCreation(t, e, p)
-			f := testF105FreezeProposal(t, e, p, testF105RecordSeq(t, e))
+		{"finalize claim", mqttTransitionFinalizeCreation, func(t *testing.T, e *testOutboundEnv) func(string) (mqttOpOutcome, error) {
+			p := testCreationProp(t, "c2-fin-claim")
+			testStandCreation(t, e, p)
+			f := testFreezeProposal(t, e, p, testRecordSeq(t, e))
 			if _, err := e.asm.jsa.commitMetadataAttempt(f); err != nil {
 				t.Fatalf("committing the creation's metadata: %v", err)
 			}
@@ -88,35 +88,35 @@ func TestF105OwnershipStepLostResponseIsResolved(t *testing.T) {
 				return e.asm.jsa.opFinalizeClaim(e.id, e.epoch, txn, p.ID)
 			}
 		}},
-		{"prepare", mqttTransitionPrepareIntent, func(t *testing.T, e *testF105Env) func(string) (mqttOpOutcome, error) {
-			i := testF105Intent(t, e, "c2-prep")
+		{"prepare", mqttTransitionPrepareIntent, func(t *testing.T, e *testOutboundEnv) func(string) (mqttOpOutcome, error) {
+			i := testIntent(t, e, "c2-prep")
 			return func(txn string) (mqttOpOutcome, error) {
 				return e.asm.jsa.opPrepareHandoff(e.id, e.epoch, txn, i)
 			}
 		}},
-		{"finalize handoff", mqttTransitionFinalize, func(t *testing.T, e *testF105Env) func(string) (mqttOpOutcome, error) {
-			i := testF105Intent(t, e, "c2-fin")
-			testF105Prepare(t, e, i)
-			if _, err := e.asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))); err != nil {
+		{"finalize handoff", mqttTransitionFinalize, func(t *testing.T, e *testOutboundEnv) func(string) (mqttOpOutcome, error) {
+			i := testIntent(t, e, "c2-fin")
+			testPrepare(t, e, i)
+			if _, err := e.asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, testRecordSeq(t, e))); err != nil {
 				t.Fatalf("committing the handoff's metadata: %v", err)
 			}
 			return func(txn string) (mqttOpOutcome, error) {
 				return e.asm.jsa.opFinalizeHandoff(e.id, e.epoch, txn, i.ID)
 			}
 		}},
-		{"cancel handoff", mqttTransitionCancelIntent, func(t *testing.T, e *testF105Env) func(string) (mqttOpOutcome, error) {
-			i := testF105Intent(t, e, "c2-cancel")
-			testF105Prepare(t, e, i)
-			if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataAborted {
+		{"cancel handoff", mqttTransitionCancelIntent, func(t *testing.T, e *testOutboundEnv) func(string) (mqttOpOutcome, error) {
+			i := testIntent(t, e, "c2-cancel")
+			testPrepare(t, e, i)
+			if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataAborted {
 				t.Fatalf("settling the preparation returned %v, want ABORTED", v)
 			}
 			return func(txn string) (mqttOpOutcome, error) {
 				return e.asm.jsa.opCancelHandoff(e.id, e.epoch, txn, i.ID)
 			}
 		}},
-		{"close abandoned reservation", _EMPTY_, func(t *testing.T, e *testF105Env) func(string) (mqttOpOutcome, error) {
-			p := testF105CreationProp(t, "c2-close")
-			testF105StandCreation(t, e, p)
+		{"close abandoned reservation", _EMPTY_, func(t *testing.T, e *testOutboundEnv) func(string) (mqttOpOutcome, error) {
+			p := testCreationProp(t, "c2-close")
+			testStandCreation(t, e, p)
 			if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, p); v != mqttMetadataAborted {
 				t.Fatalf("settling the reservation returned %v, want ABORTED", v)
 			}
@@ -133,7 +133,7 @@ func TestF105OwnershipStepLostResponseIsResolved(t *testing.T) {
 	for _, st := range steps {
 		st := st
 		t.Run(st.name, func(t *testing.T) {
-			e, done := testF105NewEnv(t, "c2-"+strings.ReplaceAll(st.name, " ", "-"))
+			e, done := testNewEnv(t, "c2-"+strings.ReplaceAll(st.name, " ", "-"))
 			defer done()
 			op := st.setup(t, e)
 			var calls, lost atomic.Int32
@@ -177,13 +177,13 @@ func TestF105OwnershipStepLostResponseIsResolved(t *testing.T) {
 // allowance or the deadline refuses. Every attempt is refused before any batch is sent, so each is
 // settled never-landed and admits one re-attempt only through allow. Mutation M-C4a: stop
 // consulting allow, and the attempt count exceeds the bound.
-func TestF105OwnershipStepReattemptsAreBounded(t *testing.T) {
+func TestOwnershipStepReattemptsAreBounded(t *testing.T) {
 	for _, allowance := range []int{mqttOwnershipStepReattempts, 0} {
 		allowance := allowance
 		t.Run(fmt.Sprintf("allowance %d", allowance), func(t *testing.T) {
-			e, done := testF105NewEnv(t, fmt.Sprintf("c4-bound-%d", allowance))
+			e, done := testNewEnv(t, fmt.Sprintf("c4-bound-%d", allowance))
 			defer done()
-			p := testF105CreationProp(t, fmt.Sprintf("c4-%d", allowance))
+			p := testCreationProp(t, fmt.Sprintf("c4-%d", allowance))
 			var calls atomic.Int32
 			testArmTransitionSeam(t, &e.asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 				if calls.Add(1) > 50 {
@@ -214,12 +214,12 @@ func TestF105OwnershipStepReattemptsAreBounded(t *testing.T) {
 // still name P1 — and be refused, P1 no longer standing — leaving P2 PREPARING. Mutation M-C3:
 // re-discover the standing proposal inside the retry, and P2 is finalized by an acceptance that
 // never proposed it.
-func TestF105OwnershipFinalizeTargetIsPinned(t *testing.T) {
-	e, done := testF105NewEnv(t, "c3-pinned")
+func TestOwnershipFinalizeTargetIsPinned(t *testing.T) {
+	e, done := testNewEnv(t, "c3-pinned")
 	defer done()
-	p1 := testF105Intent(t, e, "c3-p1")
-	testF105Prepare(t, e, p1)
-	if _, err := e.asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, p1, testF105RecordSeq(t, e))); err != nil {
+	p1 := testIntent(t, e, "c3-p1")
+	testPrepare(t, e, p1)
+	if _, err := e.asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, p1, testRecordSeq(t, e))); err != nil {
 		t.Fatalf("committing P1's metadata: %v", err)
 	}
 	var p2 *mqttHandoffIntent
@@ -232,9 +232,9 @@ func TestF105OwnershipFinalizeTargetIsPinned(t *testing.T) {
 		if _, err := e.asm.jsa.opFinalizeHandoff(e.id, e.epoch, "txn-peer-fin", p1.ID); err != nil {
 			t.Errorf("the peer's finalize of P1: %v", err)
 		}
-		p2 = testF105Intent(t, e, "c3-p2")
-		testF105Prepare(t, e, p2)
-		if _, err := e.asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, p2, testF105RecordSeq(t, e))); err != nil {
+		p2 = testIntent(t, e, "c3-p2")
+		testPrepare(t, e, p2)
+		if _, err := e.asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, p2, testRecordSeq(t, e))); err != nil {
 			t.Errorf("committing P2's metadata: %v", err)
 		}
 		peer.Store(false)
@@ -262,10 +262,10 @@ func TestF105OwnershipFinalizeTargetIsPinned(t *testing.T) {
 // proposal is settled aborted and cancelled and ANOTHER acceptance's preparation stands. The step
 // must refuse without even entering the fenced metadata commit. Mutation M-C5: drop the intent
 // identity check, and the metadata commit is entered for the foreign proposal.
-func TestF105OwnershipPrepareRefusesAForeignPreparation(t *testing.T) {
-	e, done := testF105NewEnv(t, "c5-foreign")
+func TestOwnershipPrepareRefusesAForeignPreparation(t *testing.T) {
+	e, done := testNewEnv(t, "c5-foreign")
 	defer done()
-	own := testF105Intent(t, e, "c5-own")
+	own := testIntent(t, e, "c5-own")
 	var entered atomic.Int32
 	e.asm.mu.Lock()
 	e.asm.testOwnershipMetadataEntry = func() { entered.Add(1) }
@@ -287,14 +287,14 @@ func TestF105OwnershipPrepareRefusesAForeignPreparation(t *testing.T) {
 			return seq, err
 		}
 		peer.Store(true)
-		if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, testF105Prop(t, own)); v != mqttMetadataAborted {
+		if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, testProp(t, own)); v != mqttMetadataAborted {
 			t.Errorf("settling the executor's proposal returned %v, want ABORTED", v)
 		}
 		if _, cerr := e.asm.jsa.opCancelHandoff(e.id, e.epoch, "txn-peer-cancel", own.ID); cerr != nil {
 			t.Errorf("cancelling the executor's preparation: %v", cerr)
 		}
-		foreign = testF105Intent(t, e, "c5-foreign")
-		testF105Prepare(t, e, foreign)
+		foreign = testIntent(t, e, "c5-foreign")
+		testPrepare(t, e, foreign)
 		peer.Store(false)
 		return 0, errors.New("test: the prepare committed but its response was lost")
 	})
@@ -322,7 +322,7 @@ func TestF105OwnershipPrepareRefusesAForeignPreparation(t *testing.T) {
 // M-L1a (the advance writes the authority again): the first prepare is refused by the pre-submit
 // check and re-attempted. The re-attempt on a never-landed prepare (M-C1) is witnessed by the C4
 // allowance tests, whose refusals are staged at the seam.
-func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
+func TestResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -433,7 +433,7 @@ func TestF105ResumeOwnershipSurvivesAPubRecAdvance(t *testing.T) {
 // the re-drive is refused, so it may spend only the two re-attempts left. Six prepares in all.
 // Mutation M-C4b: initialise the allowance below `restoreSession`, and the re-drive gets a fresh
 // four — eight prepares.
-func TestF105OwnershipAllowanceSurvivesARedrive(t *testing.T) {
+func TestOwnershipAllowanceSurvivesARedrive(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)

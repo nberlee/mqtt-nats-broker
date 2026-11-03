@@ -13,13 +13,13 @@ import (
 // the pass restarts from the new floor instead of reporting the retired positions as uncertain. The injection is the caller-side inflight-load seam, on the traversal's own goroutine:
 // it forwards the duty read first and only then advances the floor.
 func TestTraversalRestartsWhenFloorCrossesAFailedExchange(t *testing.T) {
-	e, done := testF112Env(t, "floor-cross")
+	e, done := testFloorEnv(t, "floor-cross")
 	defer done()
 	jsa := &e.asm.jsa
 	for i := 0; i < 3; i++ {
-		testF112EndAndResolve(t, e, testF112Admit(t, e, 10))
+		testEndAndResolve(t, e, testFloorAdmit(t, e, 10))
 	}
-	keep := testF112Admit(t, e, 2)
+	keep := testFloorAdmit(t, e, 2)
 
 	o := testObserveJSA(t, jsa)
 	m := o.mark()
@@ -30,14 +30,14 @@ func TestTraversalRestartsWhenFloorCrossesAFailedExchange(t *testing.T) {
 		resps, err := e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
 		if calls.Add(1) == 1 {
 			advFrom = o.mark()
-			led, _ := testF112Ledger(t, e)
-			testF112AdvanceTo(t, e, led.Hi)
+			led, _ := testFloorLedger(t, e)
+			testAdvanceTo(t, e, led.Hi)
 			advTo = o.mark()
 		}
 		return resps, err
 	}
 	e.asm.mu.Unlock()
-	census, err := mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testF105Gen, nil)
+	census, err := mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testGen, nil)
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = nil
 	e.asm.mu.Unlock()
@@ -52,14 +52,14 @@ func TestTraversalRestartsWhenFloorCrossesAFailedExchange(t *testing.T) {
 	// it absent, and one ledger read judged it crossed, which restarts at once; the second pass read
 	// the surviving exchange. Nothing is re-read within a pass.
 	idHash := getHash(e.id)
-	xprefix := mqttF105SubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + testF105Gen + "."
+	xprefix := mqttOutboundRecordSubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + testGen + "."
 	traversal := func(match func(string) bool) int {
 		return o.sends(m, match) - (o.sends(advFrom, match) - o.sends(advTo, match))
 	}
 	if n := traversal(testSubjectHasPrefix(xprefix)); n != 1+1 {
 		t.Fatalf("the restarting traversal read %d exchanges, want 2: one in the crossed pass, one after", n)
 	}
-	if n := traversal(testSubjectIs(mqttGenLedgerSubject(idHash, testF105Gen))); n != 3 {
+	if n := traversal(testSubjectIs(mqttGenLedgerSubject(idHash, testGen))); n != 3 {
 		t.Fatalf("the restarting traversal read the ledger %d times, want 3: each pass, and the crossing", n)
 	}
 }

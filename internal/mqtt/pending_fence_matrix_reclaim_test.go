@@ -37,9 +37,9 @@ import (
 // runExclusionReclaim, driven one pass at a time with its self-rescheduling switched off by the
 // session's reclaim seam so a pass never runs behind the fixture's back.
 
-// TestF088PendingFenceDisposalPreservationMatrix is T36: ONE matrix, row by row per consult C6.
+// TestPendingFenceDisposalPreservationMatrix is T36: ONE matrix, row by row per consult C6.
 // Rows are subtests; each builds its own environment.
-func TestF088PendingFenceDisposalPreservationMatrix(t *testing.T) {
+func TestPendingFenceDisposalPreservationMatrix(t *testing.T) {
 	t.Parallel()
 	for _, row := range t36Rows() {
 		row := row
@@ -243,7 +243,7 @@ func (r *t36Reclaim) fence(name string, pi uint16) (subject, nonce string, seq u
 	r.t.Helper()
 	r.sseq++
 	nonce = mqttNewInflightNonce()
-	_, seq = testF088WriteFence(r.t, r.e, pi, r.dur, r.sseq, nonce)
+	_, seq = testWriteFence(r.t, r.e, pi, r.dur, r.sseq, nonce)
 	subject = mqttInflightSubject(r.e.sess.idHash, r.e.sess.gen, pi)
 	r.mu.Lock()
 	r.names[subject] = name
@@ -311,7 +311,7 @@ func t36Row18FiniteFailureFenceRetry(t *testing.T) {
 	e.sess.mu.Lock()
 	pi := e.sess.bumpPI()
 	e.sess.mu.Unlock()
-	_, fseq := testF088WriteFence(t, e, pi, dur, 4, mqttNewInflightNonce())
+	_, fseq := testWriteFence(t, e, pi, dur, 4, mqttNewInflightNonce())
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 
 	var mu sync.Mutex
@@ -331,7 +331,7 @@ func t36Row18FiniteFailureFenceRetry(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	restored := testF088ColdResume(t, e)
+	restored := testColdResume(t, e)
 	// Served on the resuming connection, as a resumed object is: its continuation disposes of the
 	// serving-generation fence under that connection's licence (issue #121).
 	restored.mu.Lock()
@@ -644,7 +644,7 @@ func t36Row18cShutdown(t *testing.T) {
 		r, f, _ := setup(t, "f088-t36-18c-ii")
 		shutAfterLoad(t, r)
 		closeGate(r.e, false)
-		testF088ColdResume(t, r.e)
+		testColdResume(t, r.e)
 		if r.present(f) {
 			t.Fatal("recovery's drop list must dispose of the fence after the restart")
 		}

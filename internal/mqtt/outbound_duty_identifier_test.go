@@ -32,7 +32,7 @@ import (
 // kind names one.
 func TestDutyEntryIdentifierShape(t *testing.T) {
 	base := func(kind mqttDutyKind, pi uint16, state mqttDutyState) *mqttDutyEntry {
-		d := &mqttDutyEntry{ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Ord: 1,
+		d := &mqttDutyEntry{ID: testID, Epoch: testEpoch, Gen: testGen, Ord: 1,
 			Kind: kind, Ref: "ref-a", PI: pi, State: state}
 		switch state {
 		case mqttDutyTerminal:
@@ -55,7 +55,7 @@ func TestDutyEntryIdentifierShape(t *testing.T) {
 		"a cleanup duty naming an identifier":            {base(mqttDutyCleanup, 7, mqttDutyNotYetActionable), false},
 		"a provision duty naming none":                   {base(mqttDutyProvision, 0, mqttDutyPending), true},
 	} {
-		err := mqttValidateDutyEntry(tc.d, testF105ID, testF105Epoch, testF105Gen, 1)
+		err := mqttValidateDutyEntry(tc.d, testID, testEpoch, testGen, 1)
 		if tc.ok && err != nil {
 			t.Fatalf("%s was refused: %v", name, err)
 		}
@@ -66,7 +66,7 @@ func TestDutyEntryIdentifierShape(t *testing.T) {
 	// AND THE STORED SHAPE: a body without the member decodes as unsupported, never as "any
 	// identifier".
 	body, _ := json.Marshal(base(mqttDutyExchange, 0, mqttDutyPending))
-	if _, err := mqttDecodeDutyEntry(body, testF105ID, testF105Epoch, testF105Gen, 1); err == nil {
+	if _, err := mqttDecodeDutyEntry(body, testID, testEpoch, testGen, 1); err == nil {
 		t.Fatalf("an exchange duty stored without its identifier decoded")
 	}
 }
@@ -74,7 +74,7 @@ func TestDutyEntryIdentifierShape(t *testing.T) {
 // TestAllocationBindsDutyIdentifierToExchange: the boundary binds an allocated exchange duty to
 // the exchange created beside it, identifier included.
 func TestAllocationBindsDutyIdentifierToExchange(t *testing.T) {
-	e, done := testF105NewEnv(t, "duty-identifier-binding")
+	e, done := testNewEnv(t, "duty-identifier-binding")
 	defer done()
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "txn-1")
@@ -85,7 +85,7 @@ func TestAllocationBindsDutyIdentifierToExchange(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 			PI: pi, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, err := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+		tr, err := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if err != nil {
 			t.Fatalf("composing the admission: %v", err)
 		}
@@ -120,9 +120,9 @@ func TestAllocationBindsDutyIdentifierToExchange(t *testing.T) {
 	}
 
 	// A DUTY NAMING AN EXCHANGE THE BATCH DOES NOT CREATE.
-	if err := testF105SubmitInventory(t, e, "txn-orphan-duty",
-		testF105LedgerMember(t, e, 0, testF105Ledger(e, mqttGenLedgerOpen, 1)),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyExchange, "xch-nowhere", mqttDutyPending)),
+	if err := testSubmitInventory(t, e, "txn-orphan-duty",
+		testLedgerMember(t, e, 0, testInventoryLedger(e, mqttGenLedgerOpen, 1)),
+		testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyExchange, "xch-nowhere", mqttDutyPending)),
 	); err == nil {
 		t.Fatalf("an exchange duty was allocated for an exchange no batch creates")
 	} else if !strings.Contains(err.Error(), "does not create") {
@@ -138,21 +138,21 @@ func TestAllocationBindsDutyIdentifierToExchange(t *testing.T) {
 
 // TestDutyContinuationKeepsIdentifier: a continuation is the same duty, identifier included.
 func TestDutyContinuationKeepsIdentifier(t *testing.T) {
-	e, done := testF112Env(t, "duty-identifier-continuation")
+	e, done := testFloorEnv(t, "duty-identifier-continuation")
 	defer done()
-	nonce := testF112Admit(t, e, 5)
-	ord, found, err := e.asm.jsa.findDutyInInventory(e.id, e.epoch, testF105Gen,
+	nonce := testFloorAdmit(t, e, 5)
+	ord, found, err := e.asm.jsa.findDutyInInventory(e.id, e.epoch, testGen,
 		func(d *mqttDutyEntry) bool { return d.Ref == nonce })
 	if err != nil || !found {
 		t.Fatalf("finding the admitted duty: %v", err)
 	}
-	d, dseq := testF105LoadDuty(t, e, ord)
+	d, dseq := testLoadDuty(t, e, ord)
 	if d.PI != 5 {
 		t.Fatalf("fixture: the admitted duty names identifier %d, want 5", d.PI)
 	}
 	moved := *d
 	moved.PI = 6
-	if err := testF105SubmitInventory(t, e, "txn-repoint", testF105DutyMember(t, e, dseq, &moved)); err == nil {
+	if err := testSubmitInventory(t, e, "txn-repoint", testDutyMember(t, e, dseq, &moved)); err == nil {
 		t.Fatalf("a continuation moved an exchange duty from identifier 5 to 6")
 	} else if !strings.Contains(err.Error(), "re-identifies duty") {
 		t.Fatalf("the refusal did not come from the continuation identity: %v", err)
@@ -162,17 +162,17 @@ func TestDutyContinuationKeepsIdentifier(t *testing.T) {
 // TestFloorRelocationKeepsIdentifier: a relocation carries the identifier unchanged, on the
 // marker and on the representative.
 func TestFloorRelocationKeepsIdentifier(t *testing.T) {
-	e, done := testF112Env(t, "duty-identifier-relocation")
+	e, done := testFloorEnv(t, "duty-identifier-relocation")
 	defer done()
 	jsa := &e.asm.jsa
 
-	testF112Admit(t, e, 1) // outstanding: its position is relocated, not reclaimed
-	led, ledSeq := testF112Ledger(t, e)
-	d, seq, err := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, 1)
+	testFloorAdmit(t, e, 1) // outstanding: its position is relocated, not reclaimed
+	led, ledSeq := testFloorLedger(t, e)
+	d, seq, err := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, 1)
 	if err != nil || d == nil {
 		t.Fatalf("reading position 1: %v", err)
 	}
-	f := &mqttFloorAdvance{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ledger: led, LedgerSeq: ledSeq,
+	f := &mqttFloorAdvance{ID: e.id, Epoch: e.epoch, Gen: testGen, Ledger: led, LedgerSeq: ledSeq,
 		Positions: []mqttFloorPosition{{Ord: 1, Entry: d, Seq: seq, Class: mqttFloorRelocate}}}
 
 	tamper := func(marker bool) []mqttTransitionMember {
@@ -199,11 +199,11 @@ func TestFloorRelocationKeepsIdentifier(t *testing.T) {
 		}
 		return members
 	}
-	if err := testF112CommitFloorMembers(t, e, tamper(true)); err == nil ||
+	if err := testCommitFloorMembers(t, e, tamper(true)); err == nil ||
 		!strings.Contains(err.Error(), "re-identifies position") {
 		t.Fatalf("a relocation marker moved the identifier: %v", err)
 	}
-	if err := testF112CommitFloorMembers(t, e, tamper(false)); err == nil ||
+	if err := testCommitFloorMembers(t, e, tamper(false)); err == nil ||
 		!strings.Contains(err.Error(), "different state") {
 		t.Fatalf("a representative moved the identifier: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestFloorRelocationKeepsIdentifier(t *testing.T) {
 // duties name the identifier it claims, and none of the others, while a live, an abandoned or an
 // unreadable obligation on that identifier still refuses it.
 func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
-	e, done := testF112Env(t, "duty-identifier-walk")
+	e, done := testFloorEnv(t, "duty-identifier-walk")
 	defer done()
 	jsa := &e.asm.jsa
 
@@ -225,13 +225,13 @@ func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
 	// of them is inside [Lo, Hi], which is what a walk reading every exchange used to read.
 	history := map[string]struct{}{}
 	for pi := uint16(20); pi < 28; pi++ {
-		n := testF112Admit(t, e, pi)
-		testF112EndAndResolve(t, e, n)
+		n := testFloorAdmit(t, e, pi)
+		testEndAndResolve(t, e, n)
 		history[n] = struct{}{}
 	}
 	// An ended obligation on the claimed identifier 7: read, and found ended.
-	endedSeven := testF112Admit(t, e, 7)
-	testF112EndAndResolve(t, e, endedSeven)
+	endedSeven := testFloorAdmit(t, e, 7)
+	testEndAndResolve(t, e, endedSeven)
 
 	var mu sync.Mutex
 	read := map[string]int{}
@@ -242,18 +242,18 @@ func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		for n := range history {
-			if strings.Contains(string(ev.Body), mqttExchangeSubject(getHash(e.id), testF105Gen, n)) {
+			if strings.Contains(string(ev.Body), mqttExchangeSubject(getHash(e.id), testGen, n)) {
 				read["history"]++
 			}
 		}
-		if strings.Contains(string(ev.Body), mqttExchangeSubject(getHash(e.id), testF105Gen, endedSeven)) {
+		if strings.Contains(string(ev.Body), mqttExchangeSubject(getHash(e.id), testGen, endedSeven)) {
 			read["seven"]++
 		}
 	}
 	jsa.testObserveRequest.Store(&obs)
 	defer jsa.testObserveRequest.Store(nil)
 
-	live := testF112Admit(t, e, 7)
+	live := testFloorAdmit(t, e, 7)
 	mu.Lock()
 	got := map[string]int{"history": read["history"], "seven": read["seven"]}
 	mu.Unlock()
@@ -271,7 +271,7 @@ func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 			PI: pi, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			t.Fatalf("composing the admission at %d: %v", pi, terr)
 		}
@@ -288,8 +288,8 @@ func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
 	// AN ABANDONED OBLIGATION KEEPS ITS IDENTIFIER, so its duty is read and refuses.
 	// Planted: the abandonment route runs on a live session, and what this pins is only what
 	// the walk does with the phase it reads.
-	abandoned := testF112Admit(t, e, 9)
-	ax, _, aerr := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, abandoned)
+	abandoned := testFloorAdmit(t, e, 9)
+	ax, _, aerr := jsa.loadOutboundExchange(e.id, e.epoch, testGen, abandoned)
 	if aerr != nil {
 		t.Fatalf("reading the obligation on 9: %v", aerr)
 	}
@@ -298,7 +298,7 @@ func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
 	ax.Abandoned = &mqttExchangeAbandonment{Reason: mqttAbandonReasonACLDeny, Tenure: al.rec.Tenure,
 		Alloc: abandoned, Acq: 1, Dur: "$MQTT_src", Seq: 1, Reply: testInflightAckSubject("$MQTT_src", 1, 1)}
 	abody, _ := json.Marshal(ax)
-	if _, err := jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testF105Gen, abandoned), -1, abody); err != nil {
+	if _, err := jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testGen, abandoned), -1, abody); err != nil {
 		t.Fatalf("planting the abandoned phase: %v", err)
 	}
 	if err := admit("txn-over-abandoned", 9); err == nil {
@@ -308,7 +308,7 @@ func TestIdentifierExclusivityReadsOnlyClaimedIdentifiers(t *testing.T) {
 	}
 
 	// AN UNREADABLE EXCHANGE WHOSE DUTY NAMES THE CLAIMED IDENTIFIER REFUSES.
-	if _, err := jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testF105Gen, live), -1,
+	if _, err := jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testGen, live), -1,
 		[]byte(`{"id":"nonsense"`)); err != nil {
 		t.Fatalf("corrupting the live exchange: %v", err)
 	}

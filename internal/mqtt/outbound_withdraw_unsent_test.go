@@ -168,7 +168,7 @@ func testRewriteAuthority(t *testing.T, e *testInflightEnv, mutate func(a *mqttO
 // use). The obligation is ended before its register is destroyed.
 //
 // Mutation M1: endUnsentBeforeDestroy disabled -> the exchange stays Publish.
-func TestF105WithdrawProvenUnsentDisposalEndsTheObligation(t *testing.T) {
+func TestWithdrawProvenUnsentDisposalEndsTheObligation(t *testing.T) {
 	t.Parallel()
 	for _, qos := range []byte{1, 2} {
 		f := testWithdrawAdmitted(t, "withdraw-drop-q"+string('0'+qos), qos)
@@ -181,7 +181,7 @@ func TestF105WithdrawProvenUnsentDisposalEndsTheObligation(t *testing.T) {
 
 // T2 (oversize order). The oversize disposal drains the section's acquisition BEFORE it disposes,
 // so the withdrawal meets no token; a withdrawal attempted under the live token is refused.
-func TestF105WithdrawOversizeAfterTheDrainEndsTheObligation(t *testing.T) {
+func TestWithdrawOversizeAfterTheDrainEndsTheObligation(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "withdraw-oversize", 2)
 	f := &testWithdrawFix{e: s.e, pi: s.pi, subject: s.subject}
@@ -205,7 +205,7 @@ func TestF105WithdrawOversizeAfterTheDrainEndsTheObligation(t *testing.T) {
 // finalizer's releaseBoundInflightRegister) both end the obligation first.
 //
 // Mutation M3: the step present only in reapRegisterGatedOutcome -> the loaded case fails.
-func TestF105WithdrawAtBothDoorEntrances(t *testing.T) {
+func TestWithdrawAtBothDoorEntrances(t *testing.T) {
 	t.Parallel()
 	t.Run("gated", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-door-gated", 1)
@@ -226,7 +226,7 @@ func TestF105WithdrawAtBothDoorEntrances(t *testing.T) {
 
 // T3 (the cancellation fallback). A cancellation's tombstone, for an ordinary obligation with its
 // evidence standing, is the withdrawal's: the exchange ends in the same batch.
-func TestF105WithdrawCancellationTombstoneEndsTheObligation(t *testing.T) {
+func TestWithdrawCancellationTombstoneEndsTheObligation(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-cancel-tomb", 1)
 	_, seq := f.register(t)
@@ -245,7 +245,7 @@ func TestF105WithdrawCancellationTombstoneEndsTheObligation(t *testing.T) {
 // The cancellation fallback WITHOUT the marker evidence stores the standalone tombstone exactly as
 // before and leaves the exchange at Publish (consult 32): the ordinary real-store equivalent of the
 // placeholder rig's "a landed CAS is STORED" arm.
-func TestF105CancellationWithoutEvidenceStoresTheStandaloneTombstone(t *testing.T) {
+func TestCancellationWithoutEvidenceStoresTheStandaloneTombstone(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-cancel-noev", 1)
 	ml := f.e.asm.jsa.loadOccupantMarkerLoad(f.subject)
@@ -268,7 +268,7 @@ func TestF105CancellationWithoutEvidenceStoresTheStandaloneTombstone(t *testing.
 // T4b (boundary, token). A hand-composed batch over a token-bearing predecessor is refused.
 // Regression-only: the withdrawal rule's token clause and checkActionTokenMembers each refuse;
 // M4 removes both (a double mutation).
-func TestF105WithdrawBoundaryRefusesALiveToken(t *testing.T) {
+func TestWithdrawBoundaryRefusesALiveToken(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-bnd-token", 1)
 	cur, seq := f.register(t)
@@ -287,7 +287,7 @@ func TestF105WithdrawBoundaryRefusesALiveToken(t *testing.T) {
 // allocation is absent, names another allocation, or cannot be read.
 //
 // Mutation M5: the boundary's marker rule removed -> all three land.
-func TestF105WithdrawBoundaryValidatesTheMarkerItself(t *testing.T) {
+func TestWithdrawBoundaryValidatesTheMarkerItself(t *testing.T) {
 	t.Parallel()
 	t.Run("absent", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-bnd-mk-absent", 1)
@@ -330,7 +330,7 @@ func testRewriteMarkerRaw(t *testing.T, f *testWithdrawFix, body []byte) {
 // T6 (op-level interleaving, regression-only). The writer acquires between the op's evidence reads
 // and its commit: the register moved, the commit is refused, and the door refuses rather than
 // deleting a register that now carries a live holder.
-func TestF105WithdrawAcquisitionInTheReadToCommitWindowWins(t *testing.T) {
+func TestWithdrawAcquisitionInTheReadToCommitWindowWins(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "withdraw-window", 1)
 	f := &testWithdrawFix{e: s.e, pi: s.pi, subject: s.subject, gen: s.tok.slot.name.gen}
@@ -362,7 +362,7 @@ func TestF105WithdrawAcquisitionInTheReadToCommitWindowWins(t *testing.T) {
 // allocation of the same obligation; the withdrawal is refused by op and boundary alike.
 //
 // Mutation M7: mqttMarkerNamesAllocation accepts any nonce -> lands.
-func TestF105WithdrawRequiresTheMarkerOfThisAllocation(t *testing.T) {
+func TestWithdrawRequiresTheMarkerOfThisAllocation(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-nonce", 1)
 	testRewriteMarker(t, f, mqttNewInflightNonce())
@@ -383,7 +383,7 @@ func TestF105WithdrawRequiresTheMarkerOfThisAllocation(t *testing.T) {
 // Mutations: M8a (the entitlement comparison removed -> the closed and stale withdrawals land),
 // M8b (the generation exception not extended -> G2's withdrawal of G1's obligation is refused),
 // M8c (the withdrawal arm skips the shared authority-preservation rule).
-func TestF105WithdrawUnderTheStandingAuthority(t *testing.T) {
+func TestWithdrawUnderTheStandingAuthority(t *testing.T) {
 	t.Parallel()
 	t.Run("closed", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-closed", 1)
@@ -437,7 +437,7 @@ func TestF105WithdrawUnderTheStandingAuthority(t *testing.T) {
 // reason.
 //
 // Mutation M9: a direct reapRegisterWithVerdict call added elsewhere -> this fails.
-func TestF105WithdrawDestructionHasOneDoor(t *testing.T) {
+func TestWithdrawDestructionHasOneDoor(t *testing.T) {
 	t.Parallel()
 	callers := testProductionCallers(t, map[string]bool{
 		"reapRegisterWithVerdict": true, "deleteInflightRegister": true, "deleteInflightRegisterConfirmed": true,
@@ -528,7 +528,7 @@ func testProductionCallers(t *testing.T, callees map[string]bool) map[string][]s
 // ended exchange; the next destruction finishes it through the door ("already ended").
 //
 // Mutation M10: the door refuses an already-ended exchange -> the tombstone is left.
-func TestF105WithdrawLandedBeforeACrashIsFinishedByTheNextPass(t *testing.T) {
+func TestWithdrawLandedBeforeACrashIsFinishedByTheNextPass(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-crash", 1)
 	if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawLanded {
@@ -548,7 +548,7 @@ func TestF105WithdrawLandedBeforeACrashIsFinishedByTheNextPass(t *testing.T) {
 // T11a. A withdrawal whose landing cannot be resolved refuses the destruction: register kept.
 //
 // Mutation M11a: UNRESOLVED treated as proceed -> the register is destroyed with its ending unknown.
-func TestF105WithdrawUnresolvedRefusesTheDestruction(t *testing.T) {
+func TestWithdrawUnresolvedRefusesTheDestruction(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-unresolved", 1)
 	f.e.asm.mu.Lock()
@@ -573,7 +573,7 @@ func TestF105WithdrawUnresolvedRefusesTheDestruction(t *testing.T) {
 // T11b. A positively aborted attempt is re-read and re-attempted once.
 //
 // Mutation M11b: no retry -> the door refuses a still-eligible obligation.
-func TestF105WithdrawNeverLandedIsReattempted(t *testing.T) {
+func TestWithdrawNeverLandedIsReattempted(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-never", 1)
 	var calls atomic.Int32
@@ -611,7 +611,7 @@ func TestF105WithdrawNeverLandedIsReattempted(t *testing.T) {
 // since taken the subject is left alone.
 //
 // Mutation M11d: a superseded withdrawal deletes whatever occupies the subject -> (ii) fails.
-func TestF105WithdrawSupersededIsReobservedByIdentity(t *testing.T) {
+func TestWithdrawSupersededIsReobservedByIdentity(t *testing.T) {
 	t.Parallel()
 	successorNonce := mqttNewInflightNonce()
 	run := func(t *testing.T, clientID string, successor bool) (*testWithdrawFix, bool) {
@@ -668,7 +668,7 @@ func TestF105WithdrawSupersededIsReobservedByIdentity(t *testing.T) {
 // counter is refused. (T12a-d are refused by overlapping fences and are regression-only.)
 //
 // Mutation M12e: the body rule dropped -> lands.
-func TestF105WithdrawBoundaryKeepsTheOccupantWhole(t *testing.T) {
+func TestWithdrawBoundaryKeepsTheOccupantWhole(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-bnd-body", 1)
 	err := f.commitWithdrawal(t, func(tr *mqttAuthorityTransition) {
@@ -694,7 +694,7 @@ func TestF105WithdrawBoundaryKeepsTheOccupantWhole(t *testing.T) {
 }
 
 // T13 (regression-only). Nothing is acquired at a withdrawn obligation.
-func TestF105WithdrawnObligationAdmitsNoAcquisition(t *testing.T) {
+func TestWithdrawnObligationAdmitsNoAcquisition(t *testing.T) {
 	t.Parallel()
 	for _, k := range []mqttActionKind{mqttActionPublish, mqttActionPubRel} {
 		if mqttActionPermittedAtPhase(2, mqttExchangeWithdrawnUnsent, k) == nil {
@@ -707,7 +707,7 @@ func TestF105WithdrawnObligationAdmitsNoAcquisition(t *testing.T) {
 // stands, is withdrawn when it is destroyed.
 //
 // Mutation M14: a tombstone predecessor refused by the withdrawal -> the exchange stays Publish.
-func TestF105WithdrawAPreexistingCancellationTombstone(t *testing.T) {
+func TestWithdrawAPreexistingCancellationTombstone(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-pre-tomb", 1)
 	cur, seq := f.register(t)
@@ -728,7 +728,7 @@ func TestF105WithdrawAPreexistingCancellationTombstone(t *testing.T) {
 //
 // Mutation M15: the serving authority read restored at the admission site -> it admits under the
 // successor's tenure.
-func TestF105AdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
+func TestAdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "admit-pin", 1)
 	testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) {
@@ -759,7 +759,7 @@ func TestF105AdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
 //
 // Mutation M16 (double): the op's marker check AND the boundary's marker rule removed -> the
 // exchange is withdrawn without evidence.
-func TestF105WithdrawNeverManufacturedWithoutEvidence(t *testing.T) {
+func TestWithdrawNeverManufacturedWithoutEvidence(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-no-evidence", 1)
 	ml := f.e.asm.jsa.loadOccupantMarkerLoad(f.subject)
@@ -810,7 +810,7 @@ func TestF105WithdrawNeverManufacturedWithoutEvidence(t *testing.T) {
 // for an exchange no acquisition may serve.
 //
 // Mutation M17: the adopt arm ignores the tombstone -> the ended write is adopted and confirmed.
-func TestF105OwnWriteEndedIsNotAdopted(t *testing.T) {
+func TestOwnWriteEndedIsNotAdopted(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
@@ -892,7 +892,7 @@ func testOwnWriteEnded(t *testing.T, clientID string, lost bool) {
 // obligation that stands there, whatever evidence that one has.
 //
 // Mutation M20: the op's allocation binding removed -> the standing obligation is withdrawn.
-func TestF105WithdrawEndsOnlyTheValidatedAllocation(t *testing.T) {
+func TestWithdrawEndsOnlyTheValidatedAllocation(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-stale-caller", 1)
 	stale := mqttNewInflightNonce()
@@ -910,7 +910,7 @@ func TestF105WithdrawEndsOnlyTheValidatedAllocation(t *testing.T) {
 }
 
 // T19 (regression-only). Under the acquire-action kind a tombstone register member is refused.
-func TestF105WithdrawTombstoneIsTheWithdrawalKindsOnly(t *testing.T) {
+func TestWithdrawTombstoneIsTheWithdrawalKindsOnly(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "withdraw-kind", 1)
 	err := f.commitWithdrawal(t, func(tr *mqttAuthorityTransition) {

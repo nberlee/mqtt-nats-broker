@@ -27,41 +27,41 @@ import (
 // hook), never after a bare timeout: another durable's delivery proves nothing about this one.
 // NOT parallel: the seams are process-global, and every one is restored by t.Cleanup.
 
-const f117NoLocal = byte(0x04)
+const noLocalReplNoLocal = byte(0x04)
 
-// f117Exit is one QoS 1/2 delivery callback of the watched session that has returned, and
+// noLocalReplExit is one QoS 1/2 delivery callback of the watched session that has returned, and
 // whether it took the withheld (skipped) exit, which neither delivers nor acks.
-type f117Exit struct {
+type noLocalReplExit struct {
 	sub     *subscription
 	skipped bool
 }
 
-// f117Watcher observes every QoS 1/2 delivery callback of one session, and can hold the first
+// noLocalReplWatcher observes every QoS 1/2 delivery callback of one session, and can hold the first
 // one before its lock.
-type f117Watcher struct {
+type noLocalReplWatcher struct {
 	clientID string
 	parked   chan struct{}
 	release  chan struct{}
-	exits    chan f117Exit
+	exits    chan noLocalReplExit
 
 	mu      sync.Mutex
 	held    *subscription
 	skipped map[*subscription]bool
 }
 
-func (w *f117Watcher) mine(sub *subscription) bool {
+func (w *noLocalReplWatcher) mine(sub *subscription) bool {
 	return sub != nil && sub.client != nil && sub.client.mqtt != nil &&
 		sub.client.mqtt.sess != nil && sub.client.mqtt.sess.id == w.clientID
 }
 
-// f117Watch installs the watcher. With park, the session's FIRST delivery callback is held
+// noLocalReplWatch installs the watcher. With park, the session's FIRST delivery callback is held
 // at the pre-lock seam until release is closed.
-func f117Watch(t *testing.T, clientID string, park bool) *f117Watcher {
-	w := &f117Watcher{
+func noLocalReplWatch(t *testing.T, clientID string, park bool) *noLocalReplWatcher {
+	w := &noLocalReplWatcher{
 		clientID: clientID,
 		parked:   make(chan struct{}),
 		release:  make(chan struct{}),
-		exits:    make(chan f117Exit, 256),
+		exits:    make(chan noLocalReplExit, 256),
 		skipped:  map[*subscription]bool{},
 	}
 	if !park {
@@ -97,7 +97,7 @@ func f117Watch(t *testing.T, clientID string, park bool) *f117Watcher {
 			return
 		}
 		w.mu.Lock()
-		e := f117Exit{sub: sub, skipped: w.skipped[sub]}
+		e := noLocalReplExit{sub: sub, skipped: w.skipped[sub]}
 		w.mu.Unlock()
 		select {
 		case w.exits <- e:
@@ -121,14 +121,14 @@ func f117Watch(t *testing.T, clientID string, park bool) *f117Watcher {
 }
 
 // heldSub is the parked callback's subscription.
-func (w *f117Watcher) heldSub() *subscription {
+func (w *noLocalReplWatcher) heldSub() *subscription {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.held
 }
 
 // awaitExit waits for the next returned callback that satisfies match.
-func (w *f117Watcher) awaitExit(t *testing.T, what string, match func(f117Exit) bool) f117Exit {
+func (w *noLocalReplWatcher) awaitExit(t *testing.T, what string, match func(noLocalReplExit) bool) noLocalReplExit {
 	t.Helper()
 	deadline := time.After(10 * time.Second)
 	for {
@@ -143,7 +143,7 @@ func (w *f117Watcher) awaitExit(t *testing.T, what string, match func(f117Exit) 
 	}
 }
 
-func f117Await(t *testing.T, ch <-chan struct{}, what string) {
+func noLocalReplAwait(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
 	case <-ch:
@@ -152,7 +152,7 @@ func f117Await(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-func f117Connect(t *testing.T, o *Options, clientID string) (net.Conn, *mqttReader) {
+func noLocalReplConnect(t *testing.T, o *Options, clientID string) (net.Conn, *mqttReader) {
 	t.Helper()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	t.Cleanup(func() { c.Close() })
@@ -160,7 +160,7 @@ func f117Connect(t *testing.T, o *Options, clientID string) (net.Conn, *mqttRead
 	return c, r
 }
 
-func f117Session(t *testing.T, s *Server, clientID string) *mqttSession {
+func noLocalReplSession(t *testing.T, s *Server, clientID string) *mqttSession {
 	t.Helper()
 	asm := testMQTTGetAccountSessionManager(t, s, clientID)
 	asm.mu.RLock()
@@ -172,9 +172,9 @@ func f117Session(t *testing.T, s *Server, clientID string) *mqttSession {
 	return sess
 }
 
-// f117NextNonPublish reads the next packet that is not a PUBLISH, skipping any PUBLISH frames
+// nextNonPublish reads the next packet that is not a PUBLISH, skipping any PUBLISH frames
 // before it, and reports how many it skipped.
-func f117NextNonPublish(t *testing.T, r *mqttReader) (b byte, pl, skipped int) {
+func nextNonPublish(t *testing.T, r *mqttReader) (b byte, pl, skipped int) {
 	t.Helper()
 	for {
 		b, pl = testMQTTReadPacket(t, r)
@@ -186,11 +186,11 @@ func f117NextNonPublish(t *testing.T, r *mqttReader) (b byte, pl, skipped int) {
 	}
 }
 
-// f117ReadPubResponse reads the identifier and reason code of a v5 PUBREC or PUBCOMP of type
+// readPubResponse reads the identifier and reason code of a v5 PUBREC or PUBCOMP of type
 // want, after any PUBLISH frames.
-func f117ReadPubResponse(t *testing.T, r *mqttReader, want byte, pi uint16) (reason byte, skipped int) {
+func readPubResponse(t *testing.T, r *mqttReader, want byte, pi uint16) (reason byte, skipped int) {
 	t.Helper()
-	b, pl, skipped := f117NextNonPublish(t, r)
+	b, pl, skipped := nextNonPublish(t, r)
 	if b&mqttPacketMask != want {
 		t.Fatalf("Expected packet type 0x%x, got 0x%x", want, b&mqttPacketMask)
 	}
@@ -211,46 +211,46 @@ func f117ReadPubResponse(t *testing.T, r *mqttReader, want byte, pi uint16) (rea
 
 // An own QoS 1 message owned while No Local is OFF was admitted to the session; turning No
 // Local ON before it is forwarded must not destroy it. [MQTT-3.8.4-4].
-func TestF117QoS1OwnedBeforeNoLocalOnIsDelivered(t *testing.T) {
+func TestQoS1OwnedBeforeNoLocalOnIsDelivered(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	const id, topic = "f117-on", "f117/on"
-	c, r := f117Connect(t, o, id)
+	c, r := noLocalReplConnect(t, o, id)
 	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1}})
 
-	w := f117Watch(t, id, true)
+	w := noLocalReplWatch(t, id, true)
 	testMQTTPubV5Props(t, c, r, 1, false, 2, topic, []byte("owned-off"), nil)
-	f117Await(t, w.parked, "the own message's delivery reaching the pre-lock seam")
+	noLocalReplAwait(t, w.parked, "the own message's delivery reaching the pre-lock seam")
 
-	testMQTTSubV5(t, c, r, 3, []mqttV5SubFilter{{topic: topic, opts: 1 | f117NoLocal}})
+	testMQTTSubV5(t, c, r, 3, []mqttV5SubFilter{{topic: topic, opts: 1 | noLocalReplNoLocal}})
 	close(w.release)
 	held := w.heldSub()
-	w.awaitExit(t, "the held delivery callback returning", func(e f117Exit) bool { return e.sub == held })
+	w.awaitExit(t, "the held delivery callback returning", func(e noLocalReplExit) bool { return e.sub == held })
 
 	testMQTTReadPubV5Props(t, c, r, topic, []byte("owned-off"))
 }
 
 // An own QoS 1 message owned while No Local is ON was never admitted; turning No Local OFF
 // before its delivery callback runs must not forward it. [MQTT-3.8.3-3].
-func TestF117QoS1OwnedUnderNoLocalStaysSuppressed(t *testing.T) {
+func TestQoS1OwnedUnderNoLocalStaysSuppressed(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	const id, topic = "f117-off", "f117/off"
-	c, r := f117Connect(t, o, id)
-	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1 | f117NoLocal}})
+	c, r := noLocalReplConnect(t, o, id)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1 | noLocalReplNoLocal}})
 
-	w := f117Watch(t, id, true)
+	w := noLocalReplWatch(t, id, true)
 	testMQTTPubV5Props(t, c, r, 1, false, 2, topic, []byte("owned-on"), nil)
-	f117Await(t, w.parked, "the own message's delivery reaching the pre-lock seam")
+	noLocalReplAwait(t, w.parked, "the own message's delivery reaching the pre-lock seam")
 
 	testMQTTSubV5(t, c, r, 3, []mqttV5SubFilter{{topic: topic, opts: 1}})
 	close(w.release)
 	held := w.heldSub()
-	w.awaitExit(t, "the held delivery callback returning", func(e f117Exit) bool { return e.sub == held })
+	w.awaitExit(t, "the held delivery callback returning", func(e noLocalReplExit) bool { return e.sub == held })
 
 	// The callback has had its turn, so silence here is its decision, not a timeout. The
 	// following own publish is owned under the replacement and must be delivered, which also
@@ -261,7 +261,7 @@ func TestF117QoS1OwnedUnderNoLocalStaysSuppressed(t *testing.T) {
 
 // QoS 2 ownership is at PUBREC ([MQTT-4.3.3]), so a replacement sent between PUBREC and
 // PUBREL changes nothing for that message, in either direction.
-func TestF117QoS2OwnershipIsAtPubRec(t *testing.T) {
+func TestQoS2OwnershipIsAtPubRec(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -291,19 +291,19 @@ func TestF117QoS2OwnershipIsAtPubRec(t *testing.T) {
 
 	t.Run("owned with No Local OFF is delivered", func(t *testing.T) {
 		const topic = "f117/q2on"
-		c, r := f117Connect(t, o, "f117-q2on")
+		c, r := noLocalReplConnect(t, o, "f117-q2on")
 		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1}})
-		pubrecThenResubscribe(t, c, r, 10, topic, []byte("q2-owned-off"), 1|f117NoLocal)
+		pubrecThenResubscribe(t, c, r, 10, topic, []byte("q2-owned-off"), 1|noLocalReplNoLocal)
 		testMQTTReadPubV5Props(t, c, r, topic, []byte("q2-owned-off"))
 	})
 
 	t.Run("owned with No Local ON is suppressed", func(t *testing.T) {
 		const topic = "f117/q2off"
-		c, r := f117Connect(t, o, "f117-q2off")
-		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1 | f117NoLocal}})
-		w := f117Watch(t, "f117-q2off", false) // observe, do not hold
+		c, r := noLocalReplConnect(t, o, "f117-q2off")
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: topic, opts: 1 | noLocalReplNoLocal}})
+		w := noLocalReplWatch(t, "f117-q2off", false) // observe, do not hold
 		pubrecThenResubscribe(t, c, r, 10, topic, []byte("q2-owned-on"), 1)
-		w.awaitExit(t, "the released message's delivery callback returning", func(e f117Exit) bool { return !e.skipped })
+		w.awaitExit(t, "the released message's delivery callback returning", func(e noLocalReplExit) bool { return !e.skipped })
 		testMQTTExpectNothing(t, r)
 		testMQTTPubV5SelfEcho(t, c, r, 20, topic, []byte("q2-owned-after"))
 	})
@@ -312,25 +312,25 @@ func TestF117QoS2OwnershipIsAtPubRec(t *testing.T) {
 // No Local is per SUBSCRIPTION: when two of the publisher's own filters overlap and only one
 // has No Local, the other still admits the message. [MQTT-3.8.3-3] binds the exclusion to the
 // subscription that carries the option.
-func TestF117OverlappingFiltersAreJudgedPerFilter(t *testing.T) {
+func TestOverlappingFiltersAreJudgedPerFilter(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	const id = "f117-ov"
-	c, r := f117Connect(t, o, id)
+	c, r := noLocalReplConnect(t, o, id)
 	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
-		{topic: "f117/ov/#", opts: 1 | f117NoLocal},
+		{topic: "f117/ov/#", opts: 1 | noLocalReplNoLocal},
 		{topic: "f117/ov/x", opts: 1},
 	})
 
-	w := f117Watch(t, id, false)
+	w := noLocalReplWatch(t, id, false)
 	// Exactly one echo, through the filter without No Local.
 	testMQTTPubV5SelfEcho(t, c, r, 2, "f117/ov/x", []byte("overlap"))
 	// Both filters' callbacks have had their turn before silence is asserted.
 	seen := map[*subscription]bool{}
 	for len(seen) < 2 {
-		e := w.awaitExit(t, "both overlapping filters' delivery callbacks returning", func(e f117Exit) bool { return !e.skipped })
+		e := w.awaitExit(t, "both overlapping filters' delivery callbacks returning", func(e noLocalReplExit) bool { return !e.skipped })
 		seen[e.sub] = true
 	}
 	testMQTTExpectNothing(t, r)
@@ -339,7 +339,7 @@ func TestF117OverlappingFiltersAreJudgedPerFilter(t *testing.T) {
 // A multi-level filter also receives its parent level, through its level-up companion, and
 // the publisher's exclusion must reach that companion too, including under a single-level
 // wildcard (`f117/w/+/#` receives `f117/w/x`).
-func TestF117FwcParentLevelIsStamped(t *testing.T) {
+func TestFwcParentLevelIsStamped(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -351,14 +351,14 @@ func TestF117FwcParentLevelIsStamped(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			id := fmt.Sprintf("f117-fwc-%d", i)
 			control := fmt.Sprintf("f117/ctl/%d", i)
-			c, r := f117Connect(t, o, id)
+			c, r := noLocalReplConnect(t, o, id)
 			testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
-				{topic: tc.filter, opts: 1 | f117NoLocal},
+				{topic: tc.filter, opts: 1 | noLocalReplNoLocal},
 				{topic: control, opts: 1},
 			})
-			w := f117Watch(t, id, false)
+			w := noLocalReplWatch(t, id, false)
 			testMQTTPubV5Props(t, c, r, 1, false, 2, tc.topic, []byte("parent"), nil)
-			w.awaitExit(t, "the companion's delivery callback returning", func(e f117Exit) bool { return !e.skipped })
+			w.awaitExit(t, "the companion's delivery callback returning", func(e noLocalReplExit) bool { return !e.skipped })
 			testMQTTExpectNothing(t, r)
 			testMQTTPubV5SelfEcho(t, c, r, 3, control, []byte("live"))
 		})
@@ -368,7 +368,7 @@ func TestF117FwcParentLevelIsStamped(t *testing.T) {
 // The stamp names the filter's session KEY, and a restored level-up companion must carry that
 // key rather than its own shortened subject, or an owned backlog excluded before the
 // disconnect is delivered after the resume.
-func TestF117RestoredFwcBacklogKeepsItsStamp(t *testing.T) {
+func TestRestoredFwcBacklogKeepsItsStamp(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
@@ -380,11 +380,11 @@ func TestF117RestoredFwcBacklogKeepsItsStamp(t *testing.T) {
 	defer c.Close()
 	testMQTTReadConnAckV5(t, r)
 	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{
-		{topic: "f117/r/#", opts: 1 | f117NoLocal},
+		{topic: "f117/r/#", opts: 1 | noLocalReplNoLocal},
 		{topic: control, opts: 1},
 	})
 
-	sess := f117Session(t, s, id)
+	sess := noLocalReplSession(t, s, id)
 	sess.mu.Lock()
 	oldClient := sess.c
 	sess.mu.Unlock()
@@ -393,9 +393,9 @@ func TestF117RestoredFwcBacklogKeepsItsStamp(t *testing.T) {
 	}
 
 	// Owned and excluded; only the companion's consumer matches the parent level.
-	old := f117Watch(t, id, true)
+	old := noLocalReplWatch(t, id, true)
 	testMQTTPubV5Props(t, c, r, 1, false, 2, "f117/r", []byte("backlog"), nil)
-	f117Await(t, old.parked, "the backlog's delivery reaching the pre-lock seam")
+	noLocalReplAwait(t, old.parked, "the backlog's delivery reaching the pre-lock seam")
 
 	// The server must have detached the connection before the held callback resumes, or the
 	// callback could still decide on the live subscription and ack the message away here.
@@ -415,19 +415,19 @@ func TestF117RestoredFwcBacklogKeepsItsStamp(t *testing.T) {
 	}
 	close(old.release)
 	held := old.heldSub()
-	if e := old.awaitExit(t, "the held callback returning", func(e f117Exit) bool { return e.sub == held }); !e.skipped {
+	if e := old.awaitExit(t, "the held callback returning", func(e noLocalReplExit) bool { return e.sub == held }); !e.skipped {
 		t.Fatal("fixture: the held callback did not take the withheld exit, so it delivered or acked the backlog")
 	}
 
 	// Installed BEFORE the reconnect: a restored callback captures the done hook at entry,
 	// before waiting on the restore verdict, so a watcher installed afterwards could miss it.
-	restored := f117Watch(t, id, false)
+	restored := noLocalReplWatch(t, id, false)
 	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
 		t.Fatal("fixture: expected Session Present on the resume")
 	}
-	restored.awaitExit(t, "the restored companion's redelivery callback returning", func(e f117Exit) bool {
+	restored.awaitExit(t, "the restored companion's redelivery callback returning", func(e noLocalReplExit) bool {
 		return e.sub != held && !e.skipped
 	})
 	testMQTTExpectNothing(t, r2)
@@ -437,7 +437,7 @@ func TestF117RestoredFwcBacklogKeepsItsStamp(t *testing.T) {
 // A retransmitted QoS 2 PUBLISH on an identifier the broker already holds is answered from
 // the hold, whose stamp was budgeted when it was accepted; a stamp that only a NEW hold would
 // write must not refuse it. A fresh identifier is still refused for it.
-func TestF117DupQoS2NotRefusedForAGrownStamp(t *testing.T) {
+func TestDupQoS2NotRefusedForAGrownStamp(t *testing.T) {
 	const topic = "f117/d/a/b/c/d/e"
 	payload := []byte("dup-boundary")
 	subj, err := mqttTopicToNATSPubSubject([]byte(topic))
@@ -479,7 +479,7 @@ func TestF117DupQoS2NotRefusedForAGrownStamp(t *testing.T) {
 				parts[i] = l
 			}
 		}
-		filters = append(filters, mqttV5SubFilter{topic: strings.Join(parts, "/"), opts: f117NoLocal}) // QoS 0: no consumers
+		filters = append(filters, mqttV5SubFilter{topic: strings.Join(parts, "/"), opts: noLocalReplNoLocal}) // QoS 0: no consumers
 	}
 	if len(filters) < n {
 		t.Fatalf("fixture: only %d distinct filters for %d tags", len(filters), n)
@@ -489,7 +489,7 @@ func TestF117DupQoS2NotRefusedForAGrownStamp(t *testing.T) {
 	o.MaxPayload = int32(base)
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
-	c, r := f117Connect(t, o, "f117-dup")
+	c, r := noLocalReplConnect(t, o, "f117-dup")
 
 	send := func(pi uint16, dup bool) {
 		t.Helper()
@@ -527,15 +527,15 @@ func TestF117DupQoS2NotRefusedForAGrownStamp(t *testing.T) {
 	}
 	// QoS 2 fans out at PUBREL, so the filters subscribed after the PUBREC may receive the
 	// release as QoS 0 frames, before or after the PUBCOMP (the PUBREL window
-	// docs/CONFORMANCE.md states, witnessed by TestF117PubRelWindowSelfEchoResidual). They are
+	// docs/CONFORMANCE.md states, witnessed by TestPubRelWindowSelfEchoResidual). They are
 	// not this test's business: it neither counts nor asserts them.
-	if reason, _ := f117ReadPubResponse(t, r, mqttPacketPubComp, 10); reason != mqttReasonSuccess {
+	if reason, _ := readPubResponse(t, r, mqttPacketPubComp, 10); reason != mqttReasonSuccess {
 		t.Fatalf("Expected PUBCOMP 0x00, got 0x%x", reason)
 	}
 
 	// Control: the same publication on a FRESH identifier would write the grown stamp.
 	send(12, false)
-	if reason, _ := f117ReadPubResponse(t, r, mqttPacketPubRec, 12); reason != mqttReasonQuotaExceeded {
+	if reason, _ := readPubResponse(t, r, mqttPacketPubRec, 12); reason != mqttReasonQuotaExceeded {
 		t.Fatalf("a fresh identifier whose stamp overflows max_payload must be refused 0x%x, got 0x%x", mqttReasonQuotaExceeded, reason)
 	}
 }
@@ -547,13 +547,13 @@ func TestF117DupQoS2NotRefusedForAGrownStamp(t *testing.T) {
 // own No Local filter created in that interval did not exist, so it carries no tag for it and
 // the publisher receives its own message. The live-option check issue #119 replaced suppressed this
 // one case by accident; docs/CONFORMANCE.md states the window and this consequence.
-func TestF117PubRelWindowSelfEchoResidual(t *testing.T) {
+func TestPubRelWindowSelfEchoResidual(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
 	const topic = "f117/window"
-	c, r := f117Connect(t, o, "f117-window")
+	c, r := noLocalReplConnect(t, o, "f117-window")
 
 	vh := newMQTTWriter(0)
 	vh.WriteBytes([]byte(topic))
@@ -570,7 +570,7 @@ func TestF117PubRelWindowSelfEchoResidual(t *testing.T) {
 	if reason, _ := testMQTTReadPubRecV5(t, r, 10); reason != mqttReasonSuccess {
 		t.Fatalf("Expected PUBREC 0x00, got 0x%x", reason)
 	}
-	testMQTTSubV5(t, c, r, 11, []mqttV5SubFilter{{topic: topic, opts: f117NoLocal}})
+	testMQTTSubV5(t, c, r, 11, []mqttV5SubFilter{{topic: topic, opts: noLocalReplNoLocal}})
 	pubrel := [4]byte{mqttPacketPubRel | 0x2, 0x2, 0, 10}
 	if _, err := testMQTTWrite(c, pubrel[:]); err != nil {
 		t.Fatalf("Error writing PUBREL: %v", err)
@@ -602,7 +602,7 @@ func TestF117PubRelWindowSelfEchoResidual(t *testing.T) {
 // no key never matches a tag, and every later self-publish would bypass No Local. Both the
 // main drain and a level-up companion's drain are restored across a reconnect, then adopted
 // by a No Local re-SUBSCRIBE.
-func TestF117AdoptedRestoredDrainKeepsNoLocal(t *testing.T) {
+func TestAdoptedRestoredDrainKeepsNoLocal(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -616,7 +616,7 @@ func TestF117AdoptedRestoredDrainKeepsNoLocal(t *testing.T) {
 	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: filter, opts: 1}})
 
 	// One started, unacknowledged delivery on each consumer, so UNSUBSCRIBE drains both.
-	p, rp := f117Connect(t, o, id+"-pub")
+	p, rp := noLocalReplConnect(t, o, id+"-pub")
 	testMQTTPubV5Props(t, p, rp, 1, false, 1, "f117/da", []byte("old-parent"), nil)
 	testMQTTPubV5Props(t, p, rp, 1, false, 2, "f117/da/x", []byte("old-child"), nil)
 	for range 2 {
@@ -630,7 +630,7 @@ func TestF117AdoptedRestoredDrainKeepsNoLocal(t *testing.T) {
 	if sp, _, _ := testMQTTReadConnAckV5(t, r2); !sp {
 		t.Fatal("fixture: expected Session Present on the resume")
 	}
-	sess := f117Session(t, s, id)
+	sess := noLocalReplSession(t, s, id)
 	drained := func(sid string) bool {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()
@@ -644,7 +644,7 @@ func TestF117AdoptedRestoredDrainKeepsNoLocal(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	testMQTTSubV5(t, c2, r2, 4, []mqttV5SubFilter{{topic: filter, opts: 1 | f117NoLocal}})
+	testMQTTSubV5(t, c2, r2, 4, []mqttV5SubFilter{{topic: filter, opts: 1 | noLocalReplNoLocal}})
 	if drained(mainSid) || drained(fwcSid) {
 		t.Fatal("fixture: the No Local re-SUBSCRIBE must ADOPT both drains")
 	}
@@ -663,12 +663,12 @@ func TestF117AdoptedRestoredDrainKeepsNoLocal(t *testing.T) {
 		r2.pos = start + pl
 	}
 
-	w := f117Watch(t, id, false)
+	w := noLocalReplWatch(t, id, false)
 	testMQTTPubV5Props(t, c2, r2, 1, false, 5, "f117/da", []byte("own-parent"), nil)
 	testMQTTPubV5Props(t, c2, r2, 1, false, 6, "f117/da/x", []byte("own-child"), nil)
 	seen := map[*subscription]bool{}
 	for len(seen) < 2 {
-		e := w.awaitExit(t, "both adopted subscriptions' callbacks returning", func(e f117Exit) bool { return !e.skipped })
+		e := w.awaitExit(t, "both adopted subscriptions' callbacks returning", func(e noLocalReplExit) bool { return !e.skipped })
 		seen[e.sub] = true
 	}
 	testMQTTExpectNothing(t, r2)

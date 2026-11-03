@@ -27,28 +27,28 @@ import (
 
 // testEndedHolding is one QoS 2 obligation holding each of incs, driven by its acknowledgements
 // to Terminal: its holds stand RELEASE-OWED (outbound_release_holds.go).
-func testEndedHolding(t *testing.T, client string, incs ...string) (*testF105Env, func(), string) {
+func testEndedHolding(t *testing.T, client string, incs ...string) (*testOutboundEnv, func(), string) {
 	t.Helper()
-	e, done := testF105NewEnv(t, client)
+	e, done := testNewEnv(t, client)
 	e.bootstrap(t, "txn-1")
 	for _, inc := range incs {
 		kind := mqttResourceSourceConsumer
 		if strings.HasPrefix(inc, "inc-rel") {
 			kind = mqttResourcePubRelConsumer
 		}
-		testF105PlantResource(t, e, inc, kind)
+		testPlantResource(t, e, inc, kind)
 	}
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, incs...)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, incs...)
 	jsa := &e.asm.jsa
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("the PUBREC advance was refused: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, nonce)
+		x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testGen, nonce)
 		if x != nil && x.Phase == mqttExchangeTerminal {
 			return e, done, nonce
 		}
-		if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+		if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("the PUBCOMP advance was refused: %v", err)
 		}
 	}
@@ -57,18 +57,18 @@ func testEndedHolding(t *testing.T, client string, incs ...string) (*testF105Env
 }
 
 // testReleaseOwed releases the holds an acknowledgement ending of nonce left owed.
-func testReleaseOwed(t *testing.T, e *testF105Env, nonce string) {
+func testReleaseOwed(t *testing.T, e *testOutboundEnv, nonce string) {
 	t.Helper()
-	if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil,
+	if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{nonce}, nil,
 		mqttNewInflightNonce(), nil); err != nil {
 		t.Fatalf("releasing obligation %q's owed holds: %v", nonce, err)
 	}
 }
 
 // testHoldStands reports whether resource inc still lists obligation nonce's hold.
-func testHoldStands(t *testing.T, e *testF105Env, inc, nonce string) bool {
+func testHoldStands(t *testing.T, e *testOutboundEnv, inc, nonce string) bool {
 	t.Helper()
-	r, _, err := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, inc)
+	r, _, err := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, inc)
 	if err != nil || r == nil {
 		t.Fatalf("reading resource %q: %v", inc, err)
 	}
@@ -81,14 +81,14 @@ func testHoldStands(t *testing.T, e *testF105Env, inc, nonce string) bool {
 }
 
 // testDutyNaming finds the delivery duty predeclared for obligation nonce.
-func testDutyNaming(t *testing.T, e *testF105Env, nonce string) mqttSweptDuty {
+func testDutyNaming(t *testing.T, e *testOutboundEnv, nonce string) mqttSweptDuty {
 	t.Helper()
-	led, _, err := e.asm.jsa.loadGenLedger(e.id, e.epoch, testF105Gen)
+	led, _, err := e.asm.jsa.loadGenLedger(e.id, e.epoch, testGen)
 	if err != nil || led == nil {
 		t.Fatalf("reading the ledger: %v", err)
 	}
 	for ord := led.Lo; ord <= led.Hi; ord++ {
-		d, _, derr := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)
+		d, _, derr := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord)
 		if derr == nil && d != nil && d.Kind == mqttDutyExchange && d.Ref == nonce {
 			return mqttSweptDuty{Ord: ord, Entry: d}
 		}
@@ -99,7 +99,7 @@ func testDutyNaming(t *testing.T, e *testF105Env, nonce string) mqttSweptDuty {
 
 // testReleaseBatch composes a raw release-holds batch: the given resources with obligation
 // nonce's hold edge removed, then the given duties written terminal.
-func testReleaseBatch(t *testing.T, e *testF105Env, nonce string, incs []string, duties ...mqttSweptDuty) *mqttAuthorityTransition {
+func testReleaseBatch(t *testing.T, e *testOutboundEnv, nonce string, incs []string, duties ...mqttSweptDuty) *mqttAuthorityTransition {
 	t.Helper()
 	jsa := &e.asm.jsa
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -108,7 +108,7 @@ func testReleaseBatch(t *testing.T, e *testF105Env, nonce string, incs []string,
 		Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 	}}
 	for _, inc := range incs {
-		r, seq, err := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, inc)
+		r, seq, err := jsa.loadOutboundResource(e.id, e.epoch, testGen, inc)
 		if err != nil || r == nil {
 			t.Fatalf("reading resource %q: %v", inc, err)
 		}
@@ -123,11 +123,11 @@ func testReleaseBatch(t *testing.T, e *testF105Env, nonce string, incs []string,
 			next.Deps = []mqttResourceEdge{}
 		}
 		b, _ := json.Marshal(&next)
-		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: mqttResourceSubject(getHash(e.id), testF105Gen, inc),
+		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: mqttResourceSubject(getHash(e.id), testGen, inc),
 			expect: seq, body: b})
 	}
 	for _, d := range duties {
-		cur, seq, err := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, d.Ord)
+		cur, seq, err := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, d.Ord)
 		if err != nil || cur == nil {
 			t.Fatalf("reading duty %d: %v", d.Ord, err)
 		}
@@ -135,16 +135,16 @@ func testReleaseBatch(t *testing.T, e *testF105Env, nonce string, incs []string,
 		if berr != nil {
 			t.Fatal(berr)
 		}
-		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: mqttDutySubject(getHash(e.id), testF105Gen, d.Ord),
+		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: mqttDutySubject(getHash(e.id), testGen, d.Ord),
 			expect: seq, body: b})
 	}
 	return tr
 }
 
 // testDutyTerminal reports whether duty d stands terminal.
-func testDutyTerminal(t *testing.T, e *testF105Env, d mqttSweptDuty) bool {
+func testDutyTerminal(t *testing.T, e *testOutboundEnv, d mqttSweptDuty) bool {
 	t.Helper()
-	cur, _, err := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, d.Ord)
+	cur, _, err := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, testGen, d.Ord)
 	if err != nil || cur == nil {
 		t.Fatalf("reading duty %d: %v", d.Ord, err)
 	}
@@ -169,7 +169,7 @@ func TestCompletionLeavesHoldReleaseOwed(t *testing.T) {
 	if testDutyTerminal(t, e, duty) {
 		t.Fatal("the duty of a release-owed obligation stands terminal: the debt would be forgotten")
 	}
-	out, err := jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
+	out, err := jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
 	if err != nil {
 		t.Fatalf("releasing the owed hold: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestCompletionLeavesHoldReleaseOwed(t *testing.T) {
 	if testHoldStands(t, e, "inc-src", nonce) {
 		t.Fatal("the release-holds batch left the edge listed")
 	}
-	if err := jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}, duty,
+	if err := jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}, duty,
 		mqttNewInflightNonce()); err != nil {
 		t.Fatalf("resolving the released obligation's duty: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestReleaseOwedResolvedFromTheInventory(t *testing.T) {
 	e, done, nonce := testEndedHolding(t, "release-discovered", "inc-src", "inc-rel")
 	defer done()
 	duty := testDutyNaming(t, e, nonce)
-	if err := e.asm.jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}, duty,
+	if err := e.asm.jsa.opResolveDuty(&mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}, duty,
 		mqttNewInflightNonce()); err != nil {
 		t.Fatalf("resolving a release-owed duty from the inventory: %v", err)
 	}
@@ -216,14 +216,14 @@ func TestReleaseOwedResolvedFromTheInventory(t *testing.T) {
 // accepted; judge the duty on stored resources only -> "final removal" refused; judge it on the
 // batch's resources only -> "another hold listed" accepted.
 func TestReleaseHoldsBoundary(t *testing.T) {
-	refused := func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition, want string) {
+	refused := func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition, want string) {
 		t.Helper()
 		_, err := e.asm.jsa.commitAuthorityTransition(tr)
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("the batch was answered %v, want a refusal containing %q", err, want)
 		}
 	}
-	landed := func(t *testing.T, e *testF105Env, tr *mqttAuthorityTransition) {
+	landed := func(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition) {
 		t.Helper()
 		if _, err := e.asm.jsa.commitAuthorityTransition(tr); err != nil {
 			t.Fatalf("the batch was refused: %v", err)
@@ -231,34 +231,34 @@ func TestReleaseHoldsBoundary(t *testing.T) {
 	}
 
 	t.Run("not ended", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "release-not-ended")
+		e, done := testNewEnv(t, "release-not-ended")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 		refused(t, e, testReleaseBatch(t, e, nonce, []string{"inc-src"}), "released by nothing else")
 	})
 	t.Run("pending drain", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "release-pending-drain")
+		e, done := testNewEnv(t, "release-pending-drain")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 		for _, to := range []mqttExchangePhase{mqttExchangePubRecObserved, mqttExchangeTerminalPendingDrain} {
-			if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, to); err != nil {
+			if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, to); err != nil {
 				t.Fatalf("advancing to %d: %v", to, err)
 			}
 		}
 		refused(t, e, testReleaseBatch(t, e, nonce, []string{"inc-src"}), "released by nothing else")
 	})
 	t.Run("completion releasing in its own batch", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "release-in-completion")
+		e, done := testNewEnv(t, "release-in-completion")
 		defer done()
 		e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 		jsa := &e.asm.jsa
-		x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, nonce)
+		x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testGen, nonce)
 		// A refused PUBREC ENDS the QoS 2 obligation (Rejected): an acknowledgement ending, so
 		// its hold is release-owed and a release beside it is refused.
 		tr := testComposeAck(t, e, nonce, mqttExchangeRejected)
@@ -305,7 +305,7 @@ func TestReleaseHoldsBoundary(t *testing.T) {
 		e, done, nonce := testEndedHolding(t, "release-adds", "inc-src")
 		defer done()
 		tr := testReleaseBatch(t, e, nonce, []string{"inc-src"})
-		r, _ := mqttDecodeOutboundResource(tr.Extra[0].body, e.id, e.epoch, testF105Gen, "inc-src")
+		r, _ := mqttDecodeOutboundResource(tr.Extra[0].body, e.id, e.epoch, testGen, "inc-src")
 		r.Deps = append(r.Deps, mqttResourceEdge{Nonce: mqttNewInflightNonce(), Role: mqttRoleSourceReplay})
 		tr.Extra[0].body, _ = json.Marshal(r)
 		refused(t, e, tr, "")
@@ -314,9 +314,9 @@ func TestReleaseHoldsBoundary(t *testing.T) {
 		e, done, nonce := testEndedHolding(t, "release-foreign", "inc-src")
 		defer done()
 		tr := testReleaseBatch(t, e, nonce, []string{"inc-src"})
-		x, xSeq, _ := e.asm.jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, nonce)
+		x, xSeq, _ := e.asm.jsa.loadOutboundExchange(e.id, e.epoch, testGen, nonce)
 		b, _ := json.Marshal(x)
-		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: mqttExchangeSubject(getHash(e.id), testF105Gen, nonce),
+		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: mqttExchangeSubject(getHash(e.id), testGen, nonce),
 			expect: xSeq, body: b})
 		refused(t, e, tr, "neither a resource")
 	})
@@ -468,7 +468,7 @@ func TestReleaseOwedInADiscardedGenerationIsReleasedByTheExecutor(t *testing.T) 
 	}
 	duty := testDutyNaming(t, e, nonce)
 	gen := testDiscardClose(t, e)
-	if gen != testF105Gen {
+	if gen != testGen {
 		t.Fatalf("fixture: the discarded generation is %q, not the obligation's", gen)
 	}
 	testDiscardSweepUntilCertified(t, e, gen, func() error {
@@ -509,7 +509,7 @@ func TestReleaseHoldsRacesAndLostResponses(t *testing.T) {
 			inner.Store(false)
 			return send()
 		})
-		out, err := jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
+		out, err := jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
 		if !raced.Load() {
 			t.Fatal("fixture: no race was staged")
 		}
@@ -537,14 +537,14 @@ func TestReleaseHoldsRacesAndLostResponses(t *testing.T) {
 			}
 			return 0, errors.New("test: the release's response was lost")
 		})
-		if _, err := jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil, mqttNewInflightNonce(), nil); err == nil {
+		if _, err := jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{nonce}, nil, mqttNewInflightNonce(), nil); err == nil {
 			t.Fatal("fixture: the lost response must surface as an error")
 		}
 		jsa.testTransitionCommit.Store(nil)
 		if testHoldStands(t, e, "inc-src", nonce) {
 			t.Fatal("fixture: the release must have landed behind its lost response")
 		}
-		out, err := jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
+		out, err := jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{nonce}, nil, mqttNewInflightNonce(), nil)
 		if err != nil || len(out.cleared) != 1 || out.resolved != 0 {
 			t.Fatalf("re-reading after the lost response answered %+v, %v", out, err)
 		}

@@ -76,7 +76,7 @@ func TestMQTTGatedReapRefusesAnUnpermittedTransition(t *testing.T) {
 // admissible proofs of non-transmission. No evidence makes this record releasable, which is
 // why the replacement asserts preservation and supplies the strongest contradicting evidence
 // it can rather than withholding evidence to reach the same answer cheaply.
-func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
+func TestGatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	t.Parallel()
 	// THE SURVIVING issue #94 ASSERTION, at the layer that decides it. The PHASE says which
 	// transitions are legal; `Retired` is a source fact and is not consulted here at all.
@@ -109,7 +109,7 @@ func TestF092GatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	}
 }
 
-func TestF092DrainReleaseProtectsExplicitPastPubRecPhase(t *testing.T) {
+func TestDrainReleaseProtectsExplicitPastPubRecPhase(t *testing.T) {
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPubRelReady)
 	rec.Retired = true
@@ -199,7 +199,7 @@ func TestMQTTPublishAcknowledgementReleaseKeepsSuccessfulPubRecSlot(t *testing.T
 	}
 }
 
-func TestF092ConsumerPurgePreservesPastPubRecOwnerSlot(t *testing.T) {
+func TestConsumerPurgePreservesPastPubRecOwnerSlot(t *testing.T) {
 	t.Parallel()
 	const (
 		dur    = "SRC"
@@ -225,7 +225,7 @@ func TestF092ConsumerPurgePreservesPastPubRecOwnerSlot(t *testing.T) {
 	}
 }
 
-func TestF092ConsumerTeardownCannotDeletePastPubRecSlot(t *testing.T) {
+func TestConsumerTeardownCannotDeletePastPubRecSlot(t *testing.T) {
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPubRelReady)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
@@ -242,7 +242,7 @@ func TestF092ConsumerTeardownCannotDeletePastPubRecSlot(t *testing.T) {
 	}
 }
 
-func TestF092ConsumerTeardownTombstonesSameExchangeRewrite(t *testing.T) {
+func TestConsumerTeardownTombstonesSameExchangeRewrite(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("teardown-rewrite"), mqttNewSessGen()
 	const pi = uint16(7)
@@ -287,7 +287,7 @@ func TestF092ConsumerTeardownTombstonesSameExchangeRewrite(t *testing.T) {
 	}
 }
 
-func TestF092PendingCancellationCannotRewritePastPubRecSlot(t *testing.T) {
+func TestPendingCancellationCannotRewritePastPubRecSlot(t *testing.T) {
 	t.Parallel()
 	rec, subject := testCensusSlot(mqttInflightPubRelReady)
 	current := *rec
@@ -326,7 +326,7 @@ func TestF092PendingCancellationCannotRewritePastPubRecSlot(t *testing.T) {
 	}
 }
 
-func TestF092PubCompRefusesSlotBackedEntryWithoutCapturedSlot(t *testing.T) {
+func TestPubCompRefusesSlotBackedEntryWithoutCapturedSlot(t *testing.T) {
 	t.Parallel()
 	const pi = uint16(7)
 	ack := &mqttPending{

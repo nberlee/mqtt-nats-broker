@@ -29,11 +29,11 @@ import (
 
 // testRow2Acquired admits one ordinary exchange on identifier 7 and acquires its PUBLISH through
 // the production composer, returning the lineage and the register as the acquisition left it.
-func testRow2Acquired(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority) (string, *mqttInflightRecord, uint64) {
+func testRow2Acquired(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority) (string, *mqttInflightRecord, uint64) {
 	t.Helper()
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
-	if _, _, err := e.asm.jsa.opAcquireAction(testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
+	if _, _, err := e.asm.jsa.opAcquireAction(testWithRegister(t, e, 7, &mqttAcquireActionRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-acq-a", Op: "op-acq-a",
 		Gen: auth.Gen, Tenure: auth.Tenure, Nonce: nonce, Acq: 1, Kind: mqttActionPublish,
 		Binding: mqttBindConnection(4242),
@@ -49,11 +49,11 @@ func testRow2Acquired(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority)
 
 // testRow2AcquireBatch composes an acquire-action transition carrying act and, when reg is
 // non-nil, the register member reg at expect.
-func testRow2AcquireBatch(t *testing.T, e *testF105Env, txn string, act *mqttOutboundAction,
+func testRow2AcquireBatch(t *testing.T, e *testOutboundEnv, txn string, act *mqttOutboundAction,
 	reg *mqttInflightRecord, expect uint64) *mqttAuthorityTransition {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
+	tr := testAdmitNothing(e, al.rec, al.seq, txn)
 	tr.Attempt.Kind = mqttTransitionAcquireAction
 	act.AcqTxn = txn
 	abody, err := json.Marshal(act)
@@ -84,8 +84,8 @@ func testRow2Refused(t *testing.T, err error, want string) {
 
 // T2d / T12c-i / T12c-iii: an acquisition is ONE batch of both carriers, over a token-free exact
 // occupant, recognised or refused.
-func TestF105Row2AnAcquisitionIsBothCarriersOverAFreeOccupant(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-row2-acq-boundary")
+func TestRow2AnAcquisitionIsBothCarriersOverAFreeOccupant(t *testing.T) {
+	e, done := testNewEnv(t, "f105-row2-acq-boundary")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	nonce, afterA, seqA := testRow2Acquired(t, e, auth)
@@ -135,12 +135,12 @@ func TestF105Row2AnAcquisitionIsBothCarriersOverAFreeOccupant(t *testing.T) {
 
 // T2c: the packet binds to the register step, at the boundary. The exchange is at PUBREC-observed,
 // so a PUBREL action passes the exchange's own check and reaches the register-step binding.
-func TestF105Row2ThePacketBindsToTheRegisterStep(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-row2-kind")
+func TestRow2ThePacketBindsToTheRegisterStep(t *testing.T) {
+	e, done := testNewEnv(t, "f105-row2-kind")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, auth.Gen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("recording the PUBREC: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestF105Row2ThePacketBindsToTheRegisterStep(t *testing.T) {
 
 // T2b: the direct arrow's rebind installs the canonical tuple and moves intended -> ready, and
 // nothing else. A member that also rewrites a shape-valid field outside the tuple is refused.
-func TestF105Row2TheRebindArmChangesOnlyTheTuple(t *testing.T) {
+func TestRow2TheRebindArmChangesOnlyTheTuple(t *testing.T) {
 	cur := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPubRelIntended, PI: 7, Dur: "$MQTT_src",
 		Seq: 1, QoS: 2, Nonce: mqttNewInflightNonce()})
 	good := *cur
@@ -198,15 +198,15 @@ func TestF105Row2TheRebindArmChangesOnlyTheTuple(t *testing.T) {
 // T12c-iv: live custody is preserved at the boundary for every kind. An admit-exchange
 // register-only replacement over a live PUBLISH token, clearing it or substituting another, is
 // refused; the legitimate PUBREC advance over the live token still commits.
-func TestF105Row2OnlyTheHolderEndsLiveCustody(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-row2-custody")
+func TestRow2OnlyTheHolderEndsLiveCustody(t *testing.T) {
+	e, done := testNewEnv(t, "f105-row2-custody")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	nonce, afterA, seqA := testRow2Acquired(t, e, auth)
 	subj := mqttInflightSubject(getHash(e.id), auth.Gen, 7)
 	replace := func(txn string, mutate func(*mqttInflightRecord)) error {
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
+		tr := testAdmitNothing(e, al.rec, al.seq, txn)
 		next := *afterA
 		mutate(&next)
 		body, err := json.Marshal(&next)
@@ -253,15 +253,15 @@ func TestF105Row2OnlyTheHolderEndsLiveCustody(t *testing.T) {
 // T12c-ii: REAL store contention. B's batch passes every boundary check against a token-free
 // occupant; before it is sent, A's acquisition lands. The store's own CAS refuses B's atomic batch,
 // and none of B's members lands: the register and the action subject read back as A's.
-func TestF105Row2StoreContentionRefusesTheWholeLosingBatch(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-row2-contention")
+func TestRow2StoreContentionRefusesTheWholeLosingBatch(t *testing.T) {
+	e, done := testNewEnv(t, "f105-row2-contention")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 	subj := mqttInflightSubject(getHash(e.id), auth.Gen, 7)
 	reqFor := func(txn string, bind uint64) *mqttAcquireActionRequest {
-		return testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
+		return testWithRegister(t, e, 7, &mqttAcquireActionRequest{
 			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn, Gen: auth.Gen, Tenure: auth.Tenure,
 			Nonce: nonce, Acq: 1, Kind: mqttActionPublish, Binding: mqttBindConnection(bind),
 		})

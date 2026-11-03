@@ -77,7 +77,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationResources(id, epoch, gen
 			"completely, so a dependent this broker never saw would read as absent", id, gen)
 	}
 	for subject := range subjects {
-		toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(subject[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			unreadable++
 			continue

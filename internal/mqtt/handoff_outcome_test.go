@@ -18,59 +18,59 @@ import (
 	"testing"
 )
 
-// TestF105HandoffSubjectIsNotASessionRecord is the tripwire for the third subject space.
+// TestHandoffSubjectIsNotASessionRecord is the tripwire for the third subject space.
 //
 // Every session walk in this package filters "sess.<domainTk>>" and decodes what it gets as
 // a session record, which is exactly why the acceptance facts are top-level. A handoff
 // outcome nested under that prefix would be read as a malformed session, and the reader
 // would be drawing conclusions about a client from a record about a handoff.
-func TestF105HandoffSubjectIsNotASessionRecord(t *testing.T) {
+func TestHandoffSubjectIsNotASessionRecord(t *testing.T) {
 	const domainTk = ""
-	subj := mqttHandoffOutcomeSubject(domainTk, testF105IDHash, "intent-1")
+	subj := mqttHandoffOutcomeSubject(domainTk, testIDHash, "intent-1")
 
-	if testF105SubjectMatchesPrefix(subj, mqttSessStreamSubjectPrefix) {
+	if testSubjectMatchesPrefix(subj, mqttSessStreamSubjectPrefix) {
 		t.Fatalf("the handoff subject %q sits under the session-record prefix, where every "+
 			"session walk would decode it as a session", subj)
 	}
-	if testF105SubjectMatchesPrefix(subj, mqttAcceptSubjectPrefix) {
+	if testSubjectMatchesPrefix(subj, mqttAcceptSubjectPrefix) {
 		t.Fatalf("the handoff subject %q sits under the acceptance-fact prefix", subj)
 	}
 	if !mqttIsHandoffSubject(subj) {
 		t.Fatalf("the handoff subject %q is not classified as one", subj)
 	}
 	// And the classification must not claim the other two spaces.
-	if mqttIsHandoffSubject(mqttSessStreamSubjectPrefix + domainTk + testF105IDHash) {
+	if mqttIsHandoffSubject(mqttSessStreamSubjectPrefix + domainTk + testIDHash) {
 		t.Fatalf("a session record subject is classified as a handoff outcome")
 	}
-	if mqttIsHandoffSubject(mqttAcceptSubject(domainTk, testF105IDHash, "ep", "aid")) {
+	if mqttIsHandoffSubject(mqttAcceptSubject(domainTk, testIDHash, "ep", "aid")) {
 		t.Fatalf("an acceptance fact subject is classified as a handoff outcome")
 	}
 }
 
-// TestF105HandoffOutcomeDecodeIsVerdictScoped pins that an aborted metadata half cannot
+// TestHandoffOutcomeDecodeIsVerdictScoped pins that an aborted metadata half cannot
 // describe a session write it did not perform, and that the verdict itself is mandatory.
-func TestF105HandoffOutcomeDecodeIsVerdictScoped(t *testing.T) {
-	committed := testF105HandoffJSON(t, mqttHandoffCommitted)
-	if _, err := mqttDecodeHandoffOutcome(committed, testF105ID, testF105Epoch, "intent-1"); err != nil {
+func TestHandoffOutcomeDecodeIsVerdictScoped(t *testing.T) {
+	committed := testHandoffJSON(t, mqttHandoffCommitted)
+	if _, err := mqttDecodeHandoffOutcome(committed, testID, testEpoch, "intent-1"); err != nil {
 		t.Fatalf("a well-formed committed handoff outcome was refused: %v", err)
 	}
-	aborted := testF105HandoffJSON(t, mqttHandoffAborted)
-	if _, err := mqttDecodeHandoffOutcome(aborted, testF105ID, testF105Epoch, "intent-1"); err != nil {
+	aborted := testHandoffJSON(t, mqttHandoffAborted)
+	if _, err := mqttDecodeHandoffOutcome(aborted, testID, testEpoch, "intent-1"); err != nil {
 		t.Fatalf("a well-formed aborted handoff outcome was refused: %v", err)
 	}
 
 	for name, body := range map[string]string{
-		"aborted with a write identity":  testF105With(t, aborted, "sess_wid", `"wid-1"`),
-		"aborted with a proposal":        testF105With(t, aborted, "proposed_gen", `"`+testF105Gen2+`"`),
-		"verdict absent":                 testF105Without(t, committed, "verdict"),
-		"verdict null":                   testF105With(t, committed, "verdict", "null"),
-		"verdict unsupported":            testF105With(t, committed, "verdict", "9"),
-		"committed without a write id":   testF105Without(t, committed, "sess_wid"),
-		"committed without a proposal":   testF105Without(t, committed, "proposed_gen"),
-		"an unknown member":              testF105With(t, committed, "extra", `"x"`),
-		"a predecessor at sequence zero": testF105With(t, committed, "prev_sess_seq", "0"),
+		"aborted with a write identity":  testWith(t, aborted, "sess_wid", `"wid-1"`),
+		"aborted with a proposal":        testWith(t, aborted, "proposed_gen", `"`+testGen2+`"`),
+		"verdict absent":                 testWithout(t, committed, "verdict"),
+		"verdict null":                   testWith(t, committed, "verdict", "null"),
+		"verdict unsupported":            testWith(t, committed, "verdict", "9"),
+		"committed without a write id":   testWithout(t, committed, "sess_wid"),
+		"committed without a proposal":   testWithout(t, committed, "proposed_gen"),
+		"an unknown member":              testWith(t, committed, "extra", `"x"`),
+		"a predecessor at sequence zero": testWith(t, committed, "prev_sess_seq", "0"),
 	} {
-		if _, err := mqttDecodeHandoffOutcome([]byte(body), testF105ID, testF105Epoch, "intent-1"); err == nil {
+		if _, err := mqttDecodeHandoffOutcome([]byte(body), testID, testEpoch, "intent-1"); err == nil {
 			t.Fatalf("a handoff outcome with %s was admitted", name)
 		}
 	}
@@ -81,7 +81,7 @@ func TestF105HandoffOutcomeDecodeIsVerdictScoped(t *testing.T) {
 	}
 }
 
-// TestF105CommittedHandoffCarriesOnlyWhatIsKnownBeforePublication pins the correction that
+// TestCommittedHandoffCarriesOnlyWhatIsKnownBeforePublication pins the correction that
 // a sequence cannot be in this record at all.
 //
 // The body is assembled BEFORE its own batch commits, the batch API returns the commit
@@ -90,9 +90,9 @@ func TestF105HandoffOutcomeDecodeIsVerdictScoped(t *testing.T) {
 // write IDENTITY, which the writer mints itself — and which is what a repair needs anyway,
 // since a replacement moves the position while the identity says whether the record is
 // still ours.
-func TestF105CommittedHandoffCarriesOnlyWhatIsKnownBeforePublication(t *testing.T) {
-	o := testF105HandoffOutcome(mqttHandoffCommitted)
-	if err := mqttValidateHandoffOutcome(o, testF105ID, testF105Epoch, "intent-1"); err != nil {
+func TestCommittedHandoffCarriesOnlyWhatIsKnownBeforePublication(t *testing.T) {
+	o := testHandoffOutcome(mqttHandoffCommitted)
+	if err := mqttValidateHandoffOutcome(o, testID, testEpoch, "intent-1"); err != nil {
 		t.Fatalf("a well-formed committed outcome was refused: %v", err)
 	}
 
@@ -104,32 +104,32 @@ func TestF105CommittedHandoffCarriesOnlyWhatIsKnownBeforePublication(t *testing.
 	} {
 		m := *o
 		mutate(&m)
-		if err := mqttValidateHandoffOutcome(&m, testF105ID, testF105Epoch, "intent-1"); err == nil {
+		if err := mqttValidateHandoffOutcome(&m, testID, testEpoch, "intent-1"); err == nil {
 			t.Fatalf("a committed handoff outcome with %s was admitted", name)
 		}
 	}
 }
 
-// TestF105HandoffOutcomeMustMatchItsIntent pins that an outcome sharing a subject is not
+// TestHandoffOutcomeMustMatchItsIntent pins that an outcome sharing a subject is not
 // thereby an answer: one conditioned on a different predecessor describes a different
 // handoff, and finalizing on it would displace ownership nobody checked.
-func TestF105HandoffOutcomeMustMatchItsIntent(t *testing.T) {
-	i := testF105PreparingAuthority().Intent
+func TestHandoffOutcomeMustMatchItsIntent(t *testing.T) {
+	i := testPreparingAuthority().Intent
 	p, perr := mqttProposalFromHandoff(i)
 	if perr != nil {
 		t.Fatalf("the fixture handoff intent was refused: %v", perr)
 	}
-	o := testF105HandoffOutcome(mqttHandoffCommitted)
+	o := testHandoffOutcome(mqttHandoffCommitted)
 	o.Intent = i.ID
 	if err := mqttOutcomeAnswersProposal(o, p); err != nil {
 		t.Fatalf("an outcome answering its own intent was rejected: %v", err)
 	}
 
 	for name, mutate := range map[string]func(*mqttHandoffOutcome){
-		"proposed generation":    func(m *mqttHandoffOutcome) { m.ProposedGen = testF105Gen },
+		"proposed generation":    func(m *mqttHandoffOutcome) { m.ProposedGen = testGen },
 		"proposed tenure":        func(m *mqttHandoffOutcome) { m.ProposedTenure = "tenure-9" },
 		"intent":                 func(m *mqttHandoffOutcome) { m.Intent = "intent-9" },
-		"predecessor generation": func(m *mqttHandoffOutcome) { m.PrevGen = testF105Gen2 },
+		"predecessor generation": func(m *mqttHandoffOutcome) { m.PrevGen = testGen2 },
 		"predecessor tenure":     func(m *mqttHandoffOutcome) { m.PrevTenure = "tenure-9" },
 		"predecessor ownership":  func(m *mqttHandoffOutcome) { m.PrevOwnerTxn = "own-9" },
 		"predecessor write id":   func(m *mqttHandoffOutcome) { m.PrevSessWID = "wid-9" },
@@ -148,23 +148,23 @@ func TestF105HandoffOutcomeMustMatchItsIntent(t *testing.T) {
 	}
 }
 
-// TestF105OutcomeShapesAreDistinct pins that the receipt's required members follow the
+// TestOutcomeShapesAreDistinct pins that the receipt's required members follow the
 // PROPOSAL KIND, in both directions.
 //
 // One reader for two shapes was the alternative to two protocols, and it is only safe if the
 // shape is mandatory and enforced: a reader that guessed would either demand a predecessor a
 // first creation never had — refusing every legitimate creation receipt — or admit a handoff
 // naming none, losing the binding that stops a delayed acceptance retargeting a successor.
-func TestF105OutcomeShapesAreDistinct(t *testing.T) {
-	handoff := testF105HandoffJSON(t, mqttHandoffCommitted)
-	creation := testF105CreationJSON(t, mqttHandoffCommitted)
-	abortedCreation := testF105CreationJSON(t, mqttHandoffAborted)
+func TestOutcomeShapesAreDistinct(t *testing.T) {
+	handoff := testHandoffJSON(t, mqttHandoffCommitted)
+	creation := testCreationJSON(t, mqttHandoffCommitted)
+	abortedCreation := testCreationJSON(t, mqttHandoffAborted)
 
 	for name, body := range map[string][]byte{
 		"a committed creation": creation,
 		"an aborted creation":  abortedCreation,
 	} {
-		if _, err := mqttDecodeHandoffOutcome(body, testF105ID, testF105Epoch, "intent-1"); err != nil {
+		if _, err := mqttDecodeHandoffOutcome(body, testID, testEpoch, "intent-1"); err != nil {
 			t.Fatalf("a well-formed receipt for %s was refused: %v", name, err)
 		}
 	}
@@ -176,15 +176,15 @@ func TestF105OutcomeShapesAreDistinct(t *testing.T) {
 	// predecessor would be published as a receipt describing a displacement that never
 	// happened.
 	for name, mutate := range map[string]func(*mqttHandoffOutcome){
-		"a predecessor generation":      func(m *mqttHandoffOutcome) { m.PrevGen = testF105Gen },
+		"a predecessor generation":      func(m *mqttHandoffOutcome) { m.PrevGen = testGen },
 		"a predecessor tenure":          func(m *mqttHandoffOutcome) { m.PrevTenure = "tenure-0" },
 		"a predecessor ownership":       func(m *mqttHandoffOutcome) { m.PrevOwnerTxn = "own-0" },
 		"a predecessor write identity":  func(m *mqttHandoffOutcome) { m.PrevSessWID = "wid-0" },
 		"a predecessor record sequence": func(m *mqttHandoffOutcome) { m.PrevSessSeq = 12 },
 	} {
-		m := *testF105CreationOutcome(mqttHandoffCommitted)
+		m := *testCreationOutcome(mqttHandoffCommitted)
 		mutate(&m)
-		if err := mqttValidateHandoffOutcome(&m, testF105ID, testF105Epoch, "intent-1"); err == nil {
+		if err := mqttValidateHandoffOutcome(&m, testID, testEpoch, "intent-1"); err == nil {
 			t.Fatalf("a creation receipt carrying %s was admitted", name)
 		}
 	}
@@ -194,43 +194,43 @@ func TestF105OutcomeShapesAreDistinct(t *testing.T) {
 		"no predecessor generation":      func(m *mqttHandoffOutcome) { m.PrevGen = _EMPTY_ },
 		"no predecessor record sequence": func(m *mqttHandoffOutcome) { m.PrevSessSeq = 0 },
 	} {
-		m := *testF105HandoffOutcome(mqttHandoffCommitted)
+		m := *testHandoffOutcome(mqttHandoffCommitted)
 		mutate(&m)
-		if err := mqttValidateHandoffOutcome(&m, testF105ID, testF105Epoch, "intent-1"); err == nil {
+		if err := mqttValidateHandoffOutcome(&m, testID, testEpoch, "intent-1"); err == nil {
 			t.Fatalf("a handoff receipt with %s was admitted", name)
 		}
 	}
 	// And an unsupported kind is refused by the validator too, not only by the decoder.
-	m := *testF105HandoffOutcome(mqttHandoffCommitted)
+	m := *testHandoffOutcome(mqttHandoffCommitted)
 	m.Kind = "transfer"
-	if err := mqttValidateHandoffOutcome(&m, testF105ID, testF105Epoch, "intent-1"); err == nil {
+	if err := mqttValidateHandoffOutcome(&m, testID, testEpoch, "intent-1"); err == nil {
 		t.Fatalf("a receipt carrying an unsupported proposal kind was admitted")
 	}
 
 	for name, body := range map[string]string{
 		// A creation that names a predecessor describes a displacement that never happened.
-		"a creation naming a predecessor generation": testF105With(t, creation, "prev_gen", `"`+testF105Gen+`"`),
-		"a creation naming a predecessor sequence":   testF105With(t, creation, "prev_sess_seq", "12"),
+		"a creation naming a predecessor generation": testWith(t, creation, "prev_gen", `"`+testGen+`"`),
+		"a creation naming a predecessor sequence":   testWith(t, creation, "prev_sess_seq", "12"),
 		// And a handoff that names none has lost the binding it exists for.
-		"a handoff without its predecessor generation": testF105Without(t, handoff, "prev_gen"),
-		"a handoff without its predecessor sequence":   testF105Without(t, handoff, "prev_sess_seq"),
+		"a handoff without its predecessor generation": testWithout(t, handoff, "prev_gen"),
+		"a handoff without its predecessor sequence":   testWithout(t, handoff, "prev_sess_seq"),
 		// The kind itself is mandatory and closed.
-		"no proposal kind":          testF105Without(t, handoff, "kind"),
-		"an unsupported kind":       testF105With(t, handoff, "kind", `"transfer"`),
-		"a null kind":               testF105With(t, handoff, "kind", "null"),
-		"an empty kind":             testF105With(t, handoff, "kind", `""`),
-		"a creation with a kind of": testF105With(t, creation, "kind", `"handoff"`),
+		"no proposal kind":          testWithout(t, handoff, "kind"),
+		"an unsupported kind":       testWith(t, handoff, "kind", `"transfer"`),
+		"a null kind":               testWith(t, handoff, "kind", "null"),
+		"an empty kind":             testWith(t, handoff, "kind", `""`),
+		"a creation with a kind of": testWith(t, creation, "kind", `"handoff"`),
 	} {
-		if _, err := mqttDecodeHandoffOutcome([]byte(body), testF105ID, testF105Epoch, "intent-1"); err == nil {
+		if _, err := mqttDecodeHandoffOutcome([]byte(body), testID, testEpoch, "intent-1"); err == nil {
 			t.Fatalf("a receipt with %s was admitted", name)
 		}
 	}
 }
 
-// TestF105ProposalViewsCarryTheirOwnShape pins that the KIND comes from the constructor and
+// TestProposalViewsCarryTheirOwnShape pins that the KIND comes from the constructor and
 // that a creation view carries no predecessor for a caller to fill in later.
-func TestF105ProposalViewsCarryTheirOwnShape(t *testing.T) {
-	h, err := mqttProposalFromHandoff(testF105PreparingAuthority().Intent)
+func TestProposalViewsCarryTheirOwnShape(t *testing.T) {
+	h, err := mqttProposalFromHandoff(testPreparingAuthority().Intent)
 	if err != nil {
 		t.Fatalf("the fixture handoff intent was refused: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestF105ProposalViewsCarryTheirOwnShape(t *testing.T) {
 	}
 
 	c, cerr := mqttProposalFromCreation(&mqttCreationIntent{
-		ID: "intent-1", Gen: testF105Gen, Tenure: "tenure-1",
+		ID: "intent-1", Gen: testGen, Tenure: "tenure-1",
 	})
 	if cerr != nil {
 		t.Fatalf("a well-formed creation intent was refused: %v", cerr)
@@ -265,52 +265,52 @@ func TestF105ProposalViewsCarryTheirOwnShape(t *testing.T) {
 	}
 }
 
-func testF105HandoffOutcome(v mqttHandoffVerdict) *mqttHandoffOutcome {
+func testHandoffOutcome(v mqttHandoffVerdict) *mqttHandoffOutcome {
 	o := &mqttHandoffOutcome{
-		ID: testF105ID, Epoch: testF105Epoch, Intent: "intent-1", Verdict: v,
+		ID: testID, Epoch: testEpoch, Intent: "intent-1", Verdict: v,
 		Kind:    mqttProposalHandoff,
-		PrevGen: testF105Gen, PrevTenure: "tenure-1", PrevOwnerTxn: "own-1",
+		PrevGen: testGen, PrevTenure: "tenure-1", PrevOwnerTxn: "own-1",
 		PrevSessWID: "wid-0", PrevSessSeq: 12,
 	}
 	if v == mqttHandoffCommitted {
 		o.SessWID = "wid-1"
-		o.ProposedGen, o.ProposedTenure = testF105Gen2, "tenure-2"
+		o.ProposedGen, o.ProposedTenure = testGen2, "tenure-2"
 	}
 	return o
 }
 
-func testF105HandoffJSON(t *testing.T, v mqttHandoffVerdict) []byte {
+func testHandoffJSON(t *testing.T, v mqttHandoffVerdict) []byte {
 	t.Helper()
-	b, err := json.Marshal(testF105HandoffOutcome(v))
+	b, err := json.Marshal(testHandoffOutcome(v))
 	if err != nil {
 		t.Fatalf("marshalling the fixture handoff outcome: %v", err)
 	}
 	return b
 }
 
-// testF105CreationOutcome is the OTHER shape: a first creation displaces nothing, so it
+// testCreationOutcome is the OTHER shape: a first creation displaces nothing, so it
 // names no predecessor at all.
-func testF105CreationOutcome(v mqttHandoffVerdict) *mqttHandoffOutcome {
+func testCreationOutcome(v mqttHandoffVerdict) *mqttHandoffOutcome {
 	o := &mqttHandoffOutcome{
-		ID: testF105ID, Epoch: testF105Epoch, Intent: "intent-1", Verdict: v,
+		ID: testID, Epoch: testEpoch, Intent: "intent-1", Verdict: v,
 		Kind: mqttProposalCreation,
 	}
 	if v == mqttHandoffCommitted {
 		o.SessWID = "wid-1"
-		o.ProposedGen, o.ProposedTenure = testF105Gen2, "tenure-2"
+		o.ProposedGen, o.ProposedTenure = testGen2, "tenure-2"
 	}
 	return o
 }
 
-func testF105CreationJSON(t *testing.T, v mqttHandoffVerdict) []byte {
+func testCreationJSON(t *testing.T, v mqttHandoffVerdict) []byte {
 	t.Helper()
-	b, err := json.Marshal(testF105CreationOutcome(v))
+	b, err := json.Marshal(testCreationOutcome(v))
 	if err != nil {
 		t.Fatalf("marshalling the fixture creation outcome: %v", err)
 	}
 	return b
 }
 
-func testF105SubjectMatchesPrefix(subject, prefix string) bool {
+func testSubjectMatchesPrefix(subject, prefix string) bool {
 	return len(subject) >= len(prefix) && subject[:len(prefix)] == prefix
 }

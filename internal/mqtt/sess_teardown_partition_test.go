@@ -26,21 +26,21 @@ import (
 // a RELEASE decision and useless for a DELETION one: by then the affine consumer would be gone
 // whatever the answer. These are about the decision that runs first.
 
-// TestF105AVacuousGenerationOwnsItsOwnCleanup: with neither closure nor ledger, nothing was
+// TestAVacuousGenerationOwnsItsOwnCleanup: with neither closure nor ledger, nothing was
 // admitted through the authority, so there is no duty a release could strand and the teardown
 // deletes exactly what it deletes today.
-func TestF105AVacuousGenerationOwnsItsOwnCleanup(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-vacuous")
+func TestAVacuousGenerationOwnsItsOwnCleanup(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-vacuous")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
 	target := &mqttTeardownTarget{
-		id: e.id, idHash: getHash(e.id), gen: testF105Gen,
+		id: e.id, idHash: getHash(e.id), gen: testGen,
 		q2AffDur: durable, q2AffGen: affGen, pubRelDur: pubRelDur,
 	}
-	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testF105Gen, target)
+	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testGen, target)
 	if err != nil {
 		t.Fatalf("classifying a generation that admitted nothing: %v", err)
 	}
@@ -52,14 +52,14 @@ func TestF105AVacuousGenerationOwnsItsOwnCleanup(t *testing.T) {
 	}
 }
 
-// TestF105APreservingClosureKeepsItsAffineConsumer: an inventory exists, its closure does not
+// TestAPreservingClosureKeepsItsAffineConsumer: an inventory exists, its closure does not
 // discard, so the affine consumer was never transferred and stays the teardown's to delete.
-func TestF105APreservingClosureKeepsItsAffineConsumer(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-preserving")
+func TestAPreservingClosureKeepsItsAffineConsumer(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-preserving")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 	auth, _ := e.bootstrap(t, "txn-boot")
 
 	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
@@ -67,10 +67,10 @@ func TestF105APreservingClosureKeepsItsAffineConsumer(t *testing.T) {
 		t.Fatalf("closing without a discard: %v", err)
 	}
 	target := &mqttTeardownTarget{
-		id: e.id, idHash: getHash(e.id), gen: testF105Gen,
+		id: e.id, idHash: getHash(e.id), gen: testGen,
 		q2AffDur: durable, q2AffGen: affGen, pubRelDur: pubRelDur,
 	}
-	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testF105Gen, target)
+	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testGen, target)
 	if err != nil {
 		t.Fatalf("classifying a preserving closure: %v", err)
 	}
@@ -87,16 +87,16 @@ func TestF105APreservingClosureKeepsItsAffineConsumer(t *testing.T) {
 	}
 }
 
-// TestF105ADiscardingClosureTransfersItsAffineConsumer: the enrolled target is recovery's, and the
+// TestADiscardingClosureTransfersItsAffineConsumer: the enrolled target is recovery's, and the
 // classification names the resource the duty is about.
-func TestF105ADiscardingClosureTransfersItsAffineConsumer(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-discarding")
+func TestADiscardingClosureTransfersItsAffineConsumer(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-discarding")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	target := &mqttTeardownTarget{
 		id: e.id, idHash: getHash(e.id), gen: gen,
 		q2AffDur: durable, q2AffGen: affGen, pubRelDur: pubRelDur,
@@ -113,17 +113,17 @@ func TestF105ADiscardingClosureTransfersItsAffineConsumer(t *testing.T) {
 	}
 }
 
-// TestF105ADiscardingClosureRequiresItsEnrolment is the "required enrolment missing" case, and it
+// TestADiscardingClosureRequiresItsEnrolment is the "required enrolment missing" case, and it
 // refuses AT CLASSIFICATION — before any downstream work, because a later refusal at the release
 // gate would leave the deletions already done.
-func TestF105ADiscardingClosureRequiresItsEnrolment(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-missing")
+func TestADiscardingClosureRequiresItsEnrolment(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-missing")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
-	gen, _ := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, _ := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	// The teardown holds a DIFFERENT affine consumer from the one the closure enrolled, which is
 	// the shape of an incomplete enrolment: a durable this teardown still holds that no resource
 	// record names.
@@ -140,34 +140,34 @@ func TestF105ADiscardingClosureRequiresItsEnrolment(t *testing.T) {
 	}
 }
 
-// TestF105IndeterminateEvidenceRefusesTheTeardown: an inventory with no closure says nothing about
+// TestIndeterminateEvidenceRefusesTheTeardown: an inventory with no closure says nothing about
 // whether its obligations were abandoned or preserved, and "I could not say" is never the vacuous
 // answer — which is the one that licenses deleting everything.
-func TestF105IndeterminateEvidenceRefusesTheTeardown(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-indeterminate")
+func TestIndeterminateEvidenceRefusesTheTeardown(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-indeterminate")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 	e.bootstrap(t, "txn-boot")
 
 	// An inventory, and no closure: the generation allocated an ordinal and nothing has ended it.
-	if err := testF105SubmitInventory(t, e, "txn-alloc",
-		testF105LedgerMember(t, e, 0, &mqttGenLedger{
+	if err := testSubmitInventory(t, e, "txn-alloc",
+		testLedgerMember(t, e, 0, &mqttGenLedger{
 			Lo: 1, Del: 1,
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 1,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, State: mqttGenLedgerOpen, Hi: 1,
 		}),
-		testF105DutyMember(t, e, 0, testF105Duty(e, 1, mqttDutyCleanup, "inc-a",
+		testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyCleanup, "inc-a",
 			mqttDutyNotYetActionable)),
 	); err != nil {
 		t.Fatalf("planting an open inventory: %v", err)
 	}
 
 	target := &mqttTeardownTarget{
-		id: e.id, idHash: getHash(e.id), gen: testF105Gen,
+		id: e.id, idHash: getHash(e.id), gen: testGen,
 		q2AffDur: durable, q2AffGen: affGen, pubRelDur: pubRelDur,
 	}
-	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testF105Gen, target)
+	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testGen, target)
 	if err == nil {
 		t.Fatalf("an inventory with no closure classified as %v", own.Class)
 	}
@@ -182,21 +182,21 @@ func TestF105IndeterminateEvidenceRefusesTheTeardown(t *testing.T) {
 	}
 }
 
-// TestF105AnEnrolledTeardownMakesNoAffineDeleteAttempt is the oracle that distinguishes a deferred
+// TestAnEnrolledTeardownMakesNoAffineDeleteAttempt is the oracle that distinguishes a deferred
 // deletion from one that happened anyway.
 //
 // A consumer that is simply GONE afterwards proves nothing: a synchronous delete that ran would
 // leave the same state. So this creates the affine consumer for real and asserts it is STILL THERE
 // when the teardown's deletions have run — the transfer is observable only as an absence of the
 // act.
-func TestF105AnEnrolledTeardownMakesNoAffineDeleteAttempt(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-noattempt")
+func TestAnEnrolledTeardownMakesNoAffineDeleteAttempt(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-noattempt")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
 	_ = affGen
 
-	gen, _ := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, _ := testDiscardingCloseWithAffine(t, e, affGen, durable)
 
 	// A REAL consumer on $MQTT_out, at the name this generation's affine consumer DERIVES, so
 	// "still there" is a fact about the store and about the right consumer.

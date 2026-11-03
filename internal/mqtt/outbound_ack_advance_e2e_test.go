@@ -34,7 +34,7 @@ import (
 // Mutation check: revert the `case mqttInflightPublish:` arm of attemptTerminalRegisterRelease
 // to the slot-only advancePublishTerminal for an ordinary slot, and the exchange stays at
 // PUBLISH here.
-func TestF105OrdinaryPubAckAdvancesExchangeToTerminal(t *testing.T) {
+func TestOrdinaryPubAckAdvancesExchangeToTerminal(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -92,10 +92,10 @@ func TestF105OrdinaryPubAckAdvancesExchangeToTerminal(t *testing.T) {
 	})
 }
 
-// testF105QoS2Delivered drives one ordinary QoS 2 delivery to the point where its PUBREC can
+// testQoS2Delivered drives one ordinary QoS 2 delivery to the point where its PUBREC can
 // arrive, and returns the subscriber, its session, the identifier and the exchange nonce the
 // admission co-created with the register.
-func testF105QoS2Delivered(t *testing.T, o *Options, s *Server, clientID string) (net.Conn, *mqttReader,
+func testQoS2Delivered(t *testing.T, o *Options, s *Server, clientID string) (net.Conn, *mqttReader,
 	*mqttSession, uint16, string) {
 	t.Helper()
 	sub, subr := testInflightSubscriber(t, o, clientID, 2)
@@ -128,8 +128,8 @@ func testF105QoS2Delivered(t *testing.T, o *Options, s *Server, clientID string)
 	return sub, subr, sess, pi, reg.Lin
 }
 
-// testF105ExchangePhaseIs waits for the exchange to stand at want.
-func testF105ExchangePhaseIs(t *testing.T, sess *mqttSession, nonce string, want mqttExchangePhase) {
+// testExchangePhaseIs waits for the exchange to stand at want.
+func testExchangePhaseIs(t *testing.T, sess *mqttSession, nonce string, want mqttExchangePhase) {
 	t.Helper()
 	sess.mu.Lock()
 	gen := sess.gen
@@ -156,18 +156,18 @@ func testF105ExchangePhaseIs(t *testing.T, sess *mqttSession, nonce string, want
 //
 // Mutation M1: route the PUBREC's exchange arm back to the slot-only CAS, and the exchange stays
 // at PUBLISH and the verdict is deliver.
-func TestF105OrdinaryPubRecAdvancesExchangeToPubRecObserved(t *testing.T) {
+func TestOrdinaryPubRecAdvancesExchangeToPubRecObserved(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, subr, sess, pi, nonce := testF105QoS2Delivered(t, o, s, "f105-ordinary-pubrec")
+	sub, subr, sess, pi, nonce := testQoS2Delivered(t, o, s, "f105-ordinary-pubrec")
 
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
 
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangePubRecObserved)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangePubRecObserved)
 	sess.mu.Lock()
 	gen := sess.gen
 	sess.mu.Unlock()
@@ -194,13 +194,13 @@ func TestF105OrdinaryPubRecAdvancesExchangeToPubRecObserved(t *testing.T) {
 //
 // Mutation M4: a single advance attempt, and the PUBREC is rolled back — no PUBREL, the
 // connection closes.
-func TestF105OrdinaryPubRecReattemptsALostBatch(t *testing.T) {
+func TestOrdinaryPubRecReattemptsALostBatch(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, subr, sess, pi, nonce := testF105QoS2Delivered(t, o, s, "f105-pubrec-reattempt")
+	sub, subr, sess, pi, nonce := testQoS2Delivered(t, o, s, "f105-pubrec-reattempt")
 	sess.mu.Lock()
 	subj := mqttInflightSubject(getHash(sess.id), sess.gen, pi)
 	sess.mu.Unlock()
@@ -250,7 +250,7 @@ func TestF105OrdinaryPubRecReattemptsALostBatch(t *testing.T) {
 	if n := attempts.Load(); n < 2 {
 		t.Fatalf("the refused batch was never re-attempted (%d attempt)", n)
 	}
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangePubRecObserved)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangePubRecObserved)
 	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
 	testMQTTFlush(t, sub, nil, subr)
 }
@@ -264,7 +264,7 @@ func TestF105OrdinaryPubRecReattemptsALostBatch(t *testing.T) {
 // would stand on the identifier indefinitely.
 //
 // Mutation M2: delete the shared/affine prefix exemption, and the register is never removed.
-func TestF105SharedPubAckCompletesSlotOnly(t *testing.T) {
+func TestSharedPubAckCompletesSlotOnly(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)

@@ -188,7 +188,7 @@ func (c *client) mqttDrainHandedOffClose() {
 // same-client-ID replacement this broker holds both ends of.
 //
 // That is the issue #86 licence, and the single caller is how it is enforced rather than
-// asserted — TestF084OnlyOneReaderOfTheTakeoverClaim fails if a second appears. It used to
+// asserted — TestOnlyOneReaderOfTheTakeoverClaim fails if a second appears. It used to
 // be the shared tail for all four displacement routes; the other three (a remote persist
 // observation, a resolver's foreign disposal, the bound rejection settlement) reach their
 // verdict from a RECORD, which proves no successor, so they report ownership-unsettled

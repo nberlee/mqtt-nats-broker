@@ -77,7 +77,7 @@ var mqttReadinessMembers = map[string]struct{}{
 
 // mqttReadinessSubject returns one generation's readiness subject.
 func mqttReadinessSubject(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttReadinessClassTk + "." + idHash + "." + gen
+	return mqttOutboundRecordSubjectPrefix() + mqttReadinessClassTk + "." + idHash + "." + gen
 }
 
 // mqttValidateAffineReadiness refuses a readiness body this broker does not support.

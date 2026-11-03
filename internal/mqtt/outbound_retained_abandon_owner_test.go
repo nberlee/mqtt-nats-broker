@@ -50,10 +50,10 @@ func (rig *testRetainedAbandonRig) awaitAbandonmentApplied(t *testing.T, reg *mq
 	}
 }
 
-// TestF105RetainedAbandonLostResponseIsSettledNotResubmitted: the abandonment commits but its
+// TestRetainedAbandonLostResponseIsSettledNotResubmitted: the abandonment commits but its
 // response is lost, and the attempt's settlement stays UNRESOLVED for two passes. The driver keeps
 // the handle, submits nothing further, and applies the abandonment once the settlement lands.
-func TestF105RetainedAbandonLostResponseIsSettledNotResubmitted(t *testing.T) {
+func TestRetainedAbandonLostResponseIsSettledNotResubmitted(t *testing.T) {
 	var submits, unresolved atomic.Int32
 	rig := testRetainedAbandonUpExpiring(t, "ret-ab-lost", 1, 60, func(rig *testRetainedAbandonRig) {
 		rig.asm.mu.Lock()
@@ -85,10 +85,10 @@ func TestF105RetainedAbandonLostResponseIsSettledNotResubmitted(t *testing.T) {
 	}
 }
 
-// TestF105RetainedAbandonSurvivesTransientReadbackFailures: after the abandonment commits, the
+// TestRetainedAbandonSurvivesTransientReadbackFailures: after the abandonment commits, the
 // register's readback fails three times. The driver neither gives up nor re-decides: it applies the
 // abandonment once the register reads again.
-func TestF105RetainedAbandonSurvivesTransientReadbackFailures(t *testing.T) {
+func TestRetainedAbandonSurvivesTransientReadbackFailures(t *testing.T) {
 	var committed atomic.Bool
 	var failed atomic.Int32
 	rig := testRetainedAbandonUpExpiring(t, "ret-ab-readback", 1, 60, func(rig *testRetainedAbandonRig) {
@@ -117,11 +117,11 @@ func TestF105RetainedAbandonSurvivesTransientReadbackFailures(t *testing.T) {
 	}
 }
 
-// TestF105RetainedAbandonPassesToATakeover: the abandonment decision is made, then a takeover
+// TestRetainedAbandonPassesToATakeover: the abandonment decision is made, then a takeover
 // resumes the session on a new connection (a new tenure, a limit the replay fits) before the
 // decision is submitted. The decision is passed on, never committed under the successor; the
 // successor's own resume replays the PUBLISH.
-func TestF105RetainedAbandonPassesToATakeover(t *testing.T) {
+func TestRetainedAbandonPassesToATakeover(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	var submits atomic.Int32
@@ -166,7 +166,7 @@ func TestF105RetainedAbandonPassesToATakeover(t *testing.T) {
 // the register cannot be read. The handler leaves the intent to the asynchronous resolver and the
 // connection open; once reads recover, the resolver's confirmation must still install and emit the
 // owed PUBREL to the silent, connected client.
-func TestF105RetainedAbandonedLatePubRecResolvedAsynchronouslyEmitsThePubRel(t *testing.T) {
+func TestRetainedAbandonedLatePubRecResolvedAsynchronouslyEmitsThePubRel(t *testing.T) {
 	var armed atomic.Bool
 	var failed atomic.Int32
 	rig := testRetainedAbandonUpExpiring(t, "ret-ab-async", 2, 60, func(rig *testRetainedAbandonRig) {
@@ -199,7 +199,7 @@ func TestF105RetainedAbandonedLatePubRecResolvedAsynchronouslyEmitsThePubRel(t *
 // PUBREL still arrives on the open connection. (b) A cold resume whose inventory could not decide
 // the exchange (its duty unreadable): the abandoned arm seeds custody provisionally, as every
 // restored entry does, so the installation is not refused for want of the lineage.
-func TestF105RetainedAbandonedPubRelInstallationIsOwned(t *testing.T) {
+func TestRetainedAbandonedPubRelInstallationIsOwned(t *testing.T) {
 	t.Run("transient-refusal", func(t *testing.T) {
 		rig := testRetainedAbandonUp(t, "ret-ab-install", 2)
 		defer rig.done()
@@ -263,12 +263,12 @@ func TestF105RetainedAbandonedPubRelInstallationIsOwned(t *testing.T) {
 	})
 }
 
-// TestF105RetainedStaleResolverDoesNotActOverAQuarantine (holistic H-10): a PUBREC intent resolver of
+// TestRetainedStaleResolverDoesNotActOverAQuarantine (holistic H-10): a PUBREC intent resolver of
 // the PREVIOUS connection that confirms after a same-object resume quarantined the exchange (its
 // canonical PUBREL absent) must install nothing: the quarantine authorizes no action, and the
 // exchange is not that connection's any more. The resolver's confirmation is driven directly with
 // the previous connection and the ACK-only snapshot it captured.
-func TestF105RetainedStaleResolverDoesNotActOverAQuarantine(t *testing.T) {
+func TestRetainedStaleResolverDoesNotActOverAQuarantine(t *testing.T) {
 	rig := testRetainedAbandonUp(t, "ret-ab-stale", 2)
 	defer rig.done()
 	reg, _ := rig.abandoned(t)
@@ -337,13 +337,13 @@ func TestF105RetainedStaleResolverDoesNotActOverAQuarantine(t *testing.T) {
 	testRetainedOwnershipHolds(t, &rig.testRetainedRig, false, 4, 2*time.Second)
 }
 
-// TestF105RetainedCloseRefusesAContradictedAbandonment (consult 108, row 9): the manifest close's
+// TestRetainedCloseRefusesAContradictedAbandonment (consult 108, row 9): the manifest close's
 // abandoned arm admits a copy only on POSITIVE agreement between the exchange's retained
 // abandonment fact and its register. A delivery_abandoned register whose (valid) abandonment
 // reason disagrees with the fact is the contradiction a resume quarantines; the close must refuse
 // it as material still needed, and the copy stays. Reclamation is held off (the copy's owner
 // unreadable) until the contradiction is in place, then one step is driven directly.
-func TestF105RetainedCloseRefusesAContradictedAbandonment(t *testing.T) {
+func TestRetainedCloseRefusesAContradictedAbandonment(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// forge rewrites the register or the exchange into a contradiction a resume quarantines.
@@ -473,14 +473,14 @@ func testRetainedLatePubRec(t *testing.T, rig *testRetainedAbandonRig, subject s
 	}
 }
 
-// TestF105RetainedAckAdvanceRefusesAContradictedPair (consult 109, obligation 3): the
+// TestRetainedAckAdvanceRefusesAContradictedPair (consult 109, obligation 3): the
 // acknowledgement advance is tenure-agnostic by design, so an advance already in flight is fenced
 // only by its boundary: the standing register and the exchange's predecessor must agree by the one
 // consistency definition. A late PUBREC's advance on an abandoned retained QoS 2 exchange is held
 // at its write while the exchange's abandonment reason is rewritten (a contradiction a resume
 // quarantines); released, the advance is refused — the register stays delivery_abandoned and no
 // canonical PUBREL is created.
-func TestF105RetainedAckAdvanceRefusesAContradictedPair(t *testing.T) {
+func TestRetainedAckAdvanceRefusesAContradictedPair(t *testing.T) {
 	rig := testRetainedAbandonUp(t, "ret-ab-ackpair", 2)
 	defer rig.done()
 	reg, _ := rig.abandoned(t)
@@ -552,12 +552,12 @@ func TestF105RetainedAckAdvanceRefusesAContradictedPair(t *testing.T) {
 	}
 }
 
-// TestF105RetainedCloseLocatesTheRegisterByItsAdmission (consult 109, obligations 2 and 4): the
+// TestRetainedCloseLocatesTheRegisterByItsAdmission (consult 109, obligations 2 and 4): the
 // manifest close locates the allocation's register by the copy's ADMISSION ADDRESS, never by the
 // exchange's PI. An exchange whose PI was rewritten — to an empty identifier or to one another
 // allocation's register occupies — is refused on BOTH arms; the ended arm without the rewrite closes
 // (its register legitimately gone or terminal). Reclamation is held off at the copy's owner read.
-func TestF105RetainedCloseLocatesTheRegisterByItsAdmission(t *testing.T) {
+func TestRetainedCloseLocatesTheRegisterByItsAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		ended   bool // a late PUBACK ends the abandoned QoS 1 exchange first

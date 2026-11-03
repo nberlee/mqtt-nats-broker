@@ -28,14 +28,14 @@ import (
 // The owner's teardown of a serving generation commits the generation's discarding closure FIRST
 // and only then seals its shared acquisition ledger: the admission fence lands before the join
 // fence, so no interval exists in which the ledger is sealed and the authority can still admit.
-// T7 (TestF105_8bClosureLandsBeforeTheSeal) witnesses the ORDER from the durable records; this
+// T7 (Test8bClosureLandsBeforeTheSeal) witnesses the ORDER from the durable records; this
 // witnesses its EFFECT. A shared admission that passed every readiness read before the teardown
 // began is held there; the teardown runs through the production owner destroy and is held just
 // after its seal; the admission is then let go, and it must not land.
 //
 // Mutation (S2): the licence-bypassing reorder - the owner destroy's close and seal swapped, and
 // the closing licence's default admitting. Target: the admission does not land after the seal.
-func TestF105AnAdmissionCannotLandAfterTheSeal(t *testing.T) {
+func TestAnAdmissionCannotLandAfterTheSeal(t *testing.T) {
 	// NOT parallel: the shared pause seam is process-wide.
 	r := newTestSharedAdmitRig(t, "w2-admit-after-seal")
 	e := r.e
@@ -96,7 +96,7 @@ func TestF105AnAdmissionCannotLandAfterTheSeal(t *testing.T) {
 	if presentedOverSeal.Load() {
 		t.Fatal("an admission batch passed every boundary check while the generation's ledger stood sealed")
 	}
-	if !testF105ClosureDiscards(e.asm, sess.id, e.asm.sessStreamEpoch, gen) {
+	if !testClosureDiscards(e.asm, sess.id, e.asm.sessStreamEpoch, gen) {
 		t.Fatal("the closing sealed a generation no discarding closure ever closed")
 	}
 	if reg, smsg, err := e.asm.loadInflightRecord(mqttInflightSubject(sess.idHash, gen, pi)); err != nil || smsg != nil {
@@ -121,7 +121,7 @@ func TestF105AnAdmissionCannotLandAfterTheSeal(t *testing.T) {
 // Mutation (S1): the multi-site installation that admits an older tenure (the composer's
 // ordering check plus both validator sites). Target: A's CONNECT is refused and the ledger keeps
 // B's tenure.
-func TestF105_8bADelayedInstallLosesToThePeersTenure(t *testing.T) {
+func Test8bADelayedInstallLosesToThePeersTenure(t *testing.T) {
 	// NOT parallel: the shared pause seam is process-wide.
 	const cid = "w2-delayed-install"
 	const installPt = "install:before-send"
@@ -160,7 +160,7 @@ func TestF105_8bADelayedInstallLosesToThePeersTenure(t *testing.T) {
 	if rc, err := rB.readByte("connack return code"); err != nil || rc != mqttConnAckRCConnectionAccepted {
 		t.Fatalf("broker B refused the takeover: rc %d (%v)", rc, err)
 	}
-	tenureB, _, entB, _ := testF105_8bTenureOf(t, sB, cid)
+	tenureB, _, entB, _ := test8bTenureOf(t, sB, cid)
 
 	gates.open(installPt)
 	// TARGET: A's CONNECT is refused - never an accepted CONNACK - and its connection ends.
@@ -177,7 +177,7 @@ func TestF105_8bADelayedInstallLosesToThePeersTenure(t *testing.T) {
 	testMQTTExpectDisconnect(t, cA)
 
 	asmB := testMQTTGetAccountSessionManager(t, sB, cid)
-	epoch := testF105AccountEpoch(asmB)
+	epoch := testAccountEpoch(asmB)
 	l := asmB.jsa.loadSharedLedger(cid, epoch, entB.Gen)
 	if l.status != mqttOutboundValid || l.rec.Tenure != tenureB {
 		t.Fatalf("the generation's ledger must keep B's tenure %+v, it reads %v %+v", tenureB, l.status, l.rec)

@@ -24,23 +24,23 @@ import (
 
 // What a recovery pass does about an outstanding duty, and what it refuses to do.
 
-// testF105DiscardingCloseWithAffine closes the bootstrap generation through the production route
+// testDiscardingCloseWithAffine closes the bootstrap generation through the production route
 // — prepare, metadata commit, finalize — carrying a discarding retirement that names an affine
 // consumer, and returns the closed generation and its enrolled affine resource.
-func testF105DiscardingCloseWithAffine(t *testing.T, e *testF105Env,
+func testDiscardingCloseWithAffine(t *testing.T, e *testOutboundEnv,
 	affGen, durable string) (string, *mqttOutboundResource) {
 
-	return testF105DiscardingClose(t, e, affGen, durable, true)
+	return testDiscardingClose(t, e, affGen, durable, true)
 }
 
-// testF105DiscardingClose is the same with the SHARED enrolment optional.
+// testDiscardingClose is the same with the SHARED enrolment optional.
 //
 // It has to be optional: a shared cleanup duty is deliberately not transferred by this change, so
 // a generation carrying one can never retire — and a witness that wants to see a CERTIFICATE must
 // therefore close a generation whose only enrolled duty is the affine one. A fixture that always
 // enrolled a shared durable would make certification impossible by construction and could not tell
 // a broken retirement from an unfinished one.
-func testF105DiscardingClose(t *testing.T, e *testF105Env,
+func testDiscardingClose(t *testing.T, e *testOutboundEnv,
 	affGen, durable string, withSecond bool) (string, *mqttOutboundResource) {
 
 	t.Helper()
@@ -57,7 +57,7 @@ func testF105DiscardingClose(t *testing.T, e *testF105Env,
 			t.Fatalf("provisioning the second resource: %v", err)
 		}
 	}
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	// DERIVED, not invented: the resource's PUBREL durable must be the one its own generation
 	// owns, because that is where the proofs it owes are read from.
 	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), first.Gen)
@@ -65,7 +65,7 @@ func testF105DiscardingClose(t *testing.T, e *testF105Env,
 	intent := &mqttHandoffIntent{
 		ID: "intent-clean", PrevGen: first.Gen, PrevTenure: first.Tenure,
 		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: testF105Gen2, Tenure: "tenure-clean", CleanReq: true,
+		Gen: testGen2, Tenure: "tenure-clean", CleanReq: true,
 		Retire: &mqttRetirementRequest{
 			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
 			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
@@ -98,8 +98,8 @@ func testF105DiscardingClose(t *testing.T, e *testF105Env,
 	return _EMPTY_, nil
 }
 
-// testF105SweepUntil runs passes until cond holds or the shard walk has been round twice.
-func testF105SweepUntil(t *testing.T, e *testF105Env, cond func() bool) bool {
+// testSweepUntil runs passes until cond holds or the shard walk has been round twice.
+func testSweepUntil(t *testing.T, e *testOutboundEnv, cond func() bool) bool {
 	t.Helper()
 	for i := 0; i < 2*mqttDirShards; i++ {
 		if cond() {
@@ -110,16 +110,16 @@ func testF105SweepUntil(t *testing.T, e *testF105Env, cond func() bool) bool {
 	return cond()
 }
 
-// TestF105ThePassCompletesAnEnrolledAffineCleanup is the executable core of the transfer: with
+// TestThePassCompletesAnEnrolledAffineCleanup is the executable core of the transfer: with
 // the prerequisites asserted, a pass authorizes the deletion, performs it, classifies the result
 // and ends the duty — from the durable records alone, with no teardown and no session object.
-func TestF105ThePassCompletesAnEnrolledAffineCleanup(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-cleanup")
+func TestThePassCompletesAnEnrolledAffineCleanup(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-exec-cleanup")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 
 	// The prerequisites, asserted by the teardown's producer. The consumer itself was never
 	// created in this fixture, so the physical act will report NOT FOUND — which is a POSITIVE
@@ -131,7 +131,7 @@ func TestF105ThePassCompletesAnEnrolledAffineCleanup(t *testing.T) {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
 
-	done := testF105SweepUntil(t, e, func() bool {
+	done := testSweepUntil(t, e, func() bool {
 		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, r.Inc)
 		return cur != nil && cur.State == mqttResourceCleanupComplete
 	})
@@ -174,24 +174,24 @@ func TestF105ThePassCompletesAnEnrolledAffineCleanup(t *testing.T) {
 	}
 }
 
-// TestF105ThePassIsTheReadinessProducerOfLastResort: with no teardown running at all, the pass
+// TestThePassIsTheReadinessProducerOfLastResort: with no teardown running at all, the pass
 // does the prerequisite work itself and only then seals.
 //
 // This is the window a discarding finalization leaves — it replaces the predecessor's metadata, so
 // no marked record anchors a teardown, and "the successor's acceptance will do it" names a live
 // caller rather than a restartable one. The fixture runs no teardown whatsoever.
-func TestF105ThePassIsTheReadinessProducerOfLastResort(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-lastresort")
+func TestThePassIsTheReadinessProducerOfLastResort(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-exec-lastresort")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	if ready, rerr := e.asm.jsa.loadAffineReadiness(e.id, e.epoch, gen); rerr != nil || ready != nil {
 		t.Fatalf("readiness stood before any producer ran: %+v (%v)", ready, rerr)
 	}
 
-	if !testF105SweepUntil(t, e, func() bool {
+	if !testSweepUntil(t, e, func() bool {
 		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, r.Inc)
 		return cur != nil && cur.State == mqttResourceCleanupComplete
 	}) {
@@ -210,11 +210,11 @@ func TestF105ThePassIsTheReadinessProducerOfLastResort(t *testing.T) {
 	}
 }
 
-// TestF105ANonDiscardingClosureEnrolsNoAffineTarget is the structural half of the same rule: the
+// TestANonDiscardingClosureEnrolsNoAffineTarget is the structural half of the same rule: the
 // pass has no affine input at all for a generation whose obligations were not abandoned, so there
 // is nothing for a discard guard to protect.
-func TestF105ANonDiscardingClosureEnrolsNoAffineTarget(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-preserving")
+func TestANonDiscardingClosureEnrolsNoAffineTarget(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-exec-preserving")
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
@@ -249,7 +249,7 @@ func TestF105ANonDiscardingClosureEnrolsNoAffineTarget(t *testing.T) {
 		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing without a discard: %v", err)
 	}
-	res, unreadable, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen)
+	res, unreadable, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, testGen)
 	if rerr != nil || unreadable != 0 {
 		t.Fatalf("enumerating the enrolment: %v (%d unreadable)", rerr, unreadable)
 	}
@@ -264,21 +264,21 @@ func TestF105ANonDiscardingClosureEnrolsNoAffineTarget(t *testing.T) {
 	for i := 0; i < 2*mqttDirShards; i++ {
 		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
 	}
-	if ready, lerr := e.asm.jsa.loadAffineReadiness(e.id, e.epoch, testF105Gen); lerr != nil || ready != nil {
+	if ready, lerr := e.asm.jsa.loadAffineReadiness(e.id, e.epoch, testGen); lerr != nil || ready != nil {
 		t.Fatalf("a readiness assertion was written for a preserving closure: %+v (%v)", ready, lerr)
 	}
 }
 
-// TestF105AnAbsentAuthorityWithholdsEveryDuty exercises the guard on an ALREADY AUTHORIZED
+// TestAnAbsentAuthorityWithholdsEveryDuty exercises the guard on an ALREADY AUTHORIZED
 // cleanup, so removing it would reach the physical delete rather than being masked by
 // opAuthorizeDeletion's own refusal.
-func TestF105AnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-noauth")
+func TestAnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-exec-noauth")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: e.id, Epoch: e.epoch, Gen: gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
@@ -286,7 +286,7 @@ func TestF105AnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
 	// Drive it to DELETE_AUTHORIZED through the ordinary route.
-	if !testF105SweepUntil(t, e, func() bool {
+	if !testSweepUntil(t, e, func() bool {
 		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, r.Inc)
 		return cur != nil && cur.State != mqttResourceLive
 	}) {
@@ -378,7 +378,7 @@ func TestF105AnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
 	}
 }
 
-// TestF105AnAbsentAuthorityWithholdsTheReadinessWorkToo is the same rule on the OTHER mutating
+// TestAnAbsentAuthorityWithholdsTheReadinessWorkToo is the same rule on the OTHER mutating
 // branch, and it exists because fixing the first one alone was the mistake.
 //
 // The readiness work is dispatched from the WITHHELD arm rather than the acting one, so the guard
@@ -386,13 +386,13 @@ func TestF105AnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
 // pass still secured proofs, marked owned assignments Discarded and could publish readiness — and
 // the seal that would have been refused comes after all of it. A refusal that arrives after the
 // irreversible half is not a refusal.
-func TestF105AnAbsentAuthorityWithholdsTheReadinessWorkToo(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-noauth-readiness")
+func TestAnAbsentAuthorityWithholdsTheReadinessWorkToo(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-noauth-readiness")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, r := testDiscardingClose(t, e, affGen, durable, false)
 
 	// AN OWNED ASSIGNMENT, so the branch has something to mutate and its absence of change is
 	// measurable. A planted claim of THIS client's affine generation is what the discard targets.
@@ -449,22 +449,22 @@ func TestF105AnAbsentAuthorityWithholdsTheReadinessWorkToo(t *testing.T) {
 	}
 }
 
-// TestF105TheBoundaryJudgesTheEndingAgainstTheBatch is the S-xor-Delta rule, with the middle arm
+// TestTheBoundaryJudgesTheEndingAgainstTheBatch is the S-xor-Delta rule, with the middle arm
 // pinned so no other validator can mask the binding.
-func TestF105TheBoundaryJudgesTheEndingAgainstTheBatch(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-ending-binding")
+func TestTheBoundaryJudgesTheEndingAgainstTheBatch(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-ending-binding")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: e.id, Epoch: e.epoch, Gen: gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
 	}); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
-	if !testF105SweepUntil(t, e, func() bool {
+	if !testSweepUntil(t, e, func() bool {
 		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, r.Inc)
 		return cur != nil && cur.State == mqttResourceDeleteAuthorized
 	}) {
@@ -507,16 +507,16 @@ func TestF105TheBoundaryJudgesTheEndingAgainstTheBatch(t *testing.T) {
 	}
 }
 
-// TestF105CleanupOfG1RunsWhileG2Serves: a retired generation's disposal runs under the CLOSED
+// TestCleanupOfG1RunsWhileG2Serves: a retired generation's disposal runs under the CLOSED
 // authority the client carries, and it neither moves the successor's ownership nor resolves a
 // proposal standing beside it.
-func TestF105CleanupOfG1RunsWhileG2Serves(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-g1g2")
+func TestCleanupOfG1RunsWhileG2Serves(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-exec-g1g2")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	// The successor is SERVING after the discarding finalization, and it is a different
 	// generation from the one being cleaned up.
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -534,7 +534,7 @@ func TestF105CleanupOfG1RunsWhileG2Serves(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
-	if !testF105SweepUntil(t, e, func() bool {
+	if !testSweepUntil(t, e, func() bool {
 		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, r.Inc)
 		return cur != nil && cur.State == mqttResourceCleanupComplete
 	}) {
@@ -552,14 +552,14 @@ func TestF105CleanupOfG1RunsWhileG2Serves(t *testing.T) {
 	}
 }
 
-// TestF105AnUnsupportedOutcomeIsRefused pins what a completion may say.
-func TestF105AnUnsupportedOutcomeIsRefused(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-exec-outcome")
+// TestAnUnsupportedOutcomeIsRefused pins what a completion may say.
+func TestAnUnsupportedOutcomeIsRefused(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-exec-outcome")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	cur, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, r.Inc)
 	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: gen}
 	err := e.asm.jsa.completeCleanupAndResolve(root, cur, rseq, mqttSweptDuty{Ord: 1},
@@ -572,7 +572,7 @@ func TestF105AnUnsupportedOutcomeIsRefused(t *testing.T) {
 	}
 }
 
-// TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup is the WITNESS.
+// TestARestartedBrokerCompletesTheEnrolledAffineCleanup is the WITNESS.
 //
 // Everything a running broker knows is destroyed between the enrolment and the recovery: the
 // server is shut down and a fresh one is brought up against the same JetStream state, so the new
@@ -592,7 +592,7 @@ func TestF105AnUnsupportedOutcomeIsRefused(t *testing.T) {
 //     deliberately untransferred, so a generation carrying one can never retire and a witness
 //     built on it could not tell a broken retirement from an unfinished one;
 //  5. only then, the consumer is gone.
-func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
+func TestARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -607,8 +607,8 @@ func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 	if epoch == _EMPTY_ {
 		t.Fatal("the account has no recovery epoch, so nothing here can be attributed")
 	}
-	e := &testF105Env{asm: asm, id: clientID, epoch: epoch}
-	testF105ClearMintedAuthority(t, asm, clientID, nil)
+	e := &testOutboundEnv{asm: asm, id: clientID, epoch: epoch}
+	testClearMintedAuthority(t, asm, clientID, nil)
 
 	// THE AFFINE GENERATION AND ITS DERIVED NAMES. The resource's own name is derived from the
 	// affine generation, so the fixture cannot invent one: a record naming any other consumer is
@@ -626,7 +626,7 @@ func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 	}
 
 	// AFFINE-ONLY, so the generation can retire once that one duty ends.
-	gen, res := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, res := testDiscardingClose(t, e, affGen, durable, false)
 	if res.Name != durable {
 		t.Fatalf("the enrolment names %q, and the consumer is %q", res.Name, durable)
 	}
@@ -748,7 +748,7 @@ func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 	}
 }
 
-// TestF105TheEndingRuleBindsToItsOwnResource is the wrong-resource fixture, pinned so no other
+// TestTheEndingRuleBindsToItsOwnResource is the wrong-resource fixture, pinned so no other
 // validator can mask the binding.
 //
 // The batch carries a completion for resource A that is independently valid at its own CAS
@@ -756,15 +756,15 @@ func TestF105ARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 // cleanup-INCOMPLETE, holds a valid pending cleanup duty at the expectation the continuation
 // names, and has NO completion member of its own. Every member passes its own validator; B cannot
 // support its own ending; only the resource binding can reject the pairing.
-func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-ending-ab")
+func TestTheEndingRuleBindsToItsOwnResource(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-ending-ab")
 	defer cleanup()
 
 	// TWO resources in one generation, each with its own pending cleanup duty: the affine
 	// consumer the closure enrols, and a source consumer provisioned before it.
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, a := testF105DiscardingClose(t, e, affGen, durable, true)
+	gen, a := testDiscardingClose(t, e, affGen, durable, true)
 	var b *mqttOutboundResource
 	res, _, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, gen)
 	if rerr != nil {
@@ -786,7 +786,7 @@ func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
-	if !testF105SweepUntil(t, e, func() bool {
+	if !testSweepUntil(t, e, func() bool {
 		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, a.Inc)
 		return cur != nil && cur.State != mqttResourceLive
 	}) {
@@ -855,7 +855,7 @@ func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
 	}
 }
 
-// TestF105ReadinessConvergesPastOnePassOfClaims is round 2's finding 2, pinned.
+// TestReadinessConvergesPastOnePassOfClaims is round 2's finding 2, pinned.
 //
 // The assignment stream is keyed by GROUP DURABLE, not by client, so establishing that a retiring
 // generation's assignments are discarded is an account-wide walk that cannot be filtered. Charging
@@ -867,8 +867,8 @@ func TestF105TheEndingRuleBindsToItsOwnResource(t *testing.T) {
 //
 // So the fixture plants MORE unrelated claims than one pass could ever charge for, and requires
 // the generation to certify anyway.
-func TestF105ReadinessConvergesPastOnePassOfClaims(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-readiness-converge")
+func TestReadinessConvergesPastOnePassOfClaims(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-readiness-converge")
 	defer cleanup()
 
 	// Unrelated, stable, and more numerous than the whole pass budget.
@@ -897,7 +897,7 @@ func TestF105ReadinessConvergesPastOnePassOfClaims(t *testing.T) {
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, r := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, r := testDiscardingClose(t, e, affGen, durable, false)
 
 	certified := false
 	for i := 0; i < 6*mqttDirShards && !certified; i++ {
@@ -913,14 +913,14 @@ func TestF105ReadinessConvergesPastOnePassOfClaims(t *testing.T) {
 	}
 }
 
-// TestF105TheReadinessWalkIsCancellableMidScan: what protects the shared sweep goroutine from an
+// TestTheReadinessWalkIsCancellableMidScan: what protects the shared sweep goroutine from an
 // account-wide walk is CANCELLATION, since the walk cannot be charged without starving it.
 //
 // So the stop is made to fire part-way through, and the assertion is that the walk ended there —
 // no readiness record, because partial work never licenses the assertion — and that a later pass
 // with no stop completes it.
-func TestF105TheReadinessWalkIsCancellableMidScan(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-readiness-cancel")
+func TestTheReadinessWalkIsCancellableMidScan(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-readiness-cancel")
 	defer cleanup()
 
 	for i := 0; i < 64; i++ {
@@ -944,7 +944,7 @@ func TestF105TheReadinessWalkIsCancellableMidScan(t *testing.T) {
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, _ := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, _ := testDiscardingClose(t, e, affGen, durable, false)
 
 	// A STOP THAT FIRES ONCE THE WALK HAS BEGUN, keyed on the walk itself rather than on a call
 	// count, so the cancellation lands at the walk's first store operation no matter how many
@@ -988,13 +988,13 @@ func TestF105TheReadinessWalkIsCancellableMidScan(t *testing.T) {
 	t.Fatal("readiness was never published once the stop was lifted")
 }
 
-// testF105SecondDiscardingClose closes the CURRENTLY SERVING generation with a discarding
+// testSecondDiscardingClose closes the CURRENTLY SERVING generation with a discarding
 // disposition, so one client ends up with TWO enrolled roots in ONE directory shard.
 //
 // One shard is the point: a root's shard is derived from its client (mqttDirShardFor(getHash(id))),
 // so two generations of one client are consecutive ordinals of the same traversal — which is the
 // only arrangement in which one root can starve another of the pass's single readiness attempt.
-func testF105SecondDiscardingClose(t *testing.T, e *testF105Env,
+func testSecondDiscardingClose(t *testing.T, e *testOutboundEnv,
 	nextGen, affGen, durable string) (string, *mqttOutboundResource) {
 
 	t.Helper()
@@ -1003,7 +1003,7 @@ func testF105SecondDiscardingClose(t *testing.T, e *testF105Env,
 	if cur.status != mqttOutboundValid || cur.rec == nil {
 		t.Fatalf("no serving authority to close: status %v", cur.status)
 	}
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), cur.rec.Gen)
 
 	intent := &mqttHandoffIntent{
@@ -1043,7 +1043,7 @@ func testF105SecondDiscardingClose(t *testing.T, e *testF105Env,
 	return _EMPTY_, nil
 }
 
-// TestF105APermanentlyFailingRootDoesNotStarveItsSibling is holistic round 3's finding 1.
+// TestAPermanentlyFailingRootDoesNotStarveItsSibling is holistic round 3's finding 1.
 //
 // The pass's single readiness attempt is spent BEFORE either helper can succeed, and roots are
 // visited in ordinal order, so a root whose proof resolution fails permanently would take the
@@ -1055,16 +1055,16 @@ func testF105SecondDiscardingClose(t *testing.T, e *testF105Env,
 // Two generations of ONE client is the arrangement that tests this, because a root's shard is
 // derived from its client — the two roots are consecutive ordinals of one traversal by
 // construction rather than by luck.
-func TestF105APermanentlyFailingRootDoesNotStarveItsSibling(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-starve")
+func TestAPermanentlyFailingRootDoesNotStarveItsSibling(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-starve")
 	defer cleanup()
 
 	const affA, affB = "0123456789abcdefghijka", "0123456789abcdefghijkb"
 	_, _, durA := mqttQ2AffineNames(getHash(e.id), affA)
-	genA, _ := testF105DiscardingClose(t, e, affA, durA, false)
+	genA, _ := testDiscardingClose(t, e, affA, durA, false)
 
 	_, _, durB := mqttQ2AffineNames(getHash(e.id), affB)
-	genB, resB := testF105SecondDiscardingClose(t, e, "0123456789abcdefghijkc", affB, durB)
+	genB, resB := testSecondDiscardingClose(t, e, "0123456789abcdefghijkc", affB, durB)
 	if genA == genB {
 		t.Fatalf("both closes named generation %q, so there is only one root", genA)
 	}
@@ -1118,7 +1118,7 @@ func TestF105APermanentlyFailingRootDoesNotStarveItsSibling(t *testing.T) {
 	}
 }
 
-// TestF105ThePassEndsWithTheRootThatSpendsTheReadinessAttempt is the MECHANISM behind the fairness
+// TestThePassEndsWithTheRootThatSpendsTheReadinessAttempt is the MECHANISM behind the fairness
 // claim, asserted directly.
 //
 // The starvation it prevents cannot be reproduced on demand — that needs two roots whose sweeps
@@ -1126,8 +1126,8 @@ func TestF105APermanentlyFailingRootDoesNotStarveItsSibling(t *testing.T) {
 // coupling that makes the starvation impossible whatever the alignment: a pass that spends its one
 // readiness attempt visits no further root, so the shard's traversal position is left just past
 // the spender and the next visit begins at its sibling.
-func TestF105ThePassEndsWithTheRootThatSpendsTheReadinessAttempt(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-quantum")
+func TestThePassEndsWithTheRootThatSpendsTheReadinessAttempt(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-quantum")
 	defer cleanup()
 
 	// THREE roots, not two. With two, the root that spends the attempt is always the LAST one its
@@ -1136,11 +1136,11 @@ func TestF105ThePassEndsWithTheRootThatSpendsTheReadinessAttempt(t *testing.T) {
 	const affA, affB, affC = "0123456789abcdefghijka", "0123456789abcdefghijkb",
 		"0123456789abcdefghijkd"
 	_, _, durA := mqttQ2AffineNames(getHash(e.id), affA)
-	testF105DiscardingClose(t, e, affA, durA, false)
+	testDiscardingClose(t, e, affA, durA, false)
 	_, _, durB := mqttQ2AffineNames(getHash(e.id), affB)
-	testF105SecondDiscardingClose(t, e, "0123456789abcdefghijkc", affB, durB)
+	testSecondDiscardingClose(t, e, "0123456789abcdefghijkc", affB, durB)
 	_, _, durC := mqttQ2AffineNames(getHash(e.id), affC)
-	testF105SecondDiscardingClose(t, e, "0123456789abcdefghijke", affC, durC)
+	testSecondDiscardingClose(t, e, "0123456789abcdefghijke", affC, durC)
 
 	var visitsThisPass, visitsAfterSpend int
 	var spent bool
@@ -1193,8 +1193,8 @@ func TestF105ThePassEndsWithTheRootThatSpendsTheReadinessAttempt(t *testing.T) {
 	}
 }
 
-// testF105PlantClaim writes one well-formed unrelated assignment claim.
-func testF105PlantClaim(t *testing.T, e *testF105Env, group string, sseq uint64) {
+// testPlantClaim writes one well-formed unrelated assignment claim.
+func testPlantClaim(t *testing.T, e *testOutboundEnv, group string, sseq uint64) {
 	t.Helper()
 	claim := &mqttQ2AffClaim{
 		Winner: getHash("someone-else"), Gen: "0123456789abcdefghijkx",
@@ -1213,22 +1213,22 @@ func testF105PlantClaim(t *testing.T, e *testF105Env, group string, sseq uint64)
 	}
 }
 
-// TestF105TheAssignmentWalkExtendsItsHorizonAndCompletes is holistic round 4's finding, arm 1:
+// TestTheAssignmentWalkExtendsItsHorizonAndCompletes is holistic round 4's finding, arm 1:
 // a tail that MOVES during the walk is followed, and the walk still completes.
 //
 // The moving tail is supplied from inside the walk itself, so it is not a race the fixture hopes
 // to win: the seam fires once the attempt is taken, and the records it plants land ahead of the
 // reader's first horizon by construction.
-func TestF105TheAssignmentWalkExtendsItsHorizonAndCompletes(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-horizon")
+func TestTheAssignmentWalkExtendsItsHorizonAndCompletes(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-horizon")
 	defer cleanup()
 
 	for i := 0; i < 8; i++ {
-		testF105PlantClaim(t, e, "$MQTT_SHARED_before", uint64(i+1))
+		testPlantClaim(t, e, "$MQTT_SHARED_before", uint64(i+1))
 	}
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, _ := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, _ := testDiscardingClose(t, e, affGen, durable, false)
 
 	// A SHORT BURST FROM INSIDE THE WALK, then stillness. The writes must land AFTER the walk has
 	// taken its first horizon — a burst at the walk's ENTRY is already below it and needs no
@@ -1252,7 +1252,7 @@ func TestF105TheAssignmentWalkExtendsItsHorizonAndCompletes(t *testing.T) {
 		}
 		for i := 0; i < burst; i++ {
 			planted++
-			testF105PlantClaim(t, e, "$MQTT_SHARED_during", uint64(planted))
+			testPlantClaim(t, e, "$MQTT_SHARED_during", uint64(planted))
 		}
 	})
 	defer restoreTail()
@@ -1279,20 +1279,20 @@ func TestF105TheAssignmentWalkExtendsItsHorizonAndCompletes(t *testing.T) {
 		walks, planted)
 }
 
-// TestF105TheAssignmentWalkWithholdsReadinessOnAMovingTail is arm 3: a tail that keeps moving
+// TestTheAssignmentWalkWithholdsReadinessOnAMovingTail is arm 3: a tail that keeps moving
 // past the permitted extensions ends the attempt rather than chasing it, and asserts NOTHING.
 //
 // This is the finding's actual hazard — an attempt that never returns holds the maintenance
 // goroutine, which also carries session expiry and both orphan sweeps — so the assertion is that
 // the pass RETURNS, with no readiness and no seal, and that the generation still converges once
 // the writing stops.
-func TestF105TheAssignmentWalkWithholdsReadinessOnAMovingTail(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-moving-tail")
+func TestTheAssignmentWalkWithholdsReadinessOnAMovingTail(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-moving-tail")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, res := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, res := testDiscardingClose(t, e, affGen, durable, false)
 
 	// A WRITE IN EVERY VERIFICATION INTERVAL is all it takes — the tail need not outrun the
 	// reader, it need only never be still when the reader looks.
@@ -1309,7 +1309,7 @@ func TestF105TheAssignmentWalkWithholdsReadinessOnAMovingTail(t *testing.T) {
 		// verification intervals is one more than the walk can absorb.
 		if walks > 0 && moving && planted < 4*(mqttRecoveryClaimScanExtensions+2) {
 			planted++
-			testF105PlantClaim(t, e, "$MQTT_SHARED_moving", uint64(planted))
+			testPlantClaim(t, e, "$MQTT_SHARED_moving", uint64(planted))
 		}
 		return false
 	}
@@ -1343,7 +1343,7 @@ func TestF105TheAssignmentWalkWithholdsReadinessOnAMovingTail(t *testing.T) {
 	t.Fatal("readiness was never published after the assignment stream went still")
 }
 
-// TestF105AnUnreadableSuffixIsNotACompletedSegment is holistic round 6's store-error conflation,
+// TestAnUnreadableSuffixIsNotACompletedSegment is holistic round 6's store-error conflation,
 // found by consult 9 in the pinned server: every error returned by LoadMsg, LoadNextMsg and
 // LoadLastMsg becomes JSNoMessageFoundErr, so a FAILED READ and an empty suffix are the same
 // response on the wire.
@@ -1355,16 +1355,16 @@ func TestF105TheAssignmentWalkWithholdsReadinessOnAMovingTail(t *testing.T) {
 // The fixture makes the response arise honestly rather than by injection: deleting the stream's
 // LAST record leaves the high-water above every live one, so a read from beyond the last live
 // record returns no-message while the segment's bound says there should be more.
-func TestF105AnUnreadableSuffixIsNotACompletedSegment(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-unreadable-suffix")
+func TestAnUnreadableSuffixIsNotACompletedSegment(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-unreadable-suffix")
 	defer cleanup()
 
 	for i := 0; i < 4; i++ {
-		testF105PlantClaim(t, e, "$MQTT_SHARED_suffix", uint64(i+1))
+		testPlantClaim(t, e, "$MQTT_SHARED_suffix", uint64(i+1))
 	}
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, _ := testF105DiscardingClose(t, e, affGen, durable, false)
+	gen, _ := testDiscardingClose(t, e, affGen, durable, false)
 
 	si, serr := e.asm.jsa.lookupStream(mqttQoS2AssignStreamName)
 	if serr != nil || si == nil {

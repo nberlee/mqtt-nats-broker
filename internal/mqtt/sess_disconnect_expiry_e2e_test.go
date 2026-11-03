@@ -608,9 +608,9 @@ func TestMQTTv5DisconnectRaiseToNeverExpireStampsInMemory(t *testing.T) {
 // makes "the DISCONNECT was observed first, then the CONNECT took over" an ordering
 // rather than a probability. Spec5 [3.1.2.11], [3.14.2.2.2], [MQTT-3.2.2-3].
 
-// testF040Bound is a v5 session with a live serving authority whose connection has sent
+// testBound is a v5 session with a live serving authority whose connection has sent
 // disconnect and is held at the teardown seam, still bound.
-type testF040Bound struct {
+type testBound struct {
 	s     *Server
 	o     *Options
 	asm   *mqttAccountSessionManager
@@ -622,12 +622,12 @@ type testF040Bound struct {
 	barrier *testMQTTTeardownBarrier
 }
 
-func testF040BindAndDisconnect(t *testing.T, cid string, disconnect []byte, wantOverride *uint32) *testF040Bound {
+func testBindAndDisconnect(t *testing.T, cid string, disconnect []byte, wantOverride *uint32) *testBound {
 	t.Helper()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	t.Cleanup(func() { testMQTTShutdownServer(s) })
-	f := &testF040Bound{s: s, o: o, cid: cid, topic: cid + "/t", subject: cid + ".t"}
+	f := &testBound{s: s, o: o, cid: cid, topic: cid + "/t", subject: cid + ".t"}
 
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
 		props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
@@ -675,7 +675,7 @@ func testF040BindAndDisconnect(t *testing.T, cid string, disconnect []byte, want
 }
 
 // record loads the persisted session record, or nil when there is none.
-func (f *testF040Bound) record(t *testing.T) *mqttPersistedSession {
+func (f *testBound) record(t *testing.T) *mqttPersistedSession {
 	t.Helper()
 	smsg, err := f.asm.jsa.loadSessionMsg(f.asm.domainTk, getHash(f.cid))
 	if err != nil {
@@ -693,7 +693,7 @@ func (f *testF040Bound) record(t *testing.T) *mqttPersistedSession {
 
 // delivered reports whether a QoS 1 message published to the session's subscribed topic
 // reaches r. "Session Present" is a bare bit; this is what the session IS.
-func (f *testF040Bound) delivered(t *testing.T, r *mqttReader, wait time.Duration) bool {
+func (f *testBound) delivered(t *testing.T, r *mqttReader, wait time.Duration) bool {
 	t.Helper()
 	pc, pr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: f.cid + "-pub", cleanStart: true},
 		f.o.MQTT.Host, f.o.MQTT.Port)
@@ -725,7 +725,7 @@ func TestMQTTv5TakeoverHonorsBoundDisconnectExpiryZero(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cid := fmt.Sprintf("f040-%v-%d", tc.ends, len(tc.disconnect))
-			f := testF040BindAndDisconnect(t, cid, tc.disconnect, tc.override)
+			f := testBindAndDisconnect(t, cid, tc.disconnect, tc.override)
 
 			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid,
 				props: mqttV5ConnPropsSessionExpiry(3600)}, f.o.MQTT.Host, f.o.MQTT.Port)
@@ -770,29 +770,29 @@ func TestMQTTv5TakeoverHonorsBoundDisconnectExpiryZero(t *testing.T) {
 func TestMQTTv5TakeoverDisconnectEndingSurvivesCancelledHandoff(t *testing.T) {
 	zero := uint32(0)
 	const cid = "f040-handoff"
-	f := testF040BindAndDisconnect(t, cid, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero)
+	f := testBindAndDisconnect(t, cid, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero)
 	f.asm.mu.RLock()
 	epoch := f.asm.sessStreamEpoch
 	f.asm.mu.RUnlock()
-	if _, state := testF105StandingProposal(t, f.asm, cid, epoch); state != mqttAuthorityServing {
+	if _, state := testStandingProposal(t, f.asm, cid, epoch); state != mqttAuthorityServing {
 		t.Fatalf("the session must have a SERVING authority for the takeover to hand off from, got %v", state)
 	}
 
 	var stopped atomic.Bool
-	stop := testF105StopOnce(mqttOwnershipPrepareHandoff)
-	testF105ArmBeforeMetadata(t, f.asm, func(a mqttConnectOwnershipAction) error {
+	stop := testStopOnce(mqttOwnershipPrepareHandoff)
+	testArmBeforeMetadata(t, f.asm, func(a mqttConnectOwnershipAction) error {
 		err := stop(a)
 		if err != nil {
 			stopped.Store(true)
 		}
 		return err
 	})
-	testF105RefusedConnectV5(t, f.o, &mqttV5ConnInfo{clientID: cid,
+	testRefusedConnectV5(t, f.o, &mqttV5ConnInfo{clientID: cid,
 		props: mqttV5ConnPropsSessionExpiry(3600)})
 	if !stopped.Load() {
 		t.Fatal("the takeover never reached its handoff's metadata commit: the route under test was not taken")
 	}
-	if crashed, state := testF105StandingProposal(t, f.asm, cid, epoch); crashed == _EMPTY_ || state != mqttAuthorityPreparing {
+	if crashed, state := testStandingProposal(t, f.asm, cid, epoch); crashed == _EMPTY_ || state != mqttAuthorityPreparing {
 		t.Fatalf("the refused takeover must leave its preparation standing, got %q %v", crashed, state)
 	}
 
@@ -844,7 +844,7 @@ func TestMQTTv5TakeoverDisconnectEndingSurvivesCancelledHandoff(t *testing.T) {
 func TestMQTTv5TakeoverBoundDisconnectRefusesOnLateUncertainty(t *testing.T) {
 	zero := uint32(0)
 	const cid = "f040-uncertain"
-	f := testF040BindAndDisconnect(t, cid, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero)
+	f := testBindAndDisconnect(t, cid, mqttV5DisconnectSessionExpiry(mqttReasonSuccess, 0), &zero)
 
 	var armed atomic.Bool
 	f.asm.mu.Lock()
@@ -868,7 +868,7 @@ func TestMQTTv5TakeoverBoundDisconnectRefusesOnLateUncertainty(t *testing.T) {
 		f.sess.mu.Unlock()
 	})
 
-	testF105RefusedConnectV5(t, f.o, &mqttV5ConnInfo{clientID: cid,
+	testRefusedConnectV5(t, f.o, &mqttV5ConnInfo{clientID: cid,
 		props: mqttV5ConnPropsSessionExpiry(3600)})
 	if !armed.Load() {
 		t.Fatal("the takeover never reached the bound-DISCONNECT step: the route under test was not taken")

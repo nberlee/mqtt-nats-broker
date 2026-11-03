@@ -30,9 +30,9 @@ import (
 // receipt's authority before deleting the record. A reconnect then finds CLOSED and reserves a
 // fresh generation over it.
 
-// testF105StandaloneTeardownEnv connects a PERSISTENT v5 session, returns the account, its
+// testStandaloneTeardownEnv connects a PERSISTENT v5 session, returns the account, its
 // recovery epoch and the serving generation, and the running server's options.
-func testF105StandaloneTeardownEnv(t *testing.T, clientID string) (*Server, *mqttAccountSessionManager, string, string, func()) {
+func testStandaloneTeardownEnv(t *testing.T, clientID string) (*Server, *mqttAccountSessionManager, string, string, func()) {
 	t.Helper()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -65,14 +65,14 @@ func testF105StandaloneTeardownEnv(t *testing.T, clientID string) (*Server, *mqt
 	return s, asm, epoch, gen, func() { testMQTTShutdownServer(s) }
 }
 
-// TestF105StandaloneTeardownClosesAuthorityDiscarding asserts the durable outcome of a
+// TestStandaloneTeardownClosesAuthorityDiscarding asserts the durable outcome of a
 // standalone teardown: the retiring generation carries a DISCARDING closure, and the durable
 // teardown receipt that authorized it stands, naming that exact generation with a session-end
 // reason. This is the fact a close-admission could never write, made permanent by an authority
 // the receipt supplies.
-func TestF105StandaloneTeardownClosesAuthorityDiscarding(t *testing.T) {
+func TestStandaloneTeardownClosesAuthorityDiscarding(t *testing.T) {
 	const clientID = "f105-standalone-close"
-	_, asm, epoch, gen, done := testF105StandaloneTeardownEnv(t, clientID)
+	_, asm, epoch, gen, done := testStandaloneTeardownEnv(t, clientID)
 	defer done()
 
 	cl, _, st := asm.jsa.loadGenClosure(clientID, epoch, gen)
@@ -97,13 +97,13 @@ func TestF105StandaloneTeardownClosesAuthorityDiscarding(t *testing.T) {
 	}
 }
 
-// TestF105StandaloneTeardownPermitsReserveOverClosed is the production regression the close
+// TestStandaloneTeardownPermitsReserveOverClosed is the production regression the close
 // exists for: after a standalone teardown a reconnect must be ACCEPTED, reserving a fresh
 // generation over the CLOSED authority — never met by a serving authority with a deleted
 // record it can neither resume nor displace.
-func TestF105StandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
+func TestStandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
 	const clientID = "f105-standalone-reserve"
-	s, asm, epoch, oldGen, done := testF105StandaloneTeardownEnv(t, clientID)
+	s, asm, epoch, oldGen, done := testStandaloneTeardownEnv(t, clientID)
 	defer done()
 	o := s.getOpts()
 
@@ -124,7 +124,7 @@ func TestF105StandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
 	}
 }
 
-// TestF105StandaloneTeardownCrashWindowsAreExecutableSpecs documents the cross-stream crash
+// TestStandaloneTeardownCrashWindowsAreExecutableSpecs documents the cross-stream crash
 // windows Codex enumerated (consult 7, section 4). They are executable specifications rather
 // than run assertions because reaching them needs a broker parked between two separate
 // transactions — the authority close and the record delete — which a single-broker harness
@@ -138,14 +138,14 @@ func TestF105StandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
 //   - Authority CLOSED, marker still present: never resume that generation; finish the adopted
 //     teardown, then reserve a fresh generation over CLOSED. Covered by closeTeardownGeneration's
 //     idempotency — a standing DISCARDING closure of the generation is success — and by
-//     TestF105StandaloneTeardownPermitsReserveOverClosed for the reserve.
+//     TestStandaloneTeardownPermitsReserveOverClosed for the reserve.
 //   - Closure acknowledgement lost: the bounded episode resolves the transition rather than
 //     re-composing blind or deleting on a timeout. Covered by closeTeardownGeneration's own
 //     resolve/abort loop.
 //   - Record absent while authority SERVING: a FORBIDDEN outcome. The close commits before the
 //     record delete, and the seq==0 arm never discards an authorized generation on an absent
 //     record — that state is proposal recovery's (Gap 2), not this unit's.
-func TestF105StandaloneTeardownCrashWindowsAreExecutableSpecs(t *testing.T) {
+func TestStandaloneTeardownCrashWindowsAreExecutableSpecs(t *testing.T) {
 	t.Skip("executable specification: the crash-window recoveries are implemented (adopter close, " +
 		"idempotent re-close, bounded resolve) and asserted indirectly; a parked-broker harness for " +
 		"the cross-stream window is owed with the Gap-2 CONNECT-side recovery work")

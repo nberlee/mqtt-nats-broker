@@ -112,7 +112,7 @@ func testSuccessorRestores(t *testing.T, f *testWithdrawFix, c2 *client) {
 
 // T10, both orders. Mutations M10 (the void without its entitlement comparison), M13 (entitlement
 // loss falling back to a destructive retry).
-func TestF105StaleCloseDecidesNothingForTheSuccessor(t *testing.T) {
+func TestStaleCloseDecidesNothingForTheSuccessor(t *testing.T) {
 	t.Parallel()
 	t.Run("close first", func(t *testing.T) {
 		t.Parallel()
@@ -140,7 +140,7 @@ func TestF105StaleCloseDecidesNothingForTheSuccessor(t *testing.T) {
 // successor that takes over BETWEEN the close's authority read and its commit still defeats it.
 //
 // Mutation M11: the entitlement checked, then committed in a separate write.
-func TestF105StaleCloseLosesToATakeoverBetweenLoadAndCommit(t *testing.T) {
+func TestStaleCloseLosesToATakeoverBetweenLoadAndCommit(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "stale-close-pause", 1)
 	lic := mqttLicenceOf(f.e.c)
@@ -168,7 +168,7 @@ func TestF105StaleCloseLosesToATakeoverBetweenLoadAndCommit(t *testing.T) {
 // connection's decision and is carried.
 //
 // Mutation M13b: verdict staging without the binding check.
-func TestF105VerdictStagingNeedsTheBoundEntitlement(t *testing.T) {
+func TestVerdictStagingNeedsTheBoundEntitlement(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "verdict-staging", 1)
 	e := f.e
@@ -198,7 +198,7 @@ func TestF105VerdictStagingNeedsTheBoundEntitlement(t *testing.T) {
 // T10d (consult 92). Duplicate-source ambiguity survives a stale close and another recovery: two
 // registers naming one source keep both identifiers reserved and the identifier space incomplete,
 // whatever the stale close attempted.
-func TestF105DuplicateSourceAmbiguitySurvivesAStaleClose(t *testing.T) {
+func TestDuplicateSourceAmbiguitySurvivesAStaleClose(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "stale-close-duplicate")
 	testReadyForRealPubRelDelivery(t, e)
@@ -240,7 +240,7 @@ func TestF105DuplicateSourceAmbiguitySurvivesAStaleClose(t *testing.T) {
 // fallback is the only durable representation left, and it stages and persists.
 //
 // Mutation M-detach: boundEnt cleared on detach -> the detached close's verdict is refused.
-func TestF105DetachedCloseStagesItsVerdict(t *testing.T) {
+func TestDetachedCloseStagesItsVerdict(t *testing.T) {
 	// NOT parallel: installs a process-global delete hook.
 	f := testWithdrawAdmitted(t, "detached-close", 1)
 	e := f.e
@@ -289,7 +289,7 @@ func TestF105DetachedCloseStagesItsVerdict(t *testing.T) {
 //
 // Mutation M-unreadable: the unreadable arm proceeds as the missing one does -> the register is
 // deleted.
-func TestF105StaleCloseDoesNotDestroyOverAnUnreadableExchange(t *testing.T) {
+func TestStaleCloseDoesNotDestroyOverAnUnreadableExchange(t *testing.T) {
 	// NOT parallel: installs a process-global load hook.
 	f := testWithdrawAdmitted(t, "stale-close-unreadable", 1)
 	e := f.e
@@ -323,7 +323,7 @@ func TestF105StaleCloseDoesNotDestroyOverAnUnreadableExchange(t *testing.T) {
 // successor's register stays live.
 //
 // Mutation M-nomarker: the no-marker arm deletes directly again -> the register is gone.
-func TestF105NoMarkerWithdrawalNeverDestroysWithoutAFence(t *testing.T) {
+func TestNoMarkerWithdrawalNeverDestroysWithoutAFence(t *testing.T) {
 	// NOT parallel: installs a process-global load hook.
 	f := testWithdrawAdmitted(t, "stale-close-nomarker", 1)
 	e := f.e

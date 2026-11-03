@@ -293,4 +293,4 @@ func mqttClassifyInflightSlot(obs mqttSlotObservation, want mqttAllocationIntent
 // the audit would compare the verdict against itself. A test that cannot fail is worse than no
 // test, because it reads like coverage. It is deleted with the hook, and what replaces it is
 // the corpus: twelve test files and fifty-eight call sites drive this dispatch, and
-// TestF105SlotClassifierDrivesTheLiveLadder asserts the observable outcome of each shape.
+// TestSlotClassifierDrivesTheLiveLadder asserts the observable outcome of each shape.

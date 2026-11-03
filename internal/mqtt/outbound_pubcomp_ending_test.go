@@ -31,34 +31,34 @@ import (
 // the exchange and its slot in one batch — and a live PUBREL action makes that ending
 // pending-drain until the holder's own drain completes both records.
 
-// testF105PubRelReady drives an ordinary QoS 2 delivery to the state PUBCOMP answers: the client
+// testPubRelReady drives an ordinary QoS 2 delivery to the state PUBCOMP answers: the client
 // PUBREC'd, the PUBREL was written, and the slot stands at pubrel_ready with no action live.
-func testF105PubRelReady(t *testing.T, o *Options, s *Server, clientID string) (net.Conn, *mqttReader,
+func testPubRelReady(t *testing.T, o *Options, s *Server, clientID string) (net.Conn, *mqttReader,
 	*mqttSession, *client, uint16, string, mqttInflightSlotRef) {
 	t.Helper()
-	sub, subr, sess, pi, nonce := testF105QoS2Delivered(t, o, s, clientID)
+	sub, subr, sess, pi, nonce := testQoS2Delivered(t, o, s, clientID)
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangePubRecObserved)
-	ref := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, false)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangePubRecObserved)
+	ref := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, false)
 	sess.mu.Lock()
 	c := sess.c
 	sess.mu.Unlock()
 	return sub, subr, sess, c, pi, nonce, ref
 }
 
-// testF105SlotSubject is the session's in-flight subject for pi.
-func testF105SlotSubject(sess *mqttSession, pi uint16) string {
+// testSlotSubject is the session's in-flight subject for pi.
+func testSlotSubject(sess *mqttSession, pi uint16) string {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	return mqttInflightSubject(getHash(sess.id), sess.gen, pi)
 }
 
-// testF105SlotRefAt waits for the slot to stand at want (with a live token or not) and returns a
+// testSlotRefAt waits for the slot to stand at want (with a live token or not) and returns a
 // reference captured from it.
-func testF105SlotRefAt(t *testing.T, sess *mqttSession, pi uint16, want mqttInflightState, token bool) mqttInflightSlotRef {
+func testSlotRefAt(t *testing.T, sess *mqttSession, pi uint16, want mqttInflightState, token bool) mqttInflightSlotRef {
 	t.Helper()
-	subj := testF105SlotSubject(sess, pi)
+	subj := testSlotSubject(sess, pi)
 	var ref *mqttInflightSlotRef
 	checkFor(t, 3*time.Second, 10*time.Millisecond, func() error {
 		cur, smsg, err := sess.asm.loadInflightRecord(subj)
@@ -78,10 +78,10 @@ func testF105SlotRefAt(t *testing.T, sess *mqttSession, pi uint16, want mqttInfl
 	return *ref
 }
 
-// testF105SlotGone waits for the slot to be deleted.
-func testF105SlotGone(t *testing.T, sess *mqttSession, pi uint16, within time.Duration) {
+// testSlotGone waits for the slot to be deleted.
+func testSlotGone(t *testing.T, sess *mqttSession, pi uint16, within time.Duration) {
 	t.Helper()
-	subj := testF105SlotSubject(sess, pi)
+	subj := testSlotSubject(sess, pi)
 	checkFor(t, within, 10*time.Millisecond, func() error {
 		cur, smsg, err := sess.asm.loadInflightRecord(subj)
 		if err != nil {
@@ -94,8 +94,8 @@ func testF105SlotGone(t *testing.T, sess *mqttSession, pi uint16, within time.Du
 	})
 }
 
-// testF105Verdict is what recovery would conclude about the exchange.
-func testF105Verdict(sess *mqttSession, nonce string) mqttDutyVerdict {
+// testVerdict is what recovery would conclude about the exchange.
+func testVerdict(sess *mqttSession, nonce string) mqttDutyVerdict {
 	sess.mu.Lock()
 	gen := sess.gen
 	sess.mu.Unlock()
@@ -103,9 +103,9 @@ func testF105Verdict(sess *mqttSession, nonce string) mqttDutyVerdict {
 		&mqttDutyEntry{Kind: mqttDutyExchange, Ref: nonce})
 }
 
-// testF105PubCompSeams records what the PUBCOMP path did: every canonical-PUBREL ack it sent and
+// testPubCompSeams records what the PUBCOMP path did: every canonical-PUBREL ack it sent and
 // every completion-worker enrolment.
-type testF105PubCompSeams struct {
+type testPubCompSeams struct {
 	mu        sync.Mutex
 	acks      []string
 	workerAck int
@@ -113,9 +113,9 @@ type testF105PubCompSeams struct {
 	created   int
 }
 
-func testF105ObservePubComp(t *testing.T, sess *mqttSession) *testF105PubCompSeams {
+func testObservePubComp(t *testing.T, sess *mqttSession) *testPubCompSeams {
 	t.Helper()
-	o := &testF105PubCompSeams{}
+	o := &testPubCompSeams{}
 	asm := sess.asm
 	asm.mu.Lock()
 	asm.testPubCompAck = func(subject string, byWorker bool) {
@@ -143,14 +143,14 @@ func testF105ObservePubComp(t *testing.T, sess *mqttSession) *testF105PubCompSea
 	return o
 }
 
-func (o *testF105PubCompSeams) counts() (acks, byWorker, enrolled, created int) {
+func (o *testPubCompSeams) counts() (acks, byWorker, enrolled, created int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return len(o.acks), o.workerAck, o.enrolled, o.created
 }
 
-// testF105SetAckAdvance installs the acknowledgement-advance seam for the test's life.
-func testF105SetAckAdvance(t *testing.T, sess *mqttSession,
+// testSetAckAdvance installs the acknowledgement-advance seam for the test's life.
+func testSetAckAdvance(t *testing.T, sess *mqttSession,
 	hook func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)) {
 	t.Helper()
 	asm := sess.asm
@@ -164,8 +164,8 @@ func testF105SetAckAdvance(t *testing.T, sess *mqttSession,
 	})
 }
 
-// testF105IsPubCompAdvance says whether an ack-advance request is THIS exchange's PUBCOMP.
-func testF105IsPubCompAdvance(req *mqttAdvanceExchangeAckRequest, nonce string) bool {
+// testIsPubCompAdvance says whether an ack-advance request is THIS exchange's PUBCOMP.
+func testIsPubCompAdvance(req *mqttAdvanceExchangeAckRequest, nonce string) bool {
 	return req.Nonce == nonce &&
 		(req.To == mqttExchangeTerminal || req.To == mqttExchangeTerminalPendingDrain) &&
 		req.Register != nil && req.Register.State == mqttInflightPubRelReady
@@ -178,23 +178,23 @@ func testF105IsPubCompAdvance(req *mqttAdvanceExchangeAckRequest, nonce string) 
 // Mutation M1: PUBCOMP's exchange arm back to the slot-only CAS -> the exchange stays at
 // PUBREC-observed and the verdict is release owed. M10: the destination-only arrow map -> the
 // PUBCOMP member becomes publish_terminal and is refused.
-func TestF105OrdinaryPubCompEndsTheExchange(t *testing.T) {
+func TestOrdinaryPubCompEndsTheExchange(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, subr, sess, _, pi, nonce, _ := testF105PubRelReady(t, o, s, "f105-pubcomp-ends")
-	seams := testF105ObservePubComp(t, sess)
+	sub, subr, sess, _, pi, nonce, _ := testPubRelReady(t, o, s, "f105-pubcomp-ends")
+	seams := testObservePubComp(t, sess)
 
 	testMQTTSendPIPacket(mqttPacketPubComp, t, sub, pi)
 	testMQTTFlush(t, sub, nil, subr)
 
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-	if v := testF105Verdict(sess, nonce); v.Disposition != mqttDutyMayResolve {
+	testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+	if v := testVerdict(sess, nonce); v.Disposition != mqttDutyMayResolve {
 		t.Fatalf("a completed exchange reads as %+v, want a durable ending (neither release nor drain owed)", v)
 	}
-	testF105SlotGone(t, sess, pi, time.Second)
+	testSlotGone(t, sess, pi, time.Second)
 	checkFor(t, time.Second, 10*time.Millisecond, func() error {
 		sess.mu.Lock()
 		defer sess.mu.Unlock()
@@ -215,47 +215,47 @@ func TestF105OrdinaryPubCompEndsTheExchange(t *testing.T) {
 // Mutation M2: OutstandingOutput hard-wired false -> the boundary refuses Terminal over a live
 // token and no pending-drain is recorded. M4: the drain completion kept slot-only -> the
 // exchange stays pending-drain.
-func TestF105PubCompOverALivePubRelActionPendsItsDrain(t *testing.T) {
+func TestPubCompOverALivePubRelActionPendsItsDrain(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-pubcomp-pending")
-	seams := testF105ObservePubComp(t, sess)
+	_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-pubcomp-pending")
+	seams := testObservePubComp(t, sess)
 
 	act := sess.testAcquirePubRel(c, ref)
 	if act == nil {
 		t.Fatalf("the PUBREL action was not acquired")
 	}
-	live := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
+	live := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
 	before, _, _ := sess.asm.loadInflightRecord(live.name.subject)
 
 	res := sess.mqttTerminalizeOnPubComp(c, live)
 	if !res.recorded || res.outcome != mqttTerminalHeldByAction || res.heldToken != act.token {
 		t.Fatalf("PUBCOMP over a live action concluded %+v, want recorded HeldByAction naming token %q", res, act.token)
 	}
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminalPendingDrain)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminalPendingDrain)
 	after, _, _ := sess.asm.loadInflightRecord(live.name.subject)
 	if after == nil || after.State != mqttInflightPubRelTerminal || after.ActionToken != before.ActionToken ||
 		after.ActionClaim != before.ActionClaim || after.ActionClaimSeq != before.ActionClaimSeq || after.Acq != before.Acq {
 		t.Fatalf("the PUBCOMP'd slot is %+v, want pubrel_terminal carrying the SAME action (%+v)", after, before)
 	}
-	if v := testF105Verdict(sess, nonce); v.Disposition != mqttDutyOwesWork || v.Work != mqttDutyWorkDrain {
+	if v := testVerdict(sess, nonce); v.Disposition != mqttDutyOwesWork || v.Work != mqttDutyWorkDrain {
 		t.Fatalf("a pending-drain completion reads as %+v, want the drain owed", v)
 	}
 
 	start := time.Now()
 	sess.startActionDrain(c, act)
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-	testF105SlotGone(t, sess, pi, mqttActionReconcileDelay/2)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+	testSlotGone(t, sess, pi, mqttActionReconcileDelay/2)
 	if time.Since(start) >= mqttActionReconcileDelay {
 		t.Fatalf("the drain's cleanup waited for a reconcile timer rather than running inline")
 	}
 	if _, _, enrolled, _ := seams.counts(); enrolled != 0 {
 		t.Fatalf("the inline drain completion enrolled %d cleanup workers, want 0", enrolled)
 	}
-	if v := testF105Verdict(sess, nonce); v.Disposition != mqttDutyMayResolve {
+	if v := testVerdict(sess, nonce); v.Disposition != mqttDutyMayResolve {
 		t.Fatalf("the drained exchange reads as %+v, want a durable ending", v)
 	}
 }
@@ -266,7 +266,7 @@ func TestF105PubCompOverALivePubRelActionPendsItsDrain(t *testing.T) {
 // Mutation M16: the drain hands mqttOpOutcome.Seq to finalize -> (a)'s freshness fence refuses
 // and no inline delete happens. M17: the drain's indeterminate finalize goes to
 // retainAndReconcileTerminal -> (c) never retries over the delivered entry.
-func TestF105DrainCompletionFinalizesFromTheSlotSequence(t *testing.T) {
+func TestDrainCompletionFinalizesFromTheSlotSequence(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// failReads is how many reads of the slot, after the drain's batch, fail.
@@ -283,13 +283,13 @@ func TestF105DrainCompletionFinalizesFromTheSlotSequence(t *testing.T) {
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
 
-			_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-drain-seq-"+strings.ReplaceAll(tc.name, " ", "-"))
-			seams := testF105ObservePubComp(t, sess)
+			_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-drain-seq-"+strings.ReplaceAll(tc.name, " ", "-"))
+			seams := testObservePubComp(t, sess)
 			act := sess.testAcquirePubRel(c, ref)
 			if act == nil {
 				t.Fatalf("the PUBREL action was not acquired")
 			}
-			live := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
+			live := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
 			if res := sess.mqttTerminalizeOnPubComp(c, live); !res.recorded || res.outcome != mqttTerminalHeldByAction {
 				t.Fatalf("PUBCOMP over a live action concluded %+v", res)
 			}
@@ -334,9 +334,9 @@ func TestF105DrainCompletionFinalizesFromTheSlotSequence(t *testing.T) {
 			})
 
 			sess.startActionDrain(c, act)
-			testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+			testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
 			if !tc.failPostBatchRead && !tc.failDisposal {
-				testF105SlotGone(t, sess, pi, mqttActionReconcileDelay/2)
+				testSlotGone(t, sess, pi, mqttActionReconcileDelay/2)
 				if _, _, enrolled, _ := seams.counts(); enrolled != 0 {
 					t.Fatalf("an inline drain completion enrolled %d workers", enrolled)
 				}
@@ -345,29 +345,29 @@ func TestF105DrainCompletionFinalizesFromTheSlotSequence(t *testing.T) {
 			if _, _, enrolled, _ := seams.counts(); enrolled != 1 {
 				t.Fatalf("the unsettled drain cleanup enrolled %d completion workers, want 1", enrolled)
 			}
-			testF105SlotGone(t, sess, pi, 3*mqttActionReconcileDelay)
+			testSlotGone(t, sess, pi, 3*mqttActionReconcileDelay)
 		})
 	}
 }
 
 // T3. PUBCOMP and the PUBREL drain in every commit order end the exchange at Terminal.
-func TestF105PubCompAndTheDrainInEveryOrder(t *testing.T) {
+func TestPubCompAndTheDrainInEveryOrder(t *testing.T) {
 	t.Run("the drain commits first", func(t *testing.T) {
 		t.Parallel()
 		o := testMQTTDefaultOptions()
 		s := testMQTTRunServer(t, o)
 		defer testMQTTShutdownServer(s)
 
-		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-order-drain-first")
+		_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-order-drain-first")
 		act := sess.testAcquirePubRel(c, ref)
 		if act == nil {
 			t.Fatalf("the PUBREL action was not acquired")
 		}
-		live := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
+		live := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
 		var calls atomic.Int32
 		var firstRefused atomic.Bool
-		testF105SetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-			if !testF105IsPubCompAdvance(req, nonce) {
+		testSetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+			if !testIsPubCompAdvance(req, nonce) {
 				return write()
 			}
 			if calls.Add(1) == 1 {
@@ -392,8 +392,8 @@ func TestF105PubCompAndTheDrainInEveryOrder(t *testing.T) {
 		if !res.recorded {
 			t.Fatalf("PUBCOMP after the drain is unrecorded: %+v", res)
 		}
-		testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-		testF105SlotGone(t, sess, pi, time.Second)
+		testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+		testSlotGone(t, sess, pi, time.Second)
 	})
 
 	t.Run("PUBCOMP commits while the drain holds a stale read", func(t *testing.T) {
@@ -402,12 +402,12 @@ func TestF105PubCompAndTheDrainInEveryOrder(t *testing.T) {
 		s := testMQTTRunServer(t, o)
 		defer testMQTTShutdownServer(s)
 
-		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-order-pubcomp-first")
+		_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-order-pubcomp-first")
 		act := sess.testAcquirePubRel(c, ref)
 		if act == nil {
 			t.Fatalf("the PUBREL action was not acquired")
 		}
-		live := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
+		live := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, true)
 		var pubcompRan, drainRefused, paired atomic.Bool
 		asm := sess.asm
 		asm.mu.Lock()
@@ -441,25 +441,25 @@ func TestF105PubCompAndTheDrainInEveryOrder(t *testing.T) {
 			t.Fatalf("the forced order did not happen (pubcomp=%v stale drain refused=%v paired drain=%v)",
 				pubcompRan.Load(), drainRefused.Load(), paired.Load())
 		}
-		testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-		testF105SlotGone(t, sess, pi, time.Second)
+		testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+		testSlotGone(t, sess, pi, time.Second)
 	})
 }
 
 // T3b. An acquisition racing PUBCOMP, in both commit orders.
-func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
+func TestPubRelAcquisitionAgainstPubComp(t *testing.T) {
 	t.Run("the acquisition commits first", func(t *testing.T) {
 		t.Parallel()
 		o := testMQTTDefaultOptions()
 		s := testMQTTRunServer(t, o)
 		defer testMQTTShutdownServer(s)
 
-		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-acq-first")
+		_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-acq-first")
 		var act *mqttSendAction
 		var calls atomic.Int32
 		var firstRefused atomic.Bool
-		testF105SetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-			if !testF105IsPubCompAdvance(req, nonce) {
+		testSetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+			if !testIsPubCompAdvance(req, nonce) {
 				return write()
 			}
 			if calls.Add(1) == 1 {
@@ -477,10 +477,10 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 		if !res.recorded || res.outcome != mqttTerminalHeldByAction || res.heldToken != act.token {
 			t.Fatalf("PUBCOMP after the acquisition concluded %+v, want pending-drain over the new token", res)
 		}
-		testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminalPendingDrain)
+		testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminalPendingDrain)
 		sess.startActionDrain(c, act)
-		testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-		testF105SlotGone(t, sess, pi, time.Second)
+		testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+		testSlotGone(t, sess, pi, time.Second)
 	})
 
 	t.Run("PUBCOMP commits first", func(t *testing.T) {
@@ -489,7 +489,7 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 		s := testMQTTRunServer(t, o)
 		defer testMQTTShutdownServer(s)
 
-		_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-pubcomp-before-acq")
+		_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-pubcomp-before-acq")
 		var pubcompRan, acqRefused atomic.Bool
 		asm := sess.asm
 		// THE ORDINARY ACQUISITION IS AN AUTHORITY BATCH (issue #107 row 2), so the PUBCOMP is forced in
@@ -514,8 +514,8 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 		if !pubcompRan.Load() || !acqRefused.Load() {
 			t.Fatalf("the forced order did not happen (pubcomp=%v acquisition refused=%v)", pubcompRan.Load(), acqRefused.Load())
 		}
-		testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-		testF105SlotGone(t, sess, pi, time.Second)
+		testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+		testSlotGone(t, sess, pi, time.Second)
 		sess.mu.Lock()
 		h := sess.sendsInFlight[pi]
 		liveHolder := h != nil && h.action != nil && !h.action.drained
@@ -528,17 +528,17 @@ func TestF105PubRelAcquisitionAgainstPubComp(t *testing.T) {
 
 // T3c. Two completers of one exchange: exactly one transition lands, the other re-reads the
 // terminal slot and reports the completion recorded.
-func TestF105TwoCompletersOfOneExchange(t *testing.T) {
+func TestTwoCompletersOfOneExchange(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-two-completers")
+	_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-two-completers")
 	var calls, landed atomic.Int32
 	var nested atomic.Bool
-	testF105SetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		if !testF105IsPubCompAdvance(req, nonce) {
+	testSetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+		if !testIsPubCompAdvance(req, nonce) {
 			return write()
 		}
 		if calls.Add(1) == 1 {
@@ -564,8 +564,8 @@ func TestF105TwoCompletersOfOneExchange(t *testing.T) {
 	if n := landed.Load(); n != 1 {
 		t.Fatalf("%d PUBCOMP transitions landed for one exchange, want exactly 1", n)
 	}
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-	testF105SlotGone(t, sess, pi, time.Second)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+	testSlotGone(t, sess, pi, time.Second)
 }
 
 // T4. A lost response — on the first attempt, or on the final one — is resolved INLINE; the
@@ -573,7 +573,7 @@ func TestF105TwoCompletersOfOneExchange(t *testing.T) {
 //
 // Mutation M12: the exhaustion re-read deleted -> "final attempt lost" enrols a worker. M9: a
 // single attempt -> "last attempt lands" is unrecorded inline and enrols a worker.
-func TestF105PubCompResolvesALostResponseInline(t *testing.T) {
+func TestPubCompResolvesALostResponseInline(t *testing.T) {
 	refusals := func(n int) []string {
 		plan := make([]string, n)
 		for i := range plan {
@@ -596,11 +596,11 @@ func TestF105PubCompResolvesALostResponseInline(t *testing.T) {
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
 
-			_, _, sess, c, pi, nonce, ref := testF105PubRelReady(t, o, s, "f105-lost-"+strings.ReplaceAll(tc.name, " ", "-"))
-			seams := testF105ObservePubComp(t, sess)
+			_, _, sess, c, pi, nonce, ref := testPubRelReady(t, o, s, "f105-lost-"+strings.ReplaceAll(tc.name, " ", "-"))
+			seams := testObservePubComp(t, sess)
 			var calls atomic.Int32
-			testF105SetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-				if !testF105IsPubCompAdvance(req, nonce) {
+			testSetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+				if !testIsPubCompAdvance(req, nonce) {
 					return write()
 				}
 				n := int(calls.Add(1))
@@ -629,8 +629,8 @@ func TestF105PubCompResolvesALostResponseInline(t *testing.T) {
 			if _, _, enrolled, _ := seams.counts(); enrolled != 0 {
 				t.Fatalf("an inline completion enrolled %d workers", enrolled)
 			}
-			testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
-			testF105SlotGone(t, sess, pi, time.Second)
+			testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+			testSlotGone(t, sess, pi, time.Second)
 		})
 	}
 }
@@ -638,7 +638,7 @@ func TestF105PubCompResolvesALostResponseInline(t *testing.T) {
 // T8. The retired PUBREL-owed phase value is refused, never read as PUBREC-observed.
 //
 // Mutation M7: re-admit 3 to mqttValidExchangePhase and the raw record decodes.
-func TestF105RetiredPubRelOwedPhaseIsRefused(t *testing.T) {
+func TestRetiredPubRelOwedPhaseIsRefused(t *testing.T) {
 	x := &mqttOutboundExchange{
 		ID: "c", Epoch: "e", Gen: "g1", Nonce: "n1", PI: 7, QoS: 2,
 		Phase: mqttExchangePubRecObserved, AdmitTxn: "t1", Tenure: "ten1",

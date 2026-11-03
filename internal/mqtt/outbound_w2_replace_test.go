@@ -30,7 +30,7 @@ import (
 // a PAIR replacement over a proven-unsent occupant admits a fresh obligation and supersedes the
 // occupant's, and a REGISTER-ONLY replacement over a possibly-attempted occupant continues the
 // occupant's obligation under a fresh transmission nonce. Both are reached the way T9
-// (TestF105CustodyPairReplacementMovesOneCharge) reaches them: the successor's scheduling entry is
+// (TestCustodyPairReplacementMovesOneCharge) reaches them: the successor's scheduling entry is
 // installed on the occupant's identifier, which is the state the ladder meets on a re-offer.
 
 // testW2InstallSuccessorEntry puts the re-offered allocation's scheduling entry on the occupant's
@@ -108,7 +108,7 @@ func testW2LandedLineage(sess *mqttSession, pi uint16) (lin, nonce string, ok bo
 	return p.ev.lin, p.ev.nonce, true
 }
 
-// TestF105RegisterOnlyReplacementChargesOnce: a register-only replacement CONTINUES the occupant's
+// TestRegisterOnlyReplacementChargesOnce: a register-only replacement CONTINUES the occupant's
 // obligation. It writes the heir register under a fresh transmission nonce on the occupant's
 // lineage and acquisition history, and nothing else: the occupant's exchange is the obligation, so
 // it stands unchanged at PUBLISH, no second exchange is created for the heir's nonce, the custody
@@ -125,7 +125,7 @@ func testW2LandedLineage(sess *mqttSession, pi uint16) (lin, nonce string, ok bo
 // H1 the orchestrator hands custody another lineage, target custody.charges() == 1 and no charge at
 // the heir's nonce; H2 the composer's agreement refusal removed and the ladder's derivation
 // bypassed, target one charge on E1 and the settlement lineage equal to the durable register's.
-func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
+func TestRegisterOnlyReplacementChargesOnce(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "w2-register-only", 1)
 	e, sess := f.e, f.e.sess
@@ -226,7 +226,7 @@ func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
 	}
 }
 
-// TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage: a register-only attempt that FAILS sends
+// TestFailedRegisterOnlyAttemptRetriesOnAFreshLineage: a register-only attempt that FAILS sends
 // the ladder back to a create, and the create starts a FRESH obligation - its lineage is its own
 // nonce, never the occupant's that the failed attempt carried (W3 plan section 6, L4).
 //
@@ -244,7 +244,7 @@ func TestF105RegisterOnlyReplacementChargesOnce(t *testing.T) {
 // any commit. This test therefore does not kill L4b; the lineage property on a raw create is
 // killed by TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage (inflight_lineage_test.go),
 // on the shared ladder's create-only fallback.
-func TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
+func TestFailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "w2-l4-retry", 1)
 	e, sess := f.e, f.e.sess
@@ -359,7 +359,7 @@ func TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
 	t.Logf("route: %d create attempt(s) after the refused register-only attempt (%v), answered %q", len(creates), refusal, createErrs)
 }
 
-// TestF105RegisterOnlyLostResponseChargesOnce: a register-only replacement whose commit LANDS but
+// TestRegisterOnlyLostResponseChargesOnce: a register-only replacement whose commit LANDS but
 // whose response is lost - an error WITH its handle - is still charged once, on the continued
 // obligation E1 (W3 plan section 6, H3). The attempt is recorded with the lineage the ladder froze
 // and settled later, and that lineage, not the heir's nonce, is what custody charges.
@@ -370,7 +370,7 @@ func TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
 //
 // Mutation H3: the ambiguous attempt record stores the heir's nonce as its lineage. Target: exactly
 // one charge, on E1, and none at the heir's nonce.
-func TestF105RegisterOnlyLostResponseChargesOnce(t *testing.T) {
+func TestRegisterOnlyLostResponseChargesOnce(t *testing.T) {
 	for _, path := range []string{"immediate", "reconciled"} {
 		path := path
 		t.Run(path, func(t *testing.T) {
@@ -463,7 +463,7 @@ func TestF105RegisterOnlyLostResponseChargesOnce(t *testing.T) {
 	}
 }
 
-// TestF105AReplacementRespectsAThirdStandingExchange: a pair replacement claims the identifier for
+// TestAReplacementRespectsAThirdStandingExchange: a pair replacement claims the identifier for
 // its fresh obligation, and that claim is checked against the RESULTING state - the batch overlaid
 // on what already stands. An unended exchange C that is neither the occupant's nor the heir's,
 // standing on the same (generation, identifier), refuses the replacement whole: no heir register,
@@ -475,7 +475,7 @@ func TestF105RegisterOnlyLostResponseChargesOnce(t *testing.T) {
 // bumpPI/holdsPI - so this pins the replacement-scoped form of the exclusivity check, not a
 // reachable schedule. Mutations (C7): skip the claim for standing subjects; a replacement-scoped
 // early return from the exclusivity check.
-func TestF105AReplacementRespectsAThirdStandingExchange(t *testing.T) {
+func TestAReplacementRespectsAThirdStandingExchange(t *testing.T) {
 	// The marker disposition seam is process-wide: not parallel.
 	var mu sync.Mutex
 	var pairDecided bool
@@ -519,7 +519,7 @@ func TestF105AReplacementRespectsAThirdStandingExchange(t *testing.T) {
 		t.Fatalf("planting the third exchange: %v", err)
 	}
 	// AND ITS DUTY, as an admission writes it: every exchange enumeration is the inventory (issue #114).
-	testF112PlantAdmittedDuty(t, jsa, sess.id, epoch, f.gen, cNonce)
+	testPlantAdmittedDuty(t, jsa, sess.id, epoch, f.gen, cNonce)
 	xC0, xC0seq, err := jsa.loadOutboundExchange(sess.id, epoch, f.gen, cNonce)
 	if err != nil || xC0.Phase != mqttExchangePublish || xC0.PI != f.pi {
 		t.Fatalf("fixture: the planted exchange does not read back as an unended obligation on %d: %+v (%v)", f.pi, xC0, err)

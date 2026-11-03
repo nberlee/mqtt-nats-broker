@@ -2298,7 +2298,7 @@ func TestMQTTInflightStalePubRelScanDoesNotLoseTheClientsPubRel(t *testing.T) {
 		if !enumerated.Load() {
 			return nil, 0, true // read before the registers: the peer's store is not visible
 		}
-		return f099RealPubRelScan(asm, subject)
+		return realPubRelScan(asm, subject)
 	}
 	asm.mu.Unlock()
 
@@ -2315,10 +2315,10 @@ func TestMQTTInflightStalePubRelScanDoesNotLoseTheClientsPubRel(t *testing.T) {
 	testMQTTFlush(t, sub, nil, subr)
 }
 
-// f099RealPubRelScan is the unhooked scan, so a staged hook can answer "not yet" once and
+// realPubRelScan is the unhooked scan, so a staged hook can answer "not yet" once and
 // then get out of the way. Duplicated rather than delegated because scanPubRelRecords
 // consults the hook at its entry, so calling it from inside the hook would recurse.
-func f099RealPubRelScan(asm *mqttAccountSessionManager, subject string) ([]mqttStoredPubRel, int, bool) {
+func realPubRelScan(asm *mqttAccountSessionManager, subject string) ([]mqttStoredPubRel, int, bool) {
 	var records []mqttStoredPubRel
 	refused := 0
 	for seq := uint64(1); ; {
@@ -2464,7 +2464,7 @@ func TestMQTTInflightFailedPubCompKeepsItsPubRelAndCompletesAfterRestart(t *test
 		t.Fatal("no resident session after the resume")
 	}
 	// The completion is DURABLE now: the exchange itself says so.
-	testF105ExchangePhaseIs(t, sess2, lin, mqttExchangeTerminal)
+	testExchangePhaseIs(t, sess2, lin, mqttExchangeTerminal)
 
 	// THE ORACLE. The single Receive Maximum slot is free again, so a fresh message gets
 	// through.

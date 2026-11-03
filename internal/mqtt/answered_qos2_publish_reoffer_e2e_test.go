@@ -22,9 +22,9 @@ import (
 // asserts it reached its window before asserting the outcome. NOT parallel: the seams are
 // process-global.
 
-// f115Rig is one subscriber session with one delivery outstanding, and the seams that hold its
+// reofferRig is one subscriber session with one delivery outstanding, and the seams that hold its
 // windows open.
-type f115Rig struct {
+type reofferRig struct {
 	t        *testing.T
 	s        *Server
 	sess     *mqttSession
@@ -36,22 +36,22 @@ type f115Rig struct {
 	reply map[uint64]string // newest offered reply per source sequence, this session only
 }
 
-const f115Topic = "f115"
+const reofferTopic = "f115"
 
-func f115Options() *Options {
+func reofferOptions() *Options {
 	o := testMQTTDefaultOptions()
 	o.MQTT.AckWait = time.Minute // no spontaneous re-offer: every one in these tests is forced
 	return o
 }
 
-// f115Start runs a broker, attaches the subscriber the caller connected with connect, installs the
+// reofferStart runs a broker, attaches the subscriber the caller connected with connect, installs the
 // offer recorder, publishes one message at qos and returns the rig.
-func f115Start(t *testing.T, clientID string, qos byte, connect func(o *Options) (net.Conn, *mqttReader)) (*f115Rig, *Options) {
+func reofferStart(t *testing.T, clientID string, qos byte, connect func(o *Options) (net.Conn, *mqttReader)) (*reofferRig, *Options) {
 	t.Helper()
-	o := f115Options()
+	o := reofferOptions()
 	s := testMQTTRunServer(t, o)
 	t.Cleanup(func() { testMQTTShutdownServer(s) })
-	rig := &f115Rig{t: t, s: s, clientID: clientID, reply: map[uint64]string{}}
+	rig := &reofferRig{t: t, s: s, clientID: clientID, reply: map[uint64]string{}}
 	offered := func(sub *subscription, reply string) {
 		if !rig.mine(sub) {
 			return
@@ -77,17 +77,17 @@ func f115Start(t *testing.T, clientID string, qos byte, connect func(o *Options)
 	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: clientID + "-pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	t.Cleanup(func() { pub.Close() })
 	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
-	testMQTTPublish(t, pub, pubr, qos, false, false, f115Topic, 1, []byte("payload"))
+	testMQTTPublish(t, pub, pubr, qos, false, false, reofferTopic, 1, []byte("payload"))
 	return rig, o
 }
 
-func (rig *f115Rig) mine(sub *subscription) bool {
+func (rig *reofferRig) mine(sub *subscription) bool {
 	return sub != nil && sub.client != nil && sub.client.mqtt != nil &&
 		sub.client.mqtt.sess != nil && sub.client.mqtt.sess.id == rig.clientID
 }
 
 // nakSource forces JetStream to re-offer the one outstanding source delivery at once.
-func (rig *f115Rig) nakSource() {
+func (rig *reofferRig) nakSource() {
 	rig.t.Helper()
 	rig.mu.Lock()
 	var reply string
@@ -102,7 +102,7 @@ func (rig *f115Rig) nakSource() {
 }
 
 // waitFor polls cond under sess.mu until it holds.
-func (rig *f115Rig) waitFor(what string, cond func(sess *mqttSession) bool) {
+func (rig *reofferRig) waitFor(what string, cond func(sess *mqttSession) bool) {
 	rig.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -117,15 +117,15 @@ func (rig *f115Rig) waitFor(what string, cond func(sess *mqttSession) bool) {
 	rig.t.Fatalf("fixture: %s never happened", what)
 }
 
-func f115Handoff(pi uint16) func(sess *mqttSession) bool {
+func reofferHandoff(pi uint16) func(sess *mqttSession) bool {
 	return func(sess *mqttSession) bool {
 		return sess.pendingPublish[pi] == nil && sess.pendingPubRel[pi] != nil
 	}
 }
 
-// f115Park holds the NEXT delivery callback of this session before its lock, and reports
+// reofferPark holds the NEXT delivery callback of this session before its lock, and reports
 // when that callback has returned. release lets it go.
-type f115Park struct {
+type reofferPark struct {
 	parked   chan struct{}
 	done     chan struct{}
 	release  chan struct{}
@@ -133,8 +133,8 @@ type f115Park struct {
 	doneOnce sync.Once
 }
 
-func (rig *f115Rig) parkNextDelivery() *f115Park {
-	p := &f115Park{parked: make(chan struct{}), done: make(chan struct{}), release: make(chan struct{})}
+func (rig *reofferRig) parkNextDelivery() *reofferPark {
+	p := &reofferPark{parked: make(chan struct{}), done: make(chan struct{}), release: make(chan struct{})}
 	var armed sync.Mutex
 	taken := false
 	var held *subscription
@@ -174,7 +174,7 @@ func (rig *f115Rig) parkNextDelivery() *f115Park {
 	return p
 }
 
-func f115Await(t *testing.T, ch <-chan struct{}, what string) {
+func reofferAwait(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
 	case <-ch:
@@ -184,7 +184,7 @@ func f115Await(t *testing.T, ch <-chan struct{}, what string) {
 }
 
 // holdHandoff holds the next successful PUBREC of this session just after its handoff unlock.
-func (rig *f115Rig) holdHandoff(pi uint16) (reached, release chan struct{}) {
+func (rig *reofferRig) holdHandoff(pi uint16) (reached, release chan struct{}) {
 	reached, release = make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	h := func(hpi uint16) {
@@ -210,7 +210,7 @@ func (rig *f115Rig) holdHandoff(pi uint16) (reached, release chan struct{}) {
 
 // holdNextSection parks the next send section of this session for pi at the intent window, the
 // last point before its write.
-func (rig *f115Rig) holdNextSection(pi uint16) (parked, release chan struct{}) {
+func (rig *reofferRig) holdNextSection(pi uint16) (parked, release chan struct{}) {
 	parked, release = make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	restore := setMQTTTestMarkerSendWindowHook(func(sess *mqttSession, hpi uint16, window string) bool {
@@ -234,11 +234,11 @@ func (rig *f115Rig) holdNextSection(pi uint16) (parked, release chan struct{}) {
 	return parked, release
 }
 
-func f115Subscriber311(t *testing.T, clientID string, qos byte) func(o *Options) (net.Conn, *mqttReader) {
+func subscriber311(t *testing.T, clientID string, qos byte) func(o *Options) (net.Conn, *mqttReader) {
 	return func(o *Options) (net.Conn, *mqttReader) {
 		c, r := testMQTTConnect(t, &mqttConnInfo{clientID: clientID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 		testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
-		testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: f115Topic, qos: qos}}, []byte{qos})
+		testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: reofferTopic, qos: qos}}, []byte{qos})
 		testMQTTFlush(t, c, nil, r)
 		return c, r
 	}
@@ -246,22 +246,22 @@ func f115Subscriber311(t *testing.T, clientID string, qos byte) func(o *Options)
 
 // T1, shape B inside the handler: the re-offer is released while the PUBREC handler is held
 // after its handoff, before its durable intent and long before the source acknowledgement.
-func TestF115ReofferInsideThePubRecHandlerIsNotAdmittedAgain(t *testing.T) {
+func TestReofferInsideThePubRecHandlerIsNotAdmittedAgain(t *testing.T) {
 	const id = "f115-t1"
-	rig, _ := f115Start(t, id, 2, f115Subscriber311(t, id, 2))
-	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, f115Topic, mqttPubQoS2, []byte("payload"))
+	rig, _ := reofferStart(t, id, 2, subscriber311(t, id, 2))
+	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, reofferTopic, mqttPubQoS2, []byte("payload"))
 
 	park := rig.parkNextDelivery()
 	rig.nakSource()
-	f115Await(t, park.parked, "the forced re-offer reaching the delivery callback")
+	reofferAwait(t, park.parked, "the forced re-offer reaching the delivery callback")
 
 	reached, releaseHandler := rig.holdHandoff(pi)
 	testMQTTSendPIPacket(mqttPacketPubRec, t, rig.c, pi)
-	f115Await(t, reached, "the PUBREC handler reaching its handoff")
-	rig.waitFor("the PUBREC handoff", f115Handoff(pi))
+	reofferAwait(t, reached, "the PUBREC handler reaching its handoff")
+	rig.waitFor("the PUBREC handoff", reofferHandoff(pi))
 
 	close(park.release)
-	f115Await(t, park.done, "the re-offer callback returning")
+	reofferAwait(t, park.done, "the re-offer callback returning")
 	close(releaseHandler)
 
 	testMQTTReadPIPacket(mqttPacketPubRel, t, rig.r, pi)
@@ -271,14 +271,14 @@ func TestF115ReofferInsideThePubRecHandlerIsNotAdmittedAgain(t *testing.T) {
 
 // T2, shape B after the handler: the re-offer was dispatched before the source acknowledgement
 // and reaches the callback only after the handler confirmed it and the PUBREL went out.
-func TestF115StaleReofferAfterTheSourceAckIsNotAdmittedAgain(t *testing.T) {
+func TestStaleReofferAfterTheSourceAckIsNotAdmittedAgain(t *testing.T) {
 	const id = "f115-t2"
-	rig, _ := f115Start(t, id, 2, f115Subscriber311(t, id, 2))
-	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, f115Topic, mqttPubQoS2, []byte("payload"))
+	rig, _ := reofferStart(t, id, 2, subscriber311(t, id, 2))
+	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, reofferTopic, mqttPubQoS2, []byte("payload"))
 
 	park := rig.parkNextDelivery()
 	rig.nakSource()
-	f115Await(t, park.parked, "the forced re-offer reaching the delivery callback")
+	reofferAwait(t, park.parked, "the forced re-offer reaching the delivery callback")
 
 	testMQTTSendPIPacket(mqttPacketPubRec, t, rig.c, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, rig.r, pi)
@@ -287,7 +287,7 @@ func TestF115StaleReofferAfterTheSourceAckIsNotAdmittedAgain(t *testing.T) {
 	testMQTTFlush(t, rig.c, nil, rig.r)
 
 	close(park.release)
-	f115Await(t, park.done, "the stale re-offer callback returning")
+	reofferAwait(t, park.done, "the stale re-offer callback returning")
 
 	testMQTTSendPIPacket(mqttPacketPubComp, t, rig.c, pi)
 	testMQTTExpectNothing(t, rig.r)
@@ -295,17 +295,17 @@ func TestF115StaleReofferAfterTheSourceAckIsNotAdmittedAgain(t *testing.T) {
 
 // T3, shape A: a retransmission section opened before the PUBREC and held at its last point
 // before the write does not write once the PUBREC has been processed.
-func TestF115SectionOpenAtPubRecDoesNotWrite(t *testing.T) {
+func TestSectionOpenAtPubRecDoesNotWrite(t *testing.T) {
 	const id = "f115-t3"
-	rig, _ := f115Start(t, id, 2, f115Subscriber311(t, id, 2))
-	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, f115Topic, mqttPubQoS2, []byte("payload"))
+	rig, _ := reofferStart(t, id, 2, subscriber311(t, id, 2))
+	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, reofferTopic, mqttPubQoS2, []byte("payload"))
 
 	parked, release := rig.holdNextSection(pi)
 	rig.nakSource()
-	f115Await(t, parked, "the retransmission section reaching its write")
+	reofferAwait(t, parked, "the retransmission section reaching its write")
 
 	testMQTTSendPIPacket(mqttPacketPubRec, t, rig.c, pi)
-	rig.waitFor("the PUBREC handoff", f115Handoff(pi))
+	rig.waitFor("the PUBREC handoff", reofferHandoff(pi))
 	close(release)
 
 	testMQTTReadPIPacket(mqttPacketPubRel, t, rig.r, pi)
@@ -316,18 +316,18 @@ func TestF115SectionOpenAtPubRecDoesNotWrite(t *testing.T) {
 // T3b, the answer's TIMING: the open section is released and runs to its end while the PUBREC
 // handler is still held right after its handoff, so the answer must already be on the section's
 // output in the handoff's own critical section.
-func TestF115SectionIsAnsweredInTheHandoffsCriticalSection(t *testing.T) {
+func TestSectionIsAnsweredInTheHandoffsCriticalSection(t *testing.T) {
 	const id = "f115-t3b"
-	rig, _ := f115Start(t, id, 2, f115Subscriber311(t, id, 2))
-	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, f115Topic, mqttPubQoS2, []byte("payload"))
+	rig, _ := reofferStart(t, id, 2, subscriber311(t, id, 2))
+	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, reofferTopic, mqttPubQoS2, []byte("payload"))
 
 	parked, release := rig.holdNextSection(pi)
 	rig.nakSource()
-	f115Await(t, parked, "the retransmission section reaching its write")
+	reofferAwait(t, parked, "the retransmission section reaching its write")
 
 	reached, releaseHandler := rig.holdHandoff(pi)
 	testMQTTSendPIPacket(mqttPacketPubRec, t, rig.c, pi)
-	f115Await(t, reached, "the PUBREC handler reaching its handoff")
+	reofferAwait(t, reached, "the PUBREC handler reaching its handoff")
 
 	close(release)
 	rig.waitFor("the retransmission section ending", func(sess *mqttSession) bool {
@@ -343,14 +343,14 @@ func TestF115SectionIsAnsweredInTheHandoffsCriticalSection(t *testing.T) {
 
 // T4, shape A on QoS 1: a PUBACK parks its settlement on the open section; the section must not
 // then write the acknowledged PUBLISH.
-func TestF115SectionOpenAtPubAckDoesNotWrite(t *testing.T) {
+func TestSectionOpenAtPubAckDoesNotWrite(t *testing.T) {
 	const id = "f115-t4"
-	rig, _ := f115Start(t, id, 1, f115Subscriber311(t, id, 1))
-	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, f115Topic, mqttPubQos1, []byte("payload"))
+	rig, _ := reofferStart(t, id, 1, subscriber311(t, id, 1))
+	pi := testMQTTCheckPubMsgNoAck(t, rig.c, rig.r, reofferTopic, mqttPubQos1, []byte("payload"))
 
 	parked, release := rig.holdNextSection(pi)
 	rig.nakSource()
-	f115Await(t, parked, "the retransmission section reaching its write")
+	reofferAwait(t, parked, "the retransmission section reaching its write")
 
 	testMQTTSendPIPacket(mqttPacketPubAck, t, rig.c, pi)
 	rig.waitFor("the PUBACK parking its settlement", func(sess *mqttSession) bool {
@@ -371,18 +371,18 @@ func TestF115SectionOpenAtPubAckDoesNotWrite(t *testing.T) {
 // identifier is one on a reconnected session. The client received the PUBLISH on its first
 // connection, reconnects with its session, and refuses the exchange from its own state while
 // the resumed section is still before its write.
-func TestF115SectionOpenAtFailedPubRecDoesNotWrite(t *testing.T) {
+func TestSectionOpenAtFailedPubRecDoesNotWrite(t *testing.T) {
 	const id = "f115-t4b"
 	connect := func(o *Options) (net.Conn, *mqttReader) {
 		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true, props: mqttV5ConnPropsSessionExpiry(300)},
 			o.MQTT.Host, o.MQTT.Port)
 		testMQTTReadConnAckV5(t, r)
-		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: f115Topic, opts: 2}})
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: reofferTopic, opts: 2}})
 		testMQTTFlush(t, c, nil, r)
 		return c, r
 	}
-	rig, o := f115Start(t, id, 2, connect)
-	qos, pi := testMQTTReadPublishV5(t, rig.r, f115Topic, []byte("payload"))
+	rig, o := reofferStart(t, id, 2, connect)
+	qos, pi := testMQTTReadPublishV5(t, rig.r, reofferTopic, []byte("payload"))
 	if qos != 2 {
 		t.Fatalf("fixture: expected a QoS 2 delivery, got %d", qos)
 	}
@@ -395,7 +395,7 @@ func TestF115SectionOpenAtFailedPubRecDoesNotWrite(t *testing.T) {
 		t.Fatalf("fixture: the reconnect must resume the session: reason %x present %v", rc, present)
 	}
 	rig.c, rig.r = c, r
-	f115Await(t, parked, "the resumed section reaching its write")
+	reofferAwait(t, parked, "the resumed section reaching its write")
 
 	if _, err := testMQTTWrite(rig.c, []byte{mqttPacketPubRec, 3, byte(pi >> 8), byte(pi), 0x80}); err != nil {
 		t.Fatalf("writing the refused PUBREC: %v", err)

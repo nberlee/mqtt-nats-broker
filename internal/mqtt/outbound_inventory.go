@@ -113,12 +113,12 @@ func mqttParseOrdinal(tk string) (uint64, error) {
 
 // mqttGenLedgerSubject returns one generation's ledger subject.
 func mqttGenLedgerSubject(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttLedgerClassTk + "." + idHash + "." + gen
+	return mqttOutboundRecordSubjectPrefix() + mqttLedgerClassTk + "." + idHash + "." + gen
 }
 
 // mqttDutySubject returns one duty entry's subject.
 func mqttDutySubject(idHash, gen string, ord uint64) string {
-	return mqttF105SubjectPrefix() + mqttDutyClassTk + "." + idHash + "." + gen + "." +
+	return mqttOutboundRecordSubjectPrefix() + mqttDutyClassTk + "." + idHash + "." + gen + "." +
 		mqttFormatOrdinal(ord)
 }
 
@@ -126,11 +126,11 @@ func mqttDutySubject(idHash, gen string, ord uint64) string {
 // uses. The ledger is CALLER-CARRIED — an admission's batch includes its CAS — so it is an
 // obligation-class member and not an arbitration record.
 func mqttIsLedgerSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttLedgerClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttLedgerClassTk+".")
 }
 
 func mqttIsDutySubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttDutyClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttDutyClassTk+".")
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +444,7 @@ func mqttValidateDutyEntry(d *mqttDutyEntry, wantID, wantEpoch, wantGen string, 
 	if !mqttValidDutyKind(d.Kind) {
 		return fmt.Errorf("duty entry carries an unsupported kind %q", d.Kind)
 	}
-	if !mqttF105IdentTk(d.Ref) {
+	if !mqttOutboundIdentTk(d.Ref) {
 		return fmt.Errorf("duty entry carries a malformed subject reference %q", d.Ref)
 	}
 	// AN EXCHANGE DUTY NAMES ITS IDENTIFIER, AND NOTHING ELSE DOES, in every state — the
@@ -458,7 +458,7 @@ func mqttValidateDutyEntry(d *mqttDutyEntry, wantID, wantEpoch, wantGen string, 
 	if !mqttValidDutyState(d.State) {
 		return fmt.Errorf("duty entry carries an unsupported state %d", d.State)
 	}
-	if d.Claim != _EMPTY_ && !mqttF105IdentTk(d.Claim) {
+	if d.Claim != _EMPTY_ && !mqttOutboundIdentTk(d.Claim) {
 		return fmt.Errorf("duty entry carries a malformed claim %q", d.Claim)
 	}
 	// A LEASE WITHOUT A CLAIMANT NAMES NOBODY, and a claimant without a lease never expires.

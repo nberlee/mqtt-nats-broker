@@ -542,7 +542,7 @@ func TestUnitCDisposalDisplacedRecovery(t *testing.T) {
 	if err := json.Unmarshal(msg.Data, &record); err != nil {
 		t.Fatal(err)
 	}
-	gen, tenure := testF105ResumeHandoff(t, &f.e.asm.jsa, f.e.asm.domainTk, f.e.sess.id,
+	gen, tenure := testResumeHandoff(t, &f.e.asm.jsa, f.e.asm.domainTk, f.e.sess.id,
 		f.e.asm.sessStreamEpoch, &record, msg.Sequence)
 	if gen != w.key.gen || tenure == evidence.Tenure {
 		t.Fatalf("successor tenure was not established: gen=%s tenure=%s", gen, tenure)

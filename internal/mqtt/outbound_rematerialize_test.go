@@ -43,7 +43,7 @@ func testPubRelReadyWorld(t *testing.T, clientID string) (*testInflightEnv, uint
 
 // T16 (M23): the rebound slot names a readable canonical record; the lineage, the exchange's
 // phase, the inventory's Hi and the custody charge are all unchanged.
-func TestF105VanishedCanonicalPubRelIsRebound(t *testing.T) {
+func TestVanishedCanonicalPubRelIsRebound(t *testing.T) {
 	t.Parallel()
 	e, pi, subject, lin, canon := testPubRelReadyWorld(t, "remat-rebind")
 	led, _, err := e.asm.jsa.loadGenLedger(e.sess.id, e.asm.sessStreamEpoch, e.sess.gen)
@@ -152,7 +152,7 @@ func testDropCanonicalEdge(t *testing.T, e *testInflightEnv, lin string) {
 // physical consumer still standing is not eligibility — and the slot is never re-phased: it stays
 // pubrel_ready on its old tuple, which is what keeps the ordinary PUBCOMP arm applicable whenever
 // the client's answer arrives.
-func TestF105RematerializationWithheldWithoutTheResourceEdge(t *testing.T) {
+func TestRematerializationWithheldWithoutTheResourceEdge(t *testing.T) {
 	t.Parallel()
 	e, pi, subject, lin, canon := testPubRelReadyWorld(t, "remat-withheld")
 	if err := e.asm.jsa.deleteMsg(mqttOutStreamName, canon, true); err != nil {
@@ -173,7 +173,7 @@ func TestF105RematerializationWithheldWithoutTheResourceEdge(t *testing.T) {
 }
 
 // T16 (race): two materializers racing land ONE rebind; the loser's record is disposed.
-func TestF105RacingMaterializersLandOneRebind(t *testing.T) {
+func TestRacingMaterializersLandOneRebind(t *testing.T) {
 	t.Parallel()
 	e, _, subject, _, canon := testPubRelReadyWorld(t, "remat-race")
 	if err := e.asm.jsa.deleteMsg(mqttOutStreamName, canon, true); err != nil {
@@ -199,7 +199,7 @@ func TestF105RacingMaterializersLandOneRebind(t *testing.T) {
 
 // T16 (M22): a materializer whose connection was superseded does not rebind: the successor's
 // recovery owns the decision. Its published candidate is disposed and the slot is unchanged.
-func TestF105StaleMaterializerDoesNotRebind(t *testing.T) {
+func TestStaleMaterializerDoesNotRebind(t *testing.T) {
 	t.Parallel()
 	e, _, subject, _, canon := testPubRelReadyWorld(t, "remat-stale")
 	if err := e.asm.jsa.deleteMsg(mqttOutStreamName, canon, true); err != nil {
@@ -220,7 +220,7 @@ func TestF105StaleMaterializerDoesNotRebind(t *testing.T) {
 
 // T16 (M29b): candidate cleanup never deletes the canonical record. Called with a candidate the
 // register currently names, the cleanup must leave it standing.
-func TestF105CandidateCleanupSparesTheCanonicalRecord(t *testing.T) {
+func TestCandidateCleanupSparesTheCanonicalRecord(t *testing.T) {
 	t.Parallel()
 	e, _, subject, _, canon := testPubRelReadyWorld(t, "remat-cleanup")
 	e.sess.disposeRematerializeCandidate(subject, e.sess.pubRelSubject, canon)
@@ -232,7 +232,7 @@ func TestF105CandidateCleanupSparesTheCanonicalRecord(t *testing.T) {
 // T16 (M28): a PUBREL callback for the OLD record, paused after its canonical check while the
 // rebind lands, is refused its acquisition: the delivered tuple is carried into the acquisition,
 // and every refreshed base must still name it. The rebound record's own acquisition lands.
-func TestF105AcquisitionCarriesTheDeliveredCanonicalTuple(t *testing.T) {
+func TestAcquisitionCarriesTheDeliveredCanonicalTuple(t *testing.T) {
 	t.Parallel()
 	e, _, subject, lin, canon := testPubRelReadyWorld(t, "remat-tuple")
 	// The callback for the old record captured its slot reference and passed its canonical check.
@@ -287,7 +287,7 @@ func testAwaitRebind(t *testing.T, e *testInflightEnv, subject string, old uint6
 // the vanished canonical record is re-materialised all the same.
 //
 // Mutation M-enrol-entry: enrolment only where a NEW entry is installed -> never rebound.
-func TestF105ResidentReconnectRematerializesTheCanonicalPubRel(t *testing.T) {
+func TestResidentReconnectRematerializesTheCanonicalPubRel(t *testing.T) {
 	t.Parallel()
 	e, pi, subject, _, canon := testPubRelReadyWorld(t, "remat-resident")
 	e.sess.mu.Lock()
@@ -313,7 +313,7 @@ func TestF105ResidentReconnectRematerializesTheCanonicalPubRel(t *testing.T) {
 // alone: M-identity-presence (presence judged by identity) SURVIVES here, because the candidate's
 // own PUBREL delivery meets the live admission, whose canonical-sequence check re-materialises
 // from there. The test pins the outcome both routes owe.
-func TestF105CandidateBeforeRebindCrashStillRematerializes(t *testing.T) {
+func TestCandidateBeforeRebindCrashStillRematerializes(t *testing.T) {
 	t.Parallel()
 	e, pi, subject, _, canon := testPubRelReadyWorld(t, "remat-crash-cut")
 	testStoreCanonical(t, e, pi, e.nonceOf(pi), testRealPubRelSrcSeq) // the orphaned candidate

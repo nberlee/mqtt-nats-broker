@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// TestF105ARetainedSourceMayNotFabricateADelivery is the defect the source union removes.
+// TestARetainedSourceMayNotFabricateADelivery is the defect the source union removes.
 //
 // Today the retained path fabricates a `Dur` and a `Seq` so it fits the shape an ordinary
 // delivery uses. Those values then flow into every reader that believes it is looking at a
@@ -30,7 +30,7 @@ import (
 // A fabricated value is WORSE than a missing one, because a missing one refuses and a fabricated
 // one is believed. So the union forbids them rather than leaving them empty by convention — a
 // convention is something a future writer breaks without anything noticing.
-func TestF105ARetainedSourceMayNotFabricateADelivery(t *testing.T) {
+func TestARetainedSourceMayNotFabricateADelivery(t *testing.T) {
 	ordinary := &mqttObligationSource{
 		Kind: mqttSourceOrdinary, Stream: "$MQTT_msgs", Inc: "inc-src", Dur: "$MQTT_src", Seq: 7,
 	}
@@ -46,7 +46,7 @@ func TestF105ARetainedSourceMayNotFabricateADelivery(t *testing.T) {
 		t.Fatalf("a retained source was refused: %v", err)
 	}
 	// Which source is admitted against a manifest is the write boundary's rule
-	// (checkRetainedAdmission), pinned by TestF105RetainedAdmissionBoundaryRefusals.
+	// (checkRetainedAdmission), pinned by TestRetainedAdmissionBoundaryRefusals.
 
 	for name, tc := range map[string]struct {
 		s    *mqttObligationSource
@@ -101,21 +101,21 @@ func TestF105ARetainedSourceMayNotFabricateADelivery(t *testing.T) {
 	}
 }
 
-// TestF105ACanonicalReferenceIsAKindNotAValue pins the second union.
+// TestACanonicalReferenceIsAKindNotAValue pins the second union.
 //
 // An ordinary exchange's release lives on $MQTT_out at a sequence; a retained one has no such
 // consumer, so its canonical record lives at a unique exchange-specific subject on
 // $MQTT_inflight. Those are different KINDS of reference, and the identity beside the in-flight
 // subject is what makes the difference safe: a subject locates an ADDRESS, and this project has
 // been bitten before by treating an address as an identity.
-func TestF105ACanonicalReferenceIsAKindNotAValue(t *testing.T) {
+func TestACanonicalReferenceIsAKindNotAValue(t *testing.T) {
 	if err := mqttValidateCanonicalRef(&mqttCanonicalRef{
 		Kind: mqttCanonicalConsumer, Consumer: "$MQTT_pubrel", Seq: 3,
 	}); err != nil {
 		t.Fatalf("a consumer reference was refused: %v", err)
 	}
 	if err := mqttValidateCanonicalRef(&mqttCanonicalRef{
-		Kind: mqttCanonicalInflight, Subject: "$MQTT.inflight.f105.rel.x", Identity: "rel-1",
+		Kind: mqttCanonicalInflight, Subject: "$MQTT.inflight.ob.rel.x", Identity: "rel-1",
 	}); err != nil {
 		t.Fatalf("an in-flight reference was refused: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestF105ACanonicalReferenceIsAKindNotAValue(t *testing.T) {
 		// A SUBJECT WITHOUT AN IDENTITY locates an address. A record read back from a rewritten
 		// subject is a different record, and only the identity says so.
 		"an in-flight reference with no identity": {
-			Kind: mqttCanonicalInflight, Subject: "$MQTT.inflight.f105.rel.x"},
+			Kind: mqttCanonicalInflight, Subject: "$MQTT.inflight.ob.rel.x"},
 		"an in-flight reference with no subject": {
 			Kind: mqttCanonicalInflight, Identity: "rel-1"},
 		"an in-flight reference carrying consumer coordinates": {

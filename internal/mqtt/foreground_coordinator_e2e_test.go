@@ -474,7 +474,7 @@ func TestPubRelClaimRefusesRecoveryInItsContentionWait(t *testing.T) {
 }
 
 // testPlantRaw stores body at subject, create-only.
-func testPlantRaw(t *testing.T, e *testF105Env, subject string, body any) uint64 {
+func testPlantRaw(t *testing.T, e *testOutboundEnv, subject string, body any) uint64 {
 	t.Helper()
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -491,14 +491,14 @@ func testPlantRaw(t *testing.T, e *testF105Env, subject string, body any) uint64
 // testPlantPoisedRoot enrols a discarded generation of the env's client whose sweep has finished:
 // unresolved > 0 poises it to ROLL, 0 to CONCLUDE (its ledger sealed at the bound, nothing below
 // the floor). Returns the root's sequence.
-func testPlantPoisedRoot(t *testing.T, e *testF105Env, gen string, ord, unresolved uint64) uint64 {
+func testPlantPoisedRoot(t *testing.T, e *testOutboundEnv, gen string, ord, unresolved uint64) uint64 {
 	t.Helper()
 	shard := mqttDirShardFor(getHash(e.id))
-	testF105PlantClosureAt(t, e, gen, shard, ord, true)
+	testPlantClosureAt(t, e, gen, shard, ord, true)
 	testPlantRaw(t, e, mqttGenLedgerSubject(getHash(e.id), gen), &mqttGenLedger{
 		Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: gen, State: mqttGenLedgerSealed, Hi: 2, SealedHi: 2,
 	})
-	return testF105PlantRoot(t, e, &mqttRecoveryRoot{
+	return testPlantRoot(t, e, &mqttRecoveryRoot{
 		Shard: shard, Ord: ord, ID: e.id, Epoch: e.epoch, Gen: gen,
 		SweepStart: 1, Resume: 3, Bound: 2, Unresolved: unresolved,
 	})
@@ -512,7 +512,7 @@ func testSharedClosingComplete(t *testing.T, id string) {
 	t.Cleanup(func() { mqttTestRecoverySharedClosingHookV.Store(prev) })
 }
 
-func testRootSeq(t *testing.T, e *testF105Env, ord uint64) uint64 {
+func testRootSeq(t *testing.T, e *testOutboundEnv, ord uint64) uint64 {
 	t.Helper()
 	r, seq, err := e.asm.jsa.loadRecoveryRoot(mqttDirShardFor(getHash(e.id)), ord)
 	if err != nil {
@@ -544,28 +544,28 @@ func testCountAttempts(t *testing.T, id string) *atomic.Int32 {
 // with the periodic pass disabled, the prompt drive alone concludes the one and rolls the other.
 func TestRefusedKickedVisitsAreNeverCharged(t *testing.T) {
 	t.Cleanup(setMQTTSessionExpirySweepInterval(time.Hour))
-	e, done := testF105NewEnv(t, "fg-poised")
+	e, done := testNewEnv(t, "fg-poised")
 	defer done()
 	testFastKickBackoff(t)
 	testSharedClosingComplete(t, e.id)
-	concludeSeq := testPlantPoisedRoot(t, e, testF105Gen, 1, 0)
-	rollSeq := testPlantPoisedRoot(t, e, testF105Gen2, 2, 1)
+	concludeSeq := testPlantPoisedRoot(t, e, testGen, 1, 0)
+	rollSeq := testPlantPoisedRoot(t, e, testGen2, 2, 1)
 	outcomes := testRecordKickOutcomes(t, e.id)
 	attempts := testCountAttempts(t, e.id)
 
 	h, _ := e.asm.announceForeground(e.id)
-	e.asm.kickRecoveryRoot(e.id, e.epoch, testF105Gen)
-	e.asm.kickRecoveryRoot(e.id, e.epoch, testF105Gen2)
+	e.asm.kickRecoveryRoot(e.id, e.epoch, testGen)
+	e.asm.kickRecoveryRoot(e.id, e.epoch, testGen2)
 	beyond := mqttRecoveryKickMaxVisits + 8
 	checkFor(t, 30*time.Second, 5*time.Millisecond, func() error {
-		_, rc, _ := outcomes.get(testF105Gen)
-		_, rr, _ := outcomes.get(testF105Gen2)
+		_, rc, _ := outcomes.get(testGen)
+		_, rr, _ := outcomes.get(testGen2)
 		if rc < beyond || rr < beyond {
 			return fmt.Errorf("refused visits so far: conclude %d, roll %d; want %d each", rc, rr, beyond)
 		}
 		return nil
 	})
-	for _, gen := range []string{testF105Gen, testF105Gen2} {
+	for _, gen := range []string{testGen, testGen2} {
 		if ch, _, gone := outcomes.get(gen); ch != 0 || gone != 0 {
 			t.Fatalf("generation %q: %d visits charged and %d gone under a standing announcement", gen, ch, gone)
 		}
@@ -579,7 +579,7 @@ func TestRefusedKickedVisitsAreNeverCharged(t *testing.T) {
 	if got := testRootSeq(t, e, 2); got != rollSeq {
 		t.Fatalf("the root poised to roll was written (%d -> %d) under a standing announcement", rollSeq, got)
 	}
-	if testDiscardCertified(e, testF105Gen) {
+	if testDiscardCertified(e, testGen) {
 		t.Fatal("the generation certified under a standing announcement")
 	}
 	if n := attempts.Load(); n != 0 {
@@ -588,7 +588,7 @@ func TestRefusedKickedVisitsAreNeverCharged(t *testing.T) {
 
 	h.release()
 	checkFor(t, 20*time.Second, 10*time.Millisecond, func() error {
-		if !testDiscardCertified(e, testF105Gen) || testRootSeq(t, e, 1) != 0 {
+		if !testDiscardCertified(e, testGen) || testRootSeq(t, e, 1) != 0 {
 			return fmt.Errorf("the root poised to conclude has not concluded")
 		}
 		if got := testRootSeq(t, e, 2); got == rollSeq {
@@ -604,13 +604,13 @@ func TestRefusedKickedVisitsAreNeverCharged(t *testing.T) {
 // the periodic pass disabled.
 func TestRefusedPeriodicVisitKicksItsRoot(t *testing.T) {
 	t.Cleanup(setMQTTSessionExpirySweepInterval(time.Hour))
-	e, done := testF105NewEnv(t, "fg-periodic")
+	e, done := testNewEnv(t, "fg-periodic")
 	defer done()
 	testFastKickBackoff(t)
 	testSharedClosingComplete(t, e.id)
 	shard := mqttDirShardFor(getHash(e.id))
-	testPlantPoisedRoot(t, e, testF105Gen, 1, 0)
-	testF105PlantShard(t, e, shard, 1)
+	testPlantPoisedRoot(t, e, testGen, 1, 0)
+	testPlantShard(t, e, shard, 1)
 	outcomes := testRecordKickOutcomes(t, e.id)
 
 	var visits atomic.Int32
@@ -624,13 +624,13 @@ func TestRefusedPeriodicVisitKicksItsRoot(t *testing.T) {
 	if visits.Load() == 0 {
 		t.Fatal("fixture: the periodic pass never walked the root's shard")
 	}
-	if testDiscardCertified(e, testF105Gen) {
+	if testDiscardCertified(e, testGen) {
 		t.Fatal("the periodic pass concluded a root its client's foreground refused")
 	}
 	h.release()
 	checkFor(t, 20*time.Second, 10*time.Millisecond, func() error {
-		if !testDiscardCertified(e, testF105Gen) {
-			_, refused, _ := outcomes.get(testF105Gen)
+		if !testDiscardCertified(e, testGen) {
+			_, refused, _ := outcomes.get(testGen)
 			return fmt.Errorf("the refused root never concluded (%d refused prompt visits)", refused)
 		}
 		return nil
@@ -643,15 +643,15 @@ func TestRefusedPeriodicVisitKicksItsRoot(t *testing.T) {
 // advances the floor.
 func TestFloorAdvancementAdmitsAfterThePositionDeletes(t *testing.T) {
 	t.Cleanup(setMQTTSessionExpirySweepInterval(time.Hour))
-	e, done := testF112Env(t, "fg-floor")
+	e, done := testFloorEnv(t, "fg-floor")
 	defer done()
 	jsa := &e.asm.jsa
 	for pi := uint16(1); pi <= 2; pi++ {
-		testF112EndAndResolve(t, e, testF112Admit(t, e, pi))
+		testEndAndResolve(t, e, testFloorAdmit(t, e, pi))
 	}
-	led, _ := testF112Ledger(t, e)
+	led, _ := testFloorLedger(t, e)
 	for i := 0; i < 8; i++ {
-		f, err := jsa.composeFloorBatch(e.id, e.epoch, testF105Gen, led.Hi+1)
+		f, err := jsa.composeFloorBatch(e.id, e.epoch, testGen, led.Hi+1)
 		if err != nil {
 			t.Fatalf("composing a floor batch: %v", err)
 		}
@@ -662,12 +662,12 @@ func TestFloorAdvancementAdmitsAfterThePositionDeletes(t *testing.T) {
 			t.Fatalf("advancing the floor: %v", err)
 		}
 	}
-	led, _ = testF112Ledger(t, e)
+	led, _ = testFloorLedger(t, e)
 	if led.Del >= led.Lo {
 		t.Fatalf("fixture: nothing below the floor awaits deletion: %+v", led)
 	}
-	root := testF105EnvRoot(e, 1, led.Hi+1, led.Hi, 0)
-	rootSeq := testF105PlantRoot(t, e, root)
+	root := testEnvRoot(e, 1, led.Hi+1, led.Hi, 0)
+	rootSeq := testPlantRoot(t, e, root)
 
 	var fg atomic.Pointer[mqttForegroundHandle]
 	seam := func(id, gen string) {
@@ -699,7 +699,7 @@ func TestFloorAdvancementAdmitsAfterThePositionDeletes(t *testing.T) {
 	if n := floors.Load(); n != 0 {
 		t.Fatalf("%d floor advancements were attempted under the announcement", n)
 	}
-	after, _ := testF112Ledger(t, e)
+	after, _ := testFloorLedger(t, e)
 	if after.Del != led.Del {
 		t.Fatalf("the floor advanced (%d -> %d) under the announcement", led.Del, after.Del)
 	}
@@ -710,7 +710,7 @@ func TestFloorAdvancementAdmitsAfterThePositionDeletes(t *testing.T) {
 	if e.asm.visitRecoveryRoot(e.asm.server(), root, rootSeq, newMqttRecoveryBudget(), nil) {
 		t.Fatal("the visit after the release was refused")
 	}
-	if after, _ = testF112Ledger(t, e); after.Del != after.Lo {
+	if after, _ = testFloorLedger(t, e); after.Del != after.Lo {
 		t.Fatalf("the floor did not advance after the release: %+v", after)
 	}
 	if got := testRootSeq(t, e, root.Ord); got == rootSeq {
@@ -723,11 +723,11 @@ func TestFloorAdvancementAdmitsAfterThePositionDeletes(t *testing.T) {
 // announcement exempts nothing — so the key exhausts its allowance and leaves the prompt drive.
 func TestUnreadableKickedClosureIsChargedUnderAnAnnouncement(t *testing.T) {
 	t.Cleanup(setMQTTSessionExpirySweepInterval(time.Hour))
-	e, done := testF105NewEnv(t, "fg-bad-closure")
+	e, done := testNewEnv(t, "fg-bad-closure")
 	defer done()
 	testFastKickBackoff(t)
 	msg, hdr := mqttFrameBatchWrite(0, []byte("{not a closure"), _EMPTY_, 0, false)
-	if _, err := e.asm.jsa.storeMsg(mqttGenClosureSubject(getHash(e.id), testF105Gen), hdr, msg); err != nil {
+	if _, err := e.asm.jsa.storeMsg(mqttGenClosureSubject(getHash(e.id), testGen), hdr, msg); err != nil {
 		t.Fatalf("planting the unreadable closure: %v", err)
 	}
 	testKickExhaustsUnderAnnouncement(t, e)
@@ -737,11 +737,11 @@ func TestUnreadableKickedClosureIsChargedUnderAnAnnouncement(t *testing.T) {
 // root cannot be read.
 func TestUnreadableKickedRootIsChargedUnderAnAnnouncement(t *testing.T) {
 	t.Cleanup(setMQTTSessionExpirySweepInterval(time.Hour))
-	e, done := testF105NewEnv(t, "fg-bad-root")
+	e, done := testNewEnv(t, "fg-bad-root")
 	defer done()
 	testFastKickBackoff(t)
 	shard := mqttDirShardFor(getHash(e.id))
-	testF105PlantClosureAt(t, e, testF105Gen, shard, 1, true)
+	testPlantClosureAt(t, e, testGen, shard, 1, true)
 	msg, hdr := mqttFrameBatchWrite(0, []byte("{not a root"), _EMPTY_, 0, false)
 	if _, err := e.asm.jsa.storeMsg(mqttRootSubject(shard, 1), hdr, msg); err != nil {
 		t.Fatalf("planting the unreadable root: %v", err)
@@ -749,20 +749,20 @@ func TestUnreadableKickedRootIsChargedUnderAnAnnouncement(t *testing.T) {
 	testKickExhaustsUnderAnnouncement(t, e)
 }
 
-func testKickExhaustsUnderAnnouncement(t *testing.T, e *testF105Env) {
+func testKickExhaustsUnderAnnouncement(t *testing.T, e *testOutboundEnv) {
 	t.Helper()
 	outcomes := testRecordKickOutcomes(t, e.id)
 	h, _ := e.asm.announceForeground(e.id)
 	defer h.release()
-	e.asm.kickRecoveryRoot(e.id, e.epoch, testF105Gen)
+	e.asm.kickRecoveryRoot(e.id, e.epoch, testGen)
 	checkFor(t, 20*time.Second, 5*time.Millisecond, func() error {
-		if testKickQueued(e.asm, e.id, e.epoch, testF105Gen) {
-			ch, rf, _ := outcomes.get(testF105Gen)
+		if testKickQueued(e.asm, e.id, e.epoch, testGen) {
+			ch, rf, _ := outcomes.get(testGen)
 			return fmt.Errorf("the key is still queued after %d charged and %d refused attempts", ch, rf)
 		}
 		return nil
 	})
-	ch, rf, gone := outcomes.get(testF105Gen)
+	ch, rf, gone := outcomes.get(testGen)
 	if ch != mqttRecoveryKickMaxVisits || rf != 0 || gone != 0 {
 		t.Fatalf("the unreadable key left after %d charged, %d refused and %d gone attempts; want exactly %d charged",
 			ch, rf, gone, mqttRecoveryKickMaxVisits)
@@ -775,7 +775,7 @@ func testKickExhaustsUnderAnnouncement(t *testing.T, e *testF105Env) {
 // visited again once due, instead of being dropped to the periodic pass.
 func TestRefusedKickedRootKeepsItsSlotWhileVisited(t *testing.T) {
 	t.Cleanup(setMQTTSessionExpirySweepInterval(time.Hour))
-	e, done := testF105NewEnv(t, "fg-kick-slot")
+	e, done := testNewEnv(t, "fg-kick-slot")
 	defer done()
 	testFastKickBackoff(t)
 	inVisit, release := make(chan struct{}), make(chan struct{})

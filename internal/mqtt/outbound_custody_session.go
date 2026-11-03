@@ -528,7 +528,7 @@ func (sess *mqttSession) readCustodySubject(gen, subject string) mqttCustodySubj
 
 // mqttExchangeNonceFromSubject extracts the exchange nonce from an exchange subject.
 func mqttExchangeNonceFromSubject(subject string) (string, bool) {
-	prefix := mqttF105SubjectPrefix()
+	prefix := mqttOutboundRecordSubjectPrefix()
 	if !strings.HasPrefix(subject, prefix) {
 		return _EMPTY_, false
 	}
@@ -1156,7 +1156,7 @@ func (sess *mqttSession) inventoryUndecidedLocked(census *mqttCustodyCensus, lin
 	if census == nil {
 		return true
 	}
-	dutyPrefix := mqttF105SubjectPrefix() + mqttDutyClassTk + "."
+	dutyPrefix := mqttOutboundRecordSubjectPrefix() + mqttDutyClassTk + "."
 	for _, subj := range census.uncertain {
 		if strings.HasPrefix(subj, dutyPrefix) {
 			return true

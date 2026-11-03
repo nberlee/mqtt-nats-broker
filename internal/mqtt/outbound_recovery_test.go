@@ -24,9 +24,9 @@ import "testing"
 // action returned by a decision function for which no transition kind exists, which is a
 // route that was decided and not built.
 
-// testF105ReserveCreation assembles a reservation over the given predecessor (nil for a
+// testReserveCreation assembles a reservation over the given predecessor (nil for a
 // virgin client, or a CLOSED authority).
-func testF105ReserveCreation(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64,
+func testReserveCreation(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn, gen, tenure, intentID string) *mqttAuthorityTransition {
 
 	rev := uint64(1)
@@ -52,10 +52,10 @@ func testF105ReserveCreation(e *testF105Env, prev *mqttOutboundAuthority, prevSe
 	}
 }
 
-// testF105FinalizeCreation turns a standing reservation into a serving authority. txn is the
+// testFinalizeCreation turns a standing reservation into a serving authority. txn is the
 // FINALIZING transition's identity, which may belong to a broker other than the one that
 // reserved — that is the whole point of the on-behalf path.
-func testF105FinalizeCreation(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64,
+func testFinalizeCreation(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn string) *mqttAuthorityTransition {
 
 	c := prev.Creation
@@ -73,7 +73,7 @@ func testF105FinalizeCreation(e *testF105Env, prev *mqttOutboundAuthority, prevS
 	}
 }
 
-// TestF105AbandonedForeignReservationIsRecoverable walks the whole RESERVING/ABORTED
+// TestAbandonedForeignReservationIsRecoverable walks the whole RESERVING/ABORTED
 // continuation against the store.
 //
 // Broker A claims a virgin client and dies before resolving its metadata half. Without a
@@ -82,13 +82,13 @@ func testF105FinalizeCreation(e *testF105Env, prev *mqttOutboundAuthority, prevS
 // proposal, closes the reserved generation, and claims a fresh one BESIDE the closure —
 // still as a reservation with its own metadata half, never as a serving authority, because
 // installing one outright is the bootstrap gap reappearing on the second attempt.
-func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-recover-reservation")
+func TestAbandonedForeignReservationIsRecoverable(t *testing.T) {
+	e, done := testNewEnv(t, "f105-recover-reservation")
 	defer done()
 
 	// (1) BROKER A reserves, and then stops.
-	a := testF105ReserveCreation(e, nil, 0, "txn-a", testF105Gen, "tenure-a", "intent-a")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, a)); err != nil {
+	a := testReserveCreation(e, nil, 0, "txn-a", testGen, "tenure-a", "intent-a")
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, a)); err != nil {
 		t.Fatalf("broker A's reservation was refused: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 		},
 		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: load.rec.Gen, Txn: "txn-b-close"},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("closing the abandoned reservation was refused: %v", err)
 	}
 	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
@@ -153,9 +153,9 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 	// REUSING THE CLOSED GENERATION IS NOT A FRESH PROPOSAL, and is refused. Attempted
 	// FIRST, at the sequence just read: run after a successful claim it would be refused by
 	// the stale CAS instead, and a fixture refused by the sequence never reaches the rule.
-	reuse := testF105ReserveCreation(e, load.rec, load.seq, "txn-b-reuse", testF105Gen,
+	reuse := testReserveCreation(e, load.rec, load.seq, "txn-b-reuse", testGen,
 		"tenure-b2", "intent-b2")
-	if _, rerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reuse)); rerr == nil {
+	if _, rerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reuse)); rerr == nil {
 		t.Fatalf("a reservation reused the closed generation")
 	}
 	if back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); back.seq != load.seq {
@@ -164,8 +164,8 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 
 	// THIS IS THE ROUTE THAT DID NOT EXIST. reserve-creation refused any predecessor, so
 	// the action was decided and unrunnable.
-	res := testF105ReserveCreation(e, load.rec, load.seq, "txn-b", testF105Gen2, "tenure-b", "intent-b")
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, res))
+	res := testReserveCreation(e, load.rec, load.seq, "txn-b", testGen2, "tenure-b", "intent-b")
+	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, res))
 	if err != nil {
 		t.Fatalf("reserving over the closure was refused: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("viewing B's reservation as a proposal failed: %v", perr)
 	}
-	f := testF105FreezeProposal(t, e, p, testF105RecordSeq(t, e))
+	f := testFreezeProposal(t, e, p, testRecordSeq(t, e))
 	if _, cerr := e.asm.jsa.commitMetadataAttempt(f); cerr != nil {
 		t.Fatalf("B's metadata commit was refused: %v", cerr)
 	}
@@ -189,37 +189,37 @@ func TestF105AbandonedForeignReservationIsRecoverable(t *testing.T) {
 			d.Action, d.Reason)
 	}
 	if _, ferr := e.asm.jsa.commitAuthorityTransition(
-		testF105FinalizeCreation(e, load.rec, load.seq, "txn-b-fin")); ferr != nil {
+		testFinalizeCreation(e, load.rec, load.seq, "txn-b-fin")); ferr != nil {
 		t.Fatalf("B's finalization was refused: %v", ferr)
 	}
 	end := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if end.status != mqttOutboundValid || end.rec.State != mqttAuthorityServing ||
-		end.rec.Gen != testF105Gen2 || end.rec.Tenure != "tenure-b" {
+		end.rec.Gen != testGen2 || end.rec.Tenure != "tenure-b" {
 		t.Fatalf("after the recovery the client is not served by B: %+v", end.rec)
 	}
 	_ = resSeq
 }
 
-// TestF105OnBehalfFinalizationGrantsTheHelperNothing is Codex's Q4, end to end.
+// TestOnBehalfFinalizationGrantsTheHelperNothing is Codex's Q4, end to end.
 //
 // Broker A's reservation COMMITTED its metadata half and A then stopped. The proposal won, so
 // settling it must not abort it — and B, finding a committed proposal it did not make,
 // finalizes it AS PROPOSED. What B must not get out of that is the tenure: A's generation and
 // A's tenure are installed, and B then takes an ordinary handoff like any other acceptance.
 // Nothing about having pushed a stalled proposal over the line entitles B to serve under it.
-func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-onbehalf")
+func TestOnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
+	e, done := testNewEnv(t, "f105-onbehalf")
 	defer done()
 
-	a := testF105ReserveCreation(e, nil, 0, "txn-a", testF105Gen, "tenure-a", "intent-a")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, a)); err != nil {
+	a := testReserveCreation(e, nil, 0, "txn-a", testGen, "tenure-a", "intent-a")
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, a)); err != nil {
 		t.Fatalf("broker A's reservation was refused: %v", err)
 	}
 	pa, perr := mqttProposalFromCreation(a.Auth.Creation)
 	if perr != nil {
 		t.Fatalf("viewing A's reservation as a proposal failed: %v", perr)
 	}
-	fa := testF105FreezeProposal(t, e, pa, testF105RecordSeq(t, e))
+	fa := testFreezeProposal(t, e, pa, testRecordSeq(t, e))
 	if _, cerr := e.asm.jsa.commitMetadataAttempt(fa); cerr != nil {
 		t.Fatalf("A's metadata commit was refused: %v", cerr)
 	}
@@ -244,8 +244,8 @@ func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
 
 	// B finalizes under ITS OWN transition identity. The ownership token stays A's, because
 	// the transition that CLAIMED the client is the one that owns it.
-	fin := testF105FinalizeCreation(e, load.rec, load.seq, "txn-b-onbehalf")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, fin)); err != nil {
+	fin := testFinalizeCreation(e, load.rec, load.seq, "txn-b-onbehalf")
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, fin)); err != nil {
 		t.Fatalf("B's on-behalf finalization was refused: %v", err)
 	}
 
@@ -254,9 +254,9 @@ func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
 		t.Fatalf("the on-behalf finalization did not install a serving authority: %+v", end.rec)
 	}
 	// EXACTLY WHAT A PROPOSED, and nothing of B's.
-	if end.rec.Gen != testF105Gen || end.rec.Tenure != "tenure-a" {
+	if end.rec.Gen != testGen || end.rec.Tenure != "tenure-a" {
 		t.Fatalf("the on-behalf finalization installed %q/%q, want A's proposal %q/%q",
-			end.rec.Gen, end.rec.Tenure, testF105Gen, "tenure-a")
+			end.rec.Gen, end.rec.Tenure, testGen, "tenure-a")
 	}
 	if end.rec.OwnerTxn != "txn-a" {
 		t.Fatalf("the on-behalf finalization moved ownership to %q; the transition that "+
@@ -274,7 +274,7 @@ func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
 	}
 }
 
-// TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable pins the predecessor rule the widened
+// TestOnlyAnAbsentOrClosedAuthorityIsClaimable pins the predecessor rule the widened
 // claim rests on.
 //
 // reserve-creation gained a CLOSED predecessor so the post-closure claim would have a route.
@@ -282,17 +282,17 @@ func TestF105OnBehalfFinalizationGrantsTheHelperNothing(t *testing.T) {
 // tenure would be displaced with no handoff and no metadata half, and a preparing or
 // reserving one would have its unresolved proposal silently abandoned — the authority would
 // still be in that state with nothing left to finalize.
-func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
-	for name, build := range map[string]func(e *testF105Env) *mqttAuthorityTransition{
-		"a serving tenure": func(e *testF105Env) *mqttAuthorityTransition {
+func TestOnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
+	for name, build := range map[string]func(e *testOutboundEnv) *mqttAuthorityTransition{
+		"a serving tenure": func(e *testOutboundEnv) *mqttAuthorityTransition {
 			return e.firstReservation("txn-live")
 		},
-		"a standing reservation": func(e *testF105Env) *mqttAuthorityTransition {
-			return testF105ReserveCreation(e, nil, 0, "txn-res", testF105Gen, "tenure-res", "intent-res")
+		"a standing reservation": func(e *testOutboundEnv) *mqttAuthorityTransition {
+			return testReserveCreation(e, nil, 0, "txn-res", testGen, "tenure-res", "intent-res")
 		},
 	} {
 		func() {
-			e, done := testF105NewEnv(t, "f105-claimable")
+			e, done := testNewEnv(t, "f105-claimable")
 			defer done()
 
 			if _, err := e.asm.jsa.commitAuthorityTransition(build(e)); err != nil {
@@ -302,9 +302,9 @@ func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
 			if load.status != mqttOutboundValid {
 				t.Fatalf("%s does not load back: status %v", name, load.status)
 			}
-			claim := testF105ReserveCreation(e, load.rec, load.seq, "txn-claim", testF105Gen2,
+			claim := testReserveCreation(e, load.rec, load.seq, "txn-claim", testGen2,
 				"tenure-claim", "intent-claim")
-			if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, claim)); err == nil {
+			if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, claim)); err == nil {
 				t.Fatalf("a reservation was claimed over %s", name)
 			}
 			after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -315,13 +315,13 @@ func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
 	}
 
 	// A PREPARING authority is the third live state, and reaching it takes a preparation.
-	e, done := testF105NewEnv(t, "f105-claimable-prep")
+	e, done := testNewEnv(t, "f105-claimable-prep")
 	defer done()
 	auth, seq := e.bootstrap(t, "txn-1")
 	intent := &mqttHandoffIntent{
 		ID: "intent-1", PrevGen: auth.Gen, PrevTenure: auth.Tenure,
 		PrevOwnerTxn: auth.OwnerTxn, PrevSessWID: "wid-0", PrevSessSeq: 12,
-		Tenure: "tenure-next", Gen: testF105Gen2, CleanReq: true,
+		Tenure: "tenure-next", Gen: testGen2, CleanReq: true,
 		Retire: &mqttRetirementRequest{
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
@@ -340,16 +340,16 @@ func TestF105OnlyAnAbsentOrClosedAuthorityIsClaimable(t *testing.T) {
 			OwnerTxn: auth.OwnerTxn, Intent: intent,
 		},
 	}
-	if _, perr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, prep)); perr != nil {
+	if _, perr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, prep)); perr != nil {
 		t.Fatalf("the preparation was refused: %v", perr)
 	}
 	load := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if load.status != mqttOutboundValid || load.rec.State != mqttAuthorityPreparing {
 		t.Fatalf("the preparing authority does not load back (status %v)", load.status)
 	}
-	claim := testF105ReserveCreation(e, load.rec, load.seq, "txn-claim", testF105Gen2,
+	claim := testReserveCreation(e, load.rec, load.seq, "txn-claim", testGen2,
 		"tenure-claim", "intent-claim")
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, claim)); cerr == nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, claim)); cerr == nil {
 		t.Fatalf("a reservation was claimed over a pending handoff, abandoning it unresolved")
 	}
 	if after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); after.rec.Intent == nil ||

@@ -33,23 +33,23 @@ import (
 // itself names mqttUntrackUnanswered explicitly.
 const testUntrackNoBinding = mqttUntrackAnswered
 
-// f088ProvSite is one discovered site: the enclosing function and what it does.
-type f088ProvSite struct {
+// provSite is one discovered site: the enclosing function and what it does.
+type provSite struct {
 	fn   string
 	what string
 }
 
-// f088ScanProvenance walks the package's PRODUCTION sources for every construction of a
+// scanProvenance walks the package's PRODUCTION sources for every construction of a
 // cancellation: each assignment or composite-literal key setting `Cancelled` or `CancelOrigin`,
 // and the value it sets where that value is a literal or a named constant. It also records the
 // call sites of the fence's persistence paths, so construction and persistence are one census.
-func f088ScanProvenance(t *testing.T) (sites map[f088ProvSite]int, funcs map[string]*ast.FuncDecl, fset *token.FileSet) {
+func scanProvenance(t *testing.T) (sites map[provSite]int, funcs map[string]*ast.FuncDecl, fset *token.FileSet) {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("reading the package directory: %v", err)
 	}
-	sites = map[f088ProvSite]int{}
+	sites = map[provSite]int{}
 	funcs = map[string]*ast.FuncDecl{}
 	fset = token.NewFileSet()
 	value := func(e ast.Expr) string {
@@ -94,11 +94,11 @@ func f088ScanProvenance(t *testing.T) (sites map[f088ProvSite]int, funcs map[str
 						if len(x.Rhs) == len(x.Lhs) {
 							v = value(x.Rhs[i])
 						}
-						sites[f088ProvSite{fn: fn, what: sel.Sel.Name + "=" + v}]++
+						sites[provSite{fn: fn, what: sel.Sel.Name + "=" + v}]++
 					}
 				case *ast.KeyValueExpr:
 					if k, ok := x.Key.(*ast.Ident); ok && (k.Name == "Cancelled" || k.Name == "CancelOrigin") {
-						sites[f088ProvSite{fn: fn, what: k.Name + ":" + value(x.Value)}]++
+						sites[provSite{fn: fn, what: k.Name + ":" + value(x.Value)}]++
 					}
 				case *ast.CallExpr:
 					var callee string
@@ -109,7 +109,7 @@ func f088ScanProvenance(t *testing.T) (sites map[f088ProvSite]int, funcs map[str
 						callee = c.Sel.Name
 					}
 					if persist[callee] {
-						sites[f088ProvSite{fn: fn, what: "call " + callee}]++
+						sites[provSite{fn: fn, what: "call " + callee}]++
 					}
 				}
 				return true
@@ -119,10 +119,10 @@ func f088ScanProvenance(t *testing.T) (sites map[f088ProvSite]int, funcs map[str
 	return sites, funcs, fset
 }
 
-// f088FrozenProvenance is the FROZEN close set (plan rule 7, C4 section 2), by branch. A new
+// frozenProvenance is the FROZEN close set (plan rule 7, C4 section 2), by branch. A new
 // site — a new writer of either member, a new value, or a new caller of a fence persistence
 // path — fails the census until it is given a disposition here, and a removed one fails as stale.
-var f088FrozenProvenance = map[f088ProvSite]int{
+var frozenProvenance = map[provSite]int{
 	// THE ONE pending-fence producer: the create-only sparse body (pending-create), and its
 	// conflict branch's rebuild over the landed same-nonce occupant (occupant).
 	{fn: "markInflightRegisterCancelledPending", what: "Cancelled:true"}:                             1,
@@ -160,24 +160,24 @@ var f088FrozenProvenance = map[f088ProvSite]int{
 	{fn: "composeAcquisition", what: "CancelOrigin=_EMPTY_"}:               1,
 }
 
-// TestF088CancellationRegisterProducersAreFrozen is T32 (plan rule 7): the census of every
+// TestCancellationRegisterProducersAreFrozen is T32 (plan rule 7): the census of every
 // construction and every persistence path of a cancellation, frozen, plus the structural
 // guarantees the dedicated disposal rule leans on.
 //
 // Not a scan of functions NAMED "tombstone": that would repeat the original inventory error
 // (the producer that writes the fence is not named for it).
-func TestF088CancellationRegisterProducersAreFrozen(t *testing.T) {
+func TestCancellationRegisterProducersAreFrozen(t *testing.T) {
 	t.Parallel()
-	sites, funcs, fset := f088ScanProvenance(t)
+	sites, funcs, fset := scanProvenance(t)
 
 	// CONSTRUCTION AND PERSISTENCE: discovered == frozen, both directions, with multiplicity.
 	var diffs []string
 	for s, got := range sites {
-		if want := f088FrozenProvenance[s]; want != got {
+		if want := frozenProvenance[s]; want != got {
 			diffs = append(diffs, s.fn+" / "+s.what+": source has "+itoa(got)+", frozen set has "+itoa(want))
 		}
 	}
-	for s, want := range f088FrozenProvenance {
+	for s, want := range frozenProvenance {
 		if _, ok := sites[s]; !ok {
 			diffs = append(diffs, s.fn+" / "+s.what+": frozen with "+itoa(want)+" but no longer in the source (stale row)")
 		}

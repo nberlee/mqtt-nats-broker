@@ -76,7 +76,7 @@ func testDutyOrdinalOf(t *testing.T, e *testInflightEnv, gen, lin string) uint64
 // inventory, not the register walk, is what reaches it.
 //
 // Mutation M1: the inventory's exchange reservation omitted -> the identifier is handed out.
-func TestF105ResumeInventoryReservesAnExchangeWithoutARegister(t *testing.T) {
+func TestResumeInventoryReservesAnExchangeWithoutARegister(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "inv-t1", 1)
 	e := f.e
@@ -104,7 +104,7 @@ func TestF105ResumeInventoryReservesAnExchangeWithoutARegister(t *testing.T) {
 //
 // Mutations M3 (a hole read as complete) and M3b (a resource-duty re-read left uncertain forever,
 // or taken as resource work done).
-func TestF105ResumeInventoryHoleIsUncertainty(t *testing.T) {
+func TestResumeInventoryHoleIsUncertainty(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name   string
@@ -173,7 +173,7 @@ func TestF105ResumeInventoryHoleIsUncertainty(t *testing.T) {
 // T3, the resource arm: a hole whose re-read decodes to a RESOURCE duty discharges the custody
 // uncertainty — a resource carries no identifier and no Receive Maximum charge — and the duty
 // itself is left exactly as the inventory records it.
-func TestF105ResumeInventoryResourceDutyDischargesCustodyOnly(t *testing.T) {
+func TestResumeInventoryResourceDutyDischargesCustodyOnly(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "inv-t3-resource", 1)
 	e := f.e
@@ -243,7 +243,7 @@ func TestF105ResumeInventoryResourceDutyDischargesCustodyOnly(t *testing.T) {
 // from a register.
 //
 // Mutation M6: the refusal removed -> the register is restored as a sendable delivery.
-func TestF105ResumeRefusesAnOrdinaryRegisterTheInventoryDidNotReach(t *testing.T) {
+func TestResumeRefusesAnOrdinaryRegisterTheInventoryDidNotReach(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "inv-t7", 1)
 	e := f.e
@@ -296,7 +296,7 @@ func TestF105ResumeRefusesAnOrdinaryRegisterTheInventoryDidNotReach(t *testing.T
 // resource duties).
 //
 // Mutation M6b: the tombstone row removed, so the tombstone is refused as unreached (opaque).
-func TestF105ResumeDropsAPendingTombstoneWithoutAnExchange(t *testing.T) {
+func TestResumeDropsAPendingTombstoneWithoutAnExchange(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "inv-t7b")
 	testReadyForRealPubRelDelivery(t, e)
@@ -349,7 +349,7 @@ func TestF105ResumeDropsAPendingTombstoneWithoutAnExchange(t *testing.T) {
 // the docs as a cost measurement, not presented as a scaling bound.
 //
 // Mutation M7: the traversal capped at the current in-flight count, or at its first page.
-func TestF105ResumeInventoryReadsEveryOrdinal(t *testing.T) {
+func TestResumeInventoryReadsEveryOrdinal(t *testing.T) {
 	t.Parallel()
 	const hi = 5000
 	const hole = hi - 1
@@ -377,7 +377,7 @@ func TestF105ResumeInventoryReadsEveryOrdinal(t *testing.T) {
 		t.Fatalf("advance the ledger: %v", err)
 	}
 	var dutyReads atomic.Int64
-	dutyPrefix := mqttF105SubjectPrefix() + mqttDutyClassTk + "."
+	dutyPrefix := mqttOutboundRecordSubjectPrefix() + mqttDutyClassTk + "."
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 		for _, s := range subjects {

@@ -1646,7 +1646,7 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			last = smsg.Sequence
 			records++
 
-			if mqttIsF105Subject(smsg.Subject) {
+			if mqttIsOutboundRecordSubject(smsg.Subject) {
 				// issue #107's ARBITRATION RECORDS, which share this stream with the registers
 				// because a JetStream atomic batch is per stream and the authority must
 				// commit with the exchange mutation it authorizes. They are a different
@@ -2588,7 +2588,7 @@ type mqttPubRelCandidate struct {
 // REFUSED and reported, never acted on and never migrated: it is a shape no supported
 // writer emits, so nothing about it can be a licence.
 func (as *mqttAccountSessionManager) pubRelCandidateFromOwnership(s *Server, smsg *StoredMsg) *mqttPubRelCandidate {
-	if !strings.HasPrefix(smsg.Subject, mqttF105SubjectPrefix()+mqttNameOwnClassTk+"."+string(mqttOwnedStreamOut)+".") {
+	if !strings.HasPrefix(smsg.Subject, mqttOutboundRecordSubjectPrefix()+mqttNameOwnClassTk+"."+string(mqttOwnedStreamOut)+".") {
 		return nil // not a $MQTT_out name's ownership
 	}
 	// The manager's epoch, never the body's: a record of another epoch is not this one's

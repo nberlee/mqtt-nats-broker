@@ -53,12 +53,12 @@ const (
 
 // mqttExchangeSubject returns the durable subject of one exchange.
 func mqttExchangeSubject(idHash, gen, nonce string) string {
-	return mqttF105SubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + gen + "." + nonce
+	return mqttOutboundRecordSubjectPrefix() + mqttExchangeClassTk + "." + idHash + "." + gen + "." + nonce
 }
 
 // mqttActionSubject returns the durable subject of one acquired action.
 func mqttActionSubject(idHash, gen, nonce string, acq uint64) string {
-	return mqttF105SubjectPrefix() + mqttActionClassTk + "." + idHash + "." + gen + "." +
+	return mqttOutboundRecordSubjectPrefix() + mqttActionClassTk + "." + idHash + "." + gen + "." +
 		nonce + "." + strconv.FormatUint(acq, 10)
 }
 
@@ -69,7 +69,7 @@ func mqttActionSubject(idHash, gen, nonce string, acq uint64) string {
 // rewrite. It lives here, beside the subject it mirrors, because a caller assembling the
 // pattern itself is a second statement of the layout that nothing keeps in step with the first.
 func mqttActionWalkFilter(idHash, gen, nonce string) string {
-	return mqttF105SubjectPrefix() + mqttActionClassTk + "." + idHash + "." + gen + "." +
+	return mqttOutboundRecordSubjectPrefix() + mqttActionClassTk + "." + idHash + "." + gen + "." +
 		nonce + ".*"
 }
 
@@ -315,7 +315,7 @@ func mqttValidateExchangeHolds(e *mqttOutboundExchange) error {
 	}
 	seen := make(map[mqttExchangeHold]struct{}, len(e.Holds))
 	for _, h := range e.Holds {
-		if !mqttF105IdentTk(h.Inc) {
+		if !mqttOutboundIdentTk(h.Inc) {
 			return fmt.Errorf("outbound exchange holds a malformed resource incarnation %q", h.Inc)
 		}
 		if !mqttHoldRole(h.Role) {
@@ -401,9 +401,9 @@ func mqttValidateExchangeAbandonment(f *mqttExchangeAbandonment) error {
 		return mqttValidateRetainedAbandonment(f)
 	case !mqttValidAbandonReason(f.Reason):
 		return fmt.Errorf("the abandonment fact carries reason %q, which this broker does not abandon for", f.Reason)
-	case !mqttF105IdentTk(f.Tenure):
+	case !mqttOutboundIdentTk(f.Tenure):
 		return fmt.Errorf("the abandonment fact carries a malformed tenure %q", f.Tenure)
-	case !mqttF105IdentTk(f.Alloc):
+	case !mqttOutboundIdentTk(f.Alloc):
 		return fmt.Errorf("the abandonment fact carries a malformed allocation %q", f.Alloc)
 	case f.Dur == _EMPTY_ || f.Seq == 0:
 		return fmt.Errorf("the abandonment fact names no source delivery")
@@ -597,7 +597,7 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 	if e.Nonce != wantNonce {
 		return fmt.Errorf("outbound exchange names nonce %q on the subject of %q", e.Nonce, wantNonce)
 	}
-	if !mqttF105IdentTk(e.Nonce) {
+	if !mqttOutboundIdentTk(e.Nonce) {
 		return fmt.Errorf("outbound exchange carries a malformed nonce %q", e.Nonce)
 	}
 	if e.PI == 0 {
@@ -619,10 +619,10 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 		e.Phase == mqttExchangeRejectedPendingDrain || e.Phase == mqttExchangeRejected) {
 		return fmt.Errorf("a QoS 1 outbound exchange carries phase %d, which belongs to QoS 2", e.Phase)
 	}
-	if !mqttF105IdentTk(e.AdmitTxn) {
+	if !mqttOutboundIdentTk(e.AdmitTxn) {
 		return fmt.Errorf("outbound exchange carries a malformed admitting transition %q", e.AdmitTxn)
 	}
-	if !mqttF105IdentTk(e.Tenure) {
+	if !mqttOutboundIdentTk(e.Tenure) {
 		return fmt.Errorf("outbound exchange carries a malformed tenure %q", e.Tenure)
 	}
 	// THE FACT AND ITS PHASES. An abandonment is written only with its fact, and the fact
@@ -650,7 +650,7 @@ func mqttValidateOutboundExchange(e *mqttOutboundExchange, wantID, wantEpoch, wa
 			return fmt.Errorf("outbound exchange depends on a shared acquisition at QoS %d; supported shared delivery is QoS 1", e.QoS)
 		}
 	}
-	if e.RetainedOwner != _EMPTY_ && !mqttF105IdentTk(e.RetainedOwner) {
+	if e.RetainedOwner != _EMPTY_ && !mqttOutboundIdentTk(e.RetainedOwner) {
 		return fmt.Errorf("outbound exchange carries a malformed retained owner %q", e.RetainedOwner)
 	}
 	return mqttValidateExchangeHolds(e)
@@ -688,10 +688,10 @@ func mqttValidateOutboundAction(a *mqttOutboundAction, wantID, wantEpoch, wantGe
 	if a.Run == _EMPTY_ || a.Conn == _EMPTY_ {
 		return fmt.Errorf("outbound action names no originating connection")
 	}
-	if !mqttF105IdentTk(a.Tenure) {
+	if !mqttOutboundIdentTk(a.Tenure) {
 		return fmt.Errorf("outbound action carries a malformed tenure %q", a.Tenure)
 	}
-	if !mqttF105IdentTk(a.AcqTxn) {
+	if !mqttOutboundIdentTk(a.AcqTxn) {
 		return fmt.Errorf("outbound action carries a malformed acquiring transition %q", a.AcqTxn)
 	}
 	return nil

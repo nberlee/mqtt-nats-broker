@@ -57,13 +57,13 @@ func (r mqttReleaseConfirmed) discharged() bool {
 
 // mqttGenClosureWalkFilter enumerates one client's closure records, and only those.
 func mqttGenClosureWalkFilter(idHash string) string {
-	return mqttF105SubjectPrefix() + mqttClosureClassTk + "." + idHash + ".*"
+	return mqttOutboundRecordSubjectPrefix() + mqttClosureClassTk + "." + idHash + ".*"
 }
 
 // mqttTransitionOutcomeWalkFilter enumerates one client's transition outcomes, and only
 // those.
 func mqttTransitionOutcomeWalkFilter(idHash string) string {
-	return mqttF105SubjectPrefix() + mqttOutcomeClassTk + "." + idHash + ".*"
+	return mqttOutboundRecordSubjectPrefix() + mqttOutcomeClassTk + "." + idHash + ".*"
 }
 
 // ---- from outbound_exchange.go ----

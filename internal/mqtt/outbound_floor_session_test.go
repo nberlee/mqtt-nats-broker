@@ -28,7 +28,7 @@ import (
 
 // T1. A resume reads [Lo, Hi] and nothing below it (M5): with the floor near the top of a long
 // history, the traversal's duty reads are exactly the span, and none names a position below Lo.
-func TestF112ResumeReadsFromTheFloor(t *testing.T) {
+func TestResumeReadsFromTheFloor(t *testing.T) {
 	t.Parallel()
 	const hi = 3000
 	const span = 120
@@ -53,7 +53,7 @@ func TestF112ResumeReadsFromTheFloor(t *testing.T) {
 		t.Fatalf("advance the ledger: %v", err)
 	}
 	var reads, below atomic.Int64
-	dutyPrefix := mqttF105SubjectPrefix() + mqttDutyClassTk + "."
+	dutyPrefix := mqttOutboundRecordSubjectPrefix() + mqttDutyClassTk + "."
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 		for _, s := range subjects {
@@ -85,7 +85,7 @@ func TestF112ResumeReadsFromTheFloor(t *testing.T) {
 // T10. The ended-lineage veto's exit (M13a/b/c). An entry is pruned only with no projection
 // naming it, no resume in flight, and its register no longer naming it; each condition alone keeps
 // it, and a kept entry still vetoes an AckRoute.
-func TestF112TheEndedLineageVetoExitsOnlyWhenNothingCanReinstallIt(t *testing.T) {
+func TestTheEndedLineageVetoExitsOnlyWhenNothingCanReinstallIt(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-t10", 1)
 	e := f.e
@@ -159,7 +159,7 @@ func TestF112TheEndedLineageVetoExitsOnlyWhenNothingCanReinstallIt(t *testing.T)
 // T16. The floor's demand is a latch that survives a closing incarnation (M16): its tick fires
 // into the closing incarnation, the start is refused at the lease, and the reopen re-arms it. The
 // floor is the only owed work.
-func TestF112TheFloorLatchSurvivesACloseAndReopen(t *testing.T) {
+func TestTheFloorLatchSurvivesACloseAndReopen(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-t16", 1)
 	sess := f.e.sess
@@ -241,7 +241,7 @@ func TestF112TheFloorLatchSurvivesACloseAndReopen(t *testing.T) {
 // T13. A retired position's uncertainty waits for a census (M15). A duty subject held uncertain
 // by this session is retired and deleted behind the floor; its individual re-read does not
 // discharge it, and the next complete census does.
-func TestF112ARetiredPositionsUncertaintyWaitsForACensus(t *testing.T) {
+func TestARetiredPositionsUncertaintyWaitsForACensus(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-t13", 1)
 	e := f.e
@@ -314,7 +314,7 @@ func TestF112ARetiredPositionsUncertaintyWaitsForACensus(t *testing.T) {
 // WITHOUT a NAK — the client already completed the message, so redelivering its source would
 // duplicate it. A record whose attempt was positively ABORTED (nothing landed) still NAKs. One
 // whose committed lineage is still named inside the floor is retained.
-func TestF112AdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
+func TestAdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-t5", 1)
 	e := f.e
@@ -450,7 +450,7 @@ func TestF112AdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 // MAXMSGSPER-REVIVAL, would bring back registers the floor then rightly carries). The fresh
 // state's census arms the floor, and its unit resolves the duties FROM THE INVENTORY — this
 // process never held those exchanges — and reclaims them rather than carrying them.
-func TestF112AFreshProcessResolvesWhatItsPredecessorCompleted(t *testing.T) {
+func TestAFreshProcessResolvesWhatItsPredecessorCompleted(t *testing.T) {
 	t.Parallel()
 	const n = 300
 	f := testWithdrawAdmitted(t, "f112-t14", 1)

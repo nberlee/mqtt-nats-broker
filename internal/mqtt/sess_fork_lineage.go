@@ -311,7 +311,7 @@ var (
 	// validating provenance, valid-shaped bodies arrive through unconditional publication,
 	// and acknowledged bytes are replayed verbatim. Its only licence is
 	// discardTakenOverClient, and the single-reader property is asserted by
-	// TestF084OnlyOneReaderOfTheTakeoverClaim.
+	// TestOnlyOneReaderOfTheTakeoverClaim.
 	mqttDisposalTakenOver = mqttDisposalVocabulary{
 		reason:      mqttReasonSessionTakenOver,
 		reasonStr:   mqttReasonStrSessionTakenOver,

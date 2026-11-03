@@ -31,85 +31,85 @@ import (
 // nothing, so each one is classified here by what makes "nothing" correct; a new direct site, or
 // a new untrack call, fails this census until it is classified.
 
-// f088RemovalClass is why a removal installs no binding (or, for the sink's Unanswered callers,
+// removalClass is why a removal installs no binding (or, for the sink's Unanswered callers,
 // why the evidence decides).
-type f088RemovalClass string
+type removalClass string
 
 const (
 	// The entry is a CANCELLED placeholder (regCancelled): never acting, Unknown evidence.
-	f088RemovalCancelledPlaceholder f088RemovalClass = "cancelled-placeholder"
+	removalCancelledPlaceholder removalClass = "cancelled-placeholder"
 	// The entry is PROVEN UNSENT by a local classification (its marker stands): nothing to answer.
-	f088RemovalProvenUnsent f088RemovalClass = "proven-unsent"
+	removalProvenUnsent removalClass = "proven-unsent"
 	// An ABANDONMENT installed its HandBack in the same section; the HandBack routes the answer.
-	f088RemovalAbandonmentHandBack f088RemovalClass = "abandonment-handback"
+	removalAbandonmentHandBack removalClass = "abandonment-handback"
 	// Recovery removes the entry WITH PROOF (a drop of a provably settled or unsent register) or
 	// hands it to a PUBREL-side owner it installed first.
-	f088RemovalRecoveryOwner f088RemovalClass = "recovery-proof-or-owner"
+	removalRecoveryOwner removalClass = "recovery-proof-or-owner"
 	// A recovery RESERVATION (non-acting) goes after its owner or exclusion is installed.
-	f088RemovalRecoveryReservation f088RemovalClass = "recovery-reservation"
+	removalRecoveryReservation removalClass = "recovery-reservation"
 	// The client ANSWERED (PUBREC/terminal successor owns the exchange now).
-	f088RemovalAnsweredHandoff f088RemovalClass = "answered-handoff"
+	removalAnsweredHandoff removalClass = "answered-handoff"
 	// The sink itself.
-	f088RemovalSink f088RemovalClass = "sink"
+	removalSink removalClass = "sink"
 	// Through the sink, by reason.
-	f088RemovalUntrackAnswered   f088RemovalClass = "untrack-answered"
-	f088RemovalUntrackEnded      f088RemovalClass = "untrack-ended"
-	f088RemovalUntrackUnanswered f088RemovalClass = "untrack-unanswered"
-	f088RemovalUntrackBySettle   f088RemovalClass = "untrack-by-settle-kind"
+	removalUntrackAnswered   removalClass = "untrack-answered"
+	removalUntrackEnded      removalClass = "untrack-ended"
+	removalUntrackUnanswered removalClass = "untrack-unanswered"
+	removalUntrackBySettle   removalClass = "untrack-by-settle-kind"
 )
 
-// f088RemovalBacking names, per class, the behavioural tests that witness it. Each must exist.
-var f088RemovalBacking = map[f088RemovalClass][]string{
-	f088RemovalCancelledPlaceholder: {"TestMQTTInflightConsumerPurgeSecuresCancellations",
+// removalBacking names, per class, the behavioural tests that witness it. Each must exist.
+var removalBacking = map[removalClass][]string{
+	removalCancelledPlaceholder: {"TestMQTTInflightConsumerPurgeSecuresCancellations",
 		"TestMQTTInflightConsumerPurgeSecuresCancellationsAuthority"},
-	f088RemovalProvenUnsent:        {"TestF088MarkerStandingRemovalInstallsNoBinding"},
-	f088RemovalAbandonmentHandBack: {"TestF105AbandonDeniedDeliveryReleasesTheChargeNotTheIdentifier", "TestUnitCAbandonedAckHandler"},
-	f088RemovalRecoveryOwner:       {"TestF088PendingFenceFromTheProducerIsDroppedOnColdResume", "TestF088PreservedRegisterLatePubAckAfterColdPeerResume"},
-	f088RemovalRecoveryReservation: {"TestF097OpaqueAndRereadFailureStayConservative"},
-	f088RemovalAnsweredHandoff:     {"TestUnitCAbandonedAckDirectArrows"},
-	f088RemovalSink:                {"TestF088UntrackedTransmittedDeliveryLatePubAckEndsTheExchange"},
-	f088RemovalUntrackAnswered:     {"TestF088UntrackedTransmittedDeliveryLatePubAckEndsTheExchange"},
-	f088RemovalUntrackEnded:        {"TestF088AckRouteEndsByLineage", "TestF088EndedLineageIsNotReboundOnIdentifierReuse"},
-	f088RemovalUntrackUnanswered:   {"TestF088UntrackedTransmittedDeliveryLatePubAckEndsTheExchange", "TestF088MarkerStandingRemovalInstallsNoBinding"},
-	f088RemovalUntrackBySettle:     {"TestF088EveryEntryRemovalHasAReason"},
+	removalProvenUnsent:        {"TestMarkerStandingRemovalInstallsNoBinding"},
+	removalAbandonmentHandBack: {"TestAbandonDeniedDeliveryReleasesTheChargeNotTheIdentifier", "TestUnitCAbandonedAckHandler"},
+	removalRecoveryOwner:       {"TestPendingFenceFromTheProducerIsDroppedOnColdResume", "TestPreservedRegisterLatePubAckAfterColdPeerResume"},
+	removalRecoveryReservation: {"TestOpaqueAndRereadFailureStayConservative"},
+	removalAnsweredHandoff:     {"TestUnitCAbandonedAckDirectArrows"},
+	removalSink:                {"TestUntrackedTransmittedDeliveryLatePubAckEndsTheExchange"},
+	removalUntrackAnswered:     {"TestUntrackedTransmittedDeliveryLatePubAckEndsTheExchange"},
+	removalUntrackEnded:        {"TestAckRouteEndsByLineage", "TestEndedLineageIsNotReboundOnIdentifierReuse"},
+	removalUntrackUnanswered:   {"TestUntrackedTransmittedDeliveryLatePubAckEndsTheExchange", "TestMarkerStandingRemovalInstallsNoBinding"},
+	removalUntrackBySettle:     {"TestEveryEntryRemovalHasAReason"},
 }
 
-// f088RemovalSite is one discovered removal: the enclosing function and what it does.
-type f088RemovalSite struct {
+// removalSite is one discovered removal: the enclosing function and what it does.
+type removalSite struct {
 	fn   string
 	what string // "delete" or "untrack:<reason>"
 }
 
-// f088FrozenRemovals is the FROZEN census, by enclosing function.
-var f088FrozenRemovals = map[f088RemovalSite]struct {
+// frozenRemovals is the FROZEN census, by enclosing function.
+var frozenRemovals = map[removalSite]struct {
 	n     int
-	class f088RemovalClass
+	class removalClass
 }{
-	{"releaseCancelledReservation", "delete"}:          {1, f088RemovalCancelledPlaceholder},
-	{"releaseSettledVoidReservationsLocked", "delete"}: {1, f088RemovalCancelledPlaceholder},
-	{"forgetVoidedReg", "delete"}:                      {1, f088RemovalCancelledPlaceholder},
-	{"confirmInflightRegister", "delete"}:              {2, f088RemovalCancelledPlaceholder},
-	{"abandonInflightRegister", "delete"}:              {1, f088RemovalCancelledPlaceholder},
-	{"purgeConsumerPendingModeLocked", "delete"}:       {1, f088RemovalProvenUnsent},
-	{"settleAbandonedDeliveryLocked", "delete"}:        {1, f088RemovalAbandonmentHandBack},
-	{"recoverInflightRegistersOnce", "delete"}:         {2, f088RemovalRecoveryOwner},
-	{"recoverExchangeRouteLocked", "delete"}:           {1, f088RemovalAnsweredHandoff},
-	{"handOffPublishEntryLocked", "delete"}:            {1, f088RemovalAnsweredHandoff},
-	{"commitRecoveryReleaseLocked", "delete"}:          {1, f088RemovalRecoveryReservation},
-	{"handOffRecoveryPublishLocked", "delete"}:         {1, f088RemovalRecoveryReservation},
-	{"untrackPublishEntry", "delete"}:                  {1, f088RemovalSink},
+	{"releaseCancelledReservation", "delete"}:          {1, removalCancelledPlaceholder},
+	{"releaseSettledVoidReservationsLocked", "delete"}: {1, removalCancelledPlaceholder},
+	{"forgetVoidedReg", "delete"}:                      {1, removalCancelledPlaceholder},
+	{"confirmInflightRegister", "delete"}:              {2, removalCancelledPlaceholder},
+	{"abandonInflightRegister", "delete"}:              {1, removalCancelledPlaceholder},
+	{"purgeConsumerPendingModeLocked", "delete"}:       {1, removalProvenUnsent},
+	{"settleAbandonedDeliveryLocked", "delete"}:        {1, removalAbandonmentHandBack},
+	{"recoverInflightRegistersOnce", "delete"}:         {2, removalRecoveryOwner},
+	{"recoverExchangeRouteLocked", "delete"}:           {1, removalAnsweredHandoff},
+	{"handOffPublishEntryLocked", "delete"}:            {1, removalAnsweredHandoff},
+	{"commitRecoveryReleaseLocked", "delete"}:          {1, removalRecoveryReservation},
+	{"handOffRecoveryPublishLocked", "delete"}:         {1, removalRecoveryReservation},
+	{"untrackPublishEntry", "delete"}:                  {1, removalSink},
 }
 
-// f088ScanRemovals finds every production `delete(sess.pendingPublish, ...)` and every
+// scanRemovals finds every production `delete(sess.pendingPublish, ...)` and every
 // untrackPublish / untrackPublishEntry call with its reason argument.
-func f088ScanRemovals(t *testing.T) map[f088RemovalSite]int {
+func scanRemovals(t *testing.T) map[removalSite]int {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
 	fset := token.NewFileSet()
-	out := map[f088RemovalSite]int{}
+	out := map[removalSite]int{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -133,7 +133,7 @@ func f088ScanRemovals(t *testing.T) map[f088RemovalSite]int {
 				case *ast.Ident:
 					if fun.Name == "delete" && len(ce.Args) == 2 {
 						if sel, ok := ce.Args[0].(*ast.SelectorExpr); ok && sel.Sel.Name == "pendingPublish" {
-							out[f088RemovalSite{fd.Name.Name, "delete"}]++
+							out[removalSite{fd.Name.Name, "delete"}]++
 						}
 					}
 				case *ast.SelectorExpr:
@@ -142,7 +142,7 @@ func f088ScanRemovals(t *testing.T) map[f088RemovalSite]int {
 						if id, ok := ce.Args[1].(*ast.Ident); ok {
 							reason = id.Name
 						}
-						out[f088RemovalSite{fd.Name.Name, "untrack:" + reason}]++
+						out[removalSite{fd.Name.Name, "untrack:" + reason}]++
 					}
 				}
 				return true
@@ -152,10 +152,10 @@ func f088ScanRemovals(t *testing.T) map[f088RemovalSite]int {
 	return out
 }
 
-// TestF088EveryEntryRemovalHasAReason is T13.
-func TestF088EveryEntryRemovalHasAReason(t *testing.T) {
+// TestEveryEntryRemovalHasAReason is T13.
+func TestEveryEntryRemovalHasAReason(t *testing.T) {
 	t.Parallel()
-	got := f088ScanRemovals(t)
+	got := scanRemovals(t)
 	var diffs []string
 	for s, n := range got {
 		if strings.HasPrefix(s.what, "untrack:") {
@@ -172,11 +172,11 @@ func TestF088EveryEntryRemovalHasAReason(t *testing.T) {
 			}
 			continue
 		}
-		if want, ok := f088FrozenRemovals[s]; !ok || want.n != n {
+		if want, ok := frozenRemovals[s]; !ok || want.n != n {
 			diffs = append(diffs, s.fn+" / "+s.what+": source has "+itoa(n)+", frozen has "+itoa(want.n))
 		}
 	}
-	for s, want := range f088FrozenRemovals {
+	for s, want := range frozenRemovals {
 		if _, ok := got[s]; !ok {
 			diffs = append(diffs, s.fn+" / "+s.what+": frozen with "+itoa(want.n)+" but gone from the source (stale row)")
 		}
@@ -187,23 +187,23 @@ func TestF088EveryEntryRemovalHasAReason(t *testing.T) {
 	}
 
 	// BEHAVIOURAL BACKING: every class names tests that exist in this package.
-	exists := f088TestNames(t)
-	for class, tests := range f088RemovalBacking {
+	exists := testNames(t)
+	for class, tests := range removalBacking {
 		for _, name := range tests {
 			if !exists[name] {
 				t.Errorf("class %s is backed by %s, which does not exist", class, name)
 			}
 		}
 	}
-	for _, row := range f088FrozenRemovals {
-		if len(f088RemovalBacking[row.class]) == 0 {
+	for _, row := range frozenRemovals {
+		if len(removalBacking[row.class]) == 0 {
 			t.Errorf("class %s has no behavioural backing", row.class)
 		}
 	}
 }
 
-// f088TestNames is every `func TestX(` declared in this package's test sources.
-func f088TestNames(t *testing.T) map[string]bool {
+// testNames is every `func TestX(` declared in this package's test sources.
+func testNames(t *testing.T) map[string]bool {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {

@@ -61,7 +61,7 @@ import (
 // caller has stopped referring to them, and inventing an expiry would rebuild the
 // inference from absence that the whole item exists to remove.
 
-// mqttF105ClassTk is the fixed token that opens every subject class this file owns.
+// mqttOutboundRecordClassTk is the fixed token that opens every subject class this file owns.
 //
 // It is what keeps these records out of the register machinery's reach, and the guard is
 // TOKEN VALIDATION rather than token count. The distinction matters and an earlier comment
@@ -72,7 +72,7 @@ import (
 // both properties rather than leaving them implied, because a class that silently began
 // parsing as a register would be destroyed by a reap that believed it had named what it
 // deleted.
-const mqttF105ClassTk = "f105"
+const mqttOutboundRecordClassTk = "ob"
 
 // The per-class tokens. Each names the fact its record carries, not the mechanism that
 // writes it.
@@ -82,17 +82,17 @@ const (
 	mqttOutcomeClassTk   = "txn"    // one attempted transition's permanent verdict
 )
 
-// mqttF105SubjectPrefix is the common prefix of every class above.
-func mqttF105SubjectPrefix() string {
-	return mqttInflightStreamSubjectPrefix + mqttF105ClassTk + "."
+// mqttOutboundRecordSubjectPrefix is the common prefix of every class above.
+func mqttOutboundRecordSubjectPrefix() string {
+	return mqttInflightStreamSubjectPrefix + mqttOutboundRecordClassTk + "."
 }
 
-// mqttIsF105Subject reports whether a subject belongs to any issue #107 record class.
-func mqttIsF105Subject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix())
+// mqttIsOutboundRecordSubject reports whether a subject belongs to any issue #107 record class.
+func mqttIsOutboundRecordSubject(subject string) bool {
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix())
 }
 
-// mqttIsF105ArbitrationSubject reports whether a subject is one of the three records the
+// mqttIsOutboundArbitrationSubject reports whether a subject is one of the three records the
 // TRANSITION WRITER ITSELF owns: the authority, a permanent generation closure, a permanent
 // transition outcome.
 //
@@ -102,11 +102,11 @@ func mqttIsF105Subject(subject string) bool {
 // commit it faithfully, because it validates ordering and never meaning. The obligation
 // classes an admission installs (an exchange, an action) are the opposite: carrying them is
 // the whole point of the batch.
-func mqttIsF105ArbitrationSubject(subject string) bool {
-	if !mqttIsF105Subject(subject) {
+func mqttIsOutboundArbitrationSubject(subject string) bool {
+	if !mqttIsOutboundRecordSubject(subject) {
 		return false
 	}
-	rest := subject[len(mqttF105SubjectPrefix()):]
+	rest := subject[len(mqttOutboundRecordSubjectPrefix()):]
 	for _, cls := range []string{mqttAuthorityClassTk, mqttClosureClassTk, mqttOutcomeClassTk} {
 		if strings.HasPrefix(rest, cls+".") {
 			return true
@@ -115,7 +115,7 @@ func mqttIsF105ArbitrationSubject(subject string) bool {
 	return false
 }
 
-// mqttF105ObligationClass returns the obligation class a subject names, and whether it is
+// mqttOutboundObligationClass returns the obligation class a subject names, and whether it is
 // one at all. A subject under the issue #107 prefix that is neither an arbitration record nor a
 // known obligation class is refused rather than guessed at.
 //
@@ -125,11 +125,11 @@ func mqttIsF105ArbitrationSubject(subject string) bool {
 // did. These two are the opposite: an admission CARRIES its ledger CAS and its duty entries, in
 // the same batch, because allocating an ordinal atomically with the obligation is the whole
 // mechanism. Carrying them is the point.
-func mqttF105ObligationClass(subject string) (string, bool) {
-	if !mqttIsF105Subject(subject) {
+func mqttOutboundObligationClass(subject string) (string, bool) {
+	if !mqttIsOutboundRecordSubject(subject) {
 		return _EMPTY_, false
 	}
-	rest := subject[len(mqttF105SubjectPrefix()):]
+	rest := subject[len(mqttOutboundRecordSubjectPrefix()):]
 	for _, cls := range []string{mqttExchangeClassTk, mqttActionClassTk, mqttResourceClassTk,
 		mqttLedgerClassTk, mqttDutyClassTk, mqttManifestClassTk, mqttChunkClassTk, mqttRelClassTk} {
 		if strings.HasPrefix(rest, cls+".") {
@@ -145,7 +145,7 @@ func mqttF105ObligationClass(subject string) (string, bool) {
 // move from one generation to the next, so a name scoped by generation could not express
 // the transition that retires one and admits its successor.
 func mqttOutboundAuthoritySubject(idHash string) string {
-	return mqttF105SubjectPrefix() + mqttAuthorityClassTk + "." + idHash
+	return mqttOutboundRecordSubjectPrefix() + mqttAuthorityClassTk + "." + idHash
 }
 
 // mqttGenClosureSubject returns the permanent closure subject for one generation.
@@ -154,7 +154,7 @@ func mqttOutboundAuthoritySubject(idHash string) string {
 // reader resolves entitlement against, and a closure that could be reaped would let a
 // later reader conclude an open generation from its absence.
 func mqttGenClosureSubject(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttClosureClassTk + "." + idHash + "." + gen
+	return mqttOutboundRecordSubjectPrefix() + mqttClosureClassTk + "." + idHash + "." + gen
 }
 
 // mqttTransitionOutcomeSubject returns the permanent outcome subject of one attempted
@@ -166,14 +166,14 @@ func mqttGenClosureSubject(idHash, gen string) string {
 // ever exist and the loser's whole batch is refused. Two slots, or one overwritable slot,
 // would let an abort stand beside a later commit and decide nothing.
 func mqttTransitionOutcomeSubject(idHash, txn string) string {
-	return mqttF105SubjectPrefix() + mqttOutcomeClassTk + "." + idHash + "." + txn
+	return mqttOutboundRecordSubjectPrefix() + mqttOutcomeClassTk + "." + idHash + "." + txn
 }
 
-// mqttF105IdentTk reports whether s is a nonempty single subject token. Used for the
+// mqttOutboundIdentTk reports whether s is a nonempty single subject token. Used for the
 // identity tokens this file mints rather than derives — a transition id, a tenure id —
 // which must not contain a separator or a wildcard, since every name here is built by
 // concatenation and a stored value is never a trusted input.
-func mqttF105IdentTk(s string) bool {
+func mqttOutboundIdentTk(s string) bool {
 	return s != _EMPTY_ && !strings.ContainsAny(s, ". \t*>")
 }
 
@@ -419,19 +419,19 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 	if a.ID == _EMPTY_ {
 		return fmt.Errorf("transition attempt names no client")
 	}
-	if !mqttF105IdentTk(a.Epoch) {
+	if !mqttOutboundIdentTk(a.Epoch) {
 		return fmt.Errorf("transition attempt carries a malformed recovery epoch %q", a.Epoch)
 	}
-	if !mqttF105IdentTk(a.Txn) {
+	if !mqttOutboundIdentTk(a.Txn) {
 		return fmt.Errorf("transition attempt carries a malformed transition id %q", a.Txn)
 	}
-	if !mqttF105IdentTk(a.Op) {
+	if !mqttOutboundIdentTk(a.Op) {
 		return fmt.Errorf("transition attempt carries a malformed operation id %q", a.Op)
 	}
 	if !mqttValidTransitionKind(a.Kind) {
 		return fmt.Errorf("transition attempt carries an unsupported kind %q", a.Kind)
 	}
-	if a.PrevTxn != _EMPTY_ && !mqttF105IdentTk(a.PrevTxn) {
+	if a.PrevTxn != _EMPTY_ && !mqttOutboundIdentTk(a.PrevTxn) {
 		return fmt.Errorf("transition attempt names a malformed predecessor transition %q", a.PrevTxn)
 	}
 	// AN AUTHORITY-FREE KIND proposes no revision and displaces no predecessor; every other kind
@@ -444,10 +444,10 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 	if !mqttValidSessGen(a.Gen) {
 		return fmt.Errorf("transition attempt proposes a malformed generation %q", a.Gen)
 	}
-	if !mqttF105IdentTk(a.Tenure) {
+	if !mqttOutboundIdentTk(a.Tenure) {
 		return fmt.Errorf("transition attempt proposes a malformed tenure %q", a.Tenure)
 	}
-	if !mqttF105IdentTk(a.OwnerTxn) {
+	if !mqttOutboundIdentTk(a.OwnerTxn) {
 		return fmt.Errorf("transition attempt proposes a malformed ownership transition %q", a.OwnerTxn)
 	}
 	// A first admission is the only attempt with no predecessor, and it is exactly the
@@ -462,7 +462,7 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 	// checks, which is how a stale value survives to be believed later.
 	needsIntent := a.Kind == mqttTransitionFinalize || a.Kind == mqttTransitionCancelIntent ||
 		a.Kind == mqttTransitionFinalizeCreation
-	if needsIntent && !mqttF105IdentTk(a.Intent) {
+	if needsIntent && !mqttOutboundIdentTk(a.Intent) {
 		return fmt.Errorf("a %s attempt names no handoff intent", a.Kind)
 	}
 	if !needsIntent && a.Intent != _EMPTY_ {
@@ -656,13 +656,13 @@ func mqttValidateCreationIntent(i *mqttCreationIntent) error {
 	if i == nil {
 		return fmt.Errorf("creation intent is absent")
 	}
-	if !mqttF105IdentTk(i.ID) {
+	if !mqttOutboundIdentTk(i.ID) {
 		return fmt.Errorf("creation intent carries a malformed id %q", i.ID)
 	}
 	if !mqttValidSessGen(i.Gen) {
 		return fmt.Errorf("creation intent proposes a malformed generation %q", i.Gen)
 	}
-	if !mqttF105IdentTk(i.Tenure) {
+	if !mqttOutboundIdentTk(i.Tenure) {
 		return fmt.Errorf("creation intent proposes a malformed tenure %q", i.Tenure)
 	}
 	return nil
@@ -1048,13 +1048,13 @@ func mqttValidateOutboundAuthority(a *mqttOutboundAuthority, wantID, wantEpoch s
 	if !mqttValidSessGen(a.Gen) {
 		return fmt.Errorf("outbound authority carries a malformed generation %q", a.Gen)
 	}
-	if !mqttF105IdentTk(a.Tenure) {
+	if !mqttOutboundIdentTk(a.Tenure) {
 		return fmt.Errorf("outbound authority carries a malformed tenure %q", a.Tenure)
 	}
-	if !mqttF105IdentTk(a.Txn) {
+	if !mqttOutboundIdentTk(a.Txn) {
 		return fmt.Errorf("outbound authority carries a malformed transition id %q", a.Txn)
 	}
-	if !mqttF105IdentTk(a.OwnerTxn) {
+	if !mqttOutboundIdentTk(a.OwnerTxn) {
 		return fmt.Errorf("outbound authority carries a malformed ownership transition id %q", a.OwnerTxn)
 	}
 	if a.Rev == 0 {
@@ -1191,16 +1191,16 @@ func mqttValidateHandoffIntent(i *mqttHandoffIntent) error {
 	if i == nil {
 		return fmt.Errorf("handoff intent is absent")
 	}
-	if !mqttF105IdentTk(i.ID) {
+	if !mqttOutboundIdentTk(i.ID) {
 		return fmt.Errorf("handoff intent carries a malformed id %q", i.ID)
 	}
 	if !mqttValidSessGen(i.PrevGen) {
 		return fmt.Errorf("handoff intent names a malformed predecessor generation %q", i.PrevGen)
 	}
-	if !mqttF105IdentTk(i.PrevTenure) {
+	if !mqttOutboundIdentTk(i.PrevTenure) {
 		return fmt.Errorf("handoff intent names a malformed predecessor tenure %q", i.PrevTenure)
 	}
-	if !mqttF105IdentTk(i.PrevOwnerTxn) {
+	if !mqttOutboundIdentTk(i.PrevOwnerTxn) {
 		return fmt.Errorf("handoff intent names a malformed predecessor ownership transition %q", i.PrevOwnerTxn)
 	}
 	if i.PrevSessWID == _EMPTY_ {
@@ -1214,7 +1214,7 @@ func mqttValidateHandoffIntent(i *mqttHandoffIntent) error {
 	if !mqttValidSessGen(i.Gen) {
 		return fmt.Errorf("handoff intent proposes a malformed generation %q", i.Gen)
 	}
-	if !mqttF105IdentTk(i.Tenure) {
+	if !mqttOutboundIdentTk(i.Tenure) {
 		return fmt.Errorf("handoff intent proposes a malformed tenure %q", i.Tenure)
 	}
 	// A clean start DISCARDS the session, so it necessarily proposes a fresh generation; a
@@ -1278,7 +1278,7 @@ func mqttValidateGenClosure(c *mqttGenClosure, wantID, wantEpoch, wantGen string
 	if !mqttValidSessGen(c.Gen) {
 		return fmt.Errorf("generation closure carries a malformed generation %q", c.Gen)
 	}
-	if !mqttF105IdentTk(c.Txn) {
+	if !mqttOutboundIdentTk(c.Txn) {
 		return fmt.Errorf("generation closure carries a malformed transition id %q", c.Txn)
 	}
 	if c.RootShard >= mqttDirShards {
@@ -1316,13 +1316,13 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 	if o.Txn != wantTxn {
 		return fmt.Errorf("transition outcome names transition %q on the subject of %q", o.Txn, wantTxn)
 	}
-	if !mqttF105IdentTk(o.Op) {
+	if !mqttOutboundIdentTk(o.Op) {
 		return fmt.Errorf("transition outcome carries a malformed operation id %q", o.Op)
 	}
 	if !mqttValidTransitionKind(o.Kind) {
 		return fmt.Errorf("transition outcome carries an unsupported kind %q", o.Kind)
 	}
-	if o.PrevTxn != _EMPTY_ && !mqttF105IdentTk(o.PrevTxn) {
+	if o.PrevTxn != _EMPTY_ && !mqttOutboundIdentTk(o.PrevTxn) {
 		return fmt.Errorf("transition outcome names a malformed predecessor transition %q", o.PrevTxn)
 	}
 	// The same three kinds that must NAME the proposal they answer must record it, so the
@@ -1330,7 +1330,7 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 	// required to name an intent whose receipt may not carry it would be unresolvable.
 	resolvesHandoff := o.Kind == mqttTransitionFinalize || o.Kind == mqttTransitionCancelIntent ||
 		o.Kind == mqttTransitionFinalizeCreation
-	if resolvesHandoff && !mqttF105IdentTk(o.Intent) {
+	if resolvesHandoff && !mqttOutboundIdentTk(o.Intent) {
 		return fmt.Errorf("a %s outcome names no handoff intent", o.Kind)
 	}
 	if !resolvesHandoff && o.Intent != _EMPTY_ {
@@ -1348,10 +1348,10 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 		if !mqttValidSessGen(o.Gen) {
 			return fmt.Errorf("committed outcome carries a malformed generation %q", o.Gen)
 		}
-		if !mqttF105IdentTk(o.Tenure) {
+		if !mqttOutboundIdentTk(o.Tenure) {
 			return fmt.Errorf("committed outcome carries a malformed tenure %q", o.Tenure)
 		}
-		if !mqttF105IdentTk(o.OwnerTxn) {
+		if !mqttOutboundIdentTk(o.OwnerTxn) {
 			return fmt.Errorf("committed outcome carries a malformed ownership transition %q", o.OwnerTxn)
 		}
 		if o.Digest == _EMPTY_ {

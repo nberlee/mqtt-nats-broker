@@ -57,9 +57,9 @@ func testAwait(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
-// TestF105AWriterQueuedOnTheLockHonoursALaterSeal pins that a seal applied while a writer is
+// TestAWriterQueuedOnTheLockHonoursALaterSeal pins that a seal applied while a writer is
 // queued on wmu reaches that writer: the gate is read once the lock is held, never before it.
-func TestF105AWriterQueuedOnTheLockHonoursALaterSeal(t *testing.T) {
+func TestAWriterQueuedOnTheLockHonoursALaterSeal(t *testing.T) {
 	t.Run("writeAuthorizedFrame", func(t *testing.T) {
 		c, tc, bind := testFrameClient(t, 0)
 		reached := testWriterPreLockSeam(t, c, nil)
@@ -127,11 +127,11 @@ func TestF105AWriterQueuedOnTheLockHonoursALaterSeal(t *testing.T) {
 	})
 }
 
-// TestF105ATornWriterSealsBeforeAnyWriterCanFollow pins that a frame torn mid-write seals the
+// TestATornWriterSealsBeforeAnyWriterCanFollow pins that a frame torn mid-write seals the
 // gate BEFORE it releases wmu. The release is the first moment a queued writer can take the lock;
 // a seal that came after it would let that writer begin a second frame on a transport already
 // carrying half of one.
-func TestF105ATornWriterSealsBeforeAnyWriterCanFollow(t *testing.T) {
+func TestATornWriterSealsBeforeAnyWriterCanFollow(t *testing.T) {
 	for _, follower := range []string{"writeAuthorizedFrame", "writeSocket"} {
 		t.Run(follower, func(t *testing.T) {
 			// The transport accepts the 3-byte header and refuses the payload: a torn frame.

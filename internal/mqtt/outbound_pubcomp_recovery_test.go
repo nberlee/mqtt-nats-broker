@@ -85,7 +85,7 @@ func testSlotAt(t *testing.T, e *testInflightEnv, subject string) *mqttInflightR
 // then rebinds the canonical tuple.
 //
 // Mutation M25: route B's ordinary arm reverted to the slot-only CAS -> the exchange stays PUBLISH.
-func TestF105RouteBRecordsTheRecoveredPubRec(t *testing.T) {
+func TestRouteBRecordsTheRecoveredPubRec(t *testing.T) {
 	t.Run("both steps", func(t *testing.T) {
 		t.Parallel()
 		e, pi, subject, lin := testAdmittedPublishWorld(t, "f105-routeb", testRealPubRelSrcSeq)
@@ -287,7 +287,7 @@ func TestF105RouteBRecordsTheRecoveredPubRec(t *testing.T) {
 //
 // Mutation M24: skip recordDrainIntentPubRec -> the exchange still reads PUBLISH when the drain
 // resume returns (admission would only repair it AT delivery).
-func TestF105DrainResumeRecordsTheIntentsPubRec(t *testing.T) {
+func TestDrainResumeRecordsTheIntentsPubRec(t *testing.T) {
 	for _, withRecord := range []bool{false, true} {
 		withRecord := withRecord
 		name := "record absent: recreate"
@@ -335,7 +335,7 @@ func TestF105DrainResumeRecordsTheIntentsPubRec(t *testing.T) {
 // kept from pubrel_intended, and — T15b — the live connection's next delivery makes progress.
 //
 // Mutation M27: admission refuses without recording the PUBREC -> T15b never delivers.
-func TestF105AdmissionRecordsThePubRecTheDeliveredRecordProves(t *testing.T) {
+func TestAdmissionRecordsThePubRecTheDeliveredRecordProves(t *testing.T) {
 	// Deliberately NOT t.Parallel(): testCountPubRelWrites counts at a process-global write hook.
 	e, pi, subject, lin := testAdmittedPublishWorld(t, "f105-admission-pubrec", testRealPubRelSrcSeq)
 	nonce := e.nonceOf(pi)
@@ -392,7 +392,7 @@ func TestF105AdmissionRecordsThePubRecTheDeliveredRecordProves(t *testing.T) {
 // T15c. The direct-arrow primitive itself never moves an ordinary publish slot past PUBREC.
 //
 // Mutation M26: remove the primitive's ordinary-publish refusal -> it acquires.
-func TestF105DirectArrowRefusesAnOrdinaryPublishOrigin(t *testing.T) {
+func TestDirectArrowRefusesAnOrdinaryPublishOrigin(t *testing.T) {
 	t.Parallel()
 	e, pi, subject, lin := testAdmittedPublishWorld(t, "f105-direct-primitive", testRealPubRelSrcSeq)
 	canon := testStoreCanonical(t, e, pi, e.nonceOf(pi), testRealPubRelSrcSeq)
@@ -423,7 +423,7 @@ func TestF105DirectArrowRefusesAnOrdinaryPublishOrigin(t *testing.T) {
 
 // T12. Recovery's and the handler's unsettled terminal cleanups go to the completion worker, and
 // the worker settles each outcome by its own rule.
-func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
+func TestTerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 	t.Run("recovery's indeterminate finalize: the worker owns it and the resume continues", func(t *testing.T) {
 		// Mutation M20: recovery's default arm back to retainAndReconcileTerminal -> no worker.
 		t.Parallel()
@@ -463,7 +463,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 		}
 		asm.mu.Unlock()
 		t.Cleanup(func() { asm.mu.Lock(); asm.testInflightPubRelScan = nil; asm.mu.Unlock() })
-		ref := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
+		ref := testSlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
 		if res := w.e.sess.mqttTerminalizeOnPubComp(w.e.c, ref); !res.recorded || res.outcome != mqttTerminalIndeterminate {
 			t.Fatalf("the held cleanup concluded %+v", res)
 		}
@@ -490,7 +490,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 		w, act := testPendingDrainWorld(t, "f105-t12b")
 		// The local holder is gone (as if its process died) but its durable token stands.
 		w.e.sess.finishActionAndWake(act, false)
-		ref := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelTerminal, true)
+		ref := testSlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelTerminal, true)
 		w.e.sess.ownTerminalCleanup(w.e.c, ref)
 		time.Sleep(mqttActionReconcileDelay + mqttActionReconcileDelay/2)
 		if entry, _ := w.pending(); entry == nil || entry.jsAckSubject != _EMPTY_ {
@@ -525,7 +525,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 		// while another action's token stands.
 		t.Parallel()
 		w := testNewPubCompWorld(t, "f105-t12c")
-		ref := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
+		ref := testSlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
 		actA := w.e.sess.testAcquirePubRel(w.e.c, ref)
 		if actA == nil {
 			t.Fatal("no local action")
@@ -593,7 +593,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 		e.asm.mu.Lock()
 		e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 			out, err := write()
-			if err == nil && testF105IsPubCompAdvance(req, seed.lin) {
+			if err == nil && testIsPubCompAdvance(req, seed.lin) {
 				armed.Store(true)
 			}
 			return out, err
@@ -610,7 +610,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 			e.asm.testAckAdvance, e.asm.testInflightLoad = nil, nil
 			e.asm.mu.Unlock()
 		})
-		ref := testF105SlotRefAt(t, e.sess, seed.pi, mqttInflightPubRelReady, false)
+		ref := testSlotRefAt(t, e.sess, seed.pi, mqttInflightPubRelReady, false)
 		res := e.sess.mqttTerminalizeOnPubComp(e.c, ref)
 		if !failed.Load() || !res.recorded || res.outcome != mqttTerminalIndeterminate {
 			t.Fatalf("the fixture did not produce a recorded, unsettled completion: %+v", res)
@@ -641,7 +641,7 @@ func TestF105TerminalCleanupOwnersSettleByOutcome(t *testing.T) {
 // completion is authority-free and leaves its hold release-owed, so it writes neither record.
 // Mutation M-L1a or M-L0a (the completion writes the authority, or releases its hold on the
 // source resource, again): the first PUBCOMP batch loses its CAS.
-func TestF105PubCompLandsOverAnAuthorityWrite(t *testing.T) {
+func TestPubCompLandsOverAnAuthorityWrite(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-pubcomp-contention")
 	var calls atomic.Int32
@@ -649,7 +649,7 @@ func TestF105PubCompLandsOverAnAuthorityWrite(t *testing.T) {
 	var inPubComp atomic.Bool
 	w.e.asm.mu.Lock()
 	w.e.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		if testF105IsPubCompAdvance(req, w.seed.lin) {
+		if testIsPubCompAdvance(req, w.seed.lin) {
 			inPubComp.Store(true)
 			defer inPubComp.Store(false)
 		}

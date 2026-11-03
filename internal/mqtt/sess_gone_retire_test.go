@@ -85,10 +85,10 @@ func (e *testRejectionEnv) restoreRecordRemotely(t *testing.T, body []byte) {
 	}
 }
 
-// TestF036SilentBoundGoneWithHigherRetirementIsRetired is the headline: a bound, silent
+// TestSilentBoundGoneWithHigherRetirementIsRetired is the headline: a bound, silent
 // client whose record is gone and whose retirement is provable is disposed of by the
 // periodic pass, with no traffic from that client at all.
-func TestF036SilentBoundGoneWithHigherRetirementIsRetired(t *testing.T) {
+func TestSilentBoundGoneWithHigherRetirementIsRetired(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonebound")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
@@ -121,7 +121,7 @@ func TestF036SilentBoundGoneWithHigherRetirementIsRetired(t *testing.T) {
 	}
 }
 
-// TestF036SilentBoundGoneAfterLaterGenerationRetirement is the case that makes the
+// TestSilentBoundGoneAfterLaterGenerationRetirement is the case that makes the
 // licence a SEQUENCE test rather than a generation test.
 //
 // The watermark's single slot has been replaced by a LATER generation's retirement, so it
@@ -129,7 +129,7 @@ func TestF036SilentBoundGoneWithHigherRetirementIsRetired(t *testing.T) {
 // record subject after the record we are acknowledged for, which is the whole licence.
 //
 // Mutation: requiring watermark generation EQUALITY here must fail this test.
-func TestF036SilentBoundGoneAfterLaterGenerationRetirement(t *testing.T) {
+func TestSilentBoundGoneAfterLaterGenerationRetirement(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonelater")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
@@ -147,12 +147,12 @@ func TestF036SilentBoundGoneAfterLaterGenerationRetirement(t *testing.T) {
 	}
 }
 
-// TestF036SilentBoundGoneWithoutLicenceRemainsBound is the negative, and it is the
+// TestSilentBoundGoneWithoutLicenceRemainsBound is the negative, and it is the
 // stated residual: absence alone is not the licence.
 //
 // Three sub-cases, each a way the licence can be missing. In every one the incumbent must
 // be left bound with its session intact — refusal, never disposal under a live owner.
-func TestF036SilentBoundGoneWithoutLicenceRemainsBound(t *testing.T) {
+func TestSilentBoundGoneWithoutLicenceRemainsBound(t *testing.T) {
 	t.Run("no watermark at all", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "f036gonenowm")
 		e.dropPersistObservations(t, e.idHash)
@@ -227,7 +227,7 @@ func (e *testRejectionEnv) assertStillBound(t *testing.T, why string) {
 	}
 }
 
-// TestF036GoneRetirementRevalidatesInsideRecordFence proves the in-fence re-check is
+// TestGoneRetirementRevalidatesInsideRecordFence proves the in-fence re-check is
 // load-bearing rather than decoration.
 //
 // The seam alters the binding after the off-gate prefilter has captured its licence and
@@ -236,7 +236,7 @@ func (e *testRejectionEnv) assertStillBound(t *testing.T, why string) {
 // binding it no longer describes.
 //
 // Mutation: removing any of the in-fence identity checks must fail this test.
-func TestF036GoneRetirementRevalidatesInsideRecordFence(t *testing.T) {
+func TestGoneRetirementRevalidatesInsideRecordFence(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonefence")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
@@ -273,7 +273,7 @@ func TestF036GoneRetirementRevalidatesInsideRecordFence(t *testing.T) {
 	}
 }
 
-// TestF036GoneRetirementRefusesOnARecordThatCameBack is the BETWEEN-READ case, and it is
+// TestGoneRetirementRefusesOnARecordThatCameBack is the BETWEEN-READ case, and it is
 // what makes the in-fence durable re-reads provable rather than decorative.
 //
 // The off-gate prefilter read the record as absent and the watermark as licensing. Both
@@ -285,7 +285,7 @@ func TestF036GoneRetirementRevalidatesInsideRecordFence(t *testing.T) {
 // Mutations: removing the in-fence record-absence re-read, or the in-fence watermark
 // re-validation, must fail this test. Neither is killable without this seam, because the
 // prefilter's own reads already satisfy every other fixture.
-func TestF036GoneRetirementRefusesOnARecordThatCameBack(t *testing.T) {
+func TestGoneRetirementRefusesOnARecordThatCameBack(t *testing.T) {
 	t.Run("the record is restored inside the fence", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "f036goneback")
 		e.dropPersistObservations(t, e.idHash)
@@ -359,7 +359,7 @@ func TestF036GoneRetirementRefusesOnARecordThatCameBack(t *testing.T) {
 	})
 }
 
-// TestF036GoneRetirementAbnormalExitUnwindsTheProof is the abnormal-exit case, and the
+// TestGoneRetirementAbnormalExitUnwindsTheProof is the abnormal-exit case, and the
 // reason the unwind guard lives INSIDE retireBoundIncarnationChecked rather than in this
 // route.
 //
@@ -373,7 +373,7 @@ func TestF036GoneRetirementRefusesOnARecordThatCameBack(t *testing.T) {
 // it runs deferred functions while skipping the rest of the frame.
 //
 // Mutations: removing the guard's p.abort(), or its tracker reopen, must fail this test.
-func TestF036GoneRetirementAbnormalExitUnwindsTheProof(t *testing.T) {
+func TestGoneRetirementAbnormalExitUnwindsTheProof(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonegoexit")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
@@ -427,7 +427,7 @@ func TestF036GoneRetirementAbnormalExitUnwindsTheProof(t *testing.T) {
 	e.assertStillBound(t, "an abnormal exit must leave the incumbent exactly as it was")
 }
 
-// TestF036GoneRetirementAbnormalExitAfterTheDetach is the POST-detach abnormal-exit case,
+// TestGoneRetirementAbnormalExitAfterTheDetach is the POST-detach abnormal-exit case,
 // and holistic review round 1 found it missing: the tail was straight-line code, so a
 // panic or runtime.Goexit escaping the Will phase let `destroy`'s own defers close the
 // record transaction and retire the tracker, and the outer defer release the gate, while
@@ -448,7 +448,7 @@ func TestF036GoneRetirementAbnormalExitUnwindsTheProof(t *testing.T) {
 // Mutations: removing the deferred `willPhase` or `connTail` wrapper, arming connTail
 // after applyWill instead of before it, or dropping the take-and-clear before either
 // invocation, must fail this test.
-func TestF036GoneRetirementAbnormalExitAfterTheDetach(t *testing.T) {
+func TestGoneRetirementAbnormalExitAfterTheDetach(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonetail")
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)
@@ -497,7 +497,7 @@ func TestF036GoneRetirementAbnormalExitAfterTheDetach(t *testing.T) {
 	}
 }
 
-// TestF036GoneRetirementAbnormalExitPreservesADelayedWill is holistic review round 2's
+// TestGoneRetirementAbnormalExitPreservesADelayedWill is holistic review round 2's
 // high finding, and it is the half round 1's repair did NOT cover.
 //
 // Arming the connection tail before the Will guarantees the socket closes. That alone is
@@ -514,7 +514,7 @@ func TestF036GoneRetirementAbnormalExitAfterTheDetach(t *testing.T) {
 // and could not see this at all.
 //
 // Mutation: removing the deferred Will BACKSTOP must fail this test.
-func TestF036GoneRetirementAbnormalExitPreservesADelayedWill(t *testing.T) {
+func TestGoneRetirementAbnormalExitPreservesADelayedWill(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonedelayed")
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)
@@ -587,7 +587,7 @@ func TestF036GoneRetirementAbnormalExitPreservesADelayedWill(t *testing.T) {
 	}
 }
 
-// TestF036GoneRetirementRefusesABoundSessionWithAParkedAction is the discriminator for
+// TestGoneRetirementRefusesABoundSessionWithAParkedAction is the discriminator for
 // escalation consult 4's Course A, and the state it covers is REACHABLE rather than
 // hypothetical: `dischargeDeferredIfUnbound` tests for exactly a bound session with a
 // parked action, so that conjunct would be dead code if the state could not occur.
@@ -604,7 +604,7 @@ func TestF036GoneRetirementAbnormalExitPreservesADelayedWill(t *testing.T) {
 // is what a pre-detach refusal promises.
 //
 // Mutation: removing the nil-action conjunct must fail this test.
-func TestF036GoneRetirementRefusesABoundSessionWithAParkedAction(t *testing.T) {
+func TestGoneRetirementRefusesABoundSessionWithAParkedAction(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036goneparked")
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)
@@ -674,7 +674,7 @@ func TestF036GoneRetirementRefusesABoundSessionWithAParkedAction(t *testing.T) {
 	}
 }
 
-// TestF036GoneRetirementRefusesOnASplitIndex covers the two manager-index checks, which
+// TestGoneRetirementRefusesOnASplitIndex covers the two manager-index checks, which
 // are DEFENSIVE DEPTH rather than a reachable production race — and the fixture says so
 // rather than dressing them up.
 //
@@ -689,7 +689,7 @@ func TestF036GoneRetirementRefusesABoundSessionWithAParkedAction(t *testing.T) {
 //
 // Mutations: dropping the as.sessions check must fail the first subtest, and dropping the
 // as.sessByHash check the second. No production race is claimed by either.
-func TestF036GoneRetirementRefusesOnASplitIndex(t *testing.T) {
+func TestGoneRetirementRefusesOnASplitIndex(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		drop func(as *mqttAccountSessionManager, sess *mqttSession)
@@ -747,14 +747,14 @@ func TestF036GoneRetirementRefusesOnASplitIndex(t *testing.T) {
 	}
 }
 
-// TestF036GoneRetirementReopensAdmissionOnRefusal is the disposition half of a refusal,
+// TestGoneRetirementReopensAdmissionOnRefusal is the disposition half of a refusal,
 // and it is what every earlier attempt at this finding could not supply.
 //
 // A refusal closes and drains the incarnation tracker on its way in. If it did not REOPEN
 // it, the incumbent would be left resident and bound but unable to serve a single further
 // packet — a session that refuses everything for the rest of the connection's life, which
 // is worse than the stranding this route exists to fix.
-func TestF036GoneRetirementReopensAdmissionOnRefusal(t *testing.T) {
+func TestGoneRetirementReopensAdmissionOnRefusal(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonereopen")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
@@ -788,7 +788,7 @@ func TestF036GoneRetirementReopensAdmissionOnRefusal(t *testing.T) {
 	lease.release()
 }
 
-// TestF036GoneRetirementDischargesWillExactlyOnce pins the Will disposition, which is
+// TestGoneRetirementDischargesWillExactlyOnce pins the Will disposition, which is
 // where issue #86 is easiest to break.
 //
 // `licensed=false` is the rule: a retirement watermark proves a TEARDOWN, not a successor
@@ -806,7 +806,7 @@ func TestF036GoneRetirementReopensAdmissionOnRefusal(t *testing.T) {
 //
 // Mutations: passing licensed=true (the Will is discarded, so the barrier arrives first),
 // and omitting applyWill (nothing is published at all), must both fail this test.
-func TestF036GoneRetirementDischargesWillExactlyOnce(t *testing.T) {
+func TestGoneRetirementDischargesWillExactlyOnce(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonewill")
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)

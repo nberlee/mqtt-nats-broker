@@ -269,8 +269,8 @@ func TestBoundaryPrefetchAcquisitionReadsTogether(t *testing.T) {
 			if _, err := mqttParseInflightSubject(m.subj); err == nil && m.expect != 0 {
 				want[m.subj] = true
 			}
-			if cls, ok := mqttF105ObligationClass(m.subj); ok && cls == mqttActionClassTk {
-				toks := strings.Split(m.subj[len(mqttF105SubjectPrefix()):], ".")
+			if cls, ok := mqttOutboundObligationClass(m.subj); ok && cls == mqttActionClassTk {
+				toks := strings.Split(m.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 				want[mqttExchangeSubject(getHash(at.Attempt.ID), toks[2], toks[3])] = true
 			}
 		}

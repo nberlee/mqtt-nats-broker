@@ -25,24 +25,24 @@ import (
 // admission's authority CAS.
 
 // testCompletionWorld is one admitted QoS 2 obligation on a bootstrapped authority.
-func testCompletionWorld(t *testing.T, client string) (*testF105Env, func(), string) {
+func testCompletionWorld(t *testing.T, client string) (*testOutboundEnv, func(), string) {
 	t.Helper()
-	e, done := testF105NewEnv(t, client)
+	e, done := testNewEnv(t, client)
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	return e, done, testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	return e, done, testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 }
 
 // testComposeAck composes, without sending, the PUBREC advance of exchange nonce as the
 // production operation would.
-func testComposeAck(t *testing.T, e *testF105Env, nonce string, to mqttExchangePhase) *mqttAuthorityTransition {
+func testComposeAck(t *testing.T, e *testOutboundEnv, nonce string, to mqttExchangePhase) *mqttAuthorityTransition {
 	t.Helper()
 	jsa := &e.asm.jsa
-	x, xSeq, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, nonce)
+	x, xSeq, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testGen, nonce)
 	if xerr != nil || x == nil {
 		t.Fatalf("reading exchange %q: %+v %v", nonce, x, xerr)
 	}
-	reg, smsg, lerr := jsa.loadInflightRecord(mqttInflightSubject(getHash(e.id), testF105Gen, x.PI))
+	reg, smsg, lerr := jsa.loadInflightRecord(mqttInflightSubject(getHash(e.id), testGen, x.PI))
 	if lerr != nil || reg == nil || smsg == nil {
 		t.Fatalf("reading the slot of exchange %q: %v", nonce, lerr)
 	}
@@ -52,7 +52,7 @@ func testComposeAck(t *testing.T, e *testF105Env, nonce string, to mqttExchangeP
 	}
 	tr, err := mqttAdvanceExchangeAckTransition(al.rec, al.seq, &mqttAdvanceExchangeAckRequest{
 		ID: e.id, Epoch: e.epoch, Txn: mqttNewInflightNonce(), Op: "op-ack",
-		Gen: testF105Gen, Nonce: nonce, To: to, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
+		Gen: testGen, Nonce: nonce, To: to, Acq: reg.Acq, Register: reg, RegisterSeq: smsg.Sequence,
 	}, x, xSeq)
 	if err != nil {
 		t.Fatalf("composing the advance: %v", err)
@@ -83,10 +83,10 @@ func TestCompletionWritesNoAuthority(t *testing.T) {
 	}
 
 	before := jsa.loadOutboundAuthority(e.id, e.epoch)
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("the PUBREC advance was refused: %v", err)
 	}
-	if x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, nonce); x == nil ||
+	if x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testGen, nonce); x == nil ||
 		x.Phase != mqttExchangePubRecObserved {
 		t.Fatalf("the PUBREC advance did not land: %+v", x)
 	}
@@ -110,7 +110,7 @@ func TestCompletionOutcomeResolvesLanded(t *testing.T) {
 	defer done()
 	jsa := &e.asm.jsa
 
-	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved)
+	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved)
 	if err != nil || out.Handle == nil {
 		t.Fatalf("the PUBREC advance was refused or returned no handle: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCompletionOutcomeResolvesLanded(t *testing.T) {
 	}
 	// An ADMISSION moves the authority's revision; the advance's answer does not change.
 	before := jsa.loadOutboundAuthority(e.id, e.epoch)
-	second := testF105AdmitOn(t, e, "txn-adm-2", 8, "inc-src")
+	second := testAdmitOn(t, e, "txn-adm-2", 8, "inc-src")
 	if after := jsa.loadOutboundAuthority(e.id, e.epoch); after.rec.Rev == before.rec.Rev {
 		t.Fatal("fixture: the second admission did not move the authority, so nothing here is tested")
 	}
@@ -163,18 +163,18 @@ func TestCompletionLandsOverAMovedAuthority(t *testing.T) {
 		}
 		paused = true
 		before := jsa.loadOutboundAuthority(e.id, e.epoch)
-		testF105AdmitOn(t, e, "txn-adm-2", 8, "inc-src")
+		testAdmitOn(t, e, "txn-adm-2", 8, "inc-src")
 		moved = jsa.loadOutboundAuthority(e.id, e.epoch).seq != before.seq
 		return send()
 	})
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("the advance composed before the authority moved was refused: %v", err)
 	}
 	if !paused || !moved {
 		t.Fatalf("fixture: the advance was paused %v and the authority moved %v, so nothing here is tested",
 			paused, moved)
 	}
-	if x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, nonce); x == nil ||
+	if x, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, testGen, nonce); x == nil ||
 		x.Phase != mqttExchangePubRecObserved {
 		t.Fatalf("the paused advance did not land: %+v", x)
 	}

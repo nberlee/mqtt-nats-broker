@@ -266,7 +266,7 @@ func testDiscardObserveDeletes(t *testing.T, f **testDiscardFix) (deleted func()
 
 // T1: the teardown TRANSFERS the source consumer (it still exists when the teardown returns, with
 // every caller parked), and the executor then retires it through its resource.
-func TestF105DiscardedGenerationRetiresItsSourceConsumer(t *testing.T) {
+func TestDiscardedGenerationRetiresItsSourceConsumer(t *testing.T) {
 	var fx *testDiscardFix
 	deletes := testDiscardObserveDeletes(t, &fx)
 	release := testDiscardParkAll(t)
@@ -306,7 +306,7 @@ func TestF105DiscardedGenerationRetiresItsSourceConsumer(t *testing.T) {
 // at zero grace and run twice (it quarantines on one pass and acts on the next), must leave the
 // consumer and its stored PUBREL alone: the name is LIVE, so only the executor may retire it, and
 // it then does so with the consumer REMOVED (W2 M4(i)).
-func TestF105DiscardedGenerationRetiresItsPubRelConsumer(t *testing.T) {
+func TestDiscardedGenerationRetiresItsPubRelConsumer(t *testing.T) {
 	var fx *testDiscardFix
 	testDiscardObserveDeletes(t, &fx)
 	release := testDiscardParkAll(t)
@@ -409,7 +409,7 @@ func TestF105DiscardedGenerationRetiresItsPubRelConsumer(t *testing.T) {
 
 // T11: with the periodic pass an hour away and no test kick, the teardown's own kick retires the
 // consumers promptly.
-func TestF105DiscardIsDrivenPromptly(t *testing.T) {
+func TestDiscardIsDrivenPromptly(t *testing.T) {
 	restore := setMQTTSessionExpirySweepInterval(time.Hour)
 	defer restore()
 	f := testDiscardTearDown(t, "discard-prompt", 1, false)

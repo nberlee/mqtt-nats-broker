@@ -66,7 +66,7 @@ func testOrphanDropSession(t *testing.T, asm *mqttAccountSessionManager, idHash 
 	// ANOTHER broker with no record satisfies equally, so an unlicensed pass RETAINS.
 	// These tests are all about a session that is genuinely gone, so the fixture records
 	// the fact that makes it so. The RETENTION half — absence with no watermark — is
-	// asserted by TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement
+	// asserted by TestOrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement
 	// and its siblings.
 	if ps := mqttDecodeSessionRecord(smsg); ps != nil && ps.ID != _EMPTY_ && ps.Gen != _EMPTY_ {
 		wmSubject := mqttTeardownSubject(asm.domainTk, idHash)

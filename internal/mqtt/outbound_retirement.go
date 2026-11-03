@@ -174,12 +174,12 @@ func mqttValidCleanupOutcome(o mqttCleanupOutcome) bool {
 // it; the incarnation token is what makes an authorization about the thing it was computed
 // for.
 func mqttResourceSubject(idHash, gen, inc string) string {
-	return mqttF105SubjectPrefix() + mqttResourceClassTk + "." + idHash + "." + gen + "." + inc
+	return mqttOutboundRecordSubjectPrefix() + mqttResourceClassTk + "." + idHash + "." + gen + "." + inc
 }
 
 // mqttResourceWalkFilter enumerates one generation's resources, and only those.
 func mqttResourceWalkFilter(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttResourceClassTk + "." + idHash + "." + gen + ".*"
+	return mqttOutboundRecordSubjectPrefix() + mqttResourceClassTk + "." + idHash + "." + gen + ".*"
 }
 
 // mqttResourceRole is the closed set of reasons an obligation needs a resource.
@@ -279,7 +279,7 @@ func (e mqttResourceEdge) String() string {
 
 // mqttValidateResourceEdge refuses an edge this broker cannot act on.
 func mqttValidateResourceEdge(e mqttResourceEdge) error {
-	if !mqttF105IdentTk(e.Nonce) {
+	if !mqttOutboundIdentTk(e.Nonce) {
 		return fmt.Errorf("names a malformed dependent obligation %q", e.Nonce)
 	}
 	if !mqttValidResourceRole(e.Role) {
@@ -438,7 +438,7 @@ func mqttValidateResourceDisposal(d *mqttResourceDisposal) error {
 	switch {
 	case d == nil:
 		return fmt.Errorf("the disposal fact is absent")
-	case !mqttF105IdentTk(d.Txn):
+	case !mqttOutboundIdentTk(d.Txn):
 		return fmt.Errorf("the disposal fact carries a malformed transition %q", d.Txn)
 	case !mqttValidDisposalReason(d.Reason):
 		return fmt.Errorf("the disposal fact carries reason %q, which no route disposes for", d.Reason)
@@ -451,7 +451,7 @@ func mqttValidateResourceDisposal(d *mqttResourceDisposal) error {
 			return fmt.Errorf("the disposal fact records a generation's discard under tenure %q, but a "+
 				"discard is decided by the closure, not by a connection", d.Tenure)
 		}
-	case !mqttF105IdentTk(d.Tenure):
+	case !mqttOutboundIdentTk(d.Tenure):
 		return fmt.Errorf("the disposal fact carries a malformed tenure %q", d.Tenure)
 	}
 	return nil
@@ -522,7 +522,7 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	if r.Inc != wantInc {
 		return fmt.Errorf("outbound resource names incarnation %q on the subject of %q", r.Inc, wantInc)
 	}
-	if !mqttF105IdentTk(r.Inc) {
+	if !mqttOutboundIdentTk(r.Inc) {
 		return fmt.Errorf("outbound resource carries a malformed incarnation %q", r.Inc)
 	}
 	if !mqttValidResourceKind(r.Kind) {
@@ -578,7 +578,7 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 	// unsupported shape rather than one to infer a tenure for; any other kind carrying it would
 	// claim a settlement nothing performs.
 	if mqttResourceLogicalUseKind(r.Kind) {
-		if !mqttF105IdentTk(r.ProvTenure) {
+		if !mqttOutboundIdentTk(r.ProvTenure) {
 			return fmt.Errorf("outbound resource %q of kind %q carries a malformed provisioning tenure %q",
 				r.Inc, r.Kind, r.ProvTenure)
 		}
@@ -619,7 +619,7 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 			return fmt.Errorf("a live outbound resource describes a deletion it has not been authorized for")
 		}
 	case mqttResourceDeleteAuthorized:
-		if !mqttF105IdentTk(r.AuthTxn) {
+		if !mqttOutboundIdentTk(r.AuthTxn) {
 			return fmt.Errorf("an authorized outbound resource carries a malformed authorizing transition %q", r.AuthTxn)
 		}
 		if r.Outcome != _EMPTY_ {
@@ -632,7 +632,7 @@ func mqttValidateOutboundResource(r *mqttOutboundResource, wantID, wantEpoch, wa
 			return fmt.Errorf("an authorized outbound resource still names %d dependent obligations", len(r.Deps))
 		}
 	case mqttResourceCleanupComplete:
-		if !mqttF105IdentTk(r.AuthTxn) {
+		if !mqttOutboundIdentTk(r.AuthTxn) {
 			return fmt.Errorf("a completed outbound resource carries a malformed authorizing transition %q", r.AuthTxn)
 		}
 		if !mqttValidCleanupOutcome(r.Outcome) {
@@ -862,10 +862,10 @@ func mqttResourceReleaseDependency(r *mqttOutboundResource, e mqttResourceEdge) 
 	return &next, nil
 }
 
-// mqttResourceIsF105Class reports whether a subject is a resource record. Used by the
+// mqttIsOutboundResourceSubject reports whether a subject is a resource record. Used by the
 // transition writer's member classifier, which admits obligation and resource members and
 // refuses the arbitration records.
-func mqttResourceIsF105Class(subject string) bool {
+func mqttIsOutboundResourceSubject(subject string) bool {
 	return strings.HasPrefix(subject,
-		mqttF105SubjectPrefix()+mqttResourceClassTk+".")
+		mqttOutboundRecordSubjectPrefix()+mqttResourceClassTk+".")
 }

@@ -28,12 +28,12 @@ import (
 // standalone (no accept loop yet — the wiring is a later WP), which is the point of the
 // unwired-first order.
 
-// testF105OwnAcceptSession builds a transient session bound to the env's account, seeded from
+// testOwnAcceptSession builds a transient session bound to the env's account, seeded from
 // the standing session record, plus a RESERVING authority carrying a creation proposal — the
 // reserve-before-commit ordering the ownership protocol rests on.
-func testF105OwnAcceptSession(t *testing.T, e *testF105Env) (*mqttSession, uint64, mqttOwnershipProposal) {
+func testOwnAcceptSession(t *testing.T, e *testOutboundEnv) (*mqttSession, uint64, mqttOwnershipProposal) {
 	t.Helper()
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	// The reservation's generation is the SESSION record's generation: the metadata commit
 	// validates that the record it installs agrees with the proposal's generation, so the
 	// outbound authority generation and the session generation are one, not two namespaces.
@@ -55,14 +55,14 @@ func testF105OwnAcceptSession(t *testing.T, e *testF105Env) (*mqttSession, uint6
 	return sess, seq, proposal
 }
 
-// TestF105OwnershipMetadataCommitPreservesTheRecordInvariants is the happy path: the
+// TestOwnershipMetadataCommitPreservesTheRecordInvariants is the happy path: the
 // three-member batch (fact + COMMITTED receipt + record) commits through persistRecord, the
 // receipt slot reads committed, and sess.seq / lineage / void are adopted from THIS batch's own
 // acknowledged record — never a newer record's sequence.
-func TestF105OwnershipMetadataCommitPreservesTheRecordInvariants(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-accept-own")
+func TestOwnershipMetadataCommitPreservesTheRecordInvariants(t *testing.T) {
+	e, done := testNewEnv(t, "f105-accept-own")
 	defer done()
-	sess, baseSeq, proposal := testF105OwnAcceptSession(t, e)
+	sess, baseSeq, proposal := testOwnAcceptSession(t, e)
 
 	tok := sess.beginRecordTx()
 	detail, err := sess.saveAcceptWithOwnership(sess.jsa, tok, e.id, e.epoch, proposal)
@@ -109,18 +109,18 @@ func TestF105OwnershipMetadataCommitPreservesTheRecordInvariants(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipMetadataCommitRefusesAStaleHandoffPredecessor: a handoff proposal whose
+// TestOwnershipMetadataCommitRefusesAStaleHandoffPredecessor: a handoff proposal whose
 // PrevSessSeq is not the fenced base is refused BEFORE the send, so a delayed handoff can never
 // commit against a session record that has moved.
-func TestF105OwnershipMetadataCommitRefusesAStaleHandoffPredecessor(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-accept-own-stale")
+func TestOwnershipMetadataCommitRefusesAStaleHandoffPredecessor(t *testing.T) {
+	e, done := testNewEnv(t, "f105-accept-own-stale")
 	defer done()
-	sess, baseSeq, _ := testF105OwnAcceptSession(t, e)
+	sess, baseSeq, _ := testOwnAcceptSession(t, e)
 
 	// A handoff proposal naming a DIFFERENT predecessor sequence than the fenced base.
 	handoff := mqttOwnershipProposal{
-		Kind: mqttProposalHandoff, ID: "intent-stale", Gen: testF105Gen, Tenure: "tenure-stale",
-		PrevGen: testF105Gen, PrevTenure: "tenure-own", PrevOwnerTxn: "txn-own",
+		Kind: mqttProposalHandoff, ID: "intent-stale", Gen: testGen, Tenure: "tenure-stale",
+		PrevGen: testGen, PrevTenure: "tenure-own", PrevOwnerTxn: "txn-own",
 		PrevSessWID: "wid-x", PrevSessSeq: baseSeq + 999,
 	}
 	tok := sess.beginRecordTx()
@@ -134,13 +134,13 @@ func TestF105OwnershipMetadataCommitRefusesAStaleHandoffPredecessor(t *testing.T
 	}
 }
 
-// TestF105OwnershipMetadataCommitRefusesAnUnresolvedWrite: the ambiguous-write invariant holds
+// TestOwnershipMetadataCommitRefusesAnUnresolvedWrite: the ambiguous-write invariant holds
 // on the ownership path exactly as on the ordinary record write — a session with an unresolved
 // earlier write refuses to compose a new one.
-func TestF105OwnershipMetadataCommitRefusesAnUnresolvedWrite(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-accept-own-uncertain")
+func TestOwnershipMetadataCommitRefusesAnUnresolvedWrite(t *testing.T) {
+	e, done := testNewEnv(t, "f105-accept-own-uncertain")
 	defer done()
-	sess, _, proposal := testF105OwnAcceptSession(t, e)
+	sess, _, proposal := testOwnAcceptSession(t, e)
 
 	sess.mu.Lock()
 	sess.seqUncertain = true
@@ -156,13 +156,13 @@ func TestF105OwnershipMetadataCommitRefusesAnUnresolvedWrite(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipMetadataCommitCertainRejectionLeavesSeqIntact: a record CAS rejection stored
+// TestOwnershipMetadataCommitCertainRejectionLeavesSeqIntact: a record CAS rejection stored
 // nothing (fact, receipt and record are one atomic batch), so sess.seq is unchanged and the
 // session stays usable — the same certainty the two-member accept path relies on.
-func TestF105OwnershipMetadataCommitCertainRejectionLeavesSeqIntact(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-accept-own-reject")
+func TestOwnershipMetadataCommitCertainRejectionLeavesSeqIntact(t *testing.T) {
+	e, done := testNewEnv(t, "f105-accept-own-reject")
 	defer done()
-	sess, baseSeq, proposal := testF105OwnAcceptSession(t, e)
+	sess, baseSeq, proposal := testOwnAcceptSession(t, e)
 
 	// Force the record CAS to reject by fencing on a base the subject is not at.
 	wrong := baseSeq + 4242

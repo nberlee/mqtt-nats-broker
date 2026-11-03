@@ -42,13 +42,13 @@ func TestMQTTPubCompOutlastsThePreAdmittedWriters(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, subr, sess, _, pi, nonce, _ := testF105PubRelReady(t, o, s, "fgloops-pubcomp")
-	seams := testF105ObservePubComp(t, sess)
+	sub, subr, sess, _, pi, nonce, _ := testPubRelReady(t, o, s, "fgloops-pubcomp")
+	seams := testObservePubComp(t, sess)
 	waits := testCountContentionWaits(t, sess)
 	w := testNewAuthorityContender(t, sess)
 	w.preAdmit(mqttBackgroundAuthorityWriters)
 	var windows atomic.Int32
-	testPresendFor(t, sess, "op-ack-advance", testF105SlotSubject(sess, pi), func(*mqttAuthorityTransition) {
+	testPresendFor(t, sess, "op-ack-advance", testSlotSubject(sess, pi), func(*mqttAuthorityTransition) {
 		windows.Add(1)
 		w.fire()
 	})
@@ -60,7 +60,7 @@ func TestMQTTPubCompOutlastsThePreAdmittedWriters(t *testing.T) {
 		t.Fatalf("the PUBCOMP was handed to the completion worker after %d attempts (%d contending commits): "+
 			"the pre-admitted writers exhausted it", windows.Load(), w.commits.Load())
 	}
-	testF105ExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
+	testExchangePhaseIs(t, sess, nonce, mqttExchangeTerminal)
 	if n := windows.Load(); n != 1 {
 		t.Fatalf("the PUBCOMP made %d attempts, want 1: a pre-admitted authority writer is no contender", n)
 	}
@@ -70,7 +70,7 @@ func TestMQTTPubCompOutlastsThePreAdmittedWriters(t *testing.T) {
 	if n := waits.Load(); n != 0 {
 		t.Fatalf("%d contention waits for a completion nothing contends with", n)
 	}
-	testF105SlotGone(t, sess, pi, time.Second)
+	testSlotGone(t, sess, pi, time.Second)
 }
 
 // ROUTE B's RECOVERED PUBREC was unannounced, so a background writer admitted in each of its
@@ -123,10 +123,10 @@ func TestMQTTPubRelCallbackHoldsTheBackgroundWriters(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, subr, sess, pi, _ := testF105QoS2Delivered(t, o, s, "fgloops-pubrel")
+	sub, subr, sess, pi, _ := testQoS2Delivered(t, o, s, "fgloops-pubrel")
 	w := testNewAuthorityContender(t, sess)
 	var windows, committed atomic.Int32
-	testPresendFor(t, sess, "op-acquire-pubrel", testF105SlotSubject(sess, pi), func(*mqttAuthorityTransition) {
+	testPresendFor(t, sess, "op-acquire-pubrel", testSlotSubject(sess, pi), func(*mqttAuthorityTransition) {
 		windows.Add(1)
 		if w.live() {
 			committed.Add(1)
@@ -343,7 +343,7 @@ func testFgArms() []testFgArmCase {
 				},
 				refuseUncommitted: func(t *testing.T) *atomic.Int32 {
 					var n atomic.Int32
-					testF105SetAckAdvance(t, e.sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+					testSetAckAdvance(t, e.sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 						if req.To != mqttExchangePubRecObserved || req.Nonce != lin {
 							return write()
 						}
@@ -357,8 +357,8 @@ func testFgArms() []testFgArmCase {
 			o := testMQTTDefaultOptions()
 			s := testMQTTRunServer(t, o)
 			t.Cleanup(func() { testMQTTShutdownServer(s) })
-			_, _, sess, c, pi, _, _ := testF105PubRelReady(t, o, s, "fgarm-pubrel")
-			ref := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, false)
+			_, _, sess, c, pi, _, _ := testPubRelReady(t, o, s, "fgarm-pubrel")
+			ref := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, false)
 			return &testFgArm{sess: sess, op: "op-acquire-pubrel", subject: ref.name.subject,
 				run: func() bool {
 					_, _, ok, _ := sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, mqttNewInflightNonce(), nil, 0)
@@ -381,13 +381,13 @@ func testFgArms() []testFgArmCase {
 			o := testMQTTDefaultOptions()
 			s := testMQTTRunServer(t, o)
 			t.Cleanup(func() { testMQTTShutdownServer(s) })
-			_, _, sess, c, _, nonce, ref := testF105PubRelReady(t, o, s, "fgarm-pubcomp")
+			_, _, sess, c, _, nonce, ref := testPubRelReady(t, o, s, "fgarm-pubcomp")
 			return &testFgArm{sess: sess, op: "op-ack-advance", subject: ref.name.subject, completion: true,
 				run: func() bool { return sess.mqttTerminalizeOnPubComp(c, ref).recorded },
 				refuseUncommitted: func(t *testing.T) *atomic.Int32 {
 					var n atomic.Int32
-					testF105SetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-						if !testF105IsPubCompAdvance(req, nonce) {
+					testSetAckAdvance(t, sess, func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
+						if !testIsPubCompAdvance(req, nonce) {
 							return write()
 						}
 						n.Add(1)
@@ -515,8 +515,8 @@ func TestMQTTPubRelRedispatchAnnouncesBetweenAcquisitions(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, _, sess, pi, _ := testF105QoS2Delivered(t, o, s, "fgloops-redispatch")
-	testLoseAtCommit(t, sess, "op-acquire-pubrel", testF105SlotSubject(sess, pi), 1<<20)
+	sub, _, sess, pi, _ := testQoS2Delivered(t, o, s, "fgloops-redispatch")
+	testLoseAtCommit(t, sess, "op-acquire-pubrel", testSlotSubject(sess, pi), 1<<20)
 
 	var armed, probed atomic.Bool
 	arm := func() { armed.Store(true) }
@@ -612,8 +612,8 @@ func TestMQTTForegroundLoopsLeaveAdmittingCallersUnannounced(t *testing.T) {
 		o := testMQTTDefaultOptions()
 		s := testMQTTRunServer(t, o)
 		defer testMQTTShutdownServer(s)
-		_, _, sess, c, pi, _, _ := testF105PubRelReady(t, o, s, "fgneg-pubrel")
-		ref := testF105SlotRefAt(t, sess, pi, mqttInflightPubRelReady, false)
+		_, _, sess, c, pi, _, _ := testPubRelReady(t, o, s, "fgneg-pubrel")
+		ref := testSlotRefAt(t, sess, pi, mqttInflightPubRelReady, false)
 		run(t, sess, func() bool {
 			_, _, ok, _ := sess.acquirePubRelThroughAuthority(c, ref, mqttInflightPubRelReady, mqttNewInflightNonce(),
 				nil, 0, sess.admitBackgroundAuthority)

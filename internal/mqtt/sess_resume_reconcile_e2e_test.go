@@ -656,7 +656,7 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // An ENROLLED dependency surviving the client's absence is witnessed by
-// TestF105AdmittedQoS2DependencySurvivesOffline (outbound_w2_inactivity_test.go), which replaced
+// TestAdmittedQoS2DependencySurvivesOffline (outbound_w2_inactivity_test.go), which replaced
 // TestMQTTReconcileEnrolledSourceSurvivesBrokerThreshold: the broker option that test set was read
 // by nothing, so it waited out no timer and admitted no dependency.
 

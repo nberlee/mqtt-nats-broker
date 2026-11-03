@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// testF105PrepareTokenBase readies the register an acquisition of act will install its token on,
+// testPrepareTokenBase readies the register an acquisition of act will install its token on,
 // in the state the protocol steps a fixture skipped would have left it (issue #107 row 2: an acquisition
 // is the token AND the record, so a hand-built one needs the register too). It never writes through
 // the authority boundary: the fixture is standing in for the admission, the drain of an earlier
@@ -19,7 +19,7 @@ import (
 //   - a PUBREL acquisition over a slot still at `publish`: moved to `pubrel_ready` with a canonical
 //     tuple, as the PUBREC advance and its rebind would;
 //   - a counter behind act.Acq-1 (a fixture numbering acquisitions freely): set to act.Acq-1.
-func testF105PrepareTokenBase(t *testing.T, e *testF105Env, gen string, act *mqttOutboundAction) (*mqttInflightRecord, uint64) {
+func testPrepareTokenBase(t *testing.T, e *testOutboundEnv, gen string, act *mqttOutboundAction) (*mqttInflightRecord, uint64) {
 	t.Helper()
 	subj := mqttInflightSubject(getHash(e.id), gen, act.PI)
 	cur, smsg, err := e.asm.jsa.loadInflightRecord(subj)
@@ -43,7 +43,7 @@ func testF105PrepareTokenBase(t *testing.T, e *testF105Env, gen string, act *mqt
 	// earlier is asking to be refused, and the register is left as it is for that refusal.
 	// A live PUBREC leaves the slot at pubrel_intended; an earlier fixture path left it at publish.
 	if act.Kind == mqttActionPubRel && (next.State == mqttInflightPublish || next.State == mqttInflightPubRelIntended) &&
-		testF105PubRecRecorded(e, gen, act.Nonce) {
+		testPubRecRecorded(e, gen, act.Nonce) {
 		next.State = mqttInflightPubRelReady
 		next.PubRelDurable, next.PubRelStreamSeq = "$MQTT_PUBREL_fixture", 1
 	}
@@ -60,10 +60,10 @@ func testF105PrepareTokenBase(t *testing.T, e *testF105Env, gen string, act *mqt
 	return cur, seq
 }
 
-// testF105TokenMember is the register member production's composer puts beside an action record.
-func testF105TokenMember(t *testing.T, e *testF105Env, gen string, act *mqttOutboundAction) mqttTransitionMember {
+// testTokenMember is the register member production's composer puts beside an action record.
+func testTokenMember(t *testing.T, e *testOutboundEnv, gen string, act *mqttOutboundAction) mqttTransitionMember {
 	t.Helper()
-	cur, seq := testF105PrepareTokenBase(t, e, gen, act)
+	cur, seq := testPrepareTokenBase(t, e, gen, act)
 	next := *cur
 	next.ActionToken = mqttNewInflightNonce()
 	next.ActionClaim, next.ActionClaimSeq = cur.Claim, cur.ClaimSeq
@@ -75,15 +75,15 @@ func testF105TokenMember(t *testing.T, e *testF105Env, gen string, act *mqttOutb
 	return mqttTransitionMember{subj: mqttInflightSubject(getHash(e.id), gen, act.PI), expect: seq, body: body}
 }
 
-// testF105WithRegister fills an acquire-action request's register fields as production's callers do.
-func testF105WithRegister(t *testing.T, e *testF105Env, pi uint16, r *mqttAcquireActionRequest) *mqttAcquireActionRequest {
+// testWithRegister fills an acquire-action request's register fields as production's callers do.
+func testWithRegister(t *testing.T, e *testOutboundEnv, pi uint16, r *mqttAcquireActionRequest) *mqttAcquireActionRequest {
 	t.Helper()
-	cur, seq := testF105PrepareTokenBase(t, e, r.Gen, &mqttOutboundAction{Nonce: r.Nonce, Acq: r.Acq, Kind: r.Kind, PI: pi})
+	cur, seq := testPrepareTokenBase(t, e, r.Gen, &mqttOutboundAction{Nonce: r.Nonce, Acq: r.Acq, Kind: r.Kind, PI: pi})
 	r.Register, r.RegisterSeq, r.Token = cur, seq, mqttNewInflightNonce()
 	return r
 }
 
-func testF105PubRecRecorded(e *testF105Env, gen, nonce string) bool {
+func testPubRecRecorded(e *testOutboundEnv, gen, nonce string) bool {
 	x, _, err := e.asm.jsa.loadOutboundExchange(e.id, e.epoch, gen, nonce)
 	return err == nil && x != nil && x.Phase == mqttExchangePubRecObserved
 }

@@ -75,7 +75,7 @@ func testSupersedeTenure(t *testing.T, e *testInflightEnv) {
 // T12, the foreign-stamp half: every ordinary route proceeds for the current connection.
 //
 // Mutation M16: claim equality re-added to an ordinary route -> that route refuses.
-func TestF105ForeignStampDecidesNothingOnAnOrdinaryRoute(t *testing.T) {
+func TestForeignStampDecidesNothingOnAnOrdinaryRoute(t *testing.T) {
 	t.Parallel()
 	t.Run("PUBACK completes the exchange", func(t *testing.T) {
 		t.Parallel()
@@ -139,7 +139,7 @@ func TestF105ForeignStampDecidesNothingOnAnOrdinaryRoute(t *testing.T) {
 // destructive fallback.
 //
 // Mutation M10: the void's entitlement comparison removed -> the stale connection's write lands.
-func TestF105OwnStampWithAStaleEntitlementIsRefused(t *testing.T) {
+func TestOwnStampWithAStaleEntitlementIsRefused(t *testing.T) {
 	t.Parallel()
 	t.Run("withdrawal", func(t *testing.T) {
 		t.Parallel()

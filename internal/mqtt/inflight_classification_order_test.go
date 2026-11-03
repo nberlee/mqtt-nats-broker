@@ -24,37 +24,37 @@ import (
 	"testing"
 )
 
-// f099ScanStaging models the peer that stores a PUBREL and re-phases its slot between this
+// scanStaging models the peer that stores a PUBREL and re-phases its slot between this
 // pass's register load and its PUBREL scan.
 //
 // The trigger is the LAST register batch, not the first call: loadInflightRecordsMulti runs
 // once PER BATCH, so "the record appears once a batch has been loaded" would also be
 // satisfied by a scan placed BETWEEN batches — which violates the after-every-batch
 // invariant while passing every single-batch fixture.
-type f099ScanStaging struct {
+type scanStaging struct {
 	wantBatches int
 	batches     int
 	record      mqttStoredPubRel
 }
 
-func (s *f099ScanStaging) noteBatch() { s.batches++ }
+func (s *scanStaging) noteBatch() { s.batches++ }
 
-func (s *f099ScanStaging) scan(string) ([]mqttStoredPubRel, int, bool) {
+func (s *scanStaging) scan(string) ([]mqttStoredPubRel, int, bool) {
 	if s.batches < s.wantBatches {
 		return nil, 0, true // the peer has not stored it yet, as far as this pass can see
 	}
 	return []mqttStoredPubRel{s.record}, 0, true
 }
 
-// f099Recorder captures every durable proposal so an oracle can assert on transitions
+// classOrderRecorder captures every durable proposal so an oracle can assert on transitions
 // rather than on a final snapshot, which cannot tell "never proposed" from "proposed and
 // overwritten".
-type f099Recorder struct {
+type classOrderRecorder struct {
 	states  []mqttInflightState
 	deletes []uint64
 }
 
-func (r *f099Recorder) sawState(st mqttInflightState) bool {
+func (r *classOrderRecorder) sawState(st mqttInflightState) bool {
 	for _, s := range r.states {
 		if s == st {
 			return true
@@ -74,13 +74,13 @@ func (r *f099Recorder) sawState(st mqttInflightState) bool {
 // `finished` from a second old-site scan) must both fail this. M5a/M5b are the control:
 // with the record staged UNCONDITIONALLY the test passes under both orderings, which is
 // what shows it is driven by the ORDER and not by anything else the fixture does.
-func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
+func TestRecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
-	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
-	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
-	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
+	// store can host; that class is covered on the real store by TestRouteBRecordsTheRecoveredPubRec,
+	// TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestRecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("f099-owed"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -91,14 +91,14 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	current, currentSeq := *rec, uint64(71)
-	staging := &f099ScanStaging{
+	staging := &scanStaging{
 		wantBatches: 1,
 		record: mqttStoredPubRel{
 			seq: 141, pi: rec.PI, srcDur: rec.Dur, srcSeq: rec.Seq,
 			owner: mqttPubRelOwner{State: mqttPubRelOwnerValid, Nonce: rec.Nonce},
 		},
 	}
-	rc := &f099Recorder{}
+	rc := &classOrderRecorder{}
 
 	as := &mqttAccountSessionManager{}
 	as.testInflightPubRelScan = staging.scan
@@ -143,7 +143,7 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 	as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
 		return mqttInflightSourceComplete
 	}
-	sess := f099Session(as, "f099-owed", idHash, gen, pubRelSubject, pubRelDurable)
+	sess := classOrderSession(as, "f099-owed", idHash, gen, pubRelSubject, pubRelDurable)
 
 	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
@@ -188,13 +188,13 @@ func TestF099RecoveryOwesAPubRelStoredAfterTheRegisterRead(t *testing.T) {
 //
 // Mutation checks: M1, M3 (an old-site scan consulted by route B alone) and M1b (the scan
 // placed BETWEEN batches, which only the multi-batch fixture can see).
-func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T) {
+func TestRecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T) {
 	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
-	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
-	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
-	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
+	// store can host; that class is covered on the real store by TestRouteBRecordsTheRecoveredPubRec,
+	// TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestRecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("f099-routeb"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -231,7 +231,7 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 	if wantBatches < 2 {
 		t.Fatalf("fixture must span multiple batches, got %d", wantBatches)
 	}
-	staging := &f099ScanStaging{
+	staging := &scanStaging{
 		wantBatches: wantBatches,
 		record: mqttStoredPubRel{
 			seq: 151, pi: target.PI, srcDur: target.Dur, srcSeq: target.Seq,
@@ -284,7 +284,7 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 	as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
 		return mqttInflightSourceComplete
 	}
-	sess := f099Session(as, "f099-routeb", idHash, gen, pubRelSubject, pubRelDurable)
+	sess := classOrderSession(as, "f099-routeb", idHash, gen, pubRelSubject, pubRelDurable)
 
 	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
@@ -318,13 +318,13 @@ func TestF099RecoveryRoutesRouteBFromEvidenceReadAfterTheLastBatch(t *testing.T)
 //
 // Mutation check: M12, which restores the stale scan at this consumer ALONE, so this test
 // is shown to kill it rather than riding on M1.
-func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing.T) {
+func TestRetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing.T) {
 	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
-	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
-	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
-	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
+	// store can host; that class is covered on the real store by TestRouteBRecordsTheRecoveredPubRec,
+	// TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestRecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("f099-retired-ready"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -335,7 +335,7 @@ func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing
 	})
 	subject := mqttInflightSubject(idHash, gen, rec.PI)
 	current, currentSeq := *rec, uint64(81)
-	staging := &f099ScanStaging{
+	staging := &scanStaging{
 		wantBatches: 1,
 		record: mqttStoredPubRel{
 			seq: 161, pi: rec.PI, srcDur: rec.Dur, srcSeq: rec.Seq,
@@ -374,7 +374,7 @@ func TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister(t *testing
 	as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
 		return mqttInflightSourceComplete
 	}
-	sess := f099Session(as, "f099-retired-ready", idHash, gen, pubRelSubject, pubRelDurable)
+	sess := classOrderSession(as, "f099-retired-ready", idHash, gen, pubRelSubject, pubRelDurable)
 
 	if _, err := sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess)); err != nil {
 		t.Fatalf("recoverInflightRegisters: %v", err)
@@ -446,7 +446,7 @@ func TestSlotOnlyContestRereadDecidesARejectedClaim(t *testing.T) {
 	as.testInflightSourceState = func(*mqttInflightRecord) mqttInflightSourceState {
 		return mqttInflightSourceLive
 	}
-	sess := f099Session(as, "slot-only-contest-reread", idHash, gen, pubRelSubject, pubRelDurable)
+	sess := classOrderSession(as, "slot-only-contest-reread", idHash, gen, pubRelSubject, pubRelDurable)
 
 	_, _ = sess.recoverInflightRegisters(testHookAcceptedClient(sess.asm, sess))
 	if casAttempts == 0 {
@@ -463,7 +463,7 @@ func TestSlotOnlyContestRereadDecidesARejectedClaim(t *testing.T) {
 	}
 }
 
-func f099Session(as *mqttAccountSessionManager, id, idHash, gen, pubRelSubject, pubRelDurable string) *mqttSession {
+func classOrderSession(as *mqttAccountSessionManager, id, idHash, gen, pubRelSubject, pubRelDurable string) *mqttSession {
 	return &mqttSession{
 		asm: as, id: id, idHash: idHash, gen: gen,
 		regClaim: mqttNewInflightNonce(), seq: 9,
@@ -477,7 +477,7 @@ func f099Session(as *mqttAccountSessionManager, id, idHash, gen, pubRelSubject, 
 // The target must actually land in the LAST batch, or M1b is not the mutation this test
 // claims to kill. Asserted rather than assumed: the ordering is a property of string
 // sorting over packet identifiers, which a later edit to the fixture could silently break.
-func TestF099RouteBFixtureTargetIsInTheFinalBatch(t *testing.T) {
+func TestRouteBFixtureTargetIsInTheFinalBatch(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("f099-routeb-shape"), mqttNewSessGen()
 	subjects := make([]string, 0, mqttInflightLoadBatch+1)
@@ -496,13 +496,13 @@ func TestF099RouteBFixtureTargetIsInTheFinalBatch(t *testing.T) {
 	}
 }
 
-// f099AdoptedContest makes a custody contest come back with a body whose PHASE moved.
+// adoptedContest makes a custody contest come back with a body whose PHASE moved.
 //
 // The contest reaches its moved-and-ours arm only on a FAILED CAS followed by a reread
 // showing THIS session's claim, the SAME nonce, and a MOVED sequence — same nonce alone
 // does not select that arm. So the store is refused once and the reread answers with the
 // adopted body.
-type f099AdoptedContest struct {
+type adoptedContest struct {
 	subject  string
 	adopted  mqttInflightRecord
 	seq      uint64
@@ -510,7 +510,7 @@ type f099AdoptedContest struct {
 	rereadAt uint64
 }
 
-func (a *f099AdoptedContest) load(string) (*mqttInflightRecord, *StoredMsg, error) {
+func (a *adoptedContest) load(string) (*mqttInflightRecord, *StoredMsg, error) {
 	cp := a.adopted
 	at := a.seq
 	if a.refused {
@@ -519,7 +519,7 @@ func (a *f099AdoptedContest) load(string) (*mqttInflightRecord, *StoredMsg, erro
 	return &cp, &StoredMsg{Subject: a.subject, Sequence: at}, nil
 }
 
-func (a *f099AdoptedContest) store(_ string, _ uint64, _ *mqttInflightRecord) (uint64, error) {
+func (a *adoptedContest) store(_ string, _ uint64, _ *mqttInflightRecord) (uint64, error) {
 	a.refused = true
 	return 0, errors.New("test: custody CAS rejected, the peer rewrote the slot")
 }
@@ -539,7 +539,7 @@ func (a *f099AdoptedContest) store(_ string, _ uint64, _ *mqttInflightRecord) (u
 //
 // SLOT-ONLY (experimental affine) since issue #107 7b: the plain contest runs for that class alone, an
 // ordinary slot's ownership being its exchange's entitlement, so the source is affine-class.
-func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T) {
+func TestAdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name         string
@@ -564,7 +564,7 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 				Nonce: nonce, Claim: "predecessor", ClaimSeq: 1,
 			})
 			subject := mqttInflightSubject(idHash, gen, rec.PI)
-			sess := f099Session(nil, "f099-adopted", idHash, gen, pubRelSubject, pubRelDurable)
+			sess := classOrderSession(nil, "f099-adopted", idHash, gen, pubRelSubject, pubRelDurable)
 
 			adopted := *rec
 			adopted.State = mqttInflightPubRelReady
@@ -572,7 +572,7 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 			adopted.ClaimSeq = sess.seq
 			adopted.PubRelDurable = pubRelDurable
 			adopted.PubRelStreamSeq = 171
-			contest := &f099AdoptedContest{subject: subject, adopted: adopted, seq: 61, rereadAt: 62}
+			contest := &adoptedContest{subject: subject, adopted: adopted, seq: 61, rereadAt: 62}
 
 			as := &mqttAccountSessionManager{}
 			sess.asm = as
@@ -653,7 +653,7 @@ func TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery(t *testing.T)
 //
 // SLOT-ONLY (experimental affine) since issue #107 7b: the plain contest runs for that class alone, an
 // ordinary slot's ownership being its exchange's entitlement, so the source is affine-class.
-func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing.T) {
+func TestAdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name      string
@@ -671,7 +671,7 @@ func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing
 				Nonce: mqttNewInflightNonce(), Claim: "predecessor", ClaimSeq: 1,
 			})
 			subject := mqttInflightSubject(idHash, gen, rec.PI)
-			sess := f099Session(nil, "f099-adopted-retired", idHash, gen, pubRelSubject, pubRelDurable)
+			sess := classOrderSession(nil, "f099-adopted-retired", idHash, gen, pubRelSubject, pubRelDurable)
 
 			// The body the contest adopts: retirement acquired, phase UNCHANGED.
 			adopted := *rec
@@ -679,7 +679,7 @@ func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing
 			adopted.Cancelled = tc.cancelled
 			adopted.Claim = sess.regClaim
 			adopted.ClaimSeq = sess.seq
-			contest := &f099AdoptedContest{subject: subject, adopted: adopted, seq: 91, rereadAt: 92}
+			contest := &adoptedContest{subject: subject, adopted: adopted, seq: 91, rereadAt: 92}
 
 			as := &mqttAccountSessionManager{}
 			sess.asm = as
@@ -734,26 +734,26 @@ func TestF099AdoptedRetirementAtThePlainContestTakesTheRetirementPath(t *testing
 	}
 }
 
-// f099OwnedRoute is one reviewed DIRECT call site that takes a claim contest's OWNED
+// ownedRoute is one reviewed DIRECT call site that takes a claim contest's OWNED
 // result, bound positionally to discovery order.
-type f099OwnedRoute struct {
+type ownedRoute struct {
 	wrapper string // the contest wrapper this site calls
 	test    string // the behavioral test carrying this route's semantics
 }
 
-// f099OwnedRouteManifest is the reviewed inventory, in the source order discovery walks.
+// ownedRouteManifest is the reviewed inventory, in the source order discovery walks.
 // The two claimRecoveredSharedInflight routes are gone with the Shared contest scope (issue #107 7b):
 // a shared register's ownership is its exchange's entitlement, never a claim.
-var f099OwnedRouteManifest = []f099OwnedRoute{
-	{"claimRecoveredTransferableInflight", "TestF099AdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery"},
-	{"claimRecoveredRetiredPubRelInflight", "TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister"},
-	{"claimRecoveredTransferableInflight", "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion"},
+var ownedRouteManifest = []ownedRoute{
+	{"claimRecoveredTransferableInflight", "TestAdoptedPastPubRecBodyIsNotInstalledAsAPublishDelivery"},
+	{"claimRecoveredRetiredPubRelInflight", "TestRetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister"},
+	{"claimRecoveredTransferableInflight", "TestRecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion"},
 }
 
-// f099CalleeName returns the called function's name for both call forms, because a wrapper
+// classOrderCalleeName returns the called function's name for both call forms, because a wrapper
 // need not be a method: a free function is called as a bare identifier and a selector-only
 // scan walks straight past it.
-func f099CalleeName(call *ast.CallExpr) string {
+func classOrderCalleeName(call *ast.CallExpr) string {
 	switch fn := call.Fun.(type) {
 	case *ast.SelectorExpr:
 		return fn.Sel.Name
@@ -790,7 +790,7 @@ func f099CalleeName(call *ast.CallExpr) string {
 // Mutation checks: M10a (drop a manifest entry), M10b (add an unaccounted direct call
 // site), M13 (clear a matched entry's test name) and M15 (take a method value of a wrapper,
 // the alias form, which must fail closed).
-func TestF099OwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
+func TestOwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
 	t.Parallel()
 	const contest = "claimRecoveredInflight"
 	wrappers := map[string]bool{}
@@ -827,7 +827,7 @@ func TestF099OwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
 				return true
 			}
 			ast.Inspect(fn.Body, func(m ast.Node) bool {
-				if call, ok := m.(*ast.CallExpr); ok && f099CalleeName(call) == contest {
+				if call, ok := m.(*ast.CallExpr); ok && classOrderCalleeName(call) == contest {
 					wrappers[fn.Name.Name] = true
 				}
 				return true
@@ -872,7 +872,7 @@ func TestF099OwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
 		ast.Inspect(f, func(n ast.Node) bool {
 			switch x := n.(type) {
 			case *ast.CallExpr:
-				nm := f099CalleeName(x)
+				nm := classOrderCalleeName(x)
 				if wrappers[nm] {
 					// A wrapper calling the contest is the definition, not a route.
 					sites = append(sites, site{wrapper: nm, pos: x.Pos()})
@@ -912,14 +912,14 @@ func TestF099OwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].pos < routes[j].pos })
 
-	if len(routes) != len(f099OwnedRouteManifest) {
+	if len(routes) != len(ownedRouteManifest) {
 		var got []string
 		for _, s := range routes {
 			got = append(got, fmt.Sprintf("%s@%s", s.wrapper, fset.Position(s.pos)))
 		}
 		t.Fatalf("discovery found %d owned-result call site(s) but the manifest reviews %d: "+
 			"a route has been added or removed without review.\nsites: %v",
-			len(routes), len(f099OwnedRouteManifest), got)
+			len(routes), len(ownedRouteManifest), got)
 	}
 
 	tests := map[string]bool{}
@@ -939,7 +939,7 @@ func TestF099OwnedContestCallSiteInventoryIsReviewed(t *testing.T) {
 			}
 		}
 	}
-	for i, want := range f099OwnedRouteManifest {
+	for i, want := range ownedRouteManifest {
 		got := routes[i]
 		where := fset.Position(got.pos)
 		if got.wrapper != want.wrapper {

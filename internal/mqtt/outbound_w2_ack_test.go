@@ -127,7 +127,7 @@ func (r *testW2ResumeRig) waitPhase(t *testing.T, want mqttExchangePhase, why st
 	})
 }
 
-func TestF105ResumedConnectionAcksBeforeRetransmission(t *testing.T) {
+func TestResumedConnectionAcksBeforeRetransmission(t *testing.T) {
 	// NOT parallel: the pre-send and PUBREL delivery seams are process-wide.
 	for _, tc := range []struct {
 		name string

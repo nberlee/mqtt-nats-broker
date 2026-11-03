@@ -38,7 +38,7 @@ import (
 // record outlives the call that built it (issue #99 batch 3, R1/R4: a continuity or withdrawOwed record
 // holding the session's bound entitlement was invisible to an argument-only scan).
 //
-// THE ONE CURRENT-BINDING EXCEPTION (issue #121, lane f-119 DECISIONS D2): runExclusionReclaim captures
+// THE ONE CURRENT-BINDING EXCEPTION (issue #121): runExclusionReclaim captures
 // `lic := mqttLicenceOf(sess.c).withAdmission(sess.admitBackgroundAuthority)` once and passes it
 // to its receiver's reclaimPendingFenceStep and nowhere else. The pass makes a FRESH decision to
 // dispose of a positively identified pending fence — it replays no installer's decision and ends no
@@ -49,7 +49,7 @@ import (
 //
 // Mutation M-provenance: any NON-EXEMPT call site's licence taken from sess.c -> this test names it.
 // Mutations R1/R4: a stored record's licence taken from sess.boundEnt -> this test names it.
-func TestF105LicenceProvenanceIsTheDecidingConnection(t *testing.T) {
+func TestLicenceProvenanceIsTheDecidingConnection(t *testing.T) {
 	t.Parallel()
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
@@ -390,7 +390,7 @@ func mqttReclaimCurrentBindingExempt(fset *token.FileSet, fd *ast.FuncDecl, call
 // record hydrations assign the whole set from the record and add nothing.
 //
 // Mutation M13b-census: a decision site calls voidRegNonceLocked directly -> this test names it.
-func TestF105VerdictWritersAreTheStagingFunctionAndReplays(t *testing.T) {
+func TestVerdictWritersAreTheStagingFunctionAndReplays(t *testing.T) {
 	t.Parallel()
 	allowed := map[string]bool{"stageVoidVerdictLocked": true, "mergeForkedGrantLocked": true}
 	fset := token.NewFileSet()
@@ -439,7 +439,7 @@ func TestF105VerdictWritersAreTheStagingFunctionAndReplays(t *testing.T) {
 // of the invariant; the release-before-apply and routes tests are its behaviour.
 //
 // Mutation M33: one site installs without its gate -> this test names the site.
-func TestF105RecoveryInstallsAreGated(t *testing.T) {
+func TestRecoveryInstallsAreGated(t *testing.T) {
 	t.Parallel()
 	gates := map[string]bool{"recoveryRestoreRefusedLocked": true, "recoveryInstallRefusedLocked": true}
 	fns := map[string]bool{"recoverInflightRegistersOnce": true}

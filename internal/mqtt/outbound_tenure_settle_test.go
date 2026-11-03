@@ -121,7 +121,7 @@ func testAwaitRetired(t *testing.T, e *testInflightEnv, gen, inc, name, reason, 
 
 // T1 (M11): provisioning stamps the serving tenure, read back from the store; the schema
 // requires it on the logical-use kinds only and the step rule keeps it.
-func TestF105ProvisioningStampsItsTenure(t *testing.T) {
+func TestProvisioningStampsItsTenure(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t1")
 	ent := testServingEntitlement(t, e.sess)
@@ -151,7 +151,7 @@ func TestF105ProvisioningStampsItsTenure(t *testing.T) {
 
 // T2 (M3b): the creation boundary refuses a provisioned resource stamped with a tenure that does
 // not serve, and admits the serving one.
-func TestF105CreationBoundaryProvesTheProvisioningTenure(t *testing.T) {
+func TestCreationBoundaryProvesTheProvisioningTenure(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t2")
 	al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch)
@@ -194,7 +194,7 @@ func testSettleDisposeBatch(t *testing.T, e *testInflightEnv, gen, inc, reason, 
 
 // T2b (M3) and T10 (M4): the disposal boundary's two rules for the settlement reasons, each
 // isolated from the other.
-func TestF105SettlementReasonsAtTheBoundary(t *testing.T) {
+func TestSettlementReasonsAtTheBoundary(t *testing.T) {
 	t.Parallel()
 	t.Run("a tenure's own claim is not superseded", func(t *testing.T) {
 		t.Parallel()
@@ -248,7 +248,7 @@ func TestF105SettlementReasonsAtTheBoundary(t *testing.T) {
 // T3a/T3b: a claim whose SUBSCRIBE never named it — before and after its physical CREATE — is
 // settled by the next tenure: decided `tenure-superseded` under it, its name retired, the
 // consumer deleted, both duties resolved.
-func TestF105SupersededTenureSettlesAnUnnamedClaim(t *testing.T) {
+func TestSupersededTenureSettlesAnUnnamedClaim(t *testing.T) {
 	t.Parallel()
 	for _, created := range []bool{false, true} {
 		created := created
@@ -277,7 +277,7 @@ func TestF105SupersededTenureSettlesAnUnnamedClaim(t *testing.T) {
 }
 
 // T5 (M1): a displaced tenure's consumer that a subscription or a drain still names is spared.
-func TestF105SettlementSparesNamedConsumers(t *testing.T) {
+func TestSettlementSparesNamedConsumers(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t5")
 	sub := testClaimedSourceConsumer(t, e, "settle.t5.sub")
@@ -308,7 +308,7 @@ func TestF105SettlementSparesNamedConsumers(t *testing.T) {
 }
 
 // T6 (M2): the classifier never supersedes a consumer the serving tenure itself provisioned.
-func TestF105SettlementLeavesItsOwnTenuresClaims(t *testing.T) {
+func TestSettlementLeavesItsOwnTenuresClaims(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t6")
 	ent := testResumeUnderNewTenure(t, e)
@@ -321,7 +321,7 @@ func TestF105SettlementLeavesItsOwnTenuresClaims(t *testing.T) {
 }
 
 // T7: a route's hand-off lost after its save removed the name is settled by the next tenure.
-func TestF105SettlementCoversALostRouteHandOff(t *testing.T) {
+func TestSettlementCoversALostRouteHandOff(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t7")
 	cl := testClaimedSourceConsumer(t, e, "settle.t7")
@@ -343,7 +343,7 @@ func TestF105SettlementCoversALostRouteHandOff(t *testing.T) {
 
 // T8a (M6) and T8b: a decision that stands is finished by the next tenure from whatever state it
 // stood in, keeping the original decision.
-func TestF105SettlementFinishesAStandingDecision(t *testing.T) {
+func TestSettlementFinishesAStandingDecision(t *testing.T) {
 	t.Parallel()
 	t.Run("decided, not authorized", func(t *testing.T) {
 		t.Parallel()
@@ -393,7 +393,7 @@ func TestF105SettlementFinishesAStandingDecision(t *testing.T) {
 
 // T8c (M6b): a displaced tenure's item pending ahead of the successor's no longer swallows it.
 // Both items are queued while the owner is held on an unrelated step, the displaced one FIRST.
-func TestF105DisplacedItemDoesNotSwallowTheSuccessors(t *testing.T) {
+func TestDisplacedItemDoesNotSwallowTheSuccessors(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t8c")
 	e.asm.mu.Lock()
@@ -431,7 +431,7 @@ func TestF105DisplacedItemDoesNotSwallowTheSuccessors(t *testing.T) {
 }
 
 // T11: a settled consumer still held by an obligation is decided but not authorized.
-func TestF105SettledHeldConsumerWaitsOnItsHolds(t *testing.T) {
+func TestSettledHeldConsumerWaitsOnItsHolds(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t11")
 	cl := testClaimedSourceConsumer(t, e, "settle.t11")
@@ -467,7 +467,7 @@ func TestF105SettledHeldConsumerWaitsOnItsHolds(t *testing.T) {
 }
 
 // T15 (M5): the settlement never touches the generation's PUBREL consumer.
-func TestF105SettlementSkipsThePubRelConsumer(t *testing.T) {
+func TestSettlementSkipsThePubRelConsumer(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t15")
 	e.subscribePubRel(t)
@@ -487,7 +487,7 @@ func TestF105SettlementSkipsThePubRelConsumer(t *testing.T) {
 
 // T17 (M14): a SUBSCRIBE's claim is made under its connection's entitlement, so a connection a
 // takeover displaced claims nothing under its successor's tenure.
-func TestF105DisplacedSubscribeClaimsNothing(t *testing.T) {
+func TestDisplacedSubscribeClaimsNothing(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t17")
 	displaced := testServingEntitlement(t, e.sess)
@@ -503,7 +503,7 @@ func TestF105DisplacedSubscribeClaimsNothing(t *testing.T) {
 
 // T18 (M15, M15c) and T18b (M15b): the resource walk follows every page, survives an insertion
 // before its offset, and retries a failed read without another CONNECT.
-func TestF105SettlementWalkIsComplete(t *testing.T) {
+func TestSettlementWalkIsComplete(t *testing.T) {
 	t.Parallel()
 	t.Run("pages and an insertion before the offset", func(t *testing.T) {
 		t.Parallel()
@@ -578,7 +578,7 @@ func TestF105SettlementWalkIsComplete(t *testing.T) {
 // T4: the settlement runs on whichever broker accepts the next tenure. A second account manager on
 // the same JetStream restores the session, takes the next tenure, and settles the first broker's
 // unnamed claim.
-func TestF105SettlementRunsOnTheNextBroker(t *testing.T) {
+func TestSettlementRunsOnTheNextBroker(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-t4")
 	cl := testClaimedSourceConsumer(t, e, "settle.t4")
@@ -631,7 +631,7 @@ func testPubRelRepairReasons(t *testing.T) func() []string {
 
 // T12 (M8): an enrolled re-materialisation continuation whose PUBREL consumer is deleted before
 // its first attempt recreates the consumer and rebinds, without another CONNECT.
-func TestF105RematerializationRecreatesAnAbsentPubRelConsumer(t *testing.T) {
+func TestRematerializationRecreatesAnAbsentPubRelConsumer(t *testing.T) {
 	reasons := testPubRelRepairReasons(t)
 	e, _, subject, _, canon := testPubRelReadyWorld(t, "settle-t12")
 	if err := e.asm.jsa.deleteMsg(mqttOutStreamName, canon, true); err != nil {
@@ -662,7 +662,7 @@ func TestF105RematerializationRecreatesAnAbsentPubRelConsumer(t *testing.T) {
 
 // T13 and T14 (M10): the repair arm and the ensure refuse every not-repairable cause, each
 // reporting why, and repair the one repairable one.
-func TestF105PubRelRepairRefusesWhatItMayNotRepair(t *testing.T) {
+func TestPubRelRepairRefusesWhatItMayNotRepair(t *testing.T) {
 	reasons := testPubRelRepairReasons(t)
 	e := testNewInflightEnv(t, "settle-t13")
 	e.subscribePubRel(t)
@@ -744,7 +744,7 @@ func TestF105PubRelRepairRefusesWhatItMayNotRepair(t *testing.T) {
 // H-1: a handoff that PREPARES over the settling tenure and is then CANCELLED does not abandon the
 // settlement. The owner's disposal meets PREPARING, is withheld rather than dropped, and lands
 // under the same tenure once the cancellation restores it — with no further CONNECT.
-func TestF105CancelledHandoffDoesNotAbandonTheSettlement(t *testing.T) {
+func TestCancelledHandoffDoesNotAbandonTheSettlement(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "settle-cancel")
 	cl := testClaimedSourceConsumer(t, e, "settle.cancel")

@@ -192,11 +192,11 @@ there.
   attempt holding foreground authority and stalling the session's retained replay (see
   ARCHITECTURE "Retained delivery through the manifest
   ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7c)"). No
-  residual. Regression tests: `TestF105RetainedPubAckInstallsNoSourceOwner`
+  residual. Regression tests: `TestRetainedPubAckInstallsNoSourceOwner`
   (`internal/mqtt/outbound_retained_live_test.go`),
-  `TestF105RetainedReplayTooLargeIsAbandonedQoS1`
+  `TestRetainedReplayTooLargeIsAbandonedQoS1`
   (`internal/mqtt/outbound_retained_abandon_test.go`) and
-  `TestF105SourcelessCoordinatesAreRefusedAtEveryOrdinarySink`
+  `TestSourcelessCoordinatesAreRefusedAtEveryOrdinarySink`
   (`internal/mqtt/outbound_retained_sink_guard_test.go`).
 - **Server Keep Alive** (`test_server_keep_alive`): configurable cap via
   `MQTTNB_KEEPALIVE_MAX` / `-keepalive-max` (0 = no override), advertised in
@@ -414,12 +414,12 @@ resume that preserves the generation restores its obligations from the inventory
 8c). The client-visible outcome through the assembled production route is witnessed with
 real clients and a peer winning retirement
 (`internal/mqtt/outbound_peer_witness_e2e_test.go`): a PRESERVED obligation completes on
-the peer (`TestF105PreservedObligationCompletesOnThePeer`, and
-`TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer`, whose PUBLISH is
+the peer (`TestPreservedObligationCompletesOnThePeer`, and
+`TestAnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer`, whose PUBLISH is
 never re-sent there); an obligation of a DISCARDED generation is ended only under its
-discarding closure (`TestF105DiscardedObligationEndsUnderTheDiscardingClosure`,
-`TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure`); and an overdue session is
-not resumed on the peer (`TestF105AnOverdueSessionIsNotResumedOnThePeer`).
+discarding closure (`TestDiscardedObligationEndsUnderTheDiscardingClosure`,
+`TestExpiredObligationEndsUnderThePeersDiscardingClosure`); and an overdue session is
+not resumed on the peer (`TestAnOverdueSessionIsNotResumedOnThePeer`).
 
 **A durable closure certificate is one attempt, and its absence is never a
 licence ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
@@ -454,7 +454,7 @@ within that bound leaves the proposal standing
 - *A clean-start CONNECT* refuses before anything is detached (the client retries):
   taking the discard arm there would mark the record from the object's memory, and the marker's
   continuation could retire targets the displaced record does not name. Witnessed by
-  `TestF105_8bUnresolvedBoundaryRefusesTheCleanStart`.
+  `Test8bUnresolvedBoundaryRefusesTheCleanStart`.
 - *Every other discard* (disconnect, expiry, gone-retirement, the pending-discard finisher)
   claims the record with no retirement receipt, and the closing driver finds no licence for
   the shared closing (the generation can still admit), so it withholds: the record stays
@@ -464,8 +464,8 @@ within that bound leaves the proposal standing
   missing receipt with a CAS of the marker and finishes the discarding close. So the residue
   is a DELAYED release, converging once the store answers and an adopter runs; the
   session-record CAS still arbitrates the claim against the proposal's own metadata commit.
-  Witnessed by `TestF105_8bReceiptlessTeardownWithholds` and
-  `TestF105_8bExpiryAdoptionContinuesReceiptless`.
+  Witnessed by `Test8bReceiptlessTeardownWithholds` and
+  `Test8bExpiryAdoptionContinuesReceiptless`.
 
 **A preserving closure with an acquisition that joined before the seal withholds.** The
 closing driver seals behind a non-discarding closure only when the generation's ledger lists
@@ -474,7 +474,7 @@ landed but before its seal, leaves an open ledger listing that join; the next ad
 withholds on it rather than release an acquisition it cannot prove nothing depends on. Safe,
 but not guaranteed to converge for that schedule; production writes a preserving closure only
 over a reservation that never served, so the schedule needs a stale join under a generation
-that never installed. Witnessed by `TestF105_8bLateJoinBeforeTheSealWithholds`.
+that never installed. Witnessed by `Test8bLateJoinBeforeTheSealWithholds`.
 
 **Every CONNECT pays for its tenure.** One acceptance-fact read on `$MQTT_sess` and one
 installation on `$MQTT_shared` sit on the critical path of every CONNECT, shared
@@ -1932,8 +1932,8 @@ cancelled, no longer loses the client's PUBACK (the entry is enrolled or routed 
 than withdrawn as unsent), and a register covered by a void verdict that recovery
 restores acting is no longer fenced from every retransmission (the restoration retires
 the verdict). Both were witnessed failing before the fix, and the same tests are now
-their regressions (`TestF088CrossTenureLegitimateTransmissionThenCancellation`;
-`TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold`, re-expressed over a
+their regressions (`TestCrossTenureLegitimateTransmissionThenCancellation`;
+`TestCrossTenureVerdictOverAPossiblyAttemptedRegisterCold`, re-expressed over a
 persisted verdict, since the fix removes the producer that made one).
 
 **Two qualifications on that hold, neither conditioned on a rollout.** A consumer
@@ -2059,7 +2059,7 @@ generic delete failure, since the store may have recorded the deletion before fa
   observed by the witness (its consumer at `NumAckPending` 2, `AckFloor.Stream` 0,
   `NumRedelivered` 0), never inferred from the recovered register carrying no
   `jsAckSubject`. Pinned by
-  `TestF121IntentDeleteAfterCertificationStrandsAWithdrawnExchange`, and filed
+  `TestIntentDeleteAfterCertificationStrandsAWithdrawnExchange`, and filed
   as [issue #123](https://github.com/nberlee/mqtt-nats-broker/issues/123) in
   `docs/ROADMAP.md` §0.3; its fix needs an ordering design. **Accepted as a residual on
   2026-10-12:** no owed delivery is lost, because the message never left and withdrawing
@@ -3278,7 +3278,7 @@ Residuals:
   ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) 7f) or
   the generation is disposed of; no fixed time or storage bound is claimed while the
   session continues. Characterized by the injected arm of
-  `TestF088RecoveredDrainClaimRetiresDespiteAFailedSave`, which gets no credit for
+  `TestRecoveredDrainClaimRetiresDespiteAFailedSave`, which gets no credit for
   in-session disposal after the failure. The mechanism is in code the
   [issue #99](https://github.com/nberlee/mqtt-nats-broker/issues/99)/ [issue #90](https://github.com/nberlee/mqtt-nats-broker/issues/90)
   close-out leaves unchanged against `d784cdb`; it was observed with that change applied
@@ -4296,7 +4296,7 @@ remain.
   self-echo is new behavior from
   [issue #119](https://github.com/nberlee/mqtt-nats-broker/issues/119); the
   window it rides is pre-existing and
-  is the defect to repair. `TestF117PubRelWindowSelfEchoResidual`
+  is the defect to repair. `TestPubRelWindowSelfEchoResidual`
   characterizes it and changes when the window is repaired.
 
 ### An ambiguous record write COMPLETES rather than aborts, once it is settled
@@ -6928,7 +6928,7 @@ Four residuals follow, and the alpha ships with them stated.
    **The absence of a re-park is deliberate, not an oversight.** Phase 1 has already
    deresidented the session, so an action put back there is unreachable by the periodic
    pass and by the next CONNECT: re-parking would convert a logged loss into a silent one.
-   Pinned by `TestF084DeferredWillImmediatePublishFailureIsLoggedNotReparked`. Closing it
+   Pinned by `TestDeferredWillImmediatePublishFailureIsLoggedNotReparked`. Closing it
    needs a durable intent record written before the in-memory consume, which is new durable
    state the broker does not have — the same boundary residual 3 sits behind.
 

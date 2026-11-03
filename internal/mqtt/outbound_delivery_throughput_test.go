@@ -485,8 +485,8 @@ func outboundDeliveryCensusClass(subject string, body []byte) string {
 	}
 	if strings.HasPrefix(verb, "STREAM.MSG.GET") {
 		b := string(body)
-		if i := strings.Index(b, mqttF105SubjectPrefix()); i >= 0 {
-			rest := b[i+len(mqttF105SubjectPrefix()):]
+		if i := strings.Index(b, mqttOutboundRecordSubjectPrefix()); i >= 0 {
+			rest := b[i+len(mqttOutboundRecordSubjectPrefix()):]
 			if j := strings.IndexAny(rest, ".\""); j > 0 {
 				rest = rest[:j]
 			}

@@ -10,21 +10,21 @@ import (
 
 // testOpRefusalEnv is an issue #107 world with a serving authority and the two consumer resources a QoS 2
 // obligation depends on.
-func testOpRefusalEnv(t *testing.T, name string) (*testF105Env, *mqttOutboundAuthority, *testJSAObserver) {
+func testOpRefusalEnv(t *testing.T, name string) (*testOutboundEnv, *mqttOutboundAuthority, *testJSAObserver) {
 	t.Helper()
-	e, done := testF105NewEnv(t, name)
+	e, done := testNewEnv(t, name)
 	t.Cleanup(done)
 	auth, _ := e.bootstrap(t, "txn-boot")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	testPlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
 	return e, auth, testObserveJSA(t, &e.asm.jsa)
 }
 
-func testOpAdmitRequest(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority, pi uint16, qos byte, gen string, incs ...string) *mqttAdmitPublishRequest {
+func testOpAdmitRequest(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority, pi uint16, qos byte, gen string, incs ...string) *mqttAdmitPublishRequest {
 	t.Helper()
 	deps := make([]mqttAdmitDependency, 0, len(incs))
 	for _, inc := range incs {
-		deps = append(deps, mqttAdmitDependency{Inc: inc, Role: testF105AdmissionRole(t, e, inc)})
+		deps = append(deps, mqttAdmitDependency{Inc: inc, Role: testAdmissionRole(t, e, inc)})
 	}
 	txn := mqttNewInflightNonce()
 	return &mqttAdmitPublishRequest{
@@ -76,17 +76,17 @@ func TestOpRefusalCosts(t *testing.T) {
 	idHash := getHash(e.id)
 	moved := mqttGenSessEpoch()
 	r := testOpAdmitRequest(t, e, auth, 7, 2, moved, "inc-src", "inc-rel")
-	f105 := testSubjectHasPrefix(mqttF105SubjectPrefix())
+	recordPrefix := testSubjectHasPrefix(mqttOutboundRecordSubjectPrefix())
 	m := o.mark()
 	if _, err := e.asm.jsa.opAdmitPublish(r); err == nil {
 		t.Fatal("an admission under a moved generation must be refused")
 	}
-	if n := o.sends(m, f105); n != 1 || o.sends(m, testSubjectIs(mqttOutboundAuthoritySubject(idHash))) != 1 {
-		t.Fatalf("the refused admission made %d issue #107 reads, want only the authority: %v", n, o.sentSubjects(m, f105))
+	if n := o.sends(m, recordPrefix); n != 1 || o.sends(m, testSubjectIs(mqttOutboundAuthoritySubject(idHash))) != 1 {
+		t.Fatalf("the refused admission made %d issue #107 reads, want only the authority: %v", n, o.sentSubjects(m, recordPrefix))
 	}
 
-	nonce, _, reg, seq := testF105AdmitQoS(t, e, "txn-adm", 9, 2, "inc-src", "inc-rel")
-	x, _ := testF105LoadExchange(t, e, auth.Gen, nonce)
+	nonce, _, reg, seq := testAdmitQoS(t, e, "txn-adm", 9, 2, "inc-src", "inc-rel")
+	x, _ := testLoadExchange(t, e, auth.Gen, nonce)
 	if len(x.Holds) != 2 {
 		t.Fatalf("fixture: a QoS 2 exchange holds %d resources, want 2", len(x.Holds))
 	}

@@ -128,8 +128,8 @@ var mqttSocketPlumbingSites = map[string]mqttOutputSite{
 	"shim_engine.go|readLoop|nc (aliased)":                {1, "the read loop's own local"},
 }
 
-// TestF105EveryTransportWriteIsAccountedFor is the structural check itself.
-func TestF105EveryTransportWriteIsAccountedFor(t *testing.T) {
+// TestEveryTransportWriteIsAccountedFor is the structural check itself.
+func TestEveryTransportWriteIsAccountedFor(t *testing.T) {
 	found := mqttScanRawOutputSites(t)
 
 	recorded := map[string]mqttOutputSite{}
@@ -178,7 +178,7 @@ func TestF105EveryTransportWriteIsAccountedFor(t *testing.T) {
 			"outlives what it describes stops describing anything.", strings.Join(gone, "\n  "))
 	}
 
-	// THE SET'S CONTENT IS TestF105OutputBypassSetIsTheTwoMixedSites's to assert; this test
+	// THE SET'S CONTENT IS TestOutputBypassSetIsTheTwoMixedSites's to assert; this test
 	// asks only that every raw write is recorded, accurately.
 	t.Logf("output boundary: %d boundary site(s), %d bypass(es) still owed",
 		len(mqttOutputBoundarySites), len(mqttOutputBypassesOwed))
@@ -194,16 +194,16 @@ func TestF105EveryTransportWriteIsAccountedFor(t *testing.T) {
 //
 // The cutover plan's EMPTY set is not met and is not claimed: what is left on these two sites is
 // supported QoS 0 and actionless acknowledgements beside chapter P's slot-only QoS 1/2.
-// TestF105SupportedObligationsNeverLeaveThroughAMixedSite is the runtime half that a count cannot
+// TestSupportedObligationsNeverLeaveThroughAMixedSite is the runtime half that a count cannot
 // supply: it shows supported QoS 1/2 traffic does not pass through them.
 var mqttAlphaMixedSites = map[string]int{
 	"protocol_output.go|mqttEnqueueProtoLocked|enqueueProto":           1,
 	"publish_deliver.go|mqttEnqueuePreparedPublishMsgTo|queueOutbound": 2,
 }
 
-// TestF105OutputBypassSetIsTheTwoMixedSites asserts the recorded failure set EQUALS the alpha set,
+// TestOutputBypassSetIsTheTwoMixedSites asserts the recorded failure set EQUALS the alpha set,
 // by key and by count.
-func TestF105OutputBypassSetIsTheTwoMixedSites(t *testing.T) {
+func TestOutputBypassSetIsTheTwoMixedSites(t *testing.T) {
 	var diff []string
 	for site, rec := range mqttOutputBypassesOwed {
 		want, ok := mqttAlphaMixedSites[site]

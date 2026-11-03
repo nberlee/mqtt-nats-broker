@@ -610,7 +610,7 @@ func TestUnitCLandedSuccessorAfterTenureDisplacement(t *testing.T) {
 			if err := json.Unmarshal(msg.Data, &record); err != nil {
 				t.Fatal(err)
 			}
-			gen, tenure := testF105ResumeHandoff(t, &e.asm.jsa, e.asm.domainTk, e.sess.id,
+			gen, tenure := testResumeHandoff(t, &e.asm.jsa, e.asm.domainTk, e.sess.id,
 				e.asm.sessStreamEpoch, &record, msg.Sequence)
 			if gen != f.gen || tenure == fact.Tenure {
 				t.Fatalf("B did not displace A: gen=%s tenure=%s", gen, tenure)

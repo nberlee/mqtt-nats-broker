@@ -98,7 +98,7 @@ func (f *testLateAckFix) entry() *mqttPending {
 //
 // Mutation M5 (Unanswered skips install): no binding -> the PUBACK is dropped, the exchange stays
 // Publish.
-func TestF088UntrackedTransmittedDeliveryLatePubAckEndsTheExchange(t *testing.T) {
+func TestUntrackedTransmittedDeliveryLatePubAckEndsTheExchange(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t4", 1)
 	f.untrackByDeny(t)
@@ -141,7 +141,7 @@ func TestF088UntrackedTransmittedDeliveryLatePubAckEndsTheExchange(t *testing.T)
 // T5. T4 to the untrack; broker A stops; a cold COMPLETE resume on peer B: recovery restores an
 // ACTING entry for p (its marker is gone: possibly attempted), and the client's PUBACK on B ends the
 // exchange through the ordinary path.
-func TestF088PreservedRegisterLatePubAckAfterColdPeerResume(t *testing.T) {
+func TestPreservedRegisterLatePubAckAfterColdPeerResume(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t5", 1)
 	f.untrackByDeny(t)
@@ -178,7 +178,7 @@ func TestF088PreservedRegisterLatePubAckAfterColdPeerResume(t *testing.T) {
 // T9 (R1-F1). L1 on p ENDS (acknowledged): its removal is Ended and installs nothing. p is then
 // re-allocated to L2, which is transmitted and untracked UNANSWERED: its AckRoute names L2 (the
 // stale L1 is vetoed as an ended lineage), and the PUBACK ends L2.
-func TestF088EndedLineageIsNotReboundOnIdentifierReuse(t *testing.T) {
+func TestEndedLineageIsNotReboundOnIdentifierReuse(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t9", 1)
 	l1 := f.lin
@@ -229,12 +229,12 @@ func TestF088EndedLineageIsNotReboundOnIdentifierReuse(t *testing.T) {
 // That removal must install nothing (Ended, and the ended-lineage veto); then p is re-allocated on
 // A to L2, which is transmitted and untracked UNANSWERED: its AckRoute names L2 and the PUBACK
 // ends L2.
-func TestF088EndedLineageObservedWhileTrackedIsNotRebound(t *testing.T) {
+func TestEndedLineageObservedWhileTrackedIsNotRebound(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t9-ledger", 1)
 	// THE FLOOR UNIT IS HELD (issue #114): once L1's projection and register are both gone its
 	// ended-lineage entry is legitimately pruned, and this test reads that entry as its proof that
-	// A observed the ending. The prune's own conditions are TestF112TheEndedLineageVetoExits...'s.
+	// A observed the ending. The prune's own conditions are the TestTheEndedLineageVetoExits... tests'.
 	f.e.sess.mu.Lock()
 	if f.e.sess.testCustodyDriver == nil {
 		f.e.sess.testCustodyDriver = &mqttCustodyDriverSeams{}
@@ -311,7 +311,7 @@ func TestF088EndedLineageObservedWhileTrackedIsNotRebound(t *testing.T) {
 // T9b. A NEVER-SENT acting entry removed by the non-drain UNSUBSCRIBE teardown's proven-unsent arm
 // installs no binding (its marker stands: nothing to answer), and the teardown's ladder then
 // withdraws it (WithdrawnUnsent).
-func TestF088MarkerStandingRemovalInstallsNoBinding(t *testing.T) {
+func TestMarkerStandingRemovalInstallsNoBinding(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f088-t9b", 1)
 	f.e.sess.mu.Lock()
@@ -342,7 +342,7 @@ func TestF088MarkerStandingRemovalInstallsNoBinding(t *testing.T) {
 // removal that DOES carry a marker-standing entry into the install is the UNSUBSCRIBE drain's
 // withdraw arm (stageDrain, drainClaimWithdraw): it untracks the never-sent entry UNANSWERED, and
 // the evidence enum must keep MarkerStanding from installing an AckRoute.
-func TestF088MarkerStandingDrainWithdrawInstallsNoBinding(t *testing.T) {
+func TestMarkerStandingDrainWithdrawInstallsNoBinding(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f088-t9b-drain", 1)
 	sess := f.e.sess
@@ -378,7 +378,7 @@ func TestF088MarkerStandingDrainWithdrawInstallsNoBinding(t *testing.T) {
 // T13b. The door REFUSES a vanished marker: the marker is deleted after the door's evidence was
 // minted and before the withdrawal op's marker read; the op reports no marker, and the register
 // survives (no destruction on a cancellation's or a tombstone's say-so).
-func TestF088DoorRefusesAVanishedMarker(t *testing.T) {
+func TestDoorRefusesAVanishedMarker(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f088-t13b", 1)
 	rec, seq := f.register(t)
@@ -436,7 +436,7 @@ func testLateAckUnitBinding(sess *mqttSession, role mqttAllocationAckBindingRole
 
 // T7. A QoS 1 AckRoute is answered by the WRONG packet (PUBREC): mqttPhaseForAck refuses it and
 // the exchange stays Publish; the right packet (PUBACK) then ends it (positive control).
-func TestF088BindingRefusesTheWrongAcknowledgement(t *testing.T) {
+func TestBindingRefusesTheWrongAcknowledgement(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t7", 1)
 	f.untrackByDeny(t)
@@ -462,7 +462,7 @@ func TestF088BindingRefusesTheWrongAcknowledgement(t *testing.T) {
 
 // T8a/T8b. The install boundary refuses a binding of another generation, or of another stream
 // epoch; the same binding with this session's generation and epoch installs.
-func TestF088BindingRefusesAnotherGeneration(t *testing.T) {
+func TestBindingRefusesAnotherGeneration(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	b := testLateAckUnitBinding(sess, mqttAckRoleAckRoute, 5, "n5", "n5", "dur")
@@ -478,7 +478,7 @@ func TestF088BindingRefusesAnotherGeneration(t *testing.T) {
 	}
 }
 
-func TestF088BindingRefusesAnotherEpoch(t *testing.T) {
+func TestBindingRefusesAnotherEpoch(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	b := testLateAckUnitBinding(sess, mqttAckRoleAckRoute, 5, "n5", "n5", "dur")
@@ -497,7 +497,7 @@ func TestF088BindingRefusesAnotherEpoch(t *testing.T) {
 // T18. A HandBack installs DESPITE the ended-lineage veto (it reconstructs a terminal abandonment
 // whose exchange already ended), and a shared one keeps the source gate closed until its register
 // is proven deleted; an AckRoute of an ended lineage is refused.
-func TestF088TerminalHandBackStillReconstructs(t *testing.T) {
+func TestTerminalHandBackStillReconstructs(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	sess.mu.Lock()
@@ -530,7 +530,7 @@ func TestF088TerminalHandBackStillReconstructs(t *testing.T) {
 }
 
 // T19. A SHARED AckRoute holds no source gate: only a HandBack does.
-func TestF088SharedAckRouteDoesNotGateTheSource(t *testing.T) {
+func TestSharedAckRouteDoesNotGateTheSource(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	shared := mqttSharedConsumerDurablePrefix + "group"
@@ -546,7 +546,7 @@ func TestF088SharedAckRouteDoesNotGateTheSource(t *testing.T) {
 
 // T19b. An ORDINARY AckRoute is removed by its exchange's ordinary Terminal observation (no
 // abandonment fact), matched by lineage.
-func TestF088AckRouteEndsByLineage(t *testing.T) {
+func TestAckRouteEndsByLineage(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	b := testLateAckUnitBinding(sess, mqttAckRoleAckRoute, 9, "n9", "lin9", "dur")
@@ -572,7 +572,7 @@ func TestF088AckRouteEndsByLineage(t *testing.T) {
 // T19c. An abandonment's HandBack UPGRADES the same allocation's AckRoute; a binding of a
 // different allocation on the same identifier is never overwritten, and an AckRoute never
 // replaces a HandBack.
-func TestF088AbandonmentUpgradesAnAckRoute(t *testing.T) {
+func TestAbandonmentUpgradesAnAckRoute(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	sess.mu.Lock()
@@ -735,8 +735,8 @@ func TestMQTTAckArrowClearsAKnownFalseCancellation(t *testing.T) {
 // Cold resume on a peer: recovery's cancellation classification (WP3 edit 4)
 // ---------------------------------------------------------------------------
 
-// testF088CancelSeen is one firing of recovery's cancellation-classification seam.
-type testF088CancelSeen struct {
+// testCancelSeen is one firing of recovery's cancellation-classification seam.
+type testCancelSeen struct {
 	pi           uint16
 	nonce        string
 	recCancelled bool
@@ -744,41 +744,41 @@ type testF088CancelSeen struct {
 	markerSeq    uint64
 }
 
-// testF088Peer is broker B after a cold COMPLETE resume of the fixture's session.
-type testF088Peer struct {
+// testPeer is broker B after a cold COMPLETE resume of the fixture's session.
+type testPeer struct {
 	asm  *mqttAccountSessionManager
 	sess *mqttSession
 	c    *client
 	mu   sync.Mutex
-	seen []testF088CancelSeen
+	seen []testCancelSeen
 }
 
-func (p *testF088Peer) cancellations() []testF088CancelSeen {
+func (p *testPeer) cancellations() []testCancelSeen {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]testF088CancelSeen(nil), p.seen...)
+	return append([]testCancelSeen(nil), p.seen...)
 }
 
-func (p *testF088Peer) entry(pi uint16) *mqttPending {
+func (p *testPeer) entry(pi uint16) *mqttPending {
 	p.sess.mu.Lock()
 	defer p.sess.mu.Unlock()
 	return p.sess.pendingPublish[pi]
 }
 
-// testF088ResumeOnPeer persists A's session record (A stops serving here: nothing further is
+// testResumeOnPeerComplete persists A's session record (A stops serving here: nothing further is
 // driven on it), restores the session on peer B and runs B's recovery with the cancellation
 // seam observing it. The resume must be COMPLETE.
-func testF088ResumeOnPeer(t *testing.T, f *testWithdrawFix, node string) *testF088Peer {
+func testResumeOnPeerComplete(t *testing.T, f *testWithdrawFix, node string) *testPeer {
 	t.Helper()
 	if err := testSessSave(t, f.e.sess); err != nil {
 		t.Fatalf("persist the session record: %v", err)
 	}
 	asm, sess, c := f.e.peer(t, node, f.e.sess.id)
-	p := &testF088Peer{asm: asm, sess: sess, c: c}
+	p := &testPeer{asm: asm, sess: sess, c: c}
 	asm.mu.Lock()
 	asm.testRecoverCancellation = func(pi uint16, nonce string, recCancelled, verdict bool, markerSeq uint64) {
 		p.mu.Lock()
-		p.seen = append(p.seen, testF088CancelSeen{pi, nonce, recCancelled, verdict, markerSeq})
+		p.seen = append(p.seen, testCancelSeen{pi, nonce, recCancelled, verdict, markerSeq})
 		p.mu.Unlock()
 	}
 	asm.mu.Unlock()
@@ -798,7 +798,7 @@ func testF088ResumeOnPeer(t *testing.T, f *testWithdrawFix, node string) *testF0
 // requireMarkerlessCancellationMet is the REACH witness, asserted before any outcome: recovery's
 // cancellation classification met p, by the cancellation fact the test names, with the marker
 // authoritatively ABSENT (no marker sequence on a decided send state).
-func (p *testF088Peer) requireMarkerlessCancellationMet(t *testing.T, pi uint16, nonce string, byRecord, byVerdict bool) {
+func (p *testPeer) requireMarkerlessCancellationMet(t *testing.T, pi uint16, nonce string, byRecord, byVerdict bool) {
 	t.Helper()
 	for _, s := range p.cancellations() {
 		if s.pi != pi || s.nonce != nonce {
@@ -819,7 +819,7 @@ func (p *testF088Peer) requireMarkerlessCancellationMet(t *testing.T, pi uint16,
 
 // captureAdvance records the register member every advance-exchange transition on B writes for
 // subject, so the test can read whether the acknowledgement cleared the cancellation.
-func (p *testF088Peer) captureAdvance(t *testing.T, subject string) func() *mqttInflightRecord {
+func (p *testPeer) captureAdvance(t *testing.T, subject string) func() *mqttInflightRecord {
 	t.Helper()
 	var mu sync.Mutex
 	var advanced *mqttInflightRecord
@@ -862,7 +862,7 @@ func (p *testF088Peer) captureAdvance(t *testing.T, subject string) func() *mqtt
 //
 // Mutation M6 (edit 4 reverted): the markerless cancellation keeps the pre-edit cancellation
 // disposition -> p is not restored acting.
-func TestF088MarkerlessCancelledRegisterRestoresActingOnColdResume(t *testing.T) {
+func TestMarkerlessCancelledRegisterRestoresActingOnColdResume(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t5d", 1)
 	if f.markerStands() {
@@ -881,7 +881,7 @@ func TestF088MarkerlessCancelledRegisterRestoresActingOnColdResume(t *testing.T)
 		t.Fatalf("fixture: a markerless cancellation must not end the exchange, got %+v", x)
 	}
 
-	p := testF088ResumeOnPeer(t, f.testWithdrawFix, "node2-t5d")
+	p := testResumeOnPeerComplete(t, f.testWithdrawFix, "node2-t5d")
 	p.requireMarkerlessCancellationMet(t, f.pi, f.nonce, true, false)
 
 	ent := p.entry(f.pi)
@@ -911,7 +911,7 @@ func TestF088MarkerlessCancelledRegisterRestoresActingOnColdResume(t *testing.T)
 // (stageVoidVerdictLocked) invoked DIRECTLY over a transmitted allocation, and made
 // durable by a real save. PS-2's production schedule (a covered verdict over a possibly-transmitted
 // register) is not demonstrated here. Boundary-hardening; recorded separately from M6's T5d.
-func TestF088CoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
+func TestCoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t5e", 1)
 	if f.markerStands() {
@@ -938,7 +938,7 @@ func TestF088CoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
 		t.Fatalf("fixture: the register itself must not be cancelled, got %+v", cur)
 	}
 
-	p := testF088ResumeOnPeer(t, f.testWithdrawFix, "node2-t5e")
+	p := testResumeOnPeerComplete(t, f.testWithdrawFix, "node2-t5e")
 	p.requireMarkerlessCancellationMet(t, f.pi, f.nonce, false, true)
 
 	if ent := p.entry(f.pi); ent == nil || !ent.acts() {
@@ -958,15 +958,15 @@ func TestF088CoveredVerdictRegisterRestoresActingOnColdResume(t *testing.T) {
 // PUBREC on B ends it Rejected. `completed`: a successful PUBREC on B records the intent and the
 // canonical PUBREL, the PUBREL is delivered and transmitted on B, and the client's PUBCOMP ends
 // it Terminal.
-func TestF088PreservedQoS2CompletesAcrossColdResume(t *testing.T) {
+func TestPreservedQoS2CompletesAcrossColdResume(t *testing.T) {
 	t.Parallel()
-	setup := func(t *testing.T, clientID string) (*testLateAckFix, *testF088Peer) {
+	setup := func(t *testing.T, clientID string) (*testLateAckFix, *testPeer) {
 		f := testLateAckTransmitted(t, clientID, 2)
 		f.untrackByDeny(t)
 		if b := f.binding(); b == nil || b.role != mqttAckRoleAckRoute {
 			t.Fatalf("fixture: the AckRoute must stand on A, got %+v", b)
 		}
-		p := testF088ResumeOnPeer(t, f.testWithdrawFix, "node2-"+clientID)
+		p := testResumeOnPeerComplete(t, f.testWithdrawFix, "node2-"+clientID)
 		if ent := p.entry(f.pi); ent == nil || !ent.acts() {
 			t.Fatalf("B's recovery must restore an ACTING entry for the preserved QoS 2 register, got %+v", ent)
 		}
@@ -1030,11 +1030,11 @@ func TestF088PreservedQoS2CompletesAcrossColdResume(t *testing.T) {
 	})
 }
 
-// TestF088RecoveryHandoffRetiresTheAckRoute backs T13c's recovery-handoff reason: a resident
+// TestRecoveryHandoffRetiresTheAckRoute backs T13c's recovery-handoff reason: a resident
 // CONNECT's recovery on the SAME session object restores an acting entry for the allocation an
 // AckRoute names, and the AckRoute is removed (HANDOFF): the restored entry now owns the
 // acknowledgement, and the PUBACK ends the exchange through it.
-func TestF088RecoveryHandoffRetiresTheAckRoute(t *testing.T) {
+func TestRecoveryHandoffRetiresTheAckRoute(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-handoff", 1)
 	f.untrackByDeny(t)
@@ -1070,7 +1070,7 @@ func TestF088RecoveryHandoffRetiresTheAckRoute(t *testing.T) {
 // delivery's register is the lost-delete schedule the arm exists for.
 //
 // Mutation M3a (the arm treats sourceComplete as proven-unsent): the occupant is reaped -> fails.
-func TestF097DifferentSourceArmReservesAPossiblyAttemptedOccupant(t *testing.T) {
+func TestDifferentSourceArmReservesAPossiblyAttemptedOccupant(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f097-t3b")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -1227,7 +1227,7 @@ func TestMQTTAcquisitionOverAGenuineCancellationIsRefused(t *testing.T) {
 // INPUT, STATED: the verdict is staged directly through the production entry
 // (stageVoidVerdictLocked) over the transmitted allocation and saved; no P-b producer
 // schedule is claimed (M1b's condition).
-func TestF088VerdictRetiredByTerminalCleanup(t *testing.T) {
+func TestVerdictRetiredByTerminalCleanup(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f088-t16", 1)
 	f.e.sess.mu.Lock()
@@ -1282,7 +1282,7 @@ func TestF088VerdictRetiredByTerminalCleanup(t *testing.T) {
 // behind W5c and are not asserted. The cancellation is the consumer teardown's purge of the
 // pending allocation, run inside the write seam after the replacement landed; the teardown's
 // separate securing pass is not run.
-func TestF088InheritedReplacementCancellationEnrolsTheDrain(t *testing.T) {
+func TestInheritedReplacementCancellationEnrolsTheDrain(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f088-t17")
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -1365,7 +1365,7 @@ func TestF088InheritedReplacementCancellationEnrolsTheDrain(t *testing.T) {
 //     withdraws and deletes the never-sent obligation, register and marker both.
 //   - `affine`: an EXPERIMENTAL AFFINE (slot-only) pair with its marker standing is removed whole by
 //     the same ladder; nothing is fabricated for a class with no exchange.
-func TestF088MarkerBackedCancellationStillWithdraws(t *testing.T) {
+func TestMarkerBackedCancellationStillWithdraws(t *testing.T) {
 	t.Parallel()
 	t.Run("tombstone-then-door", func(t *testing.T) {
 		t.Parallel()
@@ -1450,8 +1450,8 @@ func TestF088MarkerBackedCancellationStillWithdraws(t *testing.T) {
 //
 // The matrix is over the door's ENTRANCES: every production route reaches the door through one of
 // them, and the routes into the two inner entrances are frozen below. Which functions may call the
-// door's own delete is TestF105WithdrawDestructionHasOneDoor's census, not this test's.
-func TestF088EveryDestructiveRouteEndsOrPreserves(t *testing.T) {
+// door's own delete is TestWithdrawDestructionHasOneDoor's census, not this test's.
+func TestEveryDestructiveRouteEndsOrPreserves(t *testing.T) {
 	t.Parallel()
 	callers := testProductionCallers(t, map[string]bool{"reapLoadedRegister": true, "reapRegisterGatedOutcome": true})
 	for callee, want := range map[string][]string{
@@ -1568,7 +1568,7 @@ func TestF088EveryDestructiveRouteEndsOrPreserves(t *testing.T) {
 //     itself withdraws the obligation under the new licence.
 //   - `connect-recovery`: the reconnect's recovery withdraws the obligation under the NEW licence
 //     (the genuine-cancellation arm: the verdict names it and its marker stands).
-func TestF088WithdrawalDebtAcrossSameObjectReconnect(t *testing.T) {
+func TestWithdrawalDebtAcrossSameObjectReconnect(t *testing.T) {
 	t.Parallel()
 	type world struct {
 		f          *testWithdrawFix
@@ -1772,19 +1772,19 @@ func TestF088WithdrawalDebtAcrossSameObjectReconnect(t *testing.T) {
 // INCOMPLETE stays conservative, and only the next complete resume decides the opaque register
 // ---------------------------------------------------------------------------
 
-// testF097ResumeOnPeer persists A's session record, restores it on peer B and runs B's recovery
+// testResumeOnPeerBatched persists A's session record, restores it on peer B and runs B's recovery
 // with B's BATCHED register/marker read routed through multi (nil: the real store). Unlike
-// testF088ResumeOnPeer it does not require the resume to be complete: the residual tests build
+// testResumeOnPeerComplete it does not require the resume to be complete: the residual tests build
 // exactly the incomplete one. The resume's marker phase and its pre-apply reread both read
 // through the batched seam (testInflightLoadMulti), never through the point-read marker seam.
-func testF097ResumeOnPeer(t *testing.T, f *testWithdrawFix, node string,
-	multi func(asm *mqttAccountSessionManager) func(subjects []string) ([]*JSApiMsgGetResponse, error)) *testF088Peer {
+func testResumeOnPeerBatched(t *testing.T, f *testWithdrawFix, node string,
+	multi func(asm *mqttAccountSessionManager) func(subjects []string) ([]*JSApiMsgGetResponse, error)) *testPeer {
 	t.Helper()
 	if err := testSessSave(t, f.e.sess); err != nil {
 		t.Fatalf("persist the session record: %v", err)
 	}
 	asm, sess, c := f.e.peer(t, node, f.e.sess.id)
-	p := &testF088Peer{asm: asm, sess: sess, c: c}
+	p := &testPeer{asm: asm, sess: sess, c: c}
 	if multi != nil {
 		asm.mu.Lock()
 		asm.testInflightLoadMulti = multi(asm)
@@ -1799,11 +1799,11 @@ func testF097ResumeOnPeer(t *testing.T, f *testWithdrawFix, node string,
 	return p
 }
 
-// testF097OpaqueMarkerSeam answers B's batched read of q's unsent marker with a marker naming
+// testOpaqueMarkerSeam answers B's batched read of q's unsent marker with a marker naming
 // ANOTHER allocation (every other subject reads the store as it stands): the marker phase then
 // cannot read q's marker as q's or as absent, and recovery reserves q MARKER-OPAQUE. patched
 // records that the seam actually served q's marker (the route witness).
-func testF097OpaqueMarkerSeam(t *testing.T, regSubject string, patched *atomic.Bool) func(asm *mqttAccountSessionManager) func([]string) ([]*JSApiMsgGetResponse, error) {
+func testOpaqueMarkerSeam(t *testing.T, regSubject string, patched *atomic.Bool) func(asm *mqttAccountSessionManager) func([]string) ([]*JSApiMsgGetResponse, error) {
 	t.Helper()
 	markerSubject := regSubject + "." + mqttInflightMarkerSuffix
 	foreign, ferr := mqttBuildInflightMarker(mqttNewInflightNonce())
@@ -1836,7 +1836,7 @@ func testF097OpaqueMarkerSeam(t *testing.T, regSubject string, patched *atomic.B
 // q's marker and a FULL dispatcher pass leave piSpaceIncomplete set and allocation withheld (WP4
 // never clears it: only the next complete resume does), and the connection is still open (no
 // server DISCONNECT was produced by any of it).
-func (p *testF088Peer) requireStaysConservative(t *testing.T, subject string) {
+func (p *testPeer) requireStaysConservative(t *testing.T, subject string) {
 	t.Helper()
 	p.asm.mu.Lock()
 	p.asm.testInflightLoadMulti = nil
@@ -1896,13 +1896,13 @@ func (p *testF088Peer) requireStaysConservative(t *testing.T, subject string) {
 //
 // Mutation M34 (a dispatcher unit clears piSpaceIncomplete after a successful point read): the
 // flag is cleared by the pass -> fails.
-func TestF097OpaqueAndRereadFailureStayConservative(t *testing.T) {
+func TestOpaqueAndRereadFailureStayConservative(t *testing.T) {
 	t.Parallel()
 	t.Run("opaque", func(t *testing.T) {
 		t.Parallel()
 		f := testWithdrawAdmitted(t, "f097-t27-opaque", 1)
 		var patched atomic.Bool
-		p := testF097ResumeOnPeer(t, f, "node2-t27-opaque", testF097OpaqueMarkerSeam(t, f.subject, &patched))
+		p := testResumeOnPeerBatched(t, f, "node2-t27-opaque", testOpaqueMarkerSeam(t, f.subject, &patched))
 		if !patched.Load() {
 			t.Fatal("witness: B's marker phase never read q's marker through the seam")
 		}
@@ -1941,7 +1941,7 @@ func TestF097OpaqueAndRereadFailureStayConservative(t *testing.T) {
 		}
 		var reads atomic.Int32
 		var failed atomic.Bool
-		p := testF097ResumeOnPeer(t, f.testWithdrawFix, "node2-t27-reread",
+		p := testResumeOnPeerBatched(t, f.testWithdrawFix, "node2-t27-reread",
 			func(asm *mqttAccountSessionManager) func([]string) ([]*JSApiMsgGetResponse, error) {
 				return func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 					names := false
@@ -1990,12 +1990,12 @@ func TestF097OpaqueAndRereadFailureStayConservative(t *testing.T) {
 // WP3 edit 7: the admission classifier probes a CANCELLED occupant's marker before it classifies
 // ---------------------------------------------------------------------------
 
-// testF088CancelledOcc is T17's inherited same-delivery occupant on identifier 11, carrying an
+// testCancelledOcc is T17's inherited same-delivery occupant on identifier 11, carrying an
 // OCCUPANT cancellation. INPUT, STATED: the occupant is seeded (an admission batch landed directly,
 // its cancellation then written at the raw register boundary as the copy-and-CAS fallback writes
 // it); markerAbsent consumes its unsent marker first (possibly attempted). The next allocation of
 // the same delivery is tracked onto identifier 11 and returned with its nonce.
-type testF088CancelledOcc struct {
+type testCancelledOcc struct {
 	e       *testInflightEnv
 	dur     string
 	sseq    uint64
@@ -2010,22 +2010,22 @@ type testF088CancelledOcc struct {
 	events  []string
 }
 
-func (o *testF088CancelledOcc) note(ev string) {
+func (o *testCancelledOcc) note(ev string) {
 	o.mu.Lock()
 	o.events = append(o.events, ev)
 	o.mu.Unlock()
 }
 
-func (o *testF088CancelledOcc) log() []string {
+func (o *testCancelledOcc) log() []string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]string(nil), o.events...)
 }
 
-func testF088CancelledOccupantOn(t *testing.T, e *testInflightEnv, dur string, sseq uint64, qos byte, landed *mqttInflightRecord,
-	markerAbsent bool) *testF088CancelledOcc {
+func testCancelledOccupantOn(t *testing.T, e *testInflightEnv, dur string, sseq uint64, qos byte, landed *mqttInflightRecord,
+	markerAbsent bool) *testCancelledOcc {
 	t.Helper()
-	o := &testF088CancelledOcc{e: e, dur: dur, sseq: sseq, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, 11)}
+	o := &testCancelledOcc{e: e, dur: dur, sseq: sseq, subject: mqttInflightSubject(e.sess.idHash, e.sess.gen, 11)}
 	if markerAbsent {
 		ml := e.asm.jsa.loadOccupantMarkerLoad(o.subject)
 		if err := e.asm.deleteInflightMarker(mqttMarkerCallerSender, o.subject, ml.seq, true); err != nil {
@@ -2077,8 +2077,8 @@ func testF088CancelledOccupantOn(t *testing.T, e *testInflightEnv, dur string, s
 	return o
 }
 
-// testF088OrdinaryCancelledOccupant seeds the ordinary occupant exactly as T17 does.
-func testF088OrdinaryCancelledOccupant(t *testing.T, clientID string, markerAbsent bool) *testF088CancelledOcc {
+// testOrdinaryCancelledOccupant seeds the ordinary occupant exactly as T17 does.
+func testOrdinaryCancelledOccupant(t *testing.T, clientID string, markerAbsent bool) *testCancelledOcc {
 	t.Helper()
 	e := testNewInflightEnv(t, clientID)
 	dur := e.sess.idHash + "_" + nuid.Next()
@@ -2087,7 +2087,7 @@ func testF088OrdinaryCancelledOccupant(t *testing.T, clientID string, markerAbse
 	e.sess.last_pi = 10
 	e.sess.mu.Unlock()
 	occ := e.landAdmission(t, 11, 1, dur, sseq, mqttNewInflightNonce())
-	return testF088CancelledOccupantOn(t, e, dur, sseq, 1, occ, markerAbsent)
+	return testCancelledOccupantOn(t, e, dur, sseq, 1, occ, markerAbsent)
 }
 
 // T22 (WP3 edit 7). A same-delivery occupant carrying an OCCUPANT cancellation whose marker is
@@ -2103,11 +2103,11 @@ func testF088OrdinaryCancelledOccupant(t *testing.T, clientID string, markerAbse
 //
 // Mutation M26 (the pre-classification probe removed): the classifier's cancelMarker stays at its
 // fail-closed zero value -> abandon, no register-only replacement lands -> fails.
-func TestF088MarkerlessCancelledOccupantIsReplacedRegisterOnly(t *testing.T) {
+func TestMarkerlessCancelledOccupantIsReplacedRegisterOnly(t *testing.T) {
 	t.Parallel()
 	t.Run("occupant", func(t *testing.T) {
 		t.Parallel()
-		o := testF088OrdinaryCancelledOccupant(t, "f088-t22", true)
+		o := testOrdinaryCancelledOccupant(t, "f088-t22", true)
 		e := o.e
 		var registerOnly atomic.Bool
 		var probesAtWrite atomic.Int32
@@ -2167,7 +2167,7 @@ func TestF088MarkerlessCancelledOccupantIsReplacedRegisterOnly(t *testing.T) {
 		e.sess.mu.Lock()
 		pi := e.sess.bumpPI()
 		e.sess.mu.Unlock()
-		fence, fseq := testF088WriteFence(t, e, pi, dur, 6, mqttNewInflightNonce())
+		fence, fseq := testWriteFence(t, e, pi, dur, 6, mqttNewInflightNonce())
 		nonce := mqttNewInflightNonce()
 		lin, _ := mqttLineageForWrite(mqttLineageWriteRegisterOnly, fence, nonce)
 		repl := &mqttInflightRecord{State: mqttInflightPublish, PI: pi, Dur: fence.Dur, Seq: fence.Seq, QoS: fence.QoS,
@@ -2189,9 +2189,9 @@ func TestF088MarkerlessCancelledOccupantIsReplacedRegisterOnly(t *testing.T) {
 // T22b (WP3 edit 7). The same cancelled occupant, but its marker cannot be read (every point read
 // of it fails): nothing is established, so the allocation ABANDONS with the identifier excluded,
 // and the occupant is neither reaped nor replaced.
-func TestF088CancelledOccupantMarkerIndeterminateAbandons(t *testing.T) {
+func TestCancelledOccupantMarkerIndeterminateAbandons(t *testing.T) {
 	t.Parallel()
-	o := testF088OrdinaryCancelledOccupant(t, "f088-t22b", false)
+	o := testOrdinaryCancelledOccupant(t, "f088-t22b", false)
 	e := o.e
 	markerSubject := o.subject + "." + mqttInflightMarkerSuffix
 	var anyReplacement atomic.Bool
@@ -2246,7 +2246,7 @@ func TestF088CancelledOccupantMarkerIndeterminateAbandons(t *testing.T) {
 //
 // INPUT, STATED: the affine occupant pair is seeded through the slot-only pair writer and its
 // cancellation written at the raw register boundary (no in-memory entry for it).
-func TestF088AffineCancelledOccupantMarkerBackedCleanup(t *testing.T) {
+func TestAffineCancelledOccupantMarkerBackedCleanup(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f088-t22c")
 	affDur := mqttQ2AffineConsumerDurablePrefix + e.sess.idHash + "_" + nuid.Next()[:6]
@@ -2263,7 +2263,7 @@ func TestF088AffineCancelledOccupantMarkerBackedCleanup(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.last_pi = 10
 	e.sess.mu.Unlock()
-	o := testF088CancelledOccupantOn(t, e, affDur, sseq, 2, occ, false)
+	o := testCancelledOccupantOn(t, e, affDur, sseq, 2, occ, false)
 	if !mqttDurIsSlotOnlyClass(o.occ.Dur) {
 		t.Fatalf("fixture: the occupant must be slot-only, got %+v", o.occ)
 	}
@@ -2312,7 +2312,7 @@ func TestF088AffineCancelledOccupantMarkerBackedCleanup(t *testing.T) {
 //
 // Mutation M12 (B's demand latch cleared by a Publish read): B never re-reads L after A lands, so
 // its charge waits for AckWait -> fails.
-func TestF097TakeoverFailedAdvanceReleasesOnThePeerWithoutTraffic(t *testing.T) {
+func TestTakeoverFailedAdvanceReleasesOnThePeerWithoutTraffic(t *testing.T) {
 	t.Parallel()
 	f := testLateAckTransmitted(t, "f097-t1", 1)
 	cur, _ := f.register(t)
@@ -2459,7 +2459,7 @@ func TestF097TakeoverFailedAdvanceReleasesOnThePeerWithoutTraffic(t *testing.T) 
 // Mutation M10 (combined: the terminal release ignores the token AND the advance builder's token
 // refusal removed): B's advance lands under the live token -> "Publish while the token stands"
 // fails.
-func TestF088LateAckWaitsForAnUncertifiedHoldersDrain(t *testing.T) {
+func TestLateAckWaitsForAnUncertifiedHoldersDrain(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f088-t10")
 	testReadyForRealPubRelDelivery(t, e)
@@ -2624,7 +2624,7 @@ func TestF088LateAckWaitsForAnUncertifiedHoldersDrain(t *testing.T) {
 //
 // Mutation M35 (the ACK handler or terminal attempt returns early while piSpaceIncomplete): p never
 // reaches Terminal -> fails.
-func TestF097BoundExchangeCompletesWhileAllocationStaysClosed(t *testing.T) {
+func TestBoundExchangeCompletesWhileAllocationStaysClosed(t *testing.T) {
 	t.Parallel()
 	pf := testWithdrawAdmitted(t, "f097-t26", 1)
 	qf := testWithdrawAdmitMore(t, pf.e, testRealPubRelSrcSeq+1, 1)
@@ -2634,7 +2634,7 @@ func TestF097BoundExchangeCompletesWhileAllocationStaysClosed(t *testing.T) {
 		t.Fatal("fixture: p must be transmitted (marker consumed) and q never sent (marker standing)")
 	}
 	var patched atomic.Bool
-	p := testF097ResumeOnPeer(t, pf, "node2-t26", testF097OpaqueMarkerSeam(t, qf.subject, &patched))
+	p := testResumeOnPeerBatched(t, pf, "node2-t26", testOpaqueMarkerSeam(t, qf.subject, &patched))
 	if !patched.Load() {
 		t.Fatal("witness: B's marker phase never read q's marker through the seam")
 	}
@@ -2697,10 +2697,10 @@ func TestF097BoundExchangeCompletesWhileAllocationStaysClosed(t *testing.T) {
 	}
 }
 
-// testF097OpaqueQOnPeer is T27's `opaque` state: q never sent, resumed cold on peer B as a
+// testOpaqueQOnPeer is T27's `opaque` state: q never sent, resumed cold on peer B as a
 // marker-opaque reservation (seam), the identifier space incomplete; the seam is then removed so
 // the NEXT resume reads the store as it stands.
-func testF097OpaqueQOnPeer(t *testing.T, clientID string, qos ...byte) (*testWithdrawFix, *testF088Peer) {
+func testOpaqueQOnPeer(t *testing.T, clientID string, qos ...byte) (*testWithdrawFix, *testPeer) {
 	t.Helper()
 	q := byte(1)
 	if len(qos) != 0 {
@@ -2708,7 +2708,7 @@ func testF097OpaqueQOnPeer(t *testing.T, clientID string, qos ...byte) (*testWit
 	}
 	f := testWithdrawAdmitted(t, clientID, q)
 	var patched atomic.Bool
-	p := testF097ResumeOnPeer(t, f, "node2-"+clientID, testF097OpaqueMarkerSeam(t, f.subject, &patched))
+	p := testResumeOnPeerBatched(t, f, "node2-"+clientID, testOpaqueMarkerSeam(t, f.subject, &patched))
 	p.sess.mu.Lock()
 	ent := p.sess.pendingPublish[f.pi]
 	incomplete := p.sess.piSpaceIncomplete
@@ -2728,9 +2728,9 @@ func testF097OpaqueQOnPeer(t *testing.T, clientID string, qos ...byte) (*testWit
 // object, as a CONNECT on B runs it - completes: it restores q ACTING, its retransmission carries
 // DUP=1, the client's PUBACK ends it (Terminal), piSpaceIncomplete is cleared by that recovery, and
 // a fresh delivery allocates.
-func TestF097NextCompleteResumeRetransmitsAMarkerAbsentRegister(t *testing.T) {
+func TestNextCompleteResumeRetransmitsAMarkerAbsentRegister(t *testing.T) {
 	t.Parallel()
-	f, p := testF097OpaqueQOnPeer(t, "f097-t28a")
+	f, p := testOpaqueQOnPeer(t, "f097-t28a")
 	ml := f.e.asm.jsa.loadOccupantMarkerLoad(f.subject)
 	if err := f.e.asm.deleteInflightMarker(mqttMarkerCallerSender, f.subject, ml.seq, true); err != nil {
 		t.Fatalf("fixture: consuming q's marker: %v", err)
@@ -2780,9 +2780,9 @@ func TestF097NextCompleteResumeRetransmitsAMarkerAbsentRegister(t *testing.T) {
 // B classifies q's source SRC/41 as gone, which is what makes the withdrawal happen; over a LIVE
 // source the same register is restored as an unsent acting entry instead, and the source's
 // re-offer sends it DUP=0. The row holds over a gone source, not unconditionally.
-func TestF097NextCompleteResumeWithdrawsAMarkerStandingRegister(t *testing.T) {
+func TestNextCompleteResumeWithdrawsAMarkerStandingRegister(t *testing.T) {
 	t.Parallel()
-	f, p := testF097OpaqueQOnPeer(t, "f097-t28b")
+	f, p := testOpaqueQOnPeer(t, "f097-t28b")
 	if !f.markerStands() {
 		t.Fatal("fixture: q's marker must stand")
 	}
@@ -2821,11 +2821,11 @@ func TestF097NextCompleteResumeWithdrawsAMarkerStandingRegister(t *testing.T) {
 	}
 }
 
-// testF097TerminalRetryFix is T30's construction: a transmitted ordinary exchange whose PUBACK is
+// testTerminalRetryFix is T30's construction: a transmitted ordinary exchange whose PUBACK is
 // accepted into the terminal-retry worker at acq == k because its first advance fails (seam); the
 // retry's register read is observed (the instance load seam, a passthrough) and the second
 // advance attempt is counted.
-type testF097TerminalRetryFix struct {
+type testTerminalRetryFix struct {
 	*testLateAckFix
 	k        uint64
 	advances atomic.Int32
@@ -2837,9 +2837,9 @@ type testF097TerminalRetryFix struct {
 	armed         atomic.Bool
 }
 
-func testF097AcceptedIntoRetry(t *testing.T, clientID string) *testF097TerminalRetryFix {
+func testAcceptedIntoRetry(t *testing.T, clientID string) *testTerminalRetryFix {
 	t.Helper()
-	r := &testF097TerminalRetryFix{testLateAckFix: testLateAckTransmitted(t, clientID, 1)}
+	r := &testTerminalRetryFix{testLateAckFix: testLateAckTransmitted(t, clientID, 1)}
 	cur, _ := r.register(t)
 	if cur == nil {
 		t.Fatal("fixture: the transmitted register must stand")
@@ -2887,7 +2887,7 @@ func testF097AcceptedIntoRetry(t *testing.T, clientID string) *testF097TerminalR
 
 // reconnect is the same-generation reconnect: a new tenure serves and a new connection is accepted
 // on the SAME session object (T20's construction).
-func (r *testF097TerminalRetryFix) reconnect(t *testing.T) *client {
+func (r *testTerminalRetryFix) reconnect(t *testing.T) *client {
 	t.Helper()
 	e := r.e
 	ent1, _ := e.c.outboundEntitlement()
@@ -2908,7 +2908,7 @@ func (r *testF097TerminalRetryFix) reconnect(t *testing.T) *client {
 	return c2
 }
 
-func (r *testF097TerminalRetryFix) readAcqs() []uint64 {
+func (r *testTerminalRetryFix) readAcqs() []uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]uint64(nil), r.reads...)
@@ -2918,9 +2918,9 @@ func (r *testF097TerminalRetryFix) readAcqs() []uint64 {
 // the client reconnects to the same session object (same generation, new tenure) before the
 // retry; no new acquisition happens in between (the retry's own read finds Acq == k); the retry
 // completes the SAME acquisition (Terminal).
-func TestF097AcceptedAckCompletesTheSameAcquisitionAcrossReconnect(t *testing.T) {
+func TestAcceptedAckCompletesTheSameAcquisitionAcrossReconnect(t *testing.T) {
 	t.Parallel()
-	r := testF097AcceptedIntoRetry(t, "f097-t30a")
+	r := testAcceptedIntoRetry(t, "f097-t30a")
 	r.reconnect(t)
 	r.armed.Store(true)
 	testDriverWait(t, "the retry completes the acknowledged exchange", 10*time.Second, func() bool {
@@ -2949,10 +2949,10 @@ func TestF097AcceptedAckCompletesTheSameAcquisitionAcrossReconnect(t *testing.T)
 //
 // Mutation M36 (the retry re-reads acq from the register instead of the captured ref): `drained`
 // terminalizes the successor -> fails.
-func TestF097AcceptedAckDoesNotTerminalizeASuccessor(t *testing.T) {
+func TestAcceptedAckDoesNotTerminalizeASuccessor(t *testing.T) {
 	t.Parallel()
 	run := func(t *testing.T, clientID string, drained bool) {
-		r := testF097AcceptedIntoRetry(t, clientID)
+		r := testAcceptedIntoRetry(t, clientID)
 		r.reconnect(t)
 		cur, seq := r.register(t)
 		succ := *cur
@@ -3002,19 +3002,19 @@ func TestF097AcceptedAckDoesNotTerminalizeASuccessor(t *testing.T) {
 	t.Run("drained", func(t *testing.T) { t.Parallel(); run(t, "f097-t30b-drained", true) })
 }
 
-// testF097ResolverSeen is one firing of the resolver's AckRoute publish-arm decision hook, tagged
+// testResolverSeen is one firing of the resolver's AckRoute publish-arm decision hook, tagged
 // by caller context: FOREGROUND inside the client's PUBREC handler, WORKER otherwise (the intent
 // resolution worker's attempt, which runs on its own timer after the handler returned).
-type testF097ResolverSeen struct {
+type testResolverSeen struct {
 	worker             bool
 	curAcq, bindingAcq uint64
 }
 
-// testF097QoS2AckRoute is T29's base: a TRANSMITTED QoS 2 exchange untracked UNANSWERED by the
+// testQoS2AckRoute is T29's base: a TRANSMITTED QoS 2 exchange untracked UNANSWERED by the
 // drain-owned deny (T4's base), its AckRoute standing; A records its wire, and the decision hook
 // (package-level: the caller is not parallel) and a register-read seam (instance) are installed.
 // The seam fails the first failReads reads of the register after arm(), then reads through.
-type testF097QoS2AckRoute struct {
+type testQoS2AckRoute struct {
 	*testLateAckFix
 	b          *mqttAllocationAckBinding
 	wire       *testFrameConn
@@ -3024,10 +3024,10 @@ type testF097QoS2AckRoute struct {
 	reads      atomic.Int32
 	failed     atomic.Int32
 	mu         sync.Mutex
-	seen       []testF097ResolverSeen
+	seen       []testResolverSeen
 }
 
-func testF097QoS2AckRouteFix(t *testing.T, clientID string, failReads int32) *testF097QoS2AckRoute {
+func testQoS2AckRouteFix(t *testing.T, clientID string, failReads int32) *testQoS2AckRoute {
 	t.Helper()
 	f := testLateAckTransmitted(t, clientID, 2)
 	f.untrackByDeny(t)
@@ -3035,14 +3035,14 @@ func testF097QoS2AckRouteFix(t *testing.T, clientID string, failReads int32) *te
 	if b == nil || b.role != mqttAckRoleAckRoute || b.qos != 2 {
 		t.Fatalf("fixture: a QoS 2 AckRoute must stand, got %+v", b)
 	}
-	r := &testF097QoS2AckRoute{testLateAckFix: f, b: b, failReads: failReads}
+	r := &testQoS2AckRoute{testLateAckFix: f, b: b, failReads: failReads}
 	r.wire = testRow2Wire(f.e)
 	mqttTestResolverAckRoutePublish.Set(func(alloc string, curAcq, bindingAcq uint64) {
 		if alloc != b.nonce {
 			return
 		}
 		r.mu.Lock()
-		r.seen = append(r.seen, testF097ResolverSeen{worker: !r.foreground.Load(), curAcq: curAcq, bindingAcq: bindingAcq})
+		r.seen = append(r.seen, testResolverSeen{worker: !r.foreground.Load(), curAcq: curAcq, bindingAcq: bindingAcq})
 		r.mu.Unlock()
 	})
 	t.Cleanup(func() { mqttTestResolverAckRoutePublish.Set(nil) })
@@ -3060,13 +3060,13 @@ func testF097QoS2AckRouteFix(t *testing.T, clientID string, failReads int32) *te
 	return r
 }
 
-func (r *testF097QoS2AckRoute) decisions() []testF097ResolverSeen {
+func (r *testQoS2AckRoute) decisions() []testResolverSeen {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]testF097ResolverSeen(nil), r.seen...)
+	return append([]testResolverSeen(nil), r.seen...)
 }
 
-func (r *testF097QoS2AckRoute) intentOwed() bool {
+func (r *testQoS2AckRoute) intentOwed() bool {
 	s := r.e.s
 	s.owedIntentsMu.Lock()
 	defer s.owedIntentsMu.Unlock()
@@ -3079,7 +3079,7 @@ func (r *testF097QoS2AckRoute) intentOwed() bool {
 }
 
 // pubRec is the client's PUBREC, on the session's connection, as the FOREGROUND.
-func (r *testF097QoS2AckRoute) pubRec(t *testing.T, reason byte) {
+func (r *testQoS2AckRoute) pubRec(t *testing.T, reason byte) {
 	t.Helper()
 	r.armed.Store(true)
 	r.foreground.Store(true)
@@ -3090,7 +3090,7 @@ func (r *testF097QoS2AckRoute) pubRec(t *testing.T, reason byte) {
 	}
 }
 
-func (r *testF097QoS2AckRoute) wrote(frame []byte) bool {
+func (r *testQoS2AckRoute) wrote(frame []byte) bool {
 	r.e.c.mu.Lock()
 	defer r.e.c.mu.Unlock()
 	return strings.Contains(string(r.wire.written), string(frame))
@@ -3124,9 +3124,9 @@ func (r *testF097QoS2AckRoute) wrote(frame []byte) bool {
 // exchange Rejected; M37 (the publish arm keeps HEAD's Unresolved for an AckRoute) never emits
 // the PUBREL; M38 (StillOwed without the acquisition comparison) advances the old PUBREC over
 // the successor.
-func TestF097QoS2ResidualByPhase(t *testing.T) {
+func TestQoS2ResidualByPhase(t *testing.T) {
 	t.Run("pubrec-ackroute", func(t *testing.T) {
-		r := testF097QoS2AckRouteFix(t, "f097-t29-ackroute", 2)
+		r := testQoS2AckRouteFix(t, "f097-t29-ackroute", 2)
 		r.pubRec(t, mqttReasonSuccess)
 		if n := r.failed.Load(); n != 2 {
 			t.Fatalf("witness: both foreground reads of the register must fail, %d did", n)
@@ -3190,7 +3190,7 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 	// resolver hit (the handler's binding branch read p's register) and the target is that the
 	// exchange records the PUBREC instead of ending.
 	t.Run("pubrec-ackroute-foreground", func(t *testing.T) {
-		r := testF097QoS2AckRouteFix(t, "f097-t29-foreground", 0)
+		r := testQoS2AckRouteFix(t, "f097-t29-foreground", 0)
 		r.pubRec(t, mqttReasonSuccess)
 		if r.reads.Load() == 0 {
 			t.Fatal("witness: the AckRoute resolver hit must act on p's register (no read of it after the PUBREC)")
@@ -3211,7 +3211,7 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 		})
 	})
 	t.Run("pubrec-ackroute-successor", func(t *testing.T) {
-		r := testF097QoS2AckRouteFix(t, "f097-t29-successor", 2)
+		r := testQoS2AckRouteFix(t, "f097-t29-successor", 2)
 		k := r.b.acq
 		r.pubRec(t, mqttReasonSuccess)
 		if n := r.failed.Load(); n != 2 || !r.intentOwed() {
@@ -3248,7 +3248,7 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 		}
 	})
 	t.Run("refused-pubrec", func(t *testing.T) {
-		r := testF097QoS2AckRouteFix(t, "f097-t29-refused", 0)
+		r := testQoS2AckRouteFix(t, "f097-t29-refused", 0)
 		r.pubRec(t, 0x80)
 		testCustodyEventually(t, "the refused PUBREC ends the exchange Rejected", func() bool {
 			x := r.exchange(t)
@@ -3307,7 +3307,7 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 		}
 	})
 	t.Run("awaiting-pubrec-opaque", func(t *testing.T) {
-		f, p := testF097OpaqueQOnPeer(t, "f097-t29-pubrec-opaque", 2)
+		f, p := testOpaqueQOnPeer(t, "f097-t29-pubrec-opaque", 2)
 		ent := p.entry(f.pi)
 		_, seqBefore := f.register(t)
 		if err := p.c.mqttProcessPubRec(f.pi, mqttReasonSuccess); err != nil {
@@ -3332,14 +3332,14 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 		if e := p.entry(f.pi); e == nil || !e.acts() || !e.transmitted {
 			t.Fatalf("the next complete resume must restore q ACTING and transmitted, got %+v", e)
 		}
-		pe, wire := testF097PeerPubRelEnv(t, p)
+		pe, wire := testPeerPubRelEnv(t, p)
 		if tok := pe.transmit(t, f.pi, testRealPubRelSrcDur, f.sseq, true); !tok.dup {
 			t.Fatalf("q's retransmission must carry DUP=1, got %+v", tok)
 		}
 		if err := p.c.mqttProcessPubRec(f.pi, mqttReasonSuccess); err != nil {
 			t.Fatalf("PUBREC on B: %v", err)
 		}
-		testF097PeerPubRelThroughPubComp(t, f, p, pe, wire)
+		testPeerPubRelThroughPubComp(t, f, p, pe, wire)
 	})
 	t.Run("awaiting-pubcomp-opaque", func(t *testing.T) {
 		f := testLateAckTransmitted(t, "f097-t29-pubcomp-opaque", 2)
@@ -3372,7 +3372,7 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 		// ordinary exchange is not. The residual property is asserted on the cold construction:
 		// PUBCOMP is DECLINED while the reservation stands, and the next complete resume serves it.
 		var patched atomic.Bool
-		p := testF097ResumeOnPeer(t, f.testWithdrawFix, "node2-t29-pubcomp-opaque",
+		p := testResumeOnPeerBatched(t, f.testWithdrawFix, "node2-t29-pubcomp-opaque",
 			func(asm *mqttAccountSessionManager) func([]string) ([]*JSApiMsgGetResponse, error) {
 				return func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 					resps, err := asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
@@ -3421,15 +3421,15 @@ func TestF097QoS2ResidualByPhase(t *testing.T) {
 		if incomplete {
 			t.Fatal("the next resume must complete")
 		}
-		pe, wire := testF097PeerPubRelEnv(t, p)
-		testF097PeerPubRelThroughPubComp(t, f.testWithdrawFix, p, pe, wire)
+		pe, wire := testPeerPubRelEnv(t, p)
+		testPeerPubRelThroughPubComp(t, f.testWithdrawFix, p, pe, wire)
 	})
 }
 
-// testF097PeerPubRelEnv makes peer B's connection able to emit a PUBREL and records its wire (T6's
+// testPeerPubRelEnv makes peer B's connection able to emit a PUBREL and records its wire (T6's
 // `completed` construction: an output identity, the accepted record, the PUBREL consumer, no
 // delivery subscription - the PUBREL is delivered by hand).
-func testF097PeerPubRelEnv(t *testing.T, p *testF088Peer) (*testInflightEnv, *testFrameConn) {
+func testPeerPubRelEnv(t *testing.T, p *testPeer) (*testInflightEnv, *testFrameConn) {
 	t.Helper()
 	pe := &testInflightEnv{s: p.c.srv, asm: p.asm, sess: p.sess, c: p.c}
 	if p.c.cid == 0 {
@@ -3443,9 +3443,9 @@ func testF097PeerPubRelEnv(t *testing.T, p *testF088Peer) (*testInflightEnv, *te
 	return pe, testRow2Wire(pe)
 }
 
-// testF097PeerPubRelThroughPubComp waits for B's canonical PUBREL, delivers it by hand, requires
+// testPeerPubRelThroughPubComp waits for B's canonical PUBREL, delivers it by hand, requires
 // the PUBREL (and no PUBLISH) on B's wire, then the client's PUBCOMP ends the exchange Terminal.
-func testF097PeerPubRelThroughPubComp(t *testing.T, f *testWithdrawFix, p *testF088Peer, pe *testInflightEnv, wire *testFrameConn) {
+func testPeerPubRelThroughPubComp(t *testing.T, f *testWithdrawFix, p *testPeer, pe *testInflightEnv, wire *testFrameConn) {
 	t.Helper()
 	var rec *mqttInflightRecord
 	testCustodyEventually(t, "the canonical PUBREL stands", func() bool {
@@ -3486,23 +3486,23 @@ func testF097PeerPubRelThroughPubComp(t *testing.T, f *testWithdrawFix, p *testF
 // End to end: a real server and real MQTT 5 clients
 // ---------------------------------------------------------------------------
 
-// testF097Pkt is one packet a client read, parsed far enough for these tests.
-type testF097Pkt struct {
+// testPkt is one packet a client read, parsed far enough for these tests.
+type testPkt struct {
 	ptype, flags byte
 	pi           uint16
 	topic        string
 	payload      string
 }
 
-// testF097ReadPkt reads ONE packet within timeout (ok false on a timeout), consuming it whole.
-func testF097ReadPkt(t *testing.T, r *mqttReader, timeout time.Duration) (testF097Pkt, bool) {
+// testReadPkt reads ONE packet within timeout (ok false on a timeout), consuming it whole.
+func testReadPkt(t *testing.T, r *mqttReader, timeout time.Duration) (testPkt, bool) {
 	t.Helper()
 	b, pl, ok := testMQTTReadPacketReady(r, timeout)
 	if !ok {
-		return testF097Pkt{}, false
+		return testPkt{}, false
 	}
 	start := r.pos
-	p := testF097Pkt{ptype: b & mqttPacketMask, flags: b & mqttPacketFlagMask}
+	p := testPkt{ptype: b & mqttPacketMask, flags: b & mqttPacketFlagMask}
 	switch p.ptype {
 	case mqttPacketPub:
 		topic, err := r.readBytes("topic", false)
@@ -3540,7 +3540,7 @@ func testF097ReadPkt(t *testing.T, r *mqttReader, timeout time.Duration) (testF0
 //
 // Environment: a real server and real MQTT 5 clients. NOT claimed to reach the admission's
 // different-source arm (T3b is that boundary's test).
-func TestF097LostPubRecSourceExpiryNeverReusesTheIdentifier(t *testing.T) {
+func TestLostPubRecSourceExpiryNeverReusesTheIdentifier(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 500 * time.Millisecond
@@ -3560,7 +3560,7 @@ func TestF097LostPubRecSourceExpiryNeverReusesTheIdentifier(t *testing.T) {
 	testMQTTReadConnAckV5(t, rp)
 	testMQTTPubV5Props(t, cp, rp, 2, false, 1, topic, []byte("first"), mqttV5PropsWithExpiry(1))
 
-	first, ok := testF097ReadPkt(t, rs, 5*time.Second)
+	first, ok := testReadPkt(t, rs, 5*time.Second)
 	if !ok || first.ptype != mqttPacketPub || first.payload != "first" || mqttGetQoS(first.flags) != 2 {
 		t.Fatalf("the subscriber must receive the first message at QoS 2, got %+v (ok %v)", first, ok)
 	}
@@ -3577,10 +3577,10 @@ func TestF097LostPubRecSourceExpiryNeverReusesTheIdentifier(t *testing.T) {
 	}
 
 	testMQTTPubV5Props(t, cp, rp, 1, false, 2, topic, []byte("second"), nil)
-	var second testF097Pkt
+	var second testPkt
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		pkt, ok := testF097ReadPkt(t, rs, time.Until(deadline))
+		pkt, ok := testReadPkt(t, rs, time.Until(deadline))
 		if !ok {
 			t.Fatal("the second message was never delivered")
 		}
@@ -3608,7 +3608,7 @@ func TestF097LostPubRecSourceExpiryNeverReusesTheIdentifier(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubRec, t, cs, p)
 	deadline = time.Now().Add(10 * time.Second)
 	for {
-		pkt, ok := testF097ReadPkt(t, rs, time.Until(deadline))
+		pkt, ok := testReadPkt(t, rs, time.Until(deadline))
 		if !ok {
 			t.Fatalf("no PUBREL answered the late PUBREC for %d", p)
 		}
@@ -3649,7 +3649,7 @@ func TestF097LostPubRecSourceExpiryNeverReusesTheIdentifier(t *testing.T) {
 // message is withheld (allocation closed: the stated residual, recorded, not a defect); no
 // DISCONNECT and the connection answers PINGREQ. Not compared against a HEAD build in this run:
 // the behaviour is recorded as observed.
-func TestF097NoNewDisconnectOrQoS0Degradation(t *testing.T) {
+func TestNoNewDisconnectOrQoS0Degradation(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	o.MQTT.AckWait = 500 * time.Millisecond
@@ -3673,7 +3673,7 @@ func TestF097NoNewDisconnectOrQoS0Degradation(t *testing.T) {
 	testMQTTPubV5Props(t, cp, rp, 1, false, 2, q1, []byte("b"), nil)
 	pis := map[string]uint16{}
 	for len(pis) < 2 {
-		pkt, ok := testF097ReadPkt(t, rs, 5*time.Second)
+		pkt, ok := testReadPkt(t, rs, 5*time.Second)
 		if !ok || pkt.ptype != mqttPacketPub {
 			t.Fatalf("the subscriber must receive both QoS 1 messages, got %+v (ok %v)", pkt, ok)
 		}
@@ -3752,7 +3752,7 @@ func TestF097NoNewDisconnectOrQoS0Degradation(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && !done() {
-		pkt, ok := testF097ReadPkt(t, rs, time.Until(deadline))
+		pkt, ok := testReadPkt(t, rs, time.Until(deadline))
 		if !ok {
 			break
 		}
@@ -3792,7 +3792,7 @@ func TestF097NoNewDisconnectOrQoS0Degradation(t *testing.T) {
 	if _, err := testMQTTWrite(cs, []byte{mqttPacketPing, 0}); err != nil {
 		t.Fatalf("PINGREQ: %v", err)
 	}
-	pkt, ok := testF097ReadPkt(t, rs, 2*time.Second)
+	pkt, ok := testReadPkt(t, rs, 2*time.Second)
 	if !ok || pkt.ptype != mqttPacketPingResp {
 		t.Fatalf("the connection must stay open and answer PINGREQ, got %+v (ok %v)", pkt, ok)
 	}

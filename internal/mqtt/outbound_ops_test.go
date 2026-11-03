@@ -19,10 +19,10 @@ import (
 	"testing"
 )
 
-// testF105GenInvented is a well-formed generation no authority in these fixtures stands at.
+// testGenInvented is a well-formed generation no authority in these fixtures stands at.
 // A LIE the operations must overwrite has to be well-formed, or the intent validator refuses
 // it and the derivation is never reached.
-const testF105GenInvented = "0123456789abcdefghijkZ"
+const testGenInvented = "0123456789abcdefghijkZ"
 
 // The OPERATION SURFACE, against the store.
 //
@@ -32,20 +32,20 @@ const testF105GenInvented = "0123456789abcdefghijkZ"
 // what the caller does NOT get to say: no authority body, no predecessor, no closure, no
 // member of its own.
 
-// TestF105OperationsCarryOneObligationEndToEnd walks a whole obligation through the surface
+// TestOperationsCarryOneObligationEndToEnd walks a whole obligation through the surface
 // and nothing else: claim, finalize, admit, advance, release, authorize, complete.
 //
 // If any step needed a hand-composed transition the surface would be incomplete, and the
 // first converted caller would reach for the transition struct — which is the escape hatch
 // this shape exists to remove.
-func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ops-endtoend")
+func TestOperationsCarryOneObligationEndToEnd(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ops-endtoend")
 	defer done()
 
 	jsa := &e.asm.jsa
 
 	// (1) CLAIM. A reservation serves nothing yet.
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-claim", testF105Gen, "tenure-1", "intent-1"); err != nil {
+	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-claim", testGen, "tenure-1", "intent-1"); err != nil {
 		t.Fatalf("claiming the client was refused: %v", err)
 	}
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -56,7 +56,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	// the operation refuses before composing anything.
 	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-early", Op: "op-early",
-		Gen: testF105Gen, Tenure: "tenure-1",
+		Gen: testGen, Tenure: "tenure-1",
 		Register: freshRegisterLineage(&mqttInflightRecord{
 			State: mqttInflightPublish, PI: 5, Dur: "$MQTT_src", Seq: 1, QoS: 2,
 			Nonce: mqttNewInflightNonce(),
@@ -81,7 +81,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	// The fixture plants nothing: a lifecycle test that wrote the resource itself would be
 	// demonstrating a surface that cannot actually carry one.
 	if _, err := jsa.opProvisionResource(e.id, e.epoch, "txn-prov", "op-prov",
-		testF105Gen, "tenure-1", "inc-src", "$MQTT_src", mqttResourceSourceConsumer); err != nil {
+		testGen, "tenure-1", "inc-src", "$MQTT_src", mqttResourceSourceConsumer); err != nil {
 		t.Fatalf("provisioning the backing resource was refused: %v", err)
 	}
 	reg := freshRegisterLineage(&mqttInflightRecord{
@@ -90,7 +90,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	})
 	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-adm", Op: "op-adm",
-		Gen: testF105Gen, Tenure: "tenure-1",
+		Gen: testGen, Tenure: "tenure-1",
 		Register: reg, Deps: []mqttAdmitDependency{
 			{Inc: "inc-src", Role: mqttRoleSourceReplay},
 		},
@@ -99,14 +99,14 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	}
 	// THE EXCHANGE WAS DERIVED, not supplied: its identity is the register's lineage, its
 	// allocation and QoS the register's, and its tenure the authority's.
-	x, _, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, reg.Lin)
+	x, _, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testGen, reg.Lin)
 	if xerr != nil {
 		t.Fatalf("the admitted exchange does not load back: %v", xerr)
 	}
 	if x.PI != 7 || x.QoS != 2 || x.Phase != mqttExchangePublish || x.AdmitTxn != "txn-adm" {
 		t.Fatalf("the derived exchange is %+v", x)
 	}
-	res, _, rerr := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src")
+	res, _, rerr := jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-src")
 	if rerr != nil {
 		t.Fatalf("the resource does not load back: %v", rerr)
 	}
@@ -116,7 +116,7 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 
 	// While the obligation stands, its hold refuses the authorization.
 	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-early-auth", "op-auth",
-		testF105Gen, "inc-src"); err == nil {
+		testGen, "inc-src"); err == nil {
 		t.Fatalf("a deletion was authorized while an obligation still named the resource")
 	}
 
@@ -125,22 +125,22 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	for _, to := range []mqttExchangePhase{
 		mqttExchangePubRecObserved, mqttExchangeTerminal,
 	} {
-		if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, reg.Lin, to); err != nil {
+		if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, reg.Lin, to); err != nil {
 			t.Fatalf("advancing to %d was refused: %v", to, err)
 		}
 	}
 
 	// (5) THE RELEASE-HOLDS BATCH RELEASES THE OWED HOLD, so nothing names the resource; and no
 	// other release door exists for it. Then (6) AUTHORIZE, (7) COMPLETE.
-	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src"); res == nil || len(res.Deps) != 1 {
+	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-src"); res == nil || len(res.Deps) != 1 {
 		t.Fatalf("the terminal advance did not leave its hold owed: %+v", res)
 	}
 	testReleaseOwed(t, e, reg.Lin)
-	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src"); res == nil || len(res.Deps) != 0 {
+	if res, _, _ := jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-src"); res == nil || len(res.Deps) != 0 {
 		t.Fatalf("the release did not release the owed hold: %+v", res)
 	}
 	if _, err := jsa.opReleaseDependency(e.id, e.epoch, "txn-rel", "op-rel",
-		testF105Gen, "inc-src", mqttResourceEdge{
+		testGen, "inc-src", mqttResourceEdge{
 			Nonce: reg.Lin, Role: mqttRoleSourceReplay,
 		}); err == nil {
 		t.Fatalf("a hold was released again after the ending had released it")
@@ -149,33 +149,33 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	// says nothing yet about whether the durable exists; the authorization below requires that
 	// settled, and this is the act that settles it.
 	if _, err := jsa.opSealProvisioning(e.id, e.epoch, "txn-seal", "op-seal",
-		testF105Gen, "inc-src"); err != nil {
+		testGen, "inc-src"); err != nil {
 		t.Fatalf("sealing the provisioning was refused: %v", err)
 	}
-	if err := testF105CompleteCleanup(t, e, testF105Gen, "inc-src", "txn-early-done",
+	if err := testCompleteCleanup(t, e, testGen, "inc-src", "txn-early-done",
 		mqttCleanupRemoved); err == nil {
 		t.Fatalf("a cleanup was completed that nothing had authorized")
 	}
 	// A served consumer is not authorizable until a route disposes of it (issue #107 7c-lc).
 	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-serving", "op-auth",
-		testF105Gen, "inc-src"); err == nil {
+		testGen, "inc-src"); err == nil {
 		t.Fatalf("a consumer no route disposed of was authorized")
 	}
 	if _, err := jsa.opRequestDisposal(&mqttRequestDisposalRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testF105Gen, Inc: "inc-src",
-		Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testF105Gen, Tenure: "tenure-1"},
+		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testGen, Inc: "inc-src",
+		Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testGen, Tenure: "tenure-1"},
 	}); err != nil {
 		t.Fatalf("disposing of the consumer was refused: %v", err)
 	}
 	if _, err := jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-auth",
-		testF105Gen, "inc-src"); err != nil {
+		testGen, "inc-src"); err != nil {
 		t.Fatalf("authorizing the deletion was refused: %v", err)
 	}
-	if err := testF105CompleteCleanup(t, e, testF105Gen, "inc-src", "txn-done",
+	if err := testCompleteCleanup(t, e, testGen, "inc-src", "txn-done",
 		mqttCleanupRemoved); err != nil {
 		t.Fatalf("completing the cleanup was refused: %v", err)
 	}
-	fin, _, ferr := jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-src")
+	fin, _, ferr := jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-src")
 	if ferr != nil {
 		t.Fatalf("the cleaned-up resource does not load back: %v", ferr)
 	}
@@ -188,14 +188,14 @@ func TestF105OperationsCarryOneObligationEndToEnd(t *testing.T) {
 	}
 }
 
-// TestF105OperationsReadTheAuthorityTheyActUnder pins the property the whole surface exists
+// TestOperationsReadTheAuthorityTheyActUnder pins the property the whole surface exists
 // for: no operation takes the authority, the predecessor or its sequence from its caller.
 //
 // Each case moves the standing authority to a state the operation may not act under, WITHOUT
 // telling the operation, and the operation must refuse. A surface that took a caller-supplied
 // predecessor would act on the stale one it was handed.
-func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ops-reads")
+func TestOperationsReadTheAuthorityTheyActUnder(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ops-reads")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -204,7 +204,7 @@ func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
 	// ABSENCE of a licence, never a fallback that admits work anyway.
 	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-none", Op: "op-none",
-		Gen: testF105Gen, Tenure: "tenure-txn-1",
+		Gen: testGen, Tenure: "tenure-txn-1",
 		Register: freshRegisterLineage(&mqttInflightRecord{
 			State: mqttInflightPublish, PI: 3, Dur: "$MQTT_src", Seq: 1, QoS: 2,
 			Nonce: mqttNewInflightNonce(),
@@ -212,10 +212,10 @@ func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("a publish was admitted for a client with no authority")
 	}
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
 		t.Fatalf("an exchange advanced under no authority")
 	}
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-none-close", testF105Gen, "tenure-1", "txn-1"); err == nil {
+	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-none-close", testGen, "tenure-1", "txn-1"); err == nil {
 		t.Fatalf("a generation was closed for a client with no authority")
 	}
 
@@ -223,7 +223,7 @@ func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
 
 	// A SECOND CLAIM over a SERVING authority is refused — the operation loads it, so a
 	// caller cannot claim by describing the client as free.
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-second", testF105Gen2,
+	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-second", testGen2,
 		"tenure-2", "intent-2"); err == nil {
 		t.Fatalf("a second claim displaced a serving authority")
 	}
@@ -234,11 +234,11 @@ func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
 	// what it read, because a handoff proposing a predecessor that is not there would
 	// finalize over a tenure nobody displaced.
 	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep", &mqttHandoffIntent{
-		ID: "intent-h", Tenure: "tenure-next", Gen: testF105Gen2,
-		PrevGen: testF105GenInvented, PrevTenure: "tenure-invented", PrevOwnerTxn: "txn-invented",
+		ID: "intent-h", Tenure: "tenure-next", Gen: testGen2,
+		PrevGen: testGenInvented, PrevTenure: "tenure-invented", PrevOwnerTxn: "txn-invented",
 		PrevSessWID: "wid-0", PrevSessSeq: 12, CleanReq: true,
 		Retire: &mqttRetirementRequest{
-			Gen: testF105GenInvented, Tenure: "tenure-invented", OwnerTxn: "txn-invented",
+			Gen: testGenInvented, Tenure: "tenure-invented", OwnerTxn: "txn-invented",
 			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
 		},
 	}); err != nil {
@@ -309,25 +309,25 @@ func TestF105OperationsReadTheAuthorityTheyActUnder(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("a publish was admitted over a closed authority")
 	}
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", testF105Gen,
+	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", testGen,
 		"tenure-again", "intent-again"); err == nil {
 		t.Fatalf("a post-closure claim reused the closed generation")
 	}
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", testF105Gen2,
+	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", testGen2,
 		"tenure-again", "intent-again"); err != nil {
 		t.Fatalf("a post-closure claim of a fresh generation was refused: %v", err)
 	}
 }
 
-// TestF105OperationsRefuseAnUnreadableAuthority pins the reading that must never be treated
+// TestOperationsRefuseAnUnreadableAuthority pins the reading that must never be treated
 // as absence.
 //
 // A record this broker cannot decode is not a record that is not there. If an operation read
 // CORRUPT as ABSENT, the first claim would succeed against a live owner's unreadable
 // authority — which is release-on-absence, reached through the loader instead of through a
 // caller.
-func TestF105OperationsRefuseAnUnreadableAuthority(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ops-corrupt")
+func TestOperationsRefuseAnUnreadableAuthority(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ops-corrupt")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -340,19 +340,19 @@ func TestF105OperationsRefuseAnUnreadableAuthority(t *testing.T) {
 		t.Fatalf("the planted authority reads %v, want CORRUPT", load.status)
 	}
 
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-claim", testF105Gen,
+	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-claim", testGen,
 		"tenure-1", "intent-1"); err == nil {
 		t.Fatalf("a client whose authority could not be read was claimed as if it were free")
 	}
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close", testF105Gen, "tenure-1", "txn-1"); err == nil {
+	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close", testGen, "tenure-1", "txn-1"); err == nil {
 		t.Fatalf("a generation was closed over an authority nothing could read")
 	}
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
 		t.Fatalf("an exchange advanced under an authority nothing could read")
 	}
 	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
 		ID: e.id, Epoch: e.epoch, Txn: "txn-adm", Op: "op-adm",
-		Gen: testF105Gen, Tenure: "tenure-1",
+		Gen: testGen, Tenure: "tenure-1",
 		Register: freshRegisterLineage(&mqttInflightRecord{
 			State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 1, QoS: 2,
 			Nonce: mqttNewInflightNonce(),

@@ -91,7 +91,7 @@ func mqttValidateObligationSource(s *mqttObligationSource) error {
 			return fmt.Errorf("an ordinary source names stream %q and durable %q: a delivery "+
 				"comes from a consumer on a stream", s.Stream, s.Dur)
 		}
-		if !mqttF105IdentTk(s.Inc) {
+		if !mqttOutboundIdentTk(s.Inc) {
 			return fmt.Errorf("an ordinary source names durable %q with incarnation %q: a "+
 				"consumer name can be recreated, so coordinates alone do not distinguish the "+
 				"source this obligation was delivered from", s.Dur, s.Inc)
@@ -106,7 +106,7 @@ func mqttValidateObligationSource(s *mqttObligationSource) error {
 				s.Payload, s.Digest)
 		}
 	case mqttSourceRetained:
-		if !mqttF105IdentTk(s.Payload) {
+		if !mqttOutboundIdentTk(s.Payload) {
 			return fmt.Errorf("a retained source names payload %q, which is not a material "+
 				"identity", s.Payload)
 		}
@@ -181,7 +181,7 @@ func mqttValidateCanonicalRef(r *mqttCanonicalRef) error {
 		// THE IDENTITY IS NOT OPTIONAL. A subject alone locates an ADDRESS, and this mechanism
 		// has been bitten before by treating an address as an identity — a record read back
 		// from a rewritten subject is a different record, and only the identity says so.
-		if !mqttF105IdentTk(r.Identity) {
+		if !mqttOutboundIdentTk(r.Identity) {
 			return fmt.Errorf("an in-flight canonical reference carries identity %q: a subject "+
 				"locates an address and only the identity says the record there is the one "+
 				"this exchange means", r.Identity)

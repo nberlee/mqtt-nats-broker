@@ -706,7 +706,7 @@ CHECK:
 	// after it.
 	//
 	// registerDisposalPhases is the ONLY writer of connWillPhase and connTail (a source guard,
-	// TestF105DisposalPhasesOnlyAppend, holds that): each registration runs after the ones
+	// TestDisposalPhasesOnlyAppend, holds that): each registration runs after the ones
 	// before it, so no later disposal can drop an earlier one's Will or close.
 	registerDisposalPhases := func(will, tail func()) {
 		prevWill := connWillPhase

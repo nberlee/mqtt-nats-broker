@@ -40,12 +40,12 @@ func testFrame(first byte, body ...byte) []byte {
 	return append(out, body...)
 }
 
-// TestF105TheActionlessPathRefusesWhatCarriesAnObligation is §7.1's other half.
+// TestTheActionlessPathRefusesWhatCarriesAnObligation is §7.1's other half.
 //
 // Guarding only the AUTHORIZED path leaves a way to the socket that never touches it. This path
 // therefore refuses by what the BYTES ARE — not by a caller-supplied label, of which there is
 // deliberately none.
-func TestF105TheActionlessPathRefusesWhatCarriesAnObligation(t *testing.T) {
+func TestTheActionlessPathRefusesWhatCarriesAnObligation(t *testing.T) {
 	// THE POSITIVE CONTROLS. Without these a validator that refused everything would satisfy
 	// every refusal below.
 	for name, f := range map[string][]byte{
@@ -78,13 +78,13 @@ func TestF105TheActionlessPathRefusesWhatCarriesAnObligation(t *testing.T) {
 	}
 }
 
-// TestF105TheActionlessPathRefusesATrailingPacket is the bypass a first-byte check cannot catch,
+// TestTheActionlessPathRefusesATrailingPacket is the bypass a first-byte check cannot catch,
 // and the one that defeated an earlier design of this boundary.
 //
 // A valid control packet followed by a QoS 1/2 PUBLISH in the SAME buffer passes every check
 // that looks only at the front: the first byte is a PINGRESP, and the PUBLISH behind it reaches
 // the socket having consumed no action at all.
-func TestF105TheActionlessPathRefusesATrailingPacket(t *testing.T) {
+func TestTheActionlessPathRefusesATrailingPacket(t *testing.T) {
 	ping := testFrame(mqttPacketPingResp)
 	pub := testFrame(mqttPacketPub|0x04, 0, 1, 'a', 0, 7)
 
@@ -108,12 +108,12 @@ func TestF105TheActionlessPathRefusesATrailingPacket(t *testing.T) {
 	}
 }
 
-// TestF105RemainingLengthIsDecodedOrRefused pins the decoder the trailing-packet rule rests on.
+// TestRemainingLengthIsDecodedOrRefused pins the decoder the trailing-packet rule rests on.
 //
 // A malformed length is NOT read as zero. The length is what says where the frame ends, so
 // failing to read it means this broker cannot tell whether anything follows — and "cannot tell"
 // must refuse rather than assume nothing does.
-func TestF105RemainingLengthIsDecodedOrRefused(t *testing.T) {
+func TestRemainingLengthIsDecodedOrRefused(t *testing.T) {
 	for name, tc := range map[string]struct {
 		in  []byte
 		val int
@@ -138,14 +138,14 @@ func TestF105RemainingLengthIsDecodedOrRefused(t *testing.T) {
 	}
 }
 
-// TestF105TheActionlessWriterRefusesConcatenatedFrames is B1 at the WRITER, not the validator.
+// TestTheActionlessWriterRefusesConcatenatedFrames is B1 at the WRITER, not the validator.
 //
 // The trailing-packet test above proves the validator refuses the bytes. What the cutover plan
 // asked of B1 is that the concatenated frame actually REACH the actionless boundary and leave
 // nothing on the transport; a validator nobody calls on the write path would pass the first test
 // and fail this one. Both entry points are submitted, because the emitters call the lock-agnostic
 // core and the retained QoS 0 replay calls the locking wrapper.
-func TestF105TheActionlessWriterRefusesConcatenatedFrames(t *testing.T) {
+func TestTheActionlessWriterRefusesConcatenatedFrames(t *testing.T) {
 	pingResp := testFrame(mqttPacketPingResp)
 	qos2Publish := testFrame(mqttPacketPub|0x04, 0, 1, 'a', 0, 7, 'x')
 	smuggled := append(append([]byte{}, pingResp...), qos2Publish...)
@@ -182,13 +182,13 @@ func TestF105TheActionlessWriterRefusesConcatenatedFrames(t *testing.T) {
 	}
 }
 
-// TestF105QoS12FrameRequiresActionByClass pins bindSection's rule: a QoS 1/2 frame may take the
+// TestQoS12FrameRequiresActionByClass pins bindSection's rule: a QoS 1/2 frame may take the
 // raw branch only on a slot-only (experimental affine) slot, whatever else its section carries.
 //
 // The empty-subject case is the one this rule closes. acquirePublishAction already refuses such a
 // section, but the raw branch must not depend on a precondition three calls away: a QoS 1/2 frame
 // with no slot name and no acquisition is refused at the writer, never written raw.
-func TestF105QoS12FrameRequiresActionByClass(t *testing.T) {
+func TestQoS12FrameRequiresActionByClass(t *testing.T) {
 	affine := mqttQ2AffineConsumerDurablePrefix + "grp"
 	for _, tc := range []struct {
 		name    string

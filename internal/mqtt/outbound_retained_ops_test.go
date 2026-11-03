@@ -28,7 +28,7 @@ import (
 
 // testRetainedMaterialize reserves, chunks and seals one copy, returning the READY manifest and
 // its sequence.
-func testRetainedMaterialize(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority, payload, inc string,
+func testRetainedMaterialize(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority, payload, inc string,
 	data []byte, qos byte) (*mqttRetainedManifest, uint64) {
 	t.Helper()
 	mat := &mqttRetainedMaterial{Topic: "rt/" + payload, QoS: qos, Data: data}
@@ -71,7 +71,7 @@ func testRetainedRegister(pi uint16, m *mqttRetainedManifest) *mqttInflightRecor
 	})
 }
 
-func testRetainedAdmit(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority, pi uint16,
+func testRetainedAdmit(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority, pi uint16,
 	m *mqttRetainedManifest, mSeq uint64) *mqttInflightRecord {
 	t.Helper()
 	reg := testRetainedRegister(pi, m)
@@ -84,11 +84,11 @@ func testRetainedAdmit(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority
 	return reg
 }
 
-// TestF105RetainedMaterializeAndAdmit drives the four acts and asserts what each leaves standing:
+// TestRetainedMaterializeAndAdmit drives the four acts and asserts what each leaves standing:
 // a READY copy whose chunks reassemble to the snapshot, then an exchange, a retained register with
 // its marker, the payload's retained-material edge, and the manifest naming the exchange.
-func TestF105RetainedMaterializeAndAdmit(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ret-admit")
+func TestRetainedMaterializeAndAdmit(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ret-admit")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 
@@ -127,11 +127,11 @@ func TestF105RetainedMaterializeAndAdmit(t *testing.T) {
 	}
 }
 
-// TestF105RetainedAdmissionBoundaryRefusals submits malformed admissions DIRECTLY to the boundary:
+// TestRetainedAdmissionBoundaryRefusals submits malformed admissions DIRECTLY to the boundary:
 // against a PROVISIONING copy, against an already admitted one, with a register naming another
 // digest, and without the manifest member. Each must be refused.
-func TestF105RetainedAdmissionBoundaryRefusals(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ret-adm-refuse")
+func TestRetainedAdmissionBoundaryRefusals(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ret-adm-refuse")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 
@@ -207,11 +207,11 @@ func TestF105RetainedAdmissionBoundaryRefusals(t *testing.T) {
 	}
 }
 
-// TestF105RetainedCloseArbitratesWithAdmission: an admitted copy cannot be closed while its
+// TestRetainedCloseArbitratesWithAdmission: an admitted copy cannot be closed while its
 // exchange is at Publish; an unadmitted one can be closed by its producer's own entitlement; and a
 // close landing first makes a later admission's CAS fail.
-func TestF105RetainedCloseArbitratesWithAdmission(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ret-close")
+func TestRetainedCloseArbitratesWithAdmission(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ret-close")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 
@@ -234,11 +234,11 @@ func TestF105RetainedCloseArbitratesWithAdmission(t *testing.T) {
 	}
 }
 
-// TestF105RetainedPubRecCreatesItsCanonical: a successful PUBREC moves the exchange to
+// TestRetainedPubRecCreatesItsCanonical: a successful PUBREC moves the exchange to
 // PubRecObserved and the retained register straight to pubrel_ready, creating its canonical PUBREL
 // on $MQTT_inflight in the same batch; a direct advance without the record is refused.
-func TestF105RetainedPubRecCreatesItsCanonical(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ret-pubrec")
+func TestRetainedPubRecCreatesItsCanonical(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ret-pubrec")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	m, mSeq := testRetainedMaterialize(t, e, auth, "pay-e", "inc-e", []byte("e"), 2)
@@ -322,8 +322,8 @@ func TestF105RetainedPubRecCreatesItsCanonical(t *testing.T) {
 // unreadable one are refused; a successor serving tenure, a closure, and the producer's own
 // disposition admit. A DELAYED predecessor close after a successor took over is admitted only
 // through the successor arm — its captured entitlement is not the standing one.
-func TestF105RetainedCloseTenureFence(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-ret-fence")
+func TestRetainedCloseTenureFence(t *testing.T) {
+	e, done := testNewEnv(t, "f105-ret-fence")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	m, _ := testRetainedMaterialize(t, e, auth, "pay-f", "inc-f", []byte("fence"), 1)
@@ -369,7 +369,7 @@ func TestF105RetainedCloseTenureFence(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("no serving authority: %v", aerr)
 		}
-		if _, err := e.asm.jsa.commitAuthorityTransition(testF105Closure(e, cur, curSeq, "txn-close")); err != nil {
+		if _, err := e.asm.jsa.commitAuthorityTransition(testClosure(e, cur, curSeq, "txn-close")); err != nil {
 			t.Fatalf("closing the generation: %v", err)
 		}
 		arm, err := e.asm.jsa.retainedCloseArm(attempt("anyone"), nil, m)

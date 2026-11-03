@@ -29,15 +29,15 @@ import (
 // loads the current state answers "what is there", which is not the same question as "is this
 // request still the one this owner asked for". Reading is necessary and is not sufficient.
 
-// TestF105StaleRequestsDoNotRetargetTheCurrentOwner is finding 2.
+// TestStaleRequestsDoNotRetargetTheCurrentOwner is finding 2.
 //
 // An operation that takes no target adopts whatever it loads. A closure composed for G1 and
 // delayed until G2 serves would load G2 and end it — permanently, with every boundary check
 // passing, because the operation itself had substituted the target. The same shape reaches
 // admission and acquisition, which would otherwise admit G1's delivery as G2's work under a
 // tenure that never authorized it.
-func TestF105StaleRequestsDoNotRetargetTheCurrentOwner(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-stale-target")
+func TestStaleRequestsDoNotRetargetTheCurrentOwner(t *testing.T) {
+	e, done := testNewEnv(t, "f105-stale-target")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -47,12 +47,12 @@ func TestF105StaleRequestsDoNotRetargetTheCurrentOwner(t *testing.T) {
 	capturedGen, capturedTenure, capturedOwner := g1.Gen, g1.Tenure, g1.OwnerTxn
 
 	// Ownership moves on: G1 is closed and G2 is claimed beside it.
-	closing := testF105Closure(e, g1, g1Seq, "txn-close-g1")
+	closing := testClosure(e, g1, g1Seq, "txn-close-g1")
 	closeSeq, cerr := jsa.commitAuthorityTransition(closing)
 	if cerr != nil {
 		t.Fatalf("closing G1 was refused: %v", cerr)
 	}
-	g2, _ := e.claim(t, closing.Auth, closeSeq, "txn-g2", testF105Gen2, "tenure-g2")
+	g2, _ := e.claim(t, closing.Auth, closeSeq, "txn-g2", testGen2, "tenure-g2")
 
 	// THE DELAYED CLOSURE MUST NOT END G2.
 	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close-late", capturedGen, capturedTenure, capturedOwner); err == nil {
@@ -101,25 +101,25 @@ func TestF105StaleRequestsDoNotRetargetTheCurrentOwner(t *testing.T) {
 	}
 }
 
-// TestF105AcquisitionIsDecidedByTheExchange is finding 1.
+// TestAcquisitionIsDecidedByTheExchange is finding 1.
 //
 // Acquisition is the one operation that puts bytes on the wire, and it took a caller-built
 // action without ever reading the obligation it emitted for. A fresh acquisition counter is
 // create-only and well-formed, so nothing refused a PUBLISH for an exchange the client had
 // already refused or completed, or a PUBREL for one still at its publish — the packet would
 // simply be wrong.
-func TestF105AcquisitionIsDecidedByTheExchange(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-acquire-rules")
+func TestAcquisitionIsDecidedByTheExchange(t *testing.T) {
+	e, done := testNewEnv(t, "f105-acquire-rules")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 	bind := mqttBindConnection(4242)
 
 	acquire := func(txn string, kind mqttActionKind, acq uint64, n string) error {
-		_, _, err := jsa.opAcquireAction(testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
+		_, _, err := jsa.opAcquireAction(testWithRegister(t, e, 7, &mqttAcquireActionRequest{
 			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
 			Gen: auth.Gen, Tenure: auth.Tenure,
 			Nonce: n, Acq: acq, Kind: kind, Binding: bind,
@@ -165,7 +165,7 @@ func TestF105AcquisitionIsDecidedByTheExchange(t *testing.T) {
 	}
 
 	// AND A REFUSED EXCHANGE ACQUIRES NOTHING AT ALL.
-	other := testF105AdmitOn(t, e, "txn-adm-2", 9, "inc-src")
+	other := testAdmitOn(t, e, "txn-adm-2", 9, "inc-src")
 	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, auth.Gen, other, mqttExchangeRejected); err != nil {
 		t.Fatalf("recording the refusal was refused: %v", err)
 	}
@@ -177,18 +177,18 @@ func TestF105AcquisitionIsDecidedByTheExchange(t *testing.T) {
 	}
 }
 
-// TestF105DiscardingHandoffFinalizesThroughTheSurface is finding 3, which was an outright
+// TestDiscardingHandoffFinalizesThroughTheSurface is finding 3, which was an outright
 // defect rather than a gap: the derived closure left Discard false, and the kind rule refuses
 // exactly that — so every clean-start handoff composed by the surface failed finalization,
 // and with its metadata half committed it could not be cancelled either. The authority would
 // have stayed PREPARING with admission frozen.
-func TestF105DiscardingHandoffFinalizesThroughTheSurface(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-cleanstart-finalize")
+func TestDiscardingHandoffFinalizesThroughTheSurface(t *testing.T) {
+	e, done := testNewEnv(t, "f105-cleanstart-finalize")
 	defer done()
 
 	jsa := &e.asm.jsa
-	i := testF105Intent(t, e, "clean")
-	testF105Prepare(t, e, i)
+	i := testIntent(t, e, "clean")
+	testPrepare(t, e, i)
 
 	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
 		ID: e.id, Epoch: e.epoch, IntentID: i.ID, SessWID: mqttNewSessGen(),
@@ -219,23 +219,23 @@ func TestF105DiscardingHandoffFinalizesThroughTheSurface(t *testing.T) {
 	}
 }
 
-// TestF105OperationsReturnTheEvidenceToResolveThemselves is finding 4.
+// TestOperationsReturnTheEvidenceToResolveThemselves is finding 4.
 //
 // An operation composes its transition internally, so on a lost acknowledgement the caller
 // holds neither that transition nor its digest — and calling the operation again is NOT a
 // retry: it reloads the state, composes a different revision, and may be refused because what
 // it asks for already stands. The handle is what makes the ambiguity decidable, and it is
 // returned even when the send fails.
-func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-op-evidence")
+func TestOperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
+	e, done := testNewEnv(t, "f105-op-evidence")
 	defer done()
 
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 
-	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved)
+	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved)
 	if err != nil {
 		t.Fatalf("the advance was refused: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 	// whether ITS attempt landed. An advance is authority-free: it installed no ownership, so
 	// nothing can supersede it, and a later advance leaves its answer LANDED (not SUPERSEDED,
 	// which is about an installed authority revision).
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("the second advance was refused: %v", err)
 	}
 	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
@@ -260,7 +260,7 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 
 	// A REFUSED operation still yields its handle, and the handle says the attempt never
 	// landed once it is settled — which is what a caller with an ambiguous send does.
-	bad, berr := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved)
+	bad, berr := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved)
 	if berr == nil {
 		t.Fatalf("an advance to a phase already passed was accepted")
 	}
@@ -273,8 +273,8 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 	// The metadata half returns its frozen attempt for the same reason, and a RETRY RESENDS
 	// THAT ATTEMPT: the slot is create-only, so a recomposed one would be a different
 	// commit racing the first.
-	i := testF105Intent(t, e, "evidence")
-	testF105Prepare(t, e, i)
+	i := testIntent(t, e, "evidence")
+	testPrepare(t, e, i)
 	f, _, merr := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
 		ID: e.id, Epoch: e.epoch, IntentID: i.ID, SessWID: mqttNewSessGen(),
 		Record:   &mqttPersistedSession{Origin: "o"},
@@ -294,23 +294,23 @@ func TestF105OperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
 	}
 }
 
-// TestF105MetadataCommitsOnlyForAStandingProposal is finding 5.
+// TestMetadataCommitsOnlyForAStandingProposal is finding 5.
 //
 // Deriving the receipt proves an attempt is internally consistent; it says nothing about
 // whether the proposal was ever claimed. A caller could invent a creation proposal, supply
 // the standing session sequence and a replacement body at a generation of its choosing, and
 // commit over a LIVE session having reserved nothing — and a creation displaces nothing, so
 // the predecessor check does not reach it either.
-func TestF105MetadataCommitsOnlyForAStandingProposal(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-proposal-provenance")
+func TestMetadataCommitsOnlyForAStandingProposal(t *testing.T) {
+	e, done := testNewEnv(t, "f105-proposal-provenance")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
 
 	// AN UNCLAIMED CREATION over a serving authority is refused.
-	invented := testF105CreationPropAt(t, "invented", mqttNewSessGen())
-	f := testF105FreezeProposal(t, e, invented, testF105RecordSeq(t, e))
+	invented := testCreationPropAt(t, "invented", mqttNewSessGen())
+	f := testFreezeProposal(t, e, invented, testRecordSeq(t, e))
 	if _, err := jsa.commitMetadataAttempt(f); err == nil {
 		t.Fatalf("a creation nobody reserved committed over a live session")
 	}
@@ -323,8 +323,8 @@ func TestF105MetadataCommitsOnlyForAStandingProposal(t *testing.T) {
 
 	// A HANDOFF WHOSE PREPARATION DOES NOT STAND is refused the same way, even though its
 	// receipt and its batch agree perfectly.
-	i := testF105Intent(t, e, "unprepared")
-	unprepared := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "unprepared")
+	unprepared := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 	if _, err := jsa.commitMetadataAttempt(unprepared); err == nil {
 		t.Fatalf("a handoff nobody prepared committed")
 	}
@@ -339,7 +339,7 @@ func TestF105MetadataCommitsOnlyForAStandingProposal(t *testing.T) {
 		t.Fatalf("the metadata operation composed a commit for a proposal nothing carries")
 	}
 
-	testF105Prepare(t, e, i)
+	testPrepare(t, e, i)
 
 	// WITH A PROPOSAL STANDING, naming ANOTHER one is still refused — and this is the case
 	// that discriminates: the authority now carries a proposal, so an operation that took
@@ -353,7 +353,7 @@ func TestF105MetadataCommitsOnlyForAStandingProposal(t *testing.T) {
 		t.Fatalf("the metadata operation committed the STANDING proposal for a caller that "+
 			"named %q", "intent-somebody-else")
 	}
-	if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataUnresolved {
+	if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataUnresolved {
 		t.Fatalf("the misnamed request committed the standing proposal anyway (verdict %v)", v)
 	}
 
@@ -368,14 +368,14 @@ func TestF105MetadataCommitsOnlyForAStandingProposal(t *testing.T) {
 	}
 }
 
-// TestF105ResourcesAreProvisionedThroughTheSurface is finding 6.
+// TestResourcesAreProvisionedThroughTheSurface is finding 6.
 //
 // An admission may only depend on a resource that EXISTS, and nothing in the surface created
 // one — so a dependency-bearing admission could only be performed by writing the record
 // directly, which is the escape hatch the surface exists to remove and would put a resource
 // on the store that no authority ever arbitrated.
-func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-provision")
+func TestResourcesAreProvisionedThroughTheSurface(t *testing.T) {
+	e, done := testNewEnv(t, "f105-provision")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -396,7 +396,7 @@ func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
 	// IT NEVER REPLACES ONE. A second provisioning of the same incarnation would reset a
 	// live resource's dependents to nothing, and authorize deleting a consumer obligations
 	// still need.
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-1")
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-1")
 	if _, err := jsa.opProvisionResource(e.id, e.epoch, "txn-prov-2", "op-prov",
 		auth.Gen, auth.Tenure, "inc-1", "$MQTT_src", mqttResourceSourceConsumer); err == nil {
 		t.Fatalf("a second provisioning replaced a resource an obligation depends on")
@@ -416,7 +416,7 @@ func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
 		t.Fatalf("marshalling the replacement resource failed: %v", merr)
 	}
 	al2 := jsa.loadOutboundAuthority(e.id, e.epoch)
-	hand := testF105AdmitNothing(e, al2.rec, al2.seq, "txn-prov-hand")
+	hand := testAdmitNothing(e, al2.rec, al2.seq, "txn-prov-hand")
 	hand.Attempt.Kind = mqttTransitionProvisionResource
 	hand.Extra = []mqttTransitionMember{{
 		subj: mqttResourceSubject(getHash(e.id), auth.Gen, "inc-1"), expect: curSeq, body: body,
@@ -431,7 +431,7 @@ func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
 
 	// AND IT IS NEW WORK, so a closed generation provisions nothing.
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	closing := testF105Closure(e, al.rec, al.seq, "txn-close")
+	closing := testClosure(e, al.rec, al.seq, "txn-close")
 	if _, cerr := jsa.commitAuthorityTransition(closing); cerr != nil {
 		t.Fatalf("closing the generation was refused: %v", cerr)
 	}
@@ -445,7 +445,7 @@ func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
 // Review round 10
 // ---------------------------------------------------------------------------
 
-// TestF105AResumeIsNotTheSameOwnership is round 10's finding 1.
+// TestAResumeIsNotTheSameOwnership is round 10's finding 1.
 //
 // Comparing the GENERATION alone looked sufficient while the fixtures all clean-started. It is
 // not, and the case that shows it is the ordinary one: a RESUME PRESERVES THE GENERATION and
@@ -453,8 +453,8 @@ func TestF105ResourcesAreProvisionedThroughTheSurface(t *testing.T) {
 // finished resuming would match on the generation and permanently close the generation B is
 // serving — which is the whole defect, reached through the one handoff shape that does not
 // change the generation.
-func TestF105AResumeIsNotTheSameOwnership(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-resume-ownership")
+func TestAResumeIsNotTheSameOwnership(t *testing.T) {
+	e, done := testNewEnv(t, "f105-resume-ownership")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -462,7 +462,7 @@ func TestF105AResumeIsNotTheSameOwnership(t *testing.T) {
 	capturedGen, capturedTenure, capturedOwner := first.Gen, first.Tenure, first.OwnerTxn
 
 	// A RESUMING handoff: the same generation, a new tenure, and no retirement.
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	resume := &mqttHandoffIntent{
 		ID: "intent-resume", PrevGen: first.Gen, PrevTenure: first.Tenure,
 		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
@@ -507,25 +507,25 @@ func TestF105AResumeIsNotTheSameOwnership(t *testing.T) {
 	}
 }
 
-// TestF105AnEmittingReleaseWaitsForItsDrain is round 10's finding 2.
+// TestAnEmittingReleaseWaitsForItsDrain is round 10's finding 2.
 //
 // A PUBREL is two different things depending on what is being asked. Written to the store and
 // nothing else it is a durable duty with no socket effect, and the completion rules ignore
 // outstanding output for it deliberately. Acquired HERE it is bound to a connection that will
 // emit bytes — so it is new output like any other, and it must wait for the transmission it
 // would race.
-func TestF105AnEmittingReleaseWaitsForItsDrain(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-release-drain")
+func TestAnEmittingReleaseWaitsForItsDrain(t *testing.T) {
+	e, done := testNewEnv(t, "f105-release-drain")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 	bind := mqttBindConnection(4242)
 
 	acquire := func(txn string, acq uint64, outstanding bool) error {
-		_, _, err := jsa.opAcquireAction(testF105WithRegister(t, e, 7, &mqttAcquireActionRequest{
+		_, _, err := jsa.opAcquireAction(testWithRegister(t, e, 7, &mqttAcquireActionRequest{
 			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
 			Gen: auth.Gen, Tenure: auth.Tenure,
 			Nonce: nonce, Acq: acq, Kind: mqttActionPubRel, Binding: bind,
@@ -555,21 +555,21 @@ func TestF105AnEmittingReleaseWaitsForItsDrain(t *testing.T) {
 	}
 }
 
-// TestF105ActionMembersAreCheckedAgainstTheirExchange is round 10's finding 4.
+// TestActionMembersAreCheckedAgainstTheirExchange is round 10's finding 4.
 //
 // The operation derives the action from the exchange, which makes the SURFACE correct. It does
 // not make the BOUNDARY correct, and the boundary is what the documentation claims: an action
 // member's shape and create-only expectation were checked, and nothing about the obligation it
 // emits for. A hand-composed action could commit for an exchange that had ended, or carry an
 // identifier the client was never told.
-func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-action-boundary")
+func TestActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
+	e, done := testNewEnv(t, "f105-action-boundary")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 
 	// withToken puts the register token member production composes beside the record (issue #107 row 2).
 	// The refusals below leave it off: each is refused by the exchange check, which runs first.
@@ -579,14 +579,14 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 		if merr != nil {
 			t.Fatalf("marshalling the action failed: %v", merr)
 		}
-		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
+		tr := testAdmitNothing(e, al.rec, al.seq, txn)
 		tr.Attempt.Kind = mqttTransitionAcquireAction
 		tr.Extra = []mqttTransitionMember{{
 			subj:   mqttActionSubject(getHash(e.id), act.Gen, act.Nonce, act.Acq),
 			expect: 0, body: body,
 		}}
 		if withToken {
-			tr.Extra = append(tr.Extra, testF105TokenMember(t, e, act.Gen, act))
+			tr.Extra = append(tr.Extra, testTokenMember(t, e, act.Gen, act))
 		}
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
@@ -643,7 +643,7 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	}
 }
 
-// TestF105MetadataProvenanceComparesTheWholeProposal is round 10's finding 3.
+// TestMetadataProvenanceComparesTheWholeProposal is round 10's finding 3.
 //
 // Comparing the proposal's identity and what it PROPOSES leaves its PREDECESSOR uncovered, and
 // those fields are not decoration. A receipt naming a predecessor tenure or ownership the
@@ -651,13 +651,13 @@ func TestF105ActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 // identity and the generation — takes the permanent COMMITTED slot, and is then read as
 // FOREIGN by every later resolution, because a receipt answers a proposal only if it answers
 // all of it. Neither finalization nor cancellation could then proceed.
-func TestF105MetadataProvenanceComparesTheWholeProposal(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-provenance-whole")
+func TestMetadataProvenanceComparesTheWholeProposal(t *testing.T) {
+	e, done := testNewEnv(t, "f105-provenance-whole")
 	defer done()
 
 	jsa := &e.asm.jsa
-	i := testF105Intent(t, e, "whole")
-	testF105Prepare(t, e, i)
+	i := testIntent(t, e, "whole")
+	testPrepare(t, e, i)
 
 	for name, mutate := range map[string]func(*mqttHandoffIntent){
 		"another predecessor tenure":   func(m *mqttHandoffIntent) { m.PrevTenure = "tenure-invented" },
@@ -672,7 +672,7 @@ func TestF105MetadataProvenanceComparesTheWholeProposal(t *testing.T) {
 		m.Retire.SessSeq = m.PrevSessSeq
 		// The substitution is COHERENT: the attempt's receipt is derived from the mutated
 		// proposal, so nothing internal to it disagrees. Only the standing intent does.
-		f, ferr := testF105TryFreeze(t, e, &m, m.PrevSessSeq)
+		f, ferr := testTryFreeze(t, e, &m, m.PrevSessSeq)
 		if ferr != nil {
 			t.Fatalf("freezing the %s attempt failed: %v", name, ferr)
 		}
@@ -680,7 +680,7 @@ func TestF105MetadataProvenanceComparesTheWholeProposal(t *testing.T) {
 			t.Fatalf("a metadata half naming %s committed for a standing proposal that names "+
 				"something else", name)
 		}
-		if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataUnresolved {
+		if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataUnresolved {
 			t.Fatalf("the refused %s attempt left verdict %v on the standing proposal", name, v)
 		}
 	}
@@ -703,15 +703,15 @@ func TestF105MetadataProvenanceComparesTheWholeProposal(t *testing.T) {
 // Review round 11 — what a CREATE-ONLY member was never asked
 // ---------------------------------------------------------------------------
 
-// TestF105CreatedExchangesStartAtTheirPublish is round 11's finding 2.
+// TestCreatedExchangesStartAtTheirPublish is round 11's finding 2.
 //
 // A create-only member had "nothing to compare against", which is exactly what made it the way
 // round the protocol: the successor relation is consulted for an ADVANCE, so an admission whose
 // exchange body says TERMINAL simply commits. A dependency release then accepts that fabricated
 // ending and authorizes deleting a consumer the client's real obligation still needs. A phase
 // relation is only a protocol if the FIRST phase is enforced too.
-func TestF105CreatedExchangesStartAtTheirPublish(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-created-exchange")
+func TestCreatedExchangesStartAtTheirPublish(t *testing.T) {
+	e, done := testNewEnv(t, "f105-created-exchange")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -724,7 +724,7 @@ func TestF105CreatedExchangesStartAtTheirPublish(t *testing.T) {
 			PI: 7, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
 		mutate(x)
-		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			// The builder refuses some of these itself, which is not the property under
 			// test: the member is then composed by hand at the same subject.
@@ -732,7 +732,7 @@ func TestF105CreatedExchangesStartAtTheirPublish(t *testing.T) {
 			if merr != nil {
 				t.Fatalf("marshalling the exchange failed: %v", merr)
 			}
-			tr = testF105AdmitNothing(e, al.rec, al.seq, txn)
+			tr = testAdmitNothing(e, al.rec, al.seq, txn)
 			tr.Extra = []mqttTransitionMember{{
 				subj:   mqttExchangeSubject(getHash(e.id), x.Gen, x.Nonce),
 				expect: 0, body: body,
@@ -753,7 +753,7 @@ func TestF105CreatedExchangesStartAtTheirPublish(t *testing.T) {
 		{"already refused", func(x *mqttOutboundExchange) { x.Phase = mqttExchangeRejected }},
 		{"already past its PUBREC", func(x *mqttOutboundExchange) { x.Phase = mqttExchangePubRecObserved }},
 		{"admitted by another transition", func(x *mqttOutboundExchange) { x.AdmitTxn = "txn-somebody-else" }},
-		{"admitted under another generation", func(x *mqttOutboundExchange) { x.Gen = testF105Gen2 }},
+		{"admitted under another generation", func(x *mqttOutboundExchange) { x.Gen = testGen2 }},
 		{"admitted under another tenure", func(x *mqttOutboundExchange) { x.Tenure = "tenure-invented" }},
 	} {
 		if err := admit("txn-bad-"+mqttNewInflightNonce(), c.mutate); err == nil {
@@ -770,23 +770,23 @@ func TestF105CreatedExchangesStartAtTheirPublish(t *testing.T) {
 	_ = authSeq
 }
 
-// TestF105AnActionIsLegalAgainstWhatItsBatchLeaves is round 11's finding 1.
+// TestAnActionIsLegalAgainstWhatItsBatchLeaves is round 11's finding 1.
 //
 // checkActionMembers read the STORE, which is the state before the batch. A batch is atomic, so
 // what an action has to be legal against is the state the batch RESULTS IN — and the two differ
 // exactly when one batch both acquires an action and advances that exchange. Each half is legal
 // alone; together they install emitting output for an obligation the same batch ended, and the
 // release that follows is then entitled to delete the consumer under it.
-func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-action-batch-state")
+func TestAnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
+	e, done := testNewEnv(t, "f105-action-batch-state")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 
-	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, nonce)
+	cur, curSeq := testLoadExchange(t, e, testGen, nonce)
 	ended := *cur
 	ended.Phase = mqttExchangeRejected
 	xbody, xerr := json.Marshal(&ended)
@@ -804,7 +804,7 @@ func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 	}
 
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	both := testF105AdmitNothing(e, al.rec, al.seq, "txn-both")
+	both := testAdmitNothing(e, al.rec, al.seq, "txn-both")
 	both.Attempt.Kind = mqttTransitionAcquireAction
 	both.Extra = []mqttTransitionMember{
 		{subj: mqttExchangeSubject(getHash(e.id), auth.Gen, nonce), expect: curSeq, body: xbody},
@@ -814,7 +814,7 @@ func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 		t.Fatalf("a batch acquired emitting output beside the advance that ended its exchange")
 	}
 	// Neither half landed: the refusal is the whole batch.
-	after, _ := testF105LoadExchange(t, e, testF105Gen, nonce)
+	after, _ := testLoadExchange(t, e, testGen, nonce)
 	if after.Phase != mqttExchangePublish {
 		t.Fatalf("the refused batch advanced the exchange to phase %d", after.Phase)
 	}
@@ -824,7 +824,7 @@ func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 	}
 
 	// The same action WITHOUT the advance is legal, so the refusal is the combination.
-	alone := testF105AdmitNothing(e, al.rec, al.seq, "txn-alone")
+	alone := testAdmitNothing(e, al.rec, al.seq, "txn-alone")
 	alone.Attempt.Kind = mqttTransitionAcquireAction
 	solo := *act
 	solo.AcqTxn = "txn-alone"
@@ -834,14 +834,14 @@ func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 	}
 	alone.Extra = []mqttTransitionMember{
 		{subj: mqttActionSubject(getHash(e.id), auth.Gen, nonce, 1), expect: 0, body: sbody},
-		testF105TokenMember(t, e, auth.Gen, &solo),
+		testTokenMember(t, e, auth.Gen, &solo),
 	}
 	if _, err := jsa.commitAuthorityTransition(alone); err != nil {
 		t.Fatalf("an acquisition for an exchange still at its publish was refused: %v", err)
 	}
 }
 
-// TestF105CreatedResourcesOweNothing is round 11's finding 3.
+// TestCreatedResourcesOweNothing is round 11's finding 3.
 //
 // A create-only resource skipped the state machine entirely. A hand-composed provisioning could
 // install a resource already naming a dependent obligation that does not exist — which no
@@ -849,8 +849,8 @@ func TestF105AnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 // already DELETE_AUTHORIZED, which is the authorization this mechanism exists to make provable.
 // And because disposal is deliberately permitted after closure, a creation carried by a
 // disposal would provision under a closed generation through the other kind.
-func TestF105CreatedResourcesOweNothing(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-created-resource")
+func TestCreatedResourcesOweNothing(t *testing.T) {
+	e, done := testNewEnv(t, "f105-created-resource")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -869,7 +869,7 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 		if merr != nil {
 			t.Fatalf("marshalling the resource failed: %v", merr)
 		}
-		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
+		tr := testAdmitNothing(e, al.rec, al.seq, txn)
 		tr.Attempt.Kind = kind
 		// A PROVISIONING OWES BOTH OF ITS DUTIES — the operation reserves them together, and
 		// this fixture builds its member by hand so it reserves them by hand too. The cleanup
@@ -930,7 +930,7 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 	_ = auth
 }
 
-// TestF105AClosedGenerationIsNeverClaimedAgain is round 11's finding 4.
+// TestAClosedGenerationIsNeverClaimedAgain is round 11's finding 4.
 //
 // The kind rules compare a claim with its IMMEDIATE predecessor, and a permanent closure
 // outlives every predecessor it had. So after G1 was closed, G2 served and G2 closed, nothing
@@ -938,20 +938,20 @@ func TestF105CreatedResourcesOweNothing(t *testing.T) {
 // metadata half commits, its finalization installs SERVING at G1, and new work enters a
 // generation whose permanent closure says it admits none — after which the next closure fails
 // outright, because that slot is already taken.
-func TestF105AClosedGenerationIsNeverClaimedAgain(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-generation-reuse")
+func TestAClosedGenerationIsNeverClaimedAgain(t *testing.T) {
+	e, done := testNewEnv(t, "f105-generation-reuse")
 	defer done()
 
 	jsa := &e.asm.jsa
 	g1, g1Seq := e.bootstrap(t, "txn-1")
 
-	closing := testF105Closure(e, g1, g1Seq, "txn-close-g1")
+	closing := testClosure(e, g1, g1Seq, "txn-close-g1")
 	closeSeq, cerr := jsa.commitAuthorityTransition(closing)
 	if cerr != nil {
 		t.Fatalf("closing G1 was refused: %v", cerr)
 	}
-	g2, g2Seq := e.claim(t, closing.Auth, closeSeq, "txn-g2", testF105Gen2, "tenure-g2")
-	closing2 := testF105Closure(e, g2, g2Seq, "txn-close-g2")
+	g2, g2Seq := e.claim(t, closing.Auth, closeSeq, "txn-g2", testGen2, "tenure-g2")
+	closing2 := testClosure(e, g2, g2Seq, "txn-close-g2")
 	if _, err := jsa.commitAuthorityTransition(closing2); err != nil {
 		t.Fatalf("closing G2 was refused: %v", err)
 	}
@@ -976,7 +976,7 @@ func TestF105AClosedGenerationIsNeverClaimedAgain(t *testing.T) {
 
 	// AND A CLEAN START MAY NOT PROPOSE ONE EITHER: a preparation names the generation it
 	// will install, and that is a claim on it.
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	reuse := &mqttHandoffIntent{
 		ID: "intent-reuse", PrevGen: fresh.Gen, PrevTenure: fresh.Tenure,
 		PrevOwnerTxn: fresh.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
@@ -995,7 +995,7 @@ func TestF105AClosedGenerationIsNeverClaimedAgain(t *testing.T) {
 // Review round 12
 // ---------------------------------------------------------------------------
 
-// TestF105NewWorkIsCarriedOnlyByTheKindThatAdmitsIt is round 12's finding 1.
+// TestNewWorkIsCarriedOnlyByTheKindThatAdmitsIt is round 12's finding 1.
 //
 // The kind rules confine members for every kind that has a member rule, and the OWNERSHIP
 // kinds have none. So a close-admission — including the one an abandoned claim must make over
@@ -1005,18 +1005,18 @@ func TestF105AClosedGenerationIsNeverClaimedAgain(t *testing.T) {
 //
 // The two restrictions are exercised SEPARATELY. A batch carrying both is refused by either
 // one, which would let a mutation of one hide behind the other.
-func TestF105NewWorkIsCarriedOnlyByTheKindThatAdmitsIt(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-closure-carries-work")
+func TestNewWorkIsCarriedOnlyByTheKindThatAdmitsIt(t *testing.T) {
+	e, done := testNewEnv(t, "f105-closure-carries-work")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	standing := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	standing := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 
 	closure := func(txn string, extra []mqttTransitionMember) error {
 		cur := jsa.loadOutboundAuthority(e.id, e.epoch)
-		tr := testF105Closure(e, cur.rec, cur.seq, txn)
+		tr := testClosure(e, cur.rec, cur.seq, txn)
 		// APPENDED, not assigned: the fixture's closure now carries its own enrolment — every
 		// closure seals and roots — and overwriting Extra would leave a closing batch the
 		// boundary refuses for a reason that has nothing to do with the member under test.
@@ -1084,7 +1084,7 @@ func TestF105NewWorkIsCarriedOnlyByTheKindThatAdmitsIt(t *testing.T) {
 	}
 }
 
-// TestF105AnActionIsAttributedToWhatAcquiredIt is round 12's finding 2.
+// TestAnActionIsAttributedToWhatAcquiredIt is round 12's finding 2.
 //
 // An action's acquiring transition and tenure are immutable evidence a captured completion
 // handler resolves against, and the decoder checks only that they are well-formed tokens. A
@@ -1092,18 +1092,18 @@ func TestF105NewWorkIsCarriedOnlyByTheKindThatAdmitsIt(t *testing.T) {
 // under the current authority — so after a resume from one tenure to the next, an action
 // claiming the DISPLACED tenure would be permanent evidence attributed to ownership that never
 // authorized it.
-func TestF105AnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-action-attribution")
+func TestAnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
+	e, done := testNewEnv(t, "f105-action-attribution")
 	defer done()
 
 	jsa := &e.asm.jsa
 	first, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 	displaced := first.Tenure
 
 	// A RESUME: the same generation, a new tenure.
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	resume := &mqttHandoffIntent{
 		ID: "intent-resume", PrevGen: first.Gen, PrevTenure: first.Tenure,
 		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
@@ -1135,13 +1135,13 @@ func TestF105AnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
 		if merr != nil {
 			t.Fatalf("marshalling the action failed: %v", merr)
 		}
-		tr := testF105AdmitNothing(e, cur.rec, cur.seq, txn)
+		tr := testAdmitNothing(e, cur.rec, cur.seq, txn)
 		tr.Attempt.Kind = mqttTransitionAcquireAction
 		tr.Extra = []mqttTransitionMember{{
 			subj:   mqttActionSubject(getHash(e.id), act.Gen, act.Nonce, act.Acq),
 			expect: 0, body: body,
 		}}
-		tr.Extra = append(tr.Extra, testF105TokenMember(t, e, act.Gen, act))
+		tr.Extra = append(tr.Extra, testTokenMember(t, e, act.Gen, act))
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -1164,7 +1164,7 @@ func TestF105AnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
 // Review round 13
 // ---------------------------------------------------------------------------
 
-// TestF105AnAdmissionsRecordsDescribeOneObligation is round 13's finding.
+// TestAnAdmissionsRecordsDescribeOneObligation is round 13's finding.
 //
 // The builder binds the exchange to its register — same identifier, same QoS, the exchange's
 // nonce IS the register's lineage — and that is what made it a caller convention: every
@@ -1174,8 +1174,8 @@ func TestF105AnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
 // will read: an acquisition derives its identifier from the exchange, recovery derives the
 // slot from the register, and one obligation holds two identifiers with neither side able to
 // tell.
-func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-pair-binding")
+func TestAnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-pair-binding")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -1185,7 +1185,7 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 	// afterwards, which is exactly the shape a builder cannot defend against.
 	admit := func(txn string, mutate func(*mqttAuthorityTransition)) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
-		adm := testF105Admission(e, al.rec, al.seq, txn, 7, nil)
+		adm := testAdmission(e, al.rec, al.seq, txn, 7, nil)
 		tr, terr := mqttAdmitPublishTransition(adm)
 		if terr != nil {
 			t.Fatalf("assembling the admission failed: %v", terr)
@@ -1196,11 +1196,11 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 	}
 	rewriteExchange := func(tr *mqttAuthorityTransition, f func(*mqttOutboundExchange)) {
 		for i, m := range tr.Extra {
-			cls, ok := mqttF105ObligationClass(m.subj)
+			cls, ok := mqttOutboundObligationClass(m.subj)
 			if !ok || cls != mqttExchangeClassTk {
 				continue
 			}
-			toks := strings.Split(m.subj[len(mqttF105SubjectPrefix()):], ".")
+			toks := strings.Split(m.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 			x, derr := mqttDecodeOutboundExchange(m.body, e.id, e.epoch, toks[2], toks[3])
 			if derr != nil {
 				t.Fatalf("decoding the assembled exchange failed: %v", derr)
@@ -1231,11 +1231,11 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 	if err := admit("txn-lin", func(tr *mqttAuthorityTransition) {
 		fresh := mqttNewInflightNonce()
 		for i, m := range tr.Extra {
-			cls, ok := mqttF105ObligationClass(m.subj)
+			cls, ok := mqttOutboundObligationClass(m.subj)
 			if !ok || cls != mqttExchangeClassTk {
 				continue
 			}
-			toks := strings.Split(m.subj[len(mqttF105SubjectPrefix()):], ".")
+			toks := strings.Split(m.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 			x, derr := mqttDecodeOutboundExchange(m.body, e.id, e.epoch, toks[2], toks[3])
 			if derr != nil {
 				t.Fatalf("decoding the assembled exchange failed: %v", derr)
@@ -1286,7 +1286,7 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 		PI: 11, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-lone", Tenure: al.rec.Tenure,
 	}
-	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-lone", "op-lone", lone)
+	tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, "txn-lone", "op-lone", lone)
 	if terr != nil {
 		t.Fatalf("assembling the registerless admission failed: %v", terr)
 	}
@@ -1301,7 +1301,7 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 // Review round 14
 // ---------------------------------------------------------------------------
 
-// TestF105ARegisterSaysWhatItsSubjectNames is round 14's finding.
+// TestARegisterSaysWhatItsSubjectNames is round 14's finding.
 //
 // A slot is NAMED by its subject and SAYS what it is in its body, and nothing required the two
 // to agree. Moving a valid admission's register and marker to an unused identifier while
@@ -1313,21 +1313,21 @@ func TestF105AnAdmissionsRecordsDescribeOneObligation(t *testing.T) {
 // unreadable and retirement declines to delete what it cannot interpret, so the allocation is
 // stranded for the whole recovery epoch. The operation derives the subject from the body and
 // cannot produce it; a member composed some other way can.
-func TestF105ARegisterSaysWhatItsSubjectNames(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-register-subject")
+func TestARegisterSaysWhatItsSubjectNames(t *testing.T) {
+	e, done := testNewEnv(t, "f105-register-subject")
 	defer done()
 
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "txn-1")
 
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	adm := testF105Admission(e, al.rec, al.seq, "txn-moved", 7, nil)
+	adm := testAdmission(e, al.rec, al.seq, "txn-moved", 7, nil)
 	tr, terr := mqttAdmitPublishTransition(adm)
 	if terr != nil {
 		t.Fatalf("assembling the admission failed: %v", terr)
 	}
 	// THE BODIES ARE UNTOUCHED; only the subjects move, to an identifier nothing occupies.
-	moved := mqttInflightSubject(getHash(e.id), testF105Gen, 8)
+	moved := mqttInflightSubject(getHash(e.id), testGen, 8)
 	for i, m := range tr.Extra {
 		if _, perr := mqttParseInflightSubject(m.subj); perr == nil {
 			tr.Extra[i].subj = moved
@@ -1341,7 +1341,7 @@ func TestF105ARegisterSaysWhatItsSubjectNames(t *testing.T) {
 		t.Fatalf("a register whose body allocates 7 was stored under the subject for 8")
 	}
 	// NOTHING DURABLE HAPPENED, at either identifier.
-	for _, subj := range []string{moved, mqttInflightSubject(getHash(e.id), testF105Gen, 7)} {
+	for _, subj := range []string{moved, mqttInflightSubject(getHash(e.id), testGen, 7)} {
 		if _, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
 			t.Fatalf("the refused admission installed a register on %q", subj)
 		}
@@ -1352,7 +1352,7 @@ func TestF105ARegisterSaysWhatItsSubjectNames(t *testing.T) {
 
 	// The same admission with its subjects left alone commits, so the refusal is the
 	// disagreement and not the fixture.
-	good := testF105Admission(e, al.rec, al.seq, "txn-kept", 7, nil)
+	good := testAdmission(e, al.rec, al.seq, "txn-kept", 7, nil)
 	gtr, gerr := mqttAdmitPublishTransition(good)
 	if gerr != nil {
 		t.Fatalf("assembling the unmoved admission failed: %v", gerr)
@@ -1366,7 +1366,7 @@ func TestF105ARegisterSaysWhatItsSubjectNames(t *testing.T) {
 // Review round 16
 // ---------------------------------------------------------------------------
 
-// TestF105AnObligationHoldsOneAllocation is round 16's finding.
+// TestAnObligationHoldsOneAllocation is round 16's finding.
 //
 // The pair binding matched an exchange against a register carrying its lineage — and picked
 // that register out of a Go map, whose iteration order is not a rule. A batch carrying TWO
@@ -1377,15 +1377,15 @@ func TestF105ARegisterSaysWhatItsSubjectNames(t *testing.T) {
 //
 // What lands is two recovery allocations for a single obligation, while the exchange ledger —
 // and the dependency accounting that rests on it — represents one.
-func TestF105AnObligationHoldsOneAllocation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-one-allocation")
+func TestAnObligationHoldsOneAllocation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-one-allocation")
 	defer done()
 
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "txn-1")
 
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	adm := testF105Admission(e, al.rec, al.seq, "txn-two-regs", 7, nil)
+	adm := testAdmission(e, al.rec, al.seq, "txn-two-regs", 7, nil)
 	tr, terr := mqttAdmitPublishTransition(adm)
 	if terr != nil {
 		t.Fatalf("assembling the admission failed: %v", terr)
@@ -1404,7 +1404,7 @@ func TestF105AnObligationHoldsOneAllocation(t *testing.T) {
 	if mkerr != nil {
 		t.Fatalf("building the second marker failed: %v", mkerr)
 	}
-	ninth := mqttInflightSubject(getHash(e.id), testF105Gen, 9)
+	ninth := mqttInflightSubject(getHash(e.id), testGen, 9)
 	// The extra pair goes FIRST, so the register the exchange agrees with is the one a
 	// last-write-wins lookup would keep. A fixture that appended it would be refused by the
 	// identifier comparison instead, and would prove nothing about the duplication.
@@ -1419,14 +1419,14 @@ func TestF105AnObligationHoldsOneAllocation(t *testing.T) {
 			t.Fatalf("a batch carrying two allocations for one obligation was admitted")
 		}
 	}
-	for _, subj := range []string{ninth, mqttInflightSubject(getHash(e.id), testF105Gen, 7)} {
+	for _, subj := range []string{ninth, mqttInflightSubject(getHash(e.id), testGen, 7)} {
 		if _, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
 			t.Fatalf("the refused admission installed a register on %q", subj)
 		}
 	}
 
 	// The single-pair admission commits, so the refusal is the duplication.
-	good := testF105Admission(e, al.rec, al.seq, "txn-one-reg", 7, nil)
+	good := testAdmission(e, al.rec, al.seq, "txn-one-reg", 7, nil)
 	gtr, gerr := mqttAdmitPublishTransition(good)
 	if gerr != nil {
 		t.Fatalf("assembling the single admission failed: %v", gerr)
@@ -1440,21 +1440,21 @@ func TestF105AnObligationHoldsOneAllocation(t *testing.T) {
 // Review round 17
 // ---------------------------------------------------------------------------
 
-// TestF105OneAcquisitionPerObligationInABatch is round 17's finding.
+// TestOneAcquisitionPerObligationInABatch is round 17's finding.
 //
 // Two actions for one exchange land TOGETHER and are therefore executable together, which is
 // precisely the serialization the acquisition rules impose: another transmission waits while
 // an acquired action may still emit. Their subjects differ — the acquisition counter is part
 // of the name — so subject deduplication passes, and each is individually legal against the
 // same phase. The composing operation refuses this by construction; the boundary did not.
-func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-one-acquisition")
+func TestOneAcquisitionPerObligationInABatch(t *testing.T) {
+	e, done := testNewEnv(t, "f105-one-acquisition")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 
 	action := func(txn string, acq uint64) mqttTransitionMember {
 		act := &mqttOutboundAction{
@@ -1473,7 +1473,7 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 	}
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
-		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
+		tr := testAdmitNothing(e, al.rec, al.seq, txn)
 		tr.Attempt.Kind = mqttTransitionAcquireAction
 		tr.Extra = members
 		_, err := jsa.commitAuthorityTransition(tr)
@@ -1481,7 +1481,7 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 	}
 	// The register token member production composes beside the one acquisition (issue #107 row 2).
 	token := func(acq uint64) mqttTransitionMember {
-		return testF105TokenMember(t, e, auth.Gen, &mqttOutboundAction{Nonce: nonce, Acq: acq, Kind: mqttActionPublish, PI: 7})
+		return testTokenMember(t, e, auth.Gen, &mqttOutboundAction{Nonce: nonce, Acq: acq, Kind: mqttActionPublish, PI: 7})
 	}
 
 	if err := commit("txn-two", action("txn-two", 1), action("txn-two", 2)); err == nil {
@@ -1504,7 +1504,7 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 // Review round 18
 // ---------------------------------------------------------------------------
 
-// TestF105OneIdentifierPerBatchAdmission is round 18's finding.
+// TestOneIdentifierPerBatchAdmission is round 18's finding.
 //
 // Two exchanges admitted together at one identifier are two outstanding messages a client can
 // only answer ambiguously: an acknowledgement names the identifier and nothing else. Their
@@ -1512,8 +1512,8 @@ func TestF105OneAcquisitionPerObligationInABatch(t *testing.T) {
 // register, the two registers name one subject and the batch is refused there; the exchange-level
 // identifier rule, which a registerless admission used to reach, is now behind it. Each member is
 // legal; the pair is not.
-func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-one-identifier")
+func TestOneIdentifierPerBatchAdmission(t *testing.T) {
+	e, done := testNewEnv(t, "f105-one-identifier")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -1540,8 +1540,8 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 	both := func(a, b []mqttTransitionMember) []mqttTransitionMember { return append(a, b...) }
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
-		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
-		tr.Extra = testF105CoverExchanges(t, e, testF105Gen, members)
+		tr := testAdmitNothing(e, al.rec, al.seq, txn)
+		tr.Extra = testCoverExchanges(t, e, testGen, members)
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -1566,7 +1566,7 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 // Review round 19
 // ---------------------------------------------------------------------------
 
-// TestF105AnAdmittedPairStartsTogether is round 19's finding.
+// TestAnAdmittedPairStartsTogether is round 19's finding.
 //
 // The pair binding compared lineage, identifier and QoS, and never the register's STATE. A
 // register already at publish_terminal is one recovery treats as completed and eligible for
@@ -1574,8 +1574,8 @@ func TestF105OneIdentifierPerBatchAdmission(t *testing.T) {
 // the obligation's dependency edges open; one at a PUBREL state describes an exchange that has
 // already transferred ownership, which an admission has not. Each record passes its own
 // validation, and the operation derived the contradiction rather than refusing it.
-func TestF105AnAdmittedPairStartsTogether(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-pair-start")
+func TestAnAdmittedPairStartsTogether(t *testing.T) {
+	e, done := testNewEnv(t, "f105-pair-start")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -1586,7 +1586,7 @@ func TestF105AnAdmittedPairStartsTogether(t *testing.T) {
 	} {
 		// THROUGH THE BOUNDARY, with the batch otherwise exactly what the builder produced.
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
-		adm := testF105Admission(e, al.rec, al.seq, "txn-b-"+mqttNewInflightNonce(), 7, nil)
+		adm := testAdmission(e, al.rec, al.seq, "txn-b-"+mqttNewInflightNonce(), 7, nil)
 		tr, terr := mqttAdmitPublishTransition(adm)
 		if terr != nil {
 			t.Fatalf("assembling the admission failed: %v", terr)
@@ -1629,7 +1629,7 @@ func TestF105AnAdmittedPairStartsTogether(t *testing.T) {
 	// The publish-state pair commits, so every refusal above is the state and not the
 	// fixture.
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	good := testF105Admission(e, al.rec, al.seq, "txn-good", 7, nil)
+	good := testAdmission(e, al.rec, al.seq, "txn-good", 7, nil)
 	gtr, gerr := mqttAdmitPublishTransition(good)
 	if gerr != nil {
 		t.Fatalf("assembling the well-formed admission failed: %v", gerr)
@@ -1644,24 +1644,24 @@ func TestF105AnAdmittedPairStartsTogether(t *testing.T) {
 // Review round 20
 // ---------------------------------------------------------------------------
 
-// TestF105AnAdvanceStillHoldsItsIdentifier is round 20's finding.
+// TestAnAdvanceStillHoldsItsIdentifier is round 20's finding.
 //
 // The collision check counted only exchanges a batch CREATES, so a batch that advanced an
 // existing obligation along its protocol while admitting a new one at the same identifier
 // passed: the advance is legal, the admission is legal, and the identifier is claimed twice.
 // The check now runs over the batch's RESULTING state, where an advance still holds its
 // identifier and only an ENDING gives it up.
-func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-advance-holds-pi")
+func TestAnAdvanceStillHoldsItsIdentifier(t *testing.T) {
+	e, done := testNewEnv(t, "f105-advance-holds-pi")
 	defer done()
 
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	standing := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	standing := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 
 	advance := func(to mqttExchangePhase) mqttTransitionMember {
-		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, standing)
+		cur, curSeq := testLoadExchange(t, e, testGen, standing)
 		next := *cur
 		next.Phase = to
 		body, merr := json.Marshal(&next)
@@ -1693,8 +1693,8 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 	}
 	commit := func(txn string, members ...mqttTransitionMember) error {
 		al := jsa.loadOutboundAuthority(e.id, e.epoch)
-		tr := testF105AdmitNothing(e, al.rec, al.seq, txn)
-		tr.Extra = testF105CoverExchanges(t, e, testF105Gen, members)
+		tr := testAdmitNothing(e, al.rec, al.seq, txn)
+		tr.Extra = testCoverExchanges(t, e, testGen, members)
 		_, err := jsa.commitAuthorityTransition(tr)
 		return err
 	}
@@ -1707,7 +1707,7 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "outstanding on one identifier") {
 		t.Fatalf("the mixed batch was refused for another reason than its shared identifier: %v", err)
 	}
-	after, _ := testF105LoadExchange(t, e, testF105Gen, standing)
+	after, _ := testLoadExchange(t, e, testGen, standing)
 	if after.Phase != mqttExchangePublish {
 		t.Fatalf("the refused batch advanced the standing exchange to phase %d", after.Phase)
 	}
@@ -1724,7 +1724,7 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 // Review round 21
 // ---------------------------------------------------------------------------
 
-// TestF105AnIdentifierIsExclusiveAgainstStandingObligations is round 21's finding, and it is
+// TestAnIdentifierIsExclusiveAgainstStandingObligations is round 21's finding, and it is
 // the one that disproved my own proposed oracle.
 //
 // I had claimed the property behind every intra-batch finding was "the same members written
@@ -1738,8 +1738,8 @@ func TestF105AnAdvanceStillHoldsItsIdentifier(t *testing.T) {
 // admitted only with its register), and the boundary still answers from the generation's
 // inventory BEFORE the register's own create-only write is tried: each refusal below names the
 // standing obligation, not a register collision.
-func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-identifier-exclusive")
+func TestAnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
+	e, done := testNewEnv(t, "f105-identifier-exclusive")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -1752,7 +1752,7 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 			PI: pi, QoS: 2, Phase: mqttExchangePublish,
 			AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			t.Fatalf("assembling the registerless admission failed: %v", terr)
 		}
@@ -1777,10 +1777,10 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 
 	// AND THE IDENTIFIER IS RELEASED BY AN ENDING, not by time or by absence. The first
 	// obligation is refused by the client, and the identifier becomes claimable again.
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, first, mqttExchangeRejected); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, first, mqttExchangeRejected); err != nil {
 		t.Fatalf("recording the refusal was refused: %v", err)
 	}
-	testDropEndedSlot(t, jsa, e.id, e.epoch, testF105Gen, first)
+	testDropEndedSlot(t, jsa, e.id, e.epoch, testGen, first)
 	if _, err := admit("txn-d", 7); err != nil {
 		t.Fatalf("an identifier whose obligation ended was not claimable again: %v", err)
 	}
@@ -1814,7 +1814,7 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 	// INVENTORY (issue #114): every exchange is admitted with its duty in the same batch, and that
 	// duty names the identifier the exchange holds, bound at admission and never moved — so the
 	// obligation made unreadable here is one the inventory names as standing on identifier 11.
-	corrupt := mqttExchangeSubject(getHash(e.id), testF105Gen, standing)
+	corrupt := mqttExchangeSubject(getHash(e.id), testGen, standing)
 	if _, err := jsa.storeMsg(corrupt, -1, []byte(`{"id":"nonsense"`)); err != nil {
 		t.Fatalf("planting the unreadable obligation failed: %v", err)
 	}
@@ -1835,7 +1835,7 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 // Review round 23
 // ---------------------------------------------------------------------------
 
-// TestF105ATruncatedEnumerationIsNotAnAnswer is round 23's finding, carried onto the enumeration
+// TestATruncatedEnumerationIsNotAnAnswer is round 23's finding, carried onto the enumeration
 // that replaced the walk it was first stated about.
 //
 // The exclusivity check asks whether anything still holds an identifier. It used to page a
@@ -1844,8 +1844,8 @@ func TestF105AnIdentifierIsExclusiveAgainstStandingObligations(t *testing.T) {
 // paged subject list shifts under a deletion. The property is unchanged: an answer this broker
 // could not read completely is not an answer, and absence is exactly what the claim rests on. The
 // fixture makes the inventory unreadable at its root — the ledger — and then restores it.
-func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-truncated-walk")
+func TestATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
+	e, done := testNewEnv(t, "f105-truncated-walk")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -1858,7 +1858,7 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 			PI: pi, QoS: 2, Phase: mqttExchangePublish,
 			AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+		tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if terr != nil {
 			t.Fatalf("assembling the admission failed: %v", terr)
 		}
@@ -1868,7 +1868,7 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	if err := admit("txn-first", 5); err != nil {
 		t.Fatalf("the first admission was refused: %v", err)
 	}
-	ledSubj := mqttGenLedgerSubject(getHash(e.id), testF105Gen)
+	ledSubj := mqttGenLedgerSubject(getHash(e.id), testGen)
 	good, err := jsa.loadLastMsgFor(mqttInflightStreamName, ledSubj)
 	if err != nil {
 		t.Fatalf("reading the ledger: %v", err)
@@ -1888,7 +1888,7 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	if _, err := jsa.storeMsg(ledSubj, -1, good.Data); err != nil {
 		t.Fatalf("restoring the ledger for composition: %v", err)
 	}
-	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-truncated", "op-truncated", x)
+	tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, "txn-truncated", "op-truncated", x)
 	if terr != nil {
 		t.Fatalf("assembling the admission failed: %v", terr)
 	}
@@ -1910,7 +1910,7 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	}
 }
 
-// TestF105ACompleteAnswerIsTheWholeTotal covers the decision the enumeration seam cannot: whether
+// TestACompleteAnswerIsTheWholeTotal covers the decision the enumeration seam cannot: whether
 // the page a stream-info response carries can be vouched for against the envelope beside it, and
 // whether it ends the walk.
 //
@@ -1918,12 +1918,12 @@ func TestF105ATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 // original cases keep their intent under paging: an empty answer is complete; a whole answer in
 // one page is complete; one page short of a total past it does NOT complete the walk (it now says
 // where the next page starts, instead of ending it); any shortfall within a page is refused.
-func TestF105ACompleteAnswerIsTheWholeTotal(t *testing.T) {
-	const filter = "$MQTT.f105.x.h.g.*"
+func TestACompleteAnswerIsTheWholeTotal(t *testing.T) {
+	const filter = "$MQTT.ob.x.h.g.*"
 	subjects := func(from, n int) map[string]uint64 {
 		m := make(map[string]uint64, n)
 		for i := from; i < from+n; i++ {
-			m[fmt.Sprintf("$MQTT.f105.x.h.g.n%07d", i)] = 1
+			m[fmt.Sprintf("$MQTT.ob.x.h.g.n%07d", i)] = 1
 		}
 		return m
 	}
@@ -1949,7 +1949,7 @@ func TestF105ACompleteAnswerIsTheWholeTotal(t *testing.T) {
 		{"a different echoed offset", mqttSubjectPage{Subjects: subjects(4, 4), Total: 10, Limit: 4, Offset: 0}, 4, 0, false, false},
 		{"a positive total with page size zero", mqttSubjectPage{Subjects: subjects(0, 0), Total: 10, Limit: 0}, 0, 0, false, false},
 		{"a total at or below the requested offset", mqttSubjectPage{Subjects: map[string]uint64{}, Total: 4, Limit: 4, Offset: 4}, 4, 0, false, false},
-		{"a subject outside the filter", mqttSubjectPage{Subjects: map[string]uint64{"$MQTT.f105.x.h.other.n": 1}, Total: 1, Limit: 4}, 0, 0, false, false},
+		{"a subject outside the filter", mqttSubjectPage{Subjects: map[string]uint64{"$MQTT.ob.x.h.other.n": 1}, Total: 1, Limit: 4}, 0, 0, false, false},
 		{"subjects under an all-zero envelope", mqttSubjectPage{Subjects: subjects(0, 1)}, 0, 0, false, false},
 	} {
 		next, done, ok := mqttSubjectPageAdvance(c.p, filter, c.offset)
@@ -1964,15 +1964,15 @@ func TestF105ACompleteAnswerIsTheWholeTotal(t *testing.T) {
 // Review round 24
 // ---------------------------------------------------------------------------
 
-// TestF105AnAllocationIsAdmittedWithItsObligation is round 24's finding.
+// TestAnAllocationIsAdmittedWithItsObligation is round 24's finding.
 //
 // The exchange-to-register binding was ONE-DIRECTIONAL: an exchange had to agree with the
 // register beside it, and a register alone was nobody's. So a batch carrying only a fresh
 // register and its marker allocated an identifier with no obligation to answer for it, and on a
 // FREE identifier every create-only expectation succeeds. The standing obligation here holds a
 // different identifier, so nothing but this rule can refuse the allocation.
-func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-allocation-obligation")
+func TestAnAllocationIsAdmittedWithItsObligation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-allocation-obligation")
 	defer done()
 
 	jsa := &e.asm.jsa
@@ -1985,7 +1985,7 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 		PI: 5, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-standing", Tenure: al.rec.Tenure,
 	}
-	str, serr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-standing", "op-r", standing)
+	str, serr := testAdmitExchangeTr(t, e, al.rec, al.seq, "txn-standing", "op-r", standing)
 	if serr != nil {
 		t.Fatalf("assembling the standing admission failed: %v", serr)
 	}
@@ -2008,7 +2008,7 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 		t.Fatalf("building the marker failed: %v", mkerr)
 	}
 	regSubj := mqttInflightSubject(getHash(e.id), al.rec.Gen, 7)
-	pairOnly := testF105AdmitNothing(e, al.rec, al.seq, "txn-pair-only")
+	pairOnly := testAdmitNothing(e, al.rec, al.seq, "txn-pair-only")
 	pairOnly.Extra = []mqttTransitionMember{
 		{subj: regSubj, expect: 0, body: rbody},
 		{subj: regSubj + "." + mqttInflightMarkerSuffix, expect: 0, body: marker},
@@ -2025,7 +2025,7 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 	// AN UNMATCHED EXTRA REGISTER beside an otherwise valid admission is refused the same
 	// way: the admission's own pair is fine, and the extra one answers to nothing.
 	al = jsa.loadOutboundAuthority(e.id, e.epoch)
-	adm := testF105Admission(e, al.rec, al.seq, "txn-extra", 8, nil)
+	adm := testAdmission(e, al.rec, al.seq, "txn-extra", 8, nil)
 	tr, terr := mqttAdmitPublishTransition(adm)
 	if terr != nil {
 		t.Fatalf("assembling the admission failed: %v", terr)
@@ -2053,7 +2053,7 @@ func TestF105AnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 
 	// The admission alone commits, so the refusal is the unmatched allocation.
 	al = jsa.loadOutboundAuthority(e.id, e.epoch)
-	good := testF105Admission(e, al.rec, al.seq, "txn-good", 8, nil)
+	good := testAdmission(e, al.rec, al.seq, "txn-good", 8, nil)
 	gtr, gerr := mqttAdmitPublishTransition(good)
 	if gerr != nil {
 		t.Fatalf("assembling the good admission failed: %v", gerr)

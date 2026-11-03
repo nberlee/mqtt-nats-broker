@@ -20,20 +20,20 @@ import (
 	"testing"
 )
 
-// TestF105AnUnreadableResourceRefusesTheTeardownClassification pins that a discarding generation
+// TestAnUnreadableResourceRefusesTheTeardownClassification pins that a discarding generation
 // one of whose resource records cannot be interpreted is NOT classified. The classification
 // decides what the teardown transfers to recovery and what it deletes itself, and a record it
 // cannot read may be exactly the enrolment it is asking about: "I could not read it" is never "it
 // is not there". The refusal carries no class, no affine target and no transfer, and nothing is
 // deleted.
-func TestF105AnUnreadableResourceRefusesTheTeardownClassification(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-part-unreadable")
+func TestAnUnreadableResourceRefusesTheTeardownClassification(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-part-unreadable")
 	defer cleanup()
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
-	gen, aff := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+	gen, aff := testDiscardingCloseWithAffine(t, e, affGen, durable)
 	// A REAL affine consumer at the enrolled name, so "nothing deleted" is a fact about the store.
 	if _, err := e.asm.jsa.createDurableConsumer(&CreateConsumerRequest{
 		Stream: mqttOutStreamName,

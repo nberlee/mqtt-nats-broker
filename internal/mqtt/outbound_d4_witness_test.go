@@ -27,7 +27,7 @@ import (
 // claims the delivery, an ACL-denied redelivery parks DenyRelease; the client's PUBACK arrives on
 // the same connection either after the write returned or while it is still out. RECORDS the
 // parked kind and whether the exchange completes.
-func TestF097D4W6bDrainOwnedDenyReleaseThenPubAck(t *testing.T) {
+func TestD4W6bDrainOwnedDenyReleaseThenPubAck(t *testing.T) {
 	t.Parallel()
 	for _, order := range []string{"ack-after-write", "ack-during-write"} {
 		order := order

@@ -389,11 +389,11 @@ func testForegroundServer(t *testing.T, id string, retained map[string][]byte) (
 	return rig, c, r
 }
 
-// TestF105ForegroundAuthorityPriorityOverRetainedWorkers: for each retained background writer and
+// TestForegroundAuthorityPriorityOverRetainedWorkers: for each retained background writer and
 // each of its gated attempt sites, an attempt admitted before the announcement takes at most one
 // claim attempt, every later attempt waits at its gate while the claim is announced, and the work
 // completes after the release.
-func TestF105ForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
+func TestForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
 	big := []byte(strings.Repeat("b", 200))
 	multi := []byte(strings.Repeat("m", 9*mqttChunkMaxBytes+17))
 	for _, tc := range []struct {
@@ -498,7 +498,7 @@ func TestF105ForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
 		// The UNSUBSCRIBE below also hands the subscription's SOURCE consumer to the retirement
 		// owner (issue #107 7c-lc): a background writer this schedule neither parks nor accounts for,
 		// whose authority writes would also stale the parked seal's read. It is kept out of this
-		// window; its own admission at the gate is TestF105SourceRetirementWaitsForTheForeground's.
+		// window; its own admission at the gate is TestSourceRetirementWaitsForTheForeground's.
 		rig.sess.testSourceDisposalDrop.Store(true)
 		sch := testForegroundScheduleUp(t, rig.id, rig.sess, &rig.asm.jsa, rig.asm, "op-retained-seal")
 		if rc := testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "lv/big", opts: 1}}); len(rc) != 1 || rc[0] != 1 {
@@ -560,11 +560,11 @@ func TestF105ForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
 	})
 }
 
-// TestF105BackToBackSubscribeRetainedAuthorityContention (consult 104, revised for consult 105): two
+// TestBackToBackSubscribeRetainedAuthorityContention (consult 104, revised for consult 105): two
 // SUBSCRIBEs back to back, the second while the first's replay materializes, small and multi-batch:
 // both granted, both copies delivered intact. The forced schedules above prove WHY; this is the
 // client-visible pattern itself, run with no seams.
-func TestF105BackToBackSubscribeRetainedAuthorityContention(t *testing.T) {
+func TestBackToBackSubscribeRetainedAuthorityContention(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		size int
@@ -680,11 +680,11 @@ func testMQTTParsePubV5(t testing.TB, r *mqttReader, b byte, pl int) (string, []
 	return string(topic), payload, pi
 }
 
-// TestF105ForegroundAuthorityPriorityOverRetainedAbandonment: the driver's abandonment submission
+// TestForegroundAuthorityPriorityOverRetainedAbandonment: the driver's abandonment submission
 // is a gated background attempt. Its first submission is admitted and parked, then refused before
 // sending; while a SUBSCRIBE is announced the next submission waits at its admission, and the
 // abandonment lands after the release.
-func TestF105ForegroundAuthorityPriorityOverRetainedAbandonment(t *testing.T) {
+func TestForegroundAuthorityPriorityOverRetainedAbandonment(t *testing.T) {
 	parked := make(chan struct{})
 	release := make(chan struct{})
 	var first atomic.Bool
@@ -714,11 +714,11 @@ func TestF105ForegroundAuthorityPriorityOverRetainedAbandonment(t *testing.T) {
 	rig.abandoned(t)
 }
 
-// TestF105ForegroundAuthorityAnnouncementBeforeRead (consult 105): the claim announces itself
+// TestForegroundAuthorityAnnouncementBeforeRead (consult 105): the claim announces itself
 // BEFORE its pinning authority read and stays announced across every re-attempt and wait: an
 // announcement after the read would leave the read unprotected, and a release between attempts
 // would admit background writers into the claim's budget.
-func TestF105ForegroundAuthorityAnnouncementBeforeRead(t *testing.T) {
+func TestForegroundAuthorityAnnouncementBeforeRead(t *testing.T) {
 	big := []byte(strings.Repeat("b", 200))
 	rig, c, r := testForegroundServer(t, "fg-order", map[string][]byte{"lv/big": big})
 	sch := testForegroundScheduleUp(t, rig.id, rig.sess, &rig.asm.jsa, rig.asm, "op-retained-reserve")
@@ -750,11 +750,11 @@ func TestF105ForegroundAuthorityAnnouncementBeforeRead(t *testing.T) {
 	sch.verify(true)
 }
 
-// TestF105ForegroundAuthorityPriorityReleaseOnExhaustion (consult 105): a claim whose every attempt
+// TestForegroundAuthorityPriorityReleaseOnExhaustion (consult 105): a claim whose every attempt
 // is defeated — here by a foreground writer outside the handshake, committing between each attempt's
 // read and its batch — exhausts its budget, refuses the SUBSCRIBE, and still releases its
 // announcement: a background admission proceeds at once afterwards.
-func TestF105ForegroundAuthorityPriorityReleaseOnExhaustion(t *testing.T) {
+func TestForegroundAuthorityPriorityReleaseOnExhaustion(t *testing.T) {
 	rig, c, r := testForegroundServer(t, "fg-exhaust", nil)
 	jsa := &rig.asm.jsa
 	var attempts int

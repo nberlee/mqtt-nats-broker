@@ -1880,7 +1880,7 @@ func TestAdmissionBatchFlushesBeforeADrainedOffer(t *testing.T) {
 // claims an identifier a standing obligation still holds is refused whole; the identifier walk
 // judges every identifier the batch claims, not its first.
 func TestAdmissionBatchIdentifierIsExclusiveForEveryParticipant(t *testing.T) {
-	e, done := testF105NewEnv(t, "batch-identifier-exclusive")
+	e, done := testNewEnv(t, "batch-identifier-exclusive")
 	defer done()
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "txn-1")
@@ -1890,7 +1890,7 @@ func TestAdmissionBatchIdentifierIsExclusiveForEveryParticipant(t *testing.T) {
 		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 		PI: 11, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: "txn-standing", Tenure: al.rec.Tenure,
 	}
-	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-standing", "op-standing", x)
+	tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, "txn-standing", "op-standing", x)
 	if terr != nil {
 		t.Fatalf("assembling the standing obligation: %v", terr)
 	}

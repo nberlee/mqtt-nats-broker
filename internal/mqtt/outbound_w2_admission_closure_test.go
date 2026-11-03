@@ -137,8 +137,8 @@ func (r *testAdmitLosesToClosureRig) requireNothingAdmitted(t *testing.T) {
 	}
 }
 
-// TestF105OrdinaryAdmissionLosesToAClosure pins the race both ways the store can decide it.
-func TestF105OrdinaryAdmissionLosesToAClosure(t *testing.T) {
+// TestOrdinaryAdmissionLosesToAClosure pins the race both ways the store can decide it.
+func TestOrdinaryAdmissionLosesToAClosure(t *testing.T) {
 	// The closure commits in the admission's presend window: after every one of the admission's
 	// boundary reads passed, so only the store's own sequence CAS on its batch (the authority's
 	// revision and the generation ledger the closure sealed) can refuse it.

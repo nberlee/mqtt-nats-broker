@@ -30,15 +30,15 @@ import (
 // substituted after it was built, and the CAS passes because the sequence is right, so the
 // guarantee held only for callers that chose to use the builder.
 
-// TestF105PredecessorIsComparedWithTheStore pins that the rules deciding what a transition
+// TestPredecessorIsComparedWithTheStore pins that the rules deciding what a transition
 // may displace are conclusions about the STANDING authority.
 //
 // Every kind rule reads t.Prev: which state may be displaced, whether ownership is preserved,
 // whether a proposal is pending. Without this check a caller copies the standing SERVING
 // authority, sets its State to CLOSED, keeps its real sequence, and reserves a fresh
 // generation over it — live ownership displaced with no handoff and no permanent closure.
-func TestF105PredecessorIsComparedWithTheStore(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-prev-boundary")
+func TestPredecessorIsComparedWithTheStore(t *testing.T) {
+	e, done := testNewEnv(t, "f105-prev-boundary")
 	defer done()
 
 	auth, _ := e.bootstrap(t, "txn-1")
@@ -51,7 +51,7 @@ func TestF105PredecessorIsComparedWithTheStore(t *testing.T) {
 	// claim may be reserved over it.
 	lying := *load.rec
 	lying.State = mqttAuthorityClosed
-	claim := testF105ReserveCreation(e, &lying, load.seq, "txn-claim", testF105Gen2,
+	claim := testReserveCreation(e, &lying, load.seq, "txn-claim", testGen2,
 		"tenure-claim", "intent-claim")
 	if _, err := e.asm.jsa.commitAuthorityTransition(claim); err == nil {
 		t.Fatalf("a claim was reserved over a SERVING authority described as closed: the " +
@@ -67,7 +67,7 @@ func TestF105PredecessorIsComparedWithTheStore(t *testing.T) {
 	intent := &mqttHandoffIntent{
 		ID: "intent-1", PrevGen: auth.Gen, PrevTenure: auth.Tenure,
 		PrevOwnerTxn: auth.OwnerTxn, PrevSessWID: "wid-0", PrevSessSeq: 12,
-		Tenure: "tenure-next", Gen: testF105Gen2, CleanReq: true,
+		Tenure: "tenure-next", Gen: testGen2, CleanReq: true,
 		Retire: &mqttRetirementRequest{
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
@@ -151,7 +151,7 @@ func TestF105PredecessorIsComparedWithTheStore(t *testing.T) {
 	}
 }
 
-// TestF105ResourceReleaseMustProveTheObligationEnded is the whole meaning of a deletion
+// TestResourceReleaseMustProveTheObligationEnded is the whole meaning of a deletion
 // authorization, and the correction to the version that only counted.
 //
 // A COUNT CAN BE DRAINED BY TRANSITIONS THAT ENDED NOTHING. "One fewer" is an assertion; a
@@ -160,23 +160,23 @@ func TestF105PredecessorIsComparedWithTheStore(t *testing.T) {
 // obligations' only PUBREC evidence. A NAMED edge can be removed only by proving THAT
 // obligation reached its end, and only once, because the second attempt names something the
 // list no longer holds.
-func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-res-boundary")
+func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
+	e, done := testNewEnv(t, "f105-res-boundary")
 	defer done()
 
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
+	testPlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
 
 	// TWO obligations depend on the PUBREL consumer.
-	a := testF105AdmitOn(t, e, "txn-adm-1", 7, "inc-rel")
-	b := testF105AdmitOn(t, e, "txn-adm-2", 8, "inc-rel")
-	held, heldSeq := testF105LoadResource(t, e, "inc-rel")
+	a := testAdmitOn(t, e, "txn-adm-1", 7, "inc-rel")
+	b := testAdmitOn(t, e, "txn-adm-2", 8, "inc-rel")
+	held, heldSeq := testBoundaryLoadResource(t, e, "inc-rel")
 	if len(held.Deps) != 2 {
 		t.Fatalf("the PUBREL consumer is needed by %v, want both obligations", held.Deps)
 	}
 
 	// (1) A PREMATURE RELEASE IS REFUSED. Neither exchange has ended.
-	if err := testF105ReleaseDependency(t, e, "inc-rel", a, "txn-early"); err == nil {
+	if err := testReleaseDependency(t, e, "inc-rel", a, "txn-early"); err == nil {
 		t.Fatalf("a dependency was released while its obligation was still outstanding")
 	}
 
@@ -203,7 +203,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: "txn-lie", OwnerTxn: al.rec.OwnerTxn,
 		},
 		Extra: []mqttTransitionMember{{
-			subj:   mqttResourceSubject(getHash(e.id), testF105Gen, "inc-rel"),
+			subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-rel"),
 			expect: heldSeq, body: body,
 		}},
 	}
@@ -230,7 +230,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: "txn-pin", OwnerTxn: al.rec.OwnerTxn,
 		},
 		Extra: []mqttTransitionMember{{
-			subj:   mqttResourceSubject(getHash(e.id), testF105Gen, "inc-rel"),
+			subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-rel"),
 			expect: heldSeq, body: ibody,
 		}},
 	}
@@ -241,22 +241,22 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	// (4) FINISH ONE OBLIGATION, and only its edge goes (issue #107 7c-lc): the terminal advance leaves
 	// a's hold release-owed, and a release-holds batch over a's stored ending releases it and
 	// nothing else.
-	testF105FinishExchange(t, e, a)
-	if err := testF105ReleaseDependency(t, e, "inc-rel", b, "txn-wrong"); err == nil {
+	testFinishExchange(t, e, a)
+	if err := testReleaseDependency(t, e, "inc-rel", b, "txn-wrong"); err == nil {
 		t.Fatalf("finishing one obligation released another obligation's dependency")
 	}
 	// NO OTHER RELEASE DOOR. A standalone dependency release of a hold edge is refused whatever
 	// the stored phase says: only release-holds releases an acknowledgement ending's holds.
-	if err := testF105ReleaseDependency(t, e, "inc-rel", a, "txn-rel-a2"); err == nil {
+	if err := testReleaseDependency(t, e, "inc-rel", a, "txn-rel-a2"); err == nil {
 		t.Fatalf("a finished obligation's hold was released by a dependency release, after its ending")
 	}
-	if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testF105Gen, []string{a, b}, nil,
+	if _, err := e.asm.jsa.opReleaseHolds(e.id, e.epoch, testGen, []string{a, b}, nil,
 		mqttNewInflightNonce(), nil); err != nil {
 		t.Fatalf("releasing the finished obligation's hold: %v", err)
 	}
 
 	// (5) The resource is still not authorizable: the second obligation stands.
-	cur, curSeq0 := testF105LoadResource(t, e, "inc-rel")
+	cur, curSeq0 := testBoundaryLoadResource(t, e, "inc-rel")
 	if len(cur.Deps) != 1 || cur.Deps[0].Nonce != b {
 		t.Fatalf("the PUBREL consumer is needed by %v, want only the outstanding obligation", cur.Deps)
 	}
@@ -268,9 +268,9 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 
 	// (6) Finish the second: its ending leaves the last edge release-owed, the release-holds batch
 	// releases it (issue #107 7c-lc), and only then does the authorization win.
-	testF105FinishExchange(t, e, b)
+	testFinishExchange(t, e, b)
 	testReleaseOwed(t, e, b)
-	last, curSeq := testF105LoadResource(t, e, "inc-rel")
+	last, curSeq := testBoundaryLoadResource(t, e, "inc-rel")
 	if len(last.Deps) != 0 {
 		t.Fatalf("the second obligation's ending did not release the last edge: %v", last.Deps)
 	}
@@ -279,15 +279,15 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	// its name in the same batch: through the paired production operation (issue #107 7c-lc).
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if _, derr := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testF105Gen, Inc: "inc-rel",
+		ID: e.id, Epoch: e.epoch, Txn: "txn-disp", Gen: testGen, Inc: "inc-rel",
 		Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: al.rec.Gen, Tenure: al.rec.Tenure},
 	}); derr != nil {
 		t.Fatalf("disposing of the released consumer was refused: %v", derr)
 	}
-	if _, cerr := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-auth", testF105Gen, "inc-rel"); cerr != nil {
+	if _, cerr := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-auth", testGen, "inc-rel"); cerr != nil {
 		t.Fatalf("authorizing the disposed, released consumer was refused: %v", cerr)
 	}
-	done2, doneSeq := testF105LoadResource(t, e, "inc-rel")
+	done2, doneSeq := testBoundaryLoadResource(t, e, "inc-rel")
 	if !mqttResourceDeletable(done2) {
 		t.Fatalf("the resource is not deletable after a won authorization: state %d", done2.State)
 	}
@@ -325,7 +325,7 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 				State: al.rec.State, Rev: al.rec.Rev + 1, Txn: "txn-after", OwnerTxn: al.rec.OwnerTxn,
 			},
 			Extra: []mqttTransitionMember{{
-				subj:   mqttResourceSubject(getHash(e.id), testF105Gen, "inc-rel"),
+				subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-rel"),
 				expect: doneSeq, body: mbody,
 			}},
 		}
@@ -335,46 +335,46 @@ func TestF105ResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	}
 }
 
-// testF105LoadResource reads one resource as it durably stands, with its sequence.
-func testF105LoadResource(t *testing.T, e *testF105Env, inc string) (*mqttOutboundResource, uint64) {
+// testBoundaryLoadResource reads one resource as it durably stands, with its sequence.
+func testBoundaryLoadResource(t *testing.T, e *testOutboundEnv, inc string) (*mqttOutboundResource, uint64) {
 	t.Helper()
 	msg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttResourceSubject(getHash(e.id), testF105Gen, inc))
+		mqttResourceSubject(getHash(e.id), testGen, inc))
 	if err != nil {
 		t.Fatalf("loading resource %q: %v", inc, err)
 	}
-	r, derr := mqttDecodeOutboundResource(msg.Data, e.id, e.epoch, testF105Gen, inc)
+	r, derr := mqttDecodeOutboundResource(msg.Data, e.id, e.epoch, testGen, inc)
 	if derr != nil {
 		t.Fatalf("decoding resource %q: %v", inc, derr)
 	}
 	return r, msg.Sequence
 }
 
-// TestF105AdmissionRequiresLiveOwnedName is the step-1 illegal boundary (issue #107 §5.1 point 3,
+// TestAdmissionRequiresLiveOwnedName is the step-1 illegal boundary (issue #107 §5.1 point 3,
 // Codex consult 11): admitting a dependency on a name-governed consumer (source/PUBREL)
 // requires its name-ownership record to stand LIVE and be owned by exactly this incarnation.
 // A missing, RETIRED, or foreign-owned name refuses the admission. The dependency edge alone
 // must never license depending on a consumer a retirement may already have spent — otherwise a
 // teardown could delete the consumer that carries this obligation's PUBREC evidence.
-func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
-	plantSource := func(t *testing.T, e *testF105Env, inc string) {
+func TestAdmissionRequiresLiveOwnedName(t *testing.T) {
+	plantSource := func(t *testing.T, e *testOutboundEnv, inc string) {
 		t.Helper()
 		r := &mqttOutboundResource{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: inc,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Inc: inc,
 			Kind: mqttResourceSourceConsumer, Name: "$MQTT_" + inc, State: mqttResourceLive,
 			Prov: mqttProvisioningSealed, Deps: []mqttResourceEdge{}, ProvTenure: "prov-t0",
 		}
 		b, _ := json.Marshal(r)
 		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
-		if _, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, inc), hdr, msg); err != nil {
+		if _, err := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testGen, inc), hdr, msg); err != nil {
 			t.Fatalf("planting source resource %q: %v", inc, err)
 		}
 	}
-	plantOwn := func(t *testing.T, e *testF105Env, name string, state mqttNameOwnState, ownerInc string) {
+	plantOwn := func(t *testing.T, e *testOutboundEnv, name string, state mqttNameOwnState, ownerInc string) {
 		t.Helper()
 		o := &mqttNameOwnership{
 			ID: e.id, Epoch: e.epoch, Stream: mqttOwnedStreamMsgs, Name: name, State: state,
-			OwnerGen: testF105Gen, OwnerInc: ownerInc,
+			OwnerGen: testGen, OwnerInc: ownerInc,
 		}
 		b, _ := json.Marshal(o)
 		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
@@ -382,7 +382,7 @@ func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
 			t.Fatalf("planting ownership for %q: %v", name, err)
 		}
 	}
-	admit := func(t *testing.T, e *testF105Env, inc string) error {
+	admit := func(t *testing.T, e *testOutboundEnv, inc string) error {
 		t.Helper()
 		reg := freshRegisterLineage(&mqttInflightRecord{
 			State: mqttInflightPublish, PI: 7, Dur: "$MQTT_src", Seq: 1, QoS: 2,
@@ -401,7 +401,7 @@ func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
 	}
 
 	t.Run("a missing owner refuses the admission", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-own-missing")
+		e, done := testNewEnv(t, "f105-own-missing")
 		defer done()
 		e.bootstrap(t, "txn-1")
 		plantSource(t, e, "inc-src") // resource only; NO ownership record
@@ -415,7 +415,7 @@ func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
 	})
 
 	t.Run("a retired owner refuses the admission", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-own-retired")
+		e, done := testNewEnv(t, "f105-own-retired")
 		defer done()
 		e.bootstrap(t, "txn-1")
 		plantSource(t, e, "inc-src")
@@ -430,7 +430,7 @@ func TestF105AdmissionRequiresLiveOwnedName(t *testing.T) {
 	})
 
 	t.Run("a foreign-owned name refuses the admission", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-own-foreign")
+		e, done := testNewEnv(t, "f105-own-foreign")
 		defer done()
 		e.bootstrap(t, "txn-1")
 		plantSource(t, e, "inc-src")

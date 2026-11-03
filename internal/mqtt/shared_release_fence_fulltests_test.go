@@ -817,7 +817,7 @@ func TestSharedVerdictKickCoalescesWithoutLosingAWakeup(t *testing.T) {
 
 // testPlantSharedAcq gives generation gen of the issue #107 env one listed acquisition of a group, as a
 // join would, and returns it.
-func testPlantSharedAcq(t *testing.T, e *testF105Env, gen, group string) mqttSharedAcqRef {
+func testPlantSharedAcq(t *testing.T, e *testOutboundEnv, gen, group string) mqttSharedAcqRef {
 	t.Helper()
 	jsa := &e.asm.jsa
 	qkey := mqttSharedGroupKey(group, "foo")
@@ -844,7 +844,7 @@ func testPlantSharedAcq(t *testing.T, e *testF105Env, gen, group string) mqttSha
 	return b.Acq
 }
 
-func testSharedLedgerClosedEmpty(e *testF105Env, gen string) error {
+func testSharedLedgerClosedEmpty(e *testOutboundEnv, gen string) error {
 	l := e.asm.jsa.loadSharedLedger(e.id, e.epoch, gen)
 	switch {
 	case l.status != mqttOutboundValid:
@@ -861,8 +861,8 @@ func testSharedLedgerClosedEmpty(e *testF105Env, gen string) error {
 // does not certify while it reads otherwise. Held closing first: every inventory duty done, the
 // closing reports incomplete, no certificate and the root stays; released, it certifies with the
 // ledger sealed and empty. Mutations M12, M13.
-func TestF105RecoveryClosesTheDiscardedSharedLedgerBeforeCertifying(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-7e-recovery-closing")
+func TestRecoveryClosesTheDiscardedSharedLedgerBeforeCertifying(t *testing.T) {
+	e, done := testNewEnv(t, "f105-7e-recovery-closing")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -903,8 +903,8 @@ func TestF105RecoveryClosesTheDiscardedSharedLedgerBeforeCertifying(t *testing.T
 // T7e(b): a persistently failing shared closing never holds the discard back: every obligation is
 // discarded across several sweeps while the closing fails, and the root certifies only once the
 // closing succeeds. Mutations M13b, M13c.
-func TestF105FailingSharedClosingDoesNotStopTheDiscard(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-7e-failing-closing")
+func TestFailingSharedClosingDoesNotStopTheDiscard(t *testing.T) {
+	e, done := testNewEnv(t, "f105-7e-failing-closing")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -914,8 +914,8 @@ func TestF105FailingSharedClosingDoesNotStopTheDiscard(t *testing.T) {
 	nonces := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		inc := fmt.Sprintf("inc-%03d", i)
-		testF105PlantResource(t, e, inc, mqttResourceSourceConsumer)
-		nonce, _, _, _ := testF105AdmitQoS(t, e, fmt.Sprintf("txn-adm-%03d", i), uint16(i+1), 1, inc)
+		testPlantResource(t, e, inc, mqttResourceSourceConsumer)
+		nonce, _, _, _ := testAdmitQoS(t, e, fmt.Sprintf("txn-adm-%03d", i), uint16(i+1), 1, inc)
 		nonces = append(nonces, nonce)
 	}
 	testDiscardClose(t, e)
@@ -934,7 +934,7 @@ func TestF105FailingSharedClosingDoesNotStopTheDiscard(t *testing.T) {
 	defer mqttTestRecoverySharedClosingHookV.Store(nil)
 	allDiscarded := func() error {
 		for _, nonce := range nonces {
-			if x, _ := testF105LoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeDiscarded {
+			if x, _ := testLoadExchange(t, e, gen, nonce); x.Phase != mqttExchangeDiscarded {
 				return fmt.Errorf("obligation %q stands at phase %d", nonce, x.Phase)
 			}
 		}
@@ -978,8 +978,8 @@ func TestF105FailingSharedClosingDoesNotStopTheDiscard(t *testing.T) {
 // T7e(b2) + T7e(c): the closing step is bounded and cancellable — an unaffordable episode is not
 // started and a stop ends it after a complete one — and an inline closing racing the recovery's
 // converges with no error.
-func TestF105SharedClosingStepIsBoundedAndConverges(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-7e-closing-bounded")
+func TestSharedClosingStepIsBoundedAndConverges(t *testing.T) {
+	e, done := testNewEnv(t, "f105-7e-closing-bounded")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	gen := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch).rec.Gen
@@ -1063,7 +1063,7 @@ func TestSharedSealedClosingNeedsNoFence(t *testing.T) {
 // T7 + T7b: the clean-start HANDOFF releases the predecessor generation's acquisitions — the
 // pre-existing gap 7e closes. With the prompt drive parked the periodic pass does it, and the root
 // does not certify before the ledger reads sealed and empty. Mutation M12.
-func TestF105CleanStartHandoffReleasesThePredecessorsSharedAcquisitions(t *testing.T) {
+func TestCleanStartHandoffReleasesThePredecessorsSharedAcquisitions(t *testing.T) {
 	const clientID = "f105-7e-cs-shared"
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -1098,7 +1098,7 @@ func TestF105CleanStartHandoffReleasesThePredecessorsSharedAcquisitions(t *testi
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
 
-	env := &testF105Env{asm: asm, id: clientID, epoch: epoch}
+	env := &testOutboundEnv{asm: asm, id: clientID, epoch: epoch}
 	if err := testSharedLedgerClosedEmpty(env, oldGen); err == nil {
 		t.Fatal("fixture: the predecessor's shared ledger closed before any recovery visit")
 	}

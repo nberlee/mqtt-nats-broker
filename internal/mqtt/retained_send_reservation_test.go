@@ -519,7 +519,7 @@ func TestMQTTPubCompDoesNotDestroyARetainedReservation(t *testing.T) {
 // reservation, because otherwise the identifier stays reserved against reallocation for the
 // session's life while nothing will ever write it. (The other departure, a same-sid
 // replacement, TRANSFERS instead and releases nothing —
-// TestF105RetainedSameSidReplacementInheritsTheReplay and the deadlock test cover that.)
+// TestRetainedSameSidReplacementInheritsTheReplay and the deadlock test cover that.)
 func TestMQTTAbandonedRetainedFrameReleasesItsHold(t *testing.T) {
 	t.Parallel()
 	e := testNewRetainedEnv(t, "retained-abandon")
@@ -706,7 +706,7 @@ func TestMQTTAbandonmentReleasesOnlyItsOwnAllocation(t *testing.T) {
 // The release half on its own: frames detached from a displaced subscription release their
 // reservations when they are released. A same-sid replacement in production does not take
 // this path; it transfers the frames to the replacement
-// (TestF105RetainedSameSidReplacementInheritsTheReplay). Here the detach and the release are
+// (TestRetainedSameSidReplacementInheritsTheReplay). Here the detach and the release are
 // driven by hand, which is the teardown's sequence.
 func TestMQTTDetachedRetainedFramesCanBeAbandoned(t *testing.T) {
 	t.Parallel()

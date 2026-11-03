@@ -104,13 +104,14 @@ item recorded as blocked; moving elsewhere is the user's explicit call.
 Name things after the protocol fact they encode, and comment the invariant
 rather than the mechanics. That is the existing style; match it.
 
-**No issue numbers in Go file names, tests included.** A `.go` file is named
-for what it contains (`outbound_companion_members_test.go`), never for the
-issue or work unit that produced it (no issue number, former finding ID or unit
-label in the name). A reader must be able to tell from the name alone whether to
-open the file, without first looking up what an issue was about. Renaming a file
-later is costlier than rewording a comment, so get the name right when the file
-is created.
+**No issue numbers in Go file names or identifiers, tests included.** A `.go`
+file is named for what it contains (`outbound_companion_members_test.go`), and a
+function, test, type, constant or persisted subject token for what it does
+(`TestDiscardedGenerationRetiresItsPubRelConsumer`), never for the issue or work
+unit that produced it (no issue number, former finding ID or unit label in the
+name). A reader must be able to tell from the name alone what it is, without
+first looking up what an issue was about. Renaming later is costlier than
+rewording a comment, so get the name right when it is created.
 
 Never loosen a test assertion to make a change pass. If a test fails, the
 default hypothesis is that the broker is wrong. Trace the root cause in

@@ -47,21 +47,21 @@ import (
 // the window in production (B's teardown before B's own acquisition is held by construction).
 
 const (
-	testF088XAckWait = 30 * time.Second
-	// testF088XWindow bounds message 1's delivery on A to the completion of B's UNSUBSCRIBE save,
+	testXAckWait = 30 * time.Second
+	// testXWindow bounds message 1's delivery on A to the completion of B's UNSUBSCRIBE save,
 	// well inside AckWait: beyond it a redelivery to B could be in flight.
-	testF088XWindow = 20 * time.Second
-	// testF088XColdRead is the cold re-offer's read deadline: recovery installs the acting entry
+	testXWindow = 20 * time.Second
+	// testXColdRead is the cold re-offer's read deadline: recovery installs the acting entry
 	// without an ack subject, so nothing can NAK it and the re-offer waits for JetStream's own
 	// redelivery after AckWait.
-	testF088XColdRead = testF088XAckWait + 15*time.Second
+	testXColdRead = testXAckWait + 15*time.Second
 )
 
-// testF088Sections is the one process-global send-window hook, in three roles: it PARKS broker
+// testSections is the one process-global send-window hook, in three roles: it PARKS broker
 // A's first section at RESERVED (and, once armed, at WROTE), it RECORDS every window A's section
 // reaches, and it OBSERVES every section broker B opens. Sessions are told apart by their
 // manager, never by client ID: both brokers' sessions carry the same one.
-type testF088Sections struct {
+type testSections struct {
 	asmA, asmB *mqttAccountSessionManager
 
 	mu       sync.Mutex
@@ -92,12 +92,12 @@ type testF088Sections struct {
 	endedOnce sync.Once
 }
 
-// testF088InstallSections installs the hook. Its release is registered as a cleanup AFTER the
+// testInstallSections installs the hook. Its release is registered as a cleanup AFTER the
 // servers', so it runs BEFORE them: a parked section holds the shutdown barrier
 // (admitPublishSend), and a failed test must not leave shutdown waiting on it.
-func testF088InstallSections(t *testing.T, asmA, asmB *mqttAccountSessionManager) *testF088Sections {
+func testInstallSections(t *testing.T, asmA, asmB *mqttAccountSessionManager) *testSections {
 	t.Helper()
-	h := &testF088Sections{
+	h := &testSections{
 		asmA: asmA, asmB: asmB,
 		parked: make(chan uint16, 1), release: make(chan struct{}),
 		wroteReached: make(chan struct{}), wroteRelease: make(chan struct{}),
@@ -156,21 +156,21 @@ func testF088InstallSections(t *testing.T, asmA, asmB *mqttAccountSessionManager
 	return h
 }
 
-func (h *testF088Sections) releaseReserved() {
+func (h *testSections) releaseReserved() {
 	h.releaseOnce.Do(func() {
 		h.released.Store(true)
 		close(h.release)
 	})
 }
-func (h *testF088Sections) releaseWrote() { h.wroteRelOnce.Do(func() { close(h.wroteRelease) }) }
+func (h *testSections) releaseWrote() { h.wroteRelOnce.Do(func() { close(h.wroteRelease) }) }
 
-func (h *testF088Sections) windowsA() []string {
+func (h *testSections) windowsA() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.aWindows...)
 }
 
-func (h *testF088Sections) sawA(window string) bool {
+func (h *testSections) sawA(window string) bool {
 	for _, w := range h.windowsA() {
 		if w == window {
 			return true
@@ -179,14 +179,14 @@ func (h *testF088Sections) sawA(window string) bool {
 	return false
 }
 
-func (h *testF088Sections) openedB() ([]string, bool) {
+func (h *testSections) openedB() ([]string, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]string(nil), h.bOpened...), h.bOnPI
 }
 
-// testF088Attempt is one authority transition broker B attempted over message 1's register.
-type testF088Attempt struct {
+// testCrossTenureAttempt is one authority transition broker B attempted over message 1's register.
+type testCrossTenureAttempt struct {
 	kind mqttTransitionKind
 	txn  string
 	err  error
@@ -194,7 +194,7 @@ type testF088Attempt struct {
 	body *mqttInflightRecord // the register member the batch wrote
 }
 
-func (a testF088Attempt) String() string {
+func (a testCrossTenureAttempt) String() string {
 	b := "<nil>"
 	if a.body != nil {
 		b = fmt.Sprintf("{nonce %s state %v cancelled %v origin %q token %q}", a.body.Nonce, a.body.State,
@@ -203,13 +203,13 @@ func (a testF088Attempt) String() string {
 	return fmt.Sprintf("%s txn=%s seq=%d err=%v body=%s", a.kind, a.txn, a.seq, a.err, b)
 }
 
-// testF088RecordAttempts arms jsa's transition seam to record EVERY attempt whose batch names
+// testRecordAttempts arms jsa's transition seam to record EVERY attempt whose batch names
 // subject, refused ones included: the boundary checks run inside the wrapped send, so a refusal
 // is the send's error.
-func testF088RecordAttempts(t *testing.T, jsa *mqttJSA, subject string) func() []testF088Attempt {
+func testRecordAttempts(t *testing.T, jsa *mqttJSA, subject string) func() []testCrossTenureAttempt {
 	t.Helper()
 	var mu sync.Mutex
-	var seen []testF088Attempt
+	var seen []testCrossTenureAttempt
 	testArmTransitionSeam(t, jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		var body *mqttInflightRecord
 		names := false
@@ -225,20 +225,20 @@ func testF088RecordAttempts(t *testing.T, jsa *mqttJSA, subject string) func() [
 		seq, err := send()
 		if names && tr.Attempt != nil {
 			mu.Lock()
-			seen = append(seen, testF088Attempt{kind: tr.Attempt.Kind, txn: tr.Attempt.Txn, err: err, seq: seq, body: body})
+			seen = append(seen, testCrossTenureAttempt{kind: tr.Attempt.Kind, txn: tr.Attempt.Txn, err: err, seq: seq, body: body})
 			mu.Unlock()
 		}
 		return seq, err
 	})
-	return func() []testF088Attempt {
+	return func() []testCrossTenureAttempt {
 		mu.Lock()
 		defer mu.Unlock()
-		return append([]testF088Attempt(nil), seen...)
+		return append([]testCrossTenureAttempt(nil), seen...)
 	}
 }
 
-// testF088Packet is one packet the client read.
-type testF088Packet struct {
+// testPacket is one packet the client read.
+type testPacket struct {
 	typ     byte
 	flags   byte
 	pi      uint16
@@ -246,16 +246,16 @@ type testF088Packet struct {
 	payload string
 }
 
-func (p testF088Packet) String() string {
+func (p testPacket) String() string {
 	if p.typ == mqttPacketPub {
 		return fmt.Sprintf("PUBLISH pi=%d dup=%v payload=%q", p.pi, p.flags&mqttPubFlagDup != 0, p.payload)
 	}
 	return fmt.Sprintf("packet 0x%x pi=%d", p.typ, p.pi)
 }
 
-// testF088Read reads one packet within wait. eof reports the connection ending (a read that gave
+// testRead reads one packet within wait. eof reports the connection ending (a read that gave
 // up well before its wait), as distinct from a timeout.
-func testF088Read(t *testing.T, r *mqttReader, wait time.Duration) (p testF088Packet, ok, eof bool) {
+func testRead(t *testing.T, r *mqttReader, wait time.Duration) (p testPacket, ok, eof bool) {
 	t.Helper()
 	t0 := time.Now()
 	b, pl, got := testMQTTReadPacketReady(r, wait)
@@ -280,9 +280,9 @@ func testF088Read(t *testing.T, r *mqttReader, wait time.Duration) (p testF088Pa
 	return p, true, false
 }
 
-// testF088Unsub sends UNSUBSCRIBE foo and reads until its UNSUBACK, recording every packet that
+// testUnsub sends UNSUBSCRIBE foo and reads until its UNSUBACK, recording every packet that
 // arrives first.
-func testF088Unsub(t *testing.T, c net.Conn, r *mqttReader, upi uint16, trace *[]testF088Packet) {
+func testUnsub(t *testing.T, c net.Conn, r *mqttReader, upi uint16, trace *[]testPacket) {
 	t.Helper()
 	w := newMQTTWriter(0)
 	w.WriteByte(mqttPacketUnsub | mqttUnsubscribeFlags)
@@ -294,7 +294,7 @@ func testF088Unsub(t *testing.T, c net.Conn, r *mqttReader, upi uint16, trace *[
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		p, ok, eof := testF088Read(t, r, time.Until(deadline))
+		p, ok, eof := testRead(t, r, time.Until(deadline))
 		if eof {
 			t.Fatalf("fixture: the connection on B ended before the UNSUBACK; packets %v", *trace)
 		}
@@ -309,13 +309,13 @@ func testF088Unsub(t *testing.T, c net.Conn, r *mqttReader, upi uint16, trace *[
 	t.Fatalf("fixture: no UNSUBACK for %d within 10s; packets %v", upi, *trace)
 }
 
-// testF088XWorld is one client whose message 1 is parked in broker A's open send section while
+// testXWorld is one client whose message 1 is parked in broker A's open send section while
 // the client resumes on broker B under a new tenure.
-type testF088XWorld struct {
+type testXWorld struct {
 	oA, oB     *Options
 	sA, sB     *Server
 	asmA, asmB *mqttAccountSessionManager
-	sec        *testF088Sections
+	sec        *testSections
 
 	cid, idHash, gen, epoch string
 	tenureA, tenureB        mqttOutboundEntitlement
@@ -340,12 +340,12 @@ type testF088XWorld struct {
 	lin2              string
 	t0                time.Time // message 1's section opened on A
 	writerReached     atomic.Bool
-	pkts              []testF088Packet // every packet the client read on B
+	pkts              []testPacket // every packet the client read on B
 	pubConn           net.Conn
 	pubR              *mqttReader
 
-	// order is the race ordering the harness forces (see testF088Order).
-	order         testF088Order
+	// order is the race ordering the harness forces (see testOrder).
+	order         testOrder
 	regSeqB       uint64 // message 1's register sequence as B's entry names it
 	evictHold     chan struct{}
 	evictHoldOnce sync.Once
@@ -361,31 +361,31 @@ type testF088XWorld struct {
 	certHeld          atomic.Bool // A's persist reached the hold
 }
 
-// testF088Order is the race ordering between A's displacement and B's recovery. Every one is an
+// testOrder is the race ordering between A's displacement and B's recovery. Every one is an
 // ordering production can take; none is unreachable.
-type testF088Order int
+type testOrder int
 
 const (
-	// testF088AFirst: A's certificate persisted before B's recovery cleared A's token (issue #123's
+	// testAFirst: A's certificate persisted before B's recovery cleared A's token (issue #123's
 	// schedule, as run 1 resolved naturally). CHECKED: anything else fails the fixture.
-	testF088AFirst testF088Order = iota
-	// testF088BFirstCertHeld: A's closure-certificate persist is HELD, so B's recovery runs with A's
+	testAFirst testOrder = iota
+	// testBFirstCertHeld: A's closure-certificate persist is HELD, so B's recovery runs with A's
 	// token still on the register. A's gate is sealed regardless: sealing precedes persistence.
-	testF088BFirstCertHeld
-	// testF088BFirstEvictHeld: A's eviction worker is HELD before its record load
+	testBFirstCertHeld
+	// testBFirstEvictHeld: A's eviction worker is HELD before its record load
 	// (testEvictPauseBeforeLoad), so A never certifies its connection: A's session stays resident,
 	// its gate stays open, and its writer can really write to the old connection.
-	testF088BFirstEvictHeld
+	testBFirstEvictHeld
 )
 
-func (o testF088Order) bFirst() bool { return o != testF088AFirst }
+func (o testOrder) bFirst() bool { return o != testAFirst }
 
-func (o testF088Order) String() string {
+func (o testOrder) String() string {
 	return [...]string{"A-first", "B-first (certificate persist held)", "B-first (eviction held)"}[o]
 }
 
 // releaseEvict lets A's held eviction worker proceed.
-func (w *testF088XWorld) releaseEvict() {
+func (w *testXWorld) releaseEvict() {
 	if w.evictHold != nil {
 		w.evictHoldOnce.Do(func() { close(w.evictHold) })
 	}
@@ -394,7 +394,7 @@ func (w *testF088XWorld) releaseEvict() {
 // requireCertifiedWhileParked checks, while A is still PARKED at RESERVED and before it is released,
 // that A's EXACT binding holds an in-memory closure certificate: the gate was sealed before A's
 // intent could run. The INTENT window fires after recordSendIntent returns, too late to prove it.
-func (w *testF088XWorld) requireCertifiedWhileParked(t *testing.T) {
+func (w *testXWorld) requireCertifiedWhileParked(t *testing.T) {
 	t.Helper()
 	b := w.ccA.outBind
 	if c := b.closeCert(); !mqttBindingCertifies(b, c) || b.mayWrite() {
@@ -404,25 +404,25 @@ func (w *testF088XWorld) requireCertifiedWhileParked(t *testing.T) {
 }
 
 // releaseCert lets A's held certificate persist proceed.
-func (w *testF088XWorld) releaseCert() {
+func (w *testXWorld) releaseCert() {
 	if w.certHold != nil {
 		w.certHoldOnce.Do(func() { close(w.certHold) })
 	}
 }
 
-// testF088AObservation is what A's displaced section did once released.
-type testF088AObservation struct {
+// testAObservation is what A's displaced section did once released.
+type testAObservation struct {
 	intent        bool // the INTENT window fired: the marker's delete was confirmed
 	markerGone    bool
-	writerReached bool            // the writer reached wmu (its binding checks passed), nothing more
-	gateOpen      bool            // A's output gate after the section
-	oldPkt        *testF088Packet // message 1's PUBLISH, if the old reader read it
-	oldOther      []testF088Packet
+	writerReached bool        // the writer reached wmu (its binding checks passed), nothing more
+	gateOpen      bool        // A's output gate after the section
+	oldPkt        *testPacket // message 1's PUBLISH, if the old reader read it
+	oldOther      []testPacket
 	oldEOF        bool
 	reg           *mqttInflightRecord
 }
 
-func (o testF088AObservation) String() string {
+func (o testAObservation) String() string {
 	old := "nothing read within 2s"
 	switch {
 	case o.oldPkt != nil:
@@ -436,36 +436,36 @@ func (o testF088AObservation) String() string {
 }
 
 // wireReceipt reports whether the old connection's reader received message 1's PUBLISH.
-func (o testF088AObservation) wireReceipt(pi uint16) bool {
+func (o testAObservation) wireReceipt(pi uint16) bool {
 	return o.oldPkt != nil && o.oldPkt.typ == mqttPacketPub && o.oldPkt.pi == pi
 }
 
-// testF088XHarness runs steps 1-6b of the plan: message 1 parked in A's section with the token
+// testXHarness runs steps 1-6b of the plan: message 1 parked in A's section with the token
 // acquired and the marker standing, the client resumed on B under a new tenure, and message 2
 // started and unacknowledged on B so a real UNSUBSCRIBE drain is staged.
 //
-// order selects the ordering (testF088Order). For either B-first ordering the REACH of the premise is
+// order selects the ordering (testOrder). For either B-first ordering the REACH of the premise is
 // that B's entry acts, names A's allocation, has slot.actionLive over A's own token still on the
 // register, and — since issue #90's fix I — reads POSSIBLY ATTEMPTED with the marker retained as
 // deletion debt (it read PROVEN-UNSENT before the fix: witness runs 1-3). For A-first the ordering
 // itself is checked: A's certificate cleared the token before B's read, so B's entry is proven-unsent.
-func testF088XHarness(t *testing.T, cid string, order testF088Order) *testF088XWorld {
+func testXHarness(t *testing.T, cid string, order testOrder) *testXWorld {
 	t.Helper()
-	return testF088XHarnessWith(t, cid, order, nil)
+	return testXHarnessWith(t, cid, order, nil)
 }
 
-// testF088XHarnessWith is testF088XHarness with beforeResume, when non-nil, run once message 1 is
+// testXHarnessWith is testXHarness with beforeResume, when non-nil, run once message 1 is
 // parked on A and before the client resumes on B: the point where a test seeds PERSISTED state
 // (a verdict made durable on A's session record) for B's recovery to meet.
-func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeResume func(w *testF088XWorld)) *testF088XWorld {
+func testXHarnessWith(t *testing.T, cid string, order testOrder, beforeResume func(w *testXWorld)) *testXWorld {
 	t.Helper()
-	w := &testF088XWorld{cid: cid, idHash: getHash(cid), order: order}
+	w := &testXWorld{cid: cid, idHash: getHash(cid), order: order}
 	w.oA = testMQTTDefaultOptions()
-	w.oA.MQTT.AckWait = testF088XAckWait
+	w.oA.MQTT.AckWait = testXAckWait
 	w.sA = testMQTTRunServer(t, w.oA)
 	t.Cleanup(func() { testMQTTShutdownServer(w.sA) }) // owns the shared nats-server: last
 	w.oB = testMQTTDefaultOptions()
-	w.oB.MQTT.AckWait = testF088XAckWait
+	w.oB.MQTT.AckWait = testXAckWait
 	testSetStoreDir(w.oB, testStoreDir(w.oA))
 	w.sB = testMQTTRunServer(t, w.oB)
 	t.Cleanup(func() { w.sB.Shutdown() })
@@ -488,7 +488,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 	w.bindRun, w.bindConn = w.ccA.outBind.run, w.ccA.outBind.conn
 
 	// (2) The park, and the writer observation on A's original connection.
-	w.sec = testF088InstallSections(t, w.asmA, w.asmB)
+	w.sec = testInstallSections(t, w.asmA, w.asmB)
 	ccA := w.ccA
 	pre := func(c *client) {
 		if c == ccA {
@@ -498,7 +498,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 	mqttTestWriterPreLockHookV.Store(&pre)
 	t.Cleanup(func() { mqttTestWriterPreLockHookV.Store(nil) })
 	switch order {
-	case testF088BFirstEvictHeld:
+	case testBFirstEvictHeld:
 		// The hold on A's eviction worker, for this client only. Registered after the servers so
 		// its release runs before their shutdown (the worker holds the will-worker group).
 		w.evictHold = make(chan struct{})
@@ -518,7 +518,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 			w.asmA.testEvictPauseBeforeLoad = nil
 			w.asmA.mu.Unlock()
 		})
-	case testF088BFirstCertHeld:
+	case testBFirstCertHeld:
 		// The hold on A's certificate persist, filtered to A's binding. Registered after the
 		// servers so its release runs before their shutdown.
 		w.certHold = make(chan struct{})
@@ -588,7 +588,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 		t.Fatalf("REACH: B must serve generation %q under a NEW tenure: gen %q, tenure A %q, B %q",
 			w.gen, genB, w.tenureA.Tenure, w.tenureB.Tenure)
 	}
-	if order != testF088BFirstEvictHeld {
+	if order != testBFirstEvictHeld {
 		// Under the eviction hold A stays resident by construction; that test asserts A's eviction
 		// after releasing it.
 		w.requireANotResident(t)
@@ -651,7 +651,7 @@ func testF088XHarnessWith(t *testing.T, cid string, order testF088Order, beforeR
 }
 
 // requireANotResident waits for broker A to let go of the displaced session.
-func (w *testF088XWorld) requireANotResident(t *testing.T) {
+func (w *testXWorld) requireANotResident(t *testing.T) {
 	t.Helper()
 	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
 		w.asmA.mu.RLock()
@@ -666,12 +666,12 @@ func (w *testF088XWorld) requireANotResident(t *testing.T) {
 
 // startMessage2 is step 6b: message 2 published, delivered to the client on B through B's own
 // section, and left unacknowledged, so B's UNSUBSCRIBE stages a real drain.
-func (w *testF088XWorld) startMessage2(t *testing.T) {
+func (w *testXWorld) startMessage2(t *testing.T) {
 	t.Helper()
 	testMQTTPublish(t, w.pubConn, w.pubR, 1, false, false, "foo", 2, []byte("two"))
 	deadline := time.Now().Add(10 * time.Second)
 	for w.pi2 == 0 && time.Now().Before(deadline) {
-		p, ok, eof := testF088Read(t, w.rB, time.Until(deadline))
+		p, ok, eof := testRead(t, w.rB, time.Until(deadline))
 		if eof {
 			t.Fatalf("fixture: the client's connection on B ended; packets %v", w.pkts)
 		}
@@ -709,7 +709,7 @@ func (w *testF088XWorld) startMessage2(t *testing.T) {
 // production's own hooks and the stores: the confirmed marker delete (INTENT), the enqueue's
 // return (WROTE, which is not proof of a write), the writer reaching its lock, A's output gate,
 // the old connection's reader, and A's token drain.
-func (w *testF088XWorld) observeA(t *testing.T) testF088AObservation {
+func (w *testXWorld) observeA(t *testing.T) testAObservation {
 	t.Helper()
 	w.sec.releaseReserved()
 	// The section ends through endPublishSend, after its drain of the action.
@@ -719,7 +719,7 @@ func (w *testF088XWorld) observeA(t *testing.T) testF088AObservation {
 		t.Fatalf("fixture: A's released section never reached its end; windows %v; state %s",
 			w.sec.windowsA(), w.state(w.sessB, w.asmB))
 	}
-	var o testF088AObservation
+	var o testAObservation
 	o.reg, _, _ = w.asmA.jsa.loadInflightRecord(w.regSubj)
 	o.intent = w.sec.sawA(mqttMarkerSendIntent)
 	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); smsg == nil {
@@ -733,7 +733,7 @@ func (w *testF088XWorld) observeA(t *testing.T) testF088AObservation {
 	// is reported rather than mistaken for it.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		p, ok, eof := testF088Read(t, w.rA, time.Until(deadline))
+		p, ok, eof := testRead(t, w.rA, time.Until(deadline))
 		if !ok {
 			o.oldEOF = eof
 			break
@@ -753,10 +753,10 @@ func (w *testF088XWorld) observeA(t *testing.T) testF088AObservation {
 
 // checkWindow fails the FIXTURE when the premise's window was not held: the elapsed time since
 // message 1's section opened on A exceeds the bound, or B opened any section for message 1.
-func (w *testF088XWorld) checkWindow(t *testing.T, when string) {
+func (w *testXWorld) checkWindow(t *testing.T, when string) {
 	t.Helper()
-	if el := time.Since(w.t0); el > testF088XWindow {
-		t.Fatalf("fixture window expired at %s: %v since message 1's section opened on A (bound %v)", when, el, testF088XWindow)
+	if el := time.Since(w.t0); el > testXWindow {
+		t.Fatalf("fixture window expired at %s: %v since message 1's section opened on A (bound %v)", when, el, testXWindow)
 	}
 	if opened, onPI := w.sec.openedB(); onPI {
 		t.Fatalf("fixture: B opened a section for message 1's identifier %d by %s: %v", w.pi, when, opened)
@@ -764,7 +764,7 @@ func (w *testF088XWorld) checkWindow(t *testing.T, when string) {
 }
 
 // state dumps everything the contract assertions read, for a failure message.
-func (w *testF088XWorld) state(sess *mqttSession, asm *mqttAccountSessionManager) string {
+func (w *testXWorld) state(sess *mqttSession, asm *mqttAccountSessionManager) string {
 	var b strings.Builder
 	x, xseq, xerr := asm.jsa.loadOutboundExchange(w.cid, w.epoch, w.gen, w.lin)
 	fmt.Fprintf(&b, "exchange %+v@%d (%v); ", x, xseq, xerr)
@@ -799,7 +799,7 @@ func (w *testF088XWorld) state(sess *mqttSession, asm *mqttAccountSessionManager
 
 // released reports nil once message 1's exchange is Terminal and its identifier and charge are
 // released on sess.
-func (w *testF088XWorld) released(sess *mqttSession, asm *mqttAccountSessionManager) error {
+func (w *testXWorld) released(sess *mqttSession, asm *mqttAccountSessionManager) error {
 	x, _, err := asm.jsa.loadOutboundExchange(w.cid, w.epoch, w.gen, w.lin)
 	if err != nil || x == nil || x.Phase != mqttExchangeTerminal {
 		return fmt.Errorf("the exchange is not Terminal")
@@ -816,7 +816,7 @@ func (w *testF088XWorld) released(sess *mqttSession, asm *mqttAccountSessionMana
 }
 
 // awaitReleased polls released; a miss is a CONTRACT failure reported with the dump.
-func (w *testF088XWorld) awaitReleased(t *testing.T, sess *mqttSession, asm *mqttAccountSessionManager, what string) bool {
+func (w *testXWorld) awaitReleased(t *testing.T, sess *mqttSession, asm *mqttAccountSessionManager, what string) bool {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -837,7 +837,7 @@ func (w *testF088XWorld) awaitReleased(t *testing.T, sess *mqttSession, asm *mqt
 // 1's identifier (so never allocated or transmitted it) while the exchange was un-ended, and the
 // generation holds no exchange beyond message 1's and message 2's (no second exchange for the
 // source delivery).
-func (w *testF088XWorld) checkNoConflict(t *testing.T, asm *mqttAccountSessionManager) {
+func (w *testXWorld) checkNoConflict(t *testing.T, asm *mqttAccountSessionManager) {
 	t.Helper()
 	if opened, onPI := w.sec.openedB(); onPI {
 		t.Errorf("CONTRACT: B opened a section for message 1's identifier %d: %v", w.pi, opened)
@@ -857,8 +857,8 @@ func (w *testF088XWorld) checkNoConflict(t *testing.T, asm *mqttAccountSessionMa
 	}
 }
 
-// testF088Cancel is one cancellation recovery's classification met.
-type testF088Cancel struct {
+// testCancel is one cancellation recovery's classification met.
+type testCancel struct {
 	pi                    uint16
 	nonce                 string
 	recCancelled, verdict bool
@@ -868,17 +868,17 @@ type testF088Cancel struct {
 // coldOnA disconnects the client from B and reconnects it to A, a THIRD tenure, with recovery's
 // cancellation classification observed and A's advances captured. It returns the resumed
 // session, the classifications met, the advance capture, and the new connection.
-func (w *testF088XWorld) coldOnA(t *testing.T) (*mqttSession, []testF088Cancel, func() *mqttInflightRecord, net.Conn, *mqttReader) {
+func (w *testXWorld) coldOnA(t *testing.T) (*mqttSession, []testCancel, func() *mqttInflightRecord, net.Conn, *mqttReader) {
 	t.Helper()
 	// A persistent session stays resident on B after a plain disconnect; the reconnect to A takes
 	// it over across brokers, which is asserted after the CONNECT below.
 	w.cB.Close()
 	var mu sync.Mutex
-	var seen []testF088Cancel
+	var seen []testCancel
 	w.asmA.mu.Lock()
 	w.asmA.testRecoverCancellation = func(pi uint16, nonce string, recCancelled, verdict bool, markerSeq uint64) {
 		mu.Lock()
-		seen = append(seen, testF088Cancel{pi, nonce, recCancelled, verdict, markerSeq})
+		seen = append(seen, testCancel{pi, nonce, recCancelled, verdict, markerSeq})
 		mu.Unlock()
 	}
 	w.asmA.mu.Unlock()
@@ -947,7 +947,7 @@ func (w *testF088XWorld) coldOnA(t *testing.T) (*mqttSession, []testF088Cancel, 
 		return nil
 	})
 	mu.Lock()
-	met := append([]testF088Cancel(nil), seen...)
+	met := append([]testCancel(nil), seen...)
 	mu.Unlock()
 	return sess3, met, func() *mqttInflightRecord {
 		amu.Lock()
@@ -958,10 +958,10 @@ func (w *testF088XWorld) coldOnA(t *testing.T) (*mqttSession, []testF088Cancel, 
 
 // coldContract runs the cold contract after coldOnA: message 1 restored ACTING, re-offered with
 // DUP=1 within AckWait + 15 s, ended by its PUBACK, and the advance clears the cancellation.
-func (w *testF088XWorld) coldContract(t *testing.T, sess3 *mqttSession, met []testF088Cancel, byRecord, byVerdict bool,
+func (w *testXWorld) coldContract(t *testing.T, sess3 *mqttSession, met []testCancel, byRecord, byVerdict bool,
 	advanced func() *mqttInflightRecord, c3 net.Conn, r3 *mqttReader) {
 	t.Helper()
-	var hit *testF088Cancel
+	var hit *testCancel
 	for i := range met {
 		if met[i].pi == w.pi && met[i].nonce == w.nonce {
 			hit = &met[i]
@@ -981,11 +981,11 @@ func (w *testF088XWorld) coldContract(t *testing.T, sess3 *mqttSession, met []te
 		return
 	}
 	start := time.Now()
-	deadline := start.Add(testF088XColdRead)
-	var got *testF088Packet
-	var cold []testF088Packet
+	deadline := start.Add(testXColdRead)
+	var got *testPacket
+	var cold []testPacket
 	for got == nil && time.Now().Before(deadline) {
-		p, ok, eof := testF088Read(t, r3, time.Until(deadline))
+		p, ok, eof := testRead(t, r3, time.Until(deadline))
 		if eof {
 			t.Fatalf("fixture: the client's connection on A ended while awaiting the re-offer; packets %v", cold)
 		}
@@ -1003,14 +1003,14 @@ func (w *testF088XWorld) coldContract(t *testing.T, sess3 *mqttSession, met []te
 		ci, cerr := w.asmA.jsa.lookupConsumer(mqttStreamName, w.srcDur)
 		t.Errorf("CONTRACT (cold): message 1's re-offer reached A's delivery callback %d time(s) within %v and no "+
 			"PUBLISH of identifier %d followed; consumer %q %+v (%v); packets %v; state %s",
-			w.coldOffers(), testF088XColdRead, w.pi, w.srcDur, ci, cerr, cold, w.state(sess3, w.asmA))
+			w.coldOffers(), testXColdRead, w.pi, w.srcDur, ci, cerr, cold, w.state(sess3, w.asmA))
 		return
 	}
 	if got == nil {
 		ci, cerr := w.asmA.jsa.lookupConsumer(mqttStreamName, w.srcDur)
 		t.Fatalf("fixture timeout: no PUBLISH of identifier %d within %v (consumer lifecycle outcome if the "+
 			"source cannot re-offer: consumer %q %+v (%v)); packets %v; state %s",
-			w.pi, testF088XColdRead, w.srcDur, ci, cerr, cold, w.state(sess3, w.asmA))
+			w.pi, testXColdRead, w.srcDur, ci, cerr, cold, w.state(sess3, w.asmA))
 	}
 	t.Logf("cold re-offer after %v: %v (packets %v; offers of message 1 reaching A: %d)",
 		time.Since(start).Round(time.Millisecond), *got, cold, w.coldOffers())
@@ -1027,7 +1027,7 @@ func (w *testF088XWorld) coldContract(t *testing.T, sess3 *mqttSession, met []te
 // requireTombstoneLanded waits for B's teardown, finding no marker naming A's allocation, to land
 // the standalone occupant tombstone over the register A drained, with the exchange still at
 // Publish. label names what a miss is (WP1's REACH, or issue #123's characterization).
-func (w *testF088XWorld) requireTombstoneLanded(t *testing.T, label string, attempts func() []testF088Attempt) {
+func (w *testXWorld) requireTombstoneLanded(t *testing.T, label string, attempts func() []testCrossTenureAttempt) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -1056,7 +1056,7 @@ func (w *testF088XWorld) requireTombstoneLanded(t *testing.T, label string, atte
 // requireEnrolledNoTombstone asserts what B's UNSUBSCRIBE does with a POSSIBLY ATTEMPTED message 1
 // (issue #90 fix I): its drain CLAIMS the delivery as started, B keeps the acting entry, and no
 // tombstone reaches the commit seam.
-func (w *testF088XWorld) requireEnrolledNoTombstone(t *testing.T, label string, attempts func() []testF088Attempt) {
+func (w *testXWorld) requireEnrolledNoTombstone(t *testing.T, label string, attempts func() []testCrossTenureAttempt) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -1083,14 +1083,14 @@ func (w *testF088XWorld) requireEnrolledNoTombstone(t *testing.T, label string, 
 	}
 }
 
-// testF088PS1 is WP1 through the REACH for the cold test. A-FIRST since issue #90's fix I: a B-first
+// testPS1 is WP1 through the REACH for the cold test. A-FIRST since issue #90's fix I: a B-first
 // recovery now reads A's outstanding token as a possible attempt and enrols the delivery, so the
 // only schedule left that hands B's teardown a tombstone input is A-first — A's certificate
 // cleared the token before B's read, and A's post-certification intent (issue #123) then removes the
 // marker B's proven-unsent entry relied on.
-func testF088PS1(t *testing.T, cid string) (*testF088XWorld, func() []testF088Attempt) {
+func testPS1(t *testing.T, cid string) (*testXWorld, func() []testCrossTenureAttempt) {
 	t.Helper()
-	w := testF088XHarness(t, cid, testF088AFirst)
+	w := testXHarness(t, cid, testAFirst)
 	// (7) A's real section continues: intent, the writer, and its own drain of the token.
 	obs := w.observeA(t)
 	if !obs.intent {
@@ -1099,8 +1099,8 @@ func testF088PS1(t *testing.T, cid string) (*testF088XWorld, func() []testF088At
 	if obs.wireReceipt(w.pi) {
 		t.Logf("observed: message 1 REACHED the client on A's old connection")
 	}
-	attempts := testF088RecordAttempts(t, &w.asmB.jsa, w.regSubj)
-	testF088Unsub(t, w.cB, w.rB, 7, &w.pkts)
+	attempts := testRecordAttempts(t, &w.asmB.jsa, w.regSubj)
+	testUnsub(t, w.cB, w.rB, 7, &w.pkts)
 	w.checkWindow(t, "B's UNSUBSCRIBE")
 	w.requireTombstoneLanded(t, "REACH", attempts)
 	return w, attempts
@@ -1123,20 +1123,20 @@ func testF088PS1(t *testing.T, cid string) (*testF088XWorld, func() []testF088At
 //
 // Mutations: X1 (no standalone CAS when withdrawIfEvidenced returns 0: the tombstone REACH fails),
 // X3 (the genuine-cancellation arm drops its marker conjunct: message 1 is not restored acting).
-func TestF088CrossTenureTombstoneOverAPossiblyAttemptedRegisterCold(t *testing.T) {
+func TestCrossTenureTombstoneOverAPossiblyAttemptedRegisterCold(t *testing.T) {
 	// Not parallel: the send-window, writer and certificate hooks are process-wide.
-	w, _ := testF088PS1(t, "f088-ps1-cold")
+	w, _ := testPS1(t, "f088-ps1-cold")
 	sess3, met, advanced, c3, r3 := w.coldOnA(t)
 	w.coldContract(t, sess3, met, true, false, advanced, c3, r3)
 	w.checkNoConflict(t, w.asmA)
 }
 
-// testF088SeedPersistedVerdict makes a void verdict naming nonce DURABLE on sess's session
+// testSeedPersistedVerdict makes a void verdict naming nonce DURABLE on sess's session
 // record: staged through the production entry under the object's accepted entitlement and covered
 // by a landed save. This is SEEDED PERSISTED STATE, stated as such: since issue #90's fix I no
 // production schedule this file drives stages it over a possibly-attempted register (witness run 3
 // is the production reach evidence for the shape).
-func testF088SeedPersistedVerdict(t *testing.T, sess *mqttSession, nonce string) {
+func testSeedPersistedVerdict(t *testing.T, sess *mqttSession, nonce string) {
 	t.Helper()
 	sess.mu.Lock()
 	staged := sess.stageVoidVerdictLocked(mqttTestLicenceLocked(sess, nil), nonce)
@@ -1156,9 +1156,9 @@ func testF088SeedPersistedVerdict(t *testing.T, sess *mqttSession, nonce string)
 	}
 }
 
-// testF088RecordCarriesVerdict reads the session record back from the stream and reports whether it
+// testRecordCarriesVerdict reads the session record back from the stream and reports whether it
 // carries nonce among its verdicts.
-func testF088RecordCarriesVerdict(t *testing.T, asm *mqttAccountSessionManager, cid, nonce string) bool {
+func testRecordCarriesVerdict(t *testing.T, asm *mqttAccountSessionManager, cid, nonce string) bool {
 	t.Helper()
 	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, getHash(cid))
 	if err != nil || smsg == nil {
@@ -1176,19 +1176,19 @@ func testF088RecordCarriesVerdict(t *testing.T, asm *mqttAccountSessionManager, 
 	return false
 }
 
-// testF088VerdictRevisions observes, from recovery's cancellation seam, the verdict revisions the
+// testVerdictRevisions observes, from recovery's cancellation seam, the verdict revisions the
 // recovering object held BEFORE the restore could retire anything (P8-3): credited and equal is the
 // precondition the retirement's revision move is measured against.
-type testF088VerdictRevisions struct {
+type testVerdictRevisions struct {
 	mu            sync.Mutex
-	met           []testF088Cancel
+	met           []testCancel
 	seen          bool
 	rev, savedRev uint64
 }
 
-func testF088ObserveVerdictRevisions(t *testing.T, asm *mqttAccountSessionManager, cid string) *testF088VerdictRevisions {
+func testObserveVerdictRevisions(t *testing.T, asm *mqttAccountSessionManager, cid string) *testVerdictRevisions {
 	t.Helper()
-	v := &testF088VerdictRevisions{}
+	v := &testVerdictRevisions{}
 	asm.mu.Lock()
 	asm.testRecoverCancellation = func(pi uint16, nonce string, recCancelled, verdict bool, markerSeq uint64) {
 		// The seam runs in recovery's classification, outside the session and manager locks; the
@@ -1204,7 +1204,7 @@ func testF088ObserveVerdictRevisions(t *testing.T, asm *mqttAccountSessionManage
 			}
 		}
 		v.mu.Lock()
-		v.met = append(v.met, testF088Cancel{pi, nonce, recCancelled, verdict, markerSeq})
+		v.met = append(v.met, testCancel{pi, nonce, recCancelled, verdict, markerSeq})
 		if ok && !v.seen {
 			v.seen, v.rev, v.savedRev = true, rev, saved
 		}
@@ -1223,11 +1223,11 @@ func testF088ObserveVerdictRevisions(t *testing.T, asm *mqttAccountSessionManage
 // verdict revisions were credited and equal; the restoration retired the nonce in memory and MOVED
 // the revision; the revision-keyed persistence (persistVoidedRegs) then wrote, and the record read
 // back from the stream omits the nonce.
-func requireVerdictRetired(t *testing.T, label string, v *testF088VerdictRevisions, sess *mqttSession,
+func requireVerdictRetired(t *testing.T, label string, v *testVerdictRevisions, sess *mqttSession,
 	asm *mqttAccountSessionManager, cid, nonce string) {
 	t.Helper()
 	v.mu.Lock()
-	seen, before, beforeSaved, met := v.seen, v.rev, v.savedRev, append([]testF088Cancel(nil), v.met...)
+	seen, before, beforeSaved, met := v.seen, v.rev, v.savedRev, append([]testCancel(nil), v.met...)
 	v.mu.Unlock()
 	if !seen {
 		t.Fatalf("%s: recovery's classification never met the verdict-covered register (met %+v)", label, met)
@@ -1250,19 +1250,19 @@ func requireVerdictRetired(t *testing.T, label string, v *testF088VerdictRevisio
 	for !sess.persistVoidedRegs(nil) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if testF088RecordCarriesVerdict(t, asm, cid, nonce) {
+	if testRecordCarriesVerdict(t, asm, cid, nonce) {
 		t.Errorf("%s: the persisted record must omit the retired verdict %s", label, nonce)
 	}
 	t.Logf("%s: verdict retired (revision %d -> %d), record omits it; classification met %+v", label, before, after, met)
 }
 
-// testF088AwaitPublish reads r until a PUBLISH of pi arrives or the deadline passes, returning it and
+// testAwaitPublish reads r until a PUBLISH of pi arrives or the deadline passes, returning it and
 // every packet read.
-func testF088AwaitPublish(t *testing.T, r *mqttReader, pi uint16, deadline time.Time) (*testF088Packet, []testF088Packet) {
+func testAwaitPublish(t *testing.T, r *mqttReader, pi uint16, deadline time.Time) (*testPacket, []testPacket) {
 	t.Helper()
-	var pkts []testF088Packet
+	var pkts []testPacket
 	for time.Now().Before(deadline) {
-		p, ok, eof := testF088Read(t, r, time.Until(deadline))
+		p, ok, eof := testRead(t, r, time.Until(deadline))
 		if eof {
 			t.Fatalf("fixture: the connection ended while awaiting the PUBLISH of %d; packets %v", pi, pkts)
 		}
@@ -1283,7 +1283,7 @@ func testF088AwaitPublish(t *testing.T, r *mqttReader, pi uint16, deadline time.
 //
 // SEEDED PERSISTED STATE, stated as such: message 1 is really transmitted on A (the client reads it,
 // A's intent deleted the marker); the verdict is then staged and saved on A's record through the
-// production entry (testF088SeedPersistedVerdict). Its old producer — B withdrawing a
+// production entry (testSeedPersistedVerdict). Its old producer — B withdrawing a
 // proven-unsent-looking register over A's standing token — no longer exists under fix I; witness
 // run 3 stays the production reach evidence. The client resumes on B: a FRESH object, so the install
 // is fresh. B's recovery must restore message 1 ACTING and retire the verdict (12.3: revisions equal
@@ -1293,15 +1293,15 @@ func testF088AwaitPublish(t *testing.T, r *mqttReader, pi uint16, deadline time.
 //
 // Not exercised: abrupt process death. Mutations: M-F3 (the fresh-install retire call removed:
 // retirement and the re-offer fail), M-F6 (voidedRegsRev++ suppressed: the revision move fails).
-func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) {
+func TestCrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) {
 	// Not parallel: the recovery seam and the offer hook are account- and process-wide.
 	const cid = "f088-ps2c"
 	oA := testMQTTDefaultOptions()
-	oA.MQTT.AckWait = testF088XAckWait
+	oA.MQTT.AckWait = testXAckWait
 	sA := testMQTTRunServer(t, oA)
 	t.Cleanup(func() { testMQTTShutdownServer(sA) })
 	oB := testMQTTDefaultOptions()
-	oB.MQTT.AckWait = testF088XAckWait
+	oB.MQTT.AckWait = testXAckWait
 	testSetStoreDir(oB, testStoreDir(oA))
 	sB := testMQTTRunServer(t, oB)
 	t.Cleanup(func() { sB.Shutdown() })
@@ -1317,7 +1317,7 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 	t.Cleanup(func() { pub.Close() })
 	testMQTTCheckConnAck(t, pubr, mqttConnAckRCConnectionAccepted, false)
 	testMQTTPublish(t, pub, pubr, 1, false, false, "foo", 1, []byte("one"))
-	first, ok, _ := testF088Read(t, rA, 10*time.Second)
+	first, ok, _ := testRead(t, rA, 10*time.Second)
 	if !ok || first.typ != mqttPacketPub || first.payload != "one" {
 		t.Fatalf("fixture: the client must receive message 1 on A, read %v (ok %v)", first, ok)
 	}
@@ -1325,7 +1325,7 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 	sessA.mu.Lock()
 	gen, idHash := sessA.gen, sessA.idHash
 	sessA.mu.Unlock()
-	w := &testF088XWorld{cid: cid, idHash: idHash, gen: gen, epoch: asmA.sessStreamEpoch, asmA: asmA, asmB: asmB,
+	w := &testXWorld{cid: cid, idHash: idHash, gen: gen, epoch: asmA.sessStreamEpoch, asmA: asmA, asmB: asmB,
 		sA: sA, sB: sB, oA: oA, oB: oB, pi: pi}
 	w.regSubj = mqttInflightSubject(idHash, gen, pi)
 	w.markSubj = w.regSubj + "." + mqttInflightMarkerSuffix
@@ -1338,11 +1338,11 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 		w.nonce, w.lin, w.srcDur, w.srcSeq = reg.Nonce, reg.Lin, reg.Dur, reg.Seq
 		return nil
 	})
-	testF088SeedPersistedVerdict(t, sessA, w.nonce)
+	testSeedPersistedVerdict(t, sessA, w.nonce)
 	cA.Close()
 
 	// The cold resume on B, a fresh object, with the verdict revisions observed before the restore.
-	revs := testF088ObserveVerdictRevisions(t, asmB, cid)
+	revs := testObserveVerdictRevisions(t, asmB, cid)
 	var offers atomic.Int64
 	restoreOffers := setMQTTTestDeliveryOfferedHook(func(sub *subscription, reply string) {
 		if sub != nil && sub.client != nil && sub.client.srv == sB && mqttSourceAckReplyBinds(reply, mqttStreamName, w.srcDur, w.srcSeq) {
@@ -1363,13 +1363,13 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 	}
 	requireVerdictRetired(t, "W-PS2C", revs, sessB, asmB, cid, w.nonce)
 
-	got, pkts := testF088AwaitPublish(t, rB, pi, time.Now().Add(testF088XColdRead))
+	got, pkts := testAwaitPublish(t, rB, pi, time.Now().Add(testXColdRead))
 	if got == nil {
 		if offers.Load() > 0 {
 			t.Fatalf("CONTRACT: message 1's re-offer reached B's delivery callback %d time(s) and no PUBLISH followed; "+
 				"packets %v; state %s", offers.Load(), pkts, w.state(sessB, asmB))
 		}
-		t.Fatalf("fixture timeout: no re-offer of message 1 within %v; packets %v; state %s", testF088XColdRead, pkts, w.state(sessB, asmB))
+		t.Fatalf("fixture timeout: no re-offer of message 1 within %v; packets %v; state %s", testXColdRead, pkts, w.state(sessB, asmB))
 	}
 	if got.payload != "one" || got.flags&mqttPubFlagDup == 0 {
 		t.Errorf("CONTRACT: the retransmission must carry DUP=1 and message 1's payload, got %v", *got)
@@ -1385,7 +1385,7 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 // writes.
 //
 // B-first with A's eviction held so B reads A's token; the verdict is SEEDED PERSISTED STATE on A's
-// record before the resume (testF088SeedPersistedVerdict). B's recovery must keep message 1
+// record before the resume (testSeedPersistedVerdict). B's recovery must keep message 1
 // possibly attempted with the marker as debt and retire the verdict (12.3). A's eviction is then
 // released and its parked section ends WITHOUT intent (the Reserved hook returns false): the token
 // drains, the marker still stands. JetStream's AckWait re-offer reaches B: its section must reach
@@ -1395,22 +1395,22 @@ func TestF088CrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) 
 //
 // Not exercised: abrupt process death. Mutations: M-F3/M-F3b-adjacent retirement removal (the
 // verdict fence refuses B's send), M-F4 (marker debt erased: no INTENT before WROTE).
-func TestF088RecoveredTokenWithPersistedVerdictRetransmitsAfterNoIntentDrain(t *testing.T) {
+func TestRecoveredTokenWithPersistedVerdictRetransmitsAfterNoIntentDrain(t *testing.T) {
 	// Not parallel: the send-window, writer, eviction and recovery hooks are process- or account-wide.
-	var revs *testF088VerdictRevisions
-	w := testF088XHarnessWith(t, "f088-ps2t", testF088BFirstEvictHeld, func(w *testF088XWorld) {
-		testF088SeedPersistedVerdict(t, w.sessA, w.nonce)
-		revs = testF088ObserveVerdictRevisions(t, w.asmB, w.cid)
+	var revs *testVerdictRevisions
+	w := testXHarnessWith(t, "f088-ps2t", testBFirstEvictHeld, func(w *testXWorld) {
+		testSeedPersistedVerdict(t, w.sessA, w.nonce)
+		revs = testObserveVerdictRevisions(t, w.asmB, w.cid)
 	})
 	requireVerdictRetired(t, "W-PS2T", revs, w.sessB, w.asmB, w.cid, w.nonce)
-	testF088DrainWithoutIntentThenRetransmit(t, w, "W-PS2T")
+	testDrainWithoutIntentThenRetransmit(t, w, "W-PS2T")
 }
 
 // bSectionOrder reports where B's first INTENT and first WROTE window for message 1's identifier
 // fall among every window B reached. WROTE fires after the enqueue returns, so the client can read
 // the PUBLISH before it is recorded: the read waits (up to 5 s) for it rather than judge a
 // half-recorded section.
-func (w *testF088XWorld) bSectionOrder() (intentAt, wroteAt int, opened []string) {
+func (w *testXWorld) bSectionOrder() (intentAt, wroteAt int, opened []string) {
 	wantIntent := fmt.Sprintf("%d/%s", w.pi, mqttMarkerSendIntent)
 	wantWrote := fmt.Sprintf("%d/%s", w.pi, mqttMarkerSendWrote)
 	for end := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
@@ -1430,10 +1430,10 @@ func (w *testF088XWorld) bSectionOrder() (intentAt, wroteAt int, opened []string
 	}
 }
 
-// testF088DrainWithoutIntentThenRetransmit releases A's eviction, ends A's parked section WITHOUT
+// testDrainWithoutIntentThenRetransmit releases A's eviction, ends A's parked section WITHOUT
 // intent, and requires B's own retransmission to confirm the retained marker's delete before its
 // write, carry DUP=1, and complete on its PUBACK.
-func testF088DrainWithoutIntentThenRetransmit(t *testing.T, w *testF088XWorld, label string) {
+func testDrainWithoutIntentThenRetransmit(t *testing.T, w *testXWorld, label string) {
 	t.Helper()
 	w.releaseEvict()
 	w.requireANotResident(t)
@@ -1442,9 +1442,9 @@ func testF088DrainWithoutIntentThenRetransmit(t *testing.T, w *testF088XWorld, l
 	if obs.intent || obs.markerGone || obs.oldPkt != nil || obs.reg == nil || obs.reg.ActionToken != _EMPTY_ {
 		t.Fatalf("fixture (%s): A's section must drain its token WITHOUT intent, the marker standing: %v", label, obs)
 	}
-	got, pkts := testF088AwaitPublish(t, w.rB, w.pi, time.Now().Add(testF088XColdRead))
+	got, pkts := testAwaitPublish(t, w.rB, w.pi, time.Now().Add(testXColdRead))
 	if got == nil {
-		t.Fatalf("%s: B never retransmitted message 1 within %v; packets %v; state %s", label, testF088XColdRead, pkts,
+		t.Fatalf("%s: B never retransmitted message 1 within %v; packets %v; state %s", label, testXColdRead, pkts,
 			w.state(w.sessB, w.asmB))
 	}
 	intentAt, wroteAt, opened := w.bSectionOrder()
@@ -1478,9 +1478,9 @@ func testF088DrainWithoutIntentThenRetransmit(t *testing.T, w *testF088XWorld, l
 //
 // Not exercised: abrupt process death. Mutation: M-F4 (Site 1 sets markerSeq=0: no INTENT before
 // WROTE, the marker survives, the second recovery reads it unsent).
-func TestF088RecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
+func TestRecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 	// Not parallel: the send-window, writer and eviction hooks are process- or account-wide.
-	w := testF088XHarness(t, "f088-mkdebt", testF088BFirstEvictHeld)
+	w := testXHarness(t, "f088-mkdebt", testBFirstEvictHeld)
 	w.releaseEvict()
 	w.requireANotResident(t)
 	w.sec.abortReserved.Store(true)
@@ -1488,9 +1488,9 @@ func TestF088RecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 	if obs.intent || obs.markerGone || obs.oldPkt != nil || obs.reg == nil || obs.reg.ActionToken != _EMPTY_ {
 		t.Fatalf("fixture: A's section must drain its token WITHOUT intent, the marker standing: %v", obs)
 	}
-	got, pkts := testF088AwaitPublish(t, w.rB, w.pi, time.Now().Add(testF088XColdRead))
+	got, pkts := testAwaitPublish(t, w.rB, w.pi, time.Now().Add(testXColdRead))
 	if got == nil {
-		t.Fatalf("CONTRACT: B never retransmitted message 1 within %v; packets %v; state %s", testF088XColdRead, pkts,
+		t.Fatalf("CONTRACT: B never retransmitted message 1 within %v; packets %v; state %s", testXColdRead, pkts,
 			w.state(w.sessB, w.asmB))
 	}
 	intentAt, wroteAt, opened := w.bSectionOrder()
@@ -1546,15 +1546,15 @@ func TestF088RecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 // NumAckPending/AckFloor are RECORDED as read, not inferred. Input: production-reached, two real
 // Servers on one JetStream. Not exercised: abrupt process death; a transmission that actually
 // reached the client (that removal losing completion is issue #90's contract, witnessed by
-// TestF088CrossTenureLegitimateTransmissionThenCancellation).
-func TestF121IntentDeleteAfterCertificationStrandsAWithdrawnExchange(t *testing.T) {
+// TestCrossTenureLegitimateTransmissionThenCancellation).
+func TestIntentDeleteAfterCertificationStrandsAWithdrawnExchange(t *testing.T) {
 	// Not parallel: the send-window, writer and certificate hooks are process-wide.
-	t.Run("A-first", func(t *testing.T) { testF121Run(t, "f121-a-first", testF088AFirst) })
-	t.Run("B-first", func(t *testing.T) { testF121Run(t, "f121-b-first", testF088BFirstCertHeld) })
+	t.Run("A-first", func(t *testing.T) { testRun(t, "f121-a-first", testAFirst) })
+	t.Run("B-first", func(t *testing.T) { testRun(t, "f121-b-first", testBFirstCertHeld) })
 }
 
-func testF121Run(t *testing.T, cid string, order testF088Order) {
-	w := testF088XHarness(t, cid, order)
+func testRun(t *testing.T, cid string, order testOrder) {
+	w := testXHarness(t, cid, order)
 	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); smsg == nil {
 		t.Fatalf("fixture: the marker must still stand before A is released (A parked at RESERVED)")
 	}
@@ -1570,8 +1570,8 @@ func testF121Run(t *testing.T, cid string, order testF088Order) {
 	if obs.oldPkt != nil {
 		t.Errorf("issue #123: no PUBLISH may reach A's old connection through a sealed gate, read %v", *obs.oldPkt)
 	}
-	attempts := testF088RecordAttempts(t, &w.asmB.jsa, w.regSubj)
-	testF088Unsub(t, w.cB, w.rB, 7, &w.pkts)
+	attempts := testRecordAttempts(t, &w.asmB.jsa, w.regSubj)
+	testUnsub(t, w.cB, w.rB, 7, &w.pkts)
 	w.checkWindow(t, "B's UNSUBSCRIBE")
 	if order.bFirst() {
 		// B-FIRST, REPAIRED by issue #90's fix I: B's recovery read A's outstanding token and kept the
@@ -1661,9 +1661,9 @@ func testF121Run(t *testing.T, cid string, order testF088Order) {
 //
 // Mutations: X6 (recovery ignores ActionToken: the premise fails), X4a only if this route is the
 // AckRoute's (it is not: the drain enrols the entry, so completion is the entry's own).
-func TestF088CrossTenureLegitimateTransmissionThenCancellation(t *testing.T) {
+func TestCrossTenureLegitimateTransmissionThenCancellation(t *testing.T) {
 	// Not parallel: the send-window, writer and eviction hooks are process-wide or account-wide.
-	w := testF088XHarness(t, "f088-legit", testF088BFirstEvictHeld)
+	w := testXHarness(t, "f088-legit", testBFirstEvictHeld)
 
 	// (2) FIXTURE VALIDITY at the release: the hold reached, A's gate open, no certificate.
 	b := w.ccA.outBind
@@ -1688,8 +1688,8 @@ func TestF088CrossTenureLegitimateTransmissionThenCancellation(t *testing.T) {
 	w.requireANotResident(t)
 
 	// (3) B's UNSUBSCRIBE: message 1 ENROLLED in the drain as a started delivery, no tombstone.
-	attempts := testF088RecordAttempts(t, &w.asmB.jsa, w.regSubj)
-	testF088Unsub(t, w.cB, w.rB, 7, &w.pkts)
+	attempts := testRecordAttempts(t, &w.asmB.jsa, w.regSubj)
+	testUnsub(t, w.cB, w.rB, 7, &w.pkts)
 	w.requireEnrolledNoTombstone(t, "W-LEGIT", attempts)
 	w.checkWindow(t, "B's UNSUBSCRIBE")
 
@@ -1737,9 +1737,9 @@ func TestF088CrossTenureLegitimateTransmissionThenCancellation(t *testing.T) {
 //
 // Not exercised: abrupt process death; a wire-driven delay of the PUBACK. CONTRACT: Terminal, with
 // the identifier, charge and send reservation released, without another offer or resume.
-func TestF088CrossTenureAckBeforeTheHoldersDrainCompletes(t *testing.T) {
+func TestCrossTenureAckBeforeTheHoldersDrainCompletes(t *testing.T) {
 	// Not parallel: the send-window, writer and eviction hooks are process- or account-wide.
-	w := testF088XHarness(t, "f088-ackearly", testF088BFirstEvictHeld)
+	w := testXHarness(t, "f088-ackearly", testBFirstEvictHeld)
 	b := w.ccA.outBind
 	if c := b.closeCert(); c != nil || !b.mayWrite() || !w.evictReached.Load() {
 		t.Fatalf("fixture: before A's release the eviction hold must be reached (%v) and A's gate open (%v) with no "+
@@ -1752,7 +1752,7 @@ func TestF088CrossTenureAckBeforeTheHoldersDrainCompletes(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("fixture: A's section never reached WROTE; windows %v", w.sec.windowsA())
 	}
-	p, ok, _ := testF088Read(t, w.rA, 5*time.Second)
+	p, ok, _ := testRead(t, w.rA, 5*time.Second)
 	if !ok || p.typ != mqttPacketPub || p.pi != w.pi || p.payload != "one" {
 		t.Fatalf("REACH: the client's old reader must READ message 1's PUBLISH before the PUBACK, read %v (ok %v)", p, ok)
 	}
@@ -1818,20 +1818,20 @@ func TestF088CrossTenureAckBeforeTheHoldersDrainCompletes(t *testing.T) {
 // A's eviction is released after the enrolment and before the acknowledgements: a displaced
 // resident subscription otherwise keeps re-offering and refusing admissions (issue #124), and the drain
 // consumer would keep a live subscriber.
-func TestF088RecoveredDrainClaimRetiresDespiteAFailedSave(t *testing.T) {
+func TestRecoveredDrainClaimRetiresDespiteAFailedSave(t *testing.T) {
 	// Not parallel: the send-window, writer, eviction and save hooks are process- or account-wide.
-	t.Run("baseline", func(t *testing.T) { testF088RecoveredDrainRun(t, "f088-drn-base", false) })
-	t.Run("one failed save", func(t *testing.T) { testF088RecoveredDrainRun(t, "f088-drn-fail", true) })
+	t.Run("baseline", func(t *testing.T) { testRecoveredDrainRun(t, "f088-drn-base", false) })
+	t.Run("one failed save", func(t *testing.T) { testRecoveredDrainRun(t, "f088-drn-fail", true) })
 }
 
-func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
-	w := testF088XHarness(t, cid, testF088BFirstEvictHeld)
+func testRecoveredDrainRun(t *testing.T, cid string, inject bool) {
+	w := testXHarness(t, cid, testBFirstEvictHeld)
 	obs := w.observeA(t)
 	if !obs.wireReceipt(w.pi) {
 		t.Fatalf("REACH: the client's old reader must READ message 1's PUBLISH: %v", obs)
 	}
-	attempts := testF088RecordAttempts(t, &w.asmB.jsa, w.regSubj)
-	testF088Unsub(t, w.cB, w.rB, 7, &w.pkts)
+	attempts := testRecordAttempts(t, &w.asmB.jsa, w.regSubj)
+	testUnsub(t, w.cB, w.rB, 7, &w.pkts)
 	w.requireEnrolledNoTombstone(t, "W-DRN", attempts)
 	w.sessB.mu.Lock()
 	ent := w.sessB.pendingPublish[w.pi]
@@ -2016,19 +2016,19 @@ func testF088RecoveredDrainRun(t *testing.T, cid string, inject bool) {
 // The displaced connection's closure-certificate persist is HELD through the reconnect: a persisted
 // certificate lets the resume clear the token before its walk (W6a observed exactly that), which
 // would hide the token this witness is about. The verdict is SEEDED PERSISTED STATE on the session's
-// own record (testF088SeedPersistedVerdict).
+// own record (testSeedPersistedVerdict).
 //
 // Mutations: M-F7 (Site 4 (ii) removed: the resident stays unsent-classified), M-F3b (the resident
 // retire call removed: the verdict survives).
-func TestF088ResidentRecoveryReclassifiesTheLiveSection(t *testing.T) {
+func TestResidentRecoveryReclassifiesTheLiveSection(t *testing.T) {
 	// Not parallel: the send-window and certificate hooks are process-wide.
-	t.Run("intent", func(t *testing.T) { testF088ResidentRun(t, "f088-resid-intent", false) })
-	t.Run("abort", func(t *testing.T) { testF088ResidentRun(t, "f088-resid-abort", true) })
+	t.Run("intent", func(t *testing.T) { testResidentRun(t, "f088-resid-intent", false) })
+	t.Run("abort", func(t *testing.T) { testResidentRun(t, "f088-resid-abort", true) })
 }
 
-func testF088ResidentRun(t *testing.T, cid string, abort bool) {
+func testResidentRun(t *testing.T, cid string, abort bool) {
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = testF088XAckWait
+	o.MQTT.AckWait = testXAckWait
 	s := testMQTTRunServer(t, o)
 	t.Cleanup(func() { testMQTTShutdownServer(s) })
 	cOld, _ := testInflightSubscriber(t, o, cid, 1)
@@ -2037,7 +2037,7 @@ func testF088ResidentRun(t *testing.T, cid string, abort bool) {
 	sess.mu.Lock()
 	ccOld, gen, idHash := sess.c, sess.gen, sess.idHash
 	sess.mu.Unlock()
-	sec := testF088InstallSections(t, asm, nil)
+	sec := testInstallSections(t, asm, nil)
 	certHold := make(chan struct{})
 	var holdOnce sync.Once
 	releaseCert := func() { holdOnce.Do(func() { close(certHold) }) }
@@ -2071,14 +2071,14 @@ func testF088ResidentRun(t *testing.T, cid string, abort bool) {
 		t.Fatalf("fixture: the parked section must hold the ACQUIRED action token: %+v (%v)", reg, err)
 	}
 	nonce := reg.Nonce
-	testF088SeedPersistedVerdict(t, sess, nonce)
+	testSeedPersistedVerdict(t, sess, nonce)
 	sess.mu.Lock()
 	resident := sess.pendingPublish[pi]
 	sess.mu.Unlock()
 	if resident == nil || resident.transmitted || resident.markerSeq == 0 || resident.sendNonce == _EMPTY_ {
 		t.Fatalf("fixture: the resident must be this object's unsent-classified entry with its section open, got %+v", resident)
 	}
-	revs := testF088ObserveVerdictRevisions(t, asm, cid)
+	revs := testObserveVerdictRevisions(t, asm, cid)
 
 	cNew, _ := testInflightReconnect(t, o, cid)
 	t.Cleanup(func() { cNew.Close() })
@@ -2148,11 +2148,11 @@ func testF088ResidentRun(t *testing.T, cid string, abort bool) {
 //
 // Mutation: X5 (an ACK kind does not replace a parked kind at condemnSendLocked), credited only
 // when the replacement is observed.
-func TestF088D4W6aRecoveryDropOverALiveSection(t *testing.T) {
+func TestD4W6aRecoveryDropOverALiveSection(t *testing.T) {
 	// Not parallel: the send-window and writer hooks are process-wide.
 	const cid = "f088-w6a"
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = testF088XAckWait
+	o.MQTT.AckWait = testXAckWait
 	s := testMQTTRunServer(t, o)
 	t.Cleanup(func() { testMQTTShutdownServer(s) })
 
@@ -2163,7 +2163,7 @@ func TestF088D4W6aRecoveryDropOverALiveSection(t *testing.T) {
 	ccOld, gen, idHash := sess.c, sess.gen, sess.idHash
 	sess.mu.Unlock()
 	epoch := asm.sessStreamEpoch
-	sec := testF088InstallSections(t, asm, nil)
+	sec := testInstallSections(t, asm, nil)
 	var writerReached atomic.Bool
 	pre := func(c *client) {
 		if c == ccOld {
@@ -2284,7 +2284,7 @@ func TestF088D4W6aRecoveryDropOverALiveSection(t *testing.T) {
 	var oldRead string
 	var gotPub bool
 	if wrote {
-		p, ok, eof := testF088Read(t, rOld, 2*time.Second)
+		p, ok, eof := testRead(t, rOld, 2*time.Second)
 		switch {
 		case ok:
 			oldRead = "read " + p.String()

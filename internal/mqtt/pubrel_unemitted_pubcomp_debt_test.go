@@ -23,33 +23,33 @@ import "testing"
 //
 // Every test here drives a process-wide seam, so none is parallel.
 
-// testF116Hold is pi's send hold as the tests read it: the owed count, the open token and the
+// testHold is pi's send hold as the tests read it: the owed count, the open token and the
 // open attempt's write-entry fact. present is false when there is no hold at all.
-type testF116Hold struct {
+type testHold struct {
 	present bool
 	owed    int
 	token   string
 	entered bool
 }
 
-func testF116ReadHold(e *testInflightEnv, pi uint16) testF116Hold {
+func testReadHold(e *testInflightEnv, pi uint16) testHold {
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
 	h := e.sess.sendsInFlight[pi]
 	if h == nil {
-		return testF116Hold{}
+		return testHold{}
 	}
-	return testF116Hold{present: true, owed: h.pubCompOwed, token: h.token, entered: h.relEntered}
+	return testHold{present: true, owed: h.pubCompOwed, token: h.token, entered: h.relEntered}
 }
 
-// testF116Owed is pi's owed count, zero with no hold.
-func testF116Owed(e *testInflightEnv, pi uint16) int {
-	return testF116ReadHold(e, pi).owed
+// testOwed is pi's owed count, zero with no hold.
+func testOwed(e *testInflightEnv, pi uint16) int {
+	return testReadHold(e, pi).owed
 }
 
-// testF116Written delivers seed's canonical PUBREL as its n-th delivery and requires it written
+// testWritten delivers seed's canonical PUBREL as its n-th delivery and requires it written
 // once: the copy whose PUBCOMP a later step owes or answers.
-func testF116Written(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, n int) {
+func testWritten(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, n int) {
 	t.Helper()
 	writes := testCountPubRelWrites(t, e, func() {
 		testDeliverPubRelCorrelated(t, e, seed.pi, seed.reply(n), seed.nonce, testRealPubRelSrcDur, seed.sseq)
@@ -60,17 +60,17 @@ func testF116Written(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, 
 	testActionDrained(t, e, seed.pi)
 }
 
-// testF116Deliver delivers seed's canonical PUBREL as its n-th delivery.
-func testF116Deliver(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, n int) {
+// testPubCompDebtDeliver delivers seed's canonical PUBREL as its n-th delivery.
+func testPubCompDebtDeliver(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, n int) {
 	t.Helper()
 	testDeliverPubRelCorrelated(t, e, seed.pi, seed.reply(n), seed.nonce, testRealPubRelSrcDur, seed.sseq)
 }
 
-// testF116SwapToHoldLocked makes the resident PUBREL entry a Hold copy, which write entry
+// testSwapToHoldLocked makes the resident PUBREL entry a Hold copy, which write entry
 // refuses, and returns the original so the caller can put it back.
 //
 // Lock held on entry.
-func testF116SwapToHoldLocked(e *testInflightEnv, pi uint16) *mqttPending {
+func testSwapToHoldLocked(e *testInflightEnv, pi uint16) *mqttPending {
 	cur := e.sess.pendingPubRel[pi]
 	h := *cur
 	h.kind = mqttPendingHold
@@ -78,8 +78,8 @@ func testF116SwapToHoldLocked(e *testInflightEnv, pi uint16) *mqttPending {
 	return cur
 }
 
-// testF116IdentifierFree waits until nothing reserves pi: no entry in either map, no live hold.
-func testF116IdentifierFree(t *testing.T, e *testInflightEnv, pi uint16, what string) {
+// testIdentifierFree waits until nothing reserves pi: no entry in either map, no live hold.
+func testIdentifierFree(t *testing.T, e *testInflightEnv, pi uint16, what string) {
 	t.Helper()
 	testCustodyEventually(t, what, func() bool {
 		e.sess.mu.Lock()
@@ -98,21 +98,21 @@ func testF116IdentifierFree(t *testing.T, e *testInflightEnv, pi uint16, what st
 //
 // Mutations M1 (never cancel), M3 (cancel unconditionally: the written copy's unit goes too, and
 // its PUBCOMP then finds nothing to consume — caught by the owed reading before it).
-func TestF116APubRelRefusedAfterThePubCompOwesNothing(t *testing.T) {
+func TestAPubRelRefusedAfterThePubCompOwesNothing(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f116-t1")
 	seed := testSeedRealPubRelReady(t, e)
-	testF116Written(t, e, seed, 1)
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	testWritten(t, e, seed, 1)
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("a written, unanswered PUBREL must owe one PUBCOMP, owes %d", got)
 	}
 	written := len(tc.written)
 
 	var midOwed int
 	restore := mqttSetTestSeam(&mqttTestAfterPubRelCommitV, func() {
-		midOwed = testF116Owed(e, seed.pi)
+		midOwed = testOwed(e, seed.pi)
 		e.c.mqttProcessPubComp(seed.pi)
 	})
-	writes := testCountPubRelWrites(t, e, func() { testF116Deliver(t, e, seed, 2) })
+	writes := testCountPubRelWrites(t, e, func() { testPubCompDebtDeliver(t, e, seed, 2) })
 	restore()
 
 	if midOwed != 2 {
@@ -122,17 +122,17 @@ func TestF116APubRelRefusedAfterThePubCompOwesNothing(t *testing.T) {
 		t.Fatalf("a PUBREL whose exchange the PUBCOMP completed must write nothing, entered %d, wire %x",
 			writes, tc.written[written:])
 	}
-	if got := testF116Owed(e, seed.pi); got != 0 {
+	if got := testOwed(e, seed.pi); got != 0 {
 		t.Fatalf("the refused attempt's unit must be given back: owed %d after the callback", got)
 	}
-	testF116IdentifierFree(t, e, seed.pi, "the completed exchange's identifier is free")
+	testIdentifierFree(t, e, seed.pi, "the completed exchange's identifier is free")
 }
 
 // T1, the entry-swap form beside T12's control: a written PUBREL keeps its unit until its PUBCOMP,
 // and one refused at write entry (its entry swapped to a Hold) gives its unit back.
 //
 // Mutations M1 (swapped arm), M3 (control arm).
-func TestF116AnUnwrittenPubRelGivesItsUnitBackAndAWrittenOneKeepsIt(t *testing.T) {
+func TestAnUnwrittenPubRelGivesItsUnitBackAndAWrittenOneKeepsIt(t *testing.T) {
 	for _, swap := range []bool{false, true} {
 		swap := swap
 		t.Run(map[bool]string{false: "written", true: "refused at write entry"}[swap], func(t *testing.T) {
@@ -144,10 +144,10 @@ func TestF116AnUnwrittenPubRelGivesItsUnitBackAndAWrittenOneKeepsIt(t *testing.T
 					return
 				}
 				e.sess.mu.Lock()
-				orig = testF116SwapToHoldLocked(e, seed.pi)
+				orig = testSwapToHoldLocked(e, seed.pi)
 				e.sess.mu.Unlock()
 			})
-			writes := testCountPubRelWrites(t, e, func() { testF116Deliver(t, e, seed, 1) })
+			writes := testCountPubRelWrites(t, e, func() { testPubCompDebtDeliver(t, e, seed, 1) })
 			restore()
 			want, wantWrites := 1, 1
 			if swap {
@@ -156,7 +156,7 @@ func TestF116AnUnwrittenPubRelGivesItsUnitBackAndAWrittenOneKeepsIt(t *testing.T
 			if writes != wantWrites {
 				t.Fatalf("entered the write %d times, want %d", writes, wantWrites)
 			}
-			if got := testF116Owed(e, seed.pi); got != want {
+			if got := testOwed(e, seed.pi); got != want {
 				t.Fatalf("owed %d after the callback, want %d", got, want)
 			}
 			if swap {
@@ -173,15 +173,15 @@ func TestF116AnUnwrittenPubRelGivesItsUnitBackAndAWrittenOneKeepsIt(t *testing.T
 // re-minted while that PUBCOMP can still arrive.
 //
 // Mutations M2 (cancel on Failed), M3.
-func TestF116ATornPubRelWriteKeepsItsUnit(t *testing.T) {
+func TestATornPubRelWriteKeepsItsUnit(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f116-t4")
 	seed := testSeedRealPubRelReady(t, e)
 	tc.failAt = len(tc.written) + 2
-	testF116Deliver(t, e, seed, 1)
+	testPubCompDebtDeliver(t, e, seed, 1)
 	if tc.writeErr == nil {
 		t.Fatal("fixture: the PUBREL write did not tear")
 	}
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("a torn PUBREL write must keep its unit: owed %d", got)
 	}
 }
@@ -191,7 +191,7 @@ func TestF116ATornPubRelWriteKeepsItsUnit(t *testing.T) {
 // after it returns.
 //
 // Mutation M4.
-func TestF116APanicAfterTheWriterKeepsTheUnit(t *testing.T) {
+func TestAPanicAfterTheWriterKeepsTheUnit(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f116-t6")
 	seed := testSeedRealPubRelReady(t, e)
 	tc.failAt = len(tc.written) + 2
@@ -200,14 +200,14 @@ func TestF116APanicAfterTheWriterKeepsTheUnit(t *testing.T) {
 	t.Cleanup(func() { mqttTestTornWriterUnlockedHookV.Store(nil) })
 	recovered := func() (r any) {
 		defer func() { r = recover() }()
-		testF116Deliver(t, e, seed, 1)
+		testPubCompDebtDeliver(t, e, seed, 1)
 		return nil
 	}()
 	mqttTestTornWriterUnlockedHookV.Store(nil)
 	if recovered == nil {
 		t.Fatal("fixture: the hook did not panic")
 	}
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("a panic after the writer was called must keep the unit: owed %d", got)
 	}
 }
@@ -217,26 +217,26 @@ func TestF116APanicAfterTheWriterKeepsTheUnit(t *testing.T) {
 // identifier.
 //
 // Mutation M7 (two guarded decrements: owed 1 -> 0).
-func TestF116ARefusedAttemptLeavesAnUnansweredCopysUnit(t *testing.T) {
+func TestARefusedAttemptLeavesAnUnansweredCopysUnit(t *testing.T) {
 	e, _ := testExecCellEnv(t, "f116-t5b")
 	seed := testSeedRealPubRelReady(t, e)
-	testF116Written(t, e, seed, 1)
+	testWritten(t, e, seed, 1)
 
 	var orig *mqttPending
 	var tok string
 	restore := mqttSetTestSeam(&mqttTestAfterPubRelCommitV, func() {
 		e.sess.mu.Lock()
-		orig = testF116SwapToHoldLocked(e, seed.pi)
+		orig = testSwapToHoldLocked(e, seed.pi)
 		tok = e.sess.sendsInFlight[seed.pi].token
 		e.sess.mu.Unlock()
 	})
-	testF116Deliver(t, e, seed, 2)
+	testPubCompDebtDeliver(t, e, seed, 2)
 	restore()
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("the unanswered written copy's unit must stay: owed %d, want 1", got)
 	}
 	e.sess.endPubRelSend(e.c, seed.pi, tok, false)
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("a repeated closer must change nothing: owed %d, want 1", got)
 	}
 	e.sess.mu.Lock()
@@ -244,17 +244,17 @@ func TestF116ARefusedAttemptLeavesAnUnansweredCopysUnit(t *testing.T) {
 	e.sess.mu.Unlock()
 	testActionDrained(t, e, seed.pi)
 	e.c.mqttProcessPubComp(seed.pi)
-	if got := testF116Owed(e, seed.pi); got != 0 {
+	if got := testOwed(e, seed.pi); got != 0 {
 		t.Fatalf("the real PUBCOMP must answer the written copy: owed %d", got)
 	}
-	testF116IdentifierFree(t, e, seed.pi, "the answered exchange's identifier is free")
+	testIdentifierFree(t, e, seed.pi, "the answered exchange's identifier is free")
 }
 
 // T5c. A stale closer — an earlier attempt's token, after a successor's section opened — touches
 // neither the successor's token nor its count.
 //
 // Mutation M5 (the decrement not behind the exact token).
-func TestF116AStaleCloserLeavesTheSuccessorsSection(t *testing.T) {
+func TestAStaleCloserLeavesTheSuccessorsSection(t *testing.T) {
 	e, _ := testExecCellEnv(t, "f116-t5c")
 	const pi = uint16(9)
 	e.sess.mu.Lock()
@@ -271,7 +271,7 @@ func TestF116AStaleCloserLeavesTheSuccessorsSection(t *testing.T) {
 		t.Fatal("attempt B did not open")
 	}
 	e.sess.endPubRelSend(e.c, pi, tokA, false)
-	if h := testF116ReadHold(e, pi); h.token != tokB || h.owed != 2 {
+	if h := testReadHold(e, pi); h.token != tokB || h.owed != 2 {
 		t.Fatalf("a stale closer changed the successor's section: %+v, want token %q owed 2", h, tokB)
 	}
 	e.sess.endPubRelSend(e.c, pi, tokB, true)
@@ -281,7 +281,7 @@ func TestF116AStaleCloserLeavesTheSuccessorsSection(t *testing.T) {
 // and reset by the next opener even when something left it true.
 //
 // Mutations M12a (not cleared with the token), M12b (not reset by the opener).
-func TestF116TheWriteEntryFactBelongsToTheOpenAttempt(t *testing.T) {
+func TestTheWriteEntryFactBelongsToTheOpenAttempt(t *testing.T) {
 	e, _ := testExecCellEnv(t, "f116-t8")
 	const pi = uint16(10)
 	t.Run("cleared with the token", func(t *testing.T) {
@@ -291,11 +291,11 @@ func TestF116TheWriteEntryFactBelongsToTheOpenAttempt(t *testing.T) {
 			e.sess.markPubRelEnteredLocked(pi, tok)
 		}
 		e.sess.mu.Unlock()
-		if h := testF116ReadHold(e, pi); !ok || !h.entered {
+		if h := testReadHold(e, pi); !ok || !h.entered {
 			t.Fatalf("write entry must mark the open attempt entered: %+v", h)
 		}
 		e.sess.endPubRelSend(e.c, pi, tok, true)
-		if h := testF116ReadHold(e, pi); h.entered || h.token != _EMPTY_ {
+		if h := testReadHold(e, pi); h.entered || h.token != _EMPTY_ {
 			t.Fatalf("the fact must go with the token: %+v", h)
 		}
 	})
@@ -309,16 +309,16 @@ func TestF116TheWriteEntryFactBelongsToTheOpenAttempt(t *testing.T) {
 		h.relEntered = true // seeded: whatever left it true, the next attempt has not entered
 		tok, ok := e.sess.beginPubRelSendLocked(e.c, pi)
 		e.sess.mu.Unlock()
-		if got := testF116ReadHold(e, pi); !ok || got.entered {
+		if got := testReadHold(e, pi); !ok || got.entered {
 			t.Fatalf("a fresh attempt must not read as entered: %+v", got)
 		}
 		e.sess.endPubRelSend(e.c, pi, tok, true)
 	})
 }
 
-// testF116ReleaseLineage applies an accepted ending of lin, as acceptExchangeObservationLocked
+// testReleaseLineage applies an accepted ending of lin, as acceptExchangeObservationLocked
 // does, and reports what that left on pi's PUBREL map.
-func testF116ReleaseLineage(e *testInflightEnv, pi uint16, lin string) (released bool, entry *mqttPending) {
+func testReleaseLineage(e *testInflightEnv, pi uint16, lin string) (released bool, entry *mqttPending) {
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
 	testReleaseLineageLocked(e.sess, lin)
@@ -326,9 +326,9 @@ func testF116ReleaseLineage(e *testInflightEnv, pi uint16, lin string) (released
 	return p != nil && p.awaitingPubCompOwner != 0, p
 }
 
-// testF116NoReleasedDelivery requires that pi carries no released delivery: absent, or the
+// testNoReleasedDelivery requires that pi carries no released delivery: absent, or the
 // terminal reservation the worker keeps for a slot cleanup it owns.
-func testF116NoReleasedDelivery(t *testing.T, e *testInflightEnv, pi uint16, what string) {
+func testNoReleasedDelivery(t *testing.T, e *testInflightEnv, pi uint16, what string) {
 	t.Helper()
 	e.sess.mu.Lock()
 	p := e.sess.pendingPubRel[pi]
@@ -342,15 +342,15 @@ func testF116NoReleasedDelivery(t *testing.T, e *testInflightEnv, pi uint16, wha
 // delivery: that attempt can no longer emit, so no PUBCOMP will ever answer one.
 //
 // Mutation M8 (the release counts the unentered unit).
-func TestF116ALineageReleaseBeforeEntryMakesNoReleasedDelivery(t *testing.T) {
+func TestALineageReleaseBeforeEntryMakesNoReleasedDelivery(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f116-t7")
 	seed := testSeedRealPubRelReady(t, e)
 	written := len(tc.written)
 	var released bool
 	restore := mqttSetTestSeam(&mqttTestAfterPubRelCommitV, func() {
-		released, _ = testF116ReleaseLineage(e, seed.pi, seed.lin)
+		released, _ = testReleaseLineage(e, seed.pi, seed.lin)
 	})
-	writes := testCountPubRelWrites(t, e, func() { testF116Deliver(t, e, seed, 1) })
+	writes := testCountPubRelWrites(t, e, func() { testPubCompDebtDeliver(t, e, seed, 1) })
 	restore()
 	if released {
 		t.Fatal("a release before write entry made a released delivery for a PUBREL that cannot be emitted")
@@ -358,10 +358,10 @@ func TestF116ALineageReleaseBeforeEntryMakesNoReleasedDelivery(t *testing.T) {
 	if writes != 0 || len(tc.written) != written {
 		t.Fatalf("a released exchange's PUBREL must not be written: entered %d", writes)
 	}
-	if got := testF116Owed(e, seed.pi); got != 0 {
+	if got := testOwed(e, seed.pi); got != 0 {
 		t.Fatalf("the unentered attempt's unit must be given back: owed %d", got)
 	}
-	testF116NoReleasedDelivery(t, e, seed.pi, "after the callback")
+	testNoReleasedDelivery(t, e, seed.pi, "after the callback")
 }
 
 // T7b. The same release over a written copy still unanswered DOES make a released delivery — a
@@ -369,20 +369,20 @@ func TestF116ALineageReleaseBeforeEntryMakesNoReleasedDelivery(t *testing.T) {
 // settles through it.
 //
 // Mutation M8's converse guard: a reader that discounted the written unit too would fail here.
-func TestF116ALineageReleaseBeforeEntryKeepsAWrittenCopysReleasedDelivery(t *testing.T) {
+func TestALineageReleaseBeforeEntryKeepsAWrittenCopysReleasedDelivery(t *testing.T) {
 	e, _ := testExecCellEnv(t, "f116-t7b")
 	seed := testSeedRealPubRelReady(t, e)
-	testF116Written(t, e, seed, 1)
+	testWritten(t, e, seed, 1)
 	var released bool
 	restore := mqttSetTestSeam(&mqttTestAfterPubRelCommitV, func() {
-		released, _ = testF116ReleaseLineage(e, seed.pi, seed.lin)
+		released, _ = testReleaseLineage(e, seed.pi, seed.lin)
 	})
-	testF116Deliver(t, e, seed, 2)
+	testPubCompDebtDeliver(t, e, seed, 2)
 	restore()
 	if !released {
 		t.Fatal("a release over an unanswered written copy must make a released delivery")
 	}
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("the written copy's unit must stay: owed %d", got)
 	}
 	e.sess.mu.Lock()
@@ -393,23 +393,23 @@ func TestF116ALineageReleaseBeforeEntryKeepsAWrittenCopysReleasedDelivery(t *tes
 	}
 	testActionDrained(t, e, seed.pi)
 	e.c.mqttProcessPubComp(seed.pi)
-	if got := testF116Owed(e, seed.pi); got != 0 {
+	if got := testOwed(e, seed.pi); got != 0 {
 		t.Fatalf("the PUBCOMP must answer the written copy: owed %d", got)
 	}
-	testF116NoReleasedDelivery(t, e, seed.pi, "after the PUBCOMP")
+	testNoReleasedDelivery(t, e, seed.pi, "after the PUBCOMP")
 }
 
-// testF116ReleaseAtEntry releases lin inside the write block hook — after write entry, before the
+// testReleaseAtEntry releases lin inside the write block hook — after write entry, before the
 // writer — and limits the client's Maximum Packet Size so the writer refuses the frame. It
 // reports whether the release made a released delivery.
-func testF116ReleaseAtEntry(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, n int) (released, entered bool) {
+func testReleaseAtEntry(t *testing.T, e *testInflightEnv, seed testRealPubRelSeed, n int) (released, entered bool) {
 	t.Helper()
 	restore := setMQTTTestPubRelWriteBlock(func() {
-		entered = testF116ReadHold(e, seed.pi).entered
-		released, _ = testF116ReleaseLineage(e, seed.pi, seed.lin)
+		entered = testReadHold(e, seed.pi).entered
+		released, _ = testReleaseLineage(e, seed.pi, seed.lin)
 	})
 	prev := testLongLivedMaxPacketSize(e.c, 3)
-	testF116Deliver(t, e, seed, n)
+	testPubCompDebtDeliver(t, e, seed, n)
 	testLongLivedMaxPacketSize(e.c, prev)
 	restore()
 	return released, entered
@@ -421,11 +421,11 @@ func testF116ReleaseAtEntry(t *testing.T, e *testInflightEnv, seed testRealPubRe
 //
 // Mutations M9 (the release discounts an ENTERED attempt: no released delivery), M10 (no
 // retirement at cancellation).
-func TestF116AnEnteredAttemptRefusedAfterAReleaseRetiresItsReleasedDelivery(t *testing.T) {
+func TestAnEnteredAttemptRefusedAfterAReleaseRetiresItsReleasedDelivery(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f116-t7c")
 	seed := testSeedRealPubRelReady(t, e)
 	written := len(tc.written)
-	released, entered := testF116ReleaseAtEntry(t, e, seed, 1)
+	released, entered := testReleaseAtEntry(t, e, seed, 1)
 	if !entered {
 		t.Fatal("fixture: the hook must run after write entry")
 	}
@@ -435,25 +435,25 @@ func TestF116AnEnteredAttemptRefusedAfterAReleaseRetiresItsReleasedDelivery(t *t
 	if len(tc.written) != written {
 		t.Fatalf("a PUBREL refused for size put %x on the wire", tc.written[written:])
 	}
-	if got := testF116Owed(e, seed.pi); got != 0 {
+	if got := testOwed(e, seed.pi); got != 0 {
 		t.Fatalf("the size-refused attempt's unit must be given back: owed %d", got)
 	}
-	testF116NoReleasedDelivery(t, e, seed.pi, "after the size refusal")
+	testNoReleasedDelivery(t, e, seed.pi, "after the size refusal")
 }
 
 // T7d. The same over a written copy still unanswered: its unit stays, so does the released
 // delivery awaiting its PUBCOMP.
 //
 // Mutation M11 (retirement at cancellation whatever remains owed).
-func TestF116AnEnteredAttemptRefusedAfterAReleaseKeepsAWrittenCopysReleasedDelivery(t *testing.T) {
+func TestAnEnteredAttemptRefusedAfterAReleaseKeepsAWrittenCopysReleasedDelivery(t *testing.T) {
 	e, _ := testExecCellEnv(t, "f116-t7d")
 	seed := testSeedRealPubRelReady(t, e)
-	testF116Written(t, e, seed, 1)
-	released, _ := testF116ReleaseAtEntry(t, e, seed, 2)
+	testWritten(t, e, seed, 1)
+	released, _ := testReleaseAtEntry(t, e, seed, 2)
 	if !released {
 		t.Fatal("a release after write entry must make a released delivery")
 	}
-	if got := testF116Owed(e, seed.pi); got != 1 {
+	if got := testOwed(e, seed.pi); got != 1 {
 		t.Fatalf("the written copy's unit must stay: owed %d", got)
 	}
 	e.sess.mu.Lock()

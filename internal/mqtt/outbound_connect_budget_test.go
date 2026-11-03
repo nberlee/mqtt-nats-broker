@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// TestF105TheOwnershipBudgetIsOneAbsoluteInterval pins the two properties a per-operation timeout
+// TestTheOwnershipBudgetIsOneAbsoluteInterval pins the two properties a per-operation timeout
 // would not have.
 //
 // A protocol that gave each CAS its own timeout lets a retry loop extend the total without bound,
@@ -29,7 +29,7 @@ import (
 // ANCHOR rather than decrementing it as steps report back is what makes a step that HANGS still
 // spend it — a decremented counter measures the work that came back, and the client is waiting on
 // the wall clock.
-func TestF105TheOwnershipBudgetIsOneAbsoluteInterval(t *testing.T) {
+func TestTheOwnershipBudgetIsOneAbsoluteInterval(t *testing.T) {
 	anchor := time.Now()
 	b, err := mqttNewOwnershipBudget(anchor, 100*time.Millisecond)
 	if err != nil {
@@ -74,12 +74,12 @@ func TestF105TheOwnershipBudgetIsOneAbsoluteInterval(t *testing.T) {
 	}
 }
 
-// TestF105ExpiryDispositionsAreNotInterchangeable is the heart of row 9's deadline.
+// TestExpiryDispositionsAreNotInterchangeable is the heart of row 9's deadline.
 //
 // Three outcomes, two of which look alike and mean opposite things. Getting them wrong is not a
 // timing bug — it is either closing a generation whose metadata actually committed, or serving a
 // client whose proposal actually lost.
-func TestF105ExpiryDispositionsAreNotInterchangeable(t *testing.T) {
+func TestExpiryDispositionsAreNotInterchangeable(t *testing.T) {
 	// ABORTED: the loser closes its generation and refuses. It does NOT mint a replacement.
 	aborted, err := mqttDisposeExpiredOwnership(mqttProposalAborted)
 	if err != nil {

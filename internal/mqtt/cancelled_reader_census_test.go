@@ -30,100 +30,100 @@ import (
 // write's idempotence, the tombstone of an exchange a withdrawal positively ENDED, a conservative
 // exclusion that destroys nothing, or chapter P's experimental affine class — and never as a
 // licence to destroy or free an ordinary register on the bit alone. A new reader fails this census
-// until it is classified here. Writers are T32's (TestF088CancellationRegisterProducersAreFrozen).
+// until it is classified here. Writers are T32's (TestCancellationRegisterProducersAreFrozen).
 
-// f088CancelledDisposition is what a read of the bit decides.
-type f088CancelledDisposition string
+// cancelledDisposition is what a read of the bit decides.
+type cancelledDisposition string
 
 const (
 	// A SHAPE rule (decode validation, a transition kind's body rule, a boundary refusal): the bit
 	// constrains which bodies are writable; it licenses nothing.
-	f088CancelledShape f088CancelledDisposition = "shape"
+	cancelledShape cancelledDisposition = "shape"
 	// The written PROVENANCE decides (a pending fence), never the bit's presence.
-	f088CancelledProvenance f088CancelledDisposition = "provenance"
+	cancelledProvenance cancelledDisposition = "provenance"
 	// The bit only TRIGGERS or routes a decision taken on the allocation's unsent MARKER
 	// (standing: genuine cancellation; absent: possibly attempted; unread: nothing concluded).
-	f088CancelledMarkerGated f088CancelledDisposition = "marker-gated"
+	cancelledMarkerGated cancelledDisposition = "marker-gated"
 	// The recogniser or builder of a REFUTED cancellation's clearance, admitted by the write
 	// boundary only on the marker's authoritative absence (WP3 edit 3).
-	f088CancelledRefutedClearance f088CancelledDisposition = "refuted-clearance"
+	cancelledRefutedClearance cancelledDisposition = "refuted-clearance"
 	// The writer recognising an existing tombstone of its own allocation (idempotence): nothing is
 	// destroyed or freed on it.
-	f088CancelledIdempotence f088CancelledDisposition = "idempotence"
+	cancelledIdempotence cancelledDisposition = "idempotence"
 	// The tombstone a WITHDRAWAL wrote beside an exchange it positively ended: the decision rests
 	// on the ended exchange (or is routed through the door, which re-checks marker and phase).
-	f088CancelledEndedWithdrawal f088CancelledDisposition = "ended-withdrawal"
+	cancelledEndedWithdrawal cancelledDisposition = "ended-withdrawal"
 	// Conservative: the bit EXCLUDES the record from a claim, contest or admission, or retains
 	// it; nothing is destroyed or freed on it.
-	f088CancelledConservative f088CancelledDisposition = "conservative"
+	cancelledConservative cancelledDisposition = "conservative"
 	// Chapter P's EXPERIMENTAL AFFINE claim pass: a matching-nonce slot-only tombstone is that
 	// class's close decision and its exact generation is DELETED on the bit. Outside the ordinary
 	// contract (P-f); recorded here so the uniform rule (Q3) can see it, not classified as evidence-safe.
-	f088CancelledAffineClaimClose f088CancelledDisposition = "affine-claim-close"
+	cancelledAffineClaimClose cancelledDisposition = "affine-claim-close"
 )
 
-// f088CancelledBacking names the behavioural tests that witness each disposition.
-var f088CancelledBacking = map[f088CancelledDisposition][]string{
-	f088CancelledShape:      {"TestF088UnmarkedCancelledRegisterIsRefused", "TestF088PendingFenceProvenanceIsEnforcedAtTheBoundary"},
-	f088CancelledProvenance: {"TestF088CopiedFreshAdmissionTombstoneIsNotAFence"},
-	f088CancelledMarkerGated: {"TestF088MarkerlessCancelledRegisterRestoresActingOnColdResume",
-		"TestF088MarkerBackedCancellationStillWithdraws", "TestMQTTSlotAuthorityCancellationIsNotNonTransmission"},
-	f088CancelledRefutedClearance: {"TestMQTTAckArrowClearsAKnownFalseCancellation",
+// cancelledBacking names the behavioural tests that witness each disposition.
+var cancelledBacking = map[cancelledDisposition][]string{
+	cancelledShape:      {"TestUnmarkedCancelledRegisterIsRefused", "TestPendingFenceProvenanceIsEnforcedAtTheBoundary"},
+	cancelledProvenance: {"TestCopiedFreshAdmissionTombstoneIsNotAFence"},
+	cancelledMarkerGated: {"TestMarkerlessCancelledRegisterRestoresActingOnColdResume",
+		"TestMarkerBackedCancellationStillWithdraws", "TestMQTTSlotAuthorityCancellationIsNotNonTransmission"},
+	cancelledRefutedClearance: {"TestMQTTAckArrowClearsAKnownFalseCancellation",
 		"TestMQTTAcquisitionOverAGenuineCancellationIsRefused"},
-	f088CancelledIdempotence:     {"TestF105WithdrawCancellationTombstoneEndsTheObligation"},
-	f088CancelledEndedWithdrawal: {"TestF105WithdrawLandedBeforeACrashIsFinishedByTheNextPass"},
-	f088CancelledConservative:    {"TestF088PendingFenceFromTheProducerIsDroppedOnColdResume"},
-	f088CancelledAffineClaimClose: {"TestF088PendingFenceFromTheProducerIsDroppedOnColdResume",
-		"TestF088MarkerBackedCancellationStillWithdraws"},
+	cancelledIdempotence:     {"TestWithdrawCancellationTombstoneEndsTheObligation"},
+	cancelledEndedWithdrawal: {"TestWithdrawLandedBeforeACrashIsFinishedByTheNextPass"},
+	cancelledConservative:    {"TestPendingFenceFromTheProducerIsDroppedOnColdResume"},
+	cancelledAffineClaimClose: {"TestPendingFenceFromTheProducerIsDroppedOnColdResume",
+		"TestMarkerBackedCancellationStillWithdraws"},
 }
 
-// f088FrozenCancelledReaders is the FROZEN census: every production function reading `.Cancelled`
+// frozenCancelledReaders is the FROZEN census: every production function reading `.Cancelled`
 // (outside an assignment's left-hand side), the number of reads, its disposition, and why. Frozen
 // against the issue #99/issue #90 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted
 // WP2/WP3 edits).
-var f088FrozenCancelledReaders = map[string]struct {
+var frozenCancelledReaders = map[string]struct {
 	n    int
-	disp f088CancelledDisposition
+	disp cancelledDisposition
 	why  string
 }{
-	"mqttValidateInflightShape": {3, f088CancelledShape,
+	"mqttValidateInflightShape": {3, cancelledShape,
 		"decode validation: a pending store body carries no cancellation; a cancelled record cannot sit past PUBLISH with a stored PUBREL"},
-	"mqttValidateCancelOrigin": {2, f088CancelledShape, "Cancelled iff CancelOrigin: an unmarked cancellation is refused, never inferred"},
-	"mqttCheckTransitionKindRules": {1, f088CancelledShape,
+	"mqttValidateCancelOrigin": {2, cancelledShape, "Cancelled iff CancelOrigin: an unmarked cancellation is refused, never inferred"},
+	"mqttCheckTransitionKindRules": {1, cancelledShape,
 		"the tombstone-register kind's body rule: only an untokened ordinary publish cancellation"},
-	"checkPairBindings": {1, f088CancelledShape, "a tombstone-register create allocates nothing"},
-	"checkRegisterReplacements": {3, f088CancelledShape,
+	"checkPairBindings": {1, cancelledShape, "a tombstone-register create allocates nothing"},
+	"checkRegisterReplacements": {3, cancelledShape,
 		"only the tombstone kinds may set the bit, and only over an uncancelled untokened publish occupant"},
-	"mqttPendingFenceBodyOK": {1, f088CancelledProvenance, "a pending fence is identified by CancelOrigin = pending-create, never by sparsity"},
-	"mqttClassifyInflightSlot": {1, f088CancelledMarkerGated,
+	"mqttPendingFenceBodyOK": {1, cancelledProvenance, "a pending fence is identified by CancelOrigin = pending-create, never by sparsity"},
+	"mqttClassifyInflightSlot": {1, cancelledMarkerGated,
 		"a cancelled occupant is decided by its probed marker: standing reaps (through the door), absent falls through as possibly attempted, unread abandons"},
-	"runInflightAdmission": {2, f088CancelledMarkerGated,
+	"runInflightAdmission": {2, cancelledMarkerGated,
 		"the pre-classification marker probe's trigger; our own ended (withdrawn) tombstone is reaped only through the gated door and the allocation abandoned"},
-	"recoverInflightRegistersOnce": {6, f088CancelledMarkerGated,
+	"recoverInflightRegistersOnce": {6, cancelledMarkerGated,
 		"the genuine-cancellation arm requires the walked marker (edit 4; and its observation seam); the custody-contest exclusions are conservative routings. (The exchange-reach exemption for a cancelled register was REMOVED: an occupant cancellation without its exchange is P-d2 and reserved like any register.)"},
-	"mqttClearsCancellation": {2, f088CancelledRefutedClearance, "the SHAPE half of the clearance; the boundary's evidence half requires the marker absent"},
-	"mqttAdvanceExchangeAckTransition": {1, f088CancelledRefutedClearance,
+	"mqttClearsCancellation": {2, cancelledRefutedClearance, "the SHAPE half of the clearance; the boundary's evidence half requires the marker absent"},
+	"mqttAdvanceExchangeAckTransition": {1, cancelledRefutedClearance,
 		"the acknowledgement's builder clears an occupant cancellation; checkRefutedCancellation admits it only on the marker's absence"},
-	"composeAcquisition": {1, f088CancelledRefutedClearance,
+	"composeAcquisition": {1, cancelledRefutedClearance,
 		"a retransmission's acquisition clears an occupant cancellation; refused at the boundary while the marker stands"},
-	"markInflightRegisterCancelled": {1, f088CancelledIdempotence, "an already-cancelled occupant of ours: AlreadySet, nothing destroyed"},
-	"markInflightRegisterCancelledPending": {1, f088CancelledIdempotence,
+	"markInflightRegisterCancelled": {1, cancelledIdempotence, "an already-cancelled occupant of ours: AlreadySet, nothing destroyed"},
+	"markInflightRegisterCancelledPending": {1, cancelledIdempotence,
 		"the conflict branch meets our own same-nonce tombstone: nothing rewritten"},
-	"landedRegisterSeq": {1, f088CancelledEndedWithdrawal,
+	"landedRegisterSeq": {1, cancelledEndedWithdrawal,
 		"our landed register already withdrawn: not confirmed (no live entry for an ended exchange)"},
-	"endUnsentBeforeDestroy": {1, f088CancelledEndedWithdrawal,
+	"endUnsentBeforeDestroy": {1, cancelledEndedWithdrawal,
 		"after a LANDED withdrawal, only OUR tombstone (by identity) may be deleted"},
-	"retainedPairVerdict": {1, f088CancelledEndedWithdrawal, "a tombstone over an ENDED retained exchange"},
-	"claimRecoveredInflight": {2, f088CancelledAffineClaimClose,
+	"retainedPairVerdict": {1, cancelledEndedWithdrawal, "a tombstone over an ENDED retained exchange"},
+	"claimRecoveredInflight": {2, cancelledAffineClaimClose,
 		"chapter P's slot-only claim pass: a cancelled record is never a transferable claim (conservative), but a " +
 			"matching-nonce affine tombstone is that class's close decision and is DELETED on the bit (open Q3 question)"},
-	"disposeSettledAffineRegister": {1, f088CancelledConservative, "a cancelled register is RETAINED by the orphan sweep"},
-	"pubRelAdmissionContext":       {1, f088CancelledConservative, "a cancelled slot contradicts a stored PUBREL: admission refused"},
+	"disposeSettledAffineRegister": {1, cancelledConservative, "a cancelled register is RETAINED by the orphan sweep"},
+	"pubRelAdmissionContext":       {1, cancelledConservative, "a cancelled slot contradicts a stored PUBREL: admission refused"},
 }
 
-// f088ScanCancelledReaders counts, per enclosing production function, the `.Cancelled` selectors
+// scanCancelledReaders counts, per enclosing production function, the `.Cancelled` selectors
 // that are not an assignment's target.
-func f088ScanCancelledReaders(t *testing.T) map[string]int {
+func scanCancelledReaders(t *testing.T) map[string]int {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -165,17 +165,17 @@ func f088ScanCancelledReaders(t *testing.T) map[string]int {
 	return out
 }
 
-// TestF088EveryCancelledReaderHasAnEvidenceDisposition is T13d.
-func TestF088EveryCancelledReaderHasAnEvidenceDisposition(t *testing.T) {
+// TestEveryCancelledReaderHasAnEvidenceDisposition is T13d.
+func TestEveryCancelledReaderHasAnEvidenceDisposition(t *testing.T) {
 	t.Parallel()
-	got := f088ScanCancelledReaders(t)
+	got := scanCancelledReaders(t)
 	var diffs []string
 	for fn, n := range got {
-		if want, ok := f088FrozenCancelledReaders[fn]; !ok || want.n != n {
+		if want, ok := frozenCancelledReaders[fn]; !ok || want.n != n {
 			diffs = append(diffs, fn+": source has "+itoa(n)+" read(s) of Cancelled, frozen has "+itoa(want.n))
 		}
 	}
-	for fn, want := range f088FrozenCancelledReaders {
+	for fn, want := range frozenCancelledReaders {
 		if _, ok := got[fn]; !ok {
 			diffs = append(diffs, fn+": frozen with "+itoa(want.n)+" read(s) but gone from the source (stale row)")
 		}
@@ -184,16 +184,16 @@ func TestF088EveryCancelledReaderHasAnEvidenceDisposition(t *testing.T) {
 	for _, d := range diffs {
 		t.Errorf("Cancelled reader census: %s", d)
 	}
-	exists := f088TestNames(t)
-	for disp, tests := range f088CancelledBacking {
+	exists := testNames(t)
+	for disp, tests := range cancelledBacking {
 		for _, name := range tests {
 			if !exists[name] {
 				t.Errorf("disposition %s is backed by %s, which does not exist", disp, name)
 			}
 		}
 	}
-	for fn, row := range f088FrozenCancelledReaders {
-		if len(f088CancelledBacking[row.disp]) == 0 {
+	for fn, row := range frozenCancelledReaders {
+		if len(cancelledBacking[row.disp]) == 0 {
 			t.Errorf("%s: disposition %s has no behavioural backing", fn, row.disp)
 		}
 		if row.why == _EMPTY_ {

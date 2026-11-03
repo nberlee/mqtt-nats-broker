@@ -394,7 +394,7 @@ func testAcquisitionCarriesActionRecord(tr *mqttAuthorityTransition, idHash stri
 	if tr == nil || tr.Attempt == nil || tr.Attempt.Kind != mqttTransitionAcquireAction {
 		return false
 	}
-	prefix := mqttF105SubjectPrefix() + mqttActionClassTk + "." + idHash + "."
+	prefix := mqttOutboundRecordSubjectPrefix() + mqttActionClassTk + "." + idHash + "."
 	for _, m := range tr.Extra {
 		if strings.HasPrefix(m.subj, prefix) {
 			return true

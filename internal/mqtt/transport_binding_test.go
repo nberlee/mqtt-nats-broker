@@ -22,13 +22,13 @@ import (
 	"time"
 )
 
-// TestF105SealIsOneWayAndIdempotent pins that output permission, once withdrawn, stays
+// TestSealIsOneWayAndIdempotent pins that output permission, once withdrawn, stays
 // withdrawn, and that only the first sealer is the one that establishes the fact.
 //
 // A gate that could reopen would make a certificate a statement about a moment rather than
 // about the rest of the connection's life, and every reader would have to re-check — the
 // read-then-act shape this item exists to remove.
-func TestF105SealIsOneWayAndIdempotent(t *testing.T) {
+func TestSealIsOneWayAndIdempotent(t *testing.T) {
 	b := mqttNewConnBinding("run-1", "conn-1")
 	if !b.mayWrite() {
 		t.Fatalf("a fresh binding refuses output")
@@ -49,10 +49,10 @@ func TestF105SealIsOneWayAndIdempotent(t *testing.T) {
 	}
 }
 
-// TestF105CertificateNamesItsOwnConnection pins that a certificate is checked against the
+// TestCertificateNamesItsOwnConnection pins that a certificate is checked against the
 // binding it is claimed for. Accepting any certificate would let one connection's closure be
 // read as another's.
-func TestF105CertificateNamesItsOwnConnection(t *testing.T) {
+func TestCertificateNamesItsOwnConnection(t *testing.T) {
 	b := mqttNewConnBinding("run-1", "conn-1")
 	cert := mqttCertifyClosed(nil, b, "test")
 	if cert == nil {
@@ -81,7 +81,7 @@ func TestF105CertificateNamesItsOwnConnection(t *testing.T) {
 	}
 }
 
-// TestF105CertificationCrossesTheWriterBarrier is the test the whole ordering exists for.
+// TestCertificationCrossesTheWriterBarrier is the test the whole ordering exists for.
 //
 // Sealing the gate stops writers from BEGINNING. It says nothing about one already inside a
 // write. Certification must therefore cross the writer's own lock, and it must close the
@@ -91,7 +91,7 @@ func TestF105CertificateNamesItsOwnConnection(t *testing.T) {
 // The fixture holds the write lock for a bounded time and asserts that certification cannot
 // complete until it is released, which is exactly the property "no write is in progress"
 // depends on.
-func TestF105CertificationCrossesTheWriterBarrier(t *testing.T) {
+func TestCertificationCrossesTheWriterBarrier(t *testing.T) {
 	c := &client{}
 	b := mqttNewConnBinding("run-1", "conn-1")
 
@@ -136,10 +136,10 @@ func TestF105CertificationCrossesTheWriterBarrier(t *testing.T) {
 	}
 }
 
-// TestF105ConcurrentCertifiersAllWaitForTheFact pins that a caller which loses the seal race
+// TestConcurrentCertifiersAllWaitForTheFact pins that a caller which loses the seal race
 // still does not return before the certificate is true. Otherwise the loser could act on
 // "someone is sealing" while a write was still in flight.
-func TestF105ConcurrentCertifiersAllWaitForTheFact(t *testing.T) {
+func TestConcurrentCertifiersAllWaitForTheFact(t *testing.T) {
 	c := &client{}
 	b := mqttNewConnBinding("run-1", "conn-1")
 
@@ -184,7 +184,7 @@ func TestF105ConcurrentCertifiersAllWaitForTheFact(t *testing.T) {
 	}
 }
 
-// TestF105CertificationClosesTheTransportOutsideTheWriteLock is the ordering test that needs
+// TestCertificationClosesTheTransportOutsideTheWriteLock is the ordering test that needs
 // a writer genuinely blocked INSIDE a socket write, which no lock-holding fixture can model.
 //
 // net.Pipe is synchronous and unbuffered, so a Write blocks until the peer reads and returns
@@ -194,7 +194,7 @@ func TestF105ConcurrentCertifiersAllWaitForTheFact(t *testing.T) {
 //
 // The assertion is a bounded wait rather than an unbounded one precisely because the failure
 // mode is a hang.
-func TestF105CertificationClosesTheTransportOutsideTheWriteLock(t *testing.T) {
+func TestCertificationClosesTheTransportOutsideTheWriteLock(t *testing.T) {
 	srv, _ := net.Pipe() // no reader on the peer: a Write blocks until Close
 	c := &client{nc: srv, rawConn: srv}
 	b := mqttNewConnBinding("run-1", "conn-1")
@@ -234,13 +234,13 @@ func TestF105CertificationClosesTheTransportOutsideTheWriteLock(t *testing.T) {
 	}
 }
 
-// TestF105EveryConnectionGetsItsOwnBinding pins that the binding names the connection it
+// TestEveryConnectionGetsItsOwnBinding pins that the binding names the connection it
 // belongs to.
 //
 // It caught a real defect: the mint was first placed at the client struct literal, where the
 // cid has not been assigned yet, so every client on the broker shared the binding {run, "0"}.
 // Sealing one would then have reported every other connection as unable to write.
-func TestF105EveryConnectionGetsItsOwnBinding(t *testing.T) {
+func TestEveryConnectionGetsItsOwnBinding(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -269,10 +269,10 @@ func TestF105EveryConnectionGetsItsOwnBinding(t *testing.T) {
 	}
 }
 
-// TestF105SealedGateStopsRealOutput pins that the gate is consulted by the actual writer,
+// TestSealedGateStopsRealOutput pins that the gate is consulted by the actual writer,
 // not only by the tests. Until this, mayWrite had no production caller and the claim that
 // writeSocket checks it under wmu was unverified.
-func TestF105SealedGateStopsRealOutput(t *testing.T) {
+func TestSealedGateStopsRealOutput(t *testing.T) {
 	srv, peer := net.Pipe()
 	defer peer.Close()
 	c := &client{nc: srv, rawConn: srv, outBind: mqttBindConnection(42)}

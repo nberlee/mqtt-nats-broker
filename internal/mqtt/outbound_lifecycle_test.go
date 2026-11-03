@@ -29,11 +29,11 @@ import (
 // resources go. Each earlier lane in this subsystem had correct pieces and no demonstration
 // that the pieces added up.
 
-// TestF105ObligationSurvivesRetirementAndCompletes walks one QoS 2 exchange from admission,
+// TestObligationSurvivesRetirementAndCompletes walks one QoS 2 exchange from admission,
 // through a closure that would previously have destroyed its completion route, to settlement
 // and authorized cleanup.
-func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-lifecycle")
+func TestObligationSurvivesRetirementAndCompletes(t *testing.T) {
+	e, done := testNewEnv(t, "f105-lifecycle")
 	defer done()
 
 	// (1) A serving authority, and the two resources a QoS 2 delivery needs: the source
@@ -41,11 +41,11 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	// records carry the client's PUBREC evidence. The second is the one a teardown deletes
 	// today.
 	auth, authSeq := e.bootstrap(t, "txn-1")
-	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	rel, relSeq := testF105PlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
+	src, srcSeq := testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	rel, relSeq := testPlantResource(t, e, "inc-rel", mqttResourcePubRelConsumer)
 
 	// (2) ADMIT the obligation, with its dependencies, in one transaction.
-	adm := testF105Admission(e, auth, authSeq, "txn-adm", 7, []mqttResourceDependency{
+	adm := testAdmission(e, auth, authSeq, "txn-adm", 7, []mqttResourceDependency{
 		{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay},
 		{Resource: rel, Seq: relSeq, Role: mqttRoleCanonicalPubRel},
 	})
@@ -53,7 +53,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the admission failed: %v", err)
 	}
-	admSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr))
+	admSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, atr))
 	if err != nil {
 		t.Fatalf("the admission was refused: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	// resolves against later, and it is never rewritten.
 	bind := mqttBindConnection(4242)
 	act := &mqttOutboundAction{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: adm.Exchange.Nonce, Acq: 1,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: adm.Exchange.Nonce, Acq: 1,
 		Kind: mqttActionPublish, PI: 7,
 		Run: bind.run, Conn: bind.conn, Tenure: auth.Tenure, AcqTxn: "txn-acq",
 	}
@@ -70,8 +70,8 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}
-	acq.Extra = append(acq.Extra, testF105TokenMember(t, e, act.Gen, act))
-	acqSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, acq))
+	acq.Extra = append(acq.Extra, testTokenMember(t, e, act.Gen, act))
+	acqSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, acq))
 	if err != nil {
 		t.Fatalf("the acquisition was refused: %v", err)
 	}
@@ -83,8 +83,8 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	// CLOSED one.
 	for _, inc := range []string{"inc-src", "inc-rel"} {
 		if _, derr := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-disp-dec-" + inc, Gen: testF105Gen, Inc: inc,
-			Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testF105Gen, Tenure: auth.Tenure},
+			ID: e.id, Epoch: e.epoch, Txn: "txn-disp-dec-" + inc, Gen: testGen, Inc: inc,
+			Reason: mqttDisposalUnsubscribed, Entitlement: mqttOutboundEntitlement{Gen: testGen, Tenure: auth.Tenure},
 		}); derr != nil {
 			t.Fatalf("disposing of %q was refused: %v", inc, derr)
 		}
@@ -98,24 +98,24 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
 			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: pre.rec.Rev + 1,
-			Gen: testF105Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
+			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
 		Prev: pre.rec, PrevSeq: pre.seq,
 		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Tenure: auth.Tenure,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
 			State: mqttAuthorityClosed, Rev: pre.rec.Rev + 1, Txn: "txn-close",
 			OwnerTxn: auth.OwnerTxn,
 		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Txn: "txn-close"},
+		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
 	}
-	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing))
+	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if err != nil {
 		t.Fatalf("the closure was refused: %v", err)
 	}
 
 	// (5) THE OBLIGATION AND ITS RESOURCES SURVIVED. This is the assertion the whole
 	// finding is about.
-	obs, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen)
+	obs, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testGen)
 	if err != nil {
 		t.Fatalf("enumerating the closed generation's obligations failed: %v", err)
 	}
@@ -131,11 +131,11 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	}
 	for _, inc := range []string{"inc-src", "inc-rel"} {
 		rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-			mqttResourceSubject(getHash(e.id), testF105Gen, inc))
+			mqttResourceSubject(getHash(e.id), testGen, inc))
 		if rerr != nil {
 			t.Fatalf("resource %q did not survive the closure: %v", inc, rerr)
 		}
-		got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
+		got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testGen, inc)
 		if len(got.Deps) != 1 || got.Deps[0].Nonce != adm.Exchange.Nonce {
 			t.Fatalf("resource %q is needed by %v after the closure, want the admitted "+
 				"obligation", inc, got.Deps)
@@ -179,7 +179,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		{mqttExchangePubRecObserved, "PUBREC"},
 		{mqttExchangeTerminalPendingDrain, "PUBCOMP with output still outstanding"},
 	} {
-		cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
+		cur, curSeq := testLoadExchange(t, e, testGen, adm.Exchange.Nonce)
 		authNow := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		if authNow.status != mqttOutboundValid || authNow.rec.State != mqttAuthorityClosed {
 			t.Fatalf("the authority stopped being closed before %s", step.why)
@@ -193,20 +193,20 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 			// A PUBCOMP answers a release: the slot stands ready, its output still held by a live
 			// token. The generation is closed, so no acquisition can take it there; the fixture
 			// plants the shape an acquisition before the closure would have left.
-			testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, cur.Nonce)
+			testReadyPubRelSlot(t, &e.asm.jsa, e.id, e.epoch, testGen, cur.Nonce)
 		}
-		adv = testWithSlotMember(t, &e.asm.jsa, adv, testF105Gen, cur.Nonce, step.to)
-		if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, adv)); cerr != nil {
+		adv = testWithSlotMember(t, &e.asm.jsa, adv, testGen, cur.Nonce, step.to)
+		if _, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, adv)); cerr != nil {
 			t.Fatalf("the advance for %s was refused under the closed authority: %v", step.why, cerr)
 		}
-		got, _ := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
+		got, _ := testLoadExchange(t, e, testGen, adm.Exchange.Nonce)
 		if got.Phase != step.to {
 			t.Fatalf("after %s the exchange stands at phase %d, want %d", step.why, got.Phase, step.to)
 		}
 	}
 	// A SECOND PUBCOMP CHANGES NOTHING. The relation is strictly forward, so the exchange
 	// cannot be moved back to an earlier phase to be re-charged and re-emitted.
-	cur, curSeq := testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
+	cur, curSeq := testLoadExchange(t, e, testGen, adm.Exchange.Nonce)
 	authNow := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if _, aerr := mqttAdvanceExchangeTransition(authNow.rec, authNow.seq, "txn-adv-back", "op-adv",
 		cur, curSeq, mqttExchangePublish); aerr == nil {
@@ -233,17 +233,17 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	// THE DRAIN IS RECORDED DURABLY FIRST. The exchange stands at terminal-pending-drain,
 	// and a release names an obligation that ENDED — so the last phase move is part of the
 	// lifecycle rather than a thing this test asserts about itself.
-	cur, curSeq = testF105LoadExchange(t, e, testF105Gen, adm.Exchange.Nonce)
+	cur, curSeq = testLoadExchange(t, e, testGen, adm.Exchange.Nonce)
 	authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	drained, derr := mqttAdvanceExchangeTransition(authNow.rec, authNow.seq, "txn-drained",
 		"op-drained", cur, curSeq, mqttExchangeTerminal)
 	if derr != nil {
 		t.Fatalf("assembling the drain completion failed: %v", derr)
 	}
-	drained = testWithSlotMember(t, &e.asm.jsa, drained, testF105Gen, cur.Nonce, mqttExchangeTerminal)
+	drained = testWithSlotMember(t, &e.asm.jsa, drained, testGen, cur.Nonce, mqttExchangeTerminal)
 	// The drain completion is the ending; it leaves both holds release-owed, and a release-holds
 	// batch over the stored ending releases them under the CLOSED authority (issue #107 7c-lc).
-	if _, cerr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, drained)); cerr != nil {
+	if _, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, drained)); cerr != nil {
 		t.Fatalf("recording the completed drain was refused: %v", cerr)
 	}
 	testReleaseOwed(t, e, cur.Nonce)
@@ -251,8 +251,8 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	for _, inc := range []string{"inc-src", "inc-rel"} {
 		rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-			mqttResourceSubject(getHash(e.id), testF105Gen, inc))
-		cleared, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, inc)
+			mqttResourceSubject(getHash(e.id), testGen, inc))
+		cleared, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testGen, inc)
 		// The release took this obligation's hold: nothing depends on the resource.
 		if len(cleared.Deps) != 0 {
 			t.Fatalf("resource %q is still needed by %v after its only obligation ended", inc, cleared.Deps)
@@ -260,7 +260,7 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		// Through the paired production operation: the authorization retires the name in the
 		// same batch (issue #107 7c-lc).
 		if _, cerr := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-disp-"+inc, "op-disp-"+inc,
-			testF105Gen, inc); cerr != nil {
+			testGen, inc); cerr != nil {
 			t.Fatalf("authorizing %q's deletion after completion was refused: %v", inc, cerr)
 		}
 		authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -271,8 +271,8 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 			t.Fatalf("disposing %q reopened the authority to state %d", inc, authNow.rec.State)
 		}
 		fmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-			mqttResourceSubject(getHash(e.id), testF105Gen, inc))
-		fin, _ := mqttDecodeOutboundResource(fmsg.Data, e.id, e.epoch, testF105Gen, inc)
+			mqttResourceSubject(getHash(e.id), testGen, inc))
+		fin, _ := mqttDecodeOutboundResource(fmsg.Data, e.id, e.epoch, testGen, inc)
 		if !mqttResourceDeletable(fin) {
 			t.Fatalf("resource %q is not deletable after its obligation completed: state %d", inc, fin.State)
 		}
@@ -282,21 +282,21 @@ func TestF105ObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	_ = json.Marshal
 }
 
-// TestF105ClosureBeforeAdmissionRefusesTheObligation is the other ordering, and it must come
+// TestClosureBeforeAdmissionRefusesTheObligation is the other ordering, and it must come
 // out the opposite way: an admission that arrives after closure wins nothing.
 //
 // Together with the test above this is the whole boundary — admitted-before survives,
 // admitted-after is refused — and it is the pair that makes "no admission after closure"
 // mean something rather than being asserted.
-func TestF105ClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-lifecycle-race")
+func TestClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-lifecycle-race")
 	defer done()
 
 	auth, authSeq := e.bootstrap(t, "txn-1")
-	src, srcSeq := testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	src, srcSeq := testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 
 	// The admission is composed against the authority as it stands...
-	adm := testF105Admission(e, auth, authSeq, "txn-late", 7, []mqttResourceDependency{
+	adm := testAdmission(e, auth, authSeq, "txn-late", 7, []mqttResourceDependency{
 		{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay},
 	})
 	late, err := mqttAdmitPublishTransition(adm)
@@ -305,40 +305,40 @@ func TestF105ClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
 	}
 
 	// ...and the closure lands first.
-	closing := testF105Closure(e, auth, authSeq, "txn-close")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); err != nil {
+	closing := testClosure(e, auth, authSeq, "txn-close")
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("the closure was refused: %v", err)
 	}
 
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, late)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, late)); err == nil {
 		t.Fatalf("an obligation was admitted AFTER its generation closed")
 	}
 
 	// And it left nothing: no exchange, no register, no marker, and no dependency the
 	// cleanup would then wait on forever.
-	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, 7)
+	regSubj := mqttInflightSubject(getHash(e.id), testGen, 7)
 	for name, subj := range map[string]string{
 		"register": regSubj,
 		"marker":   regSubj + "." + mqttInflightMarkerSuffix,
-		"exchange": mqttExchangeSubject(getHash(e.id), testF105Gen, adm.Exchange.Nonce),
+		"exchange": mqttExchangeSubject(getHash(e.id), testGen, adm.Exchange.Nonce),
 	} {
 		if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
 			t.Fatalf("the refused post-closure admission installed its %s", name)
 		}
 	}
 	rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttResourceSubject(getHash(e.id), testF105Gen, "inc-src"))
-	got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testF105Gen, "inc-src")
+		mqttResourceSubject(getHash(e.id), testGen, "inc-src"))
+	got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testGen, "inc-src")
 	if len(got.Deps) != 0 {
 		t.Fatalf("the refused admission left %v depending on the resource, which would block "+
 			"cleanup forever for an obligation that does not exist", got.Deps)
 	}
 }
 
-// testF105LoadExchange reads one exchange as it durably stands, with the sequence an advance
+// testLoadExchange reads one exchange as it durably stands, with the sequence an advance
 // must CAS against. Read back rather than remembered: a phase advance conditioned on a
 // sequence a caller held from earlier would overwrite whatever happened in between.
-func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqttOutboundExchange, uint64) {
+func testLoadExchange(t *testing.T, e *testOutboundEnv, gen, nonce string) (*mqttOutboundExchange, uint64) {
 	t.Helper()
 	msg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
 		mqttExchangeSubject(getHash(e.id), gen, nonce))
@@ -352,32 +352,32 @@ func testF105LoadExchange(t *testing.T, e *testF105Env, gen, nonce string) (*mqt
 	return x, msg.Sequence
 }
 
-// TestF105ATruncatedCensusIsNotACensus is round I-6's finding applied to the obligation census.
+// TestATruncatedCensusIsNotACensus is round I-6's finding applied to the obligation census.
 //
 // Capacity counts custody from this enumeration. A census that stops where it cannot read
 // UNDER-counts, and an under-count admits a delivery past Receive Maximum while the client still
 // holds the exchange this broker never saw — the fail-open direction of reading part of the
 // answer as the whole of it. Since issue #114 the census is the generation's inventory [Lo, Hi], so the
 // unreadable part is the inventory's root, the ledger.
-func TestF105ATruncatedCensusIsNotACensus(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-census-truncated")
+func TestATruncatedCensusIsNotACensus(t *testing.T) {
+	e, done := testNewEnv(t, "f105-census-truncated")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	jsa := &e.asm.jsa
-	ledSubj := mqttGenLedgerSubject(getHash(e.id), testF105Gen)
+	ledSubj := mqttGenLedgerSubject(getHash(e.id), testGen)
 	if _, err := jsa.storeMsg(ledSubj, -1, []byte(`{"id":"nonsense"`)); err != nil {
 		t.Fatalf("planting the unreadable ledger: %v", err)
 	}
-	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err == nil {
+	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testGen); err == nil {
 		t.Fatalf("an inventory whose ledger cannot be read was read as this generation's whole obligation census")
 	}
 
-	led := &mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Lo: 1, Del: 1}
+	led := &mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testGen, State: mqttGenLedgerOpen, Lo: 1, Del: 1}
 	body, _ := json.Marshal(led)
 	if _, err := jsa.storeMsg(ledSubj, -1, body); err != nil {
 		t.Fatalf("restoring an empty ledger: %v", err)
 	}
-	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testF105Gen); err != nil {
+	if _, err := e.asm.enumerateGenerationObligations(e.id, e.epoch, testGen); err != nil {
 		t.Fatalf("a complete answer holding nothing was refused: %v", err)
 	}
 }

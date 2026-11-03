@@ -105,7 +105,7 @@ type mqttFrozenMetadataAttempt struct {
 func mqttFreezeMetadataAttempt(id, epoch, domainTk string, p mqttOwnershipProposal,
 	sessWID string, factSubj string, factBody []byte, baseSeq uint64, recBody []byte) (*mqttFrozenMetadataAttempt, error) {
 
-	if !mqttValidProposalKind(p.Kind) || !mqttF105IdentTk(p.ID) {
+	if !mqttValidProposalKind(p.Kind) || !mqttOutboundIdentTk(p.ID) {
 		return nil, fmt.Errorf("freezing a metadata attempt requires a constructed proposal")
 	}
 	if sessWID == _EMPTY_ {
@@ -209,7 +209,7 @@ func (jsa *mqttJSA) resolveMetadataAttempt(domainTk, id, epoch string, p mqttOwn
 // resolver's abort, or not at all if the failure was transport. The caller re-reads; this
 // returns the error rather than a verdict for that reason.
 func (jsa *mqttJSA) abortMetadataAttempt(domainTk, id, epoch string, p mqttOwnershipProposal) error {
-	if !mqttValidProposalKind(p.Kind) || !mqttF105IdentTk(p.ID) {
+	if !mqttValidProposalKind(p.Kind) || !mqttOutboundIdentTk(p.ID) {
 		return fmt.Errorf("aborting a metadata attempt requires a constructed proposal")
 	}
 	o := &mqttHandoffOutcome{
@@ -366,7 +366,7 @@ func (jsa *mqttJSA) settleProposal(domainTk, id, epoch string, p mqttOwnershipPr
 // receipt names.
 func mqttCheckFrozenMetadataAttempt(f *mqttFrozenMetadataAttempt) error {
 	p := f.Proposal
-	if !mqttValidProposalKind(p.Kind) || !mqttF105IdentTk(p.ID) {
+	if !mqttValidProposalKind(p.Kind) || !mqttOutboundIdentTk(p.ID) {
 		return fmt.Errorf("a metadata attempt carries no constructed proposal")
 	}
 	if f.Outcome == nil {

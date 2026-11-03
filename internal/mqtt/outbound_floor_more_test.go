@@ -32,7 +32,7 @@ import (
 // sound only over filters whose records are never deleted; since issue #114 exchange records are
 // deleted behind the floor, so no production call may pass it the exchange walk filter, directly
 // or through a variable.
-func TestF112NoExchangeFilterReachesThePagedSubjectWalk(t *testing.T) {
+func TestNoExchangeFilterReachesThePagedSubjectWalk(t *testing.T) {
 	t.Parallel()
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -78,7 +78,7 @@ func TestF112NoExchangeFilterReachesThePagedSubjectWalk(t *testing.T) {
 // history arrives ten positions at a time, and the horizon is driven to idle after each arrival.
 // Without the rule every arrival would rewrite the twenty pins; with it, total relocation writes
 // stay within half the reclaimed positions plus one batch.
-func TestF112RelocationIsAmortizedOverReclaimedHistory(t *testing.T) {
+func TestRelocationIsAmortizedOverReclaimedHistory(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-t2d", 1)
 	e := f.e
@@ -140,7 +140,7 @@ func TestF112RelocationIsAmortizedOverReclaimedHistory(t *testing.T) {
 // T6a. Deletion owed below the floor is discovered from a resident ledger read (M18): the floor is
 // advanced and NOT deleted, the process forgets everything, and the census it rebuilds from arms
 // the floor unit, which finishes the deletions with no ending, no admission and no manual kick.
-func TestF112DeletionOwedBelowTheFloorIsFinishedFromALedgerRead(t *testing.T) {
+func TestDeletionOwedBelowTheFloorIsFinishedFromALedgerRead(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-t6a", 1)
 	e := f.e
@@ -196,7 +196,7 @@ func TestF112DeletionOwedBelowTheFloorIsFinishedFromALedgerRead(t *testing.T) {
 
 // A reclaimed lineage is released as the ending it proves: its custody holder, and its binding
 // with the ended-and-deleted proof (a shared HandBack needs exactly that).
-func TestF112AReclaimedLineageReleasesItsBindingAndItsCustody(t *testing.T) {
+func TestAReclaimedLineageReleasesItsBindingAndItsCustody(t *testing.T) {
 	t.Parallel()
 	sess := testLateAckUnitSess()
 	sess.mu.Lock()
@@ -221,7 +221,7 @@ func TestF112AReclaimedLineageReleasesItsBindingAndItsCustody(t *testing.T) {
 // exchange but could not read the exchange — whose lineage is since reclaimed behind the floor is
 // discharged by its individual re-read, and allocation reopens. Before, only duty-subject
 // uncertainty was discharged and this one withheld allocation for the generation's life.
-func TestF112AReclaimedExchangesUncertaintyIsDischarged(t *testing.T) {
+func TestAReclaimedExchangesUncertaintyIsDischarged(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-uncx", 1)
 	e := f.e
@@ -292,27 +292,27 @@ func TestF112AReclaimedExchangesUncertaintyIsDischarged(t *testing.T) {
 // Holistic round 2, finding 2. The recovery sweep accounts a sealed generation's retired prefix in
 // constant time: with the floor near the top of a long sealed inventory, its FIRST batch reaches
 // the surviving duties, charging only the positions it reads.
-func TestF112TheRecoverySweepJumpsTheRetiredPrefix(t *testing.T) {
-	e, done := testF112Env(t, "f112-sweep")
+func TestTheRecoverySweepJumpsTheRetiredPrefix(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-sweep")
 	defer done()
 	jsa := &e.asm.jsa
 	const hi = 5000
 	idHash := getHash(e.id)
 	for _, ord := range []uint64{hi - 1, hi} {
-		d := &mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ord: ord, Kind: mqttDutyExchange,
+		d := &mqttDutyEntry{ID: e.id, Epoch: e.epoch, Gen: testGen, Ord: ord, Kind: mqttDutyExchange,
 			Ref: mqttNewInflightNonce(), State: mqttDutyPending}
 		body, _ := json.Marshal(d)
-		if _, err := jsa.storeMsg(mqttDutySubject(idHash, testF105Gen, ord), -1, body); err != nil {
+		if _, err := jsa.storeMsg(mqttDutySubject(idHash, testGen, ord), -1, body); err != nil {
 			t.Fatalf("planting duty %d: %v", ord, err)
 		}
 	}
-	led := &mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerSealed,
+	led := &mqttGenLedger{ID: e.id, Epoch: e.epoch, Gen: testGen, State: mqttGenLedgerSealed,
 		Hi: hi, SealedHi: hi, Lo: hi - 1, Del: hi - 1}
 	lbody, _ := json.Marshal(led)
-	if _, err := jsa.storeMsg(mqttGenLedgerSubject(idHash, testF105Gen), -1, lbody); err != nil {
+	if _, err := jsa.storeMsg(mqttGenLedgerSubject(idHash, testGen), -1, lbody); err != nil {
 		t.Fatalf("planting the ledger: %v", err)
 	}
-	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, SweepStart: 1, Resume: 1, Bound: hi}
+	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen, SweepStart: 1, Resume: 1, Bound: hi}
 	charged := 0
 	swept, out, err := jsa.sweepOneBatchCharged(root, func() bool { charged++; return true }, false)
 	if err != nil {
@@ -331,7 +331,7 @@ func TestF112TheRecoverySweepJumpsTheRetiredPrefix(t *testing.T) {
 // whole ladder, so a background authority attempt — the floor unit's — that starts while it runs
 // waits until it returns and cannot take one of its bounded attempts. Deterministic: the
 // background attempt is started from inside the admission's own announcement.
-func TestF112AnAdmissionHoldsTheFloorsAuthorityAttemptsBack(t *testing.T) {
+func TestAnAdmissionHoldsTheFloorsAuthorityAttemptsBack(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f112-fg", 1)
 	sess := f.e.sess

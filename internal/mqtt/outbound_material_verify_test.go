@@ -21,22 +21,22 @@ import (
 	"testing"
 )
 
-// testF105OtherChunkMember writes a chunk of DIFFERENT bytes of the same length.
+// testOtherChunkMember writes a chunk of DIFFERENT bytes of the same length.
 //
 // The fence checks that a chunk landed, not what is in it, which is exactly the gap a seal has
 // to close: equal-length material with a different content passes every layout rule.
-func testF105OtherChunkMember(t *testing.T, e *testF105Env, ord uint64) mqttTransitionMember {
+func testOtherChunkMember(t *testing.T, e *testOutboundEnv, ord uint64) mqttTransitionMember {
 	t.Helper()
 	body, err := json.Marshal(&mqttRetainedChunk{Ord: ord, Inc: "inc-pay", Data: []byte("87654321")})
 	if err != nil {
 		t.Fatalf("marshalling the chunk: %v", err)
 	}
 	return mqttTransitionMember{
-		subj: mqttChunkSubject(getHash(e.id), testF105Gen, testF105Payload, ord), body: body,
+		subj: mqttChunkSubject(getHash(e.id), testGen, testPayload, ord), body: body,
 	}
 }
 
-// TestF105ASealVerifiesTheMaterialItSeals is the review's second finding, and the reason the
+// TestASealVerifiesTheMaterialItSeals is the review's second finding, and the reason the
 // witness record is gone.
 //
 // My first answer was a durable witness of a verification. A caller supplied it, and the
@@ -46,32 +46,32 @@ func testF105OtherChunkMember(t *testing.T, e *testF105Env, ord uint64) mqttTran
 // B. A record that says "I verified" is not a verification.
 //
 // The seal now READS THE MATERIAL, inside the transaction the CAS fences.
-func TestF105ASealVerifiesTheMaterialItSeals(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-verifies")
+func TestASealVerifiesTheMaterialItSeals(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-verifies")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
+	testPlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
 
 	// A manifest whose digest describes the fixture's bytes, and a chunk holding OTHER bytes of
 	// the same length.
-	if err := testF105SubmitMaterial(t, e, "txn-reserve",
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 1, 0)),
+	if err := testSubmitMaterial(t, e, "txn-reserve",
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 1, 0)),
 	); err != nil {
 		t.Fatalf("reserving: %v", err)
 	}
-	_, seq := testF105LoadManifest(t, e)
-	if err := testF105SubmitMaterial(t, e, "txn-chunk",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestProvisioning, 1, 1)),
-		testF105OtherChunkMember(t, e, 1),
+	_, seq := testLoadManifest(t, e)
+	if err := testSubmitMaterial(t, e, "txn-chunk",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestProvisioning, 1, 1)),
+		testOtherChunkMember(t, e, 1),
 	); err != nil {
 		t.Fatalf("writing a chunk of other bytes: %v", err)
 	}
 
 	// EVERY LAYOUT RULE IS SATISFIED: one chunk claimed, one chunk written, the count is the
 	// fence's own trace. Only reading the bytes can tell.
-	_, seq = testF105LoadManifest(t, e)
-	err := testF105SubmitMaterial(t, e, "txn-ready",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestReady, 1, 1)))
+	_, seq = testLoadManifest(t, e)
+	err := testSubmitMaterial(t, e, "txn-ready",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestReady, 1, 1)))
 	if err == nil {
 		t.Fatalf("a payload sealed READY over material that is not the material it describes")
 	}
@@ -81,31 +81,31 @@ func TestF105ASealVerifiesTheMaterialItSeals(t *testing.T) {
 
 	// THE POSITIVE CONTROL: the same seal once the material IS what the manifest describes.
 	// A chunk is immutable, so this is a fresh payload rather than a rewrite.
-	e2, done2 := testF105NewEnv(t, "f105-seal-verifies-ok")
+	e2, done2 := testNewEnv(t, "f105-seal-verifies-ok")
 	defer done2()
 	e2.bootstrap(t, "txn-1")
-	seq2 := testF105Materialize(t, e2, 2)
-	if err := testF105SubmitMaterial(t, e2, "txn-ready",
-		testF105ManifestMember(t, e2, seq2, testF105Manifest(e2, mqttManifestReady, 2, 2)),
+	seq2 := testMaterialize(t, e2, 2)
+	if err := testSubmitMaterial(t, e2, "txn-ready",
+		testManifestMember(t, e2, seq2, testManifest(e2, mqttManifestReady, 2, 2)),
 	); err != nil {
 		t.Fatalf("sealing material that verifies was refused: %v", err)
 	}
 }
 
-// TestF105SealingIsTheMaterializationsOwnAct keeps the seal off the kind that outlives closure.
+// TestSealingIsTheMaterializationsOwnAct keeps the seal off the kind that outlives closure.
 //
 // Disposal carries manifests — closing one is the first thing a cleanup does — and it is
 // permitted under a CLOSED authority because cleanup must outlive closure. Sealing is the
 // opposite: READY is the state an admission relies on, and a generation that may no longer
 // admit anything has nothing to seal material for.
-func TestF105SealingIsTheMaterializationsOwnAct(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-kind")
+func TestSealingIsTheMaterializationsOwnAct(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-kind")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	seq := testF105Materialize(t, e, 1)
+	seq := testMaterialize(t, e, 1)
 
-	err := testF105SubmitInventory(t, e, "txn-dispose-seal",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestReady, 1, 1)))
+	err := testSubmitInventory(t, e, "txn-dispose-seal",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestReady, 1, 1)))
 	if err == nil {
 		t.Fatalf("a disposal sealed a payload READY")
 	}
@@ -113,41 +113,41 @@ func TestF105SealingIsTheMaterializationsOwnAct(t *testing.T) {
 		t.Fatalf("the refusal was not the kind rule: %v", err)
 	}
 	// The positive control: the same seal under the kind that owns it.
-	if err := testF105SubmitMaterial(t, e, "txn-ready",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestReady, 1, 1)),
+	if err := testSubmitMaterial(t, e, "txn-ready",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestReady, 1, 1)),
 	); err != nil {
 		t.Fatalf("sealing under the materialization kind was refused: %v", err)
 	}
 }
 
-// TestF105MaterialIsNotWrittenByADisposal is the same rule for the chunks themselves.
+// TestMaterialIsNotWrittenByADisposal is the same rule for the chunks themselves.
 //
 // The fixture is deliberately UNIMPEACHABLE: the batch under test is a legitimate next chunk of
 // a manifest that still expects it, so the only thing wrong with it is the kind carrying it. An
 // earlier version wrote a chunk the manifest did not claim, which every other rule refuses —
 // and a mutation of the kind rule survived it.
-func TestF105MaterialIsNotWrittenByADisposal(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-material-kind")
+func TestMaterialIsNotWrittenByADisposal(t *testing.T) {
+	e, done := testNewEnv(t, "f105-material-kind")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
-	if err := testF105SubmitMaterial(t, e, "txn-reserve",
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 2, 0)),
+	testPlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
+	if err := testSubmitMaterial(t, e, "txn-reserve",
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 2, 0)),
 	); err != nil {
 		t.Fatalf("reserving: %v", err)
 	}
-	_, seq := testF105LoadManifest(t, e)
-	if err := testF105SubmitMaterial(t, e, "txn-chunk-1",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestProvisioning, 2, 1)),
-		testF105ChunkMember(t, e, 1, 0),
+	_, seq := testLoadManifest(t, e)
+	if err := testSubmitMaterial(t, e, "txn-chunk-1",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestProvisioning, 2, 1)),
+		testChunkMember(t, e, 1, 0),
 	); err != nil {
 		t.Fatalf("writing the first chunk: %v", err)
 	}
 
-	_, seq = testF105LoadManifest(t, e)
-	err := testF105SubmitInventory(t, e, "txn-dispose-chunk",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestProvisioning, 2, 2)),
-		testF105ChunkMember(t, e, 2, 0),
+	_, seq = testLoadManifest(t, e)
+	err := testSubmitInventory(t, e, "txn-dispose-chunk",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestProvisioning, 2, 2)),
+		testChunkMember(t, e, 2, 0),
 	)
 	if err == nil {
 		t.Fatalf("a disposal wrote material")
@@ -155,30 +155,30 @@ func TestF105MaterialIsNotWrittenByADisposal(t *testing.T) {
 	if !strings.Contains(err.Error(), "under a serving authority") {
 		t.Fatalf("the refusal was not the kind rule: %v", err)
 	}
-	if err := testF105SubmitMaterial(t, e, "txn-chunk-2",
-		testF105ManifestMember(t, e, seq, testF105Manifest(e, mqttManifestProvisioning, 2, 2)),
-		testF105ChunkMember(t, e, 2, 0),
+	if err := testSubmitMaterial(t, e, "txn-chunk-2",
+		testManifestMember(t, e, seq, testManifest(e, mqttManifestProvisioning, 2, 2)),
+		testChunkMember(t, e, 2, 0),
 	); err != nil {
 		t.Fatalf("the same batch under the materialization kind was refused: %v", err)
 	}
 }
 
-// TestF105VerifyingMaterialReadsWhatIsActuallyThere is the verifier both sides use.
+// TestVerifyingMaterialReadsWhatIsActuallyThere is the verifier both sides use.
 //
 // The seal runs it inside the transaction; a replay runs it before emitting a byte. The review
 // required both — "as well, not instead" — because material can rot after it was sealed.
-func TestF105VerifyingMaterialReadsWhatIsActuallyThere(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-verify-material")
+func TestVerifyingMaterialReadsWhatIsActuallyThere(t *testing.T) {
+	e, done := testNewEnv(t, "f105-verify-material")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105Materialize(t, e, 2)
-	m, _ := testF105LoadManifest(t, e)
+	testMaterialize(t, e, 2)
+	m, _ := testLoadManifest(t, e)
 
 	material, err := e.asm.jsa.verifyMaterial(m)
 	if err != nil {
 		t.Fatalf("verifying whole material was refused: %v", err)
 	}
-	if string(material) != string(testF105MaterialOf(2)) {
+	if string(material) != string(testMaterialOf(2)) {
 		t.Fatalf("the material reassembled to %q", material)
 	}
 
@@ -210,11 +210,11 @@ func TestF105VerifyingMaterialReadsWhatIsActuallyThere(t *testing.T) {
 	}
 }
 
-// testF105TrySeal runs the real provisioning seal for one resource and returns what the
+// testTrySeal runs the real provisioning seal for one resource and returns what the
 // boundary made of it.
-func testF105TrySeal(t *testing.T, e *testF105Env, inc string) error {
+func testTrySeal(t *testing.T, e *testOutboundEnv, inc string) error {
 	t.Helper()
-	r, rseq := testF105LoadResource(t, e, inc)
+	r, rseq := testBoundaryLoadResource(t, e, inc)
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	seal, serr := mqttSealProvisioningTransition(al.rec, al.seq, "txn-seal-"+inc, "op-seal", r, rseq)
 	if serr != nil {
@@ -224,21 +224,21 @@ func testF105TrySeal(t *testing.T, e *testF105Env, inc string) error {
 	return cerr
 }
 
-// TestF105SealingAPayloadResourceIsAnswerable is contract 4's class at the RESOURCE boundary.
+// TestSealingAPayloadResourceIsAnswerable is contract 4's class at the RESOURCE boundary.
 //
 // The seal says nothing can materialize this resource any more, and a deletion authorization
 // rests on it — but for replay material the store can refute that claim: the manifest is in this
 // stream, at the address the resource names. A seal taken while it is still provisioning
 // authorizes deleting a name that is not free, and the material it describes is then refused
 // removal forever, because removal requires a manifest that reached CLOSED.
-func TestF105SealingAPayloadResourceIsAnswerable(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-answerable")
+func TestSealingAPayloadResourceIsAnswerable(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-answerable")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105Materialize(t, e, 2)
+	testMaterialize(t, e, 2)
 
 	// STILL PROVISIONING: the material may still grow, and the seal says it cannot.
-	err := testF105TrySeal(t, e, "inc-pay")
+	err := testTrySeal(t, e, "inc-pay")
 	if err == nil {
 		t.Fatalf("a payload resource was sealed while its material was still provisioning")
 	}
@@ -248,8 +248,8 @@ func TestF105SealingAPayloadResourceIsAnswerable(t *testing.T) {
 
 	// READY IS NOT ENOUGH SINCE issue #107 7c: an admission may still take a READY copy, so the seal
 	// would describe material a delivery is about to need. The copy must be CLOSED first.
-	testF105SealManifest(t, e, 2)
-	err = testF105TrySeal(t, e, "inc-pay")
+	testSealManifest(t, e, 2)
+	err = testTrySeal(t, e, "inc-pay")
 	if err == nil {
 		t.Fatalf("a payload resource was sealed over READY material an admission could still take")
 	}
@@ -259,42 +259,42 @@ func TestF105SealingAPayloadResourceIsAnswerable(t *testing.T) {
 
 	// THE POSITIVE CONTROL: once the copy is CLOSED, nothing further can land through the fence or
 	// be admitted against it, and the resource's seal states a fact.
-	testF105CloseManifest(t, e, 2)
-	if err := testF105TrySeal(t, e, "inc-pay"); err != nil {
+	testCloseManifest(t, e, 2)
+	if err := testTrySeal(t, e, "inc-pay"); err != nil {
 		t.Fatalf("a payload resource over closed material was refused: %v", err)
 	}
 }
 
-// TestF105SealingAConsumerResourceIsTheCallersFact is the other arm.
+// TestSealingAConsumerResourceIsTheCallersFact is the other arm.
 //
 // A consumer's physical provisioning settles in the JetStream API, not in this stream, so there
 // is nothing durable to read it against and the caller is the only one who can state it.
 // Refusing there would be refusing every seal this broker can actually take.
-func TestF105SealingAConsumerResourceIsTheCallersFact(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-consumer")
+func TestSealingAConsumerResourceIsTheCallersFact(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-consumer")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantUnsealedResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	if err := testF105TrySeal(t, e, "inc-src"); err != nil {
+	testPlantUnsealedResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	if err := testTrySeal(t, e, "inc-src"); err != nil {
 		t.Fatalf("a consumer resource's seal was refused: %v", err)
 	}
 }
 
-// TestF105SealedMaterialIsGoneMaterialOrNoMaterial covers the two cases where nothing stands at
+// TestSealedMaterialIsGoneMaterialOrNoMaterial covers the two cases where nothing stands at
 // the address the resource names.
-func TestF105SealedMaterialIsGoneMaterialOrNoMaterial(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-absent")
+func TestSealedMaterialIsGoneMaterialOrNoMaterial(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-absent")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
 	// NOTHING WAS EVER MATERIALIZED. The seal is what keeps it that way — the fence below
 	// refuses to reserve against a sealed owner — so there is nothing to wait for.
-	testF105PlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
-	if err := testF105TrySeal(t, e, "inc-pay"); err != nil {
+	testPlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
+	if err := testTrySeal(t, e, "inc-pay"); err != nil {
 		t.Fatalf("a payload resource with no material was refused a seal: %v", err)
 	}
-	err := testF105SubmitMaterial(t, e, "txn-late-reserve",
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 1, 0)))
+	err := testSubmitMaterial(t, e, "txn-late-reserve",
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 1, 0)))
 	if err == nil {
 		t.Fatalf("material was reserved against an owner whose provisioning is sealed")
 	}
@@ -303,21 +303,21 @@ func TestF105SealedMaterialIsGoneMaterialOrNoMaterial(t *testing.T) {
 	}
 }
 
-// TestF105MaterialAndItsOwnerNameEachOther is what makes the seal's read address the right
+// TestMaterialAndItsOwnerNameEachOther is what makes the seal's read address the right
 // record.
 //
 // A resource whose Name did not address its manifest could be sealed while material stood under
 // it, because the boundary would be reading an address nothing occupies. So the agreement is
 // required where material is created, in both directions and by kind.
-func TestF105MaterialAndItsOwnerNameEachOther(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-material-names-owner")
+func TestMaterialAndItsOwnerNameEachOther(t *testing.T) {
+	e, done := testNewEnv(t, "f105-material-names-owner")
 	defer done()
 	e.bootstrap(t, "txn-1")
 
 	// A RESOURCE OF ANOTHER KIND owns no replay material.
-	testF105PlantUnsealedResource(t, e, "inc-pay", mqttResourceSourceConsumer)
-	err := testF105SubmitMaterial(t, e, "txn-wrong-kind",
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 1, 0)))
+	testPlantUnsealedResource(t, e, "inc-pay", mqttResourceSourceConsumer)
+	err := testSubmitMaterial(t, e, "txn-wrong-kind",
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 1, 0)))
 	if err == nil {
 		t.Fatalf("material was reserved against a consumer resource")
 	}
@@ -326,16 +326,16 @@ func TestF105MaterialAndItsOwnerNameEachOther(t *testing.T) {
 	}
 
 	// AND A PAYLOAD RESOURCE PROVISIONED FOR OTHER MATERIAL owns none of this.
-	e2, done2 := testF105NewEnv(t, "f105-material-names-owner-2")
+	e2, done2 := testNewEnv(t, "f105-material-names-owner-2")
 	defer done2()
 	e2.bootstrap(t, "txn-1")
-	r, _ := testF105PlantUnsealedResource(t, e2, "inc-pay", mqttResourceRetainedPayload)
-	if r.Name != testF105Payload {
+	r, _ := testPlantUnsealedResource(t, e2, "inc-pay", mqttResourceRetainedPayload)
+	if r.Name != testPayload {
 		t.Fatalf("the fixture's payload resource names %q", r.Name)
 	}
-	testF105RenameResource(t, e2, "inc-pay", "pay-other")
-	err = testF105SubmitMaterial(t, e2, "txn-wrong-name",
-		testF105ManifestMember(t, e2, 0, testF105Manifest(e2, mqttManifestProvisioning, 1, 0)))
+	testRenameResource(t, e2, "inc-pay", "pay-other")
+	err = testSubmitMaterial(t, e2, "txn-wrong-name",
+		testManifestMember(t, e2, 0, testManifest(e2, mqttManifestProvisioning, 1, 0)))
 	if err == nil {
 		t.Fatalf("material was reserved against a resource provisioned for other material")
 	}
@@ -345,50 +345,50 @@ func TestF105MaterialAndItsOwnerNameEachOther(t *testing.T) {
 	}
 }
 
-// testF105RenameResource rewrites a planted resource's Name directly, which is the one thing no
+// testRenameResource rewrites a planted resource's Name directly, which is the one thing no
 // transition may do — a retirement is about the incarnation it was computed for.
-func testF105RenameResource(t *testing.T, e *testF105Env, inc, name string) {
+func testRenameResource(t *testing.T, e *testOutboundEnv, inc, name string) {
 	t.Helper()
-	r, seq := testF105LoadResource(t, e, inc)
+	r, seq := testBoundaryLoadResource(t, e, inc)
 	r.Name = name
 	b, err := json.Marshal(r)
 	if err != nil {
 		t.Fatalf("marshalling resource %q: %v", inc, err)
 	}
 	msg, hdr := mqttFrameBatchWrite(seq, b, _EMPTY_, 0, false)
-	if _, serr := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testF105Gen, inc),
+	if _, serr := e.asm.jsa.storeMsg(mqttResourceSubject(getHash(e.id), testGen, inc),
 		hdr, msg); serr != nil {
 		t.Fatalf("renaming resource %q: %v", inc, serr)
 	}
 }
 
-// TestF105ASealReadsItsOwnMaterialOrRefuses is the identity half of the seal's read.
+// TestASealReadsItsOwnMaterialOrRefuses is the identity half of the seal's read.
 //
 // The address a payload resource names can be occupied by a LATER materialization. Reading that
 // record as this resource's own is the class this lane keeps finding, so the boundary refuses
 // rather than interprets — the protocol order never produces it, and a refusal costs a lingering
 // record where a guess would cost a seal taken over material nobody looked at.
-func TestF105ASealReadsItsOwnMaterialOrRefuses(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-foreign")
+func TestASealReadsItsOwnMaterialOrRefuses(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-foreign")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105Materialize(t, e, 1)
-	testF105SealManifest(t, e, 1)
+	testMaterialize(t, e, 1)
+	testSealManifest(t, e, 1)
 
 	// A manifest standing at this resource's name, belonging to another materialization.
-	m, seq := testF105LoadManifest(t, e)
+	m, seq := testLoadManifest(t, e)
 	m.Inc = "inc-pay-2"
 	body, err := json.Marshal(m)
 	if err != nil {
 		t.Fatalf("marshalling the replacement's manifest: %v", err)
 	}
 	msg, hdr := mqttFrameBatchWrite(seq, body, _EMPTY_, 0, false)
-	if _, serr := e.asm.jsa.storeMsg(mqttManifestSubject(getHash(e.id), testF105Gen,
-		testF105Payload), hdr, msg); serr != nil {
+	if _, serr := e.asm.jsa.storeMsg(mqttManifestSubject(getHash(e.id), testGen,
+		testPayload), hdr, msg); serr != nil {
 		t.Fatalf("planting the replacement's manifest: %v", serr)
 	}
 
-	serr := testF105TrySeal(t, e, "inc-pay")
+	serr := testTrySeal(t, e, "inc-pay")
 	if serr == nil {
 		t.Fatalf("a seal was taken over another materialization's record")
 	}
@@ -397,8 +397,8 @@ func TestF105ASealReadsItsOwnMaterialOrRefuses(t *testing.T) {
 	}
 }
 
-// testF105ResourceMember carries one resource record as a batch member.
-func testF105ResourceMember(t *testing.T, e *testF105Env, expect uint64,
+// testMaterialResourceMember carries one resource record as a batch member.
+func testMaterialResourceMember(t *testing.T, e *testOutboundEnv, expect uint64,
 	r *mqttOutboundResource) mqttTransitionMember {
 	t.Helper()
 	body, err := json.Marshal(r)
@@ -406,11 +406,11 @@ func testF105ResourceMember(t *testing.T, e *testF105Env, expect uint64,
 		t.Fatalf("marshalling resource %q: %v", r.Inc, err)
 	}
 	return mqttTransitionMember{
-		subj: mqttResourceSubject(getHash(e.id), testF105Gen, r.Inc), expect: expect, body: body,
+		subj: mqttResourceSubject(getHash(e.id), testGen, r.Inc), expect: expect, body: body,
 	}
 }
 
-// TestF105OnlyAMaterializationReservesMaterial is round I-7's finding, fixed where consult 8
+// TestOnlyAMaterializationReservesMaterial is round I-7's finding, fixed where consult 8
 // ruled it belongs: at what JUSTIFIED the operation rather than at the coincidence.
 //
 // The bypass was a dispose-resource batch carrying the payload resource's SEAL beside a
@@ -419,16 +419,16 @@ func testF105ResourceMember(t *testing.T, e *testF105Env, expect uint64,
 // invisible one is that a DISPOSAL was reserving material at all: the chunk loop has always
 // refused a non-materializing kind, and the branch that brings a payload into existence never
 // got the same rule.
-func TestF105OnlyAMaterializationReservesMaterial(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-reserve-kind")
+func TestOnlyAMaterializationReservesMaterial(t *testing.T) {
+	e, done := testNewEnv(t, "f105-reserve-kind")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
+	testPlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
 
 	// A BARE RESERVATION UNDER A DISPOSAL, with nothing else riding on it. This is the arm that
 	// says the rule is about the KIND and not about the seal that happened to be beside it.
-	err := testF105SubmitInventory(t, e, "txn-dispose-reserve",
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 1, 0)))
+	err := testSubmitInventory(t, e, "txn-dispose-reserve",
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 1, 0)))
 	if err == nil {
 		t.Fatalf("a disposal reserved material")
 	}
@@ -437,30 +437,30 @@ func TestF105OnlyAMaterializationReservesMaterial(t *testing.T) {
 	}
 
 	// THE POSITIVE CONTROL for the first permitted kind.
-	if err := testF105SubmitMaterial(t, e, "txn-reserve",
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 1, 0)),
+	if err := testSubmitMaterial(t, e, "txn-reserve",
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 1, 0)),
 	); err != nil {
 		t.Fatalf("an ordinary reservation was refused: %v", err)
 	}
 }
 
-// TestF105ADisposalCannotSealAnOwnerAndReserveItsMaterial is round I-7's batch exactly, kept as
+// TestADisposalCannotSealAnOwnerAndReserveItsMaterial is round I-7's batch exactly, kept as
 // its own test so a mutation of the kind rule shows THIS arm firing.
 //
 // Split from the bare-reservation case deliberately: with both in one test the first Fatalf
 // hides the second, and what a mutation proves is then unmeasurable
 // (feedback_split_the_mutation_kills).
-func TestF105ADisposalCannotSealAnOwnerAndReserveItsMaterial(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-seal-same-batch")
+func TestADisposalCannotSealAnOwnerAndReserveItsMaterial(t *testing.T) {
+	e, done := testNewEnv(t, "f105-seal-same-batch")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	r, rseq := testF105PlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
+	r, rseq := testPlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
 
 	sealed := *r
 	sealed.Prov = mqttProvisioningSealed
-	err := testF105SubmitInventory(t, e, "txn-seal-and-reserve",
-		testF105ResourceMember(t, e, rseq, &sealed),
-		testF105ManifestMember(t, e, 0, testF105Manifest(e, mqttManifestProvisioning, 1, 0)),
+	err := testSubmitInventory(t, e, "txn-seal-and-reserve",
+		testMaterialResourceMember(t, e, rseq, &sealed),
+		testManifestMember(t, e, 0, testManifest(e, mqttManifestProvisioning, 1, 0)),
 	)
 	if err == nil {
 		t.Fatalf("one batch sealed an owner and reserved material for it")
@@ -470,29 +470,29 @@ func TestF105ADisposalCannotSealAnOwnerAndReserveItsMaterial(t *testing.T) {
 	}
 }
 
-// TestF105AProvisioningMayReserveTheMaterialItOwns is the second permitted kind, and the shape
+// TestAProvisioningMayReserveTheMaterialItOwns is the second permitted kind, and the shape
 // checkManifestOwnerExists documents: the owner may be CREATED by the batch that reserves the
 // material, with both predeclared duties.
-func TestF105AProvisioningMayReserveTheMaterialItOwns(t *testing.T) {
-	provision := func(t *testing.T, env *testF105Env, txn string, prov mqttProvisioningState) error {
+func TestAProvisioningMayReserveTheMaterialItOwns(t *testing.T) {
+	provision := func(t *testing.T, env *testOutboundEnv, txn string, prov mqttProvisioningState) error {
 		t.Helper()
 		owner := &mqttOutboundResource{
-			ID: env.id, Epoch: env.epoch, Gen: testF105Gen, Inc: "inc-pay",
-			Kind: mqttResourceRetainedPayload, Name: testF105Payload, State: mqttResourceLive,
+			ID: env.id, Epoch: env.epoch, Gen: testGen, Inc: "inc-pay",
+			Kind: mqttResourceRetainedPayload, Name: testPayload, State: mqttResourceLive,
 			Prov: prov, Deps: []mqttResourceEdge{},
 		}
-		return testF105SubmitInventoryAs(t, env, mqttTransitionProvisionResource, txn,
-			testF105ResourceMember(t, env, 0, owner),
-			testF105ManifestMember(t, env, 0, testF105Manifest(env, mqttManifestProvisioning, 1, 0)),
-			testF105LedgerMember(t, env, 0, testF105Ledger(env, mqttGenLedgerOpen, 2)),
-			testF105DutyMember(t, env, 0, testF105Duty(env, 1, mqttDutyProvision, "inc-pay",
+		return testSubmitInventoryAs(t, env, mqttTransitionProvisionResource, txn,
+			testMaterialResourceMember(t, env, 0, owner),
+			testManifestMember(t, env, 0, testManifest(env, mqttManifestProvisioning, 1, 0)),
+			testLedgerMember(t, env, 0, testInventoryLedger(env, mqttGenLedgerOpen, 2)),
+			testDutyMember(t, env, 0, testDuty(env, 1, mqttDutyProvision, "inc-pay",
 				mqttDutyPending)),
-			testF105DutyMember(t, env, 0, testF105Duty(env, 2, mqttDutyCleanup, "inc-pay",
+			testDutyMember(t, env, 0, testDuty(env, 2, mqttDutyCleanup, "inc-pay",
 				mqttDutyNotYetActionable)),
 		)
 	}
 
-	e, done := testF105NewEnv(t, "f105-provision-reserve")
+	e, done := testNewEnv(t, "f105-provision-reserve")
 	defer done()
 	e.bootstrap(t, "txn-1")
 	if err := provision(t, e, "txn-own-and-reserve", mqttProvisioningPending); err != nil {
@@ -501,7 +501,7 @@ func TestF105AProvisioningMayReserveTheMaterialItOwns(t *testing.T) {
 
 	// AND CREATING IT ALREADY SEALED is refused — by the create-only owner read, which has
 	// always been there and is what makes the two cross-reads consult 8 deleted unnecessary.
-	e2, done2 := testF105NewEnv(t, "f105-provision-reserve-2")
+	e2, done2 := testNewEnv(t, "f105-provision-reserve-2")
 	defer done2()
 	e2.bootstrap(t, "txn-1")
 	err := provision(t, e2, "txn-own-sealed-and-reserve", mqttProvisioningSealed)
@@ -513,26 +513,26 @@ func TestF105AProvisioningMayReserveTheMaterialItOwns(t *testing.T) {
 	}
 }
 
-// TestF105AClosureIsNotItsOwnSealsEvidence is consult 8's second required regression.
+// TestAClosureIsNotItsOwnSealsEvidence is consult 8's second required regression.
 //
 // A seal must rest on a cessation of materialization that is ALREADY ESTABLISHED. One act that
 // closes the manifest AND seals the resource consumes its own closure as the seal's evidence —
 // a second fact riding on a seal, which "one act, one fact" already refuses for dependency
 // edges. The seal therefore reads the STORED manifest and not the one this batch is writing.
-func TestF105AClosureIsNotItsOwnSealsEvidence(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-close-and-seal")
+func TestAClosureIsNotItsOwnSealsEvidence(t *testing.T) {
+	e, done := testNewEnv(t, "f105-close-and-seal")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105Materialize(t, e, 1)
+	testMaterialize(t, e, 1)
 
 	// ONE ACT, BOTH FACTS: refused.
-	r, rseq := testF105LoadResource(t, e, "inc-pay")
+	r, rseq := testBoundaryLoadResource(t, e, "inc-pay")
 	sealed := *r
 	sealed.Prov = mqttProvisioningSealed
-	_, mseq := testF105LoadManifest(t, e)
-	err := testF105SubmitInventory(t, e, "txn-close-and-seal",
-		testF105ResourceMember(t, e, rseq, &sealed),
-		testF105ManifestMember(t, e, mseq, testF105Manifest(e, mqttManifestClosed, 1, 1)),
+	_, mseq := testLoadManifest(t, e)
+	err := testSubmitInventory(t, e, "txn-close-and-seal",
+		testMaterialResourceMember(t, e, rseq, &sealed),
+		testManifestMember(t, e, mseq, testManifest(e, mqttManifestClosed, 1, 1)),
 	)
 	if err == nil {
 		t.Fatalf("one act closed a manifest and sealed its owner on the strength of it")
@@ -543,8 +543,8 @@ func TestF105AClosureIsNotItsOwnSealsEvidence(t *testing.T) {
 
 	// TWO ACTS, IN ORDER: accepted. A materialization that crashed mid-write is closable —
 	// PROVISIONING to CLOSED is permitted — so this is a sequence the executor can always run.
-	testF105CloseManifest(t, e, 1)
-	if serr := testF105TrySeal(t, e, "inc-pay"); serr != nil {
+	testCloseManifest(t, e, 1)
+	if serr := testTrySeal(t, e, "inc-pay"); serr != nil {
 		t.Fatalf("a seal over closed material was refused: %v", serr)
 	}
 }

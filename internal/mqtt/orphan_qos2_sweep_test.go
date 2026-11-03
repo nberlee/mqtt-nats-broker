@@ -2604,8 +2604,8 @@ func (e *testOrphanEnv) liveOwnedPubRelConsumer(t *testing.T, clientID string) t
 // A clean start then DISCARDS the generation — prepare, metadata commit, finalize, the three
 // steps a clean-start CONNECT drives — which closes it discarding and replaces the session
 // record with the successor generation's. From there the fixture drives the two ops the
-// discarded generation's recovery executor drives on a PUBREL consumer (TestF105Discarded-
-// GenerationRetiresItsPubRelConsumer runs that executor end to end under the fulltests tag):
+// discarded generation's recovery executor drives on a PUBREL consumer
+// (TestDiscardedGenerationRetiresItsPubRelConsumer runs that executor end to end under the fulltests tag):
 // opDisposeDiscarded records the decision, and opAuthorizeDeletion — the SOLE producer of a
 // RETIRED name ownership — retires the name in the same batch that authorizes the resource's
 // deletion. It stops before the executor's delete.

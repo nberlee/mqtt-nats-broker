@@ -29,8 +29,8 @@ import (
 // witnesses drive the production admission, cancellation and disposal routes; see
 // pending_fence_disposal.go for the rule.
 
-// f119AuthRev reads the serving authority's revision and sequence.
-func f119AuthRev(t *testing.T, f *t36Fix) (rev, seq uint64) {
+// authRev reads the serving authority's revision and sequence.
+func authRev(t *testing.T, f *t36Fix) (rev, seq uint64) {
 	t.Helper()
 	al := f.e.asm.jsa.loadOutboundAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
 	if al.status != mqttOutboundValid || al.rec == nil {
@@ -39,17 +39,17 @@ func f119AuthRev(t *testing.T, f *t36Fix) (rev, seq uint64) {
 	return al.rec.Rev, al.seq
 }
 
-// f119RawDelete removes a record behind the door's back, so neither the register create-only CAS
+// rawDelete removes a record behind the door's back, so neither the register create-only CAS
 // nor the disposal advance can be what refuses a later write.
-func f119RawDelete(t *testing.T, f *t36Fix, seq uint64) {
+func rawDelete(t *testing.T, f *t36Fix, seq uint64) {
 	t.Helper()
 	if err := f.e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true); err != nil {
 		t.Fatalf("raw delete of sequence %d: %v", seq, err)
 	}
 }
 
-// f119OursLanded reports whether a register carrying the allocation's nonce stands.
-func f119OursLanded(t *testing.T, f *t36Fix) bool {
+// oursLanded reports whether a register carrying the allocation's nonce stands.
+func oursLanded(t *testing.T, f *t36Fix) bool {
 	t.Helper()
 	rec, smsg := f.register(t)
 	return smsg != nil && rec != nil && rec.Nonce == f.nonce && !rec.Cancelled
@@ -62,7 +62,7 @@ func f119OursLanded(t *testing.T, f *t36Fix) bool {
 //
 // Mutation M1: emit the batch's authority member against the CURRENT stored sequence instead of
 // PrevSeq -> the paused batch lands.
-func TestF119PreparedAdmissionLosesItsAuthorityCASToTheFence(t *testing.T) {
+func TestPreparedAdmissionLosesItsAuthorityCASToTheFence(t *testing.T) {
 	f := newT36Fix(t, "f119-w1")
 	var paused atomic.Bool
 	var revBefore, revAfter uint64
@@ -70,15 +70,15 @@ func TestF119PreparedAdmissionLosesItsAuthorityCASToTheFence(t *testing.T) {
 		if tr.Attempt.Kind != mqttTransitionAdmitExchange || !paused.CompareAndSwap(false, true) {
 			return
 		}
-		revBefore, _ = f119AuthRev(t, f)
+		revBefore, _ = authRev(t, f)
 		f.cancel(t)
 		ok, fseq := f.fenceStands(t)
 		if !ok {
 			t.Error("fixture: the cancellation must land its pending fence")
 			return
 		}
-		revAfter, _ = f119AuthRev(t, f)
-		f119RawDelete(t, f, fseq)
+		revAfter, _ = authRev(t, f)
+		rawDelete(t, f, fseq)
 	}
 	f.e.asm.jsa.testTransitionPresend.Store(&presend)
 	t.Cleanup(func() { f.e.asm.jsa.testTransitionPresend.Store(nil) })
@@ -112,15 +112,15 @@ func TestF119PreparedAdmissionLosesItsAuthorityCASToTheFence(t *testing.T) {
 	if firstErr == nil {
 		t.Fatal("the batch prepared before the fence must be refused by its authority CAS")
 	}
-	if f119OursLanded(t, f) || f.exchange() != nil {
+	if oursLanded(t, f) || f.exchange() != nil {
 		t.Fatal("the refused batch must land neither its register nor its exchange")
 	}
 }
 
-// f119ServeResident binds the session to its connection and makes it the resident session for its
+// serveResident binds the session to its connection and makes it the resident session for its
 // client ID, the production preconditions of an exclusion-reclaim pass, and replaces the pass's
 // timer with the test's explicit passes. It returns the pass's fence-step outcomes so far.
-func f119ServeResident(t *testing.T, f *t36Fix) func() []mqttReclaimFenceOutcome {
+func serveResident(t *testing.T, f *t36Fix) func() []mqttReclaimFenceOutcome {
 	t.Helper()
 	var steps []mqttReclaimFenceOutcome
 	var mu sync.Mutex
@@ -143,8 +143,8 @@ func f119ServeResident(t *testing.T, f *t36Fix) func() []mqttReclaimFenceOutcome
 	}
 }
 
-// f119Advances records, per fence subject, whether each disposal decision committed an advance.
-func f119Advances(t *testing.T) func() (advanced, refused int) {
+// entitledDisposalAdvances records, per fence subject, whether each disposal decision committed an advance.
+func entitledDisposalAdvances(t *testing.T) func() (advanced, refused int) {
 	t.Helper()
 	var adv, ref atomic.Int32
 	h := func(_ string, advanced, ok bool) {
@@ -168,10 +168,10 @@ func f119Advances(t *testing.T) func() (advanced, refused int) {
 //
 // Mutation M2: fenceBeforePendingFenceDisposal admits every disposal -> the ladder's own path deletes
 // the fence with no advance and the held batch lands.
-func TestF119UnsettledPostFenceAttemptCannotLandAfterDisposal(t *testing.T) {
+func TestUnsettledPostFenceAttemptCannotLandAfterDisposal(t *testing.T) {
 	f := newT36Fix(t, "f119-w2")
-	steps := f119ServeResident(t, f)
-	advances := f119Advances(t)
+	steps := serveResident(t, f)
+	advances := entitledDisposalAdvances(t)
 	var cancelled atomic.Bool
 	f.e.asm.mu.Lock()
 	f.e.asm.testAdmitWrite = func(s *mqttSession, registerOnly bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
@@ -239,16 +239,16 @@ func TestF119UnsettledPostFenceAttemptCannotLandAfterDisposal(t *testing.T) {
 	if _, err := held(); err == nil {
 		t.Fatal("the held post-fence batch must be refused once the disposal's advance landed")
 	}
-	if f119OursLanded(t, f) || f.exchange() != nil {
+	if oursLanded(t, f) || f.exchange() != nil {
 		t.Fatal("the held batch must land neither its register nor its exchange")
 	}
 	fault.Store(false)
 }
 
-// f119StaleClient is a connection accepted under a PREDECESSOR tenure of the serving generation: the
+// staleClient is a connection accepted under a PREDECESSOR tenure of the serving generation: the
 // compare an authority transition makes is equality on generation and tenure, so a tenure the
 // standing authority does not carry is exactly a displaced connection's, on any broker.
-func f119StaleClient(t *testing.T, f *t36Fix) *client {
+func staleClient(t *testing.T, f *t36Fix) *client {
 	t.Helper()
 	stale := f.e.s.createInternalAccountClient()
 	stale.mqtt = &mqtt{asm: f.e.asm, sess: f.e.sess}
@@ -264,12 +264,12 @@ func f119StaleClient(t *testing.T, f *t36Fix) *client {
 // refused by the entitlement compare, so the fence stands and nothing is advanced.
 //
 // Mutation M3: drop the entitlement compare -> the displaced ladder advances and deletes the fence.
-func TestF119DisplacedLadderCannotDisposeOfAServingFence(t *testing.T) {
+func TestDisplacedLadderCannotDisposeOfAServingFence(t *testing.T) {
 	f := newT36Fix(t, "f119-w3")
-	advances := f119Advances(t)
+	advances := entitledDisposalAdvances(t)
 	other := mqttNewInflightNonce()
-	_, fseq := testF088WriteFence(t, f.e, f.pi, f.dur, f.sseq+100, other)
-	stale := f119StaleClient(t, f)
+	_, fseq := testWriteFence(t, f.e, f.pi, f.dur, f.sseq+100, other)
+	stale := staleClient(t, f)
 	if f.e.sess.admitInflightPublish(stale, f.pi, f.qos, f.dur, f.sseq, f.nonce, _EMPTY_, _EMPTY_, nil) {
 		t.Fatal("a displaced connection's admission must not succeed")
 	}
@@ -291,13 +291,13 @@ func TestF119DisplacedLadderCannotDisposeOfAServingFence(t *testing.T) {
 //
 // Mutation M4: the helper is called only at the loaded entrance -> the converted request deletes the
 // fence under the displaced licence.
-func TestF119GatedEntranceConvertsAndFencesTheDisposal(t *testing.T) {
+func TestGatedEntranceConvertsAndFencesTheDisposal(t *testing.T) {
 	f := newT36Fix(t, "f119-w4")
-	advances := f119Advances(t)
+	advances := entitledDisposalAdvances(t)
 	other := mqttNewInflightNonce()
-	rec, fseq := testF088WriteFence(t, f.e, f.pi, f.dur, f.sseq+100, other)
+	rec, fseq := testWriteFence(t, f.e, f.pi, f.dur, f.sseq+100, other)
 	ref := mqttSlotRefFromRecord(f.subject, fseq, rec)
-	stale := mqttLicenceOf(f119StaleClient(t, f))
+	stale := mqttLicenceOf(staleClient(t, f))
 	if f.e.sess.reapRegisterWithVerdictGated(fseq, other, false, ref, mqttSlotDeleteNeverTransmitted, stale) {
 		t.Fatal("the gated entrance must refuse a displaced licence's converted disposal")
 	}
@@ -318,10 +318,10 @@ func TestF119GatedEntranceConvertsAndFencesTheDisposal(t *testing.T) {
 	}
 }
 
-// f119PausedLadder starts the allocation's real admission and pauses its ladder inside the attempt
+// pausedLadder starts the allocation's real admission and pauses its ladder inside the attempt
 // loop, before the attempt's authority read. resume lets the attempt proceed and returns whether the
 // admission succeeded; attempted reports whether that attempt's batch was refused.
-func f119PausedLadder(t *testing.T, f *t36Fix) (resume func() (admitted bool, refusedAttempt bool)) {
+func pausedLadder(t *testing.T, f *t36Fix) (resume func() (admitted bool, refusedAttempt bool)) {
 	t.Helper()
 	paused, release := make(chan struct{}), make(chan struct{})
 	var once atomic.Bool
@@ -371,11 +371,11 @@ func f119PausedLadder(t *testing.T, f *t36Fix) (resume func() (admitted bool, re
 //
 // Mutation M5: remove Q -> the continuation advances and deletes, and the live ladder's next attempt
 // lands on the empty subject.
-func TestF119DisposalRefusedWhileTheFenceNonceLadderRuns(t *testing.T) {
+func TestDisposalRefusedWhileTheFenceNonceLadderRuns(t *testing.T) {
 	f := newT36Fix(t, "f119-w5")
-	steps := f119ServeResident(t, f)
-	advances := f119Advances(t)
-	resume := f119PausedLadder(t, f)
+	steps := serveResident(t, f)
+	advances := entitledDisposalAdvances(t)
+	resume := pausedLadder(t, f)
 	f.cancel(t)
 	ok, fseq := f.fenceStands(t)
 	if !ok {
@@ -395,7 +395,7 @@ func TestF119DisposalRefusedWhileTheFenceNonceLadderRuns(t *testing.T) {
 	if admitted || !refused {
 		t.Fatalf("the live ladder's next attempt must meet the fence and be refused: admitted=%v refused=%v", admitted, refused)
 	}
-	if f119OursLanded(t, f) {
+	if oursLanded(t, f) {
 		t.Fatal("nothing of the cancelled allocation may land")
 	}
 }
@@ -408,11 +408,11 @@ func TestF119DisposalRefusedWhileTheFenceNonceLadderRuns(t *testing.T) {
 //
 // Mutation M5b: key Q on the scheduling entry -> the drain-removed entry passes, the fence is
 // deleted, and the live ladder's next attempt lands.
-func TestF119DisposalRefusedForADrainRemovedLiveLadder(t *testing.T) {
+func TestDisposalRefusedForADrainRemovedLiveLadder(t *testing.T) {
 	f := newT36Fix(t, "f119-w5b")
-	steps := f119ServeResident(t, f)
-	advances := f119Advances(t)
-	resume := f119PausedLadder(t, f)
+	steps := serveResident(t, f)
+	advances := entitledDisposalAdvances(t)
+	resume := pausedLadder(t, f)
 	lic := mqttLicenceOf(f.e.c)
 	f.e.sess.mu.Lock()
 	ack := f.e.sess.pendingPublish[f.pi]
@@ -431,7 +431,7 @@ func TestF119DisposalRefusedForADrainRemovedLiveLadder(t *testing.T) {
 	if entryStands {
 		t.Fatal("fixture: the drain must remove the entry")
 	}
-	_, fseq := testF088WriteFence(t, f.e, f.pi, f.dur, f.sseq, f.nonce)
+	_, fseq := testWriteFence(t, f.e, f.pi, f.dur, f.sseq, f.nonce)
 	f.e.sess.runExclusionReclaim(mqttExclusionReclaimDelay)
 	if ok, seq := f.fenceStands(t); !ok || seq != fseq {
 		t.Errorf("the fence of a drain-removed live ladder's nonce must stand (steps %v)", steps())
@@ -443,13 +443,13 @@ func TestF119DisposalRefusedForADrainRemovedLiveLadder(t *testing.T) {
 	if admitted || !refused {
 		t.Fatalf("the live ladder's next attempt must meet the fence and be refused: admitted=%v refused=%v", admitted, refused)
 	}
-	if f119OursLanded(t, f) {
+	if oursLanded(t, f) {
 		t.Fatal("nothing of the cancelled allocation may land")
 	}
 }
 
-// f119RevOf reads a session's serving authority revision.
-func f119RevOf(t *testing.T, e *testInflightEnv) uint64 {
+// entitledDisposalRevOf reads a session's serving authority revision.
+func entitledDisposalRevOf(t *testing.T, e *testInflightEnv) uint64 {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch)
 	if al.status != mqttOutboundValid || al.rec == nil {
@@ -465,13 +465,13 @@ func f119RevOf(t *testing.T, e *testInflightEnv) uint64 {
 //
 // Mutation M6: the advance runs on the ungated view -> (a), (c) and (d) send requests through a closed
 // gate (a and c commit an advance).
-func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
+func TestReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 	t.Run("closed-gate-before-commit", func(t *testing.T) {
 		r := newT36Reclaim(t, "f119-w6a")
 		const X = uint16(10)
 		f, n, fseq := r.fence("f", 110)
 		r.exclude(r.e.sess, X, f, n)
-		rev := f119RevOf(t, r.e)
+		rev := entitledDisposalRevOf(t, r.e)
 		var reached atomic.Bool
 		h := func(string) {
 			reached.Store(true)
@@ -485,7 +485,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		if !reached.Load() {
 			t.Fatal("fixture: the advance never reached its commit gate")
 		}
-		if got := f119RevOf(t, r.e); got != rev {
+		if got := entitledDisposalRevOf(t, r.e); got != rev {
 			t.Fatalf("a closed gate before the commit must commit nothing: revision %d -> %d (steps %v)", rev, got, steps)
 		}
 		if !r.present(f) {
@@ -499,7 +499,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		const X = uint16(10)
 		f, n, _ := r.fence("f", 110)
 		r.exclude(r.e.sess, X, f, n)
-		rev := f119RevOf(t, r.e)
+		rev := entitledDisposalRevOf(t, r.e)
 		refusedBefore := mqttTestRequestGateRefusals.Load()
 		var closed atomic.Bool
 		presend := func(tr *mqttAuthorityTransition) {
@@ -516,7 +516,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		if !closed.Load() {
 			t.Fatal("fixture: the advance never reached its batch")
 		}
-		if got := f119RevOf(t, r.e); got != rev {
+		if got := entitledDisposalRevOf(t, r.e); got != rev {
 			t.Fatalf("a gate closed inside the commit must keep its batch unsent: revision %d -> %d (steps %v)", rev, got, steps)
 		}
 		if mqttTestRequestGateRefusals.Load() == refusedBefore {
@@ -533,7 +533,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		const X = uint16(10)
 		f, n, _ := r.fence("f", 110)
 		r.exclude(r.e.sess, X, f, n)
-		rev := f119RevOf(t, r.e)
+		rev := entitledDisposalRevOf(t, r.e)
 		refusedBefore := mqttTestRequestGateRefusals.Load()
 		commit := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 			if tr.Attempt.Kind != mqttTransitionFencePendingDisposal {
@@ -557,7 +557,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		mqttTestPendingFenceBeforeCommitHookV.Store(&pre)
 		t.Cleanup(func() { mqttTestPendingFenceBeforeCommitHookV.Store(nil) })
 		r.pass(r.e.sess)
-		if got := f119RevOf(t, r.e); got != rev {
+		if got := entitledDisposalRevOf(t, r.e); got != rev {
 			t.Fatalf("nothing may be committed: revision %d -> %d", rev, got)
 		}
 		if mqttTestRequestGateRefusals.Load() == refusedBefore {
@@ -582,7 +582,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		const X = uint16(10)
 		f, n, _ := r.fence("f", 110)
 		r.exclude(r.e.sess, X, f, n)
-		rev := f119RevOf(t, r.e)
+		rev := entitledDisposalRevOf(t, r.e)
 		commit := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 			if tr.Attempt.Kind != mqttTransitionFencePendingDisposal {
 				return send()
@@ -601,7 +601,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		if got := mqttTestRequestGateAdmits.Load() - admitsBefore; got < 4 {
 			t.Fatalf("the advance's requests must each be admitted and charged by the gate, %d were", got)
 		}
-		if got := f119RevOf(t, r.e); got != rev+1 {
+		if got := entitledDisposalRevOf(t, r.e); got != rev+1 {
 			t.Fatalf("the landed advance must stand exactly once: revision %d -> %d", rev, got)
 		}
 		if r.present(f) {
@@ -620,7 +620,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		const X = uint16(10)
 		f, n, _ := r.fence("f", 110)
 		r.exclude(r.e.sess, X, f, n)
-		rev := f119RevOf(t, r.e)
+		rev := entitledDisposalRevOf(t, r.e)
 		release := r.e.sess.announceForegroundAuthority().release
 		done := make(chan []string, 1)
 		go func() { done <- r.pass(r.e.sess) }()
@@ -630,7 +630,7 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 			t.Fatalf("the background advance must wait for the announced foreground operation (steps %v)", steps)
 		case <-time.After(300 * time.Millisecond):
 		}
-		if got := f119RevOf(t, r.e); got != rev {
+		if got := entitledDisposalRevOf(t, r.e); got != rev {
 			release()
 			t.Fatalf("nothing may be committed while a foreground operation is announced: revision %d -> %d", rev, got)
 		}
@@ -643,15 +643,15 @@ func TestF119ReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 		if r.present(f) {
 			t.Fatal("once released the pass must dispose of the fence")
 		}
-		if got := f119RevOf(t, r.e); got != rev+1 {
+		if got := entitledDisposalRevOf(t, r.e); got != rev+1 {
 			t.Fatalf("the disposal must commit exactly one advance: revision %d -> %d", rev, got)
 		}
 	})
 }
 
-// f119ServeGeneration installs, as store state, a serving authority at gen with a fresh tenure,
+// serveGeneration installs, as store state, a serving authority at gen with a fresh tenure,
 // CAS'd over the standing one: the successor generation's completed handoff.
-func f119ServeGeneration(t *testing.T, e *testInflightEnv, gen string) {
+func serveGeneration(t *testing.T, e *testInflightEnv, gen string) {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch)
 	if al.status != mqttOutboundValid || al.rec == nil {
@@ -677,9 +677,9 @@ func f119ServeGeneration(t *testing.T, e *testInflightEnv, gen string) {
 //
 // Mutations: M7b lets the ledger mismatch pass Q -> (b) deletes the fence; M7a treats another serving
 // generation like the fence's -> (a) is refused by the entitlement compare and the fence never goes.
-func TestF119GenerationBranchIsDecidedByTheStore(t *testing.T) {
+func TestGenerationBranchIsDecidedByTheStore(t *testing.T) {
 	f := newT36Fix(t, "f119-w7")
-	advances := f119Advances(t)
+	advances := entitledDisposalAdvances(t)
 	f.cancel(t)
 	rec, smsg := f.register(t)
 	if smsg == nil || !mqttValidPendingFence(f.subject, rec) {
@@ -703,7 +703,7 @@ func TestF119GenerationBranchIsDecidedByTheStore(t *testing.T) {
 	}
 
 	// (a) the handoff lands: the stored authority serves the successor generation.
-	f119ServeGeneration(t, f.e, successor)
+	serveGeneration(t, f.e, successor)
 	if out := f.e.sess.reapLoadedRegister(f.subject, smsg.Sequence, rec, mqttSlotDeletePendingFence, stillServing, nil); out != mqttReapDeleted {
 		t.Fatalf("once another generation serves, the fence must be disposed of, got %v", out)
 	}
@@ -715,9 +715,9 @@ func TestF119GenerationBranchIsDecidedByTheStore(t *testing.T) {
 	}
 }
 
-// f119ServeTenure installs, as store state, the serving authority at the SAME generation under a fresh
+// serveTenure installs, as store state, the serving authority at the SAME generation under a fresh
 // tenure (a resident reconnect's accept), and returns that tenure.
-func f119ServeTenure(t *testing.T, e *testInflightEnv) string {
+func serveTenure(t *testing.T, e *testInflightEnv) string {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch)
 	if al.status != mqttOutboundValid || al.rec == nil {
@@ -739,11 +739,11 @@ func f119ServeTenure(t *testing.T, e *testInflightEnv) string {
 // reconstruction preserved A's live admission, so the quiescence proof still sees it. A's attempt is
 // refused by the entitlement compare; once A's ladder has returned, the same exclusion's retry under B
 // disposes of the fence behind one advance.
-func TestF119ResidentRebindKeepsTheOldLadderVisible(t *testing.T) {
+func TestResidentRebindKeepsTheOldLadderVisible(t *testing.T) {
 	f := newT36Fix(t, "f119-w8")
-	steps := f119ServeResident(t, f)
-	advances := f119Advances(t)
-	resume := f119PausedLadder(t, f)
+	steps := serveResident(t, f)
+	advances := entitledDisposalAdvances(t)
+	resume := pausedLadder(t, f)
 	f.cancel(t)
 	ok, fseq := f.fenceStands(t)
 	if !ok {
@@ -753,7 +753,7 @@ func TestF119ResidentRebindKeepsTheOldLadderVisible(t *testing.T) {
 	f.e.sess.excludeIdentifierLocked(f.pi, f.subject, f.nonce)
 	f.e.sess.mu.Unlock()
 
-	tenureB := f119ServeTenure(t, f.e)
+	tenureB := serveTenure(t, f.e)
 	b := f.e.s.createInternalAccountClient()
 	b.mqtt = &mqtt{asm: f.e.asm, sess: f.e.sess}
 	b.setOutboundEntitlement(mqttOutboundEntitlement{Gen: f.gen, Tenure: tenureB})
@@ -779,7 +779,7 @@ func TestF119ResidentRebindKeepsTheOldLadderVisible(t *testing.T) {
 	if admitted || !refused {
 		t.Fatalf("A's attempt must be refused: admitted=%v refused=%v", admitted, refused)
 	}
-	if f119OursLanded(t, f) {
+	if oursLanded(t, f) {
 		t.Fatal("nothing of the cancelled allocation may land")
 	}
 

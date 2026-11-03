@@ -17,7 +17,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-func TestF092CanonicalPubRelProofMatchesTheWholeExchange(t *testing.T) {
+func TestCanonicalPubRelProofMatchesTheWholeExchange(t *testing.T) {
 	const nonce = "xxxxxxxxxxxxxxxxxxxxxx"
 	slot := freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPubRelReady, PI: 7, Dur: "SRC", Seq: 41, QoS: 2,
@@ -78,7 +78,7 @@ func TestF092CanonicalPubRelProofMatchesTheWholeExchange(t *testing.T) {
 	}
 }
 
-func TestF092UnreadableActionSlotNeverRetiresItsOnlyHolder(t *testing.T) {
+func TestUnreadableActionSlotNeverRetiresItsOnlyHolder(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("unreadable-action"), mqttNewSessGen()
 	const pi = uint16(7)
@@ -125,7 +125,7 @@ func TestF092UnreadableActionSlotNeverRetiresItsOnlyHolder(t *testing.T) {
 	})
 }
 
-func TestF092PubCompDoesNotTreatUnreadableSlotAsAbsent(t *testing.T) {
+func TestPubCompDoesNotTreatUnreadableSlotAsAbsent(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("unreadable-terminal"), mqttNewSessGen()
 	const pi = uint16(7)
@@ -151,7 +151,7 @@ func TestF092PubCompDoesNotTreatUnreadableSlotAsAbsent(t *testing.T) {
 	}
 }
 
-func TestF092DuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testing.T) {
+func TestDuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("duplicate-whole-exchange"), mqttNewSessGen()
 	_, _, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -193,13 +193,13 @@ func TestF092DuplicateDisposalRequiresTheDeliveredRecordsWholeExchange(t *testin
 	}
 }
 
-func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
+func TestRecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
 	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
-	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
-	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
-	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
+	// store can host; that class is covered on the real store by TestRouteBRecordsTheRecoveredPubRec,
+	// TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestRecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("route-b-unit"), mqttNewSessGen()
 	rec := freshRegisterLineage(&mqttInflightRecord{
@@ -257,13 +257,13 @@ func TestF092RecoveryRouteBUsesThePresentExactPubRel(t *testing.T) {
 	}
 }
 
-func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testing.T) {
+func TestRecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testing.T) {
 	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
-	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
-	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
-	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
+	// store can host; that class is covered on the real store by TestRouteBRecordsTheRecoveredPubRec,
+	// TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestRecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("route-b-recovery"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -353,7 +353,7 @@ func TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion(t *testi
 	}
 }
 
-func TestF092RecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
+func TestRecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("route-b-source-only"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -425,13 +425,13 @@ func TestF092RecoveryDoesNotInferRouteBFromSourceOnly(t *testing.T) {
 	}
 }
 
-func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
+func TestFailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
 	// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately: this fake store has no JetStream behind it, and
 	// the recovery mechanics asserted here are shared by both classes up to the class split. An
 	// ORDINARY slot's recovery also reads (and on route B writes) its exchange, which only a real
-	// store can host; that class is covered on the real store by TestF105RouteBRecordsTheRecoveredPubRec,
-	// TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange and
-	// TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
+	// store can host; that class is covered on the real store by TestRouteBRecordsTheRecoveredPubRec,
+	// TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange and
+	// TestRecoveryFinishesARevivedSlotBesideATerminalExchange (consult 26).
 	t.Parallel()
 	idHash, gen := getHash("route-b-failed-cas"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -494,7 +494,7 @@ func TestF092FailedRouteBHandoffDemotesResidentPublishEntry(t *testing.T) {
 	}
 }
 
-func TestF092RecoveryReservesRetiredPublishSlotWithoutExactPubRel(t *testing.T) {
+func TestRecoveryReservesRetiredPublishSlotWithoutExactPubRel(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("route-b-retired-without-record"), mqttNewSessGen()
 	_, pubRelSubject, pubRelDurable := mqttPubRelNames(idHash, gen)
@@ -564,7 +564,7 @@ func TestF092RecoveryReservesRetiredPublishSlotWithoutExactPubRel(t *testing.T) 
 	}
 }
 
-func TestF092CurrentConnectionDebtResetPreservesTheDurableAction(t *testing.T) {
+func TestCurrentConnectionDebtResetPreservesTheDurableAction(t *testing.T) {
 	const pi = uint16(8)
 	current := &client{cid: 22}
 	action := &mqttSendAction{token: "aaaaaaaaaaaaaaaaaaaaaa", state: mqttSendActionAcquired}
@@ -588,7 +588,7 @@ func TestF092CurrentConnectionDebtResetPreservesTheDurableAction(t *testing.T) {
 	}
 }
 
-func TestF093HandoffRefusesAConflictingPublishExchange(t *testing.T) {
+func TestHandoffRefusesAConflictingPublishExchange(t *testing.T) {
 	const pi = uint16(9)
 	action := &mqttSendAction{slot: mqttInflightSlotRef{
 		name: mqttInflightName{pi: pi}, nonce: "aaaaaaaaaaaaaaaaaaaaaa",
@@ -612,7 +612,7 @@ func TestF093HandoffRefusesAConflictingPublishExchange(t *testing.T) {
 	}
 }
 
-// TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused is issue #94's acceptance.
+// TestStalePubRelUnderAnotherExchangesIdentifierIsRefused is issue #94's acceptance.
 //
 // THE FINDING: a stale stored PUBREL whose acknowledgement was lost stays AckWait-eligible
 // while nothing names its identifier. After the identifier is reused, its redelivery used
@@ -627,7 +627,7 @@ func TestF093HandoffRefusesAConflictingPublishExchange(t *testing.T) {
 // happened — a handler that returned before ever comparing would leave the same end state,
 // so the test also asserts the matching-nonce case DOES transmit on the same fixture. One
 // arm alone proves nothing; the pair discriminates.
-func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
+func TestStalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 	// ON THE REAL STORE (consult 29): the identifier's exchange is an ordinary one, admitted
 	// through the authority and answered by the real PUBREC, so its own PUBREL is acquired only
 	// through the authority batch.
@@ -680,7 +680,7 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 	}
 }
 
-// TestF092AdmissionRequiresAnAtomicallyAcquiredAction pins the invariant that replaced
+// TestAdmissionRequiresAnAtomicallyAcquiredAction pins the invariant that replaced
 // "the slot must already say pubrel_ready".
 //
 // The corrected invariant is: NO SLOT-BACKED PUBREL BYTES ARE TRANSMITTED WITHOUT FIRST
@@ -694,7 +694,7 @@ func TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused(t *testing.T) {
 // So a `publish` slot with a MATCHING nonce must transmit, via the direct
 // `publish -> pubrel_sending` arrow, and the slot must end up carrying the canonical
 // record identity the delivery supplied.
-func TestF092AdmissionRequiresAnAtomicallyAcquiredAction(t *testing.T) {
+func TestAdmissionRequiresAnAtomicallyAcquiredAction(t *testing.T) {
 	// ON THE REAL STORE (consult 26). An ORDINARY slot still at `publish` beside a stored
 	// same-nonce PUBREL — the cut a drained PUBREC's intent-before-advance ordering leaves —
 	// transmits through admission recording the PUBREC the record proves on the exchange, then
@@ -746,11 +746,11 @@ func TestF092AdmissionRequiresAnAtomicallyAcquiredAction(t *testing.T) {
 	}
 }
 
-// TestF092ActionAcquisitionDoesNotFollowACustodyRewrite closes the race between
+// TestActionAcquisitionDoesNotFollowACustodyRewrite closes the race between
 // admission's current-owner check and the action CAS. A successor may transfer a ready
 // slot after the check; the predecessor must not follow that rewrite and bind a new action
 // to custody it does not own.
-func TestF092ActionAcquisitionDoesNotFollowACustodyRewrite(t *testing.T) {
+func TestActionAcquisitionDoesNotFollowACustodyRewrite(t *testing.T) {
 	e := testNewInflightEnv(t, "f092-action-custody-race")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(24)
@@ -789,10 +789,10 @@ func TestF092ActionAcquisitionDoesNotFollowACustodyRewrite(t *testing.T) {
 	}
 }
 
-// TestF092ActionDrainRequiresTheExactToken proves the token check is part of the CAS
+// TestActionDrainRequiresTheExactToken proves the token check is part of the CAS
 // predicate. Letting a foreign holder reach a no-op mutator still rewrites the slot and
 // moves the freshness fence under the real holder.
-func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
+func TestActionDrainRequiresTheExactToken(t *testing.T) {
 	// ON THE REAL STORE (consult 29): the action is acquired through the authority.
 	e := testNewInflightEnv(t, "f092-action-drain-token")
 	testReadyForRealPubRelDelivery(t, e)
@@ -834,11 +834,11 @@ func TestF092ActionDrainRequiresTheExactToken(t *testing.T) {
 	e.sess.startActionDrain(e.c, act)
 }
 
-// TestF092DurableCanonicalOutranksStaleInMemorySequence ensures the pre-issue #94 duplicate
+// TestDurableCanonicalOutranksStaleInMemorySequence ensures the pre-issue #94 duplicate
 // check cannot override the owner slot after admission has selected its canonical record.
 // The stale entry is memory only; acknowledging the slot's canonical because of it would
 // leave the exchange permanently naming a deleted record.
-func TestF092DurableCanonicalOutranksStaleInMemorySequence(t *testing.T) {
+func TestDurableCanonicalOutranksStaleInMemorySequence(t *testing.T) {
 	// ON THE REAL STORE (consult 29): the slot names its stored canonical, acquired through the
 	// authority.
 	e := testNewInflightEnv(t, "f092-canonical-over-memory")
@@ -866,14 +866,14 @@ func TestF092DurableCanonicalOutranksStaleInMemorySequence(t *testing.T) {
 	}
 }
 
-// TestF092TerminalReleaseFreesTheIdentifier is the other half of the pair the fifth attempt
+// TestTerminalReleaseFreesTheIdentifier is the other half of the pair the fifth attempt
 // withdrew.
 //
 // Re-phasing the slot past PUBREC without a terminal release leaks an identifier per QoS 2
 // message, which is strictly worse than the hazard it fixes — that is exactly why the fifth
 // attempt withdrew the transition rather than shipping it half-done. So the acceptance is
 // that a completed exchange leaves NOTHING: no slot, and the identifier allocatable again.
-func TestF092TerminalReleaseFreesTheIdentifier(t *testing.T) {
+func TestTerminalReleaseFreesTheIdentifier(t *testing.T) {
 	// ON THE REAL STORE: an ordinary exchange's PUBCOMP is one authority batch over its slot and
 	// its exchange, which the map-backed fixture world cannot host (consult 26).
 	e := testNewInflightEnv(t, "f092-terminal")
@@ -921,7 +921,7 @@ func TestF092TerminalReleaseFreesTheIdentifier(t *testing.T) {
 // Live terminal cleanup uses the installed consumer's durable. Recovery has no installed
 // config yet and falls back to the generation-derived name, but requiring that derived name
 // even while a live consumer is present rejects a valid slot before its exact delete.
-func TestF092TerminalFinalizerUsesInstalledConsumerDurable(t *testing.T) {
+func TestTerminalFinalizerUsesInstalledConsumerDurable(t *testing.T) {
 	t.Parallel()
 	idHash, gen := getHash("terminal-installed-durable"), mqttNewSessGen()
 	const pi = uint16(3)
@@ -959,11 +959,11 @@ func TestF092TerminalFinalizerUsesInstalledConsumerDurable(t *testing.T) {
 	}
 }
 
-// TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig covers the pre-CONNACK
+// TestTerminalRecoveryDoesNotRequireTheConsumerConfig covers the pre-CONNACK
 // ordering: register recovery runs before the PUBREL consumer is restored. A terminal
 // slot must therefore derive the generation-scoped durable name instead of requiring the
 // not-yet-installed in-memory config.
-func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
+func TestTerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
 	// ON THE REAL STORE (consult 26). The seeded slot already names the GENERATION's PUBREL
 	// durable, which is what recovery derives when no consumer config is installed.
 	e := testNewInflightEnv(t, "f092-terminal-pre-consumer")
@@ -997,11 +997,11 @@ func TestF092TerminalRecoveryDoesNotRequireTheConsumerConfig(t *testing.T) {
 	}
 }
 
-// TestF092TerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit covers the crash
+// TestTerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit covers the crash
 // between the durable phase transition and the later Retired rewrite. The phase itself
 // proves that the client has answered the source; deleting the terminal slot while that
 // source is still live would erase the only cross-restart suppression evidence.
-func TestF092TerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit(t *testing.T) {
+func TestTerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit(t *testing.T) {
 	// ON THE REAL STORE (consult 26), admitted for a source message that EXISTS, so the source
 	// is unfinished.
 	e := testNewInflightEnv(t, "f092-terminal-unfinished-source")
@@ -1045,10 +1045,10 @@ func TestF092TerminalSlotRetainsAnUnfinishedSourceWithoutRetiredBit(t *testing.T
 	}
 }
 
-// TestF092IncompleteTerminalDuplicateScanRetainsTheSlot is the fail-closed half of
+// TestIncompleteTerminalDuplicateScanRetainsTheSlot is the fail-closed half of
 // terminal cleanup. An unreadable tail is not evidence that no duplicate remains, so the
 // terminal slot must stay as the durable owner.
-func TestF092IncompleteTerminalDuplicateScanRetainsTheSlot(t *testing.T) {
+func TestIncompleteTerminalDuplicateScanRetainsTheSlot(t *testing.T) {
 	// ON THE REAL STORE (consult 26).
 	e := testNewInflightEnv(t, "f092-terminal-scan")
 	testReadyForRealPubRelDelivery(t, e)
@@ -1097,10 +1097,10 @@ func TestF092IncompleteTerminalDuplicateScanRetainsTheSlot(t *testing.T) {
 	}
 }
 
-// TestF092TerminalFinalizationRereadsTheFreshnessFence forces a same-identity rewrite
+// TestTerminalFinalizationRereadsTheFreshnessFence forces a same-identity rewrite
 // while the complete PUBREL scan is in progress. The final reread must see the moved
 // sequence and preserve it rather than deleting through an early observation.
-func TestF092TerminalFinalizationRereadsTheFreshnessFence(t *testing.T) {
+func TestTerminalFinalizationRereadsTheFreshnessFence(t *testing.T) {
 	e := testNewInflightEnv(t, "f092-terminal-freshness")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(22)
@@ -1157,9 +1157,9 @@ func TestF092TerminalFinalizationRereadsTheFreshnessFence(t *testing.T) {
 	}
 }
 
-// TestF092TerminalDuplicateDisposalPrecedesSlotDeletion plants two real records for the
+// TestTerminalDuplicateDisposalPrecedesSlotDeletion plants two real records for the
 // same exchange. Terminal cleanup must remove both before releasing the owner slot.
-func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
+func TestTerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 	// ON THE REAL STORE (consult 26): the real PUBREL consumer keeps the records, and the
 	// canonical one the seeding PUBREC stored is a same-exchange record too.
 	e := testNewInflightEnv(t, "f092-terminal-duplicates")
@@ -1199,7 +1199,7 @@ func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 	}
 }
 
-// TestF093CompletedExchangeLeavesNoPublishEntryOrMapping is issue #95's acceptance.
+// TestCompletedExchangeLeavesNoPublishEntryOrMapping is issue #95's acceptance.
 //
 // THE FINDING: `finalizeDrainDelivery` released the recovered in-flight register but never
 // removed the recovered `pendingPublish` entry or its `cpending` mapping. `trackAsPubRel`
@@ -1210,7 +1210,7 @@ func TestF092TerminalDuplicateDisposalPrecedesSlotDeletion(t *testing.T) {
 //
 // So the acceptance is what survives a completed exchange: no `pendingPublish` entry, no
 // `cpending` mapping, the identifier allocatable, and the capacity charge back to zero.
-func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
+func TestCompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 	// ON THE REAL STORE (consult 26): the ordinary exchange's PUBCOMP is one authority batch.
 	e := testNewInflightEnv(t, "f093-complete")
 	testReadyForRealPubRelDelivery(t, e)
@@ -1291,7 +1291,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 	}
 }
 
-// TestF092OrdinaryCorrelatedStalePubRelIsRefused is the test whose ABSENCE let a critical
+// TestOrdinaryCorrelatedStalePubRelIsRefused is the test whose ABSENCE let a critical
 // defect through, and it is here for that reason as much as for the property.
 //
 // Every other acceptance fixture delivered a record with an EMPTY source correlation, so
@@ -1304,7 +1304,7 @@ func TestF093CompletedExchangeLeavesNoPublishEntryOrMapping(t *testing.T) {
 //
 // So this drives a record that is correlated to a real source, on a session with NO drain
 // for that durable, and requires the refusal to come from the slot.
-func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
+func TestOrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 	// ON THE REAL STORE (consult 29): an ordinary exchange, its PUBREL acquired through the
 	// authority.
 	e := testNewInflightEnv(t, "f092-ordinary")
@@ -1355,14 +1355,14 @@ func TestF092OrdinaryCorrelatedStalePubRelIsRefused(t *testing.T) {
 	}
 }
 
-// TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt discriminates the issue #95 crash
+// TestRecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt discriminates the issue #95 crash
 // cut a holistic re-review found: recovery installs a surviving PUBREL as a nonce-bound empty
 // placeholder (installPubRelLocked). Terminal cleanup of a finished slot must ADOPT that
 // placeholder (installTerminalReservationLocked) and later RELEASE it (releaseTerminalReservation)
 // — both are nonce-keyed. A nonce-LESS placeholder (the bug) could neither be adopted nor
 // released, so the durable slot was deleted while the in-memory entry leaked the identifier and
 // its Receive Maximum charge forever.
-func TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T) {
+func TestRecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T) {
 	const pi = uint16(30)
 	nonce := mqttNewInflightNonce()
 	gen := mqttNewSessGen()
@@ -1400,14 +1400,14 @@ func TestF092RecoveredPlaceholderNonceLetsTerminalCleanupReleaseIt(t *testing.T)
 	}
 }
 
-// TestF092RecoveredSourceBackedPlaceholderIsNotRetained: a drain/removal-versus-PUBREL-store
+// TestRecoveredSourceBackedPlaceholderIsNotRetained: a drain/removal-versus-PUBREL-store
 // crash cut leaves a recovered placeholder whose durable owner slot is absent;
 // installPubRelLocked writes it with jsDur = the SOURCE consumer durable (or empty when the
 // record has no source). Transmitting either shape would put a PUBREL on the wire with no
 // durable action, recreating issue #94 across brokers. admitStoredPubRel refuses any record no
 // slot answers for — since issue #107 7c there is no slot-less retained admission at all — so
 // both arms must write nothing.
-func TestF092RecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
+func TestRecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
 	const owner = "zzzzzzzzzzzzzzzzzzzzzz"
 	for _, arm := range []struct {
 		name  string
@@ -1442,7 +1442,7 @@ func TestF092RecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
 	}
 }
 
-// TestF092AdmissionRefusesTransferWithoutCurrentAcceptance proves the transfer is gated on
+// TestAdmissionRefusesTransferWithoutCurrentAcceptance proves the transfer is gated on
 // the acceptance proof rather than on the delivery.
 //
 // Custody is durable state shared by every broker serving the session. A broker that has
@@ -1450,7 +1450,7 @@ func TestF092RecoveredSourceBackedPlaceholderIsNotRetained(t *testing.T) {
 // that legitimately owns it, which is issue #94's hazard arriving through the repair meant to
 // close it. The refusal is silent and unacknowledged, so the record is simply re-offered to
 // whoever is current.
-func TestF092AdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
+func TestAdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
 	e := testNewInflightEnv(t, "f092-custody-proof-gate")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(32)
@@ -1500,7 +1500,7 @@ func TestF092AdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
 	}
 }
 
-// TestF092UnresolvedTerminalAdvanceRefusesTheResume covers the difference between "not mine
+// TestUnresolvedTerminalAdvanceRefusesTheResume covers the difference between "not mine
 // to finish" and "I could not find out", which one boolean used to hide.
 //
 // Recovery proves a past-PUBREC slot finished, installs a terminal reservation for its
@@ -1513,7 +1513,7 @@ func TestF092AdmissionRefusesTransferWithoutCurrentAcceptance(t *testing.T) {
 // So an unresolved advance refuses the resume instead — visible, and retried by the next
 // CONNECT against a working store. A live action is a different observation entirely and
 // must NOT refuse anything, which the second arm holds the first honest about.
-func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
+func TestUnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		readback mqttInflightState
@@ -1559,7 +1559,7 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 			// A SLOT-ONLY (experimental affine; shared until 7a) source, deliberately. For an ORDINARY slot "no record and a
 			// complete source" is no proof of a PUBCOMP — its completion is recorded with its
 			// exchange, and the canonical record's ack is withheld until it is — so recovery no
-			// longer feeds an ordinary slot to this advance (TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange).
+			// longer feeds an ordinary slot to this advance (TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange).
 			// The advance and all four of its dispositions still exist for the slot-only class,
 			// and that is what this test pins.
 			_, _, genDur := mqttPubRelNames(idHash, gen)
@@ -1691,7 +1691,7 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 	}
 }
 
-// TestF092PubRelFenceRefusesStaleAcceptance covers the window the action CAS cannot close.
+// TestPubRelFenceRefusesStaleAcceptance covers the window the action CAS cannot close.
 //
 // Acquiring an action proves no other holder may act on the exchange. It does not prove
 // that the broker holding it is still the session's current accepted incarnation: a
@@ -1703,7 +1703,7 @@ func TestF092UnresolvedTerminalAdvanceRefusesTheResume(t *testing.T) {
 // The positive control matters as much as the refusal: a fence that refused everything
 // would also produce zero writes, and this test would pass while every QoS 2 exchange in
 // the broker silently stopped.
-func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
+func TestPubRelFenceRefusesStaleAcceptance(t *testing.T) {
 	// ON THE REAL STORE (consult 29): the action is acquired through the authority batch, and the
 	// refusal below must be the FENCE after it, not an earlier refusal of the acquisition.
 	e := testNewInflightEnv(t, "f092-fence-stale-acceptance")
@@ -1761,7 +1761,7 @@ func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
 	}
 }
 
-// TestF092ProveAcceptedIncarnationConjuncts isolates each conjunct of the acceptance proof.
+// TestProveAcceptedIncarnationConjuncts isolates each conjunct of the acceptance proof.
 //
 // Every arm differs from the exact-match control in exactly ONE field, because a fixture
 // that changes generation, sequence and write identity together cannot tell which check is
@@ -1771,7 +1771,7 @@ func TestF092PubRelFenceRefusesStaleAcceptance(t *testing.T) {
 // somebody else owns the session; indeterminate means the question could not be answered,
 // and the two callers act on them differently: the transmission fence refuses on both,
 // while the custody repair must not treat one unreadable moment as a takeover.
-func TestF092ProveAcceptedIncarnationConjuncts(t *testing.T) {
+func TestProveAcceptedIncarnationConjuncts(t *testing.T) {
 	e := testNewInflightEnv(t, "f092-proof-conjuncts")
 	testReadyForPubRelDelivery(t, e)
 
@@ -1841,7 +1841,7 @@ func TestF092ProveAcceptedIncarnationConjuncts(t *testing.T) {
 	}
 }
 
-// TestF092ProofRetriesAnOlderHead covers the one arm a table of single observations
+// TestProofRetriesAnOlderHead covers the one arm a table of single observations
 // cannot: our OWN later save landing between the load and the snapshot.
 //
 // A head BEHIND our acknowledged sequence is not evidence about ownership at all — it is
@@ -1849,7 +1849,7 @@ func TestF092ProveAcceptedIncarnationConjuncts(t *testing.T) {
 // than reporting anything. Replacing that retry with an immediate indeterminate passes
 // every single-observation arm, because each of those returns on its first attempt; only a
 // SEQUENCE of observations distinguishes the two.
-func TestF092ProofRetriesAnOlderHead(t *testing.T) {
+func TestProofRetriesAnOlderHead(t *testing.T) {
 	e := testNewInflightEnv(t, "f092-proof-retry")
 	testReadyForPubRelDelivery(t, e)
 
@@ -1889,14 +1889,14 @@ func TestF092ProofRetriesAnOlderHead(t *testing.T) {
 	}
 }
 
-// TestF092FenceFollowsTheActionCAS pins the ORDER, which is the property the fence rests on.
+// TestFenceFollowsTheActionCAS pins the ORDER, which is the property the fence rests on.
 //
 // A proof taken BEFORE the action CAS reports what was true before the exchange was
 // claimed, and a successor can accept in between — that is the same time-of-check race the
 // durable action exists to escape, so the proof has to come after. The oracle is the
 // observed sequence of durable operations, because a fence in the wrong place still
 // produces a correct-looking refusal in a test that only counts writes.
-func TestF092FenceFollowsTheActionCAS(t *testing.T) {
+func TestFenceFollowsTheActionCAS(t *testing.T) {
 	// ON THE REAL STORE (consult 29): the action is the authority acquisition batch, observed
 	// where it lands rather than at a register write it no longer makes.
 	e := testNewInflightEnv(t, "f092-fence-ordering")
@@ -1946,7 +1946,7 @@ func TestF092FenceFollowsTheActionCAS(t *testing.T) {
 	}
 }
 
-// TestF092CompetingCustodyTransfersLandOnce covers two writers reaching the repair from the
+// TestCompetingCustodyTransfersLandOnce covers two writers reaching the repair from the
 // SAME observed custody tuple — the shape two overlapping deliveries of one record produce.
 //
 // Both are entitled to transfer by every check they can make locally, so what has to
@@ -1954,7 +1954,7 @@ func TestF092FenceFollowsTheActionCAS(t *testing.T) {
 // the first to land moves it, so the second's predicate no longer matches. Without that,
 // two brokers each believe they hold custody of one exchange, which is the ambiguity the
 // owner slot exists to remove.
-func TestF092CompetingCustodyTransfersLandOnce(t *testing.T) {
+func TestCompetingCustodyTransfersLandOnce(t *testing.T) {
 	e := testNewInflightEnv(t, "f092-competing-transfers")
 	testReadyForPubRelDelivery(t, e)
 	const pi = uint16(40)

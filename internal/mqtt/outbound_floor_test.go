@@ -26,17 +26,17 @@ import (
 // floor: every position below Lo is reclaimed or relocated, every duty that still has work keeps
 // exactly one representative inside [Lo, Hi], and every reader reads [Lo, Hi] only.
 
-// testF112Env is a bootstrapped store-level environment: a serving authority, nothing admitted.
-func testF112Env(t *testing.T, clientID string) (*testF105Env, func()) {
+// testFloorEnv is a bootstrapped store-level environment: a serving authority, nothing admitted.
+func testFloorEnv(t *testing.T, clientID string) (*testOutboundEnv, func()) {
 	t.Helper()
-	e, done := testF105NewEnv(t, clientID)
+	e, done := testNewEnv(t, clientID)
 	e.bootstrap(t, "txn-boot")
 	return e, done
 }
 
-// testF112Admit admits one QoS 1 obligation at identifier pi, with its register, through the
+// testFloorAdmit admits one QoS 1 obligation at identifier pi, with its register, through the
 // production admission composer, and returns its nonce.
-func testF112Admit(t *testing.T, e *testF105Env, pi uint16) string {
+func testFloorAdmit(t *testing.T, e *testOutboundEnv, pi uint16) string {
 	t.Helper()
 	jsa := &e.asm.jsa
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -45,7 +45,7 @@ func testF112Admit(t *testing.T, e *testF105Env, pi uint16) string {
 		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 		PI: pi, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 	}
-	tr, terr := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+	tr, terr := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 	if terr != nil {
 		t.Fatalf("composing the admission at %d: %v", pi, terr)
 	}
@@ -55,24 +55,24 @@ func testF112Admit(t *testing.T, e *testF105Env, pi uint16) string {
 	return x.Nonce
 }
 
-// testF112EndAndResolve ends a QoS 1 obligation at Terminal (its PUBACK), lets the terminal
+// testEndAndResolve ends a QoS 1 obligation at Terminal (its PUBACK), lets the terminal
 // cleanup take its publish_terminal register, and resolves its duty. Once the register is gone
 // nothing but the obligation's own records can name it: the shape that becomes reclaimable as
 // soon as its duty resolves, and which frees the identifier for the next admission.
-func testF112EndAndResolve(t *testing.T, e *testF105Env, nonce string) {
+func testEndAndResolve(t *testing.T, e *testOutboundEnv, nonce string) {
 	t.Helper()
 	jsa := &e.asm.jsa
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending %q: %v", nonce, err)
 	}
-	testF112DropTerminalRegister(t, e, nonce)
-	testF112Resolve(t, e, nonce)
+	testDropTerminalRegister(t, e, nonce)
+	testResolve(t, e, nonce)
 }
 
-// testF112DropTerminalRegister clears an ended obligation's slot: testDropEndedSlot.
-func testF112DropTerminalRegister(t *testing.T, e *testF105Env, nonce string) {
+// testDropTerminalRegister clears an ended obligation's slot: testDropEndedSlot.
+func testDropTerminalRegister(t *testing.T, e *testOutboundEnv, nonce string) {
 	t.Helper()
-	testDropEndedSlot(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce)
+	testDropEndedSlot(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce)
 }
 
 // testDropEndedSlot removes what an ended QoS 1 obligation's identifier still carries, as
@@ -101,42 +101,42 @@ func testDropEndedSlot(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string)
 	}
 }
 
-// testF112Resolve resolves the exchange duty naming nonce.
-func testF112Resolve(t *testing.T, e *testF105Env, nonce string) {
+// testResolve resolves the exchange duty naming nonce.
+func testResolve(t *testing.T, e *testOutboundEnv, nonce string) {
 	t.Helper()
 	jsa := &e.asm.jsa
-	ord, found, err := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool {
+	ord, found, err := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool {
 		return d.Kind == mqttDutyExchange && d.Ref == nonce
 	})
 	if err != nil || !found {
 		t.Fatalf("finding the duty of %q: found=%v %v", nonce, found, err)
 	}
-	d, _, derr := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)
+	d, _, derr := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord)
 	if derr != nil || d == nil {
 		t.Fatalf("reading duty %d: %v", ord, derr)
 	}
-	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 	if err := jsa.opResolveDuty(root, mqttSweptDuty{Ord: ord, Entry: d}, mqttNewInflightNonce()); err != nil {
 		t.Fatalf("resolving duty %d of %q: %v", ord, nonce, err)
 	}
 }
 
-func testF112Ledger(t *testing.T, e *testF105Env) (*mqttGenLedger, uint64) {
+func testFloorLedger(t *testing.T, e *testOutboundEnv) (*mqttGenLedger, uint64) {
 	t.Helper()
-	led, seq, err := e.asm.jsa.loadGenLedger(e.id, e.epoch, testF105Gen)
+	led, seq, err := e.asm.jsa.loadGenLedger(e.id, e.epoch, testGen)
 	if err != nil || led == nil {
 		t.Fatalf("reading the ledger: %+v %v", led, err)
 	}
 	return led, seq
 }
 
-// testF112AdvanceTo retires every decidable position below end, in bounded batches, and then
+// testAdvanceTo retires every decidable position below end, in bounded batches, and then
 // deletes what was retired. It is the floor unit's execution without its horizon heuristic.
-func testF112AdvanceTo(t *testing.T, e *testF105Env, end uint64) {
+func testAdvanceTo(t *testing.T, e *testOutboundEnv, end uint64) {
 	t.Helper()
 	jsa := &e.asm.jsa
 	for i := 0; i < 64; i++ {
-		f, err := jsa.composeFloorBatch(e.id, e.epoch, testF105Gen, end)
+		f, err := jsa.composeFloorBatch(e.id, e.epoch, testGen, end)
 		if err != nil {
 			t.Fatalf("composing a floor batch: %v", err)
 		}
@@ -148,7 +148,7 @@ func testF112AdvanceTo(t *testing.T, e *testF105Env, end uint64) {
 		}
 	}
 	for i := 0; i < 64; i++ {
-		more, err := jsa.deleteRetiredPositionsStep(e.id, e.epoch, testF105Gen, nil)
+		more, err := jsa.deleteRetiredPositionsStep(e.id, e.epoch, testGen, nil)
 		if err != nil {
 			t.Fatalf("deleting retired positions: %v", err)
 		}
@@ -162,49 +162,49 @@ func testF112AdvanceTo(t *testing.T, e *testF105Env, end uint64) {
 // first (ordinals 1-3) stay outstanding; sixty more end and resolve. One advance over the whole
 // inventory retires every position: the sixty are reclaimed and deleted, the three are carried to
 // representatives above the old high-water, and every reader still sees them.
-func TestF112FloorReclaimsEndedHistoryAndCarriesOutstandingWork(t *testing.T) {
-	e, done := testF112Env(t, "f112-reclaim")
+func TestFloorReclaimsEndedHistoryAndCarriesOutstandingWork(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-reclaim")
 	defer done()
 	jsa := &e.asm.jsa
 
 	var outstanding []string
 	for pi := uint16(1); pi <= 3; pi++ {
-		outstanding = append(outstanding, testF112Admit(t, e, pi))
+		outstanding = append(outstanding, testFloorAdmit(t, e, pi))
 	}
 	var ended []string
 	for i := 0; i < 60; i++ {
-		n := testF112Admit(t, e, 10)
-		testF112EndAndResolve(t, e, n)
+		n := testFloorAdmit(t, e, 10)
+		testEndAndResolve(t, e, n)
 		ended = append(ended, n)
 	}
-	before, _ := testF112Ledger(t, e)
+	before, _ := testFloorLedger(t, e)
 	if before.Lo != 1 || before.Hi != 63 {
 		t.Fatalf("fixture ledger %+v, want Lo 1 Hi 63", before)
 	}
 
-	testF112AdvanceTo(t, e, before.Hi+1)
+	testAdvanceTo(t, e, before.Hi+1)
 
-	after, _ := testF112Ledger(t, e)
+	after, _ := testFloorLedger(t, e)
 	if after.Lo != before.Hi+1 || after.Hi != before.Hi+3 || after.Del != after.Lo {
 		t.Fatalf("after the advance the ledger is %+v; want Lo %d, Hi %d, Del == Lo",
 			after, before.Hi+1, before.Hi+3)
 	}
 	// THE CARRIED DUTIES ARE FOUND AT THEIR ONE REPRESENTATIVE, inside the floor.
 	for _, n := range outstanding {
-		ord, found, err := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool {
+		ord, found, err := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool {
 			return d.Kind == mqttDutyExchange && d.Ref == n
 		})
 		if err != nil || !found || ord < after.Lo {
 			t.Fatalf("outstanding obligation %q has no representative inside the floor: ord %d found %v %v",
 				n, ord, found, err)
 		}
-		d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)
+		d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord)
 		if d == nil || d.State != mqttDutyPending || d.From == 0 || d.From >= after.Lo {
 			t.Fatalf("representative of %q is %+v: a relocation carries the duty unchanged, with its provenance", n, d)
 		}
 	}
 	// THE TRAVERSAL SEES EXACTLY THE OUTSTANDING WORK, completely.
-	census, err := mqttTraverseGenerationInventory(jsa, nil, e.id, e.epoch, testF105Gen, nil)
+	census, err := mqttTraverseGenerationInventory(jsa, nil, e.id, e.epoch, testGen, nil)
 	if err != nil || !census.complete || len(census.uncertain) != 0 || len(census.live) != 3 {
 		t.Fatalf("the traversal after the advance: err %v complete %v uncertain %v live %d",
 			err, census != nil && census.complete, census.uncertain, len(census.live))
@@ -212,18 +212,18 @@ func TestF112FloorReclaimsEndedHistoryAndCarriesOutstandingWork(t *testing.T) {
 	// THE RECLAIMED RECORDS ARE GONE, and their absence classifies as a reclamation for a reader
 	// that proves the landing, and as nothing for one that cannot.
 	for _, n := range ended {
-		if _, _, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, n); xerr == nil || !mqttExchangeReadAbsent(xerr) {
+		if _, _, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testGen, n); xerr == nil || !mqttExchangeReadAbsent(xerr) {
 			t.Fatalf("reclaimed exchange %q still reads: %v", n, xerr)
 		}
 	}
-	if v := jsa.classifyExchangeAbsence(e.id, e.epoch, testF105Gen, ended[0], mqttLandingDecodedRead); v != mqttAbsenceReclaimed {
+	if v := jsa.classifyExchangeAbsence(e.id, e.epoch, testGen, ended[0], mqttLandingDecodedRead); v != mqttAbsenceReclaimed {
 		t.Fatalf("a reclaimed exchange with a landing proof classifies %d, want reclaimed", v)
 	}
-	if v := jsa.classifyExchangeAbsence(e.id, e.epoch, testF105Gen, ended[0], mqttLandingUnproven); v != mqttAbsenceUnproven {
+	if v := jsa.classifyExchangeAbsence(e.id, e.epoch, testGen, ended[0], mqttLandingUnproven); v != mqttAbsenceUnproven {
 		t.Fatalf("an absence without a landing proof classifies %d, want unproven", v)
 	}
 	for ord := uint64(1); ord < after.Del; ord++ {
-		if d, _, derr := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord); derr != nil || d != nil {
+		if d, _, derr := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord); derr != nil || d != nil {
 			t.Fatalf("retired position %d below the watermark still stands: %+v %v", ord, d, derr)
 		}
 	}
@@ -234,42 +234,42 @@ func TestF112FloorReclaimsEndedHistoryAndCarriesOutstandingWork(t *testing.T) {
 		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 		PI: 2, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: "txn-collide", Tenure: al.rec.Tenure,
 	}
-	tr, _ := testF105AdmitExchangeTr(t, e, al.rec, al.seq, "txn-collide", "op-collide", x)
+	tr, _ := testAdmitExchangeTr(t, e, al.rec, al.seq, "txn-collide", "op-collide", x)
 	if _, err := jsa.commitAuthorityTransition(tr); err == nil || !strings.Contains(err.Error(), "still holds") {
 		t.Fatalf("an identifier a carried obligation holds was claimed: %v", err)
 	}
-	testF112Admit(t, e, 10)
+	testFloorAdmit(t, e, 10)
 
 	// A CARRIED DUTY STILL COMPLETES (holistic round 1): two of the carried obligations end, one
 	// resolved alone and one in bulk, at their representatives; the next advance reclaims both.
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, outstanding[0], mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, outstanding[0], mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending a carried obligation: %v", err)
 	}
-	testF112DropTerminalRegister(t, e, outstanding[0])
-	testF112Resolve(t, e, outstanding[0])
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, outstanding[1], mqttExchangeTerminal); err != nil {
+	testDropTerminalRegister(t, e, outstanding[0])
+	testResolve(t, e, outstanding[0])
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, outstanding[1], mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending a carried obligation: %v", err)
 	}
-	testF112DropTerminalRegister(t, e, outstanding[1])
-	ord1, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == outstanding[1] })
-	d1, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord1)
-	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+	testDropTerminalRegister(t, e, outstanding[1])
+	ord1, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool { return d.Ref == outstanding[1] })
+	d1, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord1)
+	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 	if err := jsa.opResolveDuties(root, []mqttSweptDuty{{Ord: ord1, Entry: d1}}, mqttNewInflightNonce()); err != nil {
 		t.Fatalf("resolving a carried duty in bulk: %v", err)
 	}
-	now, _ := testF112Ledger(t, e)
-	testF112AdvanceTo(t, e, outstanding2Ord(t, e, outstanding[2]))
+	now, _ := testFloorLedger(t, e)
+	testAdvanceTo(t, e, outstanding2Ord(t, e, outstanding[2]))
 	for _, n := range outstanding[:2] {
-		if _, _, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, n); xerr == nil || !mqttExchangeReadAbsent(xerr) {
+		if _, _, xerr := jsa.loadOutboundExchange(e.id, e.epoch, testGen, n); xerr == nil || !mqttExchangeReadAbsent(xerr) {
 			t.Fatalf("the completed carried obligation %q was not reclaimed after its resolution: %v (ledger before %+v)", n, xerr, now)
 		}
 	}
 }
 
 // outstanding2Ord is the ordinal of the representative naming nonce.
-func outstanding2Ord(t *testing.T, e *testF105Env, nonce string) uint64 {
+func outstanding2Ord(t *testing.T, e *testOutboundEnv, nonce string) uint64 {
 	t.Helper()
-	ord, found, err := e.asm.jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == nonce })
+	ord, found, err := e.asm.jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool { return d.Ref == nonce })
 	if err != nil || !found {
 		t.Fatalf("finding the representative of %q: %v", nonce, err)
 	}
@@ -278,18 +278,18 @@ func outstanding2Ord(t *testing.T, e *testF105Env, nonce string) uint64 {
 
 // T-B. The floor advance's write boundary. Each case is a batch the composer would never build,
 // submitted straight to the boundary.
-func TestF112FloorAdvanceBoundaryRefusesUnprovenRetirement(t *testing.T) {
-	e, done := testF112Env(t, "f112-boundary")
+func TestFloorAdvanceBoundaryRefusesUnprovenRetirement(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-boundary")
 	defer done()
 	jsa := &e.asm.jsa
 
-	pinned := testF112Admit(t, e, 1)
+	pinned := testFloorAdmit(t, e, 1)
 	for i := 0; i < 4; i++ {
-		testF112EndAndResolve(t, e, testF112Admit(t, e, 10))
+		testEndAndResolve(t, e, testFloorAdmit(t, e, 10))
 	}
-	led, ledSeq := testF112Ledger(t, e)
+	led, ledSeq := testFloorLedger(t, e)
 	read := func(ord uint64) mqttFloorPosition {
-		d, seq, err := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)
+		d, seq, err := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord)
 		if err != nil || d == nil {
 			t.Fatalf("reading position %d: %v", ord, err)
 		}
@@ -299,7 +299,7 @@ func TestF112FloorAdvanceBoundaryRefusesUnprovenRetirement(t *testing.T) {
 	// (1) A NON-RECLAIMABLE POSITION RETIRED WITHOUT ITS REPRESENTATIVE (M1).
 	p := read(1)
 	p.Class = mqttFloorReclaim
-	f := &mqttFloorAdvance{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ledger: led, LedgerSeq: ledSeq,
+	f := &mqttFloorAdvance{ID: e.id, Epoch: e.epoch, Gen: testGen, Ledger: led, LedgerSeq: ledSeq,
 		Positions: []mqttFloorPosition{p}}
 	if err := jsa.opAdvanceFloor(f, mqttNewInflightNonce()); err == nil || !strings.Contains(err.Error(), "not reclaimable") {
 		t.Fatalf("an outstanding obligation's position was retired with no representative: %v", err)
@@ -321,7 +321,7 @@ func TestF112FloorAdvanceBoundaryRefusesUnprovenRetirement(t *testing.T) {
 			members[i].body, _ = json.Marshal(&d)
 		}
 	}
-	if err := testF112CommitFloorMembers(t, e, members); err == nil || !strings.Contains(err.Error(), "different state") {
+	if err := testCommitFloorMembers(t, e, members); err == nil || !strings.Contains(err.Error(), "different state") {
 		t.Fatalf("a relocation altered the duty it carried: %v", err)
 	}
 
@@ -336,24 +336,24 @@ func TestF112FloorAdvanceBoundaryRefusesUnprovenRetirement(t *testing.T) {
 	if err := jsa.opAdvanceFloor(f, mqttNewInflightNonce()); err != nil {
 		t.Fatalf("a legal advance was refused: %v", err)
 	}
-	led2, led2Seq := testF112Ledger(t, e)
-	g := &mqttFloorAdvance{ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Ledger: led2, LedgerSeq: led2Seq, DelTo: led2.Lo}
+	led2, led2Seq := testFloorLedger(t, e)
+	g := &mqttFloorAdvance{ID: e.id, Epoch: e.epoch, Gen: testGen, Ledger: led2, LedgerSeq: led2Seq, DelTo: led2.Lo}
 	if err := jsa.opAdvanceFloor(g, mqttNewInflightNonce()); err == nil || !strings.Contains(err.Error(), "still stands") {
 		t.Fatalf("positions were recorded deleted while their entries stand: %v", err)
 	}
 
 	// (4) THE CARRIED OBLIGATION IS THE ONE REPRESENTATIVE: found, and still at Publish.
-	if x, _, err := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, pinned); err != nil || x.Phase != mqttExchangePublish {
+	if x, _, err := jsa.loadOutboundExchange(e.id, e.epoch, testGen, pinned); err != nil || x.Phase != mqttExchangePublish {
 		t.Fatalf("the carried obligation does not stand: %+v %v", x, err)
 	}
 
 	// (5) A LEDGER WITHOUT ITS FLOOR OR WATERMARK IS AN UNSUPPORTED SHAPE, refused at decode.
 	for _, body := range []string{
-		`{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testF105Gen + `","state":1,"hi":3}`,
-		`{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testF105Gen + `","state":1,"hi":3,"lo":5,"del":1}`,
-		`{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testF105Gen + `","state":1,"hi":3,"lo":2,"del":3}`,
+		`{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testGen + `","state":1,"hi":3}`,
+		`{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testGen + `","state":1,"hi":3,"lo":5,"del":1}`,
+		`{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testGen + `","state":1,"hi":3,"lo":2,"del":3}`,
 	} {
-		if _, err := mqttDecodeGenLedger([]byte(body), e.id, e.epoch, testF105Gen); err == nil {
+		if _, err := mqttDecodeGenLedger([]byte(body), e.id, e.epoch, testGen); err == nil {
 			t.Fatalf("an unsupported ledger shape decoded: %s", body)
 		}
 	}
@@ -362,8 +362,8 @@ func TestF112FloorAdvanceBoundaryRefusesUnprovenRetirement(t *testing.T) {
 	}
 }
 
-// testF112CommitFloorMembers submits hand-built floor members under the standing authority.
-func testF112CommitFloorMembers(t *testing.T, e *testF105Env, members []mqttTransitionMember) error {
+// testCommitFloorMembers submits hand-built floor members under the standing authority.
+func testCommitFloorMembers(t *testing.T, e *testOutboundEnv, members []mqttTransitionMember) error {
 	t.Helper()
 	jsa := &e.asm.jsa
 	auth, authSeq, err := jsa.requireAuthority(e.id, e.epoch)
@@ -391,13 +391,13 @@ func testF112CommitFloorMembers(t *testing.T, e *testF105Env, members []mqttTran
 // T-C. The register clause and the token rule. An ended obligation whose register still names it
 // is carried, not reclaimed (M2); and no batch may end an obligation beside a register holding
 // its output token (M12).
-func TestF112ARegisterNamingTheLineagePinsItAndATokenRefusesTheEnding(t *testing.T) {
-	e, done := testF112Env(t, "f112-register")
+func TestARegisterNamingTheLineagePinsItAndATokenRefusesTheEnding(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-register")
 	defer done()
 	jsa := &e.asm.jsa
 
-	n := testF112Admit(t, e, 7)
-	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, 7)
+	n := testFloorAdmit(t, e, 7)
+	regSubj := mqttInflightSubject(getHash(e.id), testGen, 7)
 	// A transmission is in flight: its output token stands on the register.
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
 	reg, rmsg, _ := jsa.loadInflightRecord(regSubj)
@@ -408,7 +408,7 @@ func TestF112ARegisterNamingTheLineagePinsItAndATokenRefusesTheEnding(t *testing
 	}); err != nil {
 		t.Fatalf("acquiring the transmission: %v", err)
 	}
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, n, mqttExchangeTerminal); err == nil ||
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, n, mqttExchangeTerminal); err == nil ||
 		!strings.Contains(err.Error(), "live action token") {
 		t.Fatalf("an obligation was ended beside a register holding its output token: %v", err)
 	}
@@ -420,55 +420,55 @@ func TestF112ARegisterNamingTheLineagePinsItAndATokenRefusesTheEnding(t *testing
 		t.Fatalf("clearing the token: %v", err)
 	}
 	// Ended and resolved, with its register still standing (no terminal cleanup yet).
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testF105Gen, n, mqttExchangeTerminal); err != nil {
+	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, n, mqttExchangeTerminal); err != nil {
 		t.Fatalf("ending %q: %v", n, err)
 	}
-	testF112Resolve(t, e, n)
+	testResolve(t, e, n)
 
-	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == n })
-	d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)
-	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testF105Gen, d); cls != mqttFloorRelocate {
+	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool { return d.Ref == n })
+	d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord)
+	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testGen, d); cls != mqttFloorRelocate {
 		t.Fatalf("an ended obligation whose register still names it classifies %d (%v), want relocate", cls, err)
 	}
 	smsg, _ := jsa.loadLastMsgFor(mqttInflightStreamName, regSubj)
 	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("deleting the register: %v", err)
 	}
-	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testF105Gen, d); cls != mqttFloorReclaim {
+	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testGen, d); cls != mqttFloorReclaim {
 		t.Fatalf("an ended, resolved obligation with no register classifies %d (%v), want reclaim", cls, err)
 	}
 }
 
 // T-D. An abandoned delivery keeps its identifier, so its position is carried and never
 // reclaimed, whatever else has gone (M3): no register, no edges, the duty Terminal.
-func TestF112AnAbandonedDeliveryIsNeverReclaimed(t *testing.T) {
-	e, done := testF112Env(t, "f112-abandoned")
+func TestAnAbandonedDeliveryIsNeverReclaimed(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-abandoned")
 	defer done()
 	jsa := &e.asm.jsa
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	n := testF112Admit(t, e, 9)
+	n := testFloorAdmit(t, e, 9)
 	// The abandoned phase is written by its own kind beside a register this fixture does not
 	// build, so the record is planted directly: the classifier is what is under test.
 	x := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: n, PI: 9, QoS: 1,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: n, PI: 9, QoS: 1,
 		Phase: mqttExchangeDeliveryAbandoned, AdmitTxn: "txn-x", Tenure: al.rec.Tenure,
 		Abandoned: &mqttExchangeAbandonment{Reason: mqttAbandonReasonACLDeny, Tenure: al.rec.Tenure, Alloc: n, Acq: 1,
 			Dur: "$MQTT_src", Seq: 1, Reply: testInflightAckSubject("$MQTT_src", 1, 1)},
 	}
 	body, _ := json.Marshal(x)
-	if _, err := jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testF105Gen, n), -1, body); err != nil {
+	if _, err := jsa.storeMsg(mqttExchangeSubject(getHash(e.id), testGen, n), -1, body); err != nil {
 		t.Fatalf("planting the abandoned exchange: %v", err)
 	}
-	if _, _, err := jsa.loadOutboundExchange(e.id, e.epoch, testF105Gen, n); err != nil {
+	if _, _, err := jsa.loadOutboundExchange(e.id, e.epoch, testGen, n); err != nil {
 		t.Fatalf("the planted abandoned exchange does not decode: %v", err)
 	}
-	testF112Resolve(t, e, n)
-	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == n })
-	d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testF105Gen, ord)
+	testResolve(t, e, n)
+	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool { return d.Ref == n })
+	d, _, _ := jsa.loadDutyEntryAt(e.id, e.epoch, testGen, ord)
 	if d.State != mqttDutyTerminal {
 		t.Fatalf("the abandoned delivery's duty is %d, want terminal", d.State)
 	}
-	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testF105Gen, d); cls != mqttFloorRelocate {
+	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testGen, d); cls != mqttFloorRelocate {
 		t.Fatalf("an abandoned delivery classifies %d (%v): it holds its identifier and is never reclaimed", cls, err)
 	}
 }
@@ -476,14 +476,14 @@ func TestF112AnAbandonedDeliveryIsNeverReclaimed(t *testing.T) {
 // T-E. The traversal restarts when, and only when, the floor crosses a position it could not read
 // (M10). Unrelated ledger movement — an admission — and a genuine hole inside the floor are
 // UNCERTAINTY, not restarts.
-func TestF112TraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
-	e, done := testF112Env(t, "f112-restart")
+func TestTraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-restart")
 	defer done()
 	jsa := &e.asm.jsa
 	for i := 0; i < 6; i++ {
-		testF112EndAndResolve(t, e, testF112Admit(t, e, 10))
+		testEndAndResolve(t, e, testFloorAdmit(t, e, 10))
 	}
-	keep := testF112Admit(t, e, 2)
+	keep := testFloorAdmit(t, e, 2)
 
 	// A FLOOR CROSSING UNDER THE TRAVERSAL: the first batched read finds the positions retired and
 	// deleted by an advance that ran after the traversal read the ledger.
@@ -491,13 +491,13 @@ func TestF112TraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 		if reads.Add(1) == 1 {
-			led, _ := testF112Ledger(t, e)
-			testF112AdvanceTo(t, e, led.Hi)
+			led, _ := testFloorLedger(t, e)
+			testAdvanceTo(t, e, led.Hi)
 		}
 		return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
 	}
 	e.asm.mu.Unlock()
-	census, err := mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testF105Gen, nil)
+	census, err := mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testGen, nil)
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = nil
 	e.asm.mu.Unlock()
@@ -511,8 +511,8 @@ func TestF112TraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
 
 	// A GENUINE HOLE inside the floor, with only an unrelated ledger write moving its sequence
 	// meanwhile (the floor unchanged): one pass, the hole uncertain.
-	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testF105Gen, func(d *mqttDutyEntry) bool { return d.Ref == keep })
-	smsg, _ := jsa.loadLastMsgFor(mqttInflightStreamName, mqttDutySubject(getHash(e.id), testF105Gen, ord))
+	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool { return d.Ref == keep })
+	smsg, _ := jsa.loadLastMsgFor(mqttInflightStreamName, mqttDutySubject(getHash(e.id), testGen, ord))
 	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("making the hole: %v", err)
 	}
@@ -520,21 +520,21 @@ func TestF112TraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 		if reads.Add(1) == 1 {
-			smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttGenLedgerSubject(getHash(e.id), testF105Gen))
+			smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttGenLedgerSubject(getHash(e.id), testGen))
 			if lerr != nil {
 				t.Errorf("re-reading the ledger: %v", lerr)
-			} else if _, serr := jsa.storeMsg(mqttGenLedgerSubject(getHash(e.id), testF105Gen), -1, smsg.Data); serr != nil {
+			} else if _, serr := jsa.storeMsg(mqttGenLedgerSubject(getHash(e.id), testGen), -1, smsg.Data); serr != nil {
 				t.Errorf("rewriting the ledger: %v", serr)
 			}
 		}
 		return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
 	}
 	e.asm.mu.Unlock()
-	census, err = mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testF105Gen, nil)
+	census, err = mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testGen, nil)
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = nil
 	e.asm.mu.Unlock()
-	hole := mqttDutySubject(getHash(e.id), testF105Gen, ord)
+	hole := mqttDutySubject(getHash(e.id), testGen, ord)
 	if err != nil || reads.Load() != 1 || len(census.uncertain) != 1 || census.uncertain[0] != hole {
 		t.Fatalf("a genuine hole with only an admission moving the ledger: err %v reads %d uncertain %v",
 			err, reads.Load(), census.uncertain)
@@ -544,8 +544,8 @@ func TestF112TraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
 // T-F. The landing proof (M11). An admission whose attempt was positively ABORTED leaves a
 // permanent outcome and no exchange; its absence is NOT a reclamation. A committed attempt is a
 // proof whether its revision still stands (LANDED) or has been passed (SUPERSEDED).
-func TestF112ALandingProofIsACommittedAttempt(t *testing.T) {
-	e, done := testF112Env(t, "f112-landing")
+func TestALandingProofIsACommittedAttempt(t *testing.T) {
+	e, done := testFloorEnv(t, "f112-landing")
 	defer done()
 	jsa := &e.asm.jsa
 
@@ -556,7 +556,7 @@ func TestF112ALandingProofIsACommittedAttempt(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: mqttNewInflightNonce(),
 			PI: pi, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: al.rec.Tenure,
 		}
-		tr, err := testF105AdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
+		tr, err := testAdmitExchangeTr(t, e, al.rec, al.seq, txn, "op-"+txn, x)
 		if err != nil {
 			t.Fatalf("composing: %v", err)
 		}
@@ -571,11 +571,11 @@ func TestF112ALandingProofIsACommittedAttempt(t *testing.T) {
 	if err := jsa.abortTransition(&h.attempt); err != nil {
 		t.Fatalf("aborting: %v", err)
 	}
-	if p := testF112Proof(jsa, []mqttCustodyAttempt{{handle: h, lin: abortedLin}}, abortedLin); p != mqttLandingUnproven {
+	if p := testProof(jsa, []mqttCustodyAttempt{{handle: h, lin: abortedLin}}, abortedLin); p != mqttLandingUnproven {
 		t.Fatalf("an ABORTED attempt was taken as a landing proof (%d)", p)
 	}
-	if v := jsa.classifyExchangeAbsence(e.id, e.epoch, testF105Gen, abortedLin,
-		testF112Proof(jsa, []mqttCustodyAttempt{{handle: h, lin: abortedLin}}, abortedLin)); v != mqttAbsenceUnproven {
+	if v := jsa.classifyExchangeAbsence(e.id, e.epoch, testGen, abortedLin,
+		testProof(jsa, []mqttCustodyAttempt{{handle: h, lin: abortedLin}}, abortedLin)); v != mqttAbsenceUnproven {
 		t.Fatalf("a never-landed admission's absence classifies %d, want unproven (the NAK stands)", v)
 	}
 
@@ -584,26 +584,26 @@ func TestF112ALandingProofIsACommittedAttempt(t *testing.T) {
 	if _, err := jsa.commitAuthorityTransition(landed); err != nil {
 		t.Fatalf("committing: %v", err)
 	}
-	if p := testF112Proof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, landedLin); p != mqttLandingCommitted {
+	if p := testProof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, landedLin); p != mqttLandingCommitted {
 		t.Fatalf("a LANDED attempt is not a landing proof (%d)", p)
 	}
 	// SUPERSEDED: another transition passes its revision; the attempt still happened.
-	testF112Admit(t, e, 6)
+	testFloorAdmit(t, e, 6)
 	if v := jsa.resolveTransitionHandle(lh); v != mqttTransitionSuperseded {
 		t.Fatalf("fixture: the attempt resolves %d, want superseded", v)
 	}
-	if p := testF112Proof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, landedLin); p != mqttLandingCommitted {
+	if p := testProof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, landedLin); p != mqttLandingCommitted {
 		t.Fatalf("a SUPERSEDED attempt is not a landing proof (%d)", p)
 	}
 	// A proof for another lineage proves nothing about this one.
-	if p := testF112Proof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, abortedLin); p != mqttLandingUnproven {
+	if p := testProof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, abortedLin); p != mqttLandingUnproven {
 		t.Fatalf("an attempt that wrote another lineage was taken as this one's proof (%d)", p)
 	}
 }
 
 // T-G. Recovery never retires a root while authorized deletions stand below a sealed floor (M14).
-func TestF112ARootRetiresOnlyWithItsRetiredPositionsDeleted(t *testing.T) {
-	root := &mqttRecoveryRoot{ID: "c", Epoch: "e", Gen: testF105Gen, SweepStart: 1, Resume: 11, Bound: 10}
+func TestARootRetiresOnlyWithItsRetiredPositionsDeleted(t *testing.T) {
+	root := &mqttRecoveryRoot{ID: "c", Epoch: "e", Gen: testGen, SweepStart: 1, Resume: 11, Bound: 10}
 	led := &mqttGenLedger{State: mqttGenLedgerSealed, Hi: 10, SealedHi: 10, Lo: 6, Del: 3}
 	if mqttRootRetires(root, led) {
 		t.Fatal("a root retired with retired positions still standing below its floor")
@@ -614,12 +614,12 @@ func TestF112ARootRetiresOnlyWithItsRetiredPositionsDeleted(t *testing.T) {
 	}
 }
 
-// testF112PlantAdmittedDuty writes the duty entry an admission writes for exchange nonce — at the
+// testPlantAdmittedDuty writes the duty entry an admission writes for exchange nonce — at the
 // next ordinal, with the ledger's high-water moved to it — for a fixture that plants an exchange
 // record directly. Since issue #114 every exchange enumeration is the inventory, so a planted
 // obligation the inventory does not name is a shape no admission writes (the coverage rule) and
 // no reader enumerates.
-func testF112PlantAdmittedDuty(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string) {
+func testPlantAdmittedDuty(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string) {
 	t.Helper()
 	led, _, err := jsa.loadGenLedger(id, epoch, gen)
 	if err != nil {
@@ -648,8 +648,8 @@ func testF112PlantAdmittedDuty(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce
 	}
 }
 
-// testF112Proof is the landing proof, whether or not it is decided.
-func testF112Proof(jsa *mqttJSA, attempts []mqttCustodyAttempt, lin string) mqttLandingProof {
+// testProof is the landing proof, whether or not it is decided.
+func testProof(jsa *mqttJSA, attempts []mqttCustodyAttempt, lin string) mqttLandingProof {
 	p, _ := jsa.mqttLandingProofDecided(attempts, lin)
 	return p
 }

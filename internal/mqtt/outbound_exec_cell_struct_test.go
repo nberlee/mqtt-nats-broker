@@ -18,14 +18,14 @@ import (
 	"testing"
 )
 
-// TestF105NoConnectionScopedExecutionRegistry is the structural half of the integrated gate's round-1
+// TestNoConnectionScopedExecutionRegistry is the structural half of the integrated gate's round-1
 // finding: no connection or session type holds a map keyed by acquisition. Such a map outlives every
 // acquisition it records, which is the per-transmission growth the consume-once fact must not have;
 // the fact lives on each acquisition's holder instead. The runtime half, which also sees a registry
-// keyed some other way, is TestF105ALongLivedConnectionRetainsNoTransmissionHistory.
+// keyed some other way, is TestALongLivedConnectionRetainsNoTransmissionHistory.
 //
 // Mutation: M4a (a client map keyed by mqttActionKey).
-func TestF105NoConnectionScopedExecutionRegistry(t *testing.T) {
+func TestNoConnectionScopedExecutionRegistry(t *testing.T) {
 	keyT := reflect.TypeOf(mqttActionKey{})
 	pkg := keyT.PkgPath()
 	seen := map[reflect.Type]bool{}

@@ -4246,7 +4246,7 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
 // the identifier is held by the custody ledger until the exchange's durable ending, and removing
-// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing); each release
+// this metadata releases nothing (TestCustodyMetadataRemovalReleasesNothing); each release
 // below therefore also asserts that the ledger holds nothing for the identifier.
 //
 // The revision a save captures precedes its marshal, so a verdict recorded by a concurrent
@@ -4314,7 +4314,7 @@ func TestMQTTInflightSchedulingEntryWaitsForASerializedVerdict(t *testing.T) {
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
 // the identifier is held by the custody ledger until the exchange's durable ending, and removing
-// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing); each release
+// this metadata releases nothing (TestCustodyMetadataRemovalReleasesNothing); each release
 // below therefore also asserts that the ledger holds nothing for the identifier.
 //
 // A securing tombstone retires the nonce while the original store is still out. When that
@@ -4533,11 +4533,11 @@ func TestMQTTInflightStaleStoreCannotReleaseNewerReservation(t *testing.T) {
 // What these schedules release is the SCHEDULING ENTRY (pendingPublish) of an allocation that was
 // never admitted, which is what keeps its identifier from the allocator. For an ADMITTED exchange
 // the identifier is held by the custody ledger until the exchange's durable ending, and removing
-// this metadata releases nothing (TestF105CustodyMetadataRemovalReleasesNothing); each release
+// this metadata releases nothing (TestCustodyMetadataRemovalReleasesNothing); each release
 // below therefore also asserts that the ledger holds nothing for the identifier.
 // The Receive Maximum 1 behaviour this test was once named for — a void verdict retires and
 // no second delivery is admitted while the first is outstanding — is
-// TestF105CustodyMetadataRemovalReleasesNothing.
+// TestCustodyMetadataRemovalReleasesNothing.
 func TestMQTTInflightSchedulingEntryDropIsOrderIndependent(t *testing.T) {
 	// Ordering A: the verdict's save lands BEFORE the store settles.
 	t.Run("verdict-durable-then-settle", func(t *testing.T) {
@@ -5258,7 +5258,7 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 	// identifier and its Receive Maximum slot. So the sweep now requires a valid
 	// retirement watermark naming the generation, and a fixture asserting reclamation
 	// plants the fact that licenses it. The retention half is asserted separately, by
-	// TestF036OrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement.
+	// TestOrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement.
 	//
 	// The ORDER is load-bearing for the fixture, not just faithful to a real teardown
 	// (which also records its retirement before leaving state behind): this account

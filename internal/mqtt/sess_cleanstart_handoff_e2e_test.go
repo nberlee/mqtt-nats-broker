@@ -32,9 +32,9 @@ import (
 // handoff: the successor serves at a fresh generation, the predecessor generation is closed
 // with Discard and its cleanup enrolled, all in one finalization.
 
-// testF105CleanStartEnv connects a PERSISTENT session and returns the account, the client id,
+// testCleanStartEnv connects a PERSISTENT session and returns the account, the client id,
 // its recovery epoch, and the outbound authority's generation as it stands after the connect.
-func testF105CleanStartEnv(t *testing.T, clientID string) (*Server, *mqttAccountSessionManager, string, string, func()) {
+func testCleanStartEnv(t *testing.T, clientID string) (*Server, *mqttAccountSessionManager, string, string, func()) {
 	t.Helper()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -60,12 +60,12 @@ func testF105CleanStartEnv(t *testing.T, clientID string) (*Server, *mqttAccount
 	return s, asm, epoch, gen, func() { testMQTTShutdownServer(s) }
 }
 
-// TestF105CleanStartHandoffOverLiveAuthoritySucceeds is the production regression: a clean
+// TestCleanStartHandoffOverLiveAuthoritySucceeds is the production regression: a clean
 // start over a resident, persistent session with a live serving authority must be ACCEPTED,
 // report no session present, and install a successor serving authority at a NEW generation.
-func TestF105CleanStartHandoffOverLiveAuthoritySucceeds(t *testing.T) {
+func TestCleanStartHandoffOverLiveAuthoritySucceeds(t *testing.T) {
 	const clientID = "f105-cs-handoff-ok"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, clientID)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, clientID)
 	defer done()
 	o := s.getOpts()
 
@@ -83,12 +83,12 @@ func TestF105CleanStartHandoffOverLiveAuthoritySucceeds(t *testing.T) {
 	}
 }
 
-// TestF105CleanStartHandoffClosesAndReplacesThePredecessor asserts the durable outcome of the
+// TestCleanStartHandoffClosesAndReplacesThePredecessor asserts the durable outcome of the
 // handoff: the predecessor generation is CLOSED with Discard, and the standing session record
 // is the successor's — a fresh generation, parentless (a clean start inherits no lineage).
-func TestF105CleanStartHandoffClosesAndReplacesThePredecessor(t *testing.T) {
+func TestCleanStartHandoffClosesAndReplacesThePredecessor(t *testing.T) {
 	const clientID = "f105-cs-handoff-closure"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, clientID)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, clientID)
 	defer done()
 	o := s.getOpts()
 
@@ -127,12 +127,12 @@ func TestF105CleanStartHandoffClosesAndReplacesThePredecessor(t *testing.T) {
 	}
 }
 
-// TestF105CleanStartHandoffAbortBeforeCommitPreservesThePredecessor arms the metadata-commit
+// TestCleanStartHandoffAbortBeforeCommitPreservesThePredecessor arms the metadata-commit
 // seam to fail BEFORE the batch is sent. Nothing of the successor commits: the predecessor
 // session record stands unchanged, and a retry with the seam disarmed completes the handoff.
-func TestF105CleanStartHandoffAbortBeforeCommitPreservesThePredecessor(t *testing.T) {
+func TestCleanStartHandoffAbortBeforeCommitPreservesThePredecessor(t *testing.T) {
 	const clientID = "f105-cs-handoff-abort"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, clientID)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, clientID)
 	defer done()
 	o := s.getOpts()
 
@@ -178,11 +178,11 @@ func TestF105CleanStartHandoffAbortBeforeCommitPreservesThePredecessor(t *testin
 	}
 }
 
-// TestF105CleanStartHandoffCleansUpThePredecessorConsumer asserts the cleanup half: the plain
+// TestCleanStartHandoffCleansUpThePredecessorConsumer asserts the cleanup half: the plain
 // QoS 1 consumer the predecessor held is removed once the successor is serving. The affine
 // consumer, when present, is deferred to recovery; a plain source/group consumer is this
 // broker's to delete directly.
-func TestF105CleanStartHandoffCleansUpThePredecessorConsumer(t *testing.T) {
+func TestCleanStartHandoffCleansUpThePredecessorConsumer(t *testing.T) {
 	const clientID = "f105-cs-handoff-cleanup"
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -226,18 +226,18 @@ func TestF105CleanStartHandoffCleansUpThePredecessorConsumer(t *testing.T) {
 	})
 }
 
-// TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed stops the accepting CONNECT AT
+// TestCleanStartHandoffCrashAfterCommitFinalizesAsProposed stops the accepting CONNECT AT
 // its finalization step, after the three-member batch has committed: the step-entry seam fails
 // the step exactly as a process stopping there would, so no in-place settlement runs. The
 // successor record and its COMMITTED receipt are durable, the authority stands PREPARING, and
 // a fresh CONNECT must complete the SAME proposal — finalizing the successor it committed
 // rather than proposing another (Codex consult 6: a committed proposal must finalize exactly
 // as proposed). issue #107 8a: the seam moved from the metadata ACK, where a failure is now a lost
-// response the executor resolves in place (TestF105LostResponseMetadataCommitFinalizesInPlace),
+// response the executor resolves in place (TestLostResponseMetadataCommitFinalizesInPlace),
 // to the finalize step, where only a stopped process leaves this residue.
-func TestF105CleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) {
+func TestCleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) {
 	const clientID = "f105-cs-handoff-crash"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, clientID)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, clientID)
 	defer done()
 	o := s.getOpts()
 

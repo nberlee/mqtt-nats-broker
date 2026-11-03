@@ -37,19 +37,19 @@ func testServingLoad() mqttAuthorityLoad {
 	return mqttAuthorityLoad{
 		status: mqttOutboundValid,
 		rec: &mqttOutboundAuthority{
-			ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Tenure: "tenure-1",
+			ID: testID, Epoch: testEpoch, Gen: testGen, Tenure: "tenure-1",
 			State: mqttAuthorityServing, Rev: 1, Txn: "txn-1", OwnerTxn: "txn-1",
 		},
 	}
 }
 
-// TestF105OwnershipStopsAtAServableAuthority is the ordinary path, and it pins the ORDER that
+// TestOwnershipStopsAtAServableAuthority is the ordinary path, and it pins the ORDER that
 // matters most: servable is checked BEFORE the budget.
 //
 // A protocol that has already succeeded is not failed by its clock running out afterwards. The
 // disposition function refuses the question for a finalized proposal precisely so this order is
 // forced rather than assumed.
-func TestF105OwnershipStopsAtAServableAuthority(t *testing.T) {
+func TestOwnershipStopsAtAServableAuthority(t *testing.T) {
 	b, err := mqttNewOwnershipBudget(time.Now(), time.Millisecond)
 	if err != nil {
 		t.Fatalf("anchoring: %v", err)
@@ -71,12 +71,12 @@ func TestF105OwnershipStopsAtAServableAuthority(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipExpiryCarriesTheProposalsDisposition is the whole point of the budget living
+// TestOwnershipExpiryCarriesTheProposalsDisposition is the whole point of the budget living
 // in the driver rather than at the call site.
 //
 // The connection is refused in every case. What differs is what happens to the PROPOSAL, and
 // the driver is the only thing that knows which of the three states the run reached.
-func TestF105OwnershipExpiryCarriesTheProposalsDisposition(t *testing.T) {
+func TestOwnershipExpiryCarriesTheProposalsDisposition(t *testing.T) {
 	absent := mqttAuthorityLoad{status: mqttOutboundAbsent}
 
 	// UNRESOLVED: no verdict was established. Nothing is aborted — absence of a committed
@@ -142,13 +142,13 @@ func TestF105OwnershipExpiryCarriesTheProposalsDisposition(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipBindsToOneForeignProposal is the abort-war bound, and it lives here because
+// TestOwnershipBindsToOneForeignProposal is the abort-war bound, and it lives here because
 // no single decision can hold it.
 //
 // An acceptance free to chase whatever foreign proposal it finds on each reload would abort a
 // succession of them. The decision function is stateless and would happily name a new target
 // every time; what stops it is that the driver carries the first one and refuses a second.
-func TestF105OwnershipBindsToOneForeignProposal(t *testing.T) {
+func TestOwnershipBindsToOneForeignProposal(t *testing.T) {
 	first := &mqttForeignRecovery{
 		Proposal:  mqttOwnershipProposal{Kind: mqttProposalCreation, ID: "intent-A"},
 		AuthSeq:   1,
@@ -178,7 +178,7 @@ func TestF105OwnershipBindsToOneForeignProposal(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipBoundsWorkAsWellAsTime pins what the step bound ACTUALLY guarantees.
+// TestOwnershipBoundsWorkAsWellAsTime pins what the step bound ACTUALLY guarantees.
 //
 // An earlier version of this test claimed the step bound is what makes an unconverging protocol
 // terminate, and demonstrated it by removing the bound and watching the test hang. That was a
@@ -190,7 +190,7 @@ func TestF105OwnershipBindsToOneForeignProposal(t *testing.T) {
 // the budget allows — hammering the store and contending with the brokers it is racing.
 //
 // Both halves are asserted here, because the first is what stops the second being overclaimed.
-func TestF105OwnershipBoundsWorkAsWellAsTime(t *testing.T) {
+func TestOwnershipBoundsWorkAsWellAsTime(t *testing.T) {
 	absent := mqttAuthorityLoad{status: mqttOutboundAbsent}
 
 	// (1) TIME ALONE TERMINATES IT. A generous step allowance and an ADVANCING clock: the run
@@ -239,9 +239,9 @@ func TestF105OwnershipBoundsWorkAsWellAsTime(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipRequiresItsClockAndExecutor pins the two refusals that keep an unbounded run
+// TestOwnershipRequiresItsClockAndExecutor pins the two refusals that keep an unbounded run
 // from existing at all.
-func TestF105OwnershipRequiresItsClockAndExecutor(t *testing.T) {
+func TestOwnershipRequiresItsClockAndExecutor(t *testing.T) {
 	b, _ := mqttNewOwnershipBudget(time.Now(), time.Second)
 	if _, err := mqttDriveOwnership(mqttConnectOwnershipInput{}, "tenure-mine", b, time.Now, nil); err == nil {
 		t.Fatalf("ownership was driven with no executor")
@@ -254,7 +254,7 @@ func TestF105OwnershipRequiresItsClockAndExecutor(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipDeadlineViewCapsEveryRequest is consult 6's first WP-E.2 concern, as issue #107 8a
+// TestOwnershipDeadlineViewCapsEveryRequest is consult 6's first WP-E.2 concern, as issue #107 8a
 // answers it.
 //
 // Checking a deadline BEFORE starting a step does not bound a step that then BLOCKS, and neither
@@ -263,7 +263,7 @@ func TestF105OwnershipRequiresItsClockAndExecutor(t *testing.T) {
 // protocol's every request runs on: each wait is the per-request timeout capped at that instant,
 // and a request after it is refused before anything is queued — the certain shape, which says
 // nothing was sent.
-func TestF105OwnershipDeadlineViewCapsEveryRequest(t *testing.T) {
+func TestOwnershipDeadlineViewCapsEveryRequest(t *testing.T) {
 	core := &mqttJSA{mqttJSACore: &mqttJSACore{timeout: 5 * time.Second}}
 
 	if w, err := core.requestWait(); err != nil || w != 5*time.Second {
@@ -299,7 +299,7 @@ func TestF105OwnershipDeadlineViewCapsEveryRequest(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipDoesNotStopAtSomebodyElsesTenure is round I-4's first finding.
+// TestOwnershipDoesNotStopAtSomebodyElsesTenure is round I-4's first finding.
 //
 // The servable check used to accept ANY serving authority, which is the
 // finalization-versus-activation confusion in its most damaging form: an ordinary reconnect
@@ -308,7 +308,7 @@ func TestF105OwnershipDeadlineViewCapsEveryRequest(t *testing.T) {
 // proposal — its tenure becomes serving while this acceptance has acquired nothing.
 //
 // A caveat in a file header does not repair a skipped transition.
-func TestF105OwnershipDoesNotStopAtSomebodyElsesTenure(t *testing.T) {
+func TestOwnershipDoesNotStopAtSomebodyElsesTenure(t *testing.T) {
 	// A serving authority whose tenure belongs to somebody else.
 	foreign := testServingLoad()
 	b, _ := mqttNewOwnershipBudget(time.Now(), time.Hour)
@@ -364,7 +364,7 @@ func TestF105OwnershipDoesNotStopAtSomebodyElsesTenure(t *testing.T) {
 	}
 }
 
-// TestF105OwnershipLoserStopsAcrossAReload is round I-4's second finding.
+// TestOwnershipLoserStopsAcrossAReload is round I-4's second finding.
 //
 // The loser bound was latched only when the decision returned CloseAbandoned — immediately
 // before returning — so it never protected a SUBSEQUENT read. If a peer aborted and CLOSED this
@@ -373,12 +373,12 @@ func TestF105OwnershipDoesNotStopAtSomebodyElsesTenure(t *testing.T) {
 // proposal: the abort war the bound exists to prevent, entered through the loser's own retry.
 //
 // The verdict is now latched from the READ, so the run stops whatever the next decision offers.
-func TestF105OwnershipLoserStopsAcrossAReload(t *testing.T) {
+func TestOwnershipLoserStopsAcrossAReload(t *testing.T) {
 	b, _ := mqttNewOwnershipBudget(time.Now(), time.Hour)
 	closed := mqttAuthorityLoad{
 		status: mqttOutboundValid,
 		rec: &mqttOutboundAuthority{
-			ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Tenure: "tenure-old",
+			ID: testID, Epoch: testEpoch, Gen: testGen, Tenure: "tenure-old",
 			State: mqttAuthorityClosed, Rev: 2, Txn: "txn-2", OwnerTxn: "txn-2",
 		},
 	}

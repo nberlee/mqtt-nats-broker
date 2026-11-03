@@ -33,76 +33,76 @@ import (
 // argument, a new direct write to the index or a new role reader fails this census until it is
 // classified here, with the behavioural tests that back its class.
 
-// f088BindingReason is the fact a binding write or removal rests on.
-type f088BindingReason string
+// bindingReason is the fact a binding write or removal rests on.
+type bindingReason string
 
 const (
 	// The binding's own exchange positively ENDED, matched by its role's matcher (endedBy).
-	f088BindingEndedObserved f088BindingReason = "ended-observed"
+	bindingEndedObserved bindingReason = "ended-observed"
 	// The PUBREL intent resolver positively found the exchange Ended, or displaced (Other).
-	f088BindingIntentEndedOrOther f088BindingReason = "pubrel-intent-ended-or-other"
+	bindingIntentEndedOrOther bindingReason = "pubrel-intent-ended-or-other"
 	// The terminal-source continuation: Ended, EndedAndDeleted, or Discard (its proof variable
 	// takes only those three constants).
-	f088BindingTerminalSource f088BindingReason = "terminal-source"
+	bindingTerminalSource bindingReason = "terminal-source"
 	// Recovery restored an ACTING entry of the same allocation, which now owns its ACK.
-	f088BindingRecoveryHandoff f088BindingReason = "recovery-handoff"
+	bindingRecoveryHandoff bindingReason = "recovery-handoff"
 	// The role-dispatched removal boundary reaching the exact compare-delete.
-	f088BindingBoundary f088BindingReason = "boundary"
+	bindingBoundary bindingReason = "boundary"
 	// The exact compare-delete itself.
-	f088BindingCompareDelete f088BindingReason = "compare-delete"
+	bindingCompareDelete bindingReason = "compare-delete"
 	// The install boundary: a fresh install, or a HandBack upgrading its own allocation's
 	// AckRoute (REPLACED). Nothing else is overwritten.
-	f088BindingInstallOrReplaced f088BindingReason = "install-or-replaced"
+	bindingInstallOrReplaced bindingReason = "install-or-replaced"
 	// The generation was DISCARDED: its bindings are unreachable from the fresh generation.
-	f088BindingDiscard f088BindingReason = "discard"
+	bindingDiscard bindingReason = "discard"
 	// The binding's lineage was RECLAIMED behind the issue #114 floor: ended AND its register positively
 	// gone, the strongest proof a binding has (classifyExchangeAbsence).
-	f088BindingReclaimed f088BindingReason = "reclaimed"
+	bindingReclaimed bindingReason = "reclaimed"
 )
 
-// f088BindingBacking names the behavioural tests that witness each reason. Each must exist.
-var f088BindingBacking = map[f088BindingReason][]string{
-	f088BindingEndedObserved:      {"TestF088AckRouteEndsByLineage", "TestF088UntrackedTransmittedDeliveryLatePubAckEndsTheExchange"},
-	f088BindingIntentEndedOrOther: {"TestUnitCAbandonedIntentClassification"},
-	f088BindingTerminalSource: {"TestUnitCSourceCompletionPreservesUnansweredBinding",
+// bindingBacking names the behavioural tests that witness each reason. Each must exist.
+var bindingBacking = map[bindingReason][]string{
+	bindingEndedObserved:      {"TestAckRouteEndsByLineage", "TestUntrackedTransmittedDeliveryLatePubAckEndsTheExchange"},
+	bindingIntentEndedOrOther: {"TestUnitCAbandonedIntentClassification"},
+	bindingTerminalSource: {"TestUnitCSourceCompletionPreservesUnansweredBinding",
 		"TestSharedTerminalOwnerCapturedBeforeTheBindingReleasesTheHandBack"},
-	f088BindingRecoveryHandoff:   {"TestF088RecoveryHandoffRetiresTheAckRoute"},
-	f088BindingBoundary:          {"TestF088TerminalHandBackStillReconstructs"},
-	f088BindingCompareDelete:     {"TestF088TerminalHandBackStillReconstructs"},
-	f088BindingInstallOrReplaced: {"TestF088AbandonmentUpgradesAnAckRoute", "TestF088BindingRefusesAnotherGeneration"},
-	f088BindingDiscard:           {"TestUnitCAbandonedAckBindingsGoWithTheGeneration"},
-	f088BindingReclaimed:         {"TestF112AReclaimedLineageReleasesItsBindingAndItsCustody"},
+	bindingRecoveryHandoff:   {"TestRecoveryHandoffRetiresTheAckRoute"},
+	bindingBoundary:          {"TestTerminalHandBackStillReconstructs"},
+	bindingCompareDelete:     {"TestTerminalHandBackStillReconstructs"},
+	bindingInstallOrReplaced: {"TestAbandonmentUpgradesAnAckRoute", "TestBindingRefusesAnotherGeneration"},
+	bindingDiscard:           {"TestUnitCAbandonedAckBindingsGoWithTheGeneration"},
+	bindingReclaimed:         {"TestAReclaimedLineageReleasesItsBindingAndItsCustody"},
 }
 
-// f088BindingSite is one discovered write or removal: its enclosing function and its form.
-type f088BindingSite struct {
+// bindingSite is one discovered write or removal: its enclosing function and its form.
+type bindingSite struct {
 	fn   string
 	what string
 }
 
-// f088FrozenBindingSites is the FROZEN census of every binding removal (by the proof argument
+// frozenBindingSites is the FROZEN census of every binding removal (by the proof argument
 // passed) and every direct write to sess.abandonedAcks, by enclosing function. Frozen against the
 // issue #99/issue #90 working tree of 2026-10-08 (base HEAD 660a82e plus the uncommitted WP2/WP3 edits).
-var f088FrozenBindingSites = map[f088BindingSite]struct {
+var frozenBindingSites = map[bindingSite]struct {
 	n      int
-	reason f088BindingReason
+	reason bindingReason
 }{
-	{"observeAbandonedAckEndLocked", "remove:mqttBindingReleaseEnded"}:           {1, f088BindingEndedObserved},
-	{"finishAbandonedAckResolution", "remove:mqttBindingReleaseEnded"}:           {1, f088BindingIntentEndedOrOther},
-	{"finishTerminalSource", "remove:proof"}:                                     {1, f088BindingTerminalSource},
-	{"recoverInflightRegistersOnce", "remove:mqttBindingReleaseHandoff"}:         {1, f088BindingRecoveryHandoff},
-	{"removeAbandonedAckBindingLocked", "exact"}:                                 {1, f088BindingBoundary},
-	{"removeAbandonedAckLocked", "delete"}:                                       {1, f088BindingCompareDelete},
-	{"installAbandonedAckLocked", "assign:index"}:                                {1, f088BindingInstallOrReplaced},
-	{"installAbandonedAckLocked", "assign:make"}:                                 {1, f088BindingInstallOrReplaced},
-	{"resetForReuseLocked", "assign:nil"}:                                        {1, f088BindingDiscard},
-	{"acceptReclaimedLineageLocked", "remove:mqttBindingReleaseEndedAndDeleted"}: {1, f088BindingReclaimed},
+	{"observeAbandonedAckEndLocked", "remove:mqttBindingReleaseEnded"}:           {1, bindingEndedObserved},
+	{"finishAbandonedAckResolution", "remove:mqttBindingReleaseEnded"}:           {1, bindingIntentEndedOrOther},
+	{"finishTerminalSource", "remove:proof"}:                                     {1, bindingTerminalSource},
+	{"recoverInflightRegistersOnce", "remove:mqttBindingReleaseHandoff"}:         {1, bindingRecoveryHandoff},
+	{"removeAbandonedAckBindingLocked", "exact"}:                                 {1, bindingBoundary},
+	{"removeAbandonedAckLocked", "delete"}:                                       {1, bindingCompareDelete},
+	{"installAbandonedAckLocked", "assign:index"}:                                {1, bindingInstallOrReplaced},
+	{"installAbandonedAckLocked", "assign:make"}:                                 {1, bindingInstallOrReplaced},
+	{"resetForReuseLocked", "assign:nil"}:                                        {1, bindingDiscard},
+	{"acceptReclaimedLineageLocked", "remove:mqttBindingReleaseEndedAndDeleted"}: {1, bindingReclaimed},
 }
 
-// f088FrozenRoleReaders is every production function that reads a binding's ROLE (a `.role`
+// frozenRoleReaders is every production function that reads a binding's ROLE (a `.role`
 // selector, or a `.handBack()` call), with the count. Each dispatches the shared index on the role
 // the plan names for it (WP2 "Binding roles").
-var f088FrozenRoleReaders = map[string]struct {
+var frozenRoleReaders = map[string]struct {
 	n   int
 	why string
 }{
@@ -117,15 +117,15 @@ var f088FrozenRoleReaders = map[string]struct {
 	"recoverInflightRegistersOnce":    {1, "recovery's acting restore retires a same-allocation AckRoute (HANDOFF)"},
 }
 
-// f088ScanBindings scans the production sources.
-func f088ScanBindings(t *testing.T) (sites map[f088BindingSite]int, readers map[string]int, files map[string]*ast.File) {
+// scanBindings scans the production sources.
+func scanBindings(t *testing.T) (sites map[bindingSite]int, readers map[string]int, files map[string]*ast.File) {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
 	fset := token.NewFileSet()
-	sites, readers, files = map[f088BindingSite]int{}, map[string]int{}, map[string]*ast.File{}
+	sites, readers, files = map[bindingSite]int{}, map[string]int{}, map[string]*ast.File{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -150,7 +150,7 @@ func f088ScanBindings(t *testing.T) (sites map[f088BindingSite]int, readers map[
 						lhs[l] = true
 						if ix, ok := l.(*ast.IndexExpr); ok {
 							if sel, ok := ix.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "abandonedAcks" {
-								sites[f088BindingSite{fn, "assign:index"}]++
+								sites[bindingSite{fn, "assign:index"}]++
 							}
 						}
 						if sel, ok := l.(*ast.SelectorExpr); ok && sel.Sel.Name == "abandonedAcks" {
@@ -167,7 +167,7 @@ func f088ScanBindings(t *testing.T) (sites map[f088BindingSite]int, readers map[
 									}
 								}
 							}
-							sites[f088BindingSite{fn, form}]++
+							sites[bindingSite{fn, form}]++
 						}
 					}
 				}
@@ -184,7 +184,7 @@ func f088ScanBindings(t *testing.T) (sites map[f088BindingSite]int, readers map[
 					case *ast.Ident:
 						if fun.Name == "delete" && len(x.Args) == 2 {
 							if sel, ok := x.Args[0].(*ast.SelectorExpr); ok && sel.Sel.Name == "abandonedAcks" {
-								sites[f088BindingSite{fn, "delete"}]++
+								sites[bindingSite{fn, "delete"}]++
 							}
 						}
 					case *ast.SelectorExpr:
@@ -198,9 +198,9 @@ func f088ScanBindings(t *testing.T) (sites map[f088BindingSite]int, readers map[
 									proof = id.Name
 								}
 							}
-							sites[f088BindingSite{fn, "remove:" + proof}]++
+							sites[bindingSite{fn, "remove:" + proof}]++
 						case "removeAbandonedAckLocked":
-							sites[f088BindingSite{fn, "exact"}]++
+							sites[bindingSite{fn, "exact"}]++
 						}
 					}
 				}
@@ -211,27 +211,27 @@ func f088ScanBindings(t *testing.T) (sites map[f088BindingSite]int, readers map[
 	return sites, readers, files
 }
 
-// TestF088EveryBindingRemovalHasAReason is T13c.
-func TestF088EveryBindingRemovalHasAReason(t *testing.T) {
+// TestEveryBindingRemovalHasAReason is T13c.
+func TestEveryBindingRemovalHasAReason(t *testing.T) {
 	t.Parallel()
-	sites, readers, files := f088ScanBindings(t)
+	sites, readers, files := scanBindings(t)
 	var diffs []string
 	for s, n := range sites {
-		if want, ok := f088FrozenBindingSites[s]; !ok || want.n != n {
+		if want, ok := frozenBindingSites[s]; !ok || want.n != n {
 			diffs = append(diffs, s.fn+" / "+s.what+": source has "+itoa(n)+", frozen has "+itoa(want.n))
 		}
 	}
-	for s, want := range f088FrozenBindingSites {
+	for s, want := range frozenBindingSites {
 		if _, ok := sites[s]; !ok {
 			diffs = append(diffs, s.fn+" / "+s.what+": frozen with "+itoa(want.n)+" but gone from the source (stale row)")
 		}
 	}
 	for fn, n := range readers {
-		if want, ok := f088FrozenRoleReaders[fn]; !ok || want.n != n {
+		if want, ok := frozenRoleReaders[fn]; !ok || want.n != n {
 			diffs = append(diffs, "role reader "+fn+": source has "+itoa(n)+", frozen has "+itoa(want.n))
 		}
 	}
-	for fn, want := range f088FrozenRoleReaders {
+	for fn, want := range frozenRoleReaders {
 		if _, ok := readers[fn]; !ok {
 			diffs = append(diffs, "role reader "+fn+": frozen with "+itoa(want.n)+" but gone from the source (stale row)")
 		}
@@ -246,7 +246,7 @@ func TestF088EveryBindingRemovalHasAReason(t *testing.T) {
 	allowed := map[string]bool{"mqttBindingReleaseEnded": true, "mqttBindingReleaseEndedAndDeleted": true,
 		"mqttBindingReleaseDiscard": true}
 	var proofValues []string
-	if fd := f088FindFunc(files, "finishTerminalSource"); fd == nil {
+	if fd := findFunc(files, "finishTerminalSource"); fd == nil {
 		t.Error("finishTerminalSource is gone from the source")
 	} else {
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -275,7 +275,7 @@ func TestF088EveryBindingRemovalHasAReason(t *testing.T) {
 
 	// observeAbandonedAckEndLocked dispatches through the role's matcher ALONE: the pre-issue #90
 	// first-line `x.Abandoned == nil` guard made it HandBack-only and stranded every AckRoute.
-	if fd := f088FindFunc(files, "observeAbandonedAckEndLocked"); fd == nil {
+	if fd := findFunc(files, "observeAbandonedAckEndLocked"); fd == nil {
 		t.Error("observeAbandonedAckEndLocked is gone from the source")
 	} else {
 		callsEndedBy, readsAbandoned := false, false
@@ -297,23 +297,23 @@ func TestF088EveryBindingRemovalHasAReason(t *testing.T) {
 		}
 	}
 
-	exists := f088TestNames(t)
-	for reason, tests := range f088BindingBacking {
+	exists := testNames(t)
+	for reason, tests := range bindingBacking {
 		for _, name := range tests {
 			if !exists[name] {
 				t.Errorf("reason %s is backed by %s, which does not exist", reason, name)
 			}
 		}
 	}
-	for _, row := range f088FrozenBindingSites {
-		if len(f088BindingBacking[row.reason]) == 0 {
+	for _, row := range frozenBindingSites {
+		if len(bindingBacking[row.reason]) == 0 {
 			t.Errorf("reason %s has no behavioural backing", row.reason)
 		}
 	}
 }
 
-// f088FindFunc returns the production function (or method) declaration named name.
-func f088FindFunc(files map[string]*ast.File, name string) *ast.FuncDecl {
+// findFunc returns the production function (or method) declaration named name.
+func findFunc(files map[string]*ast.File, name string) *ast.FuncDecl {
 	for _, f := range files {
 		for _, d := range f.Decls {
 			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil && fd.Name.Name == name {

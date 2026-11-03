@@ -224,10 +224,10 @@ func mqttValidateHandoffOutcome(o *mqttHandoffOutcome, wantID, wantEpoch, wantIn
 		if !mqttValidSessGen(o.PrevGen) {
 			return fmt.Errorf("handoff outcome names a malformed predecessor generation %q", o.PrevGen)
 		}
-		if !mqttF105IdentTk(o.PrevTenure) {
+		if !mqttOutboundIdentTk(o.PrevTenure) {
 			return fmt.Errorf("handoff outcome names a malformed predecessor tenure %q", o.PrevTenure)
 		}
-		if !mqttF105IdentTk(o.PrevOwnerTxn) {
+		if !mqttOutboundIdentTk(o.PrevOwnerTxn) {
 			return fmt.Errorf("handoff outcome names a malformed predecessor ownership transition %q", o.PrevOwnerTxn)
 		}
 		if o.PrevSessWID == _EMPTY_ {
@@ -257,7 +257,7 @@ func mqttValidateHandoffOutcome(o *mqttHandoffOutcome, wantID, wantEpoch, wantIn
 		if !mqttValidSessGen(o.ProposedGen) {
 			return fmt.Errorf("committed handoff outcome carries a malformed proposed generation %q", o.ProposedGen)
 		}
-		if !mqttF105IdentTk(o.ProposedTenure) {
+		if !mqttOutboundIdentTk(o.ProposedTenure) {
 			return fmt.Errorf("committed handoff outcome carries a malformed proposed tenure %q", o.ProposedTenure)
 		}
 	case mqttHandoffAborted:

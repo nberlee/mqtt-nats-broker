@@ -17,38 +17,38 @@ package mqtt
 
 import "testing"
 
-func testF105Load(status mqttOutboundLoadStatus, rec *mqttOutboundAuthority) mqttAuthorityLoad {
+func testLoad(status mqttOutboundLoadStatus, rec *mqttOutboundAuthority) mqttAuthorityLoad {
 	return mqttAuthorityLoad{rec: rec, seq: 9, status: status}
 }
 
-func testF105Reserving(intentID string) *mqttOutboundAuthority {
-	c := &mqttCreationIntent{ID: intentID, Gen: testF105Gen, Tenure: "tenure-new"}
+func testReserving(intentID string) *mqttOutboundAuthority {
+	c := &mqttCreationIntent{ID: intentID, Gen: testGen, Tenure: "tenure-new"}
 	return &mqttOutboundAuthority{
-		ID: testF105ID, Epoch: testF105Epoch, Gen: c.Gen, Tenure: c.Tenure,
+		ID: testID, Epoch: testEpoch, Gen: c.Gen, Tenure: c.Tenure,
 		State: mqttAuthorityReserving, Rev: 1, Txn: "txn-res", OwnerTxn: "txn-res",
 		Creation: c,
 	}
 }
 
-func testF105Preparing(intentID string) *mqttOutboundAuthority {
-	a := testF105PreparingAuthority()
+func testPreparing(intentID string) *mqttOutboundAuthority {
+	a := testPreparingAuthority()
 	a.Intent.ID = intentID
 	return a
 }
 
-// TestF105UnreadableAuthorityRefusesTheConnect pins the rule most available to get wrong:
+// TestUnreadableAuthorityRefusesTheConnect pins the rule most available to get wrong:
 // an unreadable authority is NOT an absent one.
 //
 // Treating either corrupt or indeterminate as "no authority" would let a first-creation
 // reservation be claimed over a record this broker simply could not read — and the
 // reservation is create-only precisely so that exactly one claimant holds it.
-func TestF105UnreadableAuthorityRefusesTheConnect(t *testing.T) {
+func TestUnreadableAuthorityRefusesTheConnect(t *testing.T) {
 	for name, status := range map[string]mqttOutboundLoadStatus{
 		"corrupt":       mqttOutboundCorrupt,
 		"indeterminate": mqttOutboundIndeterminate,
 	} {
 		d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-			Load: testF105Load(status, nil),
+			Load: testLoad(status, nil),
 		})
 		got, why := d.Action, d.Reason
 		if got != mqttOwnershipRefuse {
@@ -60,12 +60,12 @@ func TestF105UnreadableAuthorityRefusesTheConnect(t *testing.T) {
 	}
 }
 
-// TestF105AbsentAuthorityReservesRatherThanServes pins that "no ownership recorded" licenses
+// TestAbsentAuthorityReservesRatherThanServes pins that "no ownership recorded" licenses
 // a reservation and nothing stronger. Serving immediately would owe a client something before
 // its ownership was established.
-func TestF105AbsentAuthorityReservesRatherThanServes(t *testing.T) {
+func TestAbsentAuthorityReservesRatherThanServes(t *testing.T) {
 	d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-		Load: testF105Load(mqttOutboundAbsent, nil),
+		Load: testLoad(mqttOutboundAbsent, nil),
 	})
 	got, why := d.Action, d.Reason
 	if got != mqttOwnershipReserve {
@@ -73,7 +73,7 @@ func TestF105AbsentAuthorityReservesRatherThanServes(t *testing.T) {
 	}
 }
 
-// TestF105AForeignProposalIsSettledNotAdopted pins the two halves of the recovery, and the
+// TestAForeignProposalIsSettledNotAdopted pins the two halves of the recovery, and the
 // line between them.
 //
 // A reservation and a preparation are resolvable ONLY by the acceptance that made them —
@@ -82,14 +82,14 @@ func TestF105AbsentAuthorityReservesRatherThanServes(t *testing.T) {
 // between writing it and resolving its metadata half leaves the client permanently
 // unservable. What another acceptance may do is SETTLE it: take its permanent metadata slot,
 // which the original claimant's own commit is racing for, and then act on the verdict.
-func TestF105AForeignProposalIsSettledNotAdopted(t *testing.T) {
+func TestAForeignProposalIsSettledNotAdopted(t *testing.T) {
 	for name, tc := range map[string]struct {
 		rec   *mqttOutboundAuthority
 		mine  string
 		state mqttAuthorityState
 	}{
-		"a first-creation reservation": {testF105Reserving("create-1"), "create-1", mqttAuthorityReserving},
-		"a pending handoff":            {testF105Preparing("intent-1"), "intent-1", mqttAuthorityPreparing},
+		"a first-creation reservation": {testReserving("create-1"), "create-1", mqttAuthorityReserving},
+		"a pending handoff":            {testPreparing("intent-1"), "intent-1", mqttAuthorityPreparing},
 	} {
 		// ANOTHER CLAIMANT'S PROPOSAL IS SETTLED, whatever THIS acceptance's own metadata
 		// verdict says — that verdict answers this acceptance's proposal and is simply not
@@ -98,7 +98,7 @@ func TestF105AForeignProposalIsSettledNotAdopted(t *testing.T) {
 			mqttMetadataCommitted, mqttMetadataAborted, mqttMetadataUnresolved, mqttMetadataForeign,
 		} {
 			d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-				Load: testF105Load(mqttOutboundValid, tc.rec), IntentID: "someone-else", Metadata: v,
+				Load: testLoad(mqttOutboundValid, tc.rec), IntentID: "someone-else", Metadata: v,
 			})
 			if d.Action != mqttOwnershipRecoverForeign {
 				t.Fatalf("%s held by another claimant produced action %d (%q) at metadata %d, "+
@@ -138,7 +138,7 @@ func TestF105AForeignProposalIsSettledNotAdopted(t *testing.T) {
 			AuthState: mqttAuthorityReserving,
 		}
 		d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-			Load: testF105Load(mqttOutboundValid, tc.rec), IntentID: "someone-else",
+			Load: testLoad(mqttOutboundValid, tc.rec), IntentID: "someone-else",
 			Recovering: bound,
 		})
 		if d.Action != mqttOwnershipRefuse {
@@ -151,7 +151,7 @@ func TestF105AForeignProposalIsSettledNotAdopted(t *testing.T) {
 			Proposal: mqttOwnershipProposal{Kind: mqttProposalCreation, ID: tc.mine}, AuthSeq: 3,
 		}
 		d = mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-			Load: testF105Load(mqttOutboundValid, tc.rec), IntentID: "someone-else",
+			Load: testLoad(mqttOutboundValid, tc.rec), IntentID: "someone-else",
 			Recovering: same,
 		})
 		if d.Action != mqttOwnershipRecoverForeign {
@@ -162,7 +162,7 @@ func TestF105AForeignProposalIsSettledNotAdopted(t *testing.T) {
 		// Its own claimant, with the metadata half UNRESOLVED: still refused. The batch may
 		// be in flight, so neither finishing nor abandoning is licensed.
 		d = mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-			Load: testF105Load(mqttOutboundValid, tc.rec), IntentID: tc.mine,
+			Load: testLoad(mqttOutboundValid, tc.rec), IntentID: tc.mine,
 			Metadata: mqttMetadataUnresolved,
 		})
 		if d.Action != mqttOwnershipRefuse {
@@ -172,9 +172,9 @@ func TestF105AForeignProposalIsSettledNotAdopted(t *testing.T) {
 	}
 }
 
-// TestF105ForeignRecoveryContinuationFollowsTheSettledVerdict pins what a settled foreign
+// TestForeignRecoveryContinuationFollowsTheSettledVerdict pins what a settled foreign
 // proposal licenses, including the two things it deliberately does NOT license.
-func TestF105ForeignRecoveryContinuationFollowsTheSettledVerdict(t *testing.T) {
+func TestForeignRecoveryContinuationFollowsTheSettledVerdict(t *testing.T) {
 	reserving := &mqttForeignRecovery{
 		Proposal:  mqttOwnershipProposal{Kind: mqttProposalCreation, ID: "create-1"},
 		AuthState: mqttAuthorityReserving, AuthSeq: 9,
@@ -229,24 +229,24 @@ func TestF105ForeignRecoveryContinuationFollowsTheSettledVerdict(t *testing.T) {
 	}
 }
 
-// TestF105ResolvedIntentsTakeTheirOwnRoute pins the four resolutions, including the one that
+// TestResolvedIntentsTakeTheirOwnRoute pins the four resolutions, including the one that
 // is easy to state wrongly: an ABORTED first creation is abandoned by READMITTING a fresh
 // generation, never by deleting the reservation, because deleting it would make the next
 // claimant's create-only write succeed against an absence.
-func TestF105ResolvedIntentsTakeTheirOwnRoute(t *testing.T) {
+func TestResolvedIntentsTakeTheirOwnRoute(t *testing.T) {
 	for name, tc := range map[string]struct {
 		rec      *mqttOutboundAuthority
 		mine     string
 		verdict  mqttMetadataVerdict
 		expected mqttConnectOwnershipAction
 	}{
-		"a committed creation": {testF105Reserving("c"), "c", mqttMetadataCommitted, mqttOwnershipFinalizeCreation},
-		"an aborted creation":  {testF105Reserving("c"), "c", mqttMetadataAborted, mqttOwnershipCloseAbandoned},
-		"a committed handoff":  {testF105Preparing("i"), "i", mqttMetadataCommitted, mqttOwnershipFinalizeHandoff},
-		"an aborted handoff":   {testF105Preparing("i"), "i", mqttMetadataAborted, mqttOwnershipCancelHandoff},
+		"a committed creation": {testReserving("c"), "c", mqttMetadataCommitted, mqttOwnershipFinalizeCreation},
+		"an aborted creation":  {testReserving("c"), "c", mqttMetadataAborted, mqttOwnershipCloseAbandoned},
+		"a committed handoff":  {testPreparing("i"), "i", mqttMetadataCommitted, mqttOwnershipFinalizeHandoff},
+		"an aborted handoff":   {testPreparing("i"), "i", mqttMetadataAborted, mqttOwnershipCancelHandoff},
 	} {
 		d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-			Load: testF105Load(mqttOutboundValid, tc.rec), IntentID: tc.mine, Metadata: tc.verdict,
+			Load: testLoad(mqttOutboundValid, tc.rec), IntentID: tc.mine, Metadata: tc.verdict,
 		})
 		got, why := d.Action, d.Reason
 		if got != tc.expected {
@@ -256,11 +256,11 @@ func TestF105ResolvedIntentsTakeTheirOwnRoute(t *testing.T) {
 
 	// A serving authority is handed off; a closed one is re-admitted beside its closure.
 	serving := &mqttOutboundAuthority{
-		ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Tenure: "tenure-0",
+		ID: testID, Epoch: testEpoch, Gen: testGen, Tenure: "tenure-0",
 		State: mqttAuthorityServing, Rev: 1, Txn: "t", OwnerTxn: "t",
 	}
 	if d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-		Load: testF105Load(mqttOutboundValid, serving),
+		Load: testLoad(mqttOutboundValid, serving),
 	}); d.Action != mqttOwnershipPrepareHandoff {
 		t.Fatalf("a serving authority produced action %d (%q), want PREPARE HANDOFF",
 			d.Action, d.Reason)
@@ -268,7 +268,7 @@ func TestF105ResolvedIntentsTakeTheirOwnRoute(t *testing.T) {
 	closed := *serving
 	closed.State = mqttAuthorityClosed
 	if d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-		Load: testF105Load(mqttOutboundValid, &closed),
+		Load: testLoad(mqttOutboundValid, &closed),
 	}); d.Action != mqttOwnershipReserveOverClosed {
 		t.Fatalf("a closed authority produced action %d (%q), want RESERVE OVER CLOSED: a "+
 			"direct readmission installs SERVING outright, with no frozen proposal and no "+
@@ -277,10 +277,10 @@ func TestF105ResolvedIntentsTakeTheirOwnRoute(t *testing.T) {
 	}
 }
 
-// TestF105OnlyServingAdmitsDelivery pins the single-state answer to "may new outbound work
+// TestOnlyServingAdmitsDelivery pins the single-state answer to "may new outbound work
 // be admitted under this". A second reading that admitted a reservation or a preparation
 // would be an admission before the metadata half committed, or during a frozen handoff.
-func TestF105OnlyServingAdmitsDelivery(t *testing.T) {
+func TestOnlyServingAdmitsDelivery(t *testing.T) {
 	serving := &mqttOutboundAuthority{State: mqttAuthorityServing}
 	if !mqttOwnershipAdmitsDelivery(serving) {
 		t.Fatalf("a serving authority does not admit delivery")
@@ -299,18 +299,18 @@ func TestF105OnlyServingAdmitsDelivery(t *testing.T) {
 	}
 }
 
-// TestF105AbortedReservationClosesBeforeItClaimsAgain pins the two-step abandonment
+// TestAbortedReservationClosesBeforeItClaimsAgain pins the two-step abandonment
 // implementation review 4 found collapsed into one.
 //
 // An aborted reservation returned READMIT, but readmit-tenure requires a CLOSED predecessor
 // and an aborted reservation is not one — so the route did not exist. Worse, a direct
 // readmission installs SERVING outright with no frozen proposal and no metadata half, which
 // is the bootstrap gap reappearing on the second attempt after a failed first creation.
-func TestF105AbortedReservationClosesBeforeItClaimsAgain(t *testing.T) {
-	rec := testF105Reserving("c")
+func TestAbortedReservationClosesBeforeItClaimsAgain(t *testing.T) {
+	rec := testReserving("c")
 
 	d := mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-		Load: testF105Load(mqttOutboundValid, rec), IntentID: "c", Metadata: mqttMetadataAborted,
+		Load: testLoad(mqttOutboundValid, rec), IntentID: "c", Metadata: mqttMetadataAborted,
 	})
 	got, why := d.Action, d.Reason
 	if got != mqttOwnershipCloseAbandoned {
@@ -321,11 +321,11 @@ func TestF105AbortedReservationClosesBeforeItClaimsAgain(t *testing.T) {
 	// And once it IS closed, the next step is a reservation over that closure — never a
 	// direct serving authority.
 	closed := &mqttOutboundAuthority{
-		ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Tenure: "tenure-new",
+		ID: testID, Epoch: testEpoch, Gen: testGen, Tenure: "tenure-new",
 		State: mqttAuthorityClosed, Rev: 2, Txn: "txn-close", OwnerTxn: "txn-res",
 	}
 	d = mqttDecideConnectOwnership(mqttConnectOwnershipInput{
-		Load: testF105Load(mqttOutboundValid, closed),
+		Load: testLoad(mqttOutboundValid, closed),
 	})
 	got, why = d.Action, d.Reason
 	if got != mqttOwnershipReserveOverClosed {

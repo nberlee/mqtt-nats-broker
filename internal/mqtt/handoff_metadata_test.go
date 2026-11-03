@@ -26,14 +26,14 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// testF105StandingSession reads the session record the environment's own CONNECT wrote, with
+// testStandingSession reads the session record the environment's own CONNECT wrote, with
 // its sequence.
 //
 // A HANDOFF NAMES THE PREDECESSOR IT ACTUALLY DISPLACES. Hard-coding a write identity and a
 // sequence made the fixture describe a session that was never there, which the write boundary
 // now refuses — correctly, since a receipt claiming to have displaced a record it did not
 // touch is the defect, not the test's convenience.
-func testF105StandingSession(t *testing.T, e *testF105Env) (*mqttPersistedSession, uint64) {
+func testStandingSession(t *testing.T, e *testOutboundEnv) (*mqttPersistedSession, uint64) {
 	t.Helper()
 	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(_EMPTY_, getHash(e.id)))
 	if err != nil {
@@ -46,16 +46,16 @@ func testF105StandingSession(t *testing.T, e *testF105Env) (*mqttPersistedSessio
 	return ps, smsg.Sequence
 }
 
-// testF105Intent builds a clean-start handoff intent naming the environment's STANDING
+// testIntent builds a clean-start handoff intent naming the environment's STANDING
 // session record as its predecessor.
-func testF105Intent(t *testing.T, e *testF105Env, idSuffix string) *mqttHandoffIntent {
+func testIntent(t *testing.T, e *testOutboundEnv, idSuffix string) *mqttHandoffIntent {
 	t.Helper()
 	// THE PREDECESSOR IS A REAL ONE. A handoff's metadata half may only commit for a
 	// proposal the client's own authority carries, so these fixtures need an ownership to
 	// hand off FROM — and its generation, tenure and ownership are what the intent names,
 	// rather than invented tokens no authority ever stood at.
-	prev := testF105PredecessorOwnership(t, e)
-	ps, seq := testF105StandingSession(t, e)
+	prev := testPredecessorOwnership(t, e)
+	ps, seq := testStandingSession(t, e)
 	// A CLEAN START REPLACES THE GENERATION WITH A FRESH ONE, minted per intent. Alternating
 	// between two literals was enough while nothing remembered the old ones; it is not now,
 	// because a generation that has ever been closed is closed permanently and may never be
@@ -73,7 +73,7 @@ func testF105Intent(t *testing.T, e *testF105Env, idSuffix string) *mqttHandoffI
 	}
 }
 
-// testF105ResumeHandoff is testF105Intent's RESUME counterpart, carried to a serving authority
+// testResumeHandoff is testIntent's RESUME counterpart, carried to a serving authority
 // through the live ops an accepting CONNECT's executor composes: prepare, commit the metadata
 // half, finalize. A RESUME PRESERVES THE GENERATION and installs a fresh tenure, so the handoff
 // proposes the standing serving authority's own generation and requests no retirement — the
@@ -81,7 +81,7 @@ func testF105Intent(t *testing.T, e *testF105Env, idSuffix string) *mqttHandoffI
 // at recordSeq as what it displaces and installs a fresh write identity, as an accepted CONNECT
 // does. The serving generation and tenure are READ BACK from the authority, never assumed from
 // what was proposed.
-func testF105ResumeHandoff(t *testing.T, jsa *mqttJSA, domainTk, id, epoch string,
+func testResumeHandoff(t *testing.T, jsa *mqttJSA, domainTk, id, epoch string,
 	record *mqttPersistedSession, recordSeq uint64) (gen, tenure string) {
 	t.Helper()
 	serving, _, err := jsa.servingAuthority(id, epoch)
@@ -137,19 +137,19 @@ func testF105ResumeHandoff(t *testing.T, jsa *mqttJSA, domainTk, id, epoch strin
 	return after.Gen, after.Tenure
 }
 
-// testF105PredecessorOwnership is the ownership a handoff built now would displace: the
+// testPredecessorOwnership is the ownership a handoff built now would displace: the
 // standing authority's, or — while a preparation stands — the one a cancellation would
 // restore, since these fixtures cancel before they prepare again.
 //
 // It CLAIMS the client if nothing stands, through the ordinary three steps, because there is
 // no other way to reach a serving authority and a fixture that installed one directly would
 // be asserting a route the broker does not have.
-func testF105PredecessorOwnership(t *testing.T, e *testF105Env) *mqttOutboundAuthority {
+func testPredecessorOwnership(t *testing.T, e *testOutboundEnv) *mqttOutboundAuthority {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	switch {
 	case al.status == mqttOutboundAbsent:
-		auth, _ := e.claim(t, nil, 0, "txn-own", testF105Gen, "tenure-own")
+		auth, _ := e.claim(t, nil, 0, "txn-own", testGen, "tenure-own")
 		return auth
 	case al.status != mqttOutboundValid:
 		t.Fatalf("the authority reads %v, so no predecessor can be named", al.status)
@@ -159,7 +159,7 @@ func testF105PredecessorOwnership(t *testing.T, e *testF105Env) *mqttOutboundAut
 		// intent names is the one that will still be standing when it is prepared. Resolved
 		// by its own permanent verdict: a COMMITTED proposal is finalized, because
 		// cancelling it would abandon a handoff the metadata half already granted.
-		testF105ResolveStanding(t, e, al.rec.Intent)
+		testResolveStanding(t, e, al.rec.Intent)
 		al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		if al.status != mqttOutboundValid {
 			t.Fatalf("the authority reads %v after resolving its preparation", al.status)
@@ -168,9 +168,9 @@ func testF105PredecessorOwnership(t *testing.T, e *testF105Env) *mqttOutboundAut
 	return al.rec
 }
 
-// testF105ResolveStanding settles a standing preparation and either finalizes or cancels it,
+// testResolveStanding settles a standing preparation and either finalizes or cancels it,
 // which is the route a broker itself takes: a preparation is never overwritten.
-func testF105ResolveStanding(t *testing.T, e *testF105Env, standing *mqttHandoffIntent) {
+func testResolveStanding(t *testing.T, e *testOutboundEnv, standing *mqttHandoffIntent) {
 	t.Helper()
 	p, perr := mqttProposalFromHandoff(standing)
 	if perr != nil {
@@ -190,9 +190,9 @@ func testF105ResolveStanding(t *testing.T, e *testF105Env, standing *mqttHandoff
 	}
 }
 
-// testF105StandCreation makes a creation proposal the client's standing reservation, which is
+// testStandCreation makes a creation proposal the client's standing reservation, which is
 // the provenance a metadata commit for it requires.
-func testF105StandCreation(t *testing.T, e *testF105Env, p mqttOwnershipProposal) {
+func testStandCreation(t *testing.T, e *testOutboundEnv, p mqttOwnershipProposal) {
 	t.Helper()
 	// A RESERVATION ALREADY STANDING IS ABANDONED FIRST, the way a broker abandons one: its
 	// proposal is settled and its generation is CLOSED. It is never deleted, because the
@@ -217,28 +217,28 @@ func testF105StandCreation(t *testing.T, e *testF105Env, p mqttOwnershipProposal
 	}
 }
 
-// testF105Prepare makes i the client's STANDING proposal.
+// testPrepare makes i the client's STANDING proposal.
 //
 // A metadata half may only commit for a proposal the authority carries: the claim is written
 // first and serves nothing, and the metadata commit is what makes it servable. Where a
 // preparation already stands it is settled and cancelled first, which is the route a broker
 // itself takes — a preparation is never simply overwritten.
-func testF105Prepare(t *testing.T, e *testF105Env, i *mqttHandoffIntent) {
+func testPrepare(t *testing.T, e *testOutboundEnv, i *mqttHandoffIntent) {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if al.status == mqttOutboundValid && al.rec.State == mqttAuthorityPreparing && al.rec.Intent != nil &&
 		al.rec.Intent.ID != i.ID {
-		testF105ResolveStanding(t, e, al.rec.Intent)
+		testResolveStanding(t, e, al.rec.Intent)
 	}
 	if _, err := e.asm.jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-"+i.ID, i); err != nil {
 		t.Fatalf("standing the handoff proposal %q failed: %v", i.ID, err)
 	}
 }
 
-// testF105Prop views a handoff intent as the proposal the metadata half commits. The two
+// testProp views a handoff intent as the proposal the metadata half commits. The two
 // shapes share ONE protocol, so every call goes through the constructor rather than filling
 // the view in by hand — the kind is the constructor's to set.
-func testF105Prop(t *testing.T, i *mqttHandoffIntent) mqttOwnershipProposal {
+func testProp(t *testing.T, i *mqttHandoffIntent) mqttOwnershipProposal {
 	t.Helper()
 	p, err := mqttProposalFromHandoff(i)
 	if err != nil {
@@ -247,11 +247,11 @@ func testF105Prop(t *testing.T, i *mqttHandoffIntent) mqttOwnershipProposal {
 	return p
 }
 
-// testF105RecordSeq is the session record's standing sequence, which every metadata attempt
+// testRecordSeq is the session record's standing sequence, which every metadata attempt
 // must CAS against. The environment's own CONNECT already wrote a record, so an attempt
 // frozen at base zero is a create against an occupied subject — a fixture error, not a
 // mechanism one.
-func testF105RecordSeq(t *testing.T, e *testF105Env) uint64 {
+func testRecordSeq(t *testing.T, e *testOutboundEnv) uint64 {
 	t.Helper()
 	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(_EMPTY_, getHash(e.id)))
 	if err != nil {
@@ -260,7 +260,7 @@ func testF105RecordSeq(t *testing.T, e *testF105Env) uint64 {
 	return smsg.Sequence
 }
 
-func testF105FreezeAttempt(t *testing.T, e *testF105Env, i *mqttHandoffIntent, baseSeq uint64) *mqttFrozenMetadataAttempt {
+func testFreezeAttempt(t *testing.T, e *testOutboundEnv, i *mqttHandoffIntent, baseSeq uint64) *mqttFrozenMetadataAttempt {
 	t.Helper()
 	fact := &mqttAcceptFact{
 		ClientID: e.id, SessEpoch: e.epoch, AcceptID: mqttNewAcceptID(),
@@ -276,26 +276,26 @@ func testF105FreezeAttempt(t *testing.T, e *testF105Env, i *mqttHandoffIntent, b
 	// handoff in the same environment had committed.
 	wid := nuid.Next()
 	rec, _ := json.Marshal(&mqttPersistedSession{ID: e.id, Gen: i.Gen, WID: wid, Origin: "o"})
-	f, ferr := mqttFreezeMetadataAttempt(e.id, e.epoch, _EMPTY_, testF105Prop(t, i), wid, factSubj, fb, baseSeq, rec)
+	f, ferr := mqttFreezeMetadataAttempt(e.id, e.epoch, _EMPTY_, testProp(t, i), wid, factSubj, fb, baseSeq, rec)
 	if ferr != nil {
 		t.Fatalf("freezing the attempt: %v", ferr)
 	}
 	return f
 }
 
-// TestF105MetadataCommitCarriesAllThreeMembers pins that the accepted CONNECT's batch gains
+// TestMetadataCommitCarriesAllThreeMembers pins that the accepted CONNECT's batch gains
 // the handoff receipt without losing either property the two-member batch established.
 //
 // Indivisibility means extending the transaction, not keeping its member count at two: the
 // fact and the record still commit together, the fact's sequence is still below the record's,
 // and the acknowledgement still names the record whose sequence the session adopts.
-func TestF105MetadataCommitCarriesAllThreeMembers(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-meta")
+func TestMetadataCommitCarriesAllThreeMembers(t *testing.T) {
+	e, done := testNewEnv(t, "f105-meta")
 	defer done()
 
-	i := testF105Intent(t, e, "1")
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "1")
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 
 	recSeq, err := e.asm.jsa.commitMetadataAttempt(f)
 	if err != nil {
@@ -306,7 +306,7 @@ func TestF105MetadataCommitCarriesAllThreeMembers(t *testing.T) {
 	}
 
 	// The receipt stands, and answers this intent.
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataCommitted {
 		t.Fatalf("the committed metadata half resolved %v, want COMMITTED", v)
 	}
 
@@ -330,19 +330,19 @@ func TestF105MetadataCommitCarriesAllThreeMembers(t *testing.T) {
 	}
 }
 
-// TestF105AbortFencesADelayedMetadataCommit is the delayed-write fence.
+// TestAbortFencesADelayedMetadataCommit is the delayed-write fence.
 //
 // A resolver that gave up on an attempt takes its permanent slot. The frozen attempt's own
 // create-only member must then be unable to land — which is what stops a batch that was
 // still in flight from committing a handoff somebody already settled, and it must leave the
 // SESSION RECORD untouched, since the whole batch is refused.
-func TestF105AbortFencesADelayedMetadataCommit(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-meta-fence")
+func TestAbortFencesADelayedMetadataCommit(t *testing.T) {
+	e, done := testNewEnv(t, "f105-meta-fence")
 	defer done()
 
-	i := testF105Intent(t, e, "2")
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "2")
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 
 	before, berr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(_EMPTY_, getHash(e.id)))
 	var beforeSeq uint64
@@ -350,10 +350,10 @@ func TestF105AbortFencesADelayedMetadataCommit(t *testing.T) {
 		beforeSeq = before.Sequence
 	}
 
-	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); err != nil {
+	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); err != nil {
 		t.Fatalf("the abort was refused: %v", err)
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataAborted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataAborted {
 		t.Fatalf("the aborted metadata half resolved %v, want ABORTED", v)
 	}
 
@@ -371,21 +371,21 @@ func TestF105AbortFencesADelayedMetadataCommit(t *testing.T) {
 	}
 
 	// And a commit-first attempt makes the abort fail, so exactly one verdict can stand.
-	j := testF105Intent(t, e, "3")
-	testF105Prepare(t, e, j)
-	g := testF105FreezeAttempt(t, e, j, testF105RecordSeq(t, e))
+	j := testIntent(t, e, "3")
+	testPrepare(t, e, j)
+	g := testFreezeAttempt(t, e, j, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(g); err != nil {
 		t.Fatalf("the second metadata commit was refused: %v", err)
 	}
-	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, j)); err == nil {
+	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, j)); err == nil {
 		t.Fatalf("an intent that had already committed was aborted afterwards")
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, j)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, j)); v != mqttMetadataCommitted {
 		t.Fatalf("the committed intent resolved %v after a failed abort, want COMMITTED", v)
 	}
 }
 
-// TestF105RetryResendsTheFrozenAttempt pins the correction to how the existing acceptance
+// TestRetryResendsTheFrozenAttempt pins the correction to how the existing acceptance
 // loop retries.
 //
 // Recomposing is right when a retry means "write this again" and WRONG once the batch
@@ -393,13 +393,13 @@ func TestF105AbortFencesADelayedMetadataCommit(t *testing.T) {
 // slot of the old one is left for nobody to resolve. A retry therefore resends the same
 // frozen attempt — and because the transport batch id is minted inside compose, resending is
 // safe rather than an abandoned staged batch.
-func TestF105RetryResendsTheFrozenAttempt(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-meta-retry")
+func TestRetryResendsTheFrozenAttempt(t *testing.T) {
+	e, done := testNewEnv(t, "f105-meta-retry")
 	defer done()
 
-	i := testF105Intent(t, e, "4")
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "4")
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 
 	// Two composes of ONE attempt differ only in their transport batch id.
 	m1, b1, err := f.compose()
@@ -444,61 +444,61 @@ func TestF105RetryResendsTheFrozenAttempt(t *testing.T) {
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err == nil {
 		t.Fatalf("resending a landed attempt committed a second time")
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataCommitted {
 		t.Fatalf("after a refused resend the intent resolved %v, want COMMITTED", v)
 	}
 }
 
-// TestF105MetadataReceiptMustAnswerItsIntent pins that a receipt sharing a slot is not
+// TestMetadataReceiptMustAnswerItsIntent pins that a receipt sharing a slot is not
 // thereby an answer: one conditioned on a different predecessor describes a different
 // handoff, and finalizing on it would displace ownership nobody checked.
-func TestF105MetadataReceiptMustAnswerItsIntent(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-meta-foreign")
+func TestMetadataReceiptMustAnswerItsIntent(t *testing.T) {
+	e, done := testNewEnv(t, "f105-meta-foreign")
 	defer done()
 
-	i := testF105Intent(t, e, "5")
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "5")
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err != nil {
 		t.Fatalf("the metadata commit was refused: %v", err)
 	}
 
 	// The same intent id, a different predecessor.
-	other := testF105Intent(t, e, "5")
+	other := testIntent(t, e, "5")
 	other.PrevSessWID = "wid-elsewhere"
 	other.Retire.SessWID = "wid-elsewhere"
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, other)); v != mqttMetadataForeign {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, other)); v != mqttMetadataForeign {
 		t.Fatalf("a receipt conditioned on another predecessor resolved %v, want FOREIGN", v)
 	}
 
 	// An intent nobody wrote for is unresolved, never aborted: the batch may still be in
 	// flight.
-	absent := testF105Intent(t, e, "never")
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, absent)); v != mqttMetadataUnresolved {
+	absent := testIntent(t, e, "never")
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, absent)); v != mqttMetadataUnresolved {
 		t.Fatalf("an unwritten intent resolved %v, want UNRESOLVED", v)
 	}
 }
 
-// TestF105CommitFirstLostAcknowledgementIsNotARetry pins the case a caller is most likely to
+// TestCommitFirstLostAcknowledgementIsNotARetry pins the case a caller is most likely to
 // get wrong: the batch LANDED and the acknowledgement did not arrive.
 //
 // A caller that treats that as "retry" would resend, be refused by its own create-only
 // members, and — if it read that refusal as failure — abort a handoff that committed. The
 // refusal must lead to a matching committed readback, never to a new acceptance.
-func TestF105CommitFirstLostAcknowledgementIsNotARetry(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-lostack")
+func TestCommitFirstLostAcknowledgementIsNotARetry(t *testing.T) {
+	e, done := testNewEnv(t, "f105-lostack")
 	defer done()
 
-	i := testF105Intent(t, e, "lost")
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "lost")
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err != nil {
 		t.Fatalf("the metadata commit was refused: %v", err)
 	}
 
 	// The caller never saw the acknowledgement. Its only honest move is to resolve, and
 	// resolution says COMMITTED — so the resend below is what a WRONG caller would do.
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataCommitted {
 		t.Fatalf("a landed attempt resolved %v, want COMMITTED", v)
 	}
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err == nil {
@@ -506,107 +506,107 @@ func TestF105CommitFirstLostAcknowledgementIsNotARetry(t *testing.T) {
 	}
 	// And after that refusal the verdict is unchanged: the refusal is evidence the work is
 	// done, not evidence it failed.
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataCommitted {
 		t.Fatalf("after a refused resend the intent resolved %v, want COMMITTED", v)
 	}
 	// Aborting now must fail: a committed handoff cannot be retracted by a caller that
 	// merely lost its acknowledgement.
-	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); err == nil {
+	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); err == nil {
 		t.Fatalf("a committed handoff was aborted by a caller that lost its acknowledgement")
 	}
 }
 
-// TestF105OutcomeSlotContendsWithoutDisplacingTheRecord pins that losing the outcome slot
+// TestOutcomeSlotContendsWithoutDisplacingTheRecord pins that losing the outcome slot
 // costs the session record NOTHING.
 //
 // The two live on one stream and in one batch, so a naive implementation could let a
 // contested receipt take the record with it — which would turn another resolver's abort into
 // a rollback of an unrelated session write.
-func TestF105OutcomeSlotContendsWithoutDisplacingTheRecord(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-slotcontend")
+func TestOutcomeSlotContendsWithoutDisplacingTheRecord(t *testing.T) {
+	e, done := testNewEnv(t, "f105-slotcontend")
 	defer done()
 
 	// Land a first handoff so there is a record whose sequence we can watch.
-	first := testF105Intent(t, e, "c1")
-	testF105Prepare(t, e, first)
-	f1 := testF105FreezeAttempt(t, e, first, testF105RecordSeq(t, e))
+	first := testIntent(t, e, "c1")
+	testPrepare(t, e, first)
+	f1 := testFreezeAttempt(t, e, first, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f1); err != nil {
 		t.Fatalf("the first metadata commit was refused: %v", err)
 	}
-	recSeq := testF105RecordSeq(t, e)
+	recSeq := testRecordSeq(t, e)
 
 	// A second handoff whose slot another resolver takes first.
-	second := testF105Intent(t, e, "c2")
-	f2 := testF105FreezeAttempt(t, e, second, recSeq)
-	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, second)); err != nil {
+	second := testIntent(t, e, "c2")
+	f2 := testFreezeAttempt(t, e, second, recSeq)
+	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, second)); err != nil {
 		t.Fatalf("the competing abort was refused: %v", err)
 	}
 	if _, err := e.asm.jsa.commitMetadataAttempt(f2); err == nil {
 		t.Fatalf("a metadata commit won a slot another resolver had aborted")
 	}
 
-	if got := testF105RecordSeq(t, e); got != recSeq {
+	if got := testRecordSeq(t, e); got != recSeq {
 		t.Fatalf("losing the outcome slot moved the session record from %d to %d: another "+
 			"resolver's abort must not roll back an unrelated session write", recSeq, got)
 	}
 	// The first handoff is untouched by the second's failure.
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, first)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, first)); v != mqttMetadataCommitted {
 		t.Fatalf("the first handoff resolved %v after the second lost its slot, want COMMITTED", v)
 	}
 }
 
-// TestF105MetadataEvidenceSurvivesRetryExhaustion pins what a caller owes when it gives up.
+// TestMetadataEvidenceSurvivesRetryExhaustion pins what a caller owes when it gives up.
 //
 // Exhausting a retry budget does not settle anything by itself: the batch may still be in
 // flight. The caller settles it by taking the slot, and only a MATCHING positive abort lets
 // it treat the handoff as never committed. Absence at exhaustion is still UNRESOLVED.
-func TestF105MetadataEvidenceSurvivesRetryExhaustion(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-exhaust")
+func TestMetadataEvidenceSurvivesRetryExhaustion(t *testing.T) {
+	e, done := testNewEnv(t, "f105-exhaust")
 	defer done()
 
-	i := testF105Intent(t, e, "ex")
+	i := testIntent(t, e, "ex")
 	// Nothing was sent, or everything sent failed: the honest state is unresolved, NOT
 	// aborted, because a delayed batch can still arrive.
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataUnresolved {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataUnresolved {
 		t.Fatalf("an exhausted attempt with no receipt resolved %v, want UNRESOLVED", v)
 	}
 	// Settling it is a positive act.
-	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); err != nil {
+	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); err != nil {
 		t.Fatalf("settling the exhausted attempt failed: %v", err)
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataAborted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataAborted {
 		t.Fatalf("a settled attempt resolved %v, want ABORTED", v)
 	}
 	// And the fence holds afterwards: a batch that was in flight all along is refused.
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err == nil {
 		t.Fatalf("a delayed batch committed after its intent was settled as aborted")
 	}
 }
 
-// TestF105PostCommitRefusalDoesNotRetractTheHandoff pins the disposition for every failure
+// TestPostCommitRefusalDoesNotRetractTheHandoff pins the disposition for every failure
 // AFTER the acceptance batch commits — a restore refusal, a failed CONNACK write, a lost
 // ownership proof.
 //
 // None of them may abort or cancel: the handoff committed, and what fails is the connection.
 // Retracting it would discard evidence the cluster has already acted on.
-func TestF105PostCommitRefusalDoesNotRetractTheHandoff(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-postcommit")
+func TestPostCommitRefusalDoesNotRetractTheHandoff(t *testing.T) {
+	e, done := testNewEnv(t, "f105-postcommit")
 	defer done()
 
-	i := testF105Intent(t, e, "pc")
-	testF105Prepare(t, e, i)
-	f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+	i := testIntent(t, e, "pc")
+	testPrepare(t, e, i)
+	f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err != nil {
 		t.Fatalf("the metadata commit was refused: %v", err)
 	}
 
 	// Whatever fails next, the receipt stands and cannot be withdrawn.
-	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); err == nil {
+	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); err == nil {
 		t.Fatalf("a committed handoff was retracted after a post-commit refusal")
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataCommitted {
 		t.Fatalf("the handoff resolved %v after a post-commit refusal, want COMMITTED", v)
 	}
 
@@ -618,21 +618,21 @@ func TestF105PostCommitRefusalDoesNotRetractTheHandoff(t *testing.T) {
 	if cert == nil || !mqttBindingCertifies(bind, cert) {
 		t.Fatalf("certifying the refused connection failed")
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, i)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataCommitted {
 		t.Fatalf("closing the connection changed the handoff verdict to %v", v)
 	}
 }
 
-// testF105CreationProp views a first-creation intent as a proposal.
-func testF105CreationProp(t *testing.T, idSuffix string) mqttOwnershipProposal {
+// testCreationProp views a first-creation intent as a proposal.
+func testCreationProp(t *testing.T, idSuffix string) mqttOwnershipProposal {
 	t.Helper()
-	return testF105CreationPropAt(t, idSuffix, testF105Gen2)
+	return testCreationPropAt(t, idSuffix, testGen2)
 }
 
-// testF105CreationPropAt names the generation, for fixtures that claim more than once: a
+// testCreationPropAt names the generation, for fixtures that claim more than once: a
 // claim over a CLOSED predecessor must propose a FRESH generation, so a second proposal
 // reusing the first's is refused by the kind rule rather than by anything being tested.
-func testF105CreationPropAt(t *testing.T, idSuffix, gen string) mqttOwnershipProposal {
+func testCreationPropAt(t *testing.T, idSuffix, gen string) mqttOwnershipProposal {
 	t.Helper()
 	p, err := mqttProposalFromCreation(&mqttCreationIntent{
 		ID: "intent-" + idSuffix, Gen: gen, Tenure: "tenure-1",
@@ -643,8 +643,8 @@ func testF105CreationPropAt(t *testing.T, idSuffix, gen string) mqttOwnershipPro
 	return p
 }
 
-// testF105FreezeProposal freezes an attempt for EITHER proposal shape.
-func testF105FreezeProposal(t *testing.T, e *testF105Env, p mqttOwnershipProposal, baseSeq uint64) *mqttFrozenMetadataAttempt {
+// testFreezeProposal freezes an attempt for EITHER proposal shape.
+func testFreezeProposal(t *testing.T, e *testOutboundEnv, p mqttOwnershipProposal, baseSeq uint64) *mqttFrozenMetadataAttempt {
 	t.Helper()
 	fact := &mqttAcceptFact{ClientID: e.id, SessEpoch: e.epoch, AcceptID: mqttNewAcceptID(),
 		At: time.Now().UnixNano()}
@@ -662,7 +662,7 @@ func testF105FreezeProposal(t *testing.T, e *testF105Env, p mqttOwnershipProposa
 	return f
 }
 
-// TestF105FirstCreationHasAnExecutableMetadataProtocol is the round trip that makes the
+// TestFirstCreationHasAnExecutableMetadataProtocol is the round trip that makes the
 // bootstrap real rather than described.
 //
 // The reservation that opens a virgin client's ownership is not a handoff — it displaces
@@ -670,17 +670,17 @@ func testF105FreezeProposal(t *testing.T, e *testF105Env, p mqttOwnershipProposa
 // intent and nothing else, so a first creation had a state machine and no way to commit. The
 // same create-only slot arbitrates it: one verdict per proposal, commit and abort racing for
 // it, which is the whole fence.
-func TestF105FirstCreationHasAnExecutableMetadataProtocol(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-creation")
+func TestFirstCreationHasAnExecutableMetadataProtocol(t *testing.T) {
+	e, done := testNewEnv(t, "f105-creation")
 	defer done()
 
-	p := testF105CreationProp(t, "c1")
+	p := testCreationProp(t, "c1")
 	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, p); v != mqttMetadataUnresolved {
 		t.Fatalf("a creation with no receipt resolved %v, want UNRESOLVED", v)
 	}
 
-	testF105StandCreation(t, e, p)
-	f := testF105FreezeProposal(t, e, p, testF105RecordSeq(t, e))
+	testStandCreation(t, e, p)
+	f := testFreezeProposal(t, e, p, testRecordSeq(t, e))
 	recSeq, err := e.asm.jsa.commitMetadataAttempt(f)
 	if err != nil {
 		t.Fatalf("the creation's metadata commit was refused: %v", err)
@@ -699,12 +699,12 @@ func TestF105FirstCreationHasAnExecutableMetadataProtocol(t *testing.T) {
 	// A HANDOFF NAMING THE SAME ID IS NOT ANSWERED BY IT. The kind is part of the answer,
 	// not decoration: finalizing a handoff on a creation's receipt would install ownership
 	// with no predecessor displaced.
-	h := testF105Prop(t, &mqttHandoffIntent{
-		ID: p.ID, PrevGen: testF105Gen, PrevTenure: "tenure-0", PrevOwnerTxn: "txn-0",
-		PrevSessWID: "wid-0", PrevSessSeq: 3, Tenure: "tenure-1", Gen: testF105Gen2,
+	h := testProp(t, &mqttHandoffIntent{
+		ID: p.ID, PrevGen: testGen, PrevTenure: "tenure-0", PrevOwnerTxn: "txn-0",
+		PrevSessWID: "wid-0", PrevSessSeq: 3, Tenure: "tenure-1", Gen: testGen2,
 		CleanReq: true,
 		Retire: &mqttRetirementRequest{
-			Gen: testF105Gen, Tenure: "tenure-0", OwnerTxn: "txn-0",
+			Gen: testGen, Tenure: "tenure-0", OwnerTxn: "txn-0",
 			SessWID: "wid-0", SessSeq: 3, Reason: mqttRetireCleanStart, Discard: true,
 		},
 	})
@@ -713,14 +713,14 @@ func TestF105FirstCreationHasAnExecutableMetadataProtocol(t *testing.T) {
 	}
 }
 
-// TestF105AbandonedCreationSettlesBeforeItsBatchArrives pins the abort half for a creation:
+// TestAbandonedCreationSettlesBeforeItsBatchArrives pins the abort half for a creation:
 // the slot is taken positively, and a batch that was in flight all along is then refused in
 // its entirety.
-func TestF105AbandonedCreationSettlesBeforeItsBatchArrives(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-creation-abort")
+func TestAbandonedCreationSettlesBeforeItsBatchArrives(t *testing.T) {
+	e, done := testNewEnv(t, "f105-creation-abort")
 	defer done()
 
-	p := testF105CreationProp(t, "c2")
+	p := testCreationProp(t, "c2")
 	if err := e.asm.jsa.abortMetadataAttempt(_EMPTY_, e.id, e.epoch, p); err != nil {
 		t.Fatalf("settling the abandoned creation failed: %v", err)
 	}
@@ -730,8 +730,8 @@ func TestF105AbandonedCreationSettlesBeforeItsBatchArrives(t *testing.T) {
 
 	// The reservation stands, so the delayed batch is refused by the SETTLED VERDICT and
 	// not for want of a claim — which is the fence being tested.
-	testF105StandCreation(t, e, p)
-	f := testF105FreezeProposal(t, e, p, testF105RecordSeq(t, e))
+	testStandCreation(t, e, p)
+	f := testFreezeProposal(t, e, p, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err == nil {
 		t.Fatalf("a delayed creation batch committed after its proposal was settled as aborted")
 	}
@@ -741,22 +741,22 @@ func TestF105AbandonedCreationSettlesBeforeItsBatchArrives(t *testing.T) {
 	}
 }
 
-// TestF105SettlementResolvesBeforeItAborts pins the order the one settlement executor runs
+// TestSettlementResolvesBeforeItAborts pins the order the one settlement executor runs
 // in, which is the whole of its correctness.
 //
 // A settlement that aborted first would destroy a verdict that had already been reached; one
 // that returned the abort's own error as the verdict would report "aborted" for a slot a
 // commit already held, because a failed abort establishes only that the slot is OCCUPIED and
 // says nothing about by what.
-func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-settle")
+func TestSettlementResolvesBeforeItAborts(t *testing.T) {
+	e, done := testNewEnv(t, "f105-settle")
 	defer done()
 
 	// (1) A COMMITTED slot is reported as committed and is NOT aborted by the settlement.
-	wonIntent := testF105Intent(t, e, "won")
-	testF105Prepare(t, e, wonIntent)
-	won := testF105Prop(t, wonIntent)
-	f := testF105FreezeProposal(t, e, won, testF105RecordSeq(t, e))
+	wonIntent := testIntent(t, e, "won")
+	testPrepare(t, e, wonIntent)
+	won := testProp(t, wonIntent)
+	f := testFreezeProposal(t, e, won, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(f); err != nil {
 		t.Fatalf("the metadata commit was refused: %v", err)
 	}
@@ -769,8 +769,8 @@ func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
 	}
 
 	// (2) AN UNRESOLVED slot is taken, and the verdict comes from the READBACK.
-	stalledIntent := testF105Intent(t, e, "stalled")
-	stalled := testF105Prop(t, stalledIntent)
+	stalledIntent := testIntent(t, e, "stalled")
+	stalled := testProp(t, stalledIntent)
 	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, stalled); v != mqttMetadataUnresolved {
 		t.Fatalf("a proposal with no receipt resolved %v, want UNRESOLVED", v)
 	}
@@ -779,8 +779,8 @@ func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
 	}
 	// AND THE FENCE HOLDS: the claimant's batch, still in flight all along, is refused in
 	// its entirety. This is what makes the settlement a decision rather than a guess.
-	testF105Prepare(t, e, stalledIntent)
-	late := testF105FreezeProposal(t, e, stalled, testF105RecordSeq(t, e))
+	testPrepare(t, e, stalledIntent)
+	late := testFreezeProposal(t, e, stalled, testRecordSeq(t, e))
 	if _, err := e.asm.jsa.commitMetadataAttempt(late); err == nil {
 		t.Fatalf("a delayed batch committed after its proposal had been settled as aborted")
 	}
@@ -793,7 +793,7 @@ func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
 
 	// (4) A CREATION SETTLES THROUGH THE SAME EXECUTOR. The slot does not know who is
 	// writing, and neither shape gets a protocol of its own.
-	virgin := testF105CreationProp(t, "c-settle")
+	virgin := testCreationProp(t, "c-settle")
 	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, virgin); v != mqttMetadataAborted {
 		t.Fatalf("settling an unresolved creation returned %v, want ABORTED", v)
 	}
@@ -801,12 +801,12 @@ func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
 	// (5) A RECEIPT THAT DOES NOT ANSWER THIS PROPOSAL IS FOREIGN, never a settlement. The
 	// handoff below shares the creation's id and nothing else, and reading its receipt as an
 	// answer would finalize a displacement that never happened.
-	impostor := testF105Prop(t, &mqttHandoffIntent{
-		ID: virgin.ID, PrevGen: testF105Gen, PrevTenure: "tenure-0", PrevOwnerTxn: "txn-0",
-		PrevSessWID: "wid-0", PrevSessSeq: 3, Tenure: "tenure-1", Gen: testF105Gen2,
+	impostor := testProp(t, &mqttHandoffIntent{
+		ID: virgin.ID, PrevGen: testGen, PrevTenure: "tenure-0", PrevOwnerTxn: "txn-0",
+		PrevSessWID: "wid-0", PrevSessSeq: 3, Tenure: "tenure-1", Gen: testGen2,
 		CleanReq: true,
 		Retire: &mqttRetirementRequest{
-			Gen: testF105Gen, Tenure: "tenure-0", OwnerTxn: "txn-0",
+			Gen: testGen, Tenure: "tenure-0", OwnerTxn: "txn-0",
 			SessWID: "wid-0", SessSeq: 3, Reason: mqttRetireCleanStart, Discard: true,
 		},
 	})
@@ -815,7 +815,7 @@ func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
 	}
 }
 
-// TestF105HandoffCommitsAgainstThePredecessorItNames pins that the receipt and the write
+// TestHandoffCommitsAgainstThePredecessorItNames pins that the receipt and the write
 // name ONE record.
 //
 // The receipt copies the proposal's PrevSessSeq and PrevSessWID; the batch writes the session
@@ -826,11 +826,11 @@ func TestF105SettlementResolvesBeforeItAborts(t *testing.T) {
 //
 // A sequence is a POSITION, not an identity, so the stored write identity and generation are
 // checked too: the session record is a single-slot register every confirmed save advances.
-func TestF105HandoffCommitsAgainstThePredecessorItNames(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-cas-binding")
+func TestHandoffCommitsAgainstThePredecessorItNames(t *testing.T) {
+	e, done := testNewEnv(t, "f105-cas-binding")
 	defer done()
 
-	i := testF105Intent(t, e, "bind")
+	i := testIntent(t, e, "bind")
 
 	// (1) THE EXPECTATION MUST BE THE PREDECESSOR'S OWN. A handoff frozen against any other
 	// sequence is refused at composition, before anything reaches the store.
@@ -839,27 +839,27 @@ func TestF105HandoffCommitsAgainstThePredecessorItNames(t *testing.T) {
 		"a predecessor's":         i.PrevSessSeq - 1,
 		"create-only, as a first": 0,
 	} {
-		if _, err := testF105TryFreeze(t, e, i, base); err == nil {
+		if _, err := testTryFreeze(t, e, i, base); err == nil {
 			t.Fatalf("a handoff naming session record %d was frozen against %s (%d)",
 				i.PrevSessSeq, name, base)
 		}
 	}
 	// The matching one is accepted.
-	if _, err := testF105TryFreeze(t, e, i, i.PrevSessSeq); err != nil {
+	if _, err := testTryFreeze(t, e, i, i.PrevSessSeq); err != nil {
 		t.Fatalf("a handoff frozen against the record it names was refused: %v", err)
 	}
 
 	// (2) AND THE RECORD AT THAT SEQUENCE MUST BE THE ONE IT NAMES. A proposal whose
 	// predecessor identity does not match the standing record is refused at commit, even
 	// though its expectation is correct — the position is right and the session is not.
-	ps, seq := testF105StandingSession(t, e)
+	ps, seq := testStandingSession(t, e)
 	for name, mutate := range map[string]func(*mqttHandoffIntent){
 		"another write identity": func(m *mqttHandoffIntent) { m.PrevSessWID = "wid-someone-else" },
 		"another generation": func(m *mqttHandoffIntent) {
-			if m.PrevGen == testF105Gen {
-				m.PrevGen, m.Gen = testF105Gen2, testF105Gen
+			if m.PrevGen == testGen {
+				m.PrevGen, m.Gen = testGen2, testGen
 			} else {
-				m.PrevGen, m.Gen = testF105Gen, testF105Gen2
+				m.PrevGen, m.Gen = testGen, testGen2
 			}
 			m.Retire.Gen = m.PrevGen
 		},
@@ -871,7 +871,7 @@ func TestF105HandoffCommitsAgainstThePredecessorItNames(t *testing.T) {
 		mutate(&m)
 		m.PrevSessSeq, m.Retire.SessSeq = seq, seq
 		m.Retire.SessWID = m.PrevSessWID
-		f, ferr := testF105TryFreeze(t, e, &m, seq)
+		f, ferr := testTryFreeze(t, e, &m, seq)
 		if ferr != nil {
 			t.Fatalf("freezing the %s attempt failed: %v", name, ferr)
 		}
@@ -879,7 +879,7 @@ func TestF105HandoffCommitsAgainstThePredecessorItNames(t *testing.T) {
 			t.Fatalf("a handoff naming %s committed against the standing session record", name)
 		}
 		// Nothing moved: the refusal is before the batch.
-		if _, after := testF105StandingSession(t, e); after != seq {
+		if _, after := testStandingSession(t, e); after != seq {
 			t.Fatalf("a refused handoff moved the session record from %d to %d", seq, after)
 		}
 	}
@@ -888,20 +888,20 @@ func TestF105HandoffCommitsAgainstThePredecessorItNames(t *testing.T) {
 	}
 
 	// (3) The legitimate handoff still commits, and its receipt answers it.
-	good := testF105Intent(t, e, "bind-ok")
-	testF105Prepare(t, e, good)
-	f := testF105FreezeAttempt(t, e, good, good.PrevSessSeq)
+	good := testIntent(t, e, "bind-ok")
+	testPrepare(t, e, good)
+	f := testFreezeAttempt(t, e, good, good.PrevSessSeq)
 	if _, cerr := e.asm.jsa.commitMetadataAttempt(f); cerr != nil {
 		t.Fatalf("a handoff naming the record it displaces was refused: %v", cerr)
 	}
-	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testF105Prop(t, good)); v != mqttMetadataCommitted {
+	if v := e.asm.jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, good)); v != mqttMetadataCommitted {
 		t.Fatalf("the committed handoff resolved %v, want COMMITTED", v)
 	}
 }
 
-// testF105TryFreeze composes an attempt and RETURNS the error rather than failing, so a
+// testTryFreeze composes an attempt and RETURNS the error rather than failing, so a
 // refusal can be the assertion.
-func testF105TryFreeze(t *testing.T, e *testF105Env, i *mqttHandoffIntent, baseSeq uint64) (*mqttFrozenMetadataAttempt, error) {
+func testTryFreeze(t *testing.T, e *testOutboundEnv, i *mqttHandoffIntent, baseSeq uint64) (*mqttFrozenMetadataAttempt, error) {
 	t.Helper()
 	fact := &mqttAcceptFact{ClientID: e.id, SessEpoch: e.epoch, AcceptID: mqttNewAcceptID(),
 		At: time.Now().UnixNano()}
@@ -912,7 +912,7 @@ func testF105TryFreeze(t *testing.T, e *testF105Env, i *mqttHandoffIntent, baseS
 	factSubj := mqttAcceptSubject(_EMPTY_, getHash(e.id), e.epoch, fact.AcceptID)
 	wid := nuid.Next()
 	rec, _ := json.Marshal(&mqttPersistedSession{ID: e.id, Gen: i.Gen, WID: wid, Origin: "o"})
-	return mqttFreezeMetadataAttempt(e.id, e.epoch, _EMPTY_, testF105Prop(t, i), wid,
+	return mqttFreezeMetadataAttempt(e.id, e.epoch, _EMPTY_, testProp(t, i), wid,
 		factSubj, fb, baseSeq, rec)
 }
 
@@ -972,12 +972,12 @@ func TestMetadataBatchAckMustNameThisBatch(t *testing.T) {
 // misconfiguration forever. A fresh batch id per composition, because reuse while a batch is
 // staged abandons it.
 func TestMetadataBatchFramingCarriesEveryCASBase(t *testing.T) {
-	e, done := testF105NewEnv(t, "meta-framing")
+	e, done := testNewEnv(t, "meta-framing")
 	defer done()
-	i := testF105Intent(t, e, "1")
-	testF105Prepare(t, e, i)
-	base := testF105RecordSeq(t, e)
-	f := testF105FreezeAttempt(t, e, i, base)
+	i := testIntent(t, e, "1")
+	testPrepare(t, e, i)
+	base := testRecordSeq(t, e)
+	f := testFreezeAttempt(t, e, i, base)
 
 	msgs, id, err := f.compose()
 	if err != nil {
@@ -1018,27 +1018,27 @@ func TestMetadataBatchFramingCarriesEveryCASBase(t *testing.T) {
 // record's, and an observer that refuses the pre-issue moment fails the commit and writes
 // nothing.
 func TestMetadataCommitObserverSeesBothMoments(t *testing.T) {
-	e, done := testF105NewEnv(t, "meta-observer")
+	e, done := testNewEnv(t, "meta-observer")
 	defer done()
-	i := testF105Intent(t, e, "1")
-	testF105Prepare(t, e, i)
+	i := testIntent(t, e, "1")
+	testPrepare(t, e, i)
 
 	// A refusal at the pre-issue moment fails the commit AND leaves the record where it was:
 	// an interception point, not a notification.
-	before := testF105RecordSeq(t, e)
+	before := testRecordSeq(t, e)
 	restore := e.asm.jsa.setAcceptStoreObserver(func(o mqttAcceptStoreObs) error {
 		if o.Phase == mqttAcceptStoreIssuing {
 			return fmt.Errorf("refused before the batch was issued")
 		}
 		return nil
 	})
-	if _, err := e.asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, before)); err == nil ||
+	if _, err := e.asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, before)); err == nil ||
 		!strings.Contains(err.Error(), "refused before the batch was issued") {
 		restore()
 		t.Fatalf("a refusal at the pre-issue moment must fail the commit, got: %v", err)
 	}
 	restore()
-	if after := testF105RecordSeq(t, e); after != before {
+	if after := testRecordSeq(t, e); after != before {
 		t.Fatalf("the refused commit wrote anyway: the record moved from %d to %d", before, after)
 	}
 
@@ -1047,7 +1047,7 @@ func TestMetadataCommitObserverSeesBothMoments(t *testing.T) {
 		seen = append(seen, o)
 		return nil
 	})
-	f := testF105FreezeAttempt(t, e, i, before)
+	f := testFreezeAttempt(t, e, i, before)
 	recSeq, err := e.asm.jsa.commitMetadataAttempt(f)
 	restore()
 	if err != nil {

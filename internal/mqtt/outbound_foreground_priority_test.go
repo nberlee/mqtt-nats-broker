@@ -18,10 +18,10 @@ import (
 	"time"
 )
 
-// TestF105ForegroundAuthorityPriorityRelease (consult 105): every exit of a foreground scope
+// TestForegroundAuthorityPriorityRelease (consult 105): every exit of a foreground scope
 // releases it exactly once, overlapping scopes keep background waiting until the LAST release, and
 // shutdown wakes a waiter without granting it an attempt.
-func TestF105ForegroundAuthorityPriorityRelease(t *testing.T) {
+func TestForegroundAuthorityPriorityRelease(t *testing.T) {
 	newSess := func() (*mqttSession, chan struct{}) {
 		quit := make(chan struct{})
 		return &mqttSession{id: "fg-release", asm: &mqttAccountSessionManager{},

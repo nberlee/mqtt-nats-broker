@@ -24,13 +24,13 @@ import (
 // and keeps the marker as deletion debt; and a successful acting restore supersedes the
 // allocation's void verdict. The token is a real acquisition (acquirePublishAction) by a
 // section left open on A's own connection — the holder that may still write — and B is a distinct
-// account session manager on the same JetStream (testF088ResumeOnPeer). These are ROUTING and
+// account session manager on the same JetStream (testResumeOnPeerComplete). These are ROUTING and
 // BOUNDARY witnesses: the cross-broker wire schedules are in cancellation_cross_tenure_witness_e2e_test.go.
 
-// testF088AcquireLeaving opens a send section for f on A's own connection and ACQUIRES its output
+// testAcquireLeaving opens a send section for f on A's own connection and ACQUIRES its output
 // token, leaving the section open and the marker standing: outstanding output authority for B's
 // recovery to read.
-func testF088AcquireLeaving(t *testing.T, f *testWithdrawFix) mqttSendToken {
+func testAcquireLeaving(t *testing.T, f *testWithdrawFix) mqttSendToken {
 	t.Helper()
 	f.e.bind()
 	tok := f.e.openSection(t, f.pi, testRealPubRelSrcDur, f.sseq)
@@ -48,7 +48,7 @@ func testF088AcquireLeaving(t *testing.T, f *testWithdrawFix) mqttSendToken {
 
 // requireRecoveredPossiblyAttempted asserts B restored f's allocation ACTING and possibly attempted,
 // with the marker kept as debt and the register and marker left in place.
-func requireRecoveredPossiblyAttempted(t *testing.T, label string, f *testWithdrawFix, p *testF088Peer) {
+func requireRecoveredPossiblyAttempted(t *testing.T, label string, f *testWithdrawFix, p *testPeer) {
 	t.Helper()
 	ent := p.entry(f.pi)
 	if ent == nil || ent.regNonce != f.nonce || !ent.acts() || !ent.transmitted || ent.markerSeq == 0 {
@@ -72,17 +72,17 @@ func requireRecoveredPossiblyAttempted(t *testing.T, label string, f *testWithdr
 // made durable by the resume's save (seeded persisted state). Not exercised: the wire.
 // Mutation M-F2a (the genuine-cancellation arm reverted to markerSeq != 0): the register is dropped
 // by nonce and nothing is restored.
-func TestF088RecoveredTokenWithVerdictAndStandingMarkerIsRestored(t *testing.T) {
+func TestRecoveredTokenWithVerdictAndStandingMarkerIsRestored(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f088-mf2a", 1)
-	tok := testF088AcquireLeaving(t, f)
+	tok := testAcquireLeaving(t, f)
 	f.e.sess.mu.Lock()
 	staged := f.e.sess.stageVoidVerdictLocked(mqttTestLicenceLocked(f.e.sess, nil), f.nonce)
 	f.e.sess.mu.Unlock()
 	if !staged {
 		t.Fatal("fixture: the verdict must be staged under the accepted entitlement")
 	}
-	p := testF088ResumeOnPeer(t, f, "node2-mf2a")
+	p := testResumeOnPeerComplete(t, f, "node2-mf2a")
 	met := false
 	for _, s := range p.cancellations() {
 		met = met || (s.pi == f.pi && s.nonce == f.nonce && s.verdict && s.markerSeq != 0)
@@ -107,17 +107,17 @@ func TestF088RecoveredTokenWithVerdictAndStandingMarkerIsRestored(t *testing.T) 
 // Input: a real acquisition left open on A; the source consumer really deleted before the resume.
 // Mutation M-F2b (the non-reofferable-source arm reverted to markerSeq != 0): the register is
 // drop-consumed and nothing is restored.
-func TestF088RecoveredTokenOverLostSourceIsRestored(t *testing.T) {
+func TestRecoveredTokenOverLostSourceIsRestored(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f088-mf2b", 1)
-	tok := testF088AcquireLeaving(t, f)
+	tok := testAcquireLeaving(t, f)
 	if ci, err := f.e.asm.jsa.lookupConsumer(mqttStreamName, testRealPubRelSrcDur); err != nil || ci == nil {
 		t.Fatalf("fixture: the source consumer must exist before it is deleted: %v", err)
 	}
 	if _, err := f.e.asm.jsa.deleteConsumer(mqttStreamName, testRealPubRelSrcDur, false); err != nil {
 		t.Fatalf("fixture: deleting the source consumer: %v", err)
 	}
-	p := testF088ResumeOnPeer(t, f, "node2-mf2b")
+	p := testResumeOnPeerComplete(t, f, "node2-mf2b")
 	requireRecoveredPossiblyAttempted(t, "M-F2b", f, p)
 	f.e.sess.endPublishSend(f.e.c, f.pi, tok, mqttIntentNone, false)
 }
@@ -126,7 +126,7 @@ func TestF088RecoveredTokenOverLostSourceIsRestored(t *testing.T) {
 // recovery meets it on its verdict with the marker standing and takes the cancellation's own
 // disposition (nothing restored acting), and an in-session verdict still fences a send
 // (beginSendLocked's nonce fence, kept unconditional by fix II).
-func TestF088GenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
+func TestGenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
 	t.Parallel()
 	t.Run("recovery", func(t *testing.T) {
 		t.Parallel()
@@ -140,7 +140,7 @@ func TestF088GenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
 		if !staged {
 			t.Fatal("fixture: the verdict must be staged")
 		}
-		p := testF088ResumeOnPeer(t, f, "node2-wstand")
+		p := testResumeOnPeerComplete(t, f, "node2-wstand")
 		met := false
 		for _, s := range p.cancellations() {
 			met = met || (s.pi == f.pi && s.nonce == f.nonce && s.verdict && s.markerSeq != 0)
@@ -173,7 +173,7 @@ func TestF088GenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
 	})
 }
 
-// testF088RecoveredUntracked builds the W-ACKRT/W-VETO state: a register B recovered POSSIBLY
+// testRecoveredUntracked builds the W-ACKRT/W-VETO state: a register B recovered POSSIBLY
 // ATTEMPTED over A's outstanding token, A's section then ended without intent (its token drained),
 // and B's entry removed UNANSWERED. It returns the peer and a copy of the entry as it stood before
 // the removal.
@@ -187,11 +187,11 @@ func TestF088GenuineMarkerStandingCancellationStaysFenced(t *testing.T) {
 //
 // drainHolder decides whether A's section ends (draining its token without intent) BEFORE the
 // removal; when false the token still stands on return, and endHolder ends it.
-func testF088RecoveredUntracked(t *testing.T, clientID string, drainHolder bool) (*testWithdrawFix, *testF088Peer, mqttPending, func()) {
+func testRecoveredUntracked(t *testing.T, clientID string, drainHolder bool) (*testWithdrawFix, *testPeer, mqttPending, func()) {
 	t.Helper()
 	f := testWithdrawAdmitted(t, clientID, 1)
-	tok := testF088AcquireLeaving(t, f)
-	p := testF088ResumeOnPeer(t, f, "node2-"+clientID)
+	tok := testAcquireLeaving(t, f)
+	p := testResumeOnPeerComplete(t, f, "node2-"+clientID)
 	requireRecoveredPossiblyAttempted(t, "fixture", f, p)
 	ended := false
 	endHolder := func() {
@@ -221,7 +221,7 @@ func testF088RecoveredUntracked(t *testing.T, clientID string, drainHolder bool)
 	return f, p, before, endHolder
 }
 
-func testF088PeerBinding(p *testF088Peer, gen string, pi uint16) *mqttAllocationAckBinding {
+func testPeerBinding(p *testPeer, gen string, pi uint16) *mqttAllocationAckBinding {
 	p.sess.mu.Lock()
 	defer p.sess.mu.Unlock()
 	return p.sess.abandonedAcks[mqttAbandonedAckIndex{gen: gen, pi: pi}]
@@ -239,7 +239,7 @@ func testF088PeerBinding(p *testF088Peer, gen string, pi uint16) *mqttAllocation
 // The repeat re-applies the verdict through voidRegNonceLocked — the one helper the union itself
 // uses — standing in for a second resurrection, and recovers again. Each retirement is asserted with
 // 12.3's revision and persistence checks.
-func TestF088ForkUnionResurrectedVerdictIsRetiredAgain(t *testing.T) {
+func TestForkUnionResurrectedVerdictIsRetiredAgain(t *testing.T) {
 	t.Parallel()
 	const cid = "f088-wfork"
 	e := testNewRejectionEnv(t, cid)
@@ -303,7 +303,7 @@ func TestF088ForkUnionResurrectedVerdictIsRetiredAgain(t *testing.T) {
 			rev, saved = sess.voidedRegsRev, sess.voidedRegsSavedRev
 			sess.mu.Unlock()
 		}
-		v := &testF088VerdictRevisions{seen: true, rev: rev, savedRev: saved}
+		v := &testVerdictRevisions{seen: true, rev: rev, savedRev: saved}
 		if _, err := sess.recoverInflightRegisters(c); err != nil {
 			t.Fatalf("recovery (%s): %v", round, err)
 		}
@@ -330,10 +330,10 @@ func TestF088ForkUnionResurrectedVerdictIsRetiredAgain(t *testing.T) {
 //
 // Mutation M-F5 (installAckRouteForRemovalLocked returns false): no binding, the PUBACK completes
 // nothing and the exchange stays at Publish.
-func TestF088RecoveredPossibleAttemptUnansweredRemovalRoutesLateAck(t *testing.T) {
+func TestRecoveredPossibleAttemptUnansweredRemovalRoutesLateAck(t *testing.T) {
 	t.Parallel()
-	f, p, _, _ := testF088RecoveredUntracked(t, "f088-ackrt", true)
-	if b := testF088PeerBinding(p, f.gen, f.pi); b == nil || b.role != mqttAckRoleAckRoute || b.ev.lin != f.lin {
+	f, p, _, _ := testRecoveredUntracked(t, "f088-ackrt", true)
+	if b := testPeerBinding(p, f.gen, f.pi); b == nil || b.role != mqttAckRoleAckRoute || b.ev.lin != f.lin {
 		t.Errorf("the unanswered removal of a recovered possible attempt must install its AckRoute, got %+v", b)
 	}
 	if err := p.c.mqttProcessPubAck(f.pi); err != nil {
@@ -349,13 +349,13 @@ func TestF088RecoveredPossibleAttemptUnansweredRemovalRoutesLateAck(t *testing.T
 // SAME allocation hands it off (removed, the acting entry owns the acknowledgement); a binding for a
 // DIFFERENT allocation on the identifier is refused while it stands; and once the lineage has ENDED
 // no AckRoute is installed for it again.
-func TestF088RecoveredPossibleAttemptAckRouteVetoes(t *testing.T) {
+func TestRecoveredPossibleAttemptAckRouteVetoes(t *testing.T) {
 	t.Parallel()
 	// A's token stands through the second recovery, so that recovery again reads the register
 	// possibly attempted (once A drains without intent and the marker still stands, a fresh
 	// classification correctly reads it proven-unsent).
-	f, p, before, endHolder := testF088RecoveredUntracked(t, "f088-veto", false)
-	b := testF088PeerBinding(p, f.gen, f.pi)
+	f, p, before, endHolder := testRecoveredUntracked(t, "f088-veto", false)
+	b := testPeerBinding(p, f.gen, f.pi)
 	if b == nil || b.role != mqttAckRoleAckRoute {
 		t.Fatalf("fixture: the AckRoute must stand, got %+v", b)
 	}
@@ -370,7 +370,7 @@ func TestF088RecoveredPossibleAttemptAckRouteVetoes(t *testing.T) {
 	if installed {
 		t.Error("an AckRoute for a different allocation must be refused while this allocation's stands")
 	}
-	if cur := testF088PeerBinding(p, f.gen, f.pi); cur == nil || cur.ev.lin != f.lin {
+	if cur := testPeerBinding(p, f.gen, f.pi); cur == nil || cur.ev.lin != f.lin {
 		t.Errorf("the standing AckRoute must be untouched, got %+v", cur)
 	}
 	// The SAME allocation restored acting hands the AckRoute off.
@@ -380,7 +380,7 @@ func TestF088RecoveredPossibleAttemptAckRouteVetoes(t *testing.T) {
 	if ent := p.entry(f.pi); ent == nil || ent.regNonce != f.nonce || !ent.acts() || !ent.transmitted {
 		t.Fatalf("the second recovery must restore the allocation acting and possibly attempted, got %+v", ent)
 	}
-	if cur := testF088PeerBinding(p, f.gen, f.pi); cur != nil && cur.role == mqttAckRoleAckRoute {
+	if cur := testPeerBinding(p, f.gen, f.pi); cur != nil && cur.role == mqttAckRoleAckRoute {
 		t.Errorf("the restoration must hand the AckRoute off, got %+v", cur)
 	}
 	// The lineage ENDS, and no AckRoute is installed for it again.

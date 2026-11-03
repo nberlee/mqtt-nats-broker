@@ -218,7 +218,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 				"completely", toks[3])
 		}
 		for asubject := range asubs {
-			atoks := strings.Split(asubject[len(mqttF105SubjectPrefix()):], ".")
+			atoks := strings.Split(asubject[len(mqttOutboundRecordSubjectPrefix()):], ".")
 			if len(atoks) != 5 {
 				out.unreadableOther++
 				continue

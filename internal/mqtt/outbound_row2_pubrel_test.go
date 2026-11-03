@@ -42,7 +42,7 @@ func testRow2Split(t *testing.T, e *testInflightEnv, tr *mqttAuthorityTransition
 	t.Helper()
 	var b testRow2Batch
 	for _, m := range tr.Extra {
-		if cls, ok := mqttF105ObligationClass(m.subj); ok && cls == mqttActionClassTk {
+		if cls, ok := mqttOutboundObligationClass(m.subj); ok && cls == mqttActionClassTk {
 			var a mqttOutboundAction
 			if err := json.Unmarshal(m.body, &a); err != nil {
 				t.Fatalf("the batch's action member does not decode: %v", err)
@@ -50,7 +50,7 @@ func testRow2Split(t *testing.T, e *testInflightEnv, tr *mqttAuthorityTransition
 			b.action = &a
 			continue
 		}
-		if mqttIsF105Subject(m.subj) || m.expect == 0 {
+		if mqttIsOutboundRecordSubject(m.subj) || m.expect == 0 {
 			continue
 		}
 		if _, perr := mqttParseInflightSubject(m.subj); perr != nil {
@@ -70,7 +70,7 @@ func testRow2Split(t *testing.T, e *testInflightEnv, tr *mqttAuthorityTransition
 
 // T1. The ready-slot PUBREL acquisition is ONE authority batch of the token and the action
 // record, and the holder carries the exact record that landed. Kills M1, M3a.
-func TestF105Row2PubRelAcquisitionIsOneAuthorityBatch(t *testing.T) {
+func TestRow2PubRelAcquisitionIsOneAuthorityBatch(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t1")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -112,7 +112,7 @@ func TestF105Row2PubRelAcquisitionIsOneAuthorityBatch(t *testing.T) {
 
 // T1 (delivery). A delivered ordinary PUBREL transmits its frame through the authorized
 // boundary, which consumes that acquisition exactly once. Kills M1, M3a, M8's PUBREL half.
-func TestF105Row2DeliveredPubRelIsTheExecutionOfItsAcquisition(t *testing.T) {
+func TestRow2DeliveredPubRelIsTheExecutionOfItsAcquisition(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t1-delivery")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -176,7 +176,7 @@ func testRow2IntendedSlot(t *testing.T, e *testInflightEnv) (pi uint16, subject,
 
 // T2. The direct arrow on an ordinary slot: the canonical tuple, intended -> ready, the token and
 // the action record in ONE authority batch, and the PUBREL transmits. Kills M2.
-func TestF105Row2DirectArrowRebindsInsideTheAcquisitionBatch(t *testing.T) {
+func TestRow2DirectArrowRebindsInsideTheAcquisitionBatch(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t2")
 	testReadyForRealPubRelDelivery(t, e)
 	pi, subject, pubRelDur, canon := testRow2IntendedSlot(t, e)
@@ -209,7 +209,7 @@ func TestF105Row2DirectArrowRebindsInsideTheAcquisitionBatch(t *testing.T) {
 // lost: the helper reports NOT acquired, the reread adopts the token for its drain only, nothing
 // is written, and the acquisition is ABANDONED on the connection it was acquired for, at the
 // counter read beside the token. Kills M10, M7c's immediate half.
-func TestF105Row2LostPubRelAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
+func TestRow2LostPubRelAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t3-ready")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -245,7 +245,7 @@ func TestF105Row2LostPubRelAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 // T3, the ready-slot site, the late discovery: the resolving read is unavailable, so the holder
 // cannot be adopted at once; the reconcile that later proves the token ours abandons it then.
 // Kills M7c.
-func TestF105Row2LostPubRelAcquisitionIsAbandonedWhenReconcileProvesIt(t *testing.T) {
+func TestRow2LostPubRelAcquisitionIsAbandonedWhenReconcileProvesIt(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t3-reconcile")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -294,7 +294,7 @@ func TestF105Row2LostPubRelAcquisitionIsAbandonedWhenReconcileProvesIt(t *testin
 }
 
 // T3, the direct-arrow site: the rebinding acquisition lands and its response is lost. Kills M10.
-func TestF105Row2LostDirectArrowAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
+func TestRow2LostDirectArrowAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t3-direct")
 	testReadyForRealPubRelDelivery(t, e)
 	pi, subject, pubRelDur, canon := testRow2IntendedSlot(t, e)
@@ -327,7 +327,7 @@ func TestF105Row2LostDirectArrowAcquisitionIsAdoptedNeverEmitted(t *testing.T) {
 // T3b. A failed candidate abandons nothing: a peer acquires counter n between our batch's
 // composition and its send, the store refuses ours, and our connection's guard has no entry for
 // n — it is the peer's acquisition, not ours. Kills M7d.
-func TestF105Row2AFailedCandidateAbandonsNothing(t *testing.T) {
+func TestRow2AFailedCandidateAbandonsNothing(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t3b")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -404,7 +404,7 @@ func testRow2SuccessorTenure(t *testing.T, e *testInflightEnv) {
 // T4. After a takeover, this connection's acquisitions are refused as an ENDED entitlement —
 // terminal for the delivery, which does not redispatch — and nothing is acquired or written.
 // Kills M9.
-func TestF105Row2AnEndedEntitlementAcquiresNothingAndEndsTheDelivery(t *testing.T) {
+func TestRow2AnEndedEntitlementAcquiresNothingAndEndsTheDelivery(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t4")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -479,7 +479,7 @@ func testRow2Enter(e *testInflightEnv, act *mqttSendAction, c *client) (*mqttWri
 // T7. A saved request for a holder that is no longer live cannot re-enter its write: entry is
 // decided by the holder's state, not by the record's existence. Each variant starts from a guard
 // with NO entry for the key, so only the holder can refuse it. Kills M4.
-func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
+func TestRow2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t7")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
@@ -602,7 +602,7 @@ func TestF105Row2EntryRefusesAHolderThatIsNoLongerLive(t *testing.T) {
 // counter, identifier, packet or lineage, or was acquired for another connection, does not enter;
 // a ticket used for another action, on another connection, or twice does not write — and each is
 // refused before consumption. Kills M4, M4b.
-func TestF105Row2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
+func TestRow2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t7b")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
@@ -683,7 +683,7 @@ func TestF105Row2EntryAndTicketCompareTheExactAcquisition(t *testing.T) {
 
 // T10a. The entry refusal itself, observed at entry: an ordinary holder with no acquisition record
 // does not enter, and stays acquired. Kills M13a.
-func TestF105Row2AnOrdinaryHolderWithoutItsRecordDoesNotEnter(t *testing.T) {
+func TestRow2AnOrdinaryHolderWithoutItsRecordDoesNotEnter(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t10a")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -707,7 +707,7 @@ func TestF105Row2AnOrdinaryHolderWithoutItsRecordDoesNotEnter(t *testing.T) {
 
 // T11 (PUBREL). A PUBREL given up before its write is ABANDONED in this connection's frame guard;
 // one acquired and not yet written has no frame state at all. Kills M7a.
-func TestF105Row2APubRelGivenUpBeforeItsWriteIsFinishedHere(t *testing.T) {
+func TestRow2APubRelGivenUpBeforeItsWriteIsFinishedHere(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t11")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
@@ -736,7 +736,7 @@ func TestF105Row2APubRelGivenUpBeforeItsWriteIsFinishedHere(t *testing.T) {
 // T14. Nonce != Lin: after a register-only replacement re-mints the allocation nonce, the
 // acquisition, its record, its execution and its abandonment are all keyed by the obligation's
 // LINEAGE. Kills M15.
-func TestF105Row2AnAcquisitionIsKeyedByItsLineageNotItsAllocation(t *testing.T) {
+func TestRow2AnAcquisitionIsKeyedByItsLineageNotItsAllocation(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t14")
 	testReadyForRealPubRelDelivery(t, e)
 	gen := testRow2Gen(e)
@@ -818,7 +818,7 @@ func testRow2SlotOnlyReady(t *testing.T, e *testInflightEnv, pi uint16, dur stri
 // T7c. A slot-only PUBREL takes the same conditional entry without an authority record: a released
 // holder does not enter (so its raw emitter is never reached), a live one does and its ticket
 // carries no action — the raw branch. And no action record is written for the class. Kills M4.
-func TestF105Row2SlotOnlyPubRelTakesTheSameConditionalEntry(t *testing.T) {
+func TestRow2SlotOnlyPubRelTakesTheSameConditionalEntry(t *testing.T) {
 	// The slot-only class is the experimental affine one since 7a: a shared delivery is ordinary
 	// and QoS 1 (it has no PUBREL at all), so the former "shared" case describes a shape that can no
 	// longer exist.
@@ -872,7 +872,7 @@ func TestF105Row2SlotOnlyPubRelTakesTheSameConditionalEntry(t *testing.T) {
 // ABANDONED by the relinquish armed at entry — not by the drain, which never abandons an entered
 // holder — the holder is not restored to acquired, and the deferred drain still clears the token.
 // Kills M6, M14b.
-func TestF105Row2ASealAfterEntryAbandonsWithoutWriting(t *testing.T) {
+func TestRow2ASealAfterEntryAbandonsWithoutWriting(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t9")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -911,7 +911,7 @@ func TestF105Row2ASealAfterEntryAbandonsWithoutWriting(t *testing.T) {
 
 // T9b. An abnormal unwind after entry — a panic at the write-block point, recovered by the caller
 // — writes nothing, still ABANDONS the acquisition, and the token still drains. Kills M14b, M14d.
-func TestF105Row2AnUnwindAfterEntryStillAbandons(t *testing.T) {
+func TestRow2AnUnwindAfterEntryStillAbandons(t *testing.T) {
 	e := testNewInflightEnv(t, "row2-t9b")
 	testReadyForRealPubRelDelivery(t, e)
 	seed := testSeedRealPubRelReady(t, e)
@@ -975,7 +975,7 @@ func testRow2PeerRefused(t *testing.T, e *testInflightEnv, seed testRealPubRelSe
 // after entry, and again with half the frame on the socket — the token stands and an entitled
 // peer cannot acquire; once the write returns, the callback's deferred drain clears it. Kills
 // M14, M14c.
-func TestF105Row2TheLeaseOutlivesTheWrite(t *testing.T) {
+func TestRow2TheLeaseOutlivesTheWrite(t *testing.T) {
 	t.Run("held after entry", func(t *testing.T) {
 		e := testNewInflightEnv(t, "row2-t12-entry")
 		testReadyForRealPubRelDelivery(t, e)

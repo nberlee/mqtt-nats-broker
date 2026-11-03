@@ -20,12 +20,12 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// TestF105RetainedReplayVerdict (T24, acl-deny): the carrying connection's judgement of a retained
+// TestRetainedReplayVerdict (T24, acl-deny): the carrying connection's judgement of a retained
 // PUBLISH before its output is acquired. A subscribe deny over the copy's topic refuses it as
 // acl-deny, AHEAD of the size check; a frame over the Maximum Packet Size refuses it as
 // packet-too-large; an unusable snapshot decides nothing. What follows a refusal is the shared
 // disposition (withdraw or abandon), exercised end to end by the packet-too-large tests.
-func TestF105RetainedReplayVerdict(t *testing.T) {
+func TestRetainedReplayVerdict(t *testing.T) {
 	e := testNewInflightEnv(t, "ret-verdict")
 	e.s.dialClient = func(string, string, string) (*nats.Conn, error) { return nil, nil }
 	setServiceAccount(e.s, "RV", true)

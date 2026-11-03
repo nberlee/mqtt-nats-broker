@@ -476,9 +476,9 @@ func testAssertCurrentOwner(t *testing.T, sess *mqttSession, idHash string) {
 // No Will assertion here, unlike the rejection-settlement e2e above, and the reason is no
 // longer a residual: this verdict is reached by the eviction route, whose Will behaviour
 // issue #86 fixed and whose fixtures live with it
-// (TestF084RemotePersistEvictionDischargesWill for a live Will,
-// TestF084RemotePersistEvictionEnqueuesDelayedWill for a delayed one, and
-// TestF084RemotePersistEvictionDischargesParkedAction for a parked action). Asserting
+// (TestRemotePersistEvictionDischargesWill for a live Will,
+// TestRemotePersistEvictionEnqueuesDelayedWill for a delayed one, and
+// TestRemotePersistEvictionDischargesParkedAction for a parked action). Asserting
 // it again here would duplicate them without discriminating anything this test is for,
 // which is the INHERITANCE the displaced client is answered about.
 //

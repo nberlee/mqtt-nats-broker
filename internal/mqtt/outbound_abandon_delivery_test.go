@@ -74,7 +74,7 @@ func (f *testAbandonFix) requireAbandoned(t *testing.T) {
 // the identifier, untracks the entry and suppresses the source.
 //
 // Mutation M25a: the ordinary arm skipped (HEAD untrack only) -> the exchange stays Publish.
-func TestF105AbandonDeniedDeliveryReleasesTheChargeNotTheIdentifier(t *testing.T) {
+func TestAbandonDeniedDeliveryReleasesTheChargeNotTheIdentifier(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-basic", 1)
 	if r := f.deny(); r != mqttAbandonDone {
@@ -103,7 +103,7 @@ func TestF105AbandonDeniedDeliveryReleasesTheChargeNotTheIdentifier(t *testing.T
 //
 // Mutation M25b: the observation removes the entry (identifier released with the charge).
 // Mutation M26: the census adopts no DeliveryAbandoned exchange.
-func TestF105AbandonedIdentifierSurvivesColdReconstruction(t *testing.T) {
+func TestAbandonedIdentifierSurvivesColdReconstruction(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-cold", 1)
 	if r := f.deny(); r != mqttAbandonDone {
@@ -138,7 +138,7 @@ func TestF105AbandonedIdentifierSurvivesColdReconstruction(t *testing.T) {
 // identifier is held.
 //
 // Mutation M27: releasing the charge also drops the identifier hold -> handed out.
-func TestF105AbandonedQoS2IdentifierIsHeld(t *testing.T) {
+func TestAbandonedQoS2IdentifierIsHeld(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-qos2", 2)
 	if r := f.deny(); r != mqttAbandonDone {
@@ -155,7 +155,7 @@ func TestF105AbandonedQoS2IdentifierIsHeld(t *testing.T) {
 // abandoned: its charge is this connection's quota. Pending, source not acknowledged.
 //
 // Mutation M28: the tenure veto removed -> abandoned.
-func TestF105AbandonVetoesACurrentConnectionAcquisition(t *testing.T) {
+func TestAbandonVetoesACurrentConnectionAcquisition(t *testing.T) {
 	t.Parallel()
 	e, subject, tok, pi := testAcquireEnv(t, "abandon-veto")
 	if !e.sess.acquirePublishAction(e.c, pi, &tok) {
@@ -196,7 +196,7 @@ func TestF105AbandonVetoesACurrentConnectionAcquisition(t *testing.T) {
 //
 // Mutation M29: a blind register-sequence refresh after the evidence -> the batch lands over the
 // moved register.
-func TestF105AbandonIsFencedByTheRegister(t *testing.T) {
+func TestAbandonIsFencedByTheRegister(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-fence", 1)
 	var moved atomic.Bool
@@ -234,7 +234,7 @@ func TestF105AbandonIsFencedByTheRegister(t *testing.T) {
 }
 
 // T30. Forged abandon-delivery batches, each refused at its own first enforcement point.
-func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
+func TestAbandonBoundaryRefusesForgedBatches(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
@@ -352,7 +352,7 @@ func TestF105AbandonBoundaryRefusesForgedBatches(t *testing.T) {
 // left) is pending: the entry and mapping stay and the caller does not acknowledge.
 //
 // Mutation M31: unresolved treated as abandoned -> the entry is untracked.
-func TestF105AbandonUnresolvedIsPending(t *testing.T) {
+func TestAbandonUnresolvedIsPending(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-unresolved", 1)
 	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
@@ -387,7 +387,7 @@ func TestF105AbandonUnresolvedIsPending(t *testing.T) {
 // Mutation M32a: the recovery arm skipped -> restored as an ordinary delivery.
 // Mutation M32b: the suppression not installed.
 // Mutation M32c: the same-object removal skipped.
-func TestF105AbandonedDeliveryRecovery(t *testing.T) {
+func TestAbandonedDeliveryRecovery(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-recovery", 1)
 	// The batch lands, but memory is left exactly as it was (the crash after the commit).
@@ -442,7 +442,7 @@ func TestF105AbandonedDeliveryRecovery(t *testing.T) {
 // destruction write no abandonment.
 //
 // Mutation M33: abandonment invoked from deleteInflightRegisterFor.
-func TestF105AbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
+func TestAbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "abandon-controls", 1)
 	ml := f.e.asm.jsa.loadOccupantMarkerLoad(f.subject)
@@ -487,7 +487,7 @@ func TestF105AbandonmentOnlyForTheOrdinaryTerminalDeny(t *testing.T) {
 // T34a. A send section open at the deny: pending, entry intact, nothing written.
 //
 // Mutation M34: condemn-and-ack as HEAD -> the entry is untracked.
-func TestF105AbandonWaitsForAnOpenSection(t *testing.T) {
+func TestAbandonWaitsForAnOpenSection(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-section", 1)
 	f.e.sess.mu.Lock()
@@ -519,7 +519,7 @@ func TestF105AbandonWaitsForAnOpenSection(t *testing.T) {
 // than leaving the guard with nothing to inspect.
 //
 // Mutation M35: exclusivity switched to mqttExchangeDeliveryDutyEnded.
-func TestF105DutyPredicateStaysOutOfIdentifierRules(t *testing.T) {
+func TestDutyPredicateStaysOutOfIdentifierRules(t *testing.T) {
 	t.Parallel()
 	rules := map[string]string{
 		"checkIdentifierExclusivity":   "outbound_transition.go",
@@ -569,7 +569,7 @@ func TestF105DutyPredicateStaysOutOfIdentifierRules(t *testing.T) {
 //
 // Mutation M36a: MarkRetired admitted from it. Mutation M36b: the classifier arm moved below
 // the own-nonce arm. Mutation M-C11: any non-acknowledgement disposition admitted.
-func TestF105AbandonedRegisterIsClosedToEveryDisposition(t *testing.T) {
+func TestAbandonedRegisterIsClosedToEveryDisposition(t *testing.T) {
 	t.Parallel()
 	for d := mqttSlotDeleteComplete; d <= mqttSlotAdvanceAcknowledgedTerminal; d++ {
 		ack := d == mqttSlotAdvancePhase || d == mqttSlotAdvanceAcknowledgedTerminal
@@ -593,7 +593,7 @@ func TestF105AbandonedRegisterIsClosedToEveryDisposition(t *testing.T) {
 //
 // Mutation M37a: the composer's carry removed -> the replacement is refused.
 // Mutation M37b: the boundary rule removed while a forged batch resets Acq -> it lands.
-func TestF105RegisterOnlyReplacementKeepsItsAcquisitionHistory(t *testing.T) {
+func TestRegisterOnlyReplacementKeepsItsAcquisitionHistory(t *testing.T) {
 	t.Parallel()
 	e, subject, tok, pi := testAcquireEnv(t, "abandon-acq-carry")
 	if !e.sess.acquirePublishAction(e.c, pi, &tok) || !e.sess.drainPublishAction(e.c, tok) {
@@ -684,7 +684,7 @@ func testAbandonRegisterAt(t *testing.T, e *testInflightEnv, subject string) (*m
 // the delivery-duty predicate) while its identifier stays held.
 //
 // Mutation M38: the classifier keeps its enumerated list -> Withheld.
-func TestF105AbandonedExchangeDutyResolves(t *testing.T) {
+func TestAbandonedExchangeDutyResolves(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-duty", 1)
 	if r := f.deny(); r != mqttAbandonDone {
@@ -713,7 +713,7 @@ func TestF105AbandonedExchangeDutyResolves(t *testing.T) {
 //
 // M39: chargeReleased cleared by a live read. M40: the uncertainty dropped with no entry.
 // M41: identifier ownership counted as a charge in replay.
-func TestF105CustodySplitIsMonotoneAndComplete(t *testing.T) {
+func TestCustodySplitIsMonotoneAndComplete(t *testing.T) {
 	t.Parallel()
 	gen := mqttNewSessGen()
 	l := newMQTTCustodyLedger(gen)
@@ -766,7 +766,7 @@ func testAbandonEvidence(t *testing.T, e *testInflightEnv, pi uint16, subject st
 // Mutation M43a: the exclusion removed -> an abandonment is written.
 // Mutation M43b: the lookup reads the delivery index (drainByDur) only -> the drains-only case
 // is abandoned.
-func TestF105DrainClaimedDeliveryIsNotAbandoned(t *testing.T) {
+func TestDrainClaimedDeliveryIsNotAbandoned(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name       string
@@ -855,7 +855,7 @@ func testAbandonRequireHeldNotAbandoned(t *testing.T, f *testAbandonFix) {
 // T44. While an abandonment is in flight, no drain may claim the delivery.
 //
 // Mutation M44: drainClaimEligibleLocked ignores the in-flight mark -> eligible.
-func TestF105AbandoningDeliveryIsNotDrainEligible(t *testing.T) {
+func TestAbandoningDeliveryIsNotDrainEligible(t *testing.T) {
 	f := testAbandonAdmitted(t, "abandon-drain-owner", 1)
 	w := testUnitCInstallDisposal(t, f)
 	f.e.sess.mu.Lock()
@@ -870,7 +870,7 @@ func TestF105AbandoningDeliveryIsNotDrainEligible(t *testing.T) {
 // (no authorization configured): it is suppressed — no identifier allocated, no entry tracked.
 //
 // Mutation M32d: the callback's suppression check removed -> a fresh identifier is allocated.
-func TestF105AbandonedSourceReofferIsSuppressedAtTheCallback(t *testing.T) {
+func TestAbandonedSourceReofferIsSuppressedAtTheCallback(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-callback", 1)
 	if r := f.deny(); r != mqttAbandonDone {
@@ -915,7 +915,7 @@ func testAbandonDrainEligible(sess *mqttSession, pi uint16) bool {
 // Mutation M45a: the in-flight mark not set -> eligible while the write is in flight.
 // Mutation M45b: an unresolved outcome lifts the fence -> eligible after it.
 // Mutation M45c: a second deny ignores the in-flight mark -> two writes.
-func TestF105AbandonmentFencesDrainStagingUntilSettled(t *testing.T) {
+func TestAbandonmentFencesDrainStagingUntilSettled(t *testing.T) {
 	t.Parallel()
 	t.Run("in-flight-then-settled", func(t *testing.T) {
 		t.Parallel()
@@ -1019,7 +1019,7 @@ func TestF105AbandonmentFencesDrainStagingUntilSettled(t *testing.T) {
 // read lifts the fence while the committed abandonment is still unsettled.
 // Mutation M46b: a still-unknown retained handle is dropped -> the same.
 // Mutation M46c: a LANDED retained handle is not taken as the answer -> the retry issues a new op.
-func TestF105UnsettledAbandonmentOutlivesAFailedRetry(t *testing.T) {
+func TestUnsettledAbandonmentOutlivesAFailedRetry(t *testing.T) {
 	t.Parallel()
 	f := testAbandonAdmitted(t, "abandon-unsettled-retry", 1)
 	var unresolved, readFault atomic.Bool

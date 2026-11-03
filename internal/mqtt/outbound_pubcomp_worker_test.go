@@ -98,7 +98,7 @@ func testNewPubCompWorld(t *testing.T, clientID string) *testPubCompWorld {
 		w.obs.mu.Unlock()
 	}
 	asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		if !testF105IsPubCompAdvance(req, w.seed.lin) || !w.refuse.Load() || w.allowOnce.CompareAndSwap(true, false) {
+		if !testIsPubCompAdvance(req, w.seed.lin) || !w.refuse.Load() || w.allowOnce.CompareAndSwap(true, false) {
 			return write()
 		}
 		w.refusals.Add(1)
@@ -161,7 +161,7 @@ func (w *testPubCompWorld) pending() (entry *mqttPending, capacity int) {
 //
 // Mutation M5: ack unconditionally again -> an ack is observed before the completion is
 // recorded. M6: the worker does not send what it carries -> no worker ack.
-func TestF105UnrecordedPubCompWithholdsTheAckAndTheRedelivery(t *testing.T) {
+func TestUnrecordedPubCompWithholdsTheAckAndTheRedelivery(t *testing.T) {
 	// Deliberately NOT t.Parallel(): testCountPubRelWrites counts at a process-global write
 	// hook, so a parallel sibling's PUBREL would be counted here
 	// (TestParallelTestsTouchNoProcessGlobalState).
@@ -245,7 +245,7 @@ func TestF105UnrecordedPubCompWithholdsTheAckAndTheRedelivery(t *testing.T) {
 //
 // Mutation M15: the detach splits the snapshot from the removal -> the ack installed in the gap
 // joins a record the worker then removes, and it is never sent.
-func TestF105WorkerDetachNeverLosesAnInstalledAck(t *testing.T) {
+func TestWorkerDetachNeverLosesAnInstalledAck(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-detach")
 	w.refuse.Store(true)
@@ -305,7 +305,7 @@ func TestF105WorkerDetachNeverLosesAnInstalledAck(t *testing.T) {
 }
 
 // T5f. A generation change retires the worker: it sends nothing and frees only its placeholder.
-func TestF105WorkerRetiresOnAGenerationChange(t *testing.T) {
+func TestWorkerRetiresOnAGenerationChange(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-generation")
 	w.refuse.Store(true)
@@ -333,7 +333,7 @@ func TestF105WorkerRetiresOnAGenerationChange(t *testing.T) {
 
 // T5g(a). A closed worker gate retires the worker with its acks unsent; the canonical PUBREL
 // stays unacked for the resume.
-func TestF105WorkerGateRefusalLeavesThePubRelUnacked(t *testing.T) {
+func TestWorkerGateRefusalLeavesThePubRelUnacked(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-gate")
 	w.refuse.Store(true)
@@ -363,7 +363,7 @@ func TestF105WorkerGateRefusalLeavesThePubRelUnacked(t *testing.T) {
 // PUBREL whose write had already entered) starts no second terminalization, sends no second ack
 // of the stored record and leaves the worker's record alone; the worker completes. It may consume
 // wire debt the duplicate answers, which the handler does before it looks at the entry.
-func TestF105DuplicatePubCompOverTheReservationSettlesNothing(t *testing.T) {
+func TestDuplicatePubCompOverTheReservationSettlesNothing(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-duplicate")
 	w.refuse.Store(true)
@@ -414,7 +414,7 @@ func TestF105DuplicatePubCompOverTheReservationSettlesNothing(t *testing.T) {
 // Mutation M14 (re-homed here when T5d's redelivery premise was removed): the worker hands
 // recorded-but-indeterminate cleanup to retainAndReconcileTerminal -> W1 makes no attempt after
 // its detach.
-func TestF105DetachedWorkerKeepsItsCleanupOwnership(t *testing.T) {
+func TestDetachedWorkerKeepsItsCleanupOwnership(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-overlap")
 	w.refuse.Store(true)
@@ -502,7 +502,7 @@ func TestF105DetachedWorkerKeepsItsCleanupOwnership(t *testing.T) {
 
 // T5b. A stale continuation meeting a successor on the identifier writes nothing, reports the
 // completion settled for ITS exchange, and leaves the successor's identifier excluded.
-func TestF105WorkerLeavesASuccessorOccupantUntouched(t *testing.T) {
+func TestWorkerLeavesASuccessorOccupantUntouched(t *testing.T) {
 	t.Parallel()
 	w := testNewPubCompWorld(t, "f105-worker-successor")
 	w.refuse.Store(true)
@@ -551,12 +551,12 @@ func testPendingDrainWorld(t *testing.T, clientID string) (*testPubCompWorld, *m
 	w.e = testNewInflightEnv(t, clientID)
 	testReadyForRealPubRelDelivery(t, w.e)
 	w.seed = testSeedRealPubRelReady(t, w.e)
-	ref := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
+	ref := testSlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, false)
 	act := w.e.sess.testAcquirePubRel(w.e.c, ref)
 	if act == nil {
 		t.Fatal("the PUBREL action was not acquired")
 	}
-	live := testF105SlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, true)
+	live := testSlotRefAt(t, w.e.sess, w.seed.pi, mqttInflightPubRelReady, true)
 	if res := w.e.sess.mqttTerminalizeOnPubComp(w.e.c, live); !res.recorded || res.outcome != mqttTerminalHeldByAction {
 		t.Fatalf("PUBCOMP over a live action concluded %+v", res)
 	}
@@ -571,7 +571,7 @@ func testPendingDrainWorld(t *testing.T, clientID string) (*testPubCompWorld, *m
 //
 // Mutation M18: the landed-lost branch takes the bare early return -> the slot survives with its
 // identifier excluded.
-func TestF105PubRelDrainCompletionSurvivesALostOrRefusedBatch(t *testing.T) {
+func TestPubRelDrainCompletionSurvivesALostOrRefusedBatch(t *testing.T) {
 	t.Run("landed, response lost", func(t *testing.T) {
 		t.Parallel()
 		w, act := testPendingDrainWorld(t, "f105-drain-lost")
@@ -598,7 +598,7 @@ func TestF105PubRelDrainCompletionSurvivesALostOrRefusedBatch(t *testing.T) {
 		if got := testRealExchangePhase(t, w.e, w.seed); got != mqttExchangeTerminal {
 			t.Fatalf("the exchange stands at phase %d, want Terminal", got)
 		}
-		testF105SlotGone(t, w.e.sess, w.seed.pi, mqttActionReconcileDelay/2)
+		testSlotGone(t, w.e.sess, w.seed.pi, mqttActionReconcileDelay/2)
 		if time.Since(start) >= mqttActionReconcileDelay {
 			t.Fatal("the cleanup waited for a timer rather than running inline")
 		}
@@ -654,7 +654,7 @@ func TestF105PubRelDrainCompletionSurvivesALostOrRefusedBatch(t *testing.T) {
 // accepted. M11: the stored-predecessor check deleted -> the two wrong-predecessor compositions
 // are accepted. M13: pubrel_terminal removed from mqttAdvanceKindSlotState -> the accepted
 // compositions are refused.
-func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
+func TestBoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 	type state struct {
 		w    *testPubCompWorld
 		auth *mqttOutboundAuthority
@@ -695,7 +695,7 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 		t.Helper()
 		for i := range tr.Extra {
 			isX := false
-			if cls, ok := mqttF105ObligationClass(tr.Extra[i].subj); ok && cls == mqttExchangeClassTk {
+			if cls, ok := mqttOutboundObligationClass(tr.Extra[i].subj); ok && cls == mqttExchangeClassTk {
 				isX = true
 			}
 			if isX != exchange {
@@ -874,7 +874,7 @@ func TestF105BoundaryAdmitsOnlyThePubCompAndDrainPairings(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i := range tr.Extra {
-			if cls, ok := mqttF105ObligationClass(tr.Extra[i].subj); ok && cls == mqttExchangeClassTk {
+			if cls, ok := mqttOutboundObligationClass(tr.Extra[i].subj); ok && cls == mqttExchangeClassTk {
 				tr.Extra[i].expect--
 			}
 		}

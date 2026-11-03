@@ -80,11 +80,11 @@ func (r *testRetainedRig) attach(t *testing.T) {
 	r.sess.mu.Unlock()
 }
 
-// TestF105RetainedQoS1PubAckReclaimsTheCopy: after the subscriber acknowledges a retained QoS 1
+// TestRetainedQoS1PubAckReclaimsTheCopy: after the subscriber acknowledges a retained QoS 1
 // delivery, the exchange is Terminal, the register goes, the identifier and the ledger charge are
 // released, and the copy is reclaimed — chunks and manifest removed, the owner CleanupComplete and
 // both of its duties terminal.
-func TestF105RetainedQoS1PubAckReclaimsTheCopy(t *testing.T) {
+func TestRetainedQoS1PubAckReclaimsTheCopy(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-puback", "rt/a", 1, []byte("retained-a"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -206,13 +206,13 @@ func testAwaitNoSourceOwner(t *testing.T, sess *mqttSession, subject string, pi 
 	}
 }
 
-// TestF105RetainedPubAckInstallsNoSourceOwner: a retained QoS 1 exchange's PUBACK settles no
+// TestRetainedPubAckInstallsNoSourceOwner: a retained QoS 1 exchange's PUBACK settles no
 // source (issue #107 7c), so it installs no ordinary source owner. One that it did install asked a
 // consumer lookup with an empty name, which a server with permissions never answers: the owner
 // never settled, its retry announced foreground authority for the full API timeout on every
 // attempt, the identifier stayed held, and the session's retained replay starved behind it — the
 // Paho test_subscribe_options failure. Re-SUBSCRIBEs must keep replaying the retained message.
-func TestF105RetainedPubAckInstallsNoSourceOwner(t *testing.T) {
+func TestRetainedPubAckInstallsNoSourceOwner(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-puback-noowner", "rt/n", 1, []byte("retained-n"))
 	defer r.done()
 	before := mqttRetainedAtOrdinarySink.Load()
@@ -260,11 +260,11 @@ func TestF105RetainedPubAckInstallsNoSourceOwner(t *testing.T) {
 	}
 }
 
-// TestF105RetainedReclaimStoreFailureKeepsItsOwner (consult 106): a reclamation step that fails
+// TestRetainedReclaimStoreFailureKeepsItsOwner (consult 106): a reclamation step that fails
 // on the STORE — here the purge's chunk delete, refused past the withheld bound — says nothing
 // about the copy, so the reclaimer keeps the copy and finishes it once the store answers; only
 // the close boundary's positive "the exchange may still need it" lets a key go.
-func TestF105RetainedReclaimStoreFailureKeepsItsOwner(t *testing.T) {
+func TestRetainedReclaimStoreFailureKeepsItsOwner(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-reclaim-fail", "rt/rf", 1, []byte("retained-rf"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -314,12 +314,12 @@ func TestF105RetainedReclaimStoreFailureKeepsItsOwner(t *testing.T) {
 	}
 }
 
-// TestF105RetainedRecoveryReadFailureRefusesTheResume (holistic H-4 f1, consult 106): a resume whose
+// TestRetainedRecoveryReadFailureRefusesTheResume (holistic H-4 f1, consult 106): a resume whose
 // read of a retained exchange's canonical PUBREL FAILS (the store did not answer) must not
 // quarantine the exchange — a quarantine owns nothing, and the connected client would be owed its
 // PUBREL forever. The resume is refused before CONNACK instead, and the reconnect classifies again
 // with the records intact and replays the PUBREL.
-func TestF105RetainedRecoveryReadFailureRefusesTheResume(t *testing.T) {
+func TestRetainedRecoveryReadFailureRefusesTheResume(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		qos  byte
@@ -395,13 +395,13 @@ func TestF105RetainedRecoveryReadFailureRefusesTheResume(t *testing.T) {
 	}
 }
 
-// TestF105RetainedRecoveryRereadFailureRefusesTheResume (holistic H-5): the classification's
+// TestRetainedRecoveryRereadFailureRefusesTheResume (holistic H-5): the classification's
 // consistency re-reads decide nothing when they go unanswered, and a walk whose passes run out
 // with a retained exchange outstanding installed nothing — so both refuse the resume before
 // CONNACK rather than accept it with the exchange owned by nothing; the reconnect replays it.
 // (a) the register re-read fails on every pass; (b) the exchange keeps moving (re-stored under a
 // new sequence on every pass) until the passes are exhausted.
-func TestF105RetainedRecoveryRereadFailureRefusesTheResume(t *testing.T) {
+func TestRetainedRecoveryRereadFailureRefusesTheResume(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		moves bool
@@ -488,13 +488,13 @@ func TestF105RetainedRecoveryRereadFailureRefusesTheResume(t *testing.T) {
 	}
 }
 
-// TestF105RetainedPreClassificationFailureRefusesTheResume (holistic H-6): a walk that stops before
+// TestRetainedPreClassificationFailureRefusesTheResume (holistic H-6): a walk that stops before
 // classifying — here its batch register load fails — takes the conservative success, withholding
 // the identifier space, which installs nothing. Sound for a source-backed delivery, whose consumer
 // re-offers it; for a RETAINED exchange nothing would own it, so the resume is refused before
 // CONNACK and the reconnect replays it. A session whose inventory rules a retained exchange out
 // keeps the conservative success (the control).
-func TestF105RetainedPreClassificationFailureRefusesTheResume(t *testing.T) {
+func TestRetainedPreClassificationFailureRefusesTheResume(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
 		retained, noCensus bool
@@ -597,11 +597,11 @@ func TestF105RetainedPreClassificationFailureRefusesTheResume(t *testing.T) {
 	}
 }
 
-// TestF105RetainedRefusedRestorationRefusesTheResume (holistic H-7 b): an exchange that reached the
+// TestRetainedRefusedRestorationRefusesTheResume (holistic H-7 b): an exchange that reached the
 // resume's installation is this generation's, live and restorable, so an installation REFUSED
 // there (a conflicting resident or binding, a custody refusal) leaves it owned by nothing. The
 // resume is refused before CONNACK, and the reconnect replays it.
-func TestF105RetainedRefusedRestorationRefusesTheResume(t *testing.T) {
+func TestRetainedRefusedRestorationRefusesTheResume(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer func() { testMQTTShutdownServer(s) }()
@@ -651,7 +651,7 @@ func TestF105RetainedRefusedRestorationRefusesTheResume(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c, pi)
 }
 
-// TestF105RetainedQuarantineMatrix (consult 107): the positive-store-answer recovery quarantine, the
+// TestRetainedQuarantineMatrix (consult 107): the positive-store-answer recovery quarantine, the
 // ONE exception to the ownership property, over each population it admits — the store ANSWERED,
 // and what it answered cannot be restored from. Each row corrupts one record of a transmitted,
 // unanswered retained exchange (the victim) beside a healthy one, restarts the broker and resumes:
@@ -659,7 +659,7 @@ func TestF105RetainedRefusedRestorationRefusesTheResume(t *testing.T) {
 // combined oracle holds — every standing register owned, except the victim's, which must be a
 // recorded quarantine of that exact allocation with its reason, its identifier reserved and
 // nothing acting for it.
-func TestF105RetainedQuarantineMatrix(t *testing.T) {
+func TestRetainedQuarantineMatrix(t *testing.T) {
 	type corrupt func(t *testing.T, r *testRetainedRig, pi uint16, reg *mqttInflightRecord)
 	rewrite := func(t *testing.T, r *testRetainedRig, subject, field string, value any) {
 		t.Helper()
@@ -798,12 +798,12 @@ func TestF105RetainedQuarantineMatrix(t *testing.T) {
 	}
 }
 
-// TestF105RetainedConcurrentPubCompIsNotQuarantined (holistic H-8): the quarantine is admitted only
+// TestRetainedConcurrentPubCompIsNotQuarantined (holistic H-8): the quarantine is admitted only
 // on evidence, never on an answer a SUPPORTED concurrent advance produced. A PUBCOMP landing on the
 // previous broker after the resume's exchange read terminalizes the pair and removes the canonical;
 // the canonical then reads absent, which must be a reclassification (the pair moved), not a
 // quarantine. The resume is accepted, nothing is quarantined, and allocation is not withheld.
-func TestF105RetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
+func TestRetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer func() { testMQTTShutdownServer(s) }()
@@ -881,12 +881,12 @@ func TestF105RetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
 	testRetainedOwnershipHolds(t, rig, false, 4, 2*time.Second)
 }
 
-// TestF105RetainedSameObjectRefusedShapeDemotesTheResident (holistic H-9): the quarantine's
+// TestRetainedSameObjectRefusedShapeDemotesTheResident (holistic H-9): the quarantine's
 // non-action holds on a SAME-OBJECT resume too. A retained QoS 2 exchange at pubrel_ready leaves a
 // resident PUBREL entry on the session object; its register then reads as a shape this broker
 // refuses. The resume must demote the resident entry — no PUBREL replayed, nothing owed, the
 // connection not closed past the retry budget — and the identifier stays reserved.
-func TestF105RetainedSameObjectRefusedShapeDemotesTheResident(t *testing.T) {
+func TestRetainedSameObjectRefusedShapeDemotesTheResident(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer func() { testMQTTShutdownServer(s) }()
@@ -952,11 +952,11 @@ func TestF105RetainedSameObjectRefusedShapeDemotesTheResident(t *testing.T) {
 	testRetainedOwnershipHolds(t, rig, false, 4, 2*time.Second)
 }
 
-// TestF105RetainedReclaimWakeDuringAWithheldStepIsKept (holistic H-4 f2): a copy withheld because
+// TestRetainedReclaimWakeDuringAWithheldStepIsKept (holistic H-4 f2): a copy withheld because
 // its exchange still needs it is dropped after the bound — but a WAKE that arrives while that last
 // attempt is out (the exchange's ending, here the client's PUBACK) is newer than the attempt's
 // answer, and must keep the key: the ending's wake is the copy's only one.
-func TestF105RetainedReclaimWakeDuringAWithheldStepIsKept(t *testing.T) {
+func TestRetainedReclaimWakeDuringAWithheldStepIsKept(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-reclaim-wake", "rt/rw", 1, []byte("retained-rw"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -1023,11 +1023,11 @@ func TestF105RetainedReclaimWakeDuringAWithheldStepIsKept(t *testing.T) {
 	}
 }
 
-// TestF105RetainedQoS2HandshakeThroughTheCanonical: a retained QoS 2 delivery's PUBREC creates its
+// TestRetainedQoS2HandshakeThroughTheCanonical: a retained QoS 2 delivery's PUBREC creates its
 // canonical PUBREL on $MQTT_inflight in the advance and the PUBREL is emitted directly — no
 // $MQTT_out record exists for it; PUBCOMP then terminalizes the exchange and the cleanup removes
 // the canonical, the register and the copy.
-func TestF105RetainedQoS2HandshakeThroughTheCanonical(t *testing.T) {
+func TestRetainedQoS2HandshakeThroughTheCanonical(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-qos2", "rt/b", 2, []byte("retained-b"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -1080,7 +1080,7 @@ func TestF105RetainedQoS2HandshakeThroughTheCanonical(t *testing.T) {
 
 // T1 — IMMUTABLE REPLAY. A retained QoS 1 delivery left unacknowledged is re-sent on reconnect with
 // DUP from its OWN copy — the original bytes — even after the retained topic was rewritten.
-func TestF105RetainedReplayIsTheOriginalCopy(t *testing.T) {
+func TestRetainedReplayIsTheOriginalCopy(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-replay", "rt/c", 1, []byte("original"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -1237,7 +1237,7 @@ func TestRetainedResumeReplayExhaustedClosesBeforeLiveDeliveries(t *testing.T) {
 // T2 / T4 — RESTART REPLAY. A retained QoS 2 delivery whose PUBLISH went unacknowledged is replayed
 // from its copy after a broker restart (a fresh session object); after a PUBREC and a second restart
 // its PUBREL is replayed from the canonical; PUBCOMP completes it.
-func TestF105RetainedReplaySurvivesARestart(t *testing.T) {
+func TestRetainedReplaySurvivesARestart(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	pub, pubr := testMQTTConnect(t, &mqttConnInfo{clientID: "ret-restart-pub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
@@ -1312,7 +1312,7 @@ func TestMQTTRetainedSendReleasesOnTheWriteWithoutADiscard(t *testing.T) {
 // CONNECT discards the generation: the closed generation's recovery pass reclaims the copy — chunks
 // and manifest gone, the owner CleanupComplete, both payload duties terminal — without waiting for
 // a PUBACK that will never come.
-func TestF105RetainedDiscardReclaimsTheCopy(t *testing.T) {
+func TestRetainedDiscardReclaimsTheCopy(t *testing.T) {
 	// The recovery pass rides the session-expiry sweep's cadence.
 	defer setMQTTSessionExpirySweepInterval(100 * time.Millisecond)()
 	r := testRetainedRigUp(t, "ret-discard", "rt/x", 1, []byte("discarded"))
@@ -1372,7 +1372,7 @@ func TestF105RetainedDiscardReclaimsTheCopy(t *testing.T) {
 // own acquisition attempts are refused before sending; the driver re-attempts and the PUBREL
 // arrives. And when the driver's attempts are exhausted too, the connection is closed and the
 // reconnect replays the PUBREL from the canonical record.
-func TestF105RetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
+func TestRetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
 	for _, exhaust := range []bool{false, true} {
 		t.Run(map[bool]string{false: "retried", true: "exhausted"}[exhaust], func(t *testing.T) {
 			r := testRetainedRigUp(t, "ret-pubrel-retry-"+map[bool]string{false: "r", true: "x"}[exhaust], "rt/q2", 2, []byte("q2"))
@@ -1435,7 +1435,7 @@ func TestF105RetainedPubRelAcquisitionIsRetriedByTheDriver(t *testing.T) {
 // PROVISIONING under the old tenure; the resume's inventory traversal collects the payload from
 // its duties, and the reclaimer closes it under the successor-tenure arm, seals the provisioning,
 // purges the material and completes the owner with both duties terminal.
-func TestF105RetainedCrashMidChunksIsReclaimedAtTheNextConnect(t *testing.T) {
+func TestRetainedCrashMidChunksIsReclaimedAtTheNextConnect(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	o.MaxPayload = 4 * 1024 * 1024
 	s := testMQTTRunServer(t, o)
@@ -1537,7 +1537,7 @@ func TestF105RetainedCrashMidChunksIsReclaimedAtTheNextConnect(t *testing.T) {
 // T5 — ORDERING. While a subscription's retained replay is held (its copy's reservation parked at
 // its batch), a live QoS 0 message published to the topic is NOT delivered ahead of it: the raw
 // subscription's gate holds it, and on release the retained frame arrives first, then the live one.
-func TestF105RetainedReplayPrecedesLiveQoS0(t *testing.T) {
+func TestRetainedReplayPrecedesLiveQoS0(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-order", "rt/o", 1, []byte("retained"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -1579,7 +1579,7 @@ func TestF105RetainedReplayPrecedesLiveQoS0(t *testing.T) {
 // T7c — DEPARTURE AFTER THE DURABLE ADMISSION, BEFORE ACQUISITION. The subscription departs while
 // its admitted copy waits (held after the admission): the driver withdraws the proven-unsent
 // exchange — WithdrawnUnsent, its register gone, its identifier released — and no PUBLISH is sent.
-func TestF105RetainedDepartureAfterAdmissionIsWithdrawn(t *testing.T) {
+func TestRetainedDepartureAfterAdmissionIsWithdrawn(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-depart", "rt/dp", 1, []byte("departing"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -1632,7 +1632,7 @@ func TestF105RetainedDepartureAfterAdmissionIsWithdrawn(t *testing.T) {
 // the delete is confirmed. (a) A transient refusal is retried by the continuation worker until the
 // tombstone is consumed and the identifier released. (b) A persistent one closes the connection,
 // and the resume consumes the tombstone; nothing is ever sent.
-func TestF105RetainedFailedWithdrawalStaysOwned(t *testing.T) {
+func TestRetainedFailedWithdrawalStaysOwned(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		persistent bool
@@ -1774,7 +1774,7 @@ func TestF105RetainedFailedWithdrawalStaysOwned(t *testing.T) {
 // delivery parks on the raw subscription's gate, and a takeover CONNECT arrives: the closing
 // signal releases the waiter (the QoS 0 message is dropped, as QoS 0 permits), so the displaced
 // incarnation drains and the takeover is accepted promptly.
-func TestF105RetainedGateWaiterDoesNotHoldATakeover(t *testing.T) {
+func TestRetainedGateWaiterDoesNotHoldATakeover(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-gate-takeover", "rt/g", 1, []byte("retained"))
 	defer r.done()
 	ci := &mqttConnInfo{clientID: r.id, cleanSess: false}
@@ -1840,7 +1840,7 @@ func TestF105RetainedGateWaiterDoesNotHoldATakeover(t *testing.T) {
 // T7 — AMBIGUITY AT EACH STEP. Each step's first batch LANDS but its response is lost; the driver
 // resolves the frozen attempt rather than treating it as refused, and the copy is delivered, the
 // client silent, exactly once.
-func TestF105RetainedLostResponsesAreResolvedAndDelivered(t *testing.T) {
+func TestRetainedLostResponsesAreResolvedAndDelivered(t *testing.T) {
 	for _, op := range []string{"op-retained-reserve", "op-retained-chunks", "op-retained-seal",
 		"op-admit-retained", "op-acquire-publish"} {
 		t.Run(op, func(t *testing.T) {
@@ -1877,7 +1877,7 @@ func TestF105RetainedLostResponsesAreResolvedAndDelivered(t *testing.T) {
 // emitted by the continuation worker, the completed exchange's copy is still reclaimed by the
 // reclaimer, and a second subscription's replay waits behind the held one; released, both replays
 // arrive in SUBSCRIBE order.
-func TestF105RetainedWorkersDoNotWaitOnAHeldReplay(t *testing.T) {
+func TestRetainedWorkersDoNotWaitOnAHeldReplay(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1967,7 +1967,7 @@ func TestF105RetainedWorkersDoNotWaitOnAHeldReplay(t *testing.T) {
 
 // T7b — THE READLOOP IS NOT BLOCKED by a replay: with the driver held at its first reservation, a
 // PINGREQ sent right after the SUBSCRIBE is answered.
-func TestF105RetainedReplayDoesNotBlockTheReadLoop(t *testing.T) {
+func TestRetainedReplayDoesNotBlockTheReadLoop(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-readloop", "rt/rl", 1, []byte("held"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -2004,7 +2004,7 @@ func TestF105RetainedReplayDoesNotBlockTheReadLoop(t *testing.T) {
 // corrupted in the store, then the broker restarts: the resume reads and verifies the copy before
 // any acquisition, finds the digest wrong with both records unchanged, and WITHHOLDS the exchange —
 // nothing is emitted, the identifier stays reserved.
-func TestF105RetainedCorruptCopyIsWithheldAtTheResume(t *testing.T) {
+func TestRetainedCorruptCopyIsWithheldAtTheResume(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer func() { testMQTTShutdownServer(s) }()
@@ -2063,7 +2063,7 @@ func TestF105RetainedCorruptCopyIsWithheldAtTheResume(t *testing.T) {
 // exchange ended: nothing is replayed, nothing stays reserved, a fresh delivery flows. (a): a delayed
 // PUBREC moves a QoS 2 exchange past PUBLISH with its copy intact — the pass re-runs on the fresh
 // phase and the PUBREL is delivered after CONNACK, the client silent.
-func TestF105RetainedResumeReclassifiesOnAConcurrentAnswer(t *testing.T) {
+func TestRetainedResumeReclassifiesOnAConcurrentAnswer(t *testing.T) {
 	for _, qos := range []byte{1, 2} {
 		t.Run(map[byte]string{1: "ended and reclaimed", 2: "pubrec"}[qos], func(t *testing.T) {
 			r := testRetainedRigUp(t, "ret-t25-"+string('0'+qos), "rt/t25", qos, []byte("raced"))
@@ -2165,7 +2165,7 @@ func TestF105RetainedResumeReclassifiesOnAConcurrentAnswer(t *testing.T) {
 // Holistic round 1, finding 2: the admission LANDS but its register can never be read back to
 // promote the allocation. A committed admission is never routed through the pre-admission
 // abandonment: the connection is closed, and the reconnect's resume restores and sends the copy.
-func TestF105RetainedCommittedAdmissionSurvivesReadbackFailures(t *testing.T) {
+func TestRetainedCommittedAdmissionSurvivesReadbackFailures(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-adm-readback", "rt/arb", 1, []byte("committed"))
 	defer r.done()
 	ci := &mqttConnInfo{clientID: r.id, cleanSess: false}
@@ -2215,7 +2215,7 @@ func TestF105RetainedCommittedAdmissionSurvivesReadbackFailures(t *testing.T) {
 // succeeds and its send section is refused by that live local token — which is not a settlement:
 // the PUBREL stays owed, and once the PUBLISH section ends it is emitted with no further client
 // packet.
-func TestF105RetainedPubRelOwedAcrossALivePublishSection(t *testing.T) {
+func TestRetainedPubRelOwedAcrossALivePublishSection(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-pubrel-section", "rt/sec", 2, []byte("sec"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -2248,7 +2248,7 @@ func TestF105RetainedPubRelOwedAcrossALivePublishSection(t *testing.T) {
 // Holistic round 2, finding 2: the admission LANDS, its response is lost, and the custody
 // settlement cannot resolve it; the next resolution confirms it. Every verdict is classified, so
 // the confirmed landing is promoted and delivered — never abandoned as unadmitted.
-func TestF105RetainedLateConfirmedAdmissionIsDelivered(t *testing.T) {
+func TestRetainedLateConfirmedAdmissionIsDelivered(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-adm-late", "rt/late", 1, []byte("late"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)

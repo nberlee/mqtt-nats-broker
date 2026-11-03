@@ -27,9 +27,9 @@ import (
 // sweep cursor is: it is the part an earlier design got wrong, and the part a test can pin
 // exactly. Everything here is a pure function over a header.
 
-// TestF105WrappingIsACASOnTheCycle walks every row of the cycle table, including the one round 5
+// TestWrappingIsACASOnTheCycle walks every row of the cycle table, including the one round 5
 // found unexercised: a walker whose own walk is complete while the HEADER's position is not.
-func TestF105WrappingIsACASOnTheCycle(t *testing.T) {
+func TestWrappingIsACASOnTheCycle(t *testing.T) {
 	const shard = 7
 
 	t.Run("same cycle, merged as a maximum", func(t *testing.T) {
@@ -118,13 +118,13 @@ func TestF105WrappingIsACASOnTheCycle(t *testing.T) {
 	})
 }
 
-// TestF105OneReadinessWalkPerPass pins the COUNT that replaces the budget for the account-wide
+// TestOneReadinessWalkPerPass pins the COUNT that replaces the budget for the account-wide
 // readiness walk.
 //
 // The walk cannot be charged per record without starving it, so what stops a single pass from
 // performing an unbounded number of them is this cap and nothing else. It is the whole bound, so
 // it is asserted on its own rather than only through a pass that happens to find one generation.
-func TestF105OneReadinessWalkPerPass(t *testing.T) {
+func TestOneReadinessWalkPerPass(t *testing.T) {
 	b := newMqttRecoveryBudget()
 	if !b.takeReadinessAttempt() {
 		t.Fatal("a fresh pass cannot take its own readiness attempt")
@@ -147,8 +147,8 @@ func TestF105OneReadinessWalkPerPass(t *testing.T) {
 	}
 }
 
-// TestF105ProgressCapacityIsReserved pins the budget's three states and its reserve.
-func TestF105ProgressCapacityIsReserved(t *testing.T) {
+// TestProgressCapacityIsReserved pins the budget's three states and its reserve.
+func TestProgressCapacityIsReserved(t *testing.T) {
 	b := newMqttRecoveryBudget()
 	if !b.fitsAUnit() {
 		t.Fatal("a fresh budget does not fit one complete unit")
@@ -185,10 +185,10 @@ func TestF105ProgressCapacityIsReserved(t *testing.T) {
 	}
 }
 
-// TestF105TheRecoveryPassStopsWithItsAccountManager establishes that a pass ends when its manager
+// TestTheRecoveryPassStopsWithItsAccountManager establishes that a pass ends when its manager
 // says stop, between store operations rather than between sweeps.
-func TestF105TheRecoveryPassStopsWithItsAccountManager(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-pass-stops")
+func TestTheRecoveryPassStopsWithItsAccountManager(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-pass-stops")
 	defer cleanup()
 
 	before := mqttRecoveryPassRuns.Load()
@@ -200,11 +200,11 @@ func TestF105TheRecoveryPassStopsWithItsAccountManager(t *testing.T) {
 	}
 }
 
-// TestF105ThePassVisitsAnEnrolledRootAndRetiresIt is the driver's end-to-end arithmetic: a
+// TestThePassVisitsAnEnrolledRootAndRetiresIt is the driver's end-to-end arithmetic: a
 // generation closed with an empty inventory is born finished, so the first visit retires it —
 // certificate first, then the root.
-func TestF105ThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-pass-retires")
+func TestThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-pass-retires")
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
@@ -212,7 +212,7 @@ func TestF105ThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
 		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}
-	closed, _, _ := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen)
+	closed, _, _ := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen)
 	if closed == nil {
 		t.Fatal("the closure does not stand")
 	}
@@ -226,7 +226,7 @@ func TestF105ThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
 		}
 	}
 
-	cert, cerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testF105Gen)
+	cert, cerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testGen)
 	if cerr != nil {
 		t.Fatalf("reading the completion certificate: %v", cerr)
 	}
@@ -248,7 +248,7 @@ func TestF105ThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
 	// AND THE GATE STILL CLEARS THE GENERATION, on the certificate rather than on the root. That
 	// is the whole reason the certificate stands on its own: recovery may finish BEFORE the
 	// teardown gets there, and requiring an open cursor would deadlock the release for ever.
-	f, ferr := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testF105Gen)
+	f, ferr := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, testGen)
 	if ferr != nil {
 		t.Fatalf("gathering release facts after retirement: %v", ferr)
 	}
@@ -258,20 +258,20 @@ func TestF105ThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
 	if f.Cert == nil {
 		t.Fatal("the gate did not read the completion certificate back")
 	}
-	if err := mqttAdoptedReleaseAuthorized(e.id, testF105Gen, f); err != nil {
+	if err := mqttAdoptedReleaseAuthorized(e.id, testGen, f); err != nil {
 		t.Fatalf("a certified generation was not cleared for release: %v", err)
 	}
 }
 
-// TestF105AHoleIsAnEmptySlotNotARetirement establishes that a missing root claims nothing about
+// TestAHoleIsAnEmptySlotNotARetirement establishes that a missing root claims nothing about
 // any generation, and does not end the shard walk either.
-func TestF105AHoleIsAnEmptySlotNotARetirement(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-hole")
+func TestAHoleIsAnEmptySlotNotARetirement(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-hole")
 	defer cleanup()
 
 	shard := mqttDirShardFor(getHash(e.id))
 	// A header covering three ordinals with NOTHING at any of them: three holes.
-	testF105PlantShard(t, e, shard, 3)
+	testPlantShard(t, e, shard, 3)
 
 	before := mqttRecoveryPassRuns.Load()
 	for i := 0; i < mqttDirShards; i++ {
@@ -284,7 +284,7 @@ func TestF105AHoleIsAnEmptySlotNotARetirement(t *testing.T) {
 	// NOTHING WAS CERTIFIED. A hole names no generation, so there is nothing a certificate could
 	// be about — and a pass that treated one as a retirement would be writing a claim out of an
 	// absence.
-	if cert, cerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testF105Gen); cerr != nil || cert != nil {
+	if cert, cerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testGen); cerr != nil || cert != nil {
 		t.Fatalf("a hole produced a completion certificate: %+v (%v)", cert, cerr)
 	}
 	// AND THE WALK MOVED PAST THEM: the header's position advanced beyond the holes rather than
@@ -298,9 +298,9 @@ func TestF105AHoleIsAnEmptySlotNotARetirement(t *testing.T) {
 	}
 }
 
-// TestF105TheSealRequiresAWellFormedReadinessRecord is the affine fence, stated against arbitrary
+// TestTheSealRequiresAWellFormedReadinessRecord is the affine fence, stated against arbitrary
 // batches rather than through the composer that respects it.
-func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
+func TestTheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 	// The affine enrolment rides a DISCARDING FINALIZATION, because that is the only closure
 	// that may carry one: `close-admit` refuses a discard outright — ending a generation is not
 	// authority to abandon its obligations — and a closure that preserves them leaves its affine
@@ -310,20 +310,20 @@ func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 	// may carry one: `close-admit` refuses a discard outright — ending a generation is not
 	// authority to abandon its obligations — and a closure that preserves them leaves its affine
 	// consumer to the incarnation that continues.
-	plant := func(t *testing.T, e *testF105Env) *mqttOutboundResource {
+	plant := func(t *testing.T, e *testOutboundEnv) *mqttOutboundResource {
 		t.Helper()
 		const affGen = "0123456789abcdefghijkq"
 		_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-		_, r := testF105DiscardingCloseWithAffine(t, e, affGen, durable)
+		_, r := testDiscardingCloseWithAffine(t, e, affGen, durable)
 		return r
 	}
 
 	t.Run("no readiness at all", func(t *testing.T) {
-		e, cleanup := testF105NewEnv(t, "client-f105-seal-noready")
+		e, cleanup := testNewEnv(t, "client-f105-seal-noready")
 		defer cleanup()
 		r := plant(t, e)
-		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, r.Inc)
-		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
+		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 		err := e.asm.jsa.opSealAffineProvisioning(root, r, rseq, mqttNewInflightNonce())
 		if err == nil {
 			t.Fatal("an affine resource was sealed with no readiness assertion standing")
@@ -334,7 +334,7 @@ func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 	})
 
 	t.Run("readiness about another consumer", func(t *testing.T) {
-		e, cleanup := testF105NewEnv(t, "client-f105-seal-wrongready")
+		e, cleanup := testNewEnv(t, "client-f105-seal-wrongready")
 		defer cleanup()
 		r := plant(t, e)
 		// A WELL-FORMED record for ANOTHER affine generation: its durable is DERIVED, so the
@@ -343,13 +343,13 @@ func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 		const other = "0123456789abcdefghijkz"
 		_, _, otherDur := mqttQ2AffineNames(getHash(e.id), other)
 		if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: other, Durable: otherDur, PubRelDur: r.PubRelDur,
 		}); err != nil {
 			t.Fatalf("publishing the readiness: %v", err)
 		}
-		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, r.Inc)
-		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
+		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 		err := e.asm.jsa.opSealAffineProvisioning(root, r, rseq, mqttNewInflightNonce())
 		if err == nil {
 			t.Fatal("a readiness assertion about another consumer sealed this one")
@@ -367,27 +367,27 @@ func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 		//
 		// Planted RAW, because the validator now refuses this at the write too: the threat is a
 		// record already standing on the stream, so the READ-side refusal is what must hold.
-		e, cleanup := testF105NewEnv(t, "client-f105-seal-wrongproofs")
+		e, cleanup := testNewEnv(t, "client-f105-seal-wrongproofs")
 		defer cleanup()
 		r := plant(t, e)
-		_, _, otherPubRel := mqttPubRelNames(getHash(e.id), testF105Gen2)
+		_, _, otherPubRel := mqttPubRelNames(getHash(e.id), testGen2)
 		if otherPubRel == r.PubRelDur {
 			t.Fatal("the fixture's two PUBREL names coincide, so nothing is substituted")
 		}
 		body, merr := json.Marshal(&mqttAffineReadiness{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: r.AffGen, Durable: r.Name, PubRelDur: otherPubRel,
 		})
 		if merr != nil {
 			t.Fatalf("marshalling the substituted readiness: %v", merr)
 		}
 		msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
-		if _, serr := e.asm.jsa.storeMsg(mqttReadinessSubject(getHash(e.id), testF105Gen),
+		if _, serr := e.asm.jsa.storeMsg(mqttReadinessSubject(getHash(e.id), testGen),
 			hdr, msg); serr != nil {
 			t.Fatalf("planting the substituted readiness: %v", serr)
 		}
-		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, r.Inc)
-		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
+		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 		if err := e.asm.jsa.opSealAffineProvisioning(root, r, rseq,
 			mqttNewInflightNonce()); err == nil {
 			t.Fatal("a readiness assertion naming another PUBREL consumer sealed this resource, " +
@@ -396,21 +396,21 @@ func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 	})
 
 	t.Run("the matching assertion seals", func(t *testing.T) {
-		e, cleanup := testF105NewEnv(t, "client-f105-seal-ok")
+		e, cleanup := testNewEnv(t, "client-f105-seal-ok")
 		defer cleanup()
 		r := plant(t, e)
 		if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
 		}); err != nil {
 			t.Fatalf("publishing the readiness: %v", err)
 		}
-		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, r.Inc)
-		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
+		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 		if err := e.asm.jsa.opSealAffineProvisioning(root, r, rseq, mqttNewInflightNonce()); err != nil {
 			t.Fatalf("a matching readiness assertion did not seal: %v", err)
 		}
-		after, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, r.Inc)
+		after, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
 		if after == nil || after.Prov != mqttProvisioningSealed {
 			t.Fatalf("the resource did not reach SEALED: %+v", after)
 		}
@@ -421,34 +421,34 @@ func TestF105TheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 		// proofs were secured — matching identifiers are not evidence of work — so a producer
 		// that skipped the acts satisfies this rule. That limit is asserted here rather than
 		// left to be discovered: the producers are enumerated and audited instead.
-		e, cleanup := testF105NewEnv(t, "client-f105-seal-premature")
+		e, cleanup := testNewEnv(t, "client-f105-seal-premature")
 		defer cleanup()
 		r := plant(t, e)
 		if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
 		}); err != nil {
 			t.Fatalf("publishing the readiness: %v", err)
 		}
-		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, r.Inc)
-		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testF105Gen}
+		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
+		root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: testGen}
 		if err := e.asm.jsa.opSealAffineProvisioning(root, r, rseq, mqttNewInflightNonce()); err != nil {
 			t.Fatalf("the trust boundary is narrower than stated: %v", err)
 		}
 	})
 }
 
-// TestF105ReadinessIsIdempotentAndConflictsAreErrors: two producers may reach it, and they write
+// TestReadinessIsIdempotentAndConflictsAreErrors: two producers may reach it, and they write
 // the same facts.
-func TestF105ReadinessIsIdempotentAndConflictsAreErrors(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-ready-idem")
+func TestReadinessIsIdempotentAndConflictsAreErrors(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-ready-idem")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 	ready := &mqttAffineReadiness{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen,
+		ID: e.id, Epoch: e.epoch, Gen: testGen,
 		AffGen: affGen, Durable: durable, PubRelDur: pubRelDur,
 	}
 	if err := e.asm.jsa.publishAffineReadiness(ready); err != nil {
@@ -466,20 +466,20 @@ func TestF105ReadinessIsIdempotentAndConflictsAreErrors(t *testing.T) {
 	}
 }
 
-// TestF105ACertificateMustStateItsCoverage exercises the READ path, which is where the required
+// TestACertificateMustStateItsCoverage exercises the READ path, which is where the required
 // member is enforced.
 //
 // A zero bound is LEGAL — an empty inventory seals at zero — so the value alone can no longer say
 // whether the certificate stated its coverage. What says it is the member being PRESENT and
 // non-null in the body: an omitted one would decode into that legal zero, and a generation sealed
 // higher would then be released on a certificate that never said what it covered.
-func TestF105ACertificateMustStateItsCoverage(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-cert-members")
+func TestACertificateMustStateItsCoverage(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-cert-members")
 	defer cleanup()
 
 	store := func(t *testing.T, body string) error {
 		t.Helper()
-		subj := mqttGenCertSubject(getHash(e.id), testF105Gen)
+		subj := mqttGenCertSubject(getHash(e.id), testGen)
 		var expect uint64
 		if cur, cerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); cerr == nil && cur != nil {
 			expect = cur.Sequence
@@ -488,55 +488,55 @@ func TestF105ACertificateMustStateItsCoverage(t *testing.T) {
 		if _, err := e.asm.jsa.storeMsg(subj, hdr, msg); err != nil {
 			t.Fatalf("planting the certificate: %v", err)
 		}
-		_, lerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testF105Gen)
+		_, lerr := e.asm.jsa.loadGenCompletionCert(e.id, e.epoch, testGen)
 		return lerr
 	}
 
 	// OMITTED: refused, rather than read as a certificate about an empty inventory.
-	body := `{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testF105Gen + `"}`
+	body := `{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testGen + `"}`
 	if err := store(t, body); err == nil {
 		t.Fatal("a certificate that never stated its coverage was accepted")
 	}
 	// NULL: the same, because a null member is not a stated one either.
-	body = `{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testF105Gen +
+	body = `{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testGen +
 		`","sealed_hi":null}`
 	if err := store(t, body); err == nil {
 		t.Fatal("a certificate with a null bound was accepted")
 	}
 	// AN EXPLICIT ZERO IS ACCEPTED, which is what the two refusals above must not be confused
 	// with: a generation that admitted nothing seals at zero and its completion covers zero.
-	body = `{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testF105Gen +
+	body = `{"id":"` + e.id + `","epoch":"` + e.epoch + `","gen":"` + testGen +
 		`","sealed_hi":0}`
 	if err := store(t, body); err != nil {
 		t.Fatalf("a certificate covering an empty inventory was refused: %v", err)
 	}
 }
 
-// TestF105TheSweepIsChargedPerEntry: the budget bounds STORE OPERATIONS, not invocations.
+// TestTheSweepIsChargedPerEntry: the budget bounds STORE OPERATIONS, not invocations.
 //
 // One call to the sweep reads up to 128 entries. Charging the call rather than the reads bought
 // 128 round trips for one unit, so the advertised limit — and the shutdown latency that rests on
 // it — meant nothing under a large inventory. This pins the charge at the entry.
-func TestF105TheSweepIsChargedPerEntry(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-sweep-charge")
+func TestTheSweepIsChargedPerEntry(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-sweep-charge")
 	defer cleanup()
 	e.bootstrap(t, "txn-boot")
 
 	// An inventory of five duties, sealed, with a root over it.
-	members := []mqttTransitionMember{testF105LedgerMember(t, e, 0, &mqttGenLedger{
+	members := []mqttTransitionMember{testLedgerMember(t, e, 0, &mqttGenLedger{
 		Lo: 1, Del: 1,
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, State: mqttGenLedgerOpen, Hi: 5,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, State: mqttGenLedgerOpen, Hi: 5,
 	})}
 	for ord := uint64(1); ord <= 5; ord++ {
-		members = append(members, testF105DutyMember(t, e, 0,
-			testF105Duty(e, ord, mqttDutyCleanup, "inc-"+string(rune('a'+ord)), mqttDutyNotYetActionable)))
+		members = append(members, testDutyMember(t, e, 0,
+			testDuty(e, ord, mqttDutyCleanup, "inc-"+string(rune('a'+ord)), mqttDutyNotYetActionable)))
 	}
-	if err := testF105SubmitInventory(t, e, "txn-alloc", members...); err != nil {
+	if err := testSubmitInventory(t, e, "txn-alloc", members...); err != nil {
 		t.Fatalf("planting the inventory: %v", err)
 	}
 	// start 1, resume 1, bound 5, nothing unresolved: a sweep with five entries ahead of it.
-	root := testF105EnvRoot(e, 1, 1, 5, 0)
-	testF105PlantRoot(t, e, root)
+	root := testEnvRoot(e, 1, 1, 5, 0)
+	testPlantRoot(t, e, root)
 
 	// A CHARGE THAT ALLOWS EXACTLY TWO READS. A per-call charge would read all five.
 	allowed := 2
@@ -571,7 +571,7 @@ func TestF105TheSweepIsChargedPerEntry(t *testing.T) {
 	}
 }
 
-// TestF105AnAffineResourceNamesItsOwnConsumer: the name the executor DELETES is derived, never
+// TestAnAffineResourceNamesItsOwnConsumer: the name the executor DELETES is derived, never
 // merely carried.
 //
 // Trusting the closing caller for the COMPLETENESS of a target set never licensed trusting it for
@@ -580,21 +580,21 @@ func TestF105TheSweepIsChargedPerEntry(t *testing.T) {
 // claims, publish a matching readiness and remove a consumer belonging to somebody else. Both
 // names are derived from an identity the record itself carries, so a mismatch is a record this
 // broker refuses to read rather than a deletion it performs.
-func TestF105AnAffineResourceNamesItsOwnConsumer(t *testing.T) {
-	e, cleanup := testF105NewEnv(t, "client-f105-affine-name")
+func TestAnAffineResourceNamesItsOwnConsumer(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-affine-name")
 	defer cleanup()
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testF105Gen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
 	base := &mqttOutboundResource{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Inc: mqttNewInflightNonce(),
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Inc: mqttNewInflightNonce(),
 		Kind: mqttResourceAffineConsumer, Name: durable, State: mqttResourceLive,
 		Prov: mqttProvisioningPending, Deps: []mqttResourceEdge{},
 		AffGen: affGen, PubRelDur: pubRelDur,
 	}
-	if err := mqttValidateOutboundResource(base, e.id, e.epoch, testF105Gen, base.Inc); err != nil {
+	if err := mqttValidateOutboundResource(base, e.id, e.epoch, testGen, base.Inc); err != nil {
 		t.Fatalf("a correctly derived affine resource was refused: %v", err)
 	}
 
@@ -602,7 +602,7 @@ func TestF105AnAffineResourceNamesItsOwnConsumer(t *testing.T) {
 	// consumer this generation does not own.
 	foreign := *base
 	foreign.Name = "$MQTT_Q2AFF_someone_else"
-	if err := mqttValidateOutboundResource(&foreign, e.id, e.epoch, testF105Gen, foreign.Inc); err == nil {
+	if err := mqttValidateOutboundResource(&foreign, e.id, e.epoch, testGen, foreign.Inc); err == nil {
 		t.Fatal("an affine resource naming another consumer was accepted")
 	} else if !strings.Contains(err.Error(), "affine generation") ||
 		!strings.Contains(err.Error(), "owns") {
@@ -616,7 +616,7 @@ func TestF105AnAffineResourceNamesItsOwnConsumer(t *testing.T) {
 	// belonging to a different incarnation.
 	otherGen := *base
 	otherGen.PubRelDur = "$MQTT_PUBREL_someone_else"
-	if err := mqttValidateOutboundResource(&otherGen, e.id, e.epoch, testF105Gen, otherGen.Inc); err == nil {
+	if err := mqttValidateOutboundResource(&otherGen, e.id, e.epoch, testGen, otherGen.Inc); err == nil {
 		t.Fatal("an affine resource naming another generation's PUBREL consumer was accepted")
 	} else if !strings.Contains(err.Error(), "PUBREL consumer") ||
 		!strings.Contains(err.Error(), "owns") {
@@ -627,7 +627,7 @@ func TestF105AnAffineResourceNamesItsOwnConsumer(t *testing.T) {
 	// pair has to agree, because the durable IS the affine generation's name.
 	mixed := *base
 	_, _, mixed.Name = mqttQ2AffineNames(getHash(e.id), "0123456789abcdefghijkz")
-	if err := mqttValidateOutboundResource(&mixed, e.id, e.epoch, testF105Gen, mixed.Inc); err == nil {
+	if err := mqttValidateOutboundResource(&mixed, e.id, e.epoch, testGen, mixed.Inc); err == nil {
 		t.Fatal("an affine resource whose name belongs to another affine generation was accepted")
 	}
 }

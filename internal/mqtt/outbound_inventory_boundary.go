@@ -253,11 +253,11 @@ func mqttCheckInventoryCoverage(a *mqttTransitionAttempt, extra []mqttTransition
 		if e.expect != 0 {
 			continue
 		}
-		cls, ok := mqttF105ObligationClass(e.subj)
+		cls, ok := mqttOutboundObligationClass(e.subj)
 		if !ok {
 			continue
 		}
-		rest := e.subj[len(mqttF105SubjectPrefix()):]
+		rest := e.subj[len(mqttOutboundRecordSubjectPrefix()):]
 		toks := strings.Split(rest, ".")
 		switch cls {
 		case mqttExchangeClassTk:
@@ -663,7 +663,7 @@ func mqttCheckAllocationInterval(a *mqttTransitionAttempt, curHi uint64, next *m
 
 // mqttParseLedgerSubject reads a ledger subject's generation, refusing anything else.
 func mqttParseLedgerSubject(subject, wantIDHash string) (string, error) {
-	rest, ok := strings.CutPrefix(subject, mqttF105SubjectPrefix()+mqttLedgerClassTk+".")
+	rest, ok := strings.CutPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttLedgerClassTk+".")
 	if !ok {
 		return _EMPTY_, fmt.Errorf("subject is not a generation ledger")
 	}
@@ -682,7 +682,7 @@ func mqttParseLedgerSubject(subject, wantIDHash string) (string, error) {
 
 // mqttParseDutySubject reads a duty subject's generation and ordinal, refusing anything else.
 func mqttParseDutySubject(subject, wantIDHash string) (string, uint64, error) {
-	rest, ok := strings.CutPrefix(subject, mqttF105SubjectPrefix()+mqttDutyClassTk+".")
+	rest, ok := strings.CutPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttDutyClassTk+".")
 	if !ok {
 		return _EMPTY_, 0, fmt.Errorf("subject is not a duty entry")
 	}

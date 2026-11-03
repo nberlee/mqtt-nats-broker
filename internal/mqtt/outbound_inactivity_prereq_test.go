@@ -20,12 +20,12 @@ import (
 	"time"
 )
 
-// TestF105InactivityPrerequisite pins the issue #107 §5.1 rule that a depended-on source/PUBREL
+// TestInactivityPrerequisite pins the issue #107 §5.1 rule that a depended-on source/PUBREL
 // consumer is safe only when its EFFECTIVE inactivity threshold is zero — both the stream's
 // substituted limit and the consumer's own request — and that an unverifiable stream is unsafe.
 // It exercises the pure decision core so no embedded JetStream is needed; the store wrapper is
 // only the lookup drainingAllowed already models.
-func TestF105InactivityPrerequisite(t *testing.T) {
+func TestInactivityPrerequisite(t *testing.T) {
 	const nonzero = 30 * time.Second
 
 	cases := []struct {
@@ -60,9 +60,9 @@ func TestF105InactivityPrerequisite(t *testing.T) {
 	}
 }
 
-// TestF105ClearConsumerInactivity pins the safe-config half: the helper zeroes a consumer's
+// TestClearConsumerInactivity pins the safe-config half: the helper zeroes a consumer's
 // requested threshold and tolerates a nil config.
-func TestF105ClearConsumerInactivity(t *testing.T) {
+func TestClearConsumerInactivity(t *testing.T) {
 	cfg := &ConsumerConfig{InactiveThreshold: 30 * time.Second}
 	mqttClearConsumerInactivity(cfg)
 	if cfg.InactiveThreshold != 0 {

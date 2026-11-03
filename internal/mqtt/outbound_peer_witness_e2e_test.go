@@ -257,7 +257,7 @@ func testPeerWorldBuild(t *testing.T, cid string, v5Expiry uint32, beforePubRec 
 	)
 	if v5Expiry == 0 {
 		var subr *mqttReader
-		sub, subr, sessA, pi, nonce = testF105QoS2Delivered(t, w.oA, w.sA, cid)
+		sub, subr, sessA, pi, nonce = testQoS2Delivered(t, w.oA, w.sA, cid)
 		if beforePubRec != nil {
 			beforePubRec(sessA.asm)
 		}
@@ -289,7 +289,7 @@ func testPeerWorldBuild(t *testing.T, cid string, v5Expiry uint32, beforePubRec 
 		}
 		nonce = reg.Lin
 	}
-	testF105ExchangePhaseIs(t, sessA, nonce, mqttExchangePubRecObserved)
+	testExchangePhaseIs(t, sessA, nonce, mqttExchangePubRecObserved)
 	w.pi, w.nonce = pi, nonce
 
 	sessA.mu.Lock()
@@ -351,7 +351,7 @@ func (w *testPeerWorld) obligationStands(asm *mqttAccountSessionManager) error {
 	if err != nil || x == nil || x.Phase != mqttExchangePubRecObserved {
 		return fmt.Errorf("the exchange does not stand at PubRecObserved: %+v (%v)", x, err)
 	}
-	recs, _, ok := f099RealPubRelScan(asm, w.relSubj)
+	recs, _, ok := realPubRelScan(asm, w.relSubj)
 	stored := false
 	for _, r := range recs {
 		stored = stored || r.pi == w.pi
@@ -448,7 +448,7 @@ func (w *testPeerWorld) discardJudge(released *atomic.Bool, asm *mqttAccountSess
 //   - WP-2: B never subscribes the PUBREL consumer on resume (ensurePubRelConsumerSubscription skipped).
 //   - WP-3: recovery reads a past-PUBREC register as a delivery owed (PUBLISH where PUBREL is due).
 //   - WP-4: the resumed CONNECT finalizes its handoff with a discarding retire.
-func TestF105PreservedObligationCompletesOnThePeer(t *testing.T) {
+func TestPreservedObligationCompletesOnThePeer(t *testing.T) {
 	// Not parallel: the consumer-delete request seam is process-wide.
 	w := testPeerWorldAtPubRec(t, "f105-peer-preserved")
 
@@ -495,7 +495,7 @@ func TestF105PreservedObligationCompletesOnThePeer(t *testing.T) {
 // encounter is a settlement, never a delivery; the PUBREL exchange completes on B.
 //
 // A PUBLISH of the original message here is issue #117 across brokers.
-func TestF105AnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer(t *testing.T) {
+func TestAnUnconfirmedSourceAckStillNeverResendsThePublishOnThePeer(t *testing.T) {
 	// Not parallel: the delivery offer seam is process-wide.
 	var (
 		mu       sync.Mutex
@@ -853,7 +853,7 @@ func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountS
 //   - WD-2: the executor ends the obligation with a non-discard ending.
 //   - WD-3: the clean-start teardown raw-deletes the PUBREL consumer (transferLogical forced false).
 //   - WD-4: B resumes the old generation's exchange on the clean start.
-func TestF105DiscardedObligationEndsUnderTheDiscardingClosure(t *testing.T) {
+func TestDiscardedObligationEndsUnderTheDiscardingClosure(t *testing.T) {
 	// Not parallel: parking the recovery drivers is process-wide.
 	release := testDiscardParkAll(t)
 	w := testPeerWorldAtPubRec(t, "f105-peer-discarded")
@@ -1038,7 +1038,7 @@ func testPeerSessionRecordGone(t *testing.T, asm *mqttAccountSessionManager, idH
 //
 // Mutations (outcomes recorded in the crosswalk): WDX-1 (B's expiry skips its discard), WDX-2
 // (the expiry teardown raw-deletes the PUBREL consumer), WD-1 and WD-2 run against this arm too.
-func TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure(t *testing.T) {
+func TestExpiredObligationEndsUnderThePeersDiscardingClosure(t *testing.T) {
 	// Not parallel: parking the recovery drivers is process-wide. Both halves are installed before
 	// either manager starts; the per-session expiry timer is not one of them.
 	release := testDiscardParkAll(t)
@@ -1149,7 +1149,7 @@ func TestF105ExpiredObligationEndsUnderThePeersDiscardingClosure(t *testing.T) {
 // the client's Clean Start = false CONNECT to B must be answered Session Present = false with a
 // new generation and no PUBREL from the expired one. The CONNECT, not the expiry pass, is what
 // refuses the resume here.
-func TestF105AnOverdueSessionIsNotResumedOnThePeer(t *testing.T) {
+func TestAnOverdueSessionIsNotResumedOnThePeer(t *testing.T) {
 	const cid = "f105-peer-overdue"
 	testDiscardParkAll(t)
 	park := func(idHash string) bool { return idHash != getHash(cid) }
@@ -1190,7 +1190,7 @@ func TestF105AnOverdueSessionIsNotResumedOnThePeer(t *testing.T) {
 // The delete observer's own negative control: a delete enqueued through a broker's send queue
 // WITHOUT passing jsa.deleteConsumer, with BOTH its publication and the observer's callback
 // delayed, is still caught by the per-queue marker barrier and the target comparison.
-func TestF105TheDeleteObserverCatchesADeleteThatBypassedTheSeam(t *testing.T) {
+func TestTheDeleteObserverCatchesADeleteThatBypassedTheSeam(t *testing.T) {
 	// Not parallel: the publication seam is process-wide.
 	const bypass = testConsumerDeletePrefix + mqttOutStreamName + ".f105_bypass_durable"
 	delayPublish := func(subject string) {

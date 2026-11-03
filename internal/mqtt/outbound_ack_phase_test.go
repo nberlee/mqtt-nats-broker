@@ -19,14 +19,14 @@ import (
 	"testing"
 )
 
-// TestF105TheAckPhaseIsDerivedFromThePacket is the contract-3 correction.
+// TestTheAckPhaseIsDerivedFromThePacket is the contract-3 correction.
 //
 // The boundary downstream checks that a proposed move is LEGAL from where the exchange stands.
 // That check is real and it is not this property: a fabricated phase can be perfectly legal and
 // still answer the wrong protocol event — a caller that read a PUBACK and supplied a
 // PUBREC-shaped phase would record a transfer of ownership the client never made, whenever that
 // move happened to be legal.
-func TestF105TheAckPhaseIsDerivedFromThePacket(t *testing.T) {
+func TestTheAckPhaseIsDerivedFromThePacket(t *testing.T) {
 	for name, tc := range map[string]struct {
 		in   mqttAckArrival
 		qos  byte
@@ -80,13 +80,13 @@ func TestF105TheAckPhaseIsDerivedFromThePacket(t *testing.T) {
 	}
 }
 
-// TestF105AnAckOfTheWrongKindAnswersADifferentObligation is the mismatch the derivation is the
+// TestAnAckOfTheWrongKindAnswersADifferentObligation is the mismatch the derivation is the
 // only place that can see.
 //
 // A PUBACK answers a QoS 1 delivery and a PUBREC a QoS 2 one. The packet has no QoS field, so
 // the pair is what makes a mismatch detectable at all — and a mismatch is not a badly-placed
 // move, it is an answer to a different obligation.
-func TestF105AnAckOfTheWrongKindAnswersADifferentObligation(t *testing.T) {
+func TestAnAckOfTheWrongKindAnswersADifferentObligation(t *testing.T) {
 	for name, tc := range map[string]struct {
 		in  mqttAckArrival
 		qos byte

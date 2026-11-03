@@ -31,15 +31,15 @@ import (
 // whole batch, and that a committed receipt survives being superseded. A fixture that
 // mocked the store would be asserting its own mock.
 
-// testF105Env is a live account session manager plus the exact identities its records are
+// testOutboundEnv is a live account session manager plus the exact identities its records are
 // attributed by.
-type testF105Env struct {
+type testOutboundEnv struct {
 	asm   *mqttAccountSessionManager
 	id    string
 	epoch string
 }
 
-func testF105NewEnv(t *testing.T, clientID string) (*testF105Env, func()) {
+func testNewEnv(t *testing.T, clientID string) (*testOutboundEnv, func()) {
 	t.Helper()
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -63,18 +63,18 @@ func testF105NewEnv(t *testing.T, clientID string) (*testF105Env, func()) {
 	asm.testQoS2SweepSeed = func(firstSeq, _ uint64) uint64 { return firstSeq }
 	asm.mu.Unlock()
 
-	testF105ClearMintedAuthority(t, asm, clientID, func() {
+	testClearMintedAuthority(t, asm, clientID, func() {
 		c.Close()
 		testMQTTShutdownServer(s)
 	})
 
-	return &testF105Env{asm: asm, id: clientID, epoch: epoch}, func() {
+	return &testOutboundEnv{asm: asm, id: clientID, epoch: epoch}, func() {
 		c.Close()
 		testMQTTShutdownServer(s)
 	}
 }
 
-// testF105ClearMintedAuthority returns a freshly-connected client to the PRE-AUTHORITY
+// testClearMintedAuthority returns a freshly-connected client to the PRE-AUTHORITY
 // substrate.
 //
 // A production CONNECT now mints a SERVING outbound authority (issue #107 rows 1-9), but the
@@ -89,7 +89,7 @@ func testF105NewEnv(t *testing.T, clientID string) (*testF105Env, func()) {
 //
 // onFatal runs the caller's own teardown before t.Fatalf, since a leaked server outlives the
 // test binary otherwise.
-func testF105ClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, clientID string, onFatal func()) {
+func testClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, clientID string, onFatal func()) {
 	t.Helper()
 	if err := asm.jsa.purgeStream(mqttInflightStreamName, mqttOutboundAuthoritySubject(getHash(clientID)), 0, false); err != nil {
 		if onFatal != nil {
@@ -105,8 +105,8 @@ func testF105ClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, 
 // installs one outright: a claim serves nothing until its metadata half commits. Its
 // OWNERSHIP IS ITS OWN IDENTITY — there is no predecessor whose ownership it could inherit,
 // so the transition that claims the client is the transition that owns it.
-func (e *testF105Env) firstReservation(txn string) *mqttAuthorityTransition {
-	return testF105ReserveCreation(e, nil, 0, txn, testF105Gen, "tenure-"+txn, "intent-"+txn)
+func (e *testOutboundEnv) firstReservation(txn string) *mqttAuthorityTransition {
+	return testReserveCreation(e, nil, 0, txn, testGen, "tenure-"+txn, "intent-"+txn)
 }
 
 // bootstrap installs a SERVING authority the only way one can now be installed: a
@@ -120,7 +120,7 @@ func (e *testF105Env) firstReservation(txn string) *mqttAuthorityTransition {
 //
 // It returns the serving authority and the sequence it stands at, which is what a follow-on
 // transition CASes against.
-func (e *testF105Env) bootstrap(t *testing.T, txn string) (*mqttOutboundAuthority, uint64) {
+func (e *testOutboundEnv) bootstrap(t *testing.T, txn string) (*mqttOutboundAuthority, uint64) {
 	t.Helper()
 	tr, seq := e.bootstrapTr(t, txn)
 	return tr.Auth, seq
@@ -132,16 +132,16 @@ func (e *testF105Env) bootstrap(t *testing.T, txn string) (*mqttOutboundAuthorit
 // It composes at the TRANSITION layer rather than through the operation surface, because
 // those fixtures are testing the transition layer: an operation returns a sequence, which is
 // all a converted caller needs and not enough to ask what an attempt resolved to.
-func (e *testF105Env) bootstrapTr(t *testing.T, txn string) (*mqttAuthorityTransition, uint64) {
+func (e *testOutboundEnv) bootstrapTr(t *testing.T, txn string) (*mqttAuthorityTransition, uint64) {
 	t.Helper()
-	return e.claimTr(t, nil, 0, txn, testF105Gen, "tenure-"+txn)
+	return e.claimTr(t, nil, 0, txn, testGen, "tenure-"+txn)
 }
 
 // claim is the whole route to a serving authority, over an absent predecessor or a CLOSED
 // one. The post-closure case is the SAME three steps as the first claim, which is what
 // deleting the readmission kind established: there is no cheaper way in on a second attempt
 // than on the first.
-func (e *testF105Env) claim(t *testing.T, prev *mqttOutboundAuthority, prevSeq uint64,
+func (e *testOutboundEnv) claim(t *testing.T, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn, gen, tenure string) (*mqttOutboundAuthority, uint64) {
 
 	t.Helper()
@@ -171,32 +171,32 @@ func (e *testF105Env) claim(t *testing.T, prev *mqttOutboundAuthority, prevSeq u
 	return fl.rec, fin.Seq
 }
 
-func (e *testF105Env) claimTr(t *testing.T, prev *mqttOutboundAuthority, prevSeq uint64,
+func (e *testOutboundEnv) claimTr(t *testing.T, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn, gen, tenure string) (*mqttAuthorityTransition, uint64) {
 
 	t.Helper()
-	res := testF105ReserveCreation(e, prev, prevSeq, txn, gen, tenure, "intent-"+txn)
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, res))
+	res := testReserveCreation(e, prev, prevSeq, txn, gen, tenure, "intent-"+txn)
+	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, res))
 	if err != nil {
 		t.Fatalf("the reservation %q was refused: %v", txn, err)
 	}
 	e.commitCreation(t, res.Auth.Creation)
-	fin := testF105FinalizeCreation(e, res.Auth, resSeq, txn+"-fin")
-	finSeq, ferr := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, fin))
+	fin := testFinalizeCreation(e, res.Auth, resSeq, txn+"-fin")
+	finSeq, ferr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, fin))
 	if ferr != nil {
 		t.Fatalf("finalizing the reservation %q was refused: %v", txn, ferr)
 	}
 	return fin, finSeq
 }
 
-// testF105AdmitNothing is an admission that carries no obligation of its own.
+// testAdmitNothing is an admission that carries no obligation of its own.
 //
 // It exists because several fixtures need a transition that ADVANCES the authority's
 // revision under the standing tenure and nothing else — to be resolved, to be superseded, or
 // to carry one hand-built member. The kind is the admission kind because that is what a
 // revision-advancing transition under a serving tenure IS; the obligations it would normally
 // carry are the caller's to add.
-func testF105AdmitNothing(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64,
+func testAdmitNothing(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn string) *mqttAuthorityTransition {
 
 	rev := prev.Rev + 1
@@ -214,12 +214,12 @@ func testF105AdmitNothing(e *testF105Env, prev *mqttOutboundAuthority, prevSeq u
 	}
 }
 
-// testF105Closure closes the generation a serving authority stands at, permanently.
+// testClosure closes the generation a serving authority stands at, permanently.
 //
 // The revision is derived from the predecessor rather than written as a literal, because the
 // route to a serving authority is three transitions rather than one and a fixture that
 // counted them would break every time the bootstrap gained a step.
-func testF105Closure(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64,
+func testClosure(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn string) *mqttAuthorityTransition {
 
 	rev := prev.Rev + 1
@@ -235,7 +235,7 @@ func testF105Closure(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64
 	if eerr != nil {
 		// A fixture that cannot compose its own enrolment would otherwise fail later, at the
 		// boundary, with a message about the rule rather than about the fixture.
-		panic("testF105Closure: composing the enrolment: " + eerr.Error())
+		panic("testClosure: composing the enrolment: " + eerr.Error())
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
@@ -258,26 +258,26 @@ func testF105Closure(e *testF105Env, prev *mqttOutboundAuthority, prevSeq uint64
 
 // commitCreation commits the metadata half of a creation proposal, which is what licenses
 // the finalization that follows it.
-func (e *testF105Env) commitCreation(t *testing.T, c *mqttCreationIntent) {
+func (e *testOutboundEnv) commitCreation(t *testing.T, c *mqttCreationIntent) {
 	t.Helper()
 	p, err := mqttProposalFromCreation(c)
 	if err != nil {
 		t.Fatalf("the reservation's proposal is uninterpretable: %v", err)
 	}
-	f := testF105FreezeProposal(t, e, p, testF105RecordSeq(t, e))
+	f := testFreezeProposal(t, e, p, testRecordSeq(t, e))
 	if _, cerr := e.asm.jsa.commitMetadataAttempt(f); cerr != nil {
 		t.Fatalf("the creation's metadata half was refused: %v", cerr)
 	}
 }
 
-// TestF105AbortAndCommitContendForOneSubject is the ambiguity protocol, against the store.
+// TestAbortAndCommitContendForOneSubject is the ambiguity protocol, against the store.
 //
 // The whole design rests on a claim about JetStream: a create-only member inside an atomic
 // batch and a standalone create-only publish to the same subject are mutually exclusive, and
 // the loser's batch is rejected in its entirety. If that were false, an abort could stand
 // beside a committed transition and "never landed" would be a lie.
-func TestF105AbortAndCommitContendForOneSubject(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-contend")
+func TestAbortAndCommitContendForOneSubject(t *testing.T) {
+	e, done := testNewEnv(t, "f105-contend")
 	defer done()
 
 	// ABORT FIRST: the commit that follows must be refused, and nothing it carried may
@@ -286,7 +286,7 @@ func TestF105AbortAndCommitContendForOneSubject(t *testing.T) {
 	if err := e.asm.jsa.abortTransition(tr.Attempt); err != nil {
 		t.Fatalf("the abort was refused: %v", err)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr)); err == nil {
 		t.Fatalf("a transition committed after its own attempt was positively aborted")
 	}
 	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.status != mqttOutboundAbsent {
@@ -300,7 +300,7 @@ func TestF105AbortAndCommitContendForOneSubject(t *testing.T) {
 	// COMMIT FIRST: the abort that follows must fail, and the receipt must still say
 	// COMMITTED.
 	tr2 := e.firstReservation("txn-commit-first")
-	seq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr2))
+	seq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr2))
 	if err != nil {
 		t.Fatalf("the transition was refused: %v", err)
 	}
@@ -328,13 +328,13 @@ func TestF105AbortAndCommitContendForOneSubject(t *testing.T) {
 	}
 }
 
-// TestF105CommittedOutcomeSurvivesSupersession pins the distinction a lost acknowledgement
+// TestCommittedOutcomeSurvivesSupersession pins the distinction a lost acknowledgement
 // depends on: an attempt that landed and was later superseded is NOT an attempt that never
 // landed. Its exchange mutations are real and its obligations exist; only the ownership it
 // installed has moved on. Collapsing the two would strand everything the first transition
 // created.
-func TestF105CommittedOutcomeSurvivesSupersession(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-supersede")
+func TestCommittedOutcomeSurvivesSupersession(t *testing.T) {
+	e, done := testNewEnv(t, "f105-supersede")
 	defer done()
 
 	first, seq := e.bootstrapTr(t, "txn-1")
@@ -348,15 +348,15 @@ func TestF105CommittedOutcomeSurvivesSupersession(t *testing.T) {
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-2", Op: "op-2",
 			Kind: mqttTransitionAdmitExchange, PrevTxn: "txn-1", Rev: first.Auth.Rev + 1,
-			Gen: testF105Gen, Tenure: first.Auth.Tenure, OwnerTxn: "txn-1",
+			Gen: testGen, Tenure: first.Auth.Tenure, OwnerTxn: "txn-1",
 		},
 		Prev: first.Auth, PrevSeq: seq,
 		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Tenure: first.Auth.Tenure,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: first.Auth.Tenure,
 			State: mqttAuthorityServing, Rev: first.Auth.Rev + 1, Txn: "txn-2", OwnerTxn: "txn-1",
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, second)); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, second)); err != nil {
 		t.Fatalf("the second transition was refused: %v", err)
 	}
 
@@ -375,16 +375,16 @@ func TestF105CommittedOutcomeSurvivesSupersession(t *testing.T) {
 	}
 }
 
-// TestF105ResolutionRefusesAReceiptForAnotherMutation pins the digest check. A receipt found
+// TestResolutionRefusesAReceiptForAnotherMutation pins the digest check. A receipt found
 // at a transition id proves only that SOME batch under that id committed; if the caller's
 // assembled mutation differs, that is a contradiction and must not be reported as its
 // answer.
-func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-digest")
+func TestResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-digest")
 	defer done()
 
 	auth, seq := e.bootstrap(t, "txn-1")
-	tr := testF105AdmitNothing(e, auth, seq, "txn-d")
+	tr := testAdmitNothing(e, auth, seq, "txn-d")
 	// An invalid body would make this test pass through the shape validator rather than
 	// through the digest, which is not the property being established.
 	//
@@ -394,7 +394,7 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	// digest.
 	xchBody := func(nonce string) []byte {
 		b, merr := json.Marshal(&mqttOutboundExchange{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: nonce,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: nonce,
 			PI: 7, QoS: 2, Phase: mqttExchangePublish,
 			AdmitTxn: "txn-d", Tenure: auth.Tenure,
 		})
@@ -407,16 +407,16 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	markerA, markerB := xchBody(nonceA), xchBody(nonceB)
 	slots := func(nonce string) []mqttTransitionMember {
 		return testSlotMembersFor(t, &e.asm.jsa, auth, seq, &mqttOutboundExchange{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: nonce,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: nonce,
 			PI: 7, QoS: 2, Phase: mqttExchangePublish, AdmitTxn: "txn-d", Tenure: auth.Tenure,
 		})
 	}
-	tr.Extra = append(testF105CoverExchanges(t, e, testF105Gen, []mqttTransitionMember{{
-		subj:   mqttExchangeSubject(getHash(e.id), testF105Gen, nonceA),
+	tr.Extra = append(testCoverExchanges(t, e, testGen, []mqttTransitionMember{{
+		subj:   mqttExchangeSubject(getHash(e.id), testGen, nonceA),
 		expect: 0,
 		body:   markerA,
 	}}), slots(nonceA)...)
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr)); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr)); err != nil {
 		t.Fatalf("the transition was refused: %v", err)
 	}
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionLanded {
@@ -427,7 +427,7 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	// the outcome still matches; only the member's body differs.
 	other := *tr
 	other.Extra = append([]mqttTransitionMember{{
-		subj:   mqttExchangeSubject(getHash(e.id), testF105Gen, nonceB),
+		subj:   mqttExchangeSubject(getHash(e.id), testGen, nonceB),
 		expect: 0,
 		body:   markerB,
 	}}, slots(nonceB)...)
@@ -436,26 +436,26 @@ func TestF105ResolutionRefusesAReceiptForAnotherMutation(t *testing.T) {
 	}
 }
 
-// TestF105ClosureLoadsBackAndAbsenceIsNotOpen pins both halves of the closure contract: a
+// TestClosureLoadsBackAndAbsenceIsNotOpen pins both halves of the closure contract: a
 // close-admission transition writes the permanent record with its authority in one batch,
 // and a generation with no closure record is NOT thereby established as open — open
 // admission requires the authority's positive state.
-func TestF105ClosureLoadsBackAndAbsenceIsNotOpen(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-closure")
+func TestClosureLoadsBackAndAbsenceIsNotOpen(t *testing.T) {
+	e, done := testNewEnv(t, "f105-closure")
 	defer done()
 
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen); st != mqttOutboundAbsent {
+	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen); st != mqttOutboundAbsent {
 		t.Fatalf("an unclosed generation reports closure status %v, want ABSENT", st)
 	}
 
 	auth, seq := e.bootstrap(t, "txn-1")
 
-	closing := testF105Closure(e, auth, seq, "txn-close")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); err != nil {
+	closing := testClosure(e, auth, seq, "txn-close")
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("the close-admission transition was refused: %v", err)
 	}
 
-	c, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen)
+	c, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen)
 	if st != mqttOutboundValid {
 		t.Fatalf("the permanent closure does not load back (status %v)", st)
 	}
@@ -463,7 +463,7 @@ func TestF105ClosureLoadsBackAndAbsenceIsNotOpen(t *testing.T) {
 		t.Fatalf("the closure names transition %q, want txn-close", c.Txn)
 	}
 	// Another generation is still absent, and absence establishes nothing about it.
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen2); st != mqttOutboundAbsent {
+	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen2); st != mqttOutboundAbsent {
 		t.Fatalf("an unrelated generation reports closure status %v, want ABSENT", st)
 	}
 
@@ -476,25 +476,25 @@ func TestF105ClosureLoadsBackAndAbsenceIsNotOpen(t *testing.T) {
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-late", Op: "op-late",
 			Kind: mqttTransitionAdmitExchange, PrevTxn: "txn-1", Rev: al.rec.Rev + 1,
-			Gen: testF105Gen, Tenure: auth.Tenure, OwnerTxn: "txn-1",
+			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: "txn-1",
 		},
 		Prev: al.rec, PrevSeq: al.seq,
 		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Tenure: auth.Tenure,
+			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
 			State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: "txn-late", OwnerTxn: "txn-1",
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, admit)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, admit)); err == nil {
 		t.Fatalf("an exchange was admitted over a CLOSED authority")
 	}
 }
 
-// TestF105UnresolvedIsNotNeverLanded pins the honest answer. An attempt whose outcome has
+// TestUnresolvedIsNotNeverLanded pins the honest answer. An attempt whose outcome has
 // not been written is UNRESOLVED, never "never landed": the batch may still be in flight and
 // may still commit, and a caller that treated absence as a negative fact would be the
 // release-on-absence shape under another name.
-func TestF105UnresolvedIsNotNeverLanded(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-unresolved")
+func TestUnresolvedIsNotNeverLanded(t *testing.T) {
+	e, done := testNewEnv(t, "f105-unresolved")
 	defer done()
 
 	tr := e.firstReservation("txn-never-sent")
@@ -510,31 +510,31 @@ func TestF105UnresolvedIsNotNeverLanded(t *testing.T) {
 	}
 }
 
-// TestF105AnUnreadableOutcomeIsNotNeverLanded is the INDETERMINATE half of the pin above
+// TestAnUnreadableOutcomeIsNotNeverLanded is the INDETERMINATE half of the pin above
 // (issue #107 WP-F W2, row M10). A transition X that COMMITTED, and was then superseded by two later
 // revisions, has an outcome that cannot be read for a reason other than its absence. The read
 // failed, so nothing was established: X is UNRESOLVED from its handle, never "never landed" -
 // a caller that took the unreadable receipt as an abort would re-issue an obligation X already
 // created. Mutation (M10): the classifier answers NeverLanded for an indeterminate outcome read.
-func TestF105AnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-unreadable-outcome")
+func TestAnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
+	e, done := testNewEnv(t, "f105-unreadable-outcome")
 	defer done()
 
 	base, baseSeq := e.bootstrap(t, "txn-1")
-	x := testF105AdmitNothing(e, base, baseSeq, "txn-x")
+	x := testAdmitNothing(e, base, baseSeq, "txn-x")
 	h, err := mqttNewTransitionHandle(x)
 	if err != nil {
 		t.Fatalf("freezing X's handle failed: %v", err)
 	}
-	prevSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, x))
+	prevSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, x))
 	if err != nil {
 		t.Fatalf("X was refused: %v", err)
 	}
 	prevAuth := x.Auth
 	// TWO MORE AUTHORITY REVISIONS land over X.
 	for _, txn := range []string{"txn-x2", "txn-x3"} {
-		next := testF105AdmitNothing(e, prevAuth, prevSeq, txn)
-		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, next)); err != nil {
+		next := testAdmitNothing(e, prevAuth, prevSeq, txn)
+		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, next)); err != nil {
 			t.Fatalf("successor %s was refused: %v", txn, err)
 		}
 		prevAuth = next.Auth
@@ -573,15 +573,15 @@ func TestF105AnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
 	}
 }
 
-// TestF105CancelledPreparationReturnsToServing pins the exit a preparation needs when its
+// TestCancelledPreparationReturnsToServing pins the exit a preparation needs when its
 // metadata half is positively aborted.
 //
 // Without a cancellation the state machine has no move: admission and preparation both
 // require SERVING, finalization requires the proposed ownership, and closing admission would
 // end a session nobody displaced. A broker would have to delete the authority or wait
 // forever, and deleting it is the shape this whole item exists to remove.
-func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-cancel")
+func TestCancelledPreparationReturnsToServing(t *testing.T) {
+	e, done := testNewEnv(t, "f105-cancel")
 	defer done()
 
 	auth, seq := e.bootstrap(t, "txn-1")
@@ -589,7 +589,7 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 	intent := &mqttHandoffIntent{
 		ID: "intent-1", PrevGen: auth.Gen, PrevTenure: auth.Tenure,
 		PrevOwnerTxn: auth.OwnerTxn, PrevSessWID: "wid-0", PrevSessSeq: 12,
-		Tenure: "tenure-next", Gen: testF105Gen2, CleanReq: true,
+		Tenure: "tenure-next", Gen: testGen2, CleanReq: true,
 		Retire: &mqttRetirementRequest{
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
@@ -608,7 +608,7 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 			OwnerTxn: auth.OwnerTxn, Intent: intent,
 		},
 	}
-	prepSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, prep))
+	prepSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, prep))
 	if err != nil {
 		t.Fatalf("the preparation was refused: %v", err)
 	}
@@ -626,7 +626,7 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 			State: mqttAuthorityServing, Rev: auth.Rev + 2, Txn: "txn-frozen", OwnerTxn: auth.OwnerTxn,
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, frozen)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, frozen)); err == nil {
 		t.Fatalf("an exchange was admitted while the authority was preparing")
 	}
 
@@ -647,7 +647,7 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 			State: mqttAuthorityServing, Rev: auth.Rev + 2, Txn: "txn-cancel-foreign", OwnerTxn: auth.OwnerTxn,
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, foreign)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, foreign)); err == nil {
 		t.Fatalf("a cancellation naming another intent was sent")
 	}
 
@@ -673,13 +673,13 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 	if herr != nil {
 		t.Fatalf("viewing the pending handoff as a proposal failed: %v", herr)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, cancel)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, cancel)); err == nil {
 		t.Fatalf("a cancellation was committed while its metadata half was unresolved")
 	}
 	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, hp); v != mqttMetadataAborted {
 		t.Fatalf("settling the pending handoff returned %v, want ABORTED", v)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, cancel)); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, cancel)); err != nil {
 		t.Fatalf("the cancellation was refused: %v", err)
 	}
 
@@ -700,7 +700,7 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 
 }
 
-// TestF105ClosedAuthorityCanClaimAFreshGeneration pins the other missing exit. Closure is
+// TestClosedAuthorityCanClaimAFreshGeneration pins the other missing exit. Closure is
 // permanent and per GENERATION while the authority is per CLIENT, so without a route out a
 // client whose authority reached CLOSED could never be served again — a first claim requires
 // revision 1 and no predecessor, and finalization requires a standing proposal.
@@ -709,68 +709,68 @@ func TestF105CancelledPreparationReturnsToServing(t *testing.T) {
 // claim: there is no kind that installs a serving authority over a closed one, because such a
 // kind would be a second bootstrap with no metadata half — reachable exactly when the first
 // creation was abandoned, which is when it matters most.
-func TestF105ClosedAuthorityCanClaimAFreshGeneration(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-reclaim")
+func TestClosedAuthorityCanClaimAFreshGeneration(t *testing.T) {
+	e, done := testNewEnv(t, "f105-reclaim")
 	defer done()
 
 	auth, seq := e.bootstrap(t, "txn-1")
-	closing := testF105Closure(e, auth, seq, "txn-close")
-	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing))
+	closing := testClosure(e, auth, seq, "txn-close")
+	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if err != nil {
 		t.Fatalf("the close-admission was refused: %v", err)
 	}
 
 	// The claim must name a DIFFERENT generation: it reserves a successor beside the
 	// permanent closure and never reopens the closed one.
-	reuse := testF105ReserveCreation(e, closing.Auth, closeSeq, "txn-reuse", testF105Gen,
+	reuse := testReserveCreation(e, closing.Auth, closeSeq, "txn-reuse", testGen,
 		"tenure-reuse", "intent-reuse")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reuse)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reuse)); err == nil {
 		t.Fatalf("a post-closure claim reused the closed generation")
 	}
 
 	// AND IT MAY NOT ARRIVE SERVING. The reservation is the only shape a claim takes, so a
 	// caller cannot skip the metadata half by describing its successor as already servable.
-	serving := testF105ReserveCreation(e, closing.Auth, closeSeq, "txn-serving", testF105Gen2,
+	serving := testReserveCreation(e, closing.Auth, closeSeq, "txn-serving", testGen2,
 		"tenure-serving", "intent-serving")
 	serving.Auth.State, serving.Auth.Creation = mqttAuthorityServing, nil
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, serving)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, serving)); err == nil {
 		t.Fatalf("a post-closure claim installed a SERVING authority in one step")
 	}
 
-	e.claim(t, closing.Auth, closeSeq, "txn-fresh", testF105Gen2, "tenure-fresh")
+	e.claim(t, closing.Auth, closeSeq, "txn-fresh", testGen2, "tenure-fresh")
 
 	// THE OLD CLOSURE STANDS. The claim reserves a successor; it does not reopen what was
 	// closed, and a reader asking about the old generation must still be told it is closed.
-	c, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen)
+	c, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen)
 	if st != mqttOutboundValid || c.Txn != "txn-close" {
 		t.Fatalf("the old generation's permanent closure did not survive re-admission (status %v)", st)
 	}
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen2); st != mqttOutboundAbsent {
+	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen2); st != mqttOutboundAbsent {
 		t.Fatalf("the fresh generation reports closure status %v, want ABSENT", st)
 	}
 }
 
-// TestF105SweepSkipsArbitrationRecords pins that the orphan sweep neither sweeps nor
+// TestSweepSkipsArbitrationRecords pins that the orphan sweep neither sweeps nor
 // mis-logs issue #107's permanent records, and does not spend its bounded budget on them.
 //
 // They share $MQTT_inflight with the registers because a batch is per stream, so the sweep
 // walks straight over them. Before this they were retained as "unattributable registers":
 // true in the sense that nothing could attribute them to a register, false as a description,
 // and each one consumed a record from a pass whose whole point is to be bounded.
-func TestF105SweepSkipsArbitrationRecords(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-sweep")
+func TestSweepSkipsArbitrationRecords(t *testing.T) {
+	e, done := testNewEnv(t, "f105-sweep")
 	defer done()
 
 	// Land an authority, a permanent outcome and a permanent closure.
 	auth, seq := e.bootstrap(t, "txn-1")
-	closing := testF105Closure(e, auth, seq, "txn-close")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, closing)); err != nil {
+	closing := testClosure(e, auth, seq, "txn-close")
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("the close-admission was refused: %v", err)
 	}
 
 	// A register behind them, so the pass has something real to find.
-	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, 9)
-	if _, err := e.asm.jsa.storeInflightCAS(regSubj, 0, testF105SweepRegister(t, e)); err != nil {
+	regSubj := mqttInflightSubject(getHash(e.id), testGen, 9)
+	if _, err := e.asm.jsa.storeInflightCAS(regSubj, 0, testSweepRegister(t, e)); err != nil {
 		t.Fatalf("planting the register behind the arbitration records failed: %v", err)
 	}
 
@@ -788,12 +788,12 @@ func TestF105SweepSkipsArbitrationRecords(t *testing.T) {
 		t.Fatalf("the candidate collection failed: %v", err)
 	}
 	for _, c := range cands {
-		if mqttIsF105Subject(c.name.subject) {
+		if mqttIsOutboundRecordSubject(c.name.subject) {
 			t.Fatalf("the sweep collected the arbitration record %q as a register candidate", c.name.subject)
 		}
 	}
 	for _, m := range markers {
-		if mqttIsF105Subject(m.name.subject) {
+		if mqttIsOutboundRecordSubject(m.name.subject) {
 			t.Fatalf("the sweep collected the arbitration record %q as a marker candidate", m.name.subject)
 		}
 	}
@@ -811,7 +811,7 @@ func TestF105SweepSkipsArbitrationRecords(t *testing.T) {
 	msgs := append([]string(nil), log.AllMsgs...)
 	log.Unlock()
 	for _, m := range msgs {
-		if strings.Contains(m, "unattributable in-flight register") && strings.Contains(m, mqttF105ClassTk) {
+		if strings.Contains(m, "unattributable in-flight register") && strings.Contains(m, mqttOutboundRecordClassTk) {
 			t.Fatalf("the sweep warned that an arbitration record is an unattributable "+
 				"in-flight register: %q", m)
 		}
@@ -822,7 +822,7 @@ func TestF105SweepSkipsArbitrationRecords(t *testing.T) {
 	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.status != mqttOutboundValid {
 		t.Fatalf("the authority did not survive the sweep (status %v)", al.status)
 	}
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testF105Gen); st != mqttOutboundValid {
+	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen); st != mqttOutboundValid {
 		t.Fatalf("the permanent closure did not survive the sweep (status %v)", st)
 	}
 	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, "txn-1"); st != mqttOutboundValid {
@@ -830,10 +830,10 @@ func TestF105SweepSkipsArbitrationRecords(t *testing.T) {
 	}
 }
 
-// testF105SweepRegister is a minimal supported register body for the sweep fixture. It is
+// testSweepRegister is a minimal supported register body for the sweep fixture. It is
 // built through the same shape the decode API accepts, so the plant cannot pass for a
 // reason the production writer would not.
-func testF105SweepRegister(t *testing.T, e *testF105Env) *mqttInflightRecord {
+func testSweepRegister(t *testing.T, e *testOutboundEnv) *mqttInflightRecord {
 	t.Helper()
 	return freshRegisterLineage(&mqttInflightRecord{
 		State: mqttInflightPublish, PI: 9, Dur: "$MQTT_sweep", Seq: 1, QoS: 1,
@@ -841,7 +841,7 @@ func testF105SweepRegister(t *testing.T, e *testF105Env) *mqttInflightRecord {
 	})
 }
 
-// TestF105SweepStaysBoundedOverArbitrationRecords pins that the skip charges the record
+// TestSweepStaysBoundedOverArbitrationRecords pins that the skip charges the record
 // budget.
 //
 // An earlier version of the skip refunded it, on the reasoning that a client's permanent
@@ -851,8 +851,8 @@ func testF105SweepRegister(t *testing.T, e *testF105Env) *mqttInflightRecord {
 // The cost is real — a client with many outcomes reaches its registers over more passes —
 // and it is the correct trade, because a bounded pass that makes progress beats an
 // unbounded one that must finish.
-func TestF105SweepStaysBoundedOverArbitrationRecords(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-bounded")
+func TestSweepStaysBoundedOverArbitrationRecords(t *testing.T) {
+	e, done := testNewEnv(t, "f105-bounded")
 	defer done()
 
 	// Several transitions, each leaving a permanent outcome ahead of the register.
@@ -860,15 +860,15 @@ func TestF105SweepStaysBoundedOverArbitrationRecords(t *testing.T) {
 	var err error
 	for i := 2; i <= 5; i++ {
 		txn := "txn-" + string(rune('0'+i))
-		next := testF105AdmitNothing(e, prevAuth, seq, txn)
-		if seq, err = e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, next)); err != nil {
+		next := testAdmitNothing(e, prevAuth, seq, txn)
+		if seq, err = e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, next)); err != nil {
 			t.Fatalf("transition %s was refused: %v", txn, err)
 		}
 		prevAuth = next.Auth
 	}
 
-	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, 9)
-	if _, err := e.asm.jsa.storeInflightCAS(regSubj, 0, testF105SweepRegister(t, e)); err != nil {
+	regSubj := mqttInflightSubject(getHash(e.id), testGen, 9)
+	if _, err := e.asm.jsa.storeInflightCAS(regSubj, 0, testSweepRegister(t, e)); err != nil {
 		t.Fatalf("planting the register behind the arbitration records failed: %v", err)
 	}
 
@@ -890,7 +890,7 @@ func TestF105SweepStaysBoundedOverArbitrationRecords(t *testing.T) {
 	}
 }
 
-// TestF105HandleClassifiesWithoutTheOriginalInputs pins the classification boundary Codex's
+// TestHandleClassifiesWithoutTheOriginalInputs pins the classification boundary Codex's
 // consult 6 set.
 //
 // resolveTransition recomputes the digest from the assembled transition, so it serves a
@@ -902,17 +902,17 @@ func TestF105SweepStaysBoundedOverArbitrationRecords(t *testing.T) {
 //
 // The test DISCARDS the original transition before resolving, which is the whole point: if
 // the handle needed those bytes it would be the same API under another name.
-func TestF105HandleClassifiesWithoutTheOriginalInputs(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-handle")
+func TestHandleClassifiesWithoutTheOriginalInputs(t *testing.T) {
+	e, done := testNewEnv(t, "f105-handle")
 	defer done()
 
 	base, baseSeq := e.bootstrap(t, "txn-1")
-	first := testF105AdmitNothing(e, base, baseSeq, "txn-h")
+	first := testAdmitNothing(e, base, baseSeq, "txn-h")
 	h, err := mqttNewTransitionHandle(first)
 	if err != nil {
 		t.Fatalf("freezing the handle failed: %v", err)
 	}
-	seq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, first))
+	seq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, first))
 	if err != nil {
 		t.Fatalf("the transition under the handle was refused: %v", err)
 	}
@@ -928,8 +928,8 @@ func TestF105HandleClassifiesWithoutTheOriginalInputs(t *testing.T) {
 	// MULTIPLE successors, each overwriting the authority the original mutation wrote.
 	for i := 2; i <= 4; i++ {
 		txn := "txn-" + string(rune('0'+i))
-		next := testF105AdmitNothing(e, prevAuth, prevSeq, txn)
-		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, next)); err != nil {
+		next := testAdmitNothing(e, prevAuth, prevSeq, txn)
+		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, next)); err != nil {
 			t.Fatalf("successor %s was refused: %v", txn, err)
 		}
 		prevAuth = next.Auth
@@ -962,15 +962,15 @@ func TestF105HandleClassifiesWithoutTheOriginalInputs(t *testing.T) {
 	}
 }
 
-// TestF105HandleCannotBeBuiltFromAReceipt pins the provenance rule: the expected digest must
+// TestHandleCannotBeBuiltFromAReceipt pins the provenance rule: the expected digest must
 // never come from the outcome being checked.
 //
 // There is deliberately no constructor from an outcome, so this asserts the property
 // structurally — the only constructor takes the frozen transition, and its digest is
 // computed from the mutation rather than read from the store. A handle built from a receipt
 // would agree with every receipt, including one this broker never authored.
-func TestF105HandleCannotBeBuiltFromAReceipt(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-provenance")
+func TestHandleCannotBeBuiltFromAReceipt(t *testing.T) {
+	e, done := testNewEnv(t, "f105-provenance")
 	defer done()
 
 	tr := e.firstReservation("txn-1")
@@ -978,7 +978,7 @@ func TestF105HandleCannotBeBuiltFromAReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("freezing the handle failed: %v", err)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr)); err != nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr)); err != nil {
 		t.Fatalf("the transition was refused: %v", err)
 	}
 
@@ -994,7 +994,7 @@ func TestF105HandleCannotBeBuiltFromAReceipt(t *testing.T) {
 	// anything at all.
 	other := e.firstReservation("txn-1")
 	other.Extra = []mqttTransitionMember{{
-		subj:   mqttInflightMarkerSubject(getHash(e.id), testF105Gen, 4),
+		subj:   mqttInflightMarkerSubject(getHash(e.id), testGen, 4),
 		expect: 0,
 		body:   []byte(`{"nonce":"n-other"}`),
 	}}
@@ -1010,15 +1010,15 @@ func TestF105HandleCannotBeBuiltFromAReceipt(t *testing.T) {
 	}
 }
 
-// TestF105ExchangeAdmissionIsAtomicWithItsAuthority is the admission boundary, against the
+// TestExchangeAdmissionIsAtomicWithItsAuthority is the admission boundary, against the
 // store.
 //
 // An exchange installed without a winning authority transition would be an obligation
 // nothing authorized; an authority advanced without its exchange landing would be an
 // authority that admitted nothing. They commit together or not at all, and the test proves
 // the second half by losing the race deliberately.
-func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-admit")
+func TestExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
+	e, done := testNewEnv(t, "f105-admit")
 	defer done()
 	// A well-formed lineage: the acquisition installs its token on a register naming it (issue #107 row 2).
 	xchNonce := mqttNewInflightNonce()
@@ -1026,26 +1026,26 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	auth, seq := e.bootstrap(t, "txn-1")
 
 	xch := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: xchNonce,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: xchNonce,
 		PI: 7, QoS: 2, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-x1", Tenure: auth.Tenure,
 	}
-	tr, err := testF105AdmitExchangeTr(t, e, auth, seq, "txn-x1", "op-x1", xch)
+	tr, err := testAdmitExchangeTr(t, e, auth, seq, "txn-x1", "op-x1", xch)
 	if err != nil {
 		t.Fatalf("assembling the admission failed: %v", err)
 	}
-	xseq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, tr))
+	xseq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr))
 	if err != nil {
 		t.Fatalf("the exchange admission was refused: %v", err)
 	}
 
 	// Both halves landed.
 	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttExchangeSubject(getHash(e.id), testF105Gen, xchNonce))
+		mqttExchangeSubject(getHash(e.id), testGen, xchNonce))
 	if err != nil {
 		t.Fatalf("the admitted exchange does not load back: %v", err)
 	}
-	got, derr := mqttDecodeOutboundExchange(smsg.Data, e.id, e.epoch, testF105Gen, xchNonce)
+	got, derr := mqttDecodeOutboundExchange(smsg.Data, e.id, e.epoch, testGen, xchNonce)
 	if derr != nil {
 		t.Fatalf("the admitted exchange does not decode: %v", derr)
 	}
@@ -1062,19 +1062,19 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	// so only the authority's expectation stops it.
 	staleNonce := mqttNewInflightNonce()
 	stale := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: staleNonce,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: staleNonce,
 		PI: 8, QoS: 1, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-x2", Tenure: auth.Tenure,
 	}
-	str, err := testF105AdmitExchangeTr(t, e, auth, seq, "txn-x2", "op-x2", stale)
+	str, err := testAdmitExchangeTr(t, e, auth, seq, "txn-x2", "op-x2", stale)
 	if err != nil {
 		t.Fatalf("assembling the stale admission failed: %v", err)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, str)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, str)); err == nil {
 		t.Fatalf("an exchange was admitted against a superseded authority")
 	}
 	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttExchangeSubject(getHash(e.id), testF105Gen, staleNonce)); lerr == nil {
+		mqttExchangeSubject(getHash(e.id), testGen, staleNonce)); lerr == nil {
 		t.Fatalf("the refused admission still installed its exchange: the obligation exists " +
 			"and no authority transition admitted it")
 	}
@@ -1082,7 +1082,7 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	// An ACTION for that exchange, carrying the ORIGINAL connection binding.
 	bind := mqttBindConnection(99)
 	act := &mqttOutboundAction{
-		ID: e.id, Epoch: e.epoch, Gen: testF105Gen, Nonce: xchNonce, Acq: 1,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Nonce: xchNonce, Acq: 1,
 		Kind: mqttActionPublish, PI: 7,
 		Run: bind.run, Conn: bind.conn, Tenure: auth.Tenure, AcqTxn: "txn-a1",
 	}
@@ -1090,16 +1090,16 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("assembling the acquisition failed: %v", err)
 	}
-	atr.Extra = append(atr.Extra, testF105TokenMember(t, e, act.Gen, act))
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, atr)); err != nil {
+	atr.Extra = append(atr.Extra, testTokenMember(t, e, act.Gen, act))
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, atr)); err != nil {
 		t.Fatalf("the action acquisition was refused: %v", err)
 	}
 	amsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttActionSubject(getHash(e.id), testF105Gen, xchNonce, 1))
+		mqttActionSubject(getHash(e.id), testGen, xchNonce, 1))
 	if err != nil {
 		t.Fatalf("the acquired action does not load back: %v", err)
 	}
-	ga, derr := mqttDecodeOutboundAction(amsg.Data, e.id, e.epoch, testF105Gen, xchNonce, 1)
+	ga, derr := mqttDecodeOutboundAction(amsg.Data, e.id, e.epoch, testGen, xchNonce, 1)
 	if derr != nil {
 		t.Fatalf("the acquired action does not decode: %v", derr)
 	}
@@ -1111,16 +1111,16 @@ func TestF105ExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	}
 }
 
-// TestF105ObligationMembersAreCheckedAgainstTheirTransition pins that carrying an obligation
+// TestObligationMembersAreCheckedAgainstTheirTransition pins that carrying an obligation
 // is not the same as carrying anything: the body must agree with the subject that names it,
 // and both must belong to the transition doing the carrying.
-func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
+func TestObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 	jsa := &mqttJSA{mqttJSACore: &mqttJSACore{}}
-	idHash := getHash(testF105ID)
+	idHash := getHash(testID)
 
 	good := func() *mqttOutboundExchange {
 		return &mqttOutboundExchange{
-			ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Nonce: "xch-1",
+			ID: testID, Epoch: testEpoch, Gen: testGen, Nonce: "xch-1",
 			PI: 7, QoS: 2, Phase: mqttExchangePublish,
 			AdmitTxn: "txn-1", Tenure: "tenure-0",
 		}
@@ -1131,21 +1131,21 @@ func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 			x.ID = "client-b"
 		},
 		"a body naming another generation": func(x *mqttOutboundExchange, _ *mqttTransitionMember) {
-			x.Gen = testF105Gen2
+			x.Gen = testGen2
 		},
 		"a body whose nonce disagrees with its subject": func(x *mqttOutboundExchange, _ *mqttTransitionMember) {
 			x.Nonce = "xch-other"
 		},
 		"a subject for another client": func(_ *mqttOutboundExchange, m *mqttTransitionMember) {
-			m.subj = mqttExchangeSubject("zzzz9999", testF105Gen, "xch-1")
+			m.subj = mqttExchangeSubject("zzzz9999", testGen, "xch-1")
 		},
 		"a subject for another generation": func(_ *mqttOutboundExchange, m *mqttTransitionMember) {
-			m.subj = mqttExchangeSubject(idHash, testF105Gen2, "xch-1")
+			m.subj = mqttExchangeSubject(idHash, testGen2, "xch-1")
 		},
 	} {
 		x := good()
-		tr := testF105Transition()
-		m := mqttTransitionMember{subj: mqttExchangeSubject(idHash, testF105Gen, "xch-1"), expect: 0}
+		tr := testTransition()
+		m := mqttTransitionMember{subj: mqttExchangeSubject(idHash, testGen, "xch-1"), expect: 0}
 		mutate(x, &m)
 		b, _ := json.Marshal(x)
 		m.body = b
@@ -1164,15 +1164,15 @@ func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 		"neither":       func(ac *mqttOutboundAction) { ac.Run, ac.Conn = _EMPTY_, _EMPTY_ },
 	} {
 		ac := &mqttOutboundAction{
-			ID: testF105ID, Epoch: testF105Epoch, Gen: testF105Gen, Nonce: "xch-1", Acq: 1,
+			ID: testID, Epoch: testEpoch, Gen: testGen, Nonce: "xch-1", Acq: 1,
 			Kind: mqttActionPublish, PI: 7,
 			Run: "run-1", Conn: "1", Tenure: "tenure-0", AcqTxn: "txn-1",
 		}
 		mutate(ac)
 		ab, _ := json.Marshal(ac)
-		atr := testF105Transition()
+		atr := testTransition()
 		atr.Extra = []mqttTransitionMember{{
-			subj: mqttActionSubject(idHash, testF105Gen, "xch-1", 1), expect: 0, body: ab,
+			subj: mqttActionSubject(idHash, testGen, "xch-1", 1), expect: 0, body: ab,
 		}}
 		if _, err := jsa.commitAuthorityTransition(atr); err == nil {
 			t.Fatalf("an action with %s was acquired: it has no completion route that "+
@@ -1185,16 +1185,16 @@ func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 	x := good()
 	x.QoS, x.Phase = 1, mqttExchangePubRecObserved
 	b, _ := json.Marshal(x)
-	tr := testF105Transition()
+	tr := testTransition()
 	tr.Extra = []mqttTransitionMember{{
-		subj: mqttExchangeSubject(idHash, testF105Gen, "xch-1"), expect: 0, body: b,
+		subj: mqttExchangeSubject(idHash, testGen, "xch-1"), expect: 0, body: b,
 	}}
 	if _, err := jsa.commitAuthorityTransition(tr); err == nil {
 		t.Fatalf("a QoS 1 exchange in a PUBREL phase was admitted")
 	}
 }
 
-// TestF105FirstCreationReservesBeforeItServes closes the bootstrap gap Codex's consult 8
+// TestFirstCreationReservesBeforeItServes closes the bootstrap gap Codex's consult 8
 // named.
 //
 // Virgin creation had no representation: a first admission installs SERVING with no
@@ -1207,11 +1207,11 @@ func TestF105ObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 // The reservation is the shape that was missing. It grants NO serving permission, it is
 // create-only so exactly one claimant holds it, and it becomes servable only by a
 // finalization bound to its own proposal.
-func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-create")
+func TestFirstCreationReservesBeforeItServes(t *testing.T) {
+	e, done := testNewEnv(t, "f105-create")
 	defer done()
 
-	creation := &mqttCreationIntent{ID: "create-1", Gen: testF105Gen, Tenure: "tenure-new"}
+	creation := &mqttCreationIntent{ID: "create-1", Gen: testGen, Tenure: "tenure-new"}
 	reserve := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-res", Op: "op-res",
@@ -1224,7 +1224,7 @@ func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
 			Creation: creation,
 		},
 	}
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reserve))
+	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reserve))
 	if err != nil {
 		t.Fatalf("the creation reservation was refused: %v", err)
 	}
@@ -1248,7 +1248,7 @@ func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
 			State: mqttAuthorityServing, Rev: 2, Txn: "txn-early", OwnerTxn: "txn-res",
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, admit)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, admit)); err == nil {
 		t.Fatalf("an obligation was admitted under a RESERVATION, before its metadata half committed")
 	}
 
@@ -1257,15 +1257,15 @@ func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-rival", Op: "op-rival",
 			Kind: mqttTransitionReserveCreation, Rev: 1,
-			Gen: testF105Gen2, Tenure: "tenure-rival", OwnerTxn: "txn-rival",
+			Gen: testGen2, Tenure: "tenure-rival", OwnerTxn: "txn-rival",
 		},
 		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testF105Gen2, Tenure: "tenure-rival",
+			ID: e.id, Epoch: e.epoch, Gen: testGen2, Tenure: "tenure-rival",
 			State: mqttAuthorityReserving, Rev: 1, Txn: "txn-rival", OwnerTxn: "txn-rival",
-			Creation: &mqttCreationIntent{ID: "create-2", Gen: testF105Gen2, Tenure: "tenure-rival"},
+			Creation: &mqttCreationIntent{ID: "create-2", Gen: testGen2, Tenure: "tenure-rival"},
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, rival)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, rival)); err == nil {
 		t.Fatalf("two claimants both reserved one client's first creation")
 	}
 
@@ -1283,7 +1283,7 @@ func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
 			State: mqttAuthorityServing, Rev: 2, Txn: "txn-fin", OwnerTxn: "txn-res",
 		},
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, wrong)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, wrong)); err == nil {
 		t.Fatalf("a finalization answering another proposal was admitted: a second claimant " +
 			"could finalize somebody else's reservation into its own tenure")
 	}
@@ -1303,7 +1303,7 @@ func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
 	if cerr != nil {
 		t.Fatalf("viewing the reservation as a proposal failed: %v", cerr)
 	}
-	mf := testF105FreezeProposal(t, e, cp, testF105RecordSeq(t, e))
+	mf := testFreezeProposal(t, e, cp, testRecordSeq(t, e))
 	if _, merr := e.asm.jsa.commitMetadataAttempt(mf); merr != nil {
 		t.Fatalf("the reservation's metadata commit was refused: %v", merr)
 	}
@@ -1323,17 +1323,17 @@ func TestF105FirstCreationReservesBeforeItServes(t *testing.T) {
 	}
 }
 
-// TestF105AbandonedReservationIsClosedNotDeleted pins the recoverable abort.
+// TestAbandonedReservationIsClosedNotDeleted pins the recoverable abort.
 //
 // No arbitration record is ever deleted, so an abandoned reservation is CLOSED: its
 // generation never served and never can, and a later attempt reserves a FRESH generation
 // beside it. Deleting it instead would make the next claimant's create-only reservation
 // succeed against an absence, which is the inference this mechanism exists to remove.
-func TestF105AbandonedReservationIsClosedNotDeleted(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-create-abort")
+func TestAbandonedReservationIsClosedNotDeleted(t *testing.T) {
+	e, done := testNewEnv(t, "f105-create-abort")
 	defer done()
 
-	creation := &mqttCreationIntent{ID: "create-1", Gen: testF105Gen, Tenure: "tenure-new"}
+	creation := &mqttCreationIntent{ID: "create-1", Gen: testGen, Tenure: "tenure-new"}
 	reserve := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
 			ID: e.id, Epoch: e.epoch, Txn: "txn-res", Op: "op-res",
@@ -1346,7 +1346,7 @@ func TestF105AbandonedReservationIsClosedNotDeleted(t *testing.T) {
 			Creation: creation,
 		},
 	}
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reserve))
+	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reserve))
 	if err != nil {
 		t.Fatalf("the creation reservation was refused: %v", err)
 	}
@@ -1369,7 +1369,7 @@ func TestF105AbandonedReservationIsClosedNotDeleted(t *testing.T) {
 	// ABANDONMENT ALSO FOLLOWS THE PERMANENT VERDICT. A reservation whose metadata half is
 	// merely unresolved may not be closed: its batch can still commit, and closing it would
 	// end a generation that is about to become the serving one.
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, abandon)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, abandon)); err == nil {
 		t.Fatalf("a reservation was abandoned while its metadata half was unresolved")
 	}
 	cp, cerr := mqttProposalFromCreation(creation)
@@ -1379,7 +1379,7 @@ func TestF105AbandonedReservationIsClosedNotDeleted(t *testing.T) {
 	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, cp); v != mqttMetadataAborted {
 		t.Fatalf("settling the abandoned reservation returned %v, want ABORTED", v)
 	}
-	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, abandon))
+	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, abandon))
 	if err != nil {
 		t.Fatalf("abandoning the reservation was refused: %v", err)
 	}
@@ -1390,29 +1390,29 @@ func TestF105AbandonedReservationIsClosedNotDeleted(t *testing.T) {
 	// A later attempt claims a FRESH generation beside it, by reserving again — the same
 	// route as the first claim, never a shortcut that installs serving over the closure. It
 	// may not reuse the abandoned generation, which is closed permanently.
-	reuse := testF105ReserveCreation(e, abandon.Auth, closeSeq, "txn-reuse", creation.Gen,
+	reuse := testReserveCreation(e, abandon.Auth, closeSeq, "txn-reuse", creation.Gen,
 		"tenure-2", "intent-reuse")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, reuse)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reuse)); err == nil {
 		t.Fatalf("a later attempt reused the abandoned generation")
 	}
-	e.claim(t, abandon.Auth, closeSeq, "txn-fresh", testF105Gen2, "tenure-2")
+	e.claim(t, abandon.Auth, closeSeq, "txn-fresh", testGen2, "tenure-2")
 	// The abandoned generation's closure still stands.
 	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, creation.Gen); st != mqttOutboundValid {
 		t.Fatalf("the abandoned generation's closure did not survive (status %v)", st)
 	}
 }
 
-// TestF105ReservationCannotServeOrMisdescribeItself covers the two ways a reservation could
+// TestReservationCannotServeOrMisdescribeItself covers the two ways a reservation could
 // be subverted into serving before its metadata half commits.
 //
 // Both survived their first mutation run because nothing exercised them: the existing tests
 // build a well-formed reservation and never try to install a serving authority under the
 // reservation kind, nor a reservation whose body disagrees with the proposal it carries.
-func TestF105ReservationCannotServeOrMisdescribeItself(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-create-subvert")
+func TestReservationCannotServeOrMisdescribeItself(t *testing.T) {
+	e, done := testNewEnv(t, "f105-create-subvert")
 	defer done()
 
-	creation := &mqttCreationIntent{ID: "create-1", Gen: testF105Gen, Tenure: "tenure-new"}
+	creation := &mqttCreationIntent{ID: "create-1", Gen: testGen, Tenure: "tenure-new"}
 
 	// A reserve-creation that installs SERVING outright. This is the claim-and-serve shape
 	// the reservation exists to replace: it would own the client and be immediately
@@ -1434,7 +1434,7 @@ func TestF105ReservationCannotServeOrMisdescribeItself(t *testing.T) {
 		t.Fatalf("a reserve-creation installed a SERVING authority: it would own the client " +
 			"and be immediately servable before any metadata committed")
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testF105EnrolClosing(t, e, serveNow)); err == nil {
+	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, serveNow)); err == nil {
 		t.Fatalf("a reserve-creation installing SERVING reached the store")
 	}
 
@@ -1442,7 +1442,7 @@ func TestF105ReservationCannotServeOrMisdescribeItself(t *testing.T) {
 	// to the proposal, so a body naming something else would make that binding meaningless:
 	// the finalization would check one thing and install another.
 	for name, mutate := range map[string]func(*mqttOutboundAuthority){
-		"generation": func(a *mqttOutboundAuthority) { a.Gen = testF105Gen2 },
+		"generation": func(a *mqttOutboundAuthority) { a.Gen = testGen2 },
 		"tenure":     func(a *mqttOutboundAuthority) { a.Tenure = "tenure-elsewhere" },
 	} {
 		c := *creation

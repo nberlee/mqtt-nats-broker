@@ -35,7 +35,7 @@ import (
 // Mutations (D1): the executor withholds the source and (separately) the PUBREL consumer's
 // retirement; a release-gate mutant that does not check durable recovery ownership is recorded
 // against the gate's own tests.
-func TestF105ARestartedBrokerRetiresADiscardedGenerationsConsumers(t *testing.T) {
+func TestARestartedBrokerRetiresADiscardedGenerationsConsumers(t *testing.T) {
 	// NOT parallel: the recovery kick and the sweep interval are process-wide.
 	testDiscardParkAll(t) // never released: only the restarted broker's recovery pass may act
 	f, o := testDiscardTearDownOpts(t, "w2-restart-discard", 2, true, nil)

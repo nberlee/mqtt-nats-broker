@@ -33,9 +33,9 @@ import (
 // descriptor, which the strict validator refuses by design. The validator stays strict; the
 // producers name the affine target whole or not at all (mqttAffineRetireDescriptor).
 
-// testF113Predecessor is one ordinary QoS 2 obligation past PUBREC on a persistent session whose
+// testPredecessor is one ordinary QoS 2 obligation past PUBREC on a persistent session whose
 // connection has gone: the state a clean start then discards.
-type testF113Predecessor struct {
+type testPredecessor struct {
 	asm    *mqttAccountSessionManager
 	idHash string
 	gen    string
@@ -45,9 +45,9 @@ type testF113Predecessor struct {
 	pubRel string
 }
 
-func testF113Capture(t *testing.T, sess *mqttSession, pi uint16) *testF113Predecessor {
+func testCapture(t *testing.T, sess *mqttSession, pi uint16) *testPredecessor {
 	t.Helper()
-	p := &testF113Predecessor{asm: sess.asm, idHash: sess.idHash, pi: pi}
+	p := &testPredecessor{asm: sess.asm, idHash: sess.idHash, pi: pi}
 	sess.mu.Lock()
 	p.gen = sess.gen
 	for _, cc := range sess.cons {
@@ -68,13 +68,13 @@ func testF113Capture(t *testing.T, sess *mqttSession, pi uint16) *testF113Predec
 		t.Fatalf("fixture: the register is not past PUBREC: %+v (%v)", reg, err)
 	}
 	p.nonce = reg.Lin
-	testF105ExchangePhaseIs(t, sess, p.nonce, mqttExchangePubRecObserved)
+	testExchangePhaseIs(t, sess, p.nonce, mqttExchangePubRecObserved)
 	return p
 }
 
 // discardedAndRetired waits for the predecessor generation's discard to complete: the obligation
 // Discarded, both consumers retired, the generation certified.
-func (p *testF113Predecessor) discardedAndRetired(t *testing.T, s *Server, cid string) {
+func (p *testPredecessor) discardedAndRetired(t *testing.T, s *Server, cid string) {
 	t.Helper()
 	f := &testDiscardFix{s: s, asm: p.asm, id: cid, gen: p.gen, nonce: p.nonce, src: p.src, pubRel: p.pubRel}
 	checkFor(t, 20*time.Second, 50*time.Millisecond, func() error {
@@ -94,7 +94,7 @@ func (p *testF113Predecessor) discardedAndRetired(t *testing.T, s *Server, cid s
 
 // T1: the bullet's reproduction (v5, Session Expiry 60, one ordinary QoS 2 delivery past PUBREC,
 // then a Clean Start) on one broker. Mutation M1 (the request names the PUBREL durable alone).
-func TestF113CleanStartOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
+func TestCleanStartOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	const cid = "f113-t1"
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -116,7 +116,7 @@ func TestF113CleanStartOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubRec, t, c, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, r, pi)
 	_, sess := testResidentSession(t, s, cid)
-	p := testF113Capture(t, sess, pi)
+	p := testCapture(t, sess, pi)
 	c.Close()
 
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true, props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
@@ -148,7 +148,7 @@ func TestF113CleanStartOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 // found it on: a persistent 3.1.1 QoS 2 session past PUBREC on broker A, then a clean-session
 // CONNECT on broker B sharing A's JetStream. B's finalize must close A's generation with Discard.
 // Mutation M1.
-func TestF113CleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
+func TestCleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	const cid = "f113-t2"
 	oA := testMQTTDefaultOptions()
 	oA.MQTT.AckWait = time.Second
@@ -166,10 +166,10 @@ func TestF113CleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) 
 	asmB := testMQTTGetAccountSessionManager(t, sB, cid+"-probe")
 	probe.Close()
 
-	sub, subr, sessA, pi, _ := testF105QoS2Delivered(t, oA, sA, cid)
+	sub, subr, sessA, pi, _ := testQoS2Delivered(t, oA, sA, cid)
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-	p := testF113Capture(t, sessA, pi)
+	p := testCapture(t, sessA, pi)
 	epoch := p.asm.sessStreamEpoch
 
 	var mu sync.Mutex
@@ -212,11 +212,11 @@ func TestF113CleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) 
 // produced before issue #115 — is still REFUSED when it reaches the validator unprojected. Mutations M2,
 // M3 (the projection drops a whole or partial affine target) and M4 (the validator accepts an empty
 // affine pair whatever the PUBREL name says).
-func TestF113AnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {
+func TestAnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {
 	const id = "f113-t3"
 	idHash := getHash(id)
-	_, _, pubRelDur := mqttPubRelNames(idHash, testF105Gen)
-	_, _, affDur := mqttQ2AffineNames(idHash, testF105Gen2)
+	_, _, pubRelDur := mqttPubRelNames(idHash, testGen)
+	_, _, affDur := mqttQ2AffineNames(idHash, testGen2)
 
 	for _, tc := range []struct {
 		name                string
@@ -225,7 +225,7 @@ func TestF113AnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {
 	}{
 		{"nothing named", "", "", "", [3]string{}},
 		{"an ordinary QoS 2 session's PUBREL consumer alone", "", "", pubRelDur, [3]string{}},
-		{"a whole affine target", affDur, testF105Gen2, pubRelDur, [3]string{affDur, testF105Gen2, pubRelDur}},
+		{"a whole affine target", affDur, testGen2, pubRelDur, [3]string{affDur, testGen2, pubRelDur}},
 		{"an affine durable without its generation", affDur, "", pubRelDur, [3]string{affDur, "", pubRelDur}},
 	} {
 		d, g, r := mqttAffineRetireDescriptor(tc.affDur, tc.affGen, tc.rel)
@@ -233,24 +233,24 @@ func TestF113AnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {
 			t.Fatalf("%s: projected to %q, want %q", tc.name, got, tc.want)
 		}
 	}
-	if err := mqttValidateAffineDescriptor(idHash, testF105Gen, testF105Gen2, affDur, pubRelDur); err != nil {
+	if err := mqttValidateAffineDescriptor(idHash, testGen, testGen2, affDur, pubRelDur); err != nil {
 		t.Fatalf("a whole affine target was refused: %v", err)
 	}
-	if err := mqttValidateAffineDescriptor(idHash, testF105Gen, "", affDur, pubRelDur); err == nil ||
+	if err := mqttValidateAffineDescriptor(idHash, testGen, "", affDur, pubRelDur); err == nil ||
 		!strings.Contains(err.Error(), "malformed affine generation") {
 		t.Fatalf("an affine durable without its generation was not refused as malformed: %v", err)
 	}
 
 	// THE STRICT VALIDATOR, fed the unprojected PUBREL-only shape directly and through the intent
 	// gate that persists it.
-	if err := mqttValidateAffineDescriptor(idHash, testF105Gen, "", "", pubRelDur); err == nil {
+	if err := mqttValidateAffineDescriptor(idHash, testGen, "", "", pubRelDur); err == nil {
 		t.Fatal("a PUBREL consumer named alone was accepted as an affine descriptor")
 	}
 	intent := &mqttHandoffIntent{
-		ID: "intent-f113", PrevGen: testF105Gen, PrevTenure: "ten", PrevOwnerTxn: "own",
-		PrevSessWID: "wid", PrevSessSeq: 1, Gen: testF105Gen2, Tenure: "ten2", CleanReq: true,
+		ID: "intent-f113", PrevGen: testGen, PrevTenure: "ten", PrevOwnerTxn: "own",
+		PrevSessWID: "wid", PrevSessSeq: 1, Gen: testGen2, Tenure: "ten2", CleanReq: true,
 		Retire: &mqttRetirementRequest{
-			Gen: testF105Gen, Tenure: "ten", OwnerTxn: "own", SessWID: "wid", SessSeq: 1,
+			Gen: testGen, Tenure: "ten", OwnerTxn: "own", SessWID: "wid", SessSeq: 1,
 			Reason: mqttRetireCleanStart, Discard: true, PubRelDurable: pubRelDur,
 		},
 	}
@@ -265,16 +265,16 @@ func TestF113AnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {
 
 // T4: the retirement a clean start carries over an ordinary QoS 2 session names no affine target
 // and no PUBREL consumer. Mutation M1.
-func TestF113TheCleanStartRetirementNamesNoAffineTarget(t *testing.T) {
+func TestTheCleanStartRetirementNamesNoAffineTarget(t *testing.T) {
 	const cid = "f113-t4"
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	sub, subr, sess, pi, _ := testF105QoS2Delivered(t, o, s, cid)
+	sub, subr, sess, pi, _ := testQoS2Delivered(t, o, s, cid)
 	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
 	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-	p := testF113Capture(t, sess, pi)
+	p := testCapture(t, sess, pi)
 
 	var retire atomic.Pointer[mqttRetirementRequest]
 	pre := func(tr *mqttAuthorityTransition) {

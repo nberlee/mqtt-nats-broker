@@ -275,12 +275,12 @@ func testMixedRequireSettled(t *testing.T, s *Server, clientID string) {
 	})
 }
 
-// TestF105SupportedObligationsNeverLeaveThroughAMixedSite is T2a (live routes) and T2b (recovery
+// TestSupportedObligationsNeverLeaveThroughAMixedSite is T2a (live routes) and T2b (recovery
 // routes) of WP-F step 1.
 //
 // Deliberately NOT parallel: the hook is process-global, and its restore must not interleave
 // with another installation of it.
-func TestF105SupportedObligationsNeverLeaveThroughAMixedSite(t *testing.T) {
+func TestSupportedObligationsNeverLeaveThroughAMixedSite(t *testing.T) {
 	w := newTestMixedSiteWatch(t)
 	o := testMQTTDefaultOptionsV5()
 	// The restart arm's resend rides redelivery, as in the inflight restart tests.

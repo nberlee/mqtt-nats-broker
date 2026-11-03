@@ -304,10 +304,10 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 func mqttCreatedResourceMember(a *mqttTransitionAttempt, e mqttTransitionMember,
 	idHash string) *mqttOutboundResource {
 
-	if !strings.HasPrefix(e.subj, mqttF105SubjectPrefix()+mqttResourceClassTk+".") || e.expect != 0 {
+	if !strings.HasPrefix(e.subj, mqttOutboundRecordSubjectPrefix()+mqttResourceClassTk+".") || e.expect != 0 {
 		return nil
 	}
-	toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+	toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 	if len(toks) != 4 || toks[1] != idHash {
 		return nil
 	}
@@ -336,7 +336,7 @@ func mqttParseRootSubject(subject string) (shard, ord uint64, err error) {
 	if !mqttIsRootSubject(subject) {
 		return 0, 0, fmt.Errorf("subject %q is not a recovery root", subject)
 	}
-	toks := strings.Split(subject[len(mqttF105SubjectPrefix()):], ".")
+	toks := strings.Split(subject[len(mqttOutboundRecordSubjectPrefix()):], ".")
 	if len(toks) != 3 {
 		return 0, 0, fmt.Errorf("recovery root subject %q is malformed", subject)
 	}

@@ -36,8 +36,8 @@ import (
 // the authorization's presend window - an authority revision and a raw resource CAS adding a
 // retained-material edge - which is exactly what a racing admission would have changed. Mutation
 // (M12): the authorization's authority and resource expectations both dropped (two-site).
-func TestF105RetainedAuthorizationLosesToAnEdge(t *testing.T) {
-	e, done := testF105NewEnv(t, "w2-retained-auth-edge")
+func TestRetainedAuthorizationLosesToAnEdge(t *testing.T) {
+	e, done := testNewEnv(t, "w2-retained-auth-edge")
 	defer done()
 	jsa := &e.asm.jsa
 	auth, _ := e.bootstrap(t, "txn-1")
@@ -70,7 +70,7 @@ func TestF105RetainedAuthorizationLosesToAnEdge(t *testing.T) {
 			plantErr = errors.New("no authority stands to revise")
 			return
 		}
-		if _, plantErr = jsa.commitAuthorityTransition(testF105AdmitNothing(e, al.rec, al.seq, "txn-racer")); plantErr != nil {
+		if _, plantErr = jsa.commitAuthorityTransition(testAdmitNothing(e, al.rec, al.seq, "txn-racer")); plantErr != nil {
 			return
 		}
 		cur, curSeq, lerr := jsa.loadOutboundResource(e.id, e.epoch, auth.Gen, "inc-auth")

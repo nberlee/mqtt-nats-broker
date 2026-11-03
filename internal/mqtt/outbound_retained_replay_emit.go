@@ -739,7 +739,7 @@ func (sess *mqttSession) disposeRetainedRel(cur *mqttInflightRecord) bool {
 
 // genOfRel is the generation token a retained canonical subject names.
 func (sess *mqttSession) genOfRel(cur *mqttInflightRecord) string {
-	toks := strings.Split(cur.RelSubj[len(mqttF105SubjectPrefix()):], ".")
+	toks := strings.Split(cur.RelSubj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 	if len(toks) != 4 {
 		return _EMPTY_
 	}

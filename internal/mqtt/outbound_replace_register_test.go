@@ -30,10 +30,10 @@ import (
 // refuses a batch whose members are each individually legal but which, taken together with
 // the state they land in, do not implement the disposition the replacement selected.
 
-// testF105ReplEnv is one bootstrapped authority with an admitted obligation standing on an
+// testReplEnv is one bootstrapped authority with an admitted obligation standing on an
 // identifier, which is what every replacement below displaces.
-type testF105ReplEnv struct {
-	*testF105Env
+type testReplEnv struct {
+	*testOutboundEnv
 	auth    *mqttOutboundAuthority
 	authSeq uint64
 	pi      uint16
@@ -43,13 +43,13 @@ type testF105ReplEnv struct {
 	occLin  string
 }
 
-func testF105NewReplEnv(t *testing.T, clientID string) (*testF105ReplEnv, func()) {
+func testNewReplEnv(t *testing.T, clientID string) (*testReplEnv, func()) {
 	t.Helper()
-	e, done := testF105NewEnv(t, clientID)
+	e, done := testNewEnv(t, clientID)
 	auth, authSeq := e.bootstrap(t, "txn-boot")
 
 	const pi = uint16(7)
-	adm := testF105Admission(e, auth, authSeq, "txn-occupant", pi, nil)
+	adm := testAdmission(e, auth, authSeq, "txn-occupant", pi, nil)
 	tr, err := mqttAdmitPublishTransition(adm)
 	if err != nil {
 		done()
@@ -59,15 +59,15 @@ func testF105NewReplEnv(t *testing.T, clientID string) (*testF105ReplEnv, func()
 		done()
 		t.Fatalf("the occupant's admission was refused: %v", err)
 	}
-	regSubj := mqttInflightSubject(getHash(e.id), testF105Gen, pi)
+	regSubj := mqttInflightSubject(getHash(e.id), testGen, pi)
 	occ, smsg, lerr := e.asm.jsa.loadInflightRecord(regSubj)
 	if lerr != nil || smsg == nil {
 		done()
 		t.Fatalf("the occupant does not load back: %v", lerr)
 	}
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	return &testF105ReplEnv{
-		testF105Env: e, auth: al.rec, authSeq: al.seq, pi: pi,
+	return &testReplEnv{
+		testOutboundEnv: e, auth: al.rec, authSeq: al.seq, pi: pi,
 		regSubj: regSubj, occ: occ, occSeq: smsg.Sequence, occLin: occ.Lin,
 	}, done
 }
@@ -77,7 +77,7 @@ func testF105NewReplEnv(t *testing.T, clientID string) (*testF105ReplEnv, func()
 // slot together, so an exchange past its publish beside a register still AT publish is a pair no
 // batch writes: these tests construct it on purpose, to pin the replacement rules that refuse it
 // whatever the store says.
-func (r *testF105ReplEnv) holdOccupantAtPublish(t *testing.T) {
+func (r *testReplEnv) holdOccupantAtPublish(t *testing.T) {
 	t.Helper()
 	_, smsg, lerr := r.asm.jsa.loadInflightRecord(r.regSubj)
 	if lerr != nil || smsg == nil {
@@ -92,7 +92,7 @@ func (r *testF105ReplEnv) holdOccupantAtPublish(t *testing.T) {
 }
 
 // markerSeq returns the occupant's standing unsent-marker sequence, or 0 when it is absent.
-func (r *testF105ReplEnv) markerSeq(t *testing.T) uint64 {
+func (r *testReplEnv) markerSeq(t *testing.T) uint64 {
 	t.Helper()
 	smsg, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, r.regSubj+"."+mqttInflightMarkerSuffix)
 	if err != nil {
@@ -103,7 +103,7 @@ func (r *testF105ReplEnv) markerSeq(t *testing.T) uint64 {
 
 // deleteMarker removes the occupant's marker, which is what a transmission does — the send
 // intent deletes it BEFORE the bytes leave, so its absence means POSSIBLY ATTEMPTED.
-func (r *testF105ReplEnv) deleteMarker(t *testing.T) {
+func (r *testReplEnv) deleteMarker(t *testing.T) {
 	t.Helper()
 	seq := r.markerSeq(t)
 	if seq == 0 {
@@ -116,7 +116,7 @@ func (r *testF105ReplEnv) deleteMarker(t *testing.T) {
 
 // replacingRegister builds the member that displaces the occupant. lin is the lineage it
 // claims, qos the QoS it writes, and both are parameters because both are refusal oracles.
-func (r *testF105ReplEnv) replacingRegister(t *testing.T, lin string, qos byte) mqttTransitionMember {
+func (r *testReplEnv) replacingRegister(t *testing.T, lin string, qos byte) mqttTransitionMember {
 	t.Helper()
 	rec := &mqttInflightRecord{
 		State: mqttInflightPublish, PI: r.pi, Dur: r.occ.Dur, Seq: r.occ.Seq, QoS: qos,
@@ -137,7 +137,7 @@ func (r *testF105ReplEnv) replacingRegister(t *testing.T, lin string, qos byte) 
 
 // freshMarkerFor is the marker a PAIR replacement mints for its own allocation, replacing the
 // occupant's at that marker's observed sequence.
-func (r *testF105ReplEnv) freshMarkerFor(t *testing.T, reg mqttTransitionMember, markerSeq uint64) mqttTransitionMember {
+func (r *testReplEnv) freshMarkerFor(t *testing.T, reg mqttTransitionMember, markerSeq uint64) mqttTransitionMember {
 	t.Helper()
 	var rec mqttInflightRecord
 	if err := json.Unmarshal(reg.body, &rec); err != nil {
@@ -154,14 +154,14 @@ func (r *testF105ReplEnv) freshMarkerFor(t *testing.T, reg mqttTransitionMember,
 
 // exchangeMember builds an exchange member: create-only when expect is 0, an advance to the
 // given phase otherwise.
-func (r *testF105ReplEnv) exchangeMember(t *testing.T, nonce string, phase mqttExchangePhase,
+func (r *testReplEnv) exchangeMember(t *testing.T, nonce string, phase mqttExchangePhase,
 	expect uint64, admitTxn string) mqttTransitionMember {
 	t.Helper()
 	// AN ADMITTED EXCHANGE NAMES THE TRANSITION ADMITTING IT. An advance keeps whatever its
 	// admission wrote, which is why the caller supplies this rather than the fixture assuming
 	// one: an obligation nothing authorized is an obligation nobody owes.
 	x := &mqttOutboundExchange{
-		ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: nonce,
+		ID: r.id, Epoch: r.epoch, Gen: testGen, Nonce: nonce,
 		PI: r.pi, QoS: r.occ.QoS, Phase: phase,
 		AdmitTxn: admitTxn, Tenure: r.auth.Tenure,
 	}
@@ -169,23 +169,23 @@ func (r *testF105ReplEnv) exchangeMember(t *testing.T, nonce string, phase mqttE
 	if err != nil {
 		t.Fatalf("marshalling the exchange failed: %v", err)
 	}
-	return mqttTransitionMember{subj: mqttExchangeSubject(getHash(r.id), testF105Gen, nonce), expect: expect, body: body}
+	return mqttTransitionMember{subj: mqttExchangeSubject(getHash(r.id), testGen, nonce), expect: expect, body: body}
 }
 
 // submit composes a transition carrying exactly these members and returns the boundary's answer.
-func (r *testF105ReplEnv) submit(t *testing.T, txn string, members ...mqttTransitionMember) error {
+func (r *testReplEnv) submit(t *testing.T, txn string, members ...mqttTransitionMember) error {
 	t.Helper()
 	al := r.asm.jsa.loadOutboundAuthority(r.id, r.epoch)
-	tr := testF105AdmitNothing(r.testF105Env, al.rec, al.seq, txn)
+	tr := testAdmitNothing(r.testOutboundEnv, al.rec, al.seq, txn)
 	// COVERED, because rule 3 makes an admitted obligation owe a duty entry and these fixtures
 	// build their exchange members by hand — they are about replacement, not about discovery.
 	// A test specifically about coverage omits it on purpose and asserts the refusal.
-	tr.Extra = testF105CoverExchanges(t, r.testF105Env, testF105Gen, members)
+	tr.Extra = testCoverExchanges(t, r.testOutboundEnv, testGen, members)
 	_, err := r.asm.jsa.commitAuthorityTransition(tr)
 	return err
 }
 
-// TestF105RegisterOnlyReplacementContinuesTheOccupantsObligation is the POSSIBLY-ATTEMPTED
+// TestRegisterOnlyReplacementContinuesTheOccupantsObligation is the POSSIBLY-ATTEMPTED
 // mode, and it is the one that must SUCCEED.
 //
 // The send intent deletes the unsent marker before the bytes leave, so an authoritatively
@@ -193,8 +193,8 @@ func (r *testF105ReplEnv) submit(t *testing.T, txn string, members ...mqttTransi
 // exchange. The obligation therefore continues: the new register inherits the occupant's
 // lineage and its QoS, and the batch admits no exchange, because admitting one would put a
 // second obligation and a second charge on an identifier the client is already holding.
-func TestF105RegisterOnlyReplacementContinuesTheOccupantsObligation(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-repl-continue")
+func TestRegisterOnlyReplacementContinuesTheOccupantsObligation(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-repl-continue")
 	defer done()
 
 	r.deleteMarker(t)
@@ -225,7 +225,7 @@ func TestF105RegisterOnlyReplacementContinuesTheOccupantsObligation(t *testing.T
 	}
 }
 
-// TestF105PairReplacementEndsThePredecessor is the PROVEN-UNSENT mode.
+// TestPairReplacementEndsThePredecessor is the PROVEN-UNSENT mode.
 //
 // A marker naming the occupant is proof nothing ever went out under it, so there is no client
 // obligation to inherit: the identifier goes to a FRESH exchange.
@@ -235,9 +235,9 @@ func TestF105RegisterOnlyReplacementContinuesTheOccupantsObligation(t *testing.T
 // distinction is not pedantic: mqttExchangePhaseEnded (outbound_exchange.go:130) is true only
 // for Terminal and Rejected, so BOTH pending-drain phases still HOLD the identifier, and
 // checkIdentifierExclusivity refuses a replacement that leaves one standing. This test ends it
-// here; TestF105PairReplacementPredecessorDispositions walks the other cases.
-func TestF105PairReplacementEndsThePredecessor(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-repl-pair")
+// here; TestPairReplacementPredecessorDispositions walks the other cases.
+func TestPairReplacementEndsThePredecessor(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-repl-pair")
 	defer done()
 
 	mseq := r.markerSeq(t)
@@ -266,18 +266,18 @@ func TestF105PairReplacementEndsThePredecessor(t *testing.T) {
 	}
 }
 
-// TestF105PairReplacementPredecessorDispositions walks what the predecessor's own phase does
+// TestPairReplacementPredecessorDispositions walks what the predecessor's own phase does
 // to a pair replacement, because "ended" is a narrower set than it reads as.
 //
 // mqttExchangePhaseEnded is true for Terminal and Rejected ONLY. Both pending-drain phases
 // still hold the identifier — an action acquired earlier may still emit under it — so a
 // replacement that leaves one standing is refused even though the phase sounds final.
-func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
+func TestPairReplacementPredecessorDispositions(t *testing.T) {
 	// pairOver composes a legal pair replacement whose predecessor is first advanced to the
 	// given phase, and returns the boundary's answer.
 	pairOver := func(t *testing.T, clientID string, phase mqttExchangePhase, endInBatch bool) error {
 		t.Helper()
-		r, done := testF105NewReplEnv(t, clientID)
+		r, done := testNewReplEnv(t, clientID)
 		defer done()
 		mseq := r.markerSeq(t)
 		// WALKED, NOT JUMPED. A QoS 2 exchange has a protocol: PUBLISH reaches a terminal
@@ -296,7 +296,7 @@ func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
 			t.Fatalf("the fixture has no path to phase %d", int(phase))
 		}
 		for _, step := range path {
-			if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, step); err != nil {
+			if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testGen, r.occLin, step); err != nil {
 				t.Fatalf("advancing the predecessor to phase %d failed: %v", int(step), err)
 			}
 		}
@@ -342,7 +342,7 @@ func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
 	// a refusal over live output waits for its drain), so no predecessor can stand there.
 
 	// And a LIVE predecessor ended BY THIS BATCH is the ordinary shape, already covered by
-	// TestF105PairReplacementEndsThePredecessor; asserted here too so the matrix is whole.
+	// TestPairReplacementEndsThePredecessor; asserted here too so the matrix is whole.
 	t.Run("live, ended by this batch", func(t *testing.T) {
 		if err := pairOver(t, "f105-pred-batchend", mqttExchangePublish, true); err != nil {
 			t.Fatalf("a replacement ending its live predecessor in the batch was refused: %v", err)
@@ -350,16 +350,16 @@ func TestF105PairReplacementPredecessorDispositions(t *testing.T) {
 	})
 }
 
-// TestF105ReplacementRequiresARealObligation is Codex consult-2 item 6: the replacement path
+// TestReplacementRequiresARealObligation is Codex consult-2 item 6: the replacement path
 // must not rest on a lineage STRING.
 //
 // checkPairBindings delegates "every allocation has an obligation" to the replacement
 // validator for a replacing register, so the validator owes the proof: the occupant's lineage
 // must name a readable exchange that agrees with the occupant. A readable ORPHAN register
 // whose exchange is gone answers to nobody and excludes nobody.
-func TestF105ReplacementRequiresARealObligation(t *testing.T) {
+func TestReplacementRequiresARealObligation(t *testing.T) {
 	t.Run("the occupant's obligation does not exist", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-orphanreg")
+		r, done := testNewReplEnv(t, "f105-repl-orphanreg")
 		defer done()
 		r.deleteMarker(t)
 		// Delete the obligation, leaving a readable register naming a lineage nothing backs.
@@ -373,10 +373,10 @@ func TestF105ReplacementRequiresARealObligation(t *testing.T) {
 	})
 
 	t.Run("a continued obligation that has already ended", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-endedcont")
+		r, done := testNewReplEnv(t, "f105-repl-endedcont")
 		defer done()
 		r.deleteMarker(t)
-		if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, mqttExchangeRejected); err != nil {
+		if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testGen, r.occLin, mqttExchangeRejected); err != nil {
 			t.Fatalf("ending the obligation failed: %v", err)
 		}
 		// Rewriting the register of an exchange that ended re-opens a completed obligation
@@ -387,7 +387,7 @@ func TestF105ReplacementRequiresARealObligation(t *testing.T) {
 	})
 
 	t.Run("a continuation that advances the slot", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-phasejump")
+		r, done := testNewReplEnv(t, "f105-repl-phasejump")
 		defer done()
 		r.deleteMarker(t)
 		reg := r.replacingRegister(t, r.occLin, r.occ.QoS)
@@ -414,7 +414,7 @@ func TestF105ReplacementRequiresARealObligation(t *testing.T) {
 	})
 }
 
-// TestF105ReplacementRefusesAPastPubRecOccupant is consult-2 item 5: the disposition gate.
+// TestReplacementRefusesAPastPubRecOccupant is consult-2 item 5: the disposition gate.
 //
 // mqttSlotAdmitsDisposition is an acceptance boundary this conversion RELAXES — the boundary
 // now permits replacement at all — so the gate needs its own fixture rather than a note in a
@@ -425,15 +425,15 @@ func TestF105ReplacementRequiresARealObligation(t *testing.T) {
 // FOCUSED, and deliberately not end-to-end. Other validators independently refuse this batch,
 // so this test drives checkRegisterReplacements DIRECTLY and asserts the gate's own refusal;
 // claiming an end-to-end mutation kill here would be claiming a kill another guard masks.
-func TestF105ReplacementRefusesAPastPubRecOccupant(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-repl-pastpubrec")
+func TestReplacementRefusesAPastPubRecOccupant(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-repl-pastpubrec")
 	defer done()
 	r.deleteMarker(t)
 
 	// Walk the obligation and its slot past PUBREC together, so the occupant is the shape
 	// the gate exists for and its exchange agrees with it.
 	for _, step := range []mqttExchangePhase{mqttExchangePubRecObserved} {
-		if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, step); err != nil {
+		if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testGen, r.occLin, step); err != nil {
 			t.Fatalf("advancing the obligation to phase %d failed: %v", int(step), err)
 		}
 	}
@@ -461,7 +461,7 @@ func TestF105ReplacementRefusesAPastPubRecOccupant(t *testing.T) {
 	}
 }
 
-// TestF105ReplacementExpectationNamesTheInspectedMarker is consult-2 item 7.
+// TestReplacementExpectationNamesTheInspectedMarker is consult-2 item 7.
 //
 // The store's CAS establishes "the marker at commit matches the supplied expectation". This
 // establishes "the supplied expectation names the marker whose body this validator inspected".
@@ -472,8 +472,8 @@ func TestF105ReplacementRefusesAPastPubRecOccupant(t *testing.T) {
 //
 // Driven DIRECTLY at the validator, so the store CAS cannot supply the refusal. A first
 // mutation run read the overlap on a stationary store as redundancy; it is not.
-func TestF105ReplacementExpectationNamesTheInspectedMarker(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-repl-expectbind")
+func TestReplacementExpectationNamesTheInspectedMarker(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-repl-expectbind")
 	defer done()
 	mseq := r.markerSeq(t)
 	if mseq == 0 {
@@ -505,7 +505,7 @@ func TestF105ReplacementExpectationNamesTheInspectedMarker(t *testing.T) {
 
 // attempt is the transition description the boundary checks are driven with directly, for the
 // tests that must not let the store's CAS supply their refusal.
-func (r *testF105ReplEnv) attempt(txn string) *mqttTransitionAttempt {
+func (r *testReplEnv) attempt(txn string) *mqttTransitionAttempt {
 	al := r.asm.jsa.loadOutboundAuthority(r.id, r.epoch)
 	return &mqttTransitionAttempt{
 		ID: r.id, Epoch: r.epoch, Txn: txn, Op: "op-" + txn,
@@ -515,9 +515,9 @@ func (r *testF105ReplEnv) attempt(txn string) *mqttTransitionAttempt {
 }
 
 // occExchange is the occupant's own obligation, as it durably stands.
-func (r *testF105ReplEnv) occExchange(t *testing.T) *mqttOutboundExchange {
+func (r *testReplEnv) occExchange(t *testing.T) *mqttOutboundExchange {
 	t.Helper()
-	x, _, err := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, testF105Gen, r.occLin)
+	x, _, err := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, testGen, r.occLin)
 	if err != nil || x == nil {
 		t.Fatalf("the occupant's obligation does not load back: %v", err)
 	}
@@ -525,26 +525,26 @@ func (r *testF105ReplEnv) occExchange(t *testing.T) *mqttOutboundExchange {
 }
 
 // exchangeSeq is the sequence an exchange currently stands at, which an advance must CAS.
-func (r *testF105ReplEnv) exchangeSeq(t *testing.T, nonce string) uint64 {
+func (r *testReplEnv) exchangeSeq(t *testing.T, nonce string) uint64 {
 	t.Helper()
 	smsg, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
-		mqttExchangeSubject(getHash(r.id), testF105Gen, nonce))
+		mqttExchangeSubject(getHash(r.id), testGen, nonce))
 	if err != nil {
 		t.Fatalf("the exchange %q does not load back: %v", nonce, err)
 	}
 	return smsg.Sequence
 }
 
-// TestF105ReplacementRefusalsAreTheBoundarys walks every way a replacement can be composed
+// TestReplacementRefusalsAreTheBoundarys walks every way a replacement can be composed
 // wrongly while every one of its members is individually legal and lands at a sequence the
 // STORE would accept.
 //
 // Each arm is a mutation oracle, and they are separate sub-tests because a single fixture
 // carrying several defects would be killed by whichever check fires first — which is how a
 // mutation that removes a later check survives.
-func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
+func TestReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	t.Run("register-only with a fresh lineage", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-freshlin")
+		r, done := testNewReplEnv(t, "f105-repl-freshlin")
 		defer done()
 		r.deleteMarker(t)
 		// An absent marker means POSSIBLY ATTEMPTED. Minting a fresh lineage here abandons
@@ -555,7 +555,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("register-only that also admits an exchange", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-dupadmit")
+		r, done := testNewReplEnv(t, "f105-repl-dupadmit")
 		defer done()
 		r.deleteMarker(t)
 		reg := r.replacingRegister(t, r.occLin, r.occ.QoS)
@@ -568,7 +568,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("pair replacement leaving its predecessor standing", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-orphan")
+		r, done := testNewReplEnv(t, "f105-repl-orphan")
 		defer done()
 		mseq := r.markerSeq(t)
 		reg := r.replacingRegister(t, _EMPTY_, r.occ.QoS)
@@ -586,7 +586,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("pair replacement inheriting a lineage", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-pairinherit")
+		r, done := testNewReplEnv(t, "f105-repl-pairinherit")
 		defer done()
 		mseq := r.markerSeq(t)
 		reg := r.replacingRegister(t, r.occLin, r.occ.QoS)
@@ -596,7 +596,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("a QoS the occupant does not hold", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-qos")
+		r, done := testNewReplEnv(t, "f105-repl-qos")
 		defer done()
 		r.deleteMarker(t)
 		// The occupant's QoS is the only durable trace of what the client may be holding,
@@ -607,7 +607,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("a marker overwrite with no register replacing its slot", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-lonemarker")
+		r, done := testNewReplEnv(t, "f105-repl-lonemarker")
 		defer done()
 		mseq := r.markerSeq(t)
 		reg := r.replacingRegister(t, _EMPTY_, r.occ.QoS)
@@ -619,7 +619,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("an occupant naming another delivery", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-otherdelivery")
+		r, done := testNewReplEnv(t, "f105-repl-otherdelivery")
 		defer done()
 		r.deleteMarker(t)
 		reg := r.replacingRegister(t, r.occLin, r.occ.QoS)
@@ -642,7 +642,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("register-only while the occupant's marker still stands", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-modelies")
+		r, done := testNewReplEnv(t, "f105-repl-modelies")
 		defer done()
 		// The marker is NOT deleted, so the occupant is PROVEN UNSENT and the disposition is
 		// PAIR. A register-only batch is individually legal in every member, and landing it
@@ -654,7 +654,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("a pair replacement over a marker naming another allocation", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-strayemarker")
+		r, done := testNewReplEnv(t, "f105-repl-strayemarker")
 		defer done()
 		mseq := r.markerSeq(t)
 		// The marker on the subject is rewritten to name SOME OTHER allocation, at its own
@@ -687,7 +687,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("a replacing register admitting nothing", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-noobligation")
+		r, done := testNewReplEnv(t, "f105-repl-noobligation")
 		defer done()
 		mseq := r.markerSeq(t)
 		// PAIR mode with a fresh lineage and no exchange admitted. checkPairBindings exempts
@@ -701,7 +701,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("an unreadable marker beside the occupant", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-opaque")
+		r, done := testNewReplEnv(t, "f105-repl-opaque")
 		defer done()
 		if _, err := r.asm.jsa.storeMsg(r.regSubj+"."+mqttInflightMarkerSuffix, -1,
 			[]byte("not a marker")); err != nil {
@@ -717,7 +717,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 
 	t.Run("a stale sequence", func(t *testing.T) {
-		r, done := testF105NewReplEnv(t, "f105-repl-stale")
+		r, done := testNewReplEnv(t, "f105-repl-stale")
 		defer done()
 		r.deleteMarker(t)
 		reg := r.replacingRegister(t, r.occLin, r.occ.QoS)
@@ -731,9 +731,9 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 	})
 }
 
-// TestF105RegisterOnlyReplacementNeedsAPublishablePhase is the gap the first bounded
+// TestRegisterOnlyReplacementNeedsAPublishablePhase is the gap the first bounded
 // implementation review found, and it is NOT the same case as
-// TestF105ReplacementRefusesAPastPubRecOccupant above.
+// TestReplacementRefusesAPastPubRecOccupant above.
 //
 // That test moves the occupant's REGISTER past PUBREC as well, so mqttSlotAdmitsDisposition
 // refuses it and the phase never comes into question. The hole was the batch where the two
@@ -750,7 +750,7 @@ func TestF105ReplacementRefusalsAreTheBoundarys(t *testing.T) {
 // DRIVEN DIRECTLY at checkRegisterReplacements, for the same reason as the test above: other
 // validators refuse neighbouring shapes, and a kill claimed end-to-end would be one another
 // guard masks.
-func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
+func TestRegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// path is walked STEP BY STEP, because phase advancement is itself validated and a
@@ -769,7 +769,7 @@ func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 			mqttExchangeTerminalPendingDrain}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r, done := testF105NewReplEnv(t, "f105-repl-phase")
+			r, done := testNewReplEnv(t, "f105-repl-phase")
 			defer done()
 			// No marker: absence means POSSIBLY ATTEMPTED, which is what selects
 			// register-only. The occupant's register is left in PUBLISH throughout — that is
@@ -777,7 +777,7 @@ func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 			r.deleteMarker(t)
 
 			for _, step := range tc.path {
-				if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testF105Gen, r.occLin, step); err != nil {
+				if _, err := testAdvanceLive(t, &r.asm.jsa, r.id, r.epoch, testGen, r.occLin, step); err != nil {
 					t.Fatalf("advancing the obligation to phase %d failed: %v", int(step), err)
 				}
 			}
@@ -813,17 +813,17 @@ func TestF105RegisterOnlyReplacementNeedsAPublishablePhase(t *testing.T) {
 	}
 }
 
-// TestF105PairSupersedesProvenUnsentPredecessor is the TRUTHFUL pair ending: a proven-unsent
+// TestPairSupersedesProvenUnsentPredecessor is the TRUTHFUL pair ending: a proven-unsent
 // occupant's PUBLISH obligation is ended as mqttExchangeSupersededUnsent when its identifier is
 // re-allocated, never Terminal (completion) or Rejected (client refusal), which would fabricate a
 // client answer that never came for a delivery that never left the broker.
-func TestF105PairSupersedesProvenUnsentPredecessor(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-superseded")
+func TestPairSupersedesProvenUnsentPredecessor(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-superseded")
 	defer done()
 
 	adm := r.replacingFor(t, mqttReplacePair, "txn-superseded")
 	adm.Exchange = &mqttOutboundExchange{
-		ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Nonce: adm.Register.Lin,
+		ID: r.id, Epoch: r.epoch, Gen: testGen, Nonce: adm.Register.Lin,
 		PI: r.pi, QoS: r.occ.QoS, Phase: mqttExchangePublish,
 		AdmitTxn: "txn-superseded", Tenure: adm.Auth.Tenure,
 	}
@@ -842,7 +842,7 @@ func TestF105PairSupersedesProvenUnsentPredecessor(t *testing.T) {
 	if lerr != nil || cur == nil || cur.Lin != adm.Register.Lin {
 		t.Fatalf("the pair replacement did not install its fresh lineage")
 	}
-	px, _, perr := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, testF105Gen, r.occLin)
+	px, _, perr := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, testGen, r.occLin)
 	if perr != nil || px == nil {
 		t.Fatalf("the superseded predecessor does not load back: %v", perr)
 	}
@@ -851,13 +851,13 @@ func TestF105PairSupersedesProvenUnsentPredecessor(t *testing.T) {
 	}
 }
 
-// TestF105BoundaryRefusesALoneSupersession proves the rule is the write boundary's, not just the
+// TestBoundaryRefusesALoneSupersession proves the rule is the write boundary's, not just the
 // composer's convention: a mqttExchangeSupersededUnsent ending is authorized ONLY as the
 // predecessor half of a pair replacement that re-allocates the identifier to a fresh obligation.
 // A lone supersession would end a proven-unsent obligation with no client answer and no
 // successor, silently dropping the delivery.
-func TestF105BoundaryRefusesALoneSupersession(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "f105-lone-superseded")
+func TestBoundaryRefusesALoneSupersession(t *testing.T) {
+	r, done := testNewReplEnv(t, "f105-lone-superseded")
 	defer done()
 
 	pred := *r.occExchange(t)
@@ -870,15 +870,15 @@ func TestF105BoundaryRefusesALoneSupersession(t *testing.T) {
 		Attempt: &mqttTransitionAttempt{
 			ID: r.id, Epoch: r.epoch, Txn: "txn-lone", Op: "op-lone",
 			Kind: mqttTransitionAdmitExchange, PrevTxn: r.auth.OwnerTxn, Rev: r.auth.Rev + 1,
-			Gen: testF105Gen, Tenure: r.auth.Tenure, OwnerTxn: r.auth.OwnerTxn,
+			Gen: testGen, Tenure: r.auth.Tenure, OwnerTxn: r.auth.OwnerTxn,
 		},
 		Prev: r.auth, PrevSeq: r.authSeq,
 		Auth: &mqttOutboundAuthority{
-			ID: r.id, Epoch: r.epoch, Gen: testF105Gen, Tenure: r.auth.Tenure,
+			ID: r.id, Epoch: r.epoch, Gen: testGen, Tenure: r.auth.Tenure,
 			State: mqttAuthorityServing, Rev: r.auth.Rev + 1, Txn: "txn-lone", OwnerTxn: r.auth.OwnerTxn,
 		},
 		Extra: []mqttTransitionMember{{
-			subj:   mqttExchangeSubject(getHash(r.id), testF105Gen, r.occLin),
+			subj:   mqttExchangeSubject(getHash(r.id), testGen, r.occLin),
 			expect: r.exchangeSeq(t, r.occLin), body: predBody,
 		}},
 	}

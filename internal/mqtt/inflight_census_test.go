@@ -242,7 +242,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C04w", kind: censusEdge, fn: "runInflightAdmission",
 		sink: "reapObservedRegister", status: censusLive,
-		test:     "TestF105OwnWriteEndedIsNotAdopted",
+		test:     "TestOwnWriteEndedIsNotAdopted",
 		mutation: "M17", oracle: "entry membership and slot presence after the ladder",
 		why: "our own landed write, since ended by a withdrawal: the tombstone is destroyed through the door and the allocation abandoned, never adopted for an exchange no acquisition may serve",
 	},
@@ -413,7 +413,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C16b", kind: censusEdge, fn: "claimRecoveredInflight",
 		sink: "storeInflightCAS", status: censusLive,
-		test:     "TestF099RetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister",
+		test:     "TestRetiredReadyTakesCustodyFromEvidenceReadAfterTheRegister",
 		mutation: "N21-C16b", oracle: "the slot's Claim after resume",
 		why: "SLOT-ONLY since issue #107 7b (an ordinary slot's ownership is its exchange's entitlement): " +
 			"the ordered PRE-CONNACK custody contest shared by the positive transferable " +
@@ -448,7 +448,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C62", kind: censusEdge, fn: "admitStoredPubRel",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092AdmissionRequiresAnAtomicallyAcquiredAction",
+		test:     "TestAdmissionRequiresAnAtomicallyAcquiredAction",
 		mutation: "N-adm-read", oracle: "admission's verdict on an indeterminate slot read",
 		why: "the admission read: the slot that owns the identifier is loaded and an " +
 			"indeterminate read refuses rather than being guessed into an absence",
@@ -456,7 +456,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C63b", kind: censusEdge, fn: "advanceFinishedSlotToTerminal",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092UnresolvedTerminalAdvanceRefusesTheResume",
+		test:     "TestUnresolvedTerminalAdvanceRefusesTheResume",
 		mutation: "N-advance-readback", oracle: "the resume's accept/refuse outcome per readback class",
 		why: "THE OUTCOME READBACK. A failed CAS returns one `false` for a storage failure, a " +
 			"disappearance, a replacement and a moved phase, and those owe the resume different " +
@@ -466,7 +466,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C67", kind: censusEdge, fn: "transferCustodyForAdmission",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF092CompetingCustodyTransfersLandOnce",
+		test:     "TestCompetingCustodyTransfersLandOnce",
 		mutation: "N-custody-transfer", oracle: "the slot's Claim/ClaimSeq after the competing transfers",
 		why: "SLOT-ONLY since issue #107 7b: the inline custody repair: a quiescent slot whose ONLY failing admission check is " +
 			"custody is moved to the proven-current incarnation, under the exact observed claim " +
@@ -484,7 +484,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C64", kind: censusEdge, fn: "resolveUnacquiredAction",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092UnreadableActionSlotNeverRetiresItsOnlyHolder",
+		test:     "TestUnreadableActionSlotNeverRetiresItsOnlyHolder",
 		mutation: "N-unacq-read", oracle: "the tentative holder's fate on an unreadable reread",
 		why: "an unacquired action's reread: the tentative holder is retired only once the reread " +
 			"proves this token absent; an unreadable or indeterminate read keeps it",
@@ -492,14 +492,14 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C65a", kind: censusEdge, fn: "retireActionLocked_",
 		sink: "delete:sendsInFlight", status: censusLive,
-		test:     "TestF092ActionDrainRequiresTheExactToken",
+		test:     "TestActionDrainRequiresTheExactToken",
 		mutation: "N-retire-del", oracle: "the sendsInFlight entry's presence after a drain",
 		why: "the action holder's in-memory removal: only the exact token's holder is removed",
 	},
 	{
 		id: "C65b", kind: censusEdge, fn: "retireActionLocked_",
 		sink: "sendHoldLiveLocked", status: censusLive,
-		test:     "TestF092ActionDrainRequiresTheExactToken",
+		test:     "TestActionDrainRequiresTheExactToken",
 		mutation: "N-retire-live", oracle: "the liveness check guarding the removal",
 		why: "the liveness predicate consulted before removing the action term, distinct from " +
 			"the delete it guards",
@@ -507,7 +507,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C66", kind: censusEdge, fn: "releaseTerminalReservation",
 		sink: "delete:pendingPubRel", status: censusLive,
-		test:     "TestF092TerminalReleaseFreesTheIdentifier",
+		test:     "TestTerminalReleaseFreesTheIdentifier",
 		mutation: "N-relterm", oracle: "the terminal reservation placeholder's removal",
 		why: "the terminal reservation's EXACT nonce-bound removal: it frees the identifier only " +
 			"once cleanup is confirmed, and never a later delivery that reused the map key",
@@ -515,7 +515,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C37a", kind: censusEdge, fn: "phaseRecoveredPublishSlotToReady",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
+		test:     "TestRecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
 		mutation: "N21-C37a", oracle: "the recovered slot state and canonical tuple",
 		why: "recovery route B's `publish -> pubrel_ready` arrow, licensed only by the " +
 			"present exact PUBREL selected from a complete scan",
@@ -523,7 +523,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C37ar", kind: censusEdge, fn: "phaseRecoveredPublishSlotToReady",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
+		test:     "TestRecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
 		mutation: "N21-C37ar", oracle: "the post-CAS slot lineage and phase",
 		why: "a rejected or ambiguous route-B CAS is resolved only from an authoritative " +
 			"reread of the same exchange already past PUBREC; the write result alone proves no handoff",
@@ -531,7 +531,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C37a2", kind: censusEdge, fn: "phaseRecoveredPublishSlotToReady",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF105RouteBRecordsTheRecoveredPubRec",
+		test:     "TestRouteBRecordsTheRecoveredPubRec",
 		mutation: "M25", oracle: "the slot at pubrel_ready beside an exchange at PUBREC-observed",
 		why: "the ORDINARY route-B rebind, from pubrel_intended once recordRecoveredPubRec has " +
 			"recorded the PUBREC the stored record proves; never a slot-only arrow from publish",
@@ -539,7 +539,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C37ar2", kind: censusEdge, fn: "phaseRecoveredPublishSlotToReady",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF105RouteBRecordsTheRecoveredPubRec",
+		test:     "TestRouteBRecordsTheRecoveredPubRec",
 		mutation: "M25", oracle: "the rebind starts from the recorded pubrel_intended slot",
 		why: "the read between the recorded PUBREC and the rebind: the rebind CASes the slot as " +
 			"the PUBREC arrow left it, identity-checked, never the pre-record body",
@@ -547,7 +547,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C49", kind: censusEdge, fn: "acquireActionFromPublish",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF092AdmissionRequiresAnAtomicallyAcquiredAction",
+		test:     "TestAdmissionRequiresAnAtomicallyAcquiredAction",
 		mutation: "M5b", oracle: "the canonical tuple on the slot after transmission",
 		why: "THE DIRECT ARROW: `publish -> pubrel_sending` installing the canonical identity and " +
 			"the action token in ONE CAS, so evidence and authorization land together",
@@ -555,14 +555,14 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C49b", kind: censusEdge, fn: "mqttAcquirePubRelAction",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF092StalePubRelUnderAnotherExchangesIdentifierIsRefused",
+		test:     "TestStalePubRelUnderAnotherExchangesIdentifierIsRefused",
 		mutation: "M1", oracle: "the PUBREL transmission count",
 		why: "the ordinary `pubrel_ready -> pubrel_sending` acquisition",
 	},
 	{
 		id: "C35a", kind: censusEdge, fn: "mqttTerminalizeOnPubComp",
 		sink: "casInflightSlot", status: censusLive,
-		test:     "TestF092TerminalReleaseFreesTheIdentifier",
+		test:     "TestTerminalReleaseFreesTheIdentifier",
 		mutation: "M2", oracle: "slot presence and bumpPI's next identifier",
 		why: "PUBCOMP's ONE arrow to `pubrel_terminal`, after which cleanup may finish the " +
 			"exchange. It is one arrow rather than two because issue #100 took the live action out " +
@@ -584,7 +584,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35d", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "reapRegisterWithVerdictGated", status: censusLive,
-		test:     "TestF092TerminalReleaseFreesTheIdentifier",
+		test:     "TestTerminalReleaseFreesTheIdentifier",
 		mutation: "M2", oracle: "slot presence",
 		why: "the terminal EXACT deletion, which needs three things and not two: subject " +
 			"addressing (issue #38), identity authorization, and a FRESHNESS FENCE on the observed " +
@@ -598,7 +598,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C29c2", kind: censusEdge, parent: "C29c", fn: "handOffPublishEntryLocked",
 		sink: "delete:pendingPublish", status: censusLive,
-		test:     "TestF093CompletedExchangeLeavesNoPublishEntryOrMapping",
+		test:     "TestCompletedExchangeLeavesNoPublishEntryOrMapping",
 		mutation: "M3", oracle: "pendingPublish membership and the capacity charge",
 		why: "the compare-delete of the PUBLISH entry, AFTER the owner and the suppression are in " +
 			"place — removing it first would leave the identifier with no reservation at all",
@@ -606,7 +606,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C29c3", kind: censusEdge, parent: "C29c", fn: "handOffPublishEntryLocked",
 		sink: "delete:cpending", status: censusLive,
-		test:     "TestF093CompletedExchangeLeavesNoPublishEntryOrMapping",
+		test:     "TestCompletedExchangeLeavesNoPublishEntryOrMapping",
 		mutation: "M3", oracle: "the cpending mapping for the source",
 		why: "the compare-delete of the source mapping, GUARDED on the identifier it names — " +
 			"untrackPublishEntry deletes it unconditionally and would remove a mapping a " +
@@ -630,7 +630,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C37c2", kind: censusEdge, parent: "C37c", fn: "recoverInflightRegistersOnce",
 		sink: "delete:pendingPublish", status: censusLive,
-		test:     "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
+		test:     "TestRecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
 		mutation: "N21-C37c2", oracle: "pendingPublish and pendingPubRel membership",
 		why: "a reused session object's exact PUBLISH entry must not survive beside the " +
 			"durable slot that route B already advanced to PUBREL",
@@ -638,7 +638,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C37c3", kind: censusEdge, parent: "C37c", fn: "recoverInflightRegistersOnce",
 		sink: "delete:cpending", status: censusLive,
-		test:     "TestF092RecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
+		test:     "TestRecoveryRoutesPublishPlusExactPubRelBeforeSourceCompletion",
 		mutation: "N21-C37c3", oracle: "the exact source-to-identifier mapping",
 		why: "the route-B PUBLISH mapping is compare-deleted with its entry so a later " +
 			"source offer cannot route back into the completed handoff",
@@ -667,7 +667,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35ar", kind: censusEdge, fn: "mqttTerminalizeOnPubComp",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092TerminalReleaseFreesTheIdentifier",
+		test:     "TestTerminalReleaseFreesTheIdentifier",
 		mutation: "N21-C35ar", oracle: "the arrow taken for each observed state",
 		why: "the read that classifies the observed phase for PUBCOMP, and whose indeterminate " +
 			"outcome must neither free nor delete: the client has answered, so what remains is a " +
@@ -676,7 +676,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35ar2", kind: censusEdge, fn: "mqttTerminalizeOnPubComp",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF105PubCompResolvesALostResponseInline",
+		test:     "TestPubCompResolvesALostResponseInline",
 		mutation: "M12", oracle: "the completion is recorded inline after a landed-lost final attempt",
 		why: "the EXHAUSTION read: a failed final attempt may hide a batch that landed, so the " +
 			"completion is decided from the slot as it stands rather than from the attempt count",
@@ -684,7 +684,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35dr", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092TerminalReleaseFreesTheIdentifier",
+		test:     "TestTerminalReleaseFreesTheIdentifier",
 		mutation: "N21-C35dr", oracle: "slot presence under a rewritten sequence",
 		why: "the terminal read, which carries the FRESHNESS FENCE: a rewrite between observation " +
 			"and delete means a concurrent operation re-targeted the exchange, so a stale " +
@@ -693,7 +693,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35dr2", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092TerminalFinalizationRereadsTheFreshnessFence",
+		test:     "TestTerminalFinalizationRereadsTheFreshnessFence",
 		mutation: "N21-C35dr2", oracle: "slot presence after a rewrite during duplicate disposal",
 		why: "the final reread moves the freshness fence to the irreversible edge: a rewrite " +
 			"while the complete PUBREL scan is running preserves the re-targeted slot",
@@ -701,7 +701,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35dr3", kind: censusEdge, fn: "finalizeTerminalSlotObserved",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF092TerminalReleaseFreesTheIdentifier",
+		test:     "TestTerminalReleaseFreesTheIdentifier",
 		mutation: "N21-C35dr3", oracle: "the slot subject is absent before the local reservation is released",
 		why: "the post-delete consequence check: an exact-sequence delete may succeed while a " +
 			"same-identity rewrite survives at the reusable subject, so memory is released only " +
@@ -710,7 +710,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35rt", kind: censusEdge, fn: "clearTerminalRetirementLocked_",
 		sink: "delete:srcAckOwed", status: censusLive,
-		test:     "TestF093CompletedExchangeLeavesNoPublishEntryOrMapping",
+		test:     "TestCompletedExchangeLeavesNoPublishEntryOrMapping",
 		mutation: "N21-C35rt", oracle: "srcAckOwed membership after terminal cleanup",
 		why: "a terminal exchange whose source is positively non-reofferable releases its " +
 			"matching in-memory suppression only after the slot deletion is confirmed",
@@ -718,7 +718,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35ds", kind: censusEdge, fn: "disposeTerminalPubRelRecords",
 		sink: "scanPubRelRecords", status: censusLive,
-		test:     "TestF092IncompleteTerminalDuplicateScanRetainsTheSlot",
+		test:     "TestIncompleteTerminalDuplicateScanRetainsTheSlot",
 		mutation: "N21-C35ds", oracle: "terminal slot presence",
 		why: "terminal deletion is licensed only by a complete scan of every PUBREL record " +
 			"on the incarnation subject; partial enumeration is never evidence of absence",
@@ -726,7 +726,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35dp", kind: censusEdge, fn: "disposeTerminalPubRelRecords",
 		sink: "deleteMsg", status: censusLive,
-		test:     "TestF092TerminalDuplicateDisposalPrecedesSlotDeletion",
+		test:     "TestTerminalDuplicateDisposalPrecedesSlotDeletion",
 		mutation: "N21-C35dp", oracle: "duplicate record and terminal slot presence",
 		why: "each valid same-nonce canonical or duplicate record is removed with confirmation, " +
 			"after affine proof discharge and before the owner slot is deleted",
@@ -742,7 +742,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C35cr2", kind: censusEdge, fn: "startActionDrain",
 		sink: "loadInflightRecord", status: censusLive,
-		test:     "TestF105DrainCompletionFinalizesFromTheSlotSequence",
+		test:     "TestDrainCompletionFinalizesFromTheSlotSequence",
 		mutation: "M16", oracle: "the slot is deleted inline from its own sequence",
 		why: "the read after an acknowledged drain completion: the op returns the AUTHORITY " +
 			"sequence, and finalize's freshness fence needs the slot's own",
@@ -849,7 +849,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "C55t", kind: censusEdge, fn: "confirmInflightRegister",
 		sink: "delete:pendingPublish", status: censusLive,
-		test:     "TestF088InheritedReplacementCancellationEnrolsTheDrain",
+		test:     "TestInheritedReplacementCancellationEnrolsTheDrain",
 		mutation: "N21-C55t", oracle: "pendingPublish membership and the identifier's exclusion",
 		why: "issue #90 WP3 edit 5 (staged): a register-only replacement that landed over a cancelled " +
 			"allocation inherited a possibly-transmitted occupant, so nothing destroys or tombstones it; " +
@@ -875,7 +875,7 @@ var mqttCensusManifest = []mqttCensusRow{
 	{
 		id: "X01", kind: censusExemption, fn: "reconcileOrphanInflight",
 		sink: "deleteInflightRegister", status: censusLive,
-		test:     "TestF036OrphanSweepRetainsAnUnlicensedRegister",
+		test:     "TestOrphanSweepRetainsAnUnlicensedRegister",
 		mutation: "N21-X01-positive", oracle: "a live other-generation register's presence",
 		why: "whole-generation teardown, permitted ONLY behind the retirement watermark; its mutation is POSITIVE — remove the proof and a live generation's register is deleted",
 	},

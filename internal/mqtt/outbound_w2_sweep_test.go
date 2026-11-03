@@ -22,7 +22,7 @@ import (
 	"github.com/nats-io/nuid"
 )
 
-// TestF105PlainSweepDeletesOnlyARetiredName pins that the plain orphan sweep's DELETE is
+// TestPlainSweepDeletesOnlyARetiredName pins that the plain orphan sweep's DELETE is
 // authorized by a name's RETIRED ownership and by nothing else (issue #107 §5.1 points 5 and 6, WP-F
 // W2 row D3). Three consumers stand in ONE pass, each unreferenced by any session and aged past
 // the grace window, so the absence of a reference - the sweep's original, wrong authority - would
@@ -33,7 +33,7 @@ import (
 //     never that the name is free;
 //   - a RETIRED name resurrected by a late CREATE, the positive control that must go, so a pass that
 //     deleted nothing cannot satisfy the two survival assertions vacuously.
-func TestF105PlainSweepDeletesOnlyARetiredName(t *testing.T) {
+func TestPlainSweepDeletesOnlyARetiredName(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "w2-sweep-retired-only")
 	jsa := &e.asm.jsa

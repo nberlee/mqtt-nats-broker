@@ -17,10 +17,10 @@ package mqtt
 
 import "testing"
 
-// TestF105NameOwnershipTransitionLegality pins the whole legality matrix of the logical-use
+// TestNameOwnershipTransitionLegality pins the whole legality matrix of the logical-use
 // fence: a name goes absent -> LIVE(owner) -> RETIRED(owner) and nowhere else. It is the
 // pure invariant, exercised without a store so every arm is exact.
-func TestF105NameOwnershipTransitionLegality(t *testing.T) {
+func TestNameOwnershipTransitionLegality(t *testing.T) {
 	live := func(gen, inc string) *mqttNameOwnership {
 		return &mqttNameOwnership{ID: "c", Epoch: "e", Stream: mqttOwnedStreamMsgs, Name: "n",
 			State: mqttNameOwnLive, OwnerGen: gen, OwnerInc: inc}
@@ -71,11 +71,11 @@ func TestF105NameOwnershipTransitionLegality(t *testing.T) {
 	}
 }
 
-// TestF105NameOwnershipBoundaryEnforcesTheFence drives the real write boundary: provisioning a
+// TestNameOwnershipBoundaryEnforcesTheFence drives the real write boundary: provisioning a
 // source consumer claims its name LIVE, a second owner of the same physical name is refused,
 // and a stray ownership member on a kind that neither provisions nor disposes is refused.
-func TestF105NameOwnershipBoundaryEnforcesTheFence(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-name-ownership")
+func TestNameOwnershipBoundaryEnforcesTheFence(t *testing.T) {
+	e, done := testNewEnv(t, "f105-name-ownership")
 	defer done()
 	jsa := &e.asm.jsa
 	e.bootstrap(t, "boot")
@@ -85,28 +85,28 @@ func TestF105NameOwnershipBoundaryEnforcesTheFence(t *testing.T) {
 	// (1) Provisioning a source consumer claims its physical name LIVE, keyed by the name and
 	// owned by this resource incarnation.
 	if _, err := jsa.opProvisionResource(e.id, e.epoch, "txn-p1", "op-p1",
-		testF105Gen, "tenure-boot", "inc-a", name, mqttResourceSourceConsumer); err != nil {
+		testGen, "tenure-boot", "inc-a", name, mqttResourceSourceConsumer); err != nil {
 		t.Fatalf("provisioning the source consumer was refused: %v", err)
 	}
 	own, _, oerr := jsa.loadNameOwnership(e.id, e.epoch, mqttOwnedStreamMsgs, name)
 	if oerr != nil || own == nil {
 		t.Fatalf("the name's ownership did not land (%v, %v)", own, oerr)
 	}
-	if own.State != mqttNameOwnLive || own.OwnerGen != testF105Gen || own.OwnerInc != "inc-a" {
+	if own.State != mqttNameOwnLive || own.OwnerGen != testGen || own.OwnerInc != "inc-a" {
 		t.Fatalf("the ownership record is %+v", own)
 	}
 
 	// (2) A SECOND owner claiming the SAME physical name is refused — a replacement must use a
 	// fresh name, never relive a standing one.
 	if _, err := jsa.opProvisionResource(e.id, e.epoch, "txn-p2", "op-p2",
-		testF105Gen, "tenure-boot", "inc-b", name, mqttResourceSourceConsumer); err == nil {
+		testGen, "tenure-boot", "inc-b", name, mqttResourceSourceConsumer); err == nil {
 		t.Fatal("a second owner claimed a name already held LIVE")
 	}
 
 	// (3) A stray ownership member on a kind that neither provisions nor disposes is refused at
 	// the boundary, keyed on the member and not trusted to the composer.
 	stray, merr := mqttNameOwnershipMember(e.id, e.epoch, mqttOwnedStreamMsgs, "$MQTT_src_stray",
-		mqttNameOwnLive, testF105Gen, "inc-c", 0)
+		mqttNameOwnLive, testGen, "inc-c", 0)
 	if merr != nil {
 		t.Fatalf("composing the stray member failed: %v", merr)
 	}

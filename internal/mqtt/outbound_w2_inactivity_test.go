@@ -24,13 +24,13 @@ import (
 
 // The inactivity prerequisite of a depended-on consumer (issue #107 WP-F W2, rows D4 and D4c).
 
-// TestF105ReadinessRefusesAStreamInactivityLimit pins that readiness for use refuses a source
+// TestReadinessRefusesAStreamInactivityLimit pins that readiness for use refuses a source
 // whose STREAM imposes a consumer inactivity limit, and does so itself: the refusal is the typed
 // inactivity refusal, from the durable/configuration half of readiness, which runs before any
 // physical consumer is looked up. The server substitutes the stream's limit for a consumer that
 // requests none, so the consumer-threshold check after the lookup would also refuse; a readiness
 // that passed here would be leaning on that later snapshot of one consumer for a stream-wide fact.
-func TestF105ReadinessRefusesAStreamInactivityLimit(t *testing.T) {
+func TestReadinessRefusesAStreamInactivityLimit(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "w2-readiness-stream-limit")
 	jsa := &e.asm.jsa
@@ -61,7 +61,7 @@ func TestF105ReadinessRefusesAStreamInactivityLimit(t *testing.T) {
 	}
 }
 
-// TestF105AdmittedQoS2DependencySurvivesOffline is the D4c witness (it re-expresses
+// TestAdmittedQoS2DependencySurvivesOffline is the D4c witness (it re-expresses
 // TestMQTTReconcileEnrolledSourceSurvivesBrokerThreshold, whose broker option no longer exists).
 // A QoS 2 delivery past PUBREC is an admitted obligation depending on two consumers: its source
 // (the redelivery) and the generation's PUBREL consumer (the interest that retains the canonical
@@ -74,9 +74,9 @@ func TestF105ReadinessRefusesAStreamInactivityLimit(t *testing.T) {
 // so a completed exchange afterwards proves nothing about what survived the absence. The
 // consumers must be the ORIGINAL ones (same creation instant) and the canonical PUBREL must still
 // stand at the stream sequence the slot recorded.
-func TestF105AdmittedQoS2DependencySurvivesOffline(t *testing.T) {
+func TestAdmittedQoS2DependencySurvivesOffline(t *testing.T) {
 	t.Parallel()
-	w := testF105RestartWorldAtPubRelReady(t, "w2-d4c-offline")
+	w := testRestartWorldAtPubRelReady(t, "w2-d4c-offline")
 	t.Cleanup(func() { testMQTTShutdownServer(w.s) })
 	jsa := &w.asm.jsa
 

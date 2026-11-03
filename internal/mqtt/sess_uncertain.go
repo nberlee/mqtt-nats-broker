@@ -960,8 +960,8 @@ type mqttForeignDisposition struct {
 // wrapper, an inlined detach, or a new primitive all evade the text and none of them evades
 // this. The ordering asserted differs by route — record transaction CLOSED is common to
 // both, ownership gate still HELD is the prepared disposition's and its INVERSE is the
-// eviction tail's. See TestF084WillPhaseOrderingIsObserved and
-// TestF084RemotePersistWillPhaseIsUngated.
+// eviction tail's. See TestWillPhaseOrderingIsObserved and
+// TestRemotePersistWillPhaseIsUngated.
 var mqttTestWillPhaseProbeV atomic.Pointer[func(sess *mqttSession, asm *mqttAccountSessionManager)]
 
 // applyWill executes the ONE action the disposition prepared. It runs outside sess.mu, with

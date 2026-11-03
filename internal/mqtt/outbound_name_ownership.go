@@ -149,7 +149,7 @@ var mqttNameOwnRequired = mqttNameOwnMembers
 // validates the body's exact Stream and Name (loadNameOwnershipPhysical), turning a collision
 // into a refusal rather than an aliased authorization.
 func mqttNameOwnershipSubject(stream mqttOwnedStream, name string) string {
-	return mqttF105SubjectPrefix() + mqttNameOwnClassTk + "." +
+	return mqttOutboundRecordSubjectPrefix() + mqttNameOwnClassTk + "." +
 		string(stream) + "." + getHash(name)
 }
 
@@ -251,10 +251,10 @@ func mqttOwnedStreamForResourceKind(kind mqttResourceKind) (mqttOwnedStream, boo
 
 // mqttIsNameOwnershipSubject reports whether a subject is an ownership record.
 func mqttIsNameOwnershipSubject(subject string) bool {
-	if !mqttIsF105Subject(subject) {
+	if !mqttIsOutboundRecordSubject(subject) {
 		return false
 	}
-	return strings.HasPrefix(subject[len(mqttF105SubjectPrefix()):], mqttNameOwnClassTk+".")
+	return strings.HasPrefix(subject[len(mqttOutboundRecordSubjectPrefix()):], mqttNameOwnClassTk+".")
 }
 
 // loadNameOwnership reads a physical name's ownership record as it durably stands. ABSENT is

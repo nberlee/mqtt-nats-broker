@@ -256,7 +256,7 @@ func testIsTimeout(err error) bool {
 // wrapper's job, and a caller holding c.mu must not reach closeConnection. Each
 // wrapper returns bounded AND leaves the socket closed through the existing
 // error path, which is the slow-consumer disconnect.
-func TestF035EveryWriteIsDeadlineBounded(t *testing.T) {
+func TestEveryWriteIsDeadlineBounded(t *testing.T) {
 	budget := 5 * time.Second
 	testShortWriteDeadline(t, 150*time.Millisecond)
 
@@ -337,7 +337,7 @@ func TestF035EveryWriteIsDeadlineBounded(t *testing.T) {
 // A follow-up MQTT write proves nothing on its own, because it installs a fresh
 // deadline anyway; what models the bypassing TLS writer is the direct transport
 // write below, issued after the shortened deadline would have elapsed.
-func TestF035WriteDeadlineIsClearedAfterASuccessfulWrite(t *testing.T) {
+func TestWriteDeadlineIsClearedAfterASuccessfulWrite(t *testing.T) {
 	testShortWriteDeadline(t, 100*time.Millisecond)
 	c, sc := testStalledClient(t)
 	sc.setWritable(true)
@@ -364,7 +364,7 @@ func TestF035WriteDeadlineIsClearedAfterASuccessfulWrite(t *testing.T) {
 // T3. A mid-frame timeout. The conn absorbs a real prefix and then stalls, so the
 // write returns a timeout with partial progress and the wrapper closes. The
 // deadline must be cleared on the ERROR path too, not only on success.
-func TestF035PartialWriteTimesOutAndCloses(t *testing.T) {
+func TestPartialWriteTimesOutAndCloses(t *testing.T) {
 	budget := 5 * time.Second
 	testShortWriteDeadline(t, 150*time.Millisecond)
 	c, sc := testStalledClient(t)
@@ -394,7 +394,7 @@ func TestF035PartialWriteTimesOutAndCloses(t *testing.T) {
 // and a c.mu section can contain many bounded writes, so what is proved here is
 // that an incumbent's timeout releases wmu for a waiter — the mechanism — not a
 // figure for how long any lock is held.
-func TestF035WriteMutexContenderIsReleased(t *testing.T) {
+func TestWriteMutexContenderIsReleased(t *testing.T) {
 	budget := 10 * time.Second
 	testShortWriteDeadline(t, 200*time.Millisecond)
 	c, sc := testStalledClient(t)
@@ -448,7 +448,7 @@ func TestF035WriteMutexContenderIsReleased(t *testing.T) {
 // already closed. The installed deadline is the EARLIER of the drain's absolute
 // budget and now+mqttWriteDeadline, and an already-past cap is installed as-is so
 // the write fails at once — which is what a spent drain budget does today.
-func TestF035CapSelectsTheEarlierBound(t *testing.T) {
+func TestCapSelectsTheEarlierBound(t *testing.T) {
 	testShortWriteDeadline(t, 500*time.Millisecond)
 
 	t.Run("a shorter remaining budget wins", func(t *testing.T) {
@@ -527,7 +527,7 @@ func testDrainableClient(t *testing.T, s *Server) (*client, *testStallConn) {
 // (ii) is cap selection, driven through the real production route
 // (`shutdownDisconnect` → `writeActionlessFrameBy` → `writeSocket`) rather than by calling
 // the writer directly, so a change that dropped the cap anywhere along it is caught.
-func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
+func TestDrainReturnsWithAStalledClient(t *testing.T) {
 	t.Run("the stalled-write obstruction is removed", func(t *testing.T) {
 		budget := 10 * time.Second
 		testShortWriteDeadline(t, 300*time.Millisecond)
@@ -618,7 +618,7 @@ func TestF035DrainReturnsWithAStalledClient(t *testing.T) {
 // Driven through the real function rather than by taking `cc.mu` by hand: a fixture
 // that locked the mutex itself would prove nothing about where the delivery path
 // actually blocks.
-func TestF035DeliverySectionReleasesTheClientMutex(t *testing.T) {
+func TestDeliverySectionReleasesTheClientMutex(t *testing.T) {
 	budget := 10 * time.Second
 	testShortWriteDeadline(t, 300*time.Millisecond)
 
@@ -687,7 +687,7 @@ func TestF035DeliverySectionReleasesTheClientMutex(t *testing.T) {
 // buffer — is explicitly not covered here. `net.Pipe` is
 // unbuffered and synchronous, so a write with no reader is blocked by construction
 // rather than by a buffer-fill argument that would have to be proved.
-func TestF035SlowConsumerIsDisconnected(t *testing.T) {
+func TestSlowConsumerIsDisconnected(t *testing.T) {
 	budget := 10 * time.Second
 	testShortWriteDeadline(t, 400*time.Millisecond)
 
@@ -806,7 +806,7 @@ func testJoinTeardown(t *testing.T, s *Server, what string) {
 // FireAt is asserted against the close-anchored Will Delay: exactly the instant the
 // teardown observed the close plus the delay when that instant is known, and otherwise
 // bracketed around the consuming call (see assertOutbox).
-func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
+func TestDelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 	const delaySecs = 600
 
 	// closeObservedAt is the anchor the Will Delay runs from (mqtt.closeObservedAt).
@@ -1004,7 +1004,7 @@ func TestF035DelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 // waiting on wmu is spent out of the drain's budget rather than being forgiven. This
 // is the case the uncontended cap tests cannot see: with no contender, "computed
 // before entering" and "computed after acquiring wmu" produce the same instant.
-func TestF035ShutdownCapIsCapturedBeforeContending(t *testing.T) {
+func TestShutdownCapIsCapturedBeforeContending(t *testing.T) {
 	testShortWriteDeadline(t, 2*time.Second)
 	s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
 	c, sc := testDrainableClient(t, s)

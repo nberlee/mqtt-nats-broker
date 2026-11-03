@@ -195,7 +195,7 @@ func TestMQTTAdmissionLadderSpacesOnlyCommittedAttempts(t *testing.T) {
 // subject empty, the ladder's next write is a CREATE of a fresh exchange whose dependencies were
 // assembled for the INCOMING QoS. The create must carry that QoS, not the failed replacement's.
 //
-// Reached the way TestF105FailedRegisterOnlyAttemptRetriesOnAFreshLineage reaches its create: a
+// Reached the way TestFailedRegisterOnlyAttemptRetriesOnAFreshLineage reaches its create: a
 // possibly-attempted QoS 2 occupant, a QoS 1 re-offer of the same delivery on its identifier, and
 // the occupant's register removed under the register-only attempt so it is refused and the subject
 // is empty. Every create composed afterwards is read at the commit seam. The occupant's exchange

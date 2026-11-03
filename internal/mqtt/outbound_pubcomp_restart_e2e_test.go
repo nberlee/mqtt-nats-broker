@@ -28,7 +28,7 @@ import (
 // exchange from its durable records, measured where it matters — a Receive Maximum 1 client either
 // receives its next message or, when the identifier must stay reserved, does not.
 
-type testF105RestartWorld struct {
+type testRestartWorld struct {
 	o       *Options
 	s       *Server
 	ci      *mqttV5ConnInfo
@@ -42,12 +42,12 @@ type testF105RestartWorld struct {
 	pubN    int
 }
 
-// testF105RestartWorldAtPubRelReady connects a Receive Maximum 1 v5 subscriber, delivers one
+// testRestartWorldAtPubRelReady connects a Receive Maximum 1 v5 subscriber, delivers one
 // ordinary QoS 2 message, answers PUBREC, reads the PUBREL, and waits for the slot to stand at
 // pubrel_ready with no action.
-func testF105RestartWorldAtPubRelReady(t *testing.T, clientID string) *testF105RestartWorld {
+func testRestartWorldAtPubRelReady(t *testing.T, clientID string) *testRestartWorld {
 	t.Helper()
-	w := &testF105RestartWorld{o: testMQTTDefaultOptionsV5()}
+	w := &testRestartWorld{o: testMQTTDefaultOptionsV5()}
 	w.s = testMQTTRunServer(t, w.o)
 	props := append(mqttV5ConnPropsReceiveMax(1), mqttV5ConnPropsSessionExpiry(3600)...)
 	w.ci = &mqttV5ConnInfo{clientID: clientID, props: props}
@@ -74,7 +74,7 @@ func testF105RestartWorldAtPubRelReady(t *testing.T, clientID string) *testF105R
 	return w
 }
 
-func (w *testF105RestartWorld) bind(t *testing.T) {
+func (w *testRestartWorld) bind(t *testing.T) {
 	t.Helper()
 	w.asm = testMQTTGetAccountSessionManager(t, w.s, w.ci.clientID)
 	w.asm.mu.RLock()
@@ -85,7 +85,7 @@ func (w *testF105RestartWorld) bind(t *testing.T) {
 	}
 }
 
-func (w *testF105RestartWorld) publish(t *testing.T, payload string) {
+func (w *testRestartWorld) publish(t *testing.T, payload string) {
 	t.Helper()
 	w.pubN++
 	pub, pubr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: fmt.Sprintf("%s-pub-%d", w.ci.clientID, w.pubN), cleanStart: true},
@@ -96,7 +96,7 @@ func (w *testF105RestartWorld) publish(t *testing.T, payload string) {
 }
 
 // restart shuts the server down cleanly, restarts it on the same store, and resumes the session.
-func (w *testF105RestartWorld) restart(t *testing.T) {
+func (w *testRestartWorld) restart(t *testing.T) {
 	t.Helper()
 	w.sub.Close()
 	w.s = testInflightRestart(t, w.s, w.o)
@@ -109,7 +109,7 @@ func (w *testF105RestartWorld) restart(t *testing.T) {
 	w.bind(t)
 }
 
-func (w *testF105RestartWorld) slot(t *testing.T) *mqttInflightRecord {
+func (w *testRestartWorld) slot(t *testing.T) *mqttInflightRecord {
 	t.Helper()
 	cur, smsg, err := w.asm.loadInflightRecord(w.subject)
 	if err != nil {
@@ -121,7 +121,7 @@ func (w *testF105RestartWorld) slot(t *testing.T) *mqttInflightRecord {
 	return cur
 }
 
-func (w *testF105RestartWorld) phase(t *testing.T) mqttExchangePhase {
+func (w *testRestartWorld) phase(t *testing.T) mqttExchangePhase {
 	t.Helper()
 	w.sess.mu.Lock()
 	gen := w.sess.gen
@@ -135,7 +135,7 @@ func (w *testF105RestartWorld) phase(t *testing.T) mqttExchangePhase {
 
 // nextDelivered publishes a fresh message and reports whether the Receive Maximum 1 client
 // receives it within the window.
-func (w *testF105RestartWorld) nextDelivered(t *testing.T) bool {
+func (w *testRestartWorld) nextDelivered(t *testing.T) bool {
 	t.Helper()
 	w.publish(t, "next")
 	deadline := time.Now().Add(3 * time.Second)
@@ -161,9 +161,9 @@ func (w *testF105RestartWorld) nextDelivered(t *testing.T) bool {
 //
 // Mutation M8: the absence arm left in force for ordinary slots -> the slot is finalized and the
 // next message is delivered. M29: every ordinary ready slot treated as finished -> the same.
-func TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange(t *testing.T) {
+func TestRecoveryAbsenceDoesNotEndAnOrdinaryExchange(t *testing.T) {
 	t.Parallel()
-	w := testF105RestartWorldAtPubRelReady(t, "f105-absence")
+	w := testRestartWorldAtPubRelReady(t, "f105-absence")
 	rec := w.slot(t)
 	if err := w.asm.jsa.deleteMsg(mqttOutStreamName, rec.PubRelStreamSeq, true); err != nil {
 		t.Fatalf("deleting the canonical PUBREL: %v", err)
@@ -186,10 +186,10 @@ func TestF105RecoveryAbsenceDoesNotEndAnOrdinaryExchange(t *testing.T) {
 // stays reserved.
 //
 // Mutation M28: accept TerminalPendingDrain as completion -> T16b's next message is delivered.
-func TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
+func TestRecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
 	t.Run("beside Terminal: finished", func(t *testing.T) {
 		t.Parallel()
-		w := testF105RestartWorldAtPubRelReady(t, "f105-revived-terminal")
+		w := testRestartWorldAtPubRelReady(t, "f105-revived-terminal")
 		revived := *w.slot(t)
 		testMQTTSendPIPacket(mqttPacketPubComp, t, w.sub, w.pi)
 		testMQTTFlush(t, w.sub, nil, w.subr)
@@ -219,7 +219,7 @@ func TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
 	})
 	t.Run("beside terminal-pending-drain: reserved", func(t *testing.T) {
 		t.Parallel()
-		w := testF105RestartWorldAtPubRelReady(t, "f105-revived-pending")
+		w := testRestartWorldAtPubRelReady(t, "f105-revived-pending")
 		revived := *w.slot(t)
 		cur, smsg, _ := w.asm.loadInflightRecord(w.subject)
 		w.sess.mu.Lock()
@@ -250,7 +250,7 @@ func TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
 	})
 	t.Run("no matching exchange: reserved", func(t *testing.T) {
 		t.Parallel()
-		w := testF105RestartWorldAtPubRelReady(t, "f105-revived-foreign")
+		w := testRestartWorldAtPubRelReady(t, "f105-revived-foreign")
 		foreign := *w.slot(t)
 		foreign.Lin = mqttNewInflightNonce()
 		cur, smsg, _ := w.asm.loadInflightRecord(w.subject)
@@ -268,15 +268,15 @@ func TestF105RecoveryFinishesARevivedSlotBesideATerminalExchange(t *testing.T) {
 // T5c / T5g(c). A PUBCOMP whose batch LANDED behind a lost final response and a failed resolving
 // read is unconfirmed: the ack is withheld. After a restart recovery finds the terminal slot beside
 // its Terminal exchange, finalizes it, disposes of the unacked record, and re-sends nothing.
-func TestF105UnconfirmedButLandedPubCompIsFinishedByRecovery(t *testing.T) {
+func TestUnconfirmedButLandedPubCompIsFinishedByRecovery(t *testing.T) {
 	t.Parallel()
-	w := testF105RestartWorldAtPubRelReady(t, "f105-landed-unconfirmed")
+	w := testRestartWorldAtPubRelReady(t, "f105-landed-unconfirmed")
 	var calls atomic.Int32
 	var failLoad, loadFailed atomic.Bool
 	var acks atomic.Int32
 	w.asm.mu.Lock()
 	w.asm.testAckAdvance = func(req *mqttAdvanceExchangeAckRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
-		if !testF105IsPubCompAdvance(req, w.lin) {
+		if !testIsPubCompAdvance(req, w.lin) {
 			return write()
 		}
 		switch calls.Add(1) {
@@ -329,9 +329,9 @@ func TestF105UnconfirmedButLandedPubCompIsFinishedByRecovery(t *testing.T) {
 
 // T5g(b). A RECORDED completion whose cleanup its worker still owns at shutdown is finished by the
 // next recovery from the terminal slot.
-func TestF105RecordedCleanupOwnedAtShutdownIsFinishedByRecovery(t *testing.T) {
+func TestRecordedCleanupOwnedAtShutdownIsFinishedByRecovery(t *testing.T) {
 	t.Parallel()
-	w := testF105RestartWorldAtPubRelReady(t, "f105-recorded-at-shutdown")
+	w := testRestartWorldAtPubRelReady(t, "f105-recorded-at-shutdown")
 	var enrolled atomic.Int32
 	w.asm.mu.Lock()
 	w.asm.testInflightPubRelScan = func(string) ([]mqttStoredPubRel, int, bool) { return nil, 0, false }
@@ -367,8 +367,8 @@ func TestF105RecordedCleanupOwnedAtShutdownIsFinishedByRecovery(t *testing.T) {
 // persistence; the certified population is T7b.
 //
 // Not parallel: the persistence observer is process-wide.
-func TestF105DeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
-	w := testF105RestartWorldAtPubRelReady(t, "f105-dead-holder")
+func TestDeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
+	w := testRestartWorldAtPubRelReady(t, "f105-dead-holder")
 	w.sess.mu.Lock()
 	holderBind := w.sess.c.outBind
 	w.sess.mu.Unlock()
@@ -412,8 +412,8 @@ func TestF105DeadPubRelHolderLeavesItsDrainOwed(t *testing.T) {
 // T7b. A dead PUBREL holder whose connection WAS certified, and whose certificate is durable,
 // leaves nothing owed: the successor's resume clears the token on the certificate's licence and
 // completes the pending drain in the same batch (issue #107 8c).
-func TestF105CertifiedDeadPubRelHolderIsFinishedByRecovery(t *testing.T) {
-	w := testF105RestartWorldAtPubRelReady(t, "f105-dead-certified")
+func TestCertifiedDeadPubRelHolderIsFinishedByRecovery(t *testing.T) {
+	w := testRestartWorldAtPubRelReady(t, "f105-dead-certified")
 	cur, smsg, _ := w.asm.loadInflightRecord(w.subject)
 	w.sess.mu.Lock()
 	c := w.sess.c

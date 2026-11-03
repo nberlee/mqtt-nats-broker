@@ -22,9 +22,9 @@ import (
 
 // testWalkHolders runs the identifier walk for pi and returns the phases of the exchanges it
 // found holding it.
-func testWalkHolders(t *testing.T, e *testF105Env, pi uint16) []mqttExchangePhase {
+func testWalkHolders(t *testing.T, e *testOutboundEnv, pi uint16) []mqttExchangePhase {
 	t.Helper()
-	w, err := mqttTraverseInventoryForIdentifiers(&e.asm.jsa, e.id, e.epoch, testF105Gen,
+	w, err := mqttTraverseInventoryForIdentifiers(&e.asm.jsa, e.id, e.epoch, testGen,
 		map[uint16]struct{}{pi: {}})
 	if err != nil || w == nil {
 		t.Fatalf("the identifier walk failed: %v", err)
@@ -42,12 +42,12 @@ func testWalkHolders(t *testing.T, e *testF105Env, pi uint16) []mqttExchangePhas
 }
 
 // testCachedPositions returns the generation's cached ordinals.
-func testCachedPositions(e *testF105Env) map[uint64]mqttDutyIdentity {
+func testCachedPositions(e *testOutboundEnv) map[uint64]mqttDutyIdentity {
 	c := &e.asm.jsa.dutyIdentities
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := map[uint64]mqttDutyIdentity{}
-	if g := c.gens[mqttDutyIdentityKey(e.id, e.epoch, testF105Gen)]; g != nil {
+	if g := c.gens[mqttDutyIdentityKey(e.id, e.epoch, testGen)]; g != nil {
 		for ord, d := range g.pos {
 			out[ord] = d
 		}
@@ -62,12 +62,12 @@ func testCachedPositions(e *testF105Env) map[uint64]mqttDutyIdentity {
 // Mutation M-L5a: read only positions above the highest cached one -> the dropped position is
 // skipped and the holder missed.
 func TestIdentifierWalkReadsOnlyUnseenPositions(t *testing.T) {
-	e, done := testF105NewEnv(t, "dutyid-unseen")
+	e, done := testNewEnv(t, "dutyid-unseen")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	for i, pi := range []uint16{7, 8, 9} {
-		testF105AdmitOn(t, e, "txn-adm-"+string(rune('a'+i)), pi, "inc-src")
+		testAdmitOn(t, e, "txn-adm-"+string(rune('a'+i)), pi, "inc-src")
 	}
 	if got := testWalkHolders(t, e, 8); len(got) != 1 {
 		t.Fatalf("the first walk found %d holder(s) of identifier 8, want 1", len(got))
@@ -87,7 +87,7 @@ func TestIdentifierWalkReadsOnlyUnseenPositions(t *testing.T) {
 	}
 	c := &e.asm.jsa.dutyIdentities
 	c.mu.Lock()
-	delete(c.gens[mqttDutyIdentityKey(e.id, e.epoch, testF105Gen)].pos, hole)
+	delete(c.gens[mqttDutyIdentityKey(e.id, e.epoch, testGen)].pos, hole)
 	c.mu.Unlock()
 	if got := testWalkHolders(t, e, 8); len(got) != 1 {
 		t.Fatalf("the walk over a dropped position found %d holder(s) of identifier 8, want 1", len(got))
@@ -102,15 +102,15 @@ func TestIdentifierWalkReadsOnlyUnseenPositions(t *testing.T) {
 //
 // Mutation M-L5b: cache the exchange with the identity -> the walk reports the stale phase.
 func TestIdentifierWalkCacheHoldsIdentityOnly(t *testing.T) {
-	e, done := testF105NewEnv(t, "dutyid-state")
+	e, done := testNewEnv(t, "dutyid-state")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testF105AdmitOn(t, e, "txn-adm", 7, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
 	if got := testWalkHolders(t, e, 7); len(got) != 1 || got[0] != mqttExchangePublish {
 		t.Fatalf("the warming walk found %v, want one holder at Publish", got)
 	}
-	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangePubRecObserved); err != nil {
+	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved); err != nil {
 		t.Fatalf("advancing the holder: %v", err)
 	}
 	if got := testWalkHolders(t, e, 7); len(got) != 1 || got[0] != mqttExchangePubRecObserved {

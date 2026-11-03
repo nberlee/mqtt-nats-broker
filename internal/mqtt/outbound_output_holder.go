@@ -30,7 +30,7 @@ import "sync/atomic"
 // one critical section, because no first drain of a holder can run while its frame is being written:
 // every drain entry is the acquiring goroutine before hand-off, the delivery callback's deferred
 // drain after the synchronous write returned, or a reconcile/shutdown pass enrolled only by a drain
-// that already ran (TestF105DrainEntriesCannotRunDuringAWrite records the set). Under wmu the writer
+// that already ran (TestDrainEntriesCannotRunDuringAWrite records the set). Under wmu the writer
 // therefore reads only state private to the execution: the PUBREL entry ticket, or the PUBLISH
 // section's own output object.
 

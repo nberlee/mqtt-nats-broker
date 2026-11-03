@@ -311,7 +311,7 @@ func (r *testDriverRec) testDriverDispatched(key string, since time.Time) (all, 
 // admitted within 5 s, with no further offer.
 //
 // Mutations M11a/b (never armed / tick callback a no-op): the release waits for AckWait.
-func TestF097FailedObservationReleasesBeforeAckWait(t *testing.T) {
+func TestFailedObservationReleasesBeforeAckWait(t *testing.T) {
 	t.Parallel()
 	f, bReply := testDriverWithheld(t, "f097-t2", 1)
 	sess := f.e.sess
@@ -401,7 +401,7 @@ func TestF097FailedObservationReleasesBeforeAckWait(t *testing.T) {
 
 // T2b. A tick paused BEFORE the start site's admission and lease, across a clean start: no unit of
 // the old generation is dispatched.
-func TestF097DriverTickRefusedAcrossClear(t *testing.T) {
+func TestDriverTickRefusedAcrossClear(t *testing.T) {
 	t.Parallel()
 	f, _ := testDriverWithheld(t, "f097-t2b", 1)
 	sess := f.e.sess
@@ -459,7 +459,7 @@ func TestF097DriverTickRefusedAcrossClear(t *testing.T) {
 // single-flight flag until its loop exits. Witness: a run paused INSIDE a unit (lease held) keeps
 // clear() from completing - the generation is unchanged while the unit is held - and the clear
 // completes only after the run released its lease.
-func TestF097DriverRunHoldsItsGenerationAcrossClear(t *testing.T) {
+func TestDriverRunHoldsItsGenerationAcrossClear(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-t2b-run", 1)
 	sess := f.e.sess
@@ -545,7 +545,7 @@ func TestF097DriverRunHoldsItsGenerationAcrossClear(t *testing.T) {
 }
 
 // T2c. Cancelling the tick releases its timer token: shutdown's timer and worker joins complete.
-func TestF097DriverStopReleasesTheTimerToken(t *testing.T) {
+func TestDriverStopReleasesTheTimerToken(t *testing.T) {
 	t.Parallel()
 	f, _ := testDriverWithheld(t, "f097-t2c", 1)
 	sess := f.e.sess
@@ -574,7 +574,7 @@ func TestF097DriverStopReleasesTheTimerToken(t *testing.T) {
 //
 // The delays are this session's own: a package-level override outlived the test in a run its
 // tick had started, and raced the next test that wrote it.
-func TestF097DriverStopFireRace(t *testing.T) {
+func TestDriverStopFireRace(t *testing.T) {
 	t.Parallel()
 	f, _ := testDriverWithheld(t, "f097-t2d", 1)
 	sess := f.e.sess
@@ -621,7 +621,7 @@ func TestF097DriverStopFireRace(t *testing.T) {
 
 // T2e. A CLOSING incarnation refuses every start; its reopen re-arms the dispatcher, and the
 // withheld delivery is then admitted.
-func TestF097DriverCloseThenReopen(t *testing.T) {
+func TestDriverCloseThenReopen(t *testing.T) {
 	t.Parallel()
 	f, bReply := testDriverWithheld(t, "f097-t2e", 1)
 	sess := f.e.sess
@@ -664,7 +664,7 @@ func TestF097DriverCloseThenReopen(t *testing.T) {
 
 // T2f. Under CONTINUOUS hints, an owed withdrawal item and a gate request each complete within 3
 // iterations of being registered.
-func TestF097DispatcherIsFairUnderContinuousHints(t *testing.T) {
+func TestDispatcherIsFairUnderContinuousHints(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-t2f", 1)
 	sess := f.e.sess
@@ -779,7 +779,7 @@ func TestF097DispatcherIsFairUnderContinuousHints(t *testing.T) {
 
 // T2h. Shutdown JOINS a dispatcher blocked inside a withdrawal's store request, and no unit is
 // dispatched after the dispatch gate closed.
-func TestF097ShutdownJoinsABlockedDispatcher(t *testing.T) {
+func TestShutdownJoinsABlockedDispatcher(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-t2h", 1)
 	sess := f.e.sess
@@ -829,7 +829,7 @@ func TestF097ShutdownJoinsABlockedDispatcher(t *testing.T) {
 
 // T2i. After dispatch closes, NO start source starts a run: a hint, a gate request, an item, and
 // the tick's own call.
-func TestF097EveryDispatcherStartIsAdmitted(t *testing.T) {
+func TestEveryDispatcherStartIsAdmitted(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-t2i", 1)
 	sess := f.e.sess
@@ -867,7 +867,7 @@ func (f *testWithdrawFix) seqOf(t *testing.T) uint64 {
 // call: the single-flight flag is held so no other dispatcher run can issue requests, and the env's
 // JetStream assistant is private to this test); at most eight units per iteration; the census at
 // most once per cap interval across competing triggers.
-func TestF097DispatcherCostBound(t *testing.T) {
+func TestDispatcherCostBound(t *testing.T) {
 	t.Parallel()
 	count := func(t *testing.T, f *testWithdrawFix, fn func()) int {
 		t.Helper()
@@ -1000,7 +1000,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 			return n
 		}
 		t.Run("ordinary-replacement", func(t *testing.T) {
-			o := testF088OrdinaryCancelledOccupant(t, "f097-t2g-probe-ord", true)
+			o := testOrdinaryCancelledOccupant(t, "f097-t2g-probe-ord", true)
 			e := o.e
 			if !e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_, nil) {
 				t.Fatalf("fixture: the allocation over the refuted cancellation must be admitted (events %v)", o.log())
@@ -1033,7 +1033,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 			e.sess.mu.Lock()
 			e.sess.last_pi = 10
 			e.sess.mu.Unlock()
-			o := testF088CancelledOccupantOn(t, e, affDur, sseq, 2, occ, true)
+			o := testCancelledOccupantOn(t, e, affDur, sseq, 2, occ, true)
 			if !mqttDurIsSlotOnlyClass(o.occ.Dur) {
 				t.Fatalf("fixture: the occupant must be slot-only, got %+v", o.occ)
 			}
@@ -1056,7 +1056,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 		t.Run("abandon-adds-one", func(t *testing.T) {
 			// A classification that ends in an ABANDON (the marker cannot be read): the probe is the
 			// ADDED read of the cost delta, exactly one.
-			o := testF088OrdinaryCancelledOccupant(t, "f097-t2g-probe-abandon", false)
+			o := testOrdinaryCancelledOccupant(t, "f097-t2g-probe-abandon", false)
 			e := o.e
 			markerSubject := o.subject + "." + mqttInflightMarkerSuffix
 			e.asm.mu.Lock()
@@ -1131,7 +1131,7 @@ func TestF097DispatcherCostBound(t *testing.T) {
 			// Positive control: T35's occupant cancellation over an admitted register whose marker an
 			// intent consumed; the late PUBACK's advance clears it on the marker's authoritative
 			// absence.
-			f, _, _ := testF088CopiedFreshTombstone(t, "f097-t2g-delta-clear")
+			f, _, _ := testCopiedFreshTombstone(t, "f097-t2g-delta-clear")
 			f.e.sess.mu.Lock()
 			ack := f.e.sess.pendingPublish[f.pi]
 			f.e.sess.mu.Unlock()
@@ -1285,7 +1285,7 @@ func testDriverTimerRegistered(srv *Server, key string) bool {
 // Mutation M-tick (every arm shares the generation's key: mqttCustodyTickKey(id, gen, 0)): the
 // re-arm is refused while the firing tick's key is registered, the arm's deadline is cleared, and
 // nothing is armed for the retry - "not within ...: a fresh arm is registered".
-func TestF097DriverTickRearmsWhileItsCallbackRuns(t *testing.T) {
+func TestDriverTickRearmsWhileItsCallbackRuns(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wtick", 1)
 	sess := f.e.sess
@@ -1377,7 +1377,7 @@ func TestF097DriverTickRearmsWhileItsCallbackRuns(t *testing.T) {
 // re-times the retry a cap interval out and re-arms the tick for it until the generation is
 // discarded - "not within ...: the census-ended exchange's retry is retired and the dispatcher is
 // idle with no tick armed".
-func TestF097DriverCensusEndedExchangeRetiresItsRetry(t *testing.T) {
+func TestDriverCensusEndedExchangeRetiresItsRetry(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-h3-retry", 1)
 	sess := f.e.sess
@@ -1444,19 +1444,19 @@ func TestF097DriverCensusEndedExchangeRetiresItsRetry(t *testing.T) {
 //
 // Mutation M-owed (the no-evidence exchange-ended arm removed): the item is re-timed and retried
 // every cap interval - "not within 5s: the owed withdrawal of an ended exchange retires".
-func TestF097DriverOwedWithdrawalOfAnEndedExchangeRetires(t *testing.T) {
+func TestDriverOwedWithdrawalOfAnEndedExchangeRetires(t *testing.T) {
 	t.Parallel()
-	testF097OwedWithdrawalLandedUnresolved(t, "f097-h4-owed", false)
+	testOwedWithdrawalLandedUnresolved(t, "f097-h4-owed", false)
 }
 
 // H-4, control. The same committed-but-unresolved withdrawal with its tombstone deleted before the
 // store answers: the item retires (under M-owed, through the register re-read finding it gone).
-func TestF097DriverOwedWithdrawalOfAGoneRegisterRetires(t *testing.T) {
+func TestDriverOwedWithdrawalOfAGoneRegisterRetires(t *testing.T) {
 	t.Parallel()
-	testF097OwedWithdrawalLandedUnresolved(t, "f097-h4-gone", true)
+	testOwedWithdrawalLandedUnresolved(t, "f097-h4-gone", true)
 }
 
-func testF097OwedWithdrawalLandedUnresolved(t *testing.T, clientID string, deleteRegister bool) {
+func testOwedWithdrawalLandedUnresolved(t *testing.T, clientID string, deleteRegister bool) {
 	t.Helper()
 	f := testWithdrawAdmitted(t, clientID, 1)
 	sess := f.e.sess
@@ -1542,7 +1542,7 @@ func testF097OwedWithdrawalLandedUnresolved(t *testing.T, clientID string, delet
 // Mutation M-cont (the classification retires on mqttExchangePhaseEnded only): the record is
 // retried at its backoff until the generation is discarded - "not within 5s: the continuity
 // record of an abandoned delivery retires".
-func TestF097ContinuityOfAnAbandonedDeliveryRetires(t *testing.T) {
+func TestContinuityOfAnAbandonedDeliveryRetires(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-h4-cont", 1)
 	sess := f.e.sess
@@ -1596,21 +1596,21 @@ func TestF097ContinuityOfAnAbandonedDeliveryRetires(t *testing.T) {
 // Mutation M-owed-2 (the exchange arm retires on mqttExchangePhaseEnded only): the item is re-timed
 // and retried every cap interval until the generation is discarded - "not within 5s: the owed
 // withdrawal of an abandoned delivery retires".
-func TestF097DriverOwedWithdrawalOfAnAbandonedDeliveryRetires(t *testing.T) {
+func TestDriverOwedWithdrawalOfAnAbandonedDeliveryRetires(t *testing.T) {
 	t.Parallel()
-	testF097OwedWithdrawalDutyEnded(t, "f097-c10-abandoned", false)
+	testOwedWithdrawalDutyEnded(t, "f097-c10-abandoned", false)
 }
 
 // C10, the discarded generation. The same owed withdrawal over an exchange the generation discard
 // moved to Discarded - by the real discard op, under the generation's discarding closure, while the
 // session still stands at that generation so the map is not cleared under the item - retires at its
 // next unit. Mutation M-owed-2: "not within 5s: the owed withdrawal of a discarded exchange retires".
-func TestF097DriverOwedWithdrawalOfADiscardedExchangeRetires(t *testing.T) {
+func TestDriverOwedWithdrawalOfADiscardedExchangeRetires(t *testing.T) {
 	t.Parallel()
-	testF097OwedWithdrawalDutyEnded(t, "f097-c10-discarded", true)
+	testOwedWithdrawalDutyEnded(t, "f097-c10-discarded", true)
 }
 
-func testF097OwedWithdrawalDutyEnded(t *testing.T, clientID string, discard bool) {
+func testOwedWithdrawalDutyEnded(t *testing.T, clientID string, discard bool) {
 	t.Helper()
 	f := testWithdrawAdmitted(t, clientID, 1)
 	sess := f.e.sess
@@ -1757,7 +1757,7 @@ func testF097OwedWithdrawalDutyEnded(t *testing.T, clientID string, discard bool
 // left to fire into a generation that no longer stands.
 //
 // Mutation (the discard cancels a key rebuilt without the arm): the stored key stays registered.
-func TestF097DriverGenerationDiscardCancelsTheArmedTick(t *testing.T) {
+func TestDriverGenerationDiscardCancelsTheArmedTick(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wtick-discard", 1)
 	sess := f.e.sess
@@ -1809,7 +1809,7 @@ func TestF097DriverGenerationDiscardCancelsTheArmedTick(t *testing.T) {
 //
 // Mutation M-drift (the IsZero guard removed: every exit backs off and re-stamps the deadline):
 // the first hint run's exit moves it - "a hint run's exit moved the latched demand's deadline".
-func TestF097DriverDemandDeadlineSurvivesHintExits(t *testing.T) {
+func TestDriverDemandDeadlineSurvivesHintExits(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wdemand", 1)
 	sess := f.e.sess
@@ -1902,12 +1902,12 @@ func TestF097DriverDemandDeadlineSurvivesHintExits(t *testing.T) {
 	}
 }
 
-// testF097ExitTakesItem drives ONE item recorded in the exit window: the first time a run finds no
+// testExitTakesItem drives ONE item recorded in the exit window: the first time a run finds no
 // work, before its exit takes the session lock, install records the item through its production
 // recorder - which finds the single-flight flag set and starts nothing. No demand is latched, no
 // tick is armed and nothing follows. The item's unit must then run in THAT run, and the item
 // retire.
-func testF097ExitTakesItem(t *testing.T, clientID string, kind mqttCustodyUnitKind,
+func testExitTakesItem(t *testing.T, clientID string, kind mqttCustodyUnitKind,
 	install func(f *testWithdrawFix, lic mqttDestroyLicence, seq uint64) bool, retired func(f *testWithdrawFix) bool) {
 	t.Helper()
 	f := testWithdrawAdmitted(t, clientID, 1)
@@ -1979,9 +1979,9 @@ func testF097ExitTakesItem(t *testing.T, clientID string, kind mqttCustodyUnitKi
 // Mutations: M-exit-a (the exit's due-item condition dropped) - the unit runs only through a fresh
 // tick's run: "ran in run 2, not in run 1". M-exit-ab (that and the due-is-now arming dropped) -
 // nothing takes it: "not within 5s: the item recorded in the exit window has its unit dispatched".
-func TestF097DriverExitTakesARecordedWithdrawal(t *testing.T) {
+func TestDriverExitTakesARecordedWithdrawal(t *testing.T) {
 	t.Parallel()
-	testF097ExitTakesItem(t, "f097-wexit-withdraw", mqttCustodyUnitWithdraw,
+	testExitTakesItem(t, "f097-wexit-withdraw", mqttCustodyUnitWithdraw,
 		func(f *testWithdrawFix, lic mqttDestroyLicence, seq uint64) bool {
 			f.e.sess.recordWithdrawOwed(f.gen, f.subject, f.nonce, f.lin, seq, lic)
 			f.e.sess.mu.Lock()
@@ -2002,7 +2002,7 @@ func TestF097DriverExitTakesARecordedWithdrawal(t *testing.T) {
 //
 // Mutation M-exit-b (a zero eligibility no longer arms as "now"): nothing is armed - "not within
 // 5s: the exit armed a tick for the due withdrawal, and its run withdrew it".
-func TestF097DriverExitThatMayNotContinueArmsADueItem(t *testing.T) {
+func TestDriverExitThatMayNotContinueArmsADueItem(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wexit-nocontinue", 1)
 	sess := f.e.sess
@@ -2041,10 +2041,10 @@ func TestF097DriverExitThatMayNotContinueArmsADueItem(t *testing.T) {
 
 // W-exit, admission continuity (issue #99, H-1). The same window for an admission continuity record.
 //
-// Mutations: as TestF097DriverExitTakesARecordedWithdrawal.
-func TestF097DriverExitTakesARecordedContinuity(t *testing.T) {
+// Mutations: as TestDriverExitTakesARecordedWithdrawal.
+func TestDriverExitTakesARecordedContinuity(t *testing.T) {
 	t.Parallel()
-	testF097ExitTakesItem(t, "f097-wexit-continuity", mqttCustodyUnitContinuity,
+	testExitTakesItem(t, "f097-wexit-continuity", mqttCustodyUnitContinuity,
 		func(f *testWithdrawFix, lic mqttDestroyLicence, _ uint64) bool {
 			f.e.sess.mu.Lock()
 			defer f.e.sess.mu.Unlock()
@@ -2136,7 +2136,7 @@ func testDriverBusyRun(t *testing.T, clientID string) *testDriverBusy {
 //
 // Mutation M-retire (quit ignores the closing signal): the run keeps its lease for as long as its
 // queue refills - "the closing incarnation never drained within 3s".
-func TestF097DriverRetirementStopsABusyRun(t *testing.T) {
+func TestDriverRetirementStopsABusyRun(t *testing.T) {
 	t.Parallel()
 	b := testDriverBusyRun(t, "f097-wretire")
 	sess, leases := b.sess, b.leases
@@ -2169,7 +2169,7 @@ func TestF097DriverRetirementStopsABusyRun(t *testing.T) {
 //
 // Mutation M-retire: the discard waits on the run's lease until its ceiling - "the clean start's
 // discard did not complete within 5s".
-func TestF097DriverCleanStartRetiresABusyRun(t *testing.T) {
+func TestDriverCleanStartRetiresABusyRun(t *testing.T) {
 	t.Parallel()
 	b := testDriverBusyRun(t, "f097-wretire-clear")
 	sess := b.sess
@@ -2207,7 +2207,7 @@ func TestF097DriverCleanStartRetiresABusyRun(t *testing.T) {
 // Mutations: M-G1 (a quit drops the unrun units) - "the unrun hint ... must be back in its queue".
 // M-retire (the run does not stop) - "stopped holding: the unrun hint is not dispatched while the
 // incarnation is closing".
-func TestF097DriverAbortedRetirementRunsTheRequeuedUnit(t *testing.T) {
+func TestDriverAbortedRetirementRunsTheRequeuedUnit(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wrequeue", 1)
 	sess := f.e.sess
@@ -2295,7 +2295,7 @@ func TestF097DriverAbortedRetirementRunsTheRequeuedUnit(t *testing.T) {
 // Mutation M-G2 (the reopen's owed set omits the census): nothing starts after the reopen - "not
 // within 5s: the reopen re-arms the owed census and it runs". P1 cannot see it: no exit is
 // involved, only the tick and the reopen.
-func TestF097DriverReopenRearmsAnOwedCensus(t *testing.T) {
+func TestDriverReopenRearmsAnOwedCensus(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wcensus", 1)
 	sess := f.e.sess
@@ -2366,7 +2366,7 @@ func TestF097DriverReopenRearmsAnOwedCensus(t *testing.T) {
 // Mutation M-G3 (the exit arms nothing for hints and pass work): nothing takes the hint - "not
 // within 5s: the exit armed a tick for the recorded hint, and its run observed it" - and P1
 // reports the exit.
-func TestF097DriverExitThatMayNotContinueArmsAHint(t *testing.T) {
+func TestDriverExitThatMayNotContinueArmsAHint(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-wexit-hint", 1)
 	sess := f.e.sess
@@ -2505,7 +2505,7 @@ func testDriverWithdrawA(t *testing.T, f *testWithdrawFix) {
 //
 // Mutation M-dem-a (the deadline always requests the pass): the latch serves forever, the
 // retirement wait fails.
-func TestF097DriverDemandOfADrainedWaiterRetires(t *testing.T) {
+func TestDriverDemandOfADrainedWaiterRetires(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-dem-drained", 1)
 	sess := f.e.sess
@@ -2551,7 +2551,7 @@ func TestF097DriverDemandOfADrainedWaiterRetires(t *testing.T) {
 // released it retires.
 //
 // Mutation M-dem-a: the latch serves forever.
-func TestF097DriverDemandOfARetainedDowngradeRetires(t *testing.T) {
+func TestDriverDemandOfARetainedDowngradeRetires(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-dem-retained", 1)
 	sess := f.e.sess
@@ -2580,7 +2580,7 @@ func TestF097DriverDemandOfARetainedDowngradeRetires(t *testing.T) {
 //
 // Mutation M-dem-b (retire on !withholdsAllocation() alone): the demand retires while A's
 // exchange is still held, and the served-while-held control fails.
-func TestF097DriverDemandOfAnExhaustedAllocatorRetires(t *testing.T) {
+func TestDriverDemandOfAnExhaustedAllocatorRetires(t *testing.T) {
 	t.Parallel()
 	f := testWithdrawAdmitted(t, "f097-dem-exhausted", 1)
 	sess := f.e.sess
@@ -2630,7 +2630,7 @@ func TestF097DriverDemandOfAnExhaustedAllocatorRetires(t *testing.T) {
 //
 // Mutation M-dem-d (holdsCustody counts held exchanges only): the demand retires while the
 // admission is the only holder, and the served-while-held assertion fails.
-func TestF097DriverDemandServedWhileAnAdmissionIsHeld(t *testing.T) {
+func TestDriverDemandServedWhileAnAdmissionIsHeld(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f097-dem-admission")
 	testReadyForRealPubRelDelivery(t, e)
@@ -2687,7 +2687,7 @@ func TestF097DriverDemandServedWhileAnAdmissionIsHeld(t *testing.T) {
 // Negative controls: the demand is SERVED while an allocation may still wait - a delivery is
 // deferred, or an identifier is unknown - even with no custody held. (A held exchange is W-D1..3's
 // served-while-held phase.)
-func TestF097DriverDemandServedWhileAnAllocationMayWait(t *testing.T) {
+func TestDriverDemandServedWhileAnAllocationMayWait(t *testing.T) {
 	t.Parallel()
 	t.Run("deferred-waiter", func(t *testing.T) {
 		t.Parallel()

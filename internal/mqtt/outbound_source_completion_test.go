@@ -234,7 +234,7 @@ func TestUnitCTerminalStageUsesDurableReply(t *testing.T) {
 }
 
 func TestUnitCSourceReplySurvivesReplacement(t *testing.T) {
-	r, done := testF105NewReplEnv(t, "c4-reply-replacement")
+	r, done := testNewReplEnv(t, "c4-reply-replacement")
 	defer done()
 	r.deleteMarker(t)
 	adm := r.replacingFor(t, mqttReplaceRegisterOnly, "txn-c4-replace")

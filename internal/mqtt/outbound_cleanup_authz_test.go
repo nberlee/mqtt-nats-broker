@@ -23,23 +23,23 @@ import (
 // The generation's resource enumeration (issue #107, row 8), which the teardown classification and
 // the recovery executor read before anything a discard transfers is retired.
 
-// TestF105ATruncatedResourcePageIsNotAnAnswer is round I-6's third finding.
+// TestATruncatedResourcePageIsNotAnAnswer is round I-6's third finding.
 //
 // The enumeration answers which resources a generation has. A walk that stops at a page it cannot
 // vouch for omits whichever resource sits past it — and a reader then misses a resource that
 // still names a dependent, or an enrolment a discard must transfer, which is an absence read as
 // a fact in the one place this mechanism exists to stop it.
-func TestF105ATruncatedResourcePageIsNotAnAnswer(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-resource-truncated")
+func TestATruncatedResourcePageIsNotAnAnswer(t *testing.T) {
+	e, done := testNewEnv(t, "f105-resource-truncated")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 
 	// A VALID FIRST PAGE that reports more beyond it, then a prematurely EMPTY second page: the
 	// walk cannot vouch for the rest.
 	truncated := testUnvouchablePages(t)
 	e.asm.jsa.exchangeSubjectsObs.Store(&truncated)
-	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen); err == nil ||
+	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testGen); err == nil ||
 		!strings.Contains(err.Error(), "could not be enumerated completely") {
 		t.Fatalf("an incompletely enumerated answer was read as this generation's whole resource inventory: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestF105ATruncatedResourcePageIsNotAnAnswer(t *testing.T) {
 		return mqttSubjectPage{}, nil
 	}
 	e.asm.jsa.exchangeSubjectsObs.Store(&complete)
-	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testF105Gen); err != nil {
+	if _, _, err := e.asm.enumerateGenerationResources(e.id, e.epoch, testGen); err != nil {
 		t.Fatalf("a complete answer holding nothing was refused: %v", err)
 	}
 	e.asm.jsa.exchangeSubjectsObs.Store(nil)

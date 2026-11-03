@@ -64,7 +64,7 @@ func testConsumerOf(sess *mqttSession, key string) string {
 // T9 (M7): the resume repair decides the durable it replaced `repair-replaced`, under the resumed
 // connection's tenure, after its confirmed save; the settlement is held back so only the repair
 // can have decided it.
-func TestF105ResumeRepairDecidesItsPredecessor(t *testing.T) {
+func TestResumeRepairDecidesItsPredecessor(t *testing.T) {
 	testSuppressSettlement(t)
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -208,7 +208,7 @@ func testRequireForkRepairedWithoutX(t *testing.T, s *Server, ci *mqttConnInfo, 
 
 // T16a (M13a): a consumer of ours that another tenure decided is not reinstated by fork repair;
 // the membership keeps its grant and a fresh consumer serves it.
-func TestF105ForkRepairDoesNotReinstateADecidedConsumer(t *testing.T) {
+func TestForkRepairDoesNotReinstateADecidedConsumer(t *testing.T) {
 	testSuppressSettlement(t)
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
@@ -246,7 +246,7 @@ func TestF105ForkRepairDoesNotReinstateADecidedConsumer(t *testing.T) {
 // the accept drive's input load and the handoff preparation's own authority read — refuses the
 // preparation, the CONNECT takes the full re-drive, fork repair reads again, and the same CONNECT
 // succeeds without the decided consumer.
-func TestF105ForkFenceRefusesADisposalAfterTheRead(t *testing.T) {
+func TestForkFenceRefusesADisposalAfterTheRead(t *testing.T) {
 	testSuppressSettlement(t)
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)

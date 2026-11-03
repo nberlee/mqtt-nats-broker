@@ -28,7 +28,7 @@ import (
 // stands between it and the wire.
 //
 // Mutation: M2 (abandon reports success without recording).
-func TestF105AnAbandonedAcquisitionIsRefusedByItsCell(t *testing.T) {
+func TestAnAbandonedAcquisitionIsRefusedByItsCell(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "exec-cell-abandoned", 2)
 	s.acquire(t)
@@ -58,7 +58,7 @@ func TestF105AnAbandonedAcquisitionIsRefusedByItsCell(t *testing.T) {
 // itself, because the writer checks the cell's connection again behind it.
 //
 // Mutation: M6 (enterWrite drops the connection comparison).
-func TestF105APublishOutputAdmitsOnlyItsOwnConnection(t *testing.T) {
+func TestAPublishOutputAdmitsOnlyItsOwnConnection(t *testing.T) {
 	t.Parallel()
 	s := testRow2OpenSection(t, "exec-cell-conn", 2)
 	s.acquire(t)

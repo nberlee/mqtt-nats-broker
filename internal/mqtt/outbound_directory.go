@@ -84,20 +84,20 @@ func mqttDirShardFor(idHash string) uint64 {
 }
 
 func mqttShardSubject(shard uint64) string {
-	return mqttF105SubjectPrefix() + mqttShardClassTk + "." + strconv.FormatUint(shard, 10)
+	return mqttOutboundRecordSubjectPrefix() + mqttShardClassTk + "." + strconv.FormatUint(shard, 10)
 }
 
 func mqttRootSubject(shard, ord uint64) string {
-	return mqttF105SubjectPrefix() + mqttRootClassTk + "." + strconv.FormatUint(shard, 10) + "." +
+	return mqttOutboundRecordSubjectPrefix() + mqttRootClassTk + "." + strconv.FormatUint(shard, 10) + "." +
 		mqttFormatOrdinal(ord)
 }
 
 func mqttIsShardSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttShardClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttShardClassTk+".")
 }
 
 func mqttIsRootSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttRootClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttRootClassTk+".")
 }
 
 // ---------------------------------------------------------------------------

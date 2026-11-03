@@ -37,8 +37,8 @@ import (
 // one CONNECT is foreign to the next: it carries another intent id, made under another
 // CONNECT's state.
 
-// testF105ArmStepEntry installs the step-entry seam for one test.
-func testF105ArmStepEntry(t *testing.T, asm *mqttAccountSessionManager, f func(mqttConnectOwnershipAction) error) {
+// testArmStepEntry installs the step-entry seam for one test.
+func testArmStepEntry(t *testing.T, asm *mqttAccountSessionManager, f func(mqttConnectOwnershipAction) error) {
 	t.Helper()
 	asm.mu.Lock()
 	asm.testOwnershipStepEntry = f
@@ -50,8 +50,8 @@ func testF105ArmStepEntry(t *testing.T, asm *mqttAccountSessionManager, f func(m
 	})
 }
 
-// testF105ArmBeforeMetadata installs the before-metadata seam for one test.
-func testF105ArmBeforeMetadata(t *testing.T, asm *mqttAccountSessionManager, f func(mqttConnectOwnershipAction) error) {
+// testArmBeforeMetadata installs the before-metadata seam for one test.
+func testArmBeforeMetadata(t *testing.T, asm *mqttAccountSessionManager, f func(mqttConnectOwnershipAction) error) {
 	t.Helper()
 	asm.mu.Lock()
 	asm.testOwnershipBeforeMetadata = f
@@ -63,8 +63,8 @@ func testF105ArmBeforeMetadata(t *testing.T, asm *mqttAccountSessionManager, f f
 	})
 }
 
-// testF105StopOnce fails the named action once, as a process stopping there would.
-func testF105StopOnce(action mqttConnectOwnershipAction) func(mqttConnectOwnershipAction) error {
+// testStopOnce fails the named action once, as a process stopping there would.
+func testStopOnce(action mqttConnectOwnershipAction) func(mqttConnectOwnershipAction) error {
 	var armed atomic.Bool
 	armed.Store(true)
 	return func(a mqttConnectOwnershipAction) error {
@@ -75,31 +75,31 @@ func testF105StopOnce(action mqttConnectOwnershipAction) func(mqttConnectOwnersh
 	}
 }
 
-// testF105TransitionLog records every committed authority transition in order: its kind and
+// testTransitionLog records every committed authority transition in order: its kind and
 // the proposal it acts on. It is the oracle for WHICH proposal a settlement finalized, cancelled
 // or closed, and in what order relative to other events.
-type testF105TransitionLog struct {
+type testTransitionLog struct {
 	mu   sync.Mutex
 	evts []string
 }
 
-func (l *testF105TransitionLog) add(e string) {
+func (l *testTransitionLog) add(e string) {
 	l.mu.Lock()
 	l.evts = append(l.evts, e)
 	l.mu.Unlock()
 }
 
-func (l *testF105TransitionLog) snapshot() []string {
+func (l *testTransitionLog) snapshot() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]string(nil), l.evts...)
 }
 
-func (l *testF105TransitionLog) has(e string) bool {
-	return testF105IndexOf(l.snapshot(), e) >= 0
+func (l *testTransitionLog) has(e string) bool {
+	return testIndexOf(l.snapshot(), e) >= 0
 }
 
-func testF105IndexOf(evts []string, e string) int {
+func testIndexOf(evts []string, e string) int {
 	for i, x := range evts {
 		if x == e {
 			return i
@@ -108,8 +108,8 @@ func testF105IndexOf(evts []string, e string) int {
 	return -1
 }
 
-// testF105ProposalOf names the proposal a transition acts on, read from what it displaces.
-func testF105ProposalOf(tr *mqttAuthorityTransition) string {
+// testProposalOf names the proposal a transition acts on, read from what it displaces.
+func testProposalOf(tr *mqttAuthorityTransition) string {
 	if tr.Prev == nil {
 		return _EMPTY_
 	}
@@ -122,21 +122,21 @@ func testF105ProposalOf(tr *mqttAuthorityTransition) string {
 	return _EMPTY_
 }
 
-func testF105LogTransitions(t *testing.T, jsa *mqttJSA) *testF105TransitionLog {
+func testLogTransitions(t *testing.T, jsa *mqttJSA) *testTransitionLog {
 	t.Helper()
-	l := &testF105TransitionLog{}
+	l := &testTransitionLog{}
 	testArmTransitionSeam(t, jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		seq, err := send()
 		if err == nil && tr.Attempt != nil {
-			l.add(string(tr.Attempt.Kind) + ":" + testF105ProposalOf(tr))
+			l.add(string(tr.Attempt.Kind) + ":" + testProposalOf(tr))
 		}
 		return seq, err
 	})
 	return l
 }
 
-// testF105StandingProposal returns the proposal the authority carries, or "".
-func testF105StandingProposal(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) (string, mqttAuthorityState) {
+// testStandingProposal returns the proposal the authority carries, or "".
+func testStandingProposal(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) (string, mqttAuthorityState) {
 	t.Helper()
 	al := asm.jsa.loadOutboundAuthority(id, epoch)
 	if al.status != mqttOutboundValid || al.rec == nil {
@@ -151,22 +151,22 @@ func testF105StandingProposal(t *testing.T, asm *mqttAccountSessionManager, id, 
 	return _EMPTY_, al.rec.State
 }
 
-func testF105AccountEpoch(asm *mqttAccountSessionManager) string {
+func testAccountEpoch(asm *mqttAccountSessionManager) string {
 	asm.mu.RLock()
 	defer asm.mu.RUnlock()
 	return asm.sessStreamEpoch
 }
 
-// testF105RefusedConnectV5 connects and expects the CONNECT to be refused.
-func testF105RefusedConnectV5(t *testing.T, o *Options, ci *mqttV5ConnInfo) {
+// testRefusedConnectV5 connects and expects the CONNECT to be refused.
+func testRefusedConnectV5(t *testing.T, o *Options, ci *mqttV5ConnInfo) {
 	t.Helper()
 	cc, _ := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	testMQTTExpectDisconnect(t, cc)
 	cc.Close()
 }
 
-// testF105ServingAt asserts the authority serves and returns it.
-func testF105ServingAt(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) *mqttOutboundAuthority {
+// testServingAt asserts the authority serves and returns it.
+func testServingAt(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) *mqttOutboundAuthority {
 	t.Helper()
 	al := asm.jsa.loadOutboundAuthority(id, epoch)
 	if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityServing {
@@ -177,7 +177,7 @@ func testF105ServingAt(t *testing.T, asm *mqttAccountSessionManager, id, epoch s
 
 // T1: a crash-left COMMITTED CREATION is finalized with ITS id — not the new acceptance's —
 // and the new acceptance then serves under its OWN tenure. Mutations M1, M2, M3, M18.
-func TestF105CrashLeftCommittedCreationIsFinalizedAsProposed(t *testing.T) {
+func TestCrashLeftCommittedCreationIsFinalizedAsProposed(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -187,19 +187,19 @@ func TestF105CrashLeftCommittedCreationIsFinalizedAsProposed(t *testing.T) {
 	defer cw.Close()
 	const cid = "f105-8a-t1"
 	asm := testMQTTGetAccountSessionManager(t, s, "f105-8a-t1-warm")
-	epoch := testF105AccountEpoch(asm)
+	epoch := testAccountEpoch(asm)
 
-	testF105ArmStepEntry(t, asm, testF105StopOnce(mqttOwnershipFinalizeCreation))
+	testArmStepEntry(t, asm, testStopOnce(mqttOwnershipFinalizeCreation))
 	persistent := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-	testF105RefusedConnectV5(t, o, persistent)
-	crashed, state := testF105StandingProposal(t, asm, cid, epoch)
+	testRefusedConnectV5(t, o, persistent)
+	crashed, state := testStandingProposal(t, asm, cid, epoch)
 	if crashed == _EMPTY_ || state != mqttAuthorityReserving {
 		t.Fatalf("the crashed acceptance must leave its reservation standing, got %q in state %v", crashed, state)
 	}
-	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testF105CreationProposal(t, asm, cid, epoch)); v != mqttMetadataCommitted {
+	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testCreationProposal(t, asm, cid, epoch)); v != mqttMetadataCommitted {
 		t.Fatalf("the crashed reservation's metadata half must stand COMMITTED, got %v", v)
 	}
-	log := testF105LogTransitions(t, &asm.jsa)
+	log := testLogTransitions(t, &asm.jsa)
 
 	c2, r2 := testMQTTConnectV5(t, persistent, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
@@ -208,15 +208,15 @@ func TestF105CrashLeftCommittedCreationIsFinalizedAsProposed(t *testing.T) {
 	if !log.has(string(mqttTransitionFinalizeCreation) + ":" + crashed) {
 		t.Fatalf("the crashed reservation %q was not finalized under its own id: %v", crashed, log.snapshot())
 	}
-	rec := testF105ServingAt(t, asm, cid, epoch)
+	rec := testServingAt(t, asm, cid, epoch)
 	ent := c2Entitlement(t, s, cid)
 	if rec.Tenure != ent.Tenure {
 		t.Fatalf("the accepted connection must serve under its own tenure %q, the authority carries %q", ent.Tenure, rec.Tenure)
 	}
 }
 
-// testF105CreationProposal reads the standing reservation's proposal.
-func testF105CreationProposal(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) mqttOwnershipProposal {
+// testCreationProposal reads the standing reservation's proposal.
+func testCreationProposal(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) mqttOwnershipProposal {
 	t.Helper()
 	al := asm.jsa.loadOutboundAuthority(id, epoch)
 	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Creation == nil {
@@ -229,8 +229,8 @@ func testF105CreationProposal(t *testing.T, asm *mqttAccountSessionManager, id, 
 	return p
 }
 
-// testF105IntentProposal reads the standing preparation's proposal.
-func testF105IntentProposal(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) mqttOwnershipProposal {
+// testIntentProposal reads the standing preparation's proposal.
+func testIntentProposal(t *testing.T, asm *mqttAccountSessionManager, id, epoch string) mqttOwnershipProposal {
 	t.Helper()
 	al := asm.jsa.loadOutboundAuthority(id, epoch)
 	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Intent == nil {
@@ -258,23 +258,23 @@ func c2Entitlement(t *testing.T, s *Server, cid string) mqttOutboundEntitlement 
 
 // T2: a crash-left COMMITTED HANDOFF is finalized as proposed, then the CONNECT takes its own
 // tenure — at the committed generation for a resume, at a fresh one for a clean start.
-func TestF105CrashLeftCommittedHandoffIsFinalizedAsProposed(t *testing.T) {
+func TestCrashLeftCommittedHandoffIsFinalizedAsProposed(t *testing.T) {
 	for _, clean := range []bool{false, true} {
 		t.Run(fmt.Sprintf("clean=%v", clean), func(t *testing.T) {
 			cid := fmt.Sprintf("f105-8a-t2-%v", clean)
-			s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+			s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
 
-			testF105ArmStepEntry(t, asm, testF105StopOnce(mqttOwnershipFinalizeHandoff))
-			testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
+			testArmStepEntry(t, asm, testStopOnce(mqttOwnershipFinalizeHandoff))
+			testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
 				props: mqttV5ConnPropsSessionExpiry(3600)})
-			crashed, state := testF105StandingProposal(t, asm, cid, epoch)
+			crashed, state := testStandingProposal(t, asm, cid, epoch)
 			if crashed == _EMPTY_ || state != mqttAuthorityPreparing {
 				t.Fatalf("the crashed acceptance must leave its preparation standing, got %q %v", crashed, state)
 			}
-			committed := testF105IntentProposal(t, asm, cid, epoch)
-			log := testF105LogTransitions(t, &asm.jsa)
+			committed := testIntentProposal(t, asm, cid, epoch)
+			log := testLogTransitions(t, &asm.jsa)
 
 			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: clean,
 				props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
@@ -286,7 +286,7 @@ func TestF105CrashLeftCommittedHandoffIsFinalizedAsProposed(t *testing.T) {
 				t.Fatalf("the crashed handoff %q was not finalized as proposed: %v", crashed, log.snapshot())
 			}
 			// (ii) the end: this CONNECT's own tenure serves.
-			rec := testF105ServingAt(t, asm, cid, epoch)
+			rec := testServingAt(t, asm, cid, epoch)
 			if ent := c2Entitlement(t, s, cid); rec.Tenure != ent.Tenure || rec.Tenure == committed.Tenure {
 				t.Fatalf("the CONNECT must serve under its own tenure, authority %q entitlement %q committed %q",
 					rec.Tenure, ent.Tenure, committed.Tenure)
@@ -304,31 +304,31 @@ func TestF105CrashLeftCommittedHandoffIsFinalizedAsProposed(t *testing.T) {
 // T2 resident: the committed foreign handoff moved the record past a RESIDENT object; the
 // CONNECT disposes the stale object and restores from the moved record. Mutations M4a, M21,
 // M26, M28.
-func TestF105CrashLeftCommittedHandoffUnderAResidentObject(t *testing.T) {
+func TestCrashLeftCommittedHandoffUnderAResidentObject(t *testing.T) {
 	for _, clean := range []bool{false, true} {
 		t.Run(fmt.Sprintf("clean=%v", clean), func(t *testing.T) {
 			cid := fmt.Sprintf("f105-8a-t2r-%v", clean)
-			s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+			s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
-			before := testF105ResidentObject(asm, cid)
+			before := testResidentObject(asm, cid)
 			if before == nil {
 				t.Fatal("the persistent session must be resident for this test to mean anything")
 			}
 
-			testF105HoldResident(t, asm, cid)
+			testHoldResident(t, asm, cid)
 			// Another acceptance's clean start, crashed after its metadata committed: planted
 			// through the same ops a peer broker runs.
-			e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-			i := testF105Intent(t, e, "t2r")
-			testF105Prepare(t, e, i)
-			if _, err := asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))); err != nil {
+			e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+			i := testIntent(t, e, "t2r")
+			testPrepare(t, e, i)
+			if _, err := asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, testRecordSeq(t, e))); err != nil {
 				t.Fatalf("committing the peer's metadata half: %v", err)
 			}
 			if i.Gen == oldGen {
 				t.Fatal("the planted handoff must change the generation for this test to mean anything")
 			}
-			log := testF105LogTransitions(t, &asm.jsa)
+			log := testLogTransitions(t, &asm.jsa)
 
 			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: clean,
 				props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
@@ -338,10 +338,10 @@ func TestF105CrashLeftCommittedHandoffUnderAResidentObject(t *testing.T) {
 			if !log.has(string(mqttTransitionFinalize) + ":" + i.ID) {
 				t.Fatalf("the peer's committed handoff %q was not finalized: %v", i.ID, log.snapshot())
 			}
-			if after := testF105ResidentObject(asm, cid); after == before {
+			if after := testResidentObject(asm, cid); after == before {
 				t.Fatal("the stale resident object is still the client's session")
 			}
-			rec := testF105ServingAt(t, asm, cid, epoch)
+			rec := testServingAt(t, asm, cid, epoch)
 			if !clean && rec.Gen != i.Gen {
 				t.Fatalf("a resume must serve the committed generation %q, serves %q", i.Gen, rec.Gen)
 			}
@@ -349,19 +349,19 @@ func TestF105CrashLeftCommittedHandoffUnderAResidentObject(t *testing.T) {
 	}
 }
 
-// testF105ResidentObject is the session object the account holds for cid, bound or not.
-func testF105ResidentObject(asm *mqttAccountSessionManager, cid string) *mqttSession {
+// testResidentObject is the session object the account holds for cid, bound or not.
+func testResidentObject(asm *mqttAccountSessionManager, cid string) *mqttSession {
 	asm.mu.RLock()
 	defer asm.mu.RUnlock()
 	return asm.sessions[cid]
 }
 
-// testF105HoldResident keeps a resident object resident while a fixture plants a foreign write
+// testHoldResident keeps a resident object resident while a fixture plants a foreign write
 // under it: this broker would otherwise evict it asynchronously when it observes the remote
 // persist (or its ownership backstop does), and the CONNECT under test would sometimes meet no
 // resident object at all. That is the state a delayed notification leaves — the stale resident
 // object the CONNECT's settlement must dispose of itself.
-func testF105HoldResident(t *testing.T, asm *mqttAccountSessionManager, cid string) {
+func testHoldResident(t *testing.T, asm *mqttAccountSessionManager, cid string) {
 	t.Helper()
 	h := getHash(cid)
 	asm.mu.Lock()
@@ -378,26 +378,26 @@ func testF105HoldResident(t *testing.T, asm *mqttAccountSessionManager, cid stri
 
 // T3: a crash-left UNRESOLVED preparation is aborted, cancelled — its predecessor restored —
 // and the CONNECT proceeds. Mutations M1, M2.
-func TestF105CrashLeftUnresolvedPreparationIsCancelled(t *testing.T) {
+func TestCrashLeftUnresolvedPreparationIsCancelled(t *testing.T) {
 	for _, clean := range []bool{false, true} {
 		t.Run(fmt.Sprintf("clean=%v", clean), func(t *testing.T) {
 			cid := fmt.Sprintf("f105-8a-t3-%v", clean)
-			s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+			s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
 
-			testF105ArmBeforeMetadata(t, asm, testF105StopOnce(mqttOwnershipPrepareHandoff))
-			testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, cleanStart: clean,
+			testArmBeforeMetadata(t, asm, testStopOnce(mqttOwnershipPrepareHandoff))
+			testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, cleanStart: clean,
 				props: mqttV5ConnPropsSessionExpiry(3600)})
-			crashed, state := testF105StandingProposal(t, asm, cid, epoch)
+			crashed, state := testStandingProposal(t, asm, cid, epoch)
 			if crashed == _EMPTY_ || state != mqttAuthorityPreparing {
 				t.Fatalf("the crashed acceptance must leave its preparation standing, got %q %v", crashed, state)
 			}
-			p := testF105IntentProposal(t, asm, cid, epoch)
+			p := testIntentProposal(t, asm, cid, epoch)
 			if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, p); v != mqttMetadataUnresolved {
 				t.Fatalf("the crashed preparation's slot must be empty, got %v", v)
 			}
-			log := testF105LogTransitions(t, &asm.jsa)
+			log := testLogTransitions(t, &asm.jsa)
 
 			c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: clean,
 				props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
@@ -410,7 +410,7 @@ func TestF105CrashLeftUnresolvedPreparationIsCancelled(t *testing.T) {
 			if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, p); v != mqttMetadataAborted {
 				t.Fatalf("the crashed preparation's slot must stand ABORTED, got %v", v)
 			}
-			rec := testF105ServingAt(t, asm, cid, epoch)
+			rec := testServingAt(t, asm, cid, epoch)
 			if !clean && rec.Gen != oldGen {
 				t.Fatalf("a resume over the restored predecessor must keep generation %q, got %q", oldGen, rec.Gen)
 			}
@@ -420,7 +420,7 @@ func TestF105CrashLeftUnresolvedPreparationIsCancelled(t *testing.T) {
 
 // T4: a crash-left UNRESOLVED reservation is aborted, its generation closed, and the CONNECT
 // reserves over the closure. Mutations M1, M6.
-func TestF105CrashLeftUnresolvedReservationIsClosed(t *testing.T) {
+func TestCrashLeftUnresolvedReservationIsClosed(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -429,17 +429,17 @@ func TestF105CrashLeftUnresolvedReservationIsClosed(t *testing.T) {
 	defer cw.Close()
 	const cid = "f105-8a-t4"
 	asm := testMQTTGetAccountSessionManager(t, s, "f105-8a-t4-warm")
-	epoch := testF105AccountEpoch(asm)
+	epoch := testAccountEpoch(asm)
 
-	testF105ArmBeforeMetadata(t, asm, testF105StopOnce(mqttOwnershipReserve))
+	testArmBeforeMetadata(t, asm, testStopOnce(mqttOwnershipReserve))
 	persistent := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-	testF105RefusedConnectV5(t, o, persistent)
-	crashed, state := testF105StandingProposal(t, asm, cid, epoch)
+	testRefusedConnectV5(t, o, persistent)
+	crashed, state := testStandingProposal(t, asm, cid, epoch)
 	if crashed == _EMPTY_ || state != mqttAuthorityReserving {
 		t.Fatalf("the crashed acceptance must leave its reservation standing, got %q %v", crashed, state)
 	}
 	crashedGen := asm.jsa.loadOutboundAuthority(cid, epoch).rec.Gen
-	log := testF105LogTransitions(t, &asm.jsa)
+	log := testLogTransitions(t, &asm.jsa)
 
 	c2, r2 := testMQTTConnectV5(t, persistent, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
@@ -451,30 +451,30 @@ func TestF105CrashLeftUnresolvedReservationIsClosed(t *testing.T) {
 	if !log.has(string(mqttTransitionReserveCreation)+":") && len(log.snapshot()) == 0 {
 		t.Fatalf("no transition was observed: %v", log.snapshot())
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen == crashedGen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen == crashedGen {
 		t.Fatalf("the CONNECT must serve a generation other than the closed %q", crashedGen)
 	}
 }
 
 // T5: a crash-left proposal positively ABORTED by somebody else does not make the next
 // acceptance a loser. Mutations M1, M18.
-func TestF105ForeignAbortedProposalDoesNotMakeTheAcceptanceALoser(t *testing.T) {
+func TestForeignAbortedProposalDoesNotMakeTheAcceptanceALoser(t *testing.T) {
 	t.Run("preparation", func(t *testing.T) {
 		const cid = "f105-8a-t5-prep"
-		s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+		s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 		defer done()
 		o := s.getOpts()
-		testF105ArmBeforeMetadata(t, asm, testF105StopOnce(mqttOwnershipPrepareHandoff))
+		testArmBeforeMetadata(t, asm, testStopOnce(mqttOwnershipPrepareHandoff))
 		ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-		testF105RefusedConnectV5(t, o, ci)
-		p := testF105IntentProposal(t, asm, cid, epoch)
+		testRefusedConnectV5(t, o, ci)
+		p := testIntentProposal(t, asm, cid, epoch)
 		if v := asm.jsa.settleProposal(_EMPTY_, cid, epoch, p); v != mqttMetadataAborted {
 			t.Fatalf("aborting the crashed preparation's slot returned %v", v)
 		}
 		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 		defer c2.Close()
 		testMQTTReadConnAckV5(t, r2)
-		testF105ServingAt(t, asm, cid, epoch)
+		testServingAt(t, asm, cid, epoch)
 	})
 	t.Run("reservation", func(t *testing.T) {
 		o := testMQTTDefaultOptionsV5()
@@ -485,18 +485,18 @@ func TestF105ForeignAbortedProposalDoesNotMakeTheAcceptanceALoser(t *testing.T) 
 		defer cw.Close()
 		const cid = "f105-8a-t5-res"
 		asm := testMQTTGetAccountSessionManager(t, s, "f105-8a-t5-warm")
-		epoch := testF105AccountEpoch(asm)
-		testF105ArmBeforeMetadata(t, asm, testF105StopOnce(mqttOwnershipReserve))
+		epoch := testAccountEpoch(asm)
+		testArmBeforeMetadata(t, asm, testStopOnce(mqttOwnershipReserve))
 		ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-		testF105RefusedConnectV5(t, o, ci)
-		p := testF105CreationProposal(t, asm, cid, epoch)
+		testRefusedConnectV5(t, o, ci)
+		p := testCreationProposal(t, asm, cid, epoch)
 		if v := asm.jsa.settleProposal(_EMPTY_, cid, epoch, p); v != mqttMetadataAborted {
 			t.Fatalf("aborting the crashed reservation's slot returned %v", v)
 		}
 		c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 		defer c2.Close()
 		testMQTTReadConnAckV5(t, r2)
-		testF105ServingAt(t, asm, cid, epoch)
+		testServingAt(t, asm, cid, epoch)
 	})
 }
 
@@ -504,9 +504,9 @@ func TestF105ForeignAbortedProposalDoesNotMakeTheAcceptanceALoser(t *testing.T) 
 // — is resolved IN PLACE: the first CONNECT is accepted. Bug v's evidence: an ambiguous
 // ownership commit is resolved from its receipt slot, never handed to the record uncertainty
 // resolver.
-func TestF105LostResponseMetadataCommitFinalizesInPlace(t *testing.T) {
+func TestLostResponseMetadataCommitFinalizesInPlace(t *testing.T) {
 	const cid = "f105-8a-t6"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var armed atomic.Bool
@@ -524,7 +524,7 @@ func TestF105LostResponseMetadataCommitFinalizesInPlace(t *testing.T) {
 	if armed.Load() {
 		t.Fatal("the lost response was never injected, so nothing here is tested")
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
 		t.Fatalf("the clean start must serve a fresh generation, still %q", oldGen)
 	}
 	_, sess := testResidentSession(t, s, cid)
@@ -536,22 +536,22 @@ func TestF105LostResponseMetadataCommitFinalizesInPlace(t *testing.T) {
 // T18: two settlers. Our settlement selects a foreign proposal; before its act, the competing
 // settler acts on it. Ours finds it gone, reloads, and the CONNECT is accepted; the proposal
 // was acted on exactly once. Mutation M22.
-func TestF105CompetingSettlerActsFirst(t *testing.T) {
+func TestCompetingSettlerActsFirst(t *testing.T) {
 	const cid = "f105-8a-t18"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	testF105ArmStepEntry(t, asm, testF105StopOnce(mqttOwnershipFinalizeHandoff))
+	testArmStepEntry(t, asm, testStopOnce(mqttOwnershipFinalizeHandoff))
 	ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-	testF105RefusedConnectV5(t, o, ci)
-	crashed, _ := testF105StandingProposal(t, asm, cid, epoch)
+	testRefusedConnectV5(t, o, ci)
+	crashed, _ := testStandingProposal(t, asm, cid, epoch)
 	if crashed == _EMPTY_ {
 		t.Fatal("no crashed proposal stands")
 	}
 	var finalized atomic.Int32
 	var raced atomic.Bool
 	testArmTransitionSeam(t, &asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
-		if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionFinalize && testF105ProposalOf(tr) == crashed {
+		if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionFinalize && testProposalOf(tr) == crashed {
 			if raced.CompareAndSwap(false, true) {
 				// THE COMPETITOR: finalize the same proposal first, then let ours run.
 				// Its own commit passes through this seam too, and is counted there.
@@ -576,11 +576,11 @@ func TestF105CompetingSettlerActsFirst(t *testing.T) {
 	if n := finalized.Load(); n != 1 {
 		t.Fatalf("the proposal must be finalized exactly once, was %d times", n)
 	}
-	testF105ServingAt(t, asm, cid, epoch)
+	testServingAt(t, asm, cid, epoch)
 }
 
-// testF105ArmBudget shrinks the account's CONNECT ownership budget for one test.
-func testF105ArmBudget(t *testing.T, asm *mqttAccountSessionManager, d time.Duration) {
+// testArmBudget shrinks the account's CONNECT ownership budget for one test.
+func testArmBudget(t *testing.T, asm *mqttAccountSessionManager, d time.Duration) {
 	t.Helper()
 	asm.mu.Lock()
 	asm.testOwnershipBudgetTotal = d
@@ -592,17 +592,17 @@ func testF105ArmBudget(t *testing.T, asm *mqttAccountSessionManager, d time.Dura
 	})
 }
 
-// testF105AbandonGate gates the owed-abandonment worker: it records each launch, and lets it
+// testAbandonGate gates the owed-abandonment worker: it records each launch, and lets it
 // act only when release is closed; proceed=false suppresses it.
-type testF105AbandonGate struct {
+type testAbandonGate struct {
 	launched atomic.Int32
 	release  chan struct{}
 	proceed  atomic.Bool
 }
 
-func testF105ArmAbandonGate(t *testing.T, asm *mqttAccountSessionManager) *testF105AbandonGate {
+func testArmAbandonGate(t *testing.T, asm *mqttAccountSessionManager) *testAbandonGate {
 	t.Helper()
-	g := &testF105AbandonGate{release: make(chan struct{})}
+	g := &testAbandonGate{release: make(chan struct{})}
 	g.proceed.Store(true)
 	asm.mu.Lock()
 	asm.testAbandonOwn = func(string, mqttOwnershipProposal) bool {
@@ -619,18 +619,18 @@ func testF105ArmAbandonGate(t *testing.T, asm *mqttAccountSessionManager) *testF
 	return g
 }
 
-// testF105OwnAbortedByPeer arms the before-metadata seam so that, the moment this
+// testOwnAbortedByPeer arms the before-metadata seam so that, the moment this
 // acceptance's own reservation or preparation lands, a PEER settles its slot ABORTED — the
 // acceptance has lost — and every attempt to abandon it (close or cancel) is held off by the
 // transition seam while blockAbandon is set, sleeping until the budget is gone when expire is
 // set. It returns the proposal id it aborted.
-func testF105OwnAbortedByPeer(t *testing.T, asm *mqttAccountSessionManager, cid, epoch string,
+func testOwnAbortedByPeer(t *testing.T, asm *mqttAccountSessionManager, cid, epoch string,
 	action mqttConnectOwnershipAction, blockAbandon *atomic.Bool, expireAfter time.Duration) *atomic.Value {
 	t.Helper()
 	var own atomic.Value
 	var armed atomic.Bool
 	armed.Store(true)
-	testF105ArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
+	testArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
 		if a != action || !armed.CompareAndSwap(true, false) {
 			return nil
 		}
@@ -654,7 +654,7 @@ func testF105OwnAbortedByPeer(t *testing.T, asm *mqttAccountSessionManager, cid,
 	})
 	testArmTransitionSeam(t, &asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		id, _ := own.Load().(string)
-		if tr.Attempt != nil && id != _EMPTY_ && testF105ProposalOf(tr) == id && blockAbandon.Load() &&
+		if tr.Attempt != nil && id != _EMPTY_ && testProposalOf(tr) == id && blockAbandon.Load() &&
 			(tr.Attempt.Kind == mqttTransitionCancelIntent || tr.Attempt.Kind == mqttTransitionCloseAdmit) {
 			if expireAfter > 0 {
 				time.Sleep(expireAfter)
@@ -672,7 +672,7 @@ func testF105OwnAbortedByPeer(t *testing.T, asm *mqttAccountSessionManager, cid,
 // (T8d: the deadline cut the cleanup off; the observation carried the ABORTED verdict).
 // Variant (c): the worker never acts, and the next acceptance settles the proposal as foreign.
 // Mutations M7, M20.
-func TestF105OwnAbortedProposalIsAbandonedAfterTheRefusal(t *testing.T) {
+func TestOwnAbortedProposalIsAbandonedAfterTheRefusal(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		expire   bool
@@ -680,26 +680,26 @@ func TestF105OwnAbortedProposalIsAbandonedAfterTheRefusal(t *testing.T) {
 	}{{"budget-remaining", false, false}, {"at-expiry", true, false}, {"worker-suppressed", false, true}} {
 		t.Run("preparation/"+tc.name, func(t *testing.T) {
 			cid := "f105-8a-t8p-" + tc.name
-			s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+			s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
-			before := testF105ServingAt(t, asm, cid, epoch)
+			before := testServingAt(t, asm, cid, epoch)
 			var expire time.Duration
 			if tc.expire {
-				testF105ArmBudget(t, asm, 400*time.Millisecond)
+				testArmBudget(t, asm, 400*time.Millisecond)
 				expire = 500 * time.Millisecond
 			}
 			var block atomic.Bool
 			block.Store(true)
-			own := testF105OwnAbortedByPeer(t, asm, cid, epoch, mqttOwnershipPrepareHandoff, &block, expire)
-			gate := testF105ArmAbandonGate(t, asm)
+			own := testOwnAbortedByPeer(t, asm, cid, epoch, mqttOwnershipPrepareHandoff, &block, expire)
+			gate := testArmAbandonGate(t, asm)
 			ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-			testF105RefusedConnectV5(t, o, ci)
+			testRefusedConnectV5(t, o, ci)
 			id, _ := own.Load().(string)
 			if id == _EMPTY_ {
 				t.Fatal("no own proposal was aborted, so nothing here is tested")
 			}
-			if standing, _ := testF105StandingProposal(t, asm, cid, epoch); standing != id {
+			if standing, _ := testStandingProposal(t, asm, cid, epoch); standing != id {
 				t.Fatalf("the aborted own preparation %q must still stand after the refusal, got %q", id, standing)
 			}
 			block.Store(false)
@@ -739,14 +739,14 @@ func TestF105OwnAbortedProposalIsAbandonedAfterTheRefusal(t *testing.T) {
 		defer cw.Close()
 		const cid = "f105-8a-t8r"
 		asm := testMQTTGetAccountSessionManager(t, s, "f105-8a-t8r-warm")
-		epoch := testF105AccountEpoch(asm)
+		epoch := testAccountEpoch(asm)
 		var block atomic.Bool
 		block.Store(true)
-		own := testF105OwnAbortedByPeer(t, asm, cid, epoch, mqttOwnershipReserve, &block, 0)
-		gate := testF105ArmAbandonGate(t, asm)
-		testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
+		own := testOwnAbortedByPeer(t, asm, cid, epoch, mqttOwnershipReserve, &block, 0)
+		gate := testArmAbandonGate(t, asm)
+		testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
 		id, _ := own.Load().(string)
-		if standing, _ := testF105StandingProposal(t, asm, cid, epoch); id == _EMPTY_ || standing != id {
+		if standing, _ := testStandingProposal(t, asm, cid, epoch); id == _EMPTY_ || standing != id {
 			t.Fatalf("the aborted own reservation %q must still stand after the refusal, got %q", id, standing)
 		}
 		gen := asm.jsa.loadOutboundAuthority(cid, epoch).rec.Gen
@@ -765,36 +765,36 @@ func TestF105OwnAbortedProposalIsAbandonedAfterTheRefusal(t *testing.T) {
 // the CONNECT is refused, NOTHING is abandoned — the owed-abandonment worker is never even
 // launched — and the next acceptance finalizes it as proposed. (b): the expiry falls between
 // the COMMITTED resolution and the adoption readback. Mutation M9, M20.
-func TestF105ExpiredCommittedProposalStandsForTheNextAcceptance(t *testing.T) {
+func TestExpiredCommittedProposalStandsForTheNextAcceptance(t *testing.T) {
 	const cid = "f105-8a-t9"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	testF105ArmBudget(t, asm, 400*time.Millisecond)
+	testArmBudget(t, asm, 400*time.Millisecond)
 	var armed atomic.Bool
 	armed.Store(true)
-	testF105ArmStepEntry(t, asm, func(a mqttConnectOwnershipAction) error {
+	testArmStepEntry(t, asm, func(a mqttConnectOwnershipAction) error {
 		if a == mqttOwnershipFinalizeHandoff && armed.CompareAndSwap(true, false) {
 			time.Sleep(500 * time.Millisecond)
 		}
 		return nil
 	})
-	gate := testF105ArmAbandonGate(t, asm)
+	gate := testArmAbandonGate(t, asm)
 	close(gate.release)
 	ci := &mqttV5ConnInfo{clientID: cid, cleanStart: true, props: mqttV5ConnPropsSessionExpiry(3600)}
-	testF105RefusedConnectV5(t, o, ci)
-	standing, state := testF105StandingProposal(t, asm, cid, epoch)
+	testRefusedConnectV5(t, o, ci)
+	standing, state := testStandingProposal(t, asm, cid, epoch)
 	if standing == _EMPTY_ || state != mqttAuthorityPreparing {
 		t.Fatalf("the committed proposal must still stand PREPARING, got %q %v", standing, state)
 	}
-	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testF105IntentProposal(t, asm, cid, epoch)); v != mqttMetadataCommitted {
+	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testIntentProposal(t, asm, cid, epoch)); v != mqttMetadataCommitted {
 		t.Fatalf("the proposal must stand COMMITTED, got %v", v)
 	}
 	if n := gate.launched.Load(); n != 0 {
 		t.Fatalf("a COMMITTED proposal owes no abandonment, but the worker was launched %d time(s)", n)
 	}
-	testF105ArmBudget(t, asm, 0)
-	log := testF105LogTransitions(t, &asm.jsa)
+	testArmBudget(t, asm, 0)
+	log := testLogTransitions(t, &asm.jsa)
 	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
@@ -807,7 +807,7 @@ func TestF105ExpiredCommittedProposalStandsForTheNextAcceptance(t *testing.T) {
 // per-request timeout at its 5s default and the budget at 300ms, a store that never answers
 // refuses the CONNECT well inside a second. (a) the authority reads; (b) the metadata batch.
 // Mutations M10a, M10b.
-func TestF105OwnershipDeadlineBoundsABlockedStore(t *testing.T) {
+func TestOwnershipDeadlineBoundsABlockedStore(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		drop func(cidHash string) func(subject string, body []byte) bool
@@ -833,10 +833,10 @@ func TestF105OwnershipDeadlineBoundsABlockedStore(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cid := "f105-8a-t10-" + tc.name
-			s, asm, _, _, done := testF105CleanStartEnv(t, cid)
+			s, asm, _, _, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
-			testF105ArmBudget(t, asm, 300*time.Millisecond)
+			testArmBudget(t, asm, 300*time.Millisecond)
 			if asm.jsa.timeout < 2*time.Second {
 				t.Fatalf("the per-request timeout %v is too short for this test to discriminate", asm.jsa.timeout)
 			}
@@ -844,7 +844,7 @@ func TestF105OwnershipDeadlineBoundsABlockedStore(t *testing.T) {
 			asm.jsa.testDropRequest.Store(&drop)
 			t.Cleanup(func() { asm.jsa.testDropRequest.Store(nil) })
 			start := time.Now()
-			testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
+			testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
 				props: mqttV5ConnPropsSessionExpiry(3600)})
 			if el := time.Since(start); el > 1500*time.Millisecond {
 				t.Fatalf("the CONNECT took %v to be refused against a 300ms ownership budget: a request "+
@@ -858,9 +858,9 @@ func bytesContains(b []byte, s string) bool {
 	return len(s) > 0 && len(b) >= len(s) && strings.Contains(string(b), s)
 }
 
-// testF105Persistent connects a persistent v5 session with the given expiry, subscribes, and
+// testPersistent connects a persistent v5 session with the given expiry, subscribes, and
 // closes it, returning its account, epoch and serving generation.
-func testF105Persistent(t *testing.T, s *Server, cid string, expiry uint32) (*mqttAccountSessionManager, string, string) {
+func testPersistent(t *testing.T, s *Server, cid string, expiry uint32) (*mqttAccountSessionManager, string, string) {
 	t.Helper()
 	o := s.getOpts()
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid,
@@ -868,18 +868,18 @@ func testF105Persistent(t *testing.T, s *Server, cid string, expiry uint32) (*mq
 	testMQTTReadConnAckV5(t, r)
 	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "foo", opts: 1}})
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
+	epoch := testAccountEpoch(asm)
+	gen := testServingAt(t, asm, cid, epoch).Gen
 	c.Close()
 	time.Sleep(150 * time.Millisecond)
 	return asm, epoch, gen
 }
 
-// testF105MakeNonResident evicts the resident object from the account's maps WITHOUT discarding
+// testMakeNonResident evicts the resident object from the account's maps WITHOUT discarding
 // it and disarms its expiry timer, leaving only the record — the state a restarted broker meets.
-func testF105MakeNonResident(t *testing.T, asm *mqttAccountSessionManager, cid string) {
+func testMakeNonResident(t *testing.T, asm *mqttAccountSessionManager, cid string) {
 	t.Helper()
-	sess := testF105ResidentObject(asm, cid)
+	sess := testResidentObject(asm, cid)
 	if sess == nil {
 		t.Fatal("no resident object to evict")
 	}
@@ -887,24 +887,24 @@ func testF105MakeNonResident(t *testing.T, asm *mqttAccountSessionManager, cid s
 	asm.removeSession(sess, true)
 }
 
-// testF105PlantUnresolved plants a foreign clean-start preparation, its metadata slot empty: an
+// testPlantUnresolved plants a foreign clean-start preparation, its metadata slot empty: an
 // acceptance on another broker stopped between its prepare and its metadata commit.
-func testF105PlantUnresolved(t *testing.T, asm *mqttAccountSessionManager, cid, epoch, tag string) *mqttHandoffIntent {
+func testPlantUnresolved(t *testing.T, asm *mqttAccountSessionManager, cid, epoch, tag string) *mqttHandoffIntent {
 	t.Helper()
-	e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-	i := testF105Intent(t, e, tag)
-	testF105Prepare(t, e, i)
+	e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+	i := testIntent(t, e, tag)
+	testPrepare(t, e, i)
 	return i
 }
 
-// testF105ClosureDiscards reports whether gen carries a DISCARDING closure.
-func testF105ClosureDiscards(asm *mqttAccountSessionManager, cid, epoch, gen string) bool {
+// testClosureDiscards reports whether gen carries a DISCARDING closure.
+func testClosureDiscards(asm *mqttAccountSessionManager, cid, epoch, gen string) bool {
 	cl, _, st := asm.jsa.loadGenClosure(cid, epoch, gen)
 	return st == mqttOutboundValid && cl != nil && cl.Discard
 }
 
-// testF105RecordGone reports whether the client's session record is gone.
-func testF105RecordGone(asm *mqttAccountSessionManager, cid string) bool {
+// testRecordGone reports whether the client's session record is gone.
+func testRecordGone(asm *mqttAccountSessionManager, cid string) bool {
 	smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
 	return err != nil || smsg == nil || mqttDecodeSessionRecord(smsg) == nil
 }
@@ -915,23 +915,23 @@ func testF105RecordGone(asm *mqttAccountSessionManager, cid string) bool {
 // settlement, just before the restore, is settled at the DISCARD BOUNDARY instead, and the
 // discard proceeds RECEIPTED — the predecessor generation ends with an authorized discarding
 // closure. Mutations M5, M17.
-func TestF105OverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) {
+func TestOverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) {
 	for _, late := range []bool{false, true} {
 		t.Run(fmt.Sprintf("late=%v", late), func(t *testing.T) {
 			o := testMQTTDefaultOptionsV5()
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
 			cid := fmt.Sprintf("f105-8a-t15-%v", late)
-			asm, epoch, gen := testF105Persistent(t, s, cid, 1)
-			testF105MakeNonResident(t, asm, cid)
+			asm, epoch, gen := testPersistent(t, s, cid, 1)
+			testMakeNonResident(t, asm, cid)
 			var early *mqttHandoffIntent
 			if !late {
-				early = testF105PlantUnresolved(t, asm, cid, epoch, "t15")
+				early = testPlantUnresolved(t, asm, cid, epoch, "t15")
 			}
 			// OVERDUE: a 1 s interval is proven elapsed at stamp + 2 s (mqttSessionExpiryDeadline), and the
 			// stamp is no later than the disconnect above.
 			time.Sleep(2100 * time.Millisecond)
-			log := testF105LogTransitions(t, &asm.jsa)
+			log := testLogTransitions(t, &asm.jsa)
 			var boundarySteps atomic.Int32
 			var lateIntent atomic.Value
 			asm.mu.Lock()
@@ -941,7 +941,7 @@ func TestF105OverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) 
 				}
 				log.add("restore-entry")
 				if late && lateIntent.Load() == nil {
-					lateIntent.Store(testF105PlantUnresolved(t, asm, cid, epoch, "t15b"))
+					lateIntent.Store(testPlantUnresolved(t, asm, cid, epoch, "t15b"))
 				}
 			}
 			asm.testBoundarySettle = func(id string, steps int) {
@@ -963,8 +963,8 @@ func TestF105OverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) 
 
 			evts := log.snapshot()
 			if !late {
-				cancel := testF105IndexOf(evts, string(mqttTransitionCancelIntent)+":"+early.ID)
-				entry := testF105IndexOf(evts, "restore-entry")
+				cancel := testIndexOf(evts, string(mqttTransitionCancelIntent)+":"+early.ID)
+				entry := testIndexOf(evts, "restore-entry")
 				if cancel < 0 || entry < 0 || cancel > entry {
 					t.Fatalf("the CONNECT's settlement must cancel %q BEFORE the restore is entered: %v", early.ID, evts)
 				}
@@ -984,7 +984,7 @@ func TestF105OverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) 
 					t.Fatal("the late preparation was not settled at the discard boundary")
 				}
 			}
-			if !testF105ClosureDiscards(asm, cid, epoch, gen) {
+			if !testClosureDiscards(asm, cid, epoch, gen) {
 				t.Fatalf("the overdue predecessor generation %q must end with an authorized DISCARDING "+
 					"closure — a receiptless discard leaves it serving", gen)
 			}
@@ -995,16 +995,16 @@ func TestF105OverdueNonResidentPredecessorSettlesBeforeTheDiscard(t *testing.T) 
 // T17: a RESIDENT clean start meets a preparation planted between the CONNECT's settlement and
 // its retirement. The clean-start retirement's own discard boundary settles it, the handoff
 // proceeds from the boundary's load, and the CONNECT is accepted. Mutation M17.
-func TestF105CleanStartRetirementSettlesALateProposal(t *testing.T) {
+func TestCleanStartRetirementSettlesALateProposal(t *testing.T) {
 	const cid = "f105-8a-t17"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var planted atomic.Value
 	asm.mu.Lock()
 	asm.testRestoreEntry = func(id string) {
 		if id == cid && planted.Load() == nil {
-			planted.Store(testF105PlantUnresolved(t, asm, cid, epoch, "t17"))
+			planted.Store(testPlantUnresolved(t, asm, cid, epoch, "t17"))
 		}
 	}
 	asm.mu.Unlock()
@@ -1013,7 +1013,7 @@ func TestF105CleanStartRetirementSettlesALateProposal(t *testing.T) {
 		asm.testRestoreEntry = nil
 		asm.mu.Unlock()
 	})
-	log := testF105LogTransitions(t, &asm.jsa)
+	log := testLogTransitions(t, &asm.jsa)
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
@@ -1024,7 +1024,7 @@ func TestF105CleanStartRetirementSettlesALateProposal(t *testing.T) {
 	if !log.has(string(mqttTransitionCancelIntent) + ":" + li.ID) {
 		t.Fatalf("the late preparation %q was not settled: %v", li.ID, log.snapshot())
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
 		t.Fatalf("the clean start must serve a fresh generation, still %q", oldGen)
 	}
 }
@@ -1032,7 +1032,7 @@ func TestF105CleanStartRetirementSettlesALateProposal(t *testing.T) {
 // T20: a disconnect whose session ends at once (expiry 0), over a crash-left foreign
 // preparation and with no CONNECT to follow: the disconnect's own discard settles it at the
 // boundary and completes RECEIPTED. Mutation M17.
-func TestF105DisconnectDiscardSettlesAStandingProposal(t *testing.T) {
+func TestDisconnectDiscardSettlesAStandingProposal(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1041,20 +1041,20 @@ func TestF105DisconnectDiscardSettlesAStandingProposal(t *testing.T) {
 	testMQTTReadConnAckV5(t, r)
 	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "foo", opts: 1}})
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
-	i := testF105PlantUnresolved(t, asm, cid, epoch, "t20")
+	epoch := testAccountEpoch(asm)
+	gen := testServingAt(t, asm, cid, epoch).Gen
+	i := testPlantUnresolved(t, asm, cid, epoch, "t20")
 	c.Close()
 	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
-		if !testF105RecordGone(asm, cid) {
+		if !testRecordGone(asm, cid) {
 			return errors.New("the session record still stands")
 		}
-		if !testF105ClosureDiscards(asm, cid, epoch, gen) {
+		if !testClosureDiscards(asm, cid, epoch, gen) {
 			return fmt.Errorf("generation %q has no discarding closure yet", gen)
 		}
 		return nil
 	})
-	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testF105Prop(t, i)); v != mqttMetadataAborted {
+	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testProp(t, i)); v != mqttMetadataAborted {
 		t.Fatalf("the crash-left preparation's slot must stand ABORTED, got %v", v)
 	}
 }
@@ -1062,24 +1062,24 @@ func TestF105DisconnectDiscardSettlesAStandingProposal(t *testing.T) {
 // T21: NONRESIDENT RECORD EXPIRY after a restart, over an overdue record and a crash-left
 // UNRESOLVED preparation, and no CONNECT: the record-expiry sweep's transient object settles at
 // the boundary and completes RECEIPTED. Mutation M17.
-func TestF105RecordExpirySettlesAStandingProposal(t *testing.T) {
+func TestRecordExpirySettlesAStandingProposal(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 	const cid = "f105-8a-t21"
-	asm, epoch, gen := testF105Persistent(t, s, cid, 1)
-	testF105MakeNonResident(t, asm, cid)
-	i := testF105PlantUnresolved(t, asm, cid, epoch, "t21")
+	asm, epoch, gen := testPersistent(t, s, cid, 1)
+	testMakeNonResident(t, asm, cid)
+	i := testPlantUnresolved(t, asm, cid, epoch, "t21")
 	// OVERDUE: a 1 s interval is proven elapsed at stamp + 2 s (mqttSessionExpiryDeadline).
 	time.Sleep(2100 * time.Millisecond)
 	asm.expireSessionFromRecord(s, getHash(cid))
-	if !testF105RecordGone(asm, cid) {
+	if !testRecordGone(asm, cid) {
 		t.Fatal("the overdue record still stands")
 	}
-	if !testF105ClosureDiscards(asm, cid, epoch, gen) {
+	if !testClosureDiscards(asm, cid, epoch, gen) {
 		t.Fatalf("generation %q must end with an authorized discarding closure", gen)
 	}
-	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testF105Prop(t, i)); v != mqttMetadataAborted {
+	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testProp(t, i)); v != mqttMetadataAborted {
 		t.Fatalf("the crash-left preparation's slot must stand ABORTED, got %v", v)
 	}
 }
@@ -1089,18 +1089,18 @@ func TestF105RecordExpirySettlesAStandingProposal(t *testing.T) {
 // successor — then claims and discards the successor; "a finalize happened" is not taken as
 // proof of supersession. With a CONNECT (T2-order), the settlement's finalize precedes the
 // first discard entry, and the discard then completes. Mutations M24, M4b.
-func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
+func TestCommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 	for _, viaConnect := range []bool{false, true} {
 		t.Run(fmt.Sprintf("connect=%v", viaConnect), func(t *testing.T) {
 			o := testMQTTDefaultOptionsV5()
 			s := testMQTTRunServer(t, o)
 			defer testMQTTShutdownServer(s)
 			cid := fmt.Sprintf("f105-8a-t21b-%v", viaConnect)
-			asm, epoch, _ := testF105Persistent(t, s, cid, 3600)
-			testF105MakeNonResident(t, asm, cid)
-			e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-			i := testF105Intent(t, e, "t21b")
-			testF105Prepare(t, e, i)
+			asm, epoch, _ := testPersistent(t, s, cid, 3600)
+			testMakeNonResident(t, asm, cid)
+			e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+			i := testIntent(t, e, "t21b")
+			testPrepare(t, e, i)
 			// The committed successor record is OVERDUE: disconnected ten seconds ago with a
 			// one-second expiry.
 			fact := &mqttAcceptFact{ClientID: cid, SessEpoch: epoch, AcceptID: mqttNewAcceptID(), At: time.Now().UnixNano()}
@@ -1108,15 +1108,15 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 			wid := mqttNewInflightNonce()
 			rec, _ := json.Marshal(&mqttPersistedSession{ID: cid, Gen: i.Gen, WID: wid, Origin: "o",
 				ExpiryInterval: 1, DisconnectedAt: time.Now().Add(-10 * time.Second).Unix()})
-			f, ferr := mqttFreezeMetadataAttempt(cid, epoch, _EMPTY_, testF105Prop(t, i), wid,
-				mqttAcceptSubject(_EMPTY_, getHash(cid), epoch, fact.AcceptID), fb, testF105RecordSeq(t, e), rec)
+			f, ferr := mqttFreezeMetadataAttempt(cid, epoch, _EMPTY_, testProp(t, i), wid,
+				mqttAcceptSubject(_EMPTY_, getHash(cid), epoch, fact.AcceptID), fb, testRecordSeq(t, e), rec)
 			if ferr != nil {
 				t.Fatalf("freezing the successor: %v", ferr)
 			}
 			if _, err := asm.jsa.commitMetadataAttempt(f); err != nil {
 				t.Fatalf("committing the successor: %v", err)
 			}
-			log := testF105LogTransitions(t, &asm.jsa)
+			log := testLogTransitions(t, &asm.jsa)
 			// EACH DISCARD ENTRY IS ATTRIBUTED: the record-driven expiry meets the same overdue record and
 			// enters its discard before it settles (the non-CONNECT subtest asserts no order for it), so
 			// the ordering below is the CONNECT's own and is judged on the CONNECT's entry only.
@@ -1144,19 +1144,19 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 			// The server's own record-expiry sweep meets the same overdue record and may be the
 			// discard that wins the claim, so the outcome is awaited rather than read at once.
 			checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
-				if !testF105ClosureDiscards(asm, cid, epoch, i.Gen) {
+				if !testClosureDiscards(asm, cid, epoch, i.Gen) {
 					return fmt.Errorf("the finalized successor generation %q has no discarding closure yet: %v",
 						i.Gen, log.snapshot())
 				}
 				return nil
 			})
 			evts := log.snapshot()
-			fin := testF105IndexOf(evts, string(mqttTransitionFinalize)+":"+i.ID)
-			entry := testF105IndexOf(evts, "discard-entry")
-			if c := testF105IndexOf(evts, "discard-entry:connect"); entry < 0 || (c >= 0 && c < entry) {
+			fin := testIndexOf(evts, string(mqttTransitionFinalize)+":"+i.ID)
+			entry := testIndexOf(evts, "discard-entry")
+			if c := testIndexOf(evts, "discard-entry:connect"); entry < 0 || (c >= 0 && c < entry) {
 				entry = c
 			}
-			connectEntry := testF105IndexOf(evts, "discard-entry:connect")
+			connectEntry := testIndexOf(evts, "discard-entry:connect")
 			if fin < 0 {
 				t.Fatalf("the committed proposal %q was never finalized: %v", i.ID, evts)
 			}
@@ -1170,16 +1170,16 @@ func TestF105CommittedOverdueSuccessorIsFinalizedThenDiscarded(t *testing.T) {
 	}
 }
 
-// T22 (THE RESIDUE) moved to TestF105_8bReceiptlessTeardownWithholds: since issue #107 8b the
+// T22 (THE RESIDUE) moved to Test8bReceiptlessTeardownWithholds: since issue #107 8b the
 // residue's teardown withholds the record's release instead of releasing it receiptless
-// (consult 121), and its continuation is TestF105_8bExpiryAdoptionContinuesReceiptless.
+// (consult 121), and its continuation is Test8bExpiryAdoptionContinuesReceiptless.
 
 // T11 / T12: a refused CONNECT that wrote no success CONNACK is certified closed AT its refusal
 // — the certificate names the refusal, not the later teardown — and a finalization another
 // acceptance completes afterwards cannot make that socket emit. Mutation M11.
-func TestF105RefusedConnectIsCertifiedAndStaysSilent(t *testing.T) {
+func TestRefusedConnectIsCertifiedAndStaysSilent(t *testing.T) {
 	const cid = "f105-8a-t11"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	type certified struct {
@@ -1201,17 +1201,17 @@ func TestF105RefusedConnectIsCertifiedAndStaysSilent(t *testing.T) {
 		asm.mu.Unlock()
 	})
 	// Refused with its committed proposal left standing (the T9 schedule).
-	testF105ArmBudget(t, asm, 400*time.Millisecond)
+	testArmBudget(t, asm, 400*time.Millisecond)
 	var armed atomic.Bool
 	armed.Store(true)
-	testF105ArmStepEntry(t, asm, func(a mqttConnectOwnershipAction) error {
+	testArmStepEntry(t, asm, func(a mqttConnectOwnershipAction) error {
 		if a == mqttOwnershipFinalizeHandoff && armed.CompareAndSwap(true, false) {
 			time.Sleep(500 * time.Millisecond)
 		}
 		return nil
 	})
 	ci := &mqttV5ConnInfo{clientID: cid, cleanStart: true, props: mqttV5ConnPropsSessionExpiry(3600)}
-	testF105RefusedConnectV5(t, o, ci)
+	testRefusedConnectV5(t, o, ci)
 	mu.Lock()
 	refusals := append([]certified(nil), got...)
 	mu.Unlock()
@@ -1221,11 +1221,11 @@ func TestF105RefusedConnectIsCertifiedAndStaysSilent(t *testing.T) {
 	}
 	refused := refusals[0].c
 	// T12: another acceptance finalizes the committed proposal.
-	testF105ArmBudget(t, asm, 0)
+	testArmBudget(t, asm, 0)
 	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
-	testF105ServingAt(t, asm, cid, epoch)
+	testServingAt(t, asm, cid, epoch)
 	if refused.outBind.mayWrite() {
 		t.Fatal("the refused connection's output gate reopened")
 	}
@@ -1238,7 +1238,7 @@ func TestF105RefusedConnectIsCertifiedAndStaysSilent(t *testing.T) {
 }
 
 // T13: an ordinary close certifies the connection through the external protocol. Mutation M13.
-func TestF105TeardownCertifiesTheConnection(t *testing.T) {
+func TestTeardownCertifiesTheConnection(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1266,8 +1266,8 @@ func TestF105TeardownCertifiesTheConnection(t *testing.T) {
 	})
 }
 
-// testF105ArmBoundarySettle installs the discard-boundary observation seam for one test.
-func testF105ArmBoundarySettle(t *testing.T, asm *mqttAccountSessionManager, f func(id string, steps int)) {
+// testArmBoundarySettle installs the discard-boundary observation seam for one test.
+func testArmBoundarySettle(t *testing.T, asm *mqttAccountSessionManager, f func(id string, steps int)) {
 	t.Helper()
 	asm.mu.Lock()
 	asm.testBoundarySettle = f
@@ -1285,7 +1285,7 @@ func testF105ArmBoundarySettle(t *testing.T, asm *mqttAccountSessionManager, f f
 // ownership; the close cannot land while B stands, so the receipt-marked record is RETAINED;
 // once B is cancelled, the adopter route finishes with a discarding closure. (c) B's commit
 // wins: the discard's claim is superseded and deletes nothing of the successor's. Mutation M19.
-func TestF105ProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
+func TestProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
 	t.Run("claim-wins", func(t *testing.T) {
 		o := testMQTTDefaultOptionsV5()
 		s := testMQTTRunServer(t, o)
@@ -1294,18 +1294,18 @@ func TestF105ProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
 		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid}, o.MQTT.Host, o.MQTT.Port)
 		testMQTTReadConnAckV5(t, r)
 		asm := testMQTTGetAccountSessionManager(t, s, cid)
-		epoch := testF105AccountEpoch(asm)
-		retiring := testF105ServingAt(t, asm, cid, epoch)
-		e := &testF105Env{asm: asm, id: cid, epoch: epoch}
+		epoch := testAccountEpoch(asm)
+		retiring := testServingAt(t, asm, cid, epoch)
+		e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
 		var b atomic.Value
 		var baseSeq atomic.Uint64
-		testF105ArmBoundarySettle(t, asm, func(id string, _ int) {
+		testArmBoundarySettle(t, asm, func(id string, _ int) {
 			if id != cid || b.Load() != nil {
 				return
 			}
-			baseSeq.Store(testF105RecordSeq(t, e))
-			i := testF105Intent(t, e, "t15bb")
-			testF105Prepare(t, e, i)
+			baseSeq.Store(testRecordSeq(t, e))
+			i := testIntent(t, e, "t15bb")
+			testPrepare(t, e, i)
 			b.Store(i)
 		})
 		c.Close() // expiry 0: the close discards
@@ -1313,7 +1313,7 @@ func TestF105ProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
 			if b.Load() == nil {
 				return errors.New("B was never planted")
 			}
-			ps, _ := testF105StandingSessionOrNil(asm, cid)
+			ps, _ := testStandingSessionOrNil(asm, cid)
 			if ps == nil || ps.Teardown == nil {
 				return errors.New("the discard's teardown marker is not standing yet")
 			}
@@ -1328,21 +1328,21 @@ func TestF105ProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
 			rcpt.Retire.OwnerTxn != retiring.OwnerTxn || !rcpt.Retire.Discard {
 			t.Fatalf("the receipt must name exactly the retiring ownership %+v, got %+v", retiring, rcpt.Retire)
 		}
-		if _, err := asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, baseSeq.Load())); err == nil {
+		if _, err := asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, baseSeq.Load())); err == nil {
 			t.Fatal("B's metadata commit must lose to the discard's claim on the shared record")
 		}
-		if testF105ClosureDiscards(asm, cid, epoch, retiring.Gen) {
+		if testClosureDiscards(asm, cid, epoch, retiring.Gen) {
 			t.Fatal("the close cannot have landed while B's preparation stands")
 		}
-		testF105ResolveStanding(t, e, i) // B settles itself: aborted, cancelled
-		ps, seq := testF105StandingSessionOrNil(asm, cid)
+		testResolveStanding(t, e, i) // B settles itself: aborted, cancelled
+		ps, seq := testStandingSessionOrNil(asm, cid)
 		if ps == nil || ps.Teardown == nil {
 			t.Fatal("the receipt-marked record must be retained until the close lands")
 		}
 		if err := asm.finishAdoptedTeardown(ps, getHash(cid), seq, s.getOpts()); err != nil {
 			t.Fatalf("the adopter route: %v", err)
 		}
-		if !testF105ClosureDiscards(asm, cid, epoch, retiring.Gen) {
+		if !testClosureDiscards(asm, cid, epoch, retiring.Gen) {
 			t.Fatalf("the adopter must finish with a discarding closure of %q", retiring.Gen)
 		}
 	})
@@ -1355,20 +1355,20 @@ func TestF105ProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
 		testMQTTReadConnAckV5(t, r)
 		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "foo", opts: 1}})
 		asm := testMQTTGetAccountSessionManager(t, s, cid)
-		epoch := testF105AccountEpoch(asm)
-		e := &testF105Env{asm: asm, id: cid, epoch: epoch}
+		epoch := testAccountEpoch(asm)
+		e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
 		var successorWID atomic.Value
-		testF105ArmBoundarySettle(t, asm, func(id string, _ int) {
+		testArmBoundarySettle(t, asm, func(id string, _ int) {
 			if id != cid || successorWID.Load() != nil {
 				return
 			}
-			i := testF105Intent(t, e, "t15bc")
-			testF105Prepare(t, e, i)
-			f := testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))
+			i := testIntent(t, e, "t15bc")
+			testPrepare(t, e, i)
+			f := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
 			if _, err := asm.jsa.commitMetadataAttempt(f); err != nil {
 				t.Errorf("B's metadata commit: %v", err)
 			}
-			ps, _ := testF105StandingSessionOrNil(asm, cid)
+			ps, _ := testStandingSessionOrNil(asm, cid)
 			if ps != nil {
 				successorWID.Store(ps.WID)
 			}
@@ -1381,15 +1381,15 @@ func TestF105ProposalAfterTheBoundaryReadIsArbitratedByTheRecord(t *testing.T) {
 			return nil
 		})
 		time.Sleep(200 * time.Millisecond)
-		ps, _ := testF105StandingSessionOrNil(asm, cid)
+		ps, _ := testStandingSessionOrNil(asm, cid)
 		if ps == nil || ps.WID != successorWID.Load().(string) || ps.Teardown != nil {
 			t.Fatalf("the discard's claim must lose to B's committed successor and touch nothing of it, got %+v", ps)
 		}
 	})
 }
 
-// testF105StandingSessionOrNil reads the client's standing session record, or nil.
-func testF105StandingSessionOrNil(asm *mqttAccountSessionManager, cid string) (*mqttPersistedSession, uint64) {
+// testStandingSessionOrNil reads the client's standing session record, or nil.
+func testStandingSessionOrNil(asm *mqttAccountSessionManager, cid string) (*mqttPersistedSession, uint64) {
 	smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
 	if err != nil || smsg == nil {
 		return nil, 0
@@ -1401,28 +1401,28 @@ func testF105StandingSessionOrNil(asm *mqttAccountSessionManager, cid string) (*
 // proposal A at its top, is forced into a full re-drive (a rival record write moves its
 // predecessor), and meets a SECOND foreign proposal B planted as its own failed attempt is
 // cleaned up. It refuses rather than settle B, and B is untouched. Mutation M14.
-func TestF105OneForeignTargetPerConnectAcrossARedrive(t *testing.T) {
+func TestOneForeignTargetPerConnectAcrossARedrive(t *testing.T) {
 	const cid = "f105-8a-t16"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
 	// A: a crash-left unresolved preparation.
-	testF105ArmBeforeMetadata(t, asm, testF105StopOnce(mqttOwnershipPrepareHandoff))
-	testF105RefusedConnectV5(t, o, ci)
-	a, _ := testF105StandingProposal(t, asm, cid, epoch)
+	testArmBeforeMetadata(t, asm, testStopOnce(mqttOwnershipPrepareHandoff))
+	testRefusedConnectV5(t, o, ci)
+	a, _ := testStandingProposal(t, asm, cid, epoch)
 	if a == _EMPTY_ {
 		t.Fatal("A was never left standing")
 	}
-	e := &testF105Env{asm: asm, id: cid, epoch: epoch}
+	e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
 	var rival, plantedB atomic.Bool
 	var b atomic.Value
 	// The re-drive: once THIS CONNECT's own preparation lands, a rival rewrites the record.
-	testF105ArmBeforeMetadata(t, asm, func(act mqttConnectOwnershipAction) error {
+	testArmBeforeMetadata(t, asm, func(act mqttConnectOwnershipAction) error {
 		if act != mqttOwnershipPrepareHandoff || !rival.CompareAndSwap(false, true) {
 			return nil
 		}
-		ps, _ := testF105StandingSessionOrNil(asm, cid)
+		ps, _ := testStandingSessionOrNil(asm, cid)
 		if ps == nil {
 			t.Error("no record to rewrite")
 			return nil
@@ -1438,8 +1438,8 @@ func TestF105OneForeignTargetPerConnectAcrossARedrive(t *testing.T) {
 	testArmTransitionSeam(t, &asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		seq, err := send()
 		if err == nil && rival.Load() && tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionCancelIntent &&
-			testF105ProposalOf(tr) != a && plantedB.CompareAndSwap(false, true) {
-			i := testF105Intent(t, e, "t16-b")
+			testProposalOf(tr) != a && plantedB.CompareAndSwap(false, true) {
+			i := testIntent(t, e, "t16-b")
 			if _, perr := asm.jsa.opPrepareHandoff(cid, epoch, "txn-prep-b", i); perr != nil {
 				t.Errorf("planting B: %v", perr)
 			}
@@ -1447,15 +1447,15 @@ func TestF105OneForeignTargetPerConnectAcrossARedrive(t *testing.T) {
 		}
 		return seq, err
 	})
-	testF105RefusedConnectV5(t, o, ci)
+	testRefusedConnectV5(t, o, ci)
 	bi, _ := b.Load().(*mqttHandoffIntent)
 	if bi == nil {
 		t.Fatal("the re-drive never happened, so B was never planted and nothing here is tested")
 	}
-	if standing, state := testF105StandingProposal(t, asm, cid, epoch); standing != bi.ID || state != mqttAuthorityPreparing {
+	if standing, state := testStandingProposal(t, asm, cid, epoch); standing != bi.ID || state != mqttAuthorityPreparing {
 		t.Fatalf("B must be untouched by a CONNECT that already settled A, got %q %v", standing, state)
 	}
-	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testF105Prop(t, bi)); v != mqttMetadataUnresolved {
+	if v := asm.jsa.resolveMetadataAttempt(_EMPTY_, cid, epoch, testProp(t, bi)); v != mqttMetadataUnresolved {
 		t.Fatalf("B's slot must be untouched, got %v", v)
 	}
 }
@@ -1463,16 +1463,16 @@ func TestF105OneForeignTargetPerConnectAcrossARedrive(t *testing.T) {
 // M8 integration: the owed-abandonment worker acts on its CAPTURED proposal only. The captured
 // preparation is cancelled and an ABORTED replacement R — one the cancellation boundary would
 // accept — stands in its place before the worker runs; R stays standing.
-func TestF105AbandonmentWorkerNeverRetargets(t *testing.T) {
+func TestAbandonmentWorkerNeverRetargets(t *testing.T) {
 	const cid = "f105-8a-m8"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var block atomic.Bool
 	block.Store(true)
-	own := testF105OwnAbortedByPeer(t, asm, cid, epoch, mqttOwnershipPrepareHandoff, &block, 0)
-	gate := testF105ArmAbandonGate(t, asm)
-	testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
+	own := testOwnAbortedByPeer(t, asm, cid, epoch, mqttOwnershipPrepareHandoff, &block, 0)
+	gate := testArmAbandonGate(t, asm)
+	testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
 	id, _ := own.Load().(string)
 	if id == _EMPTY_ {
 		t.Fatal("no own proposal was aborted")
@@ -1488,17 +1488,17 @@ func TestF105AbandonmentWorkerNeverRetargets(t *testing.T) {
 	if _, err := asm.jsa.opCancelHandoff(cid, epoch, "txn-other-cancel", id); err != nil {
 		t.Fatalf("cancelling the captured preparation: %v", err)
 	}
-	e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-	rep := testF105Intent(t, e, "m8-r")
+	e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+	rep := testIntent(t, e, "m8-r")
 	if _, err := asm.jsa.opPrepareHandoff(cid, epoch, "txn-prep-r", rep); err != nil {
 		t.Fatalf("standing R: %v", err)
 	}
-	if v := asm.jsa.settleProposal(_EMPTY_, cid, epoch, testF105Prop(t, rep)); v != mqttMetadataAborted {
+	if v := asm.jsa.settleProposal(_EMPTY_, cid, epoch, testProp(t, rep)); v != mqttMetadataAborted {
 		t.Fatalf("aborting R's slot returned %v", v)
 	}
 	close(gate.release)
 	time.Sleep(500 * time.Millisecond)
-	if standing, state := testF105StandingProposal(t, asm, cid, epoch); standing != rep.ID || state != mqttAuthorityPreparing {
+	if standing, state := testStandingProposal(t, asm, cid, epoch); standing != rep.ID || state != mqttAuthorityPreparing {
 		t.Fatalf("the worker retargeted onto the replacement: R %q must still stand, got %q %v", rep.ID, standing, state)
 	}
 }
@@ -1508,12 +1508,12 @@ func TestF105AbandonmentWorkerNeverRetargets(t *testing.T) {
 // to nobody and declare nothing about its owners); the CONNECT's existing join waits for the
 // owner to drain and finishes the discard, whose claim the moved record supersedes; the CONNECT
 // then restores from the record and is accepted.
-func TestF105RetirementPendingResidentTakesTheJoin(t *testing.T) {
+func TestRetirementPendingResidentTakesTheJoin(t *testing.T) {
 	const cid = "f105-8a-m25"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	es := testF105ResidentObject(asm, cid)
+	es := testResidentObject(asm, cid)
 	if es == nil {
 		t.Fatal("no resident object")
 	}
@@ -1528,11 +1528,11 @@ func TestF105RetirementPendingResidentTakesTheJoin(t *testing.T) {
 	if _, armed := tr.armRetirementPending(func() {}); !armed {
 		t.Fatal("a closing tracker must accept the obligation")
 	}
-	testF105HoldResident(t, asm, cid)
-	e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-	i := testF105Intent(t, e, "m25")
-	testF105Prepare(t, e, i)
-	if _, err := asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))); err != nil {
+	testHoldResident(t, asm, cid)
+	e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+	i := testIntent(t, e, "m25")
+	testPrepare(t, e, i)
+	if _, err := asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, testRecordSeq(t, e))); err != nil {
 		t.Fatalf("committing the foreign handoff: %v", err)
 	}
 	go func() {
@@ -1546,7 +1546,7 @@ func TestF105RetirementPendingResidentTakesTheJoin(t *testing.T) {
 	if tr.isRetirementPending() {
 		t.Fatal("the pending discard was never claimed: the join did not run")
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen != i.Gen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen != i.Gen {
 		t.Fatalf("the resume must serve the committed generation %q, got %q", i.Gen, rec.Gen)
 	}
 }
@@ -1554,7 +1554,7 @@ func TestF105RetirementPendingResidentTakesTheJoin(t *testing.T) {
 // M27: an object evicted while its retirement is pending — a foreign record found before any
 // CONNECT's join ran — is never destroyed, so its finisher, which runs only after the owners
 // drained, resolves the tracker: a handler parked on its decision returns.
-func TestF105EvictedPendingDiscardResolvesItsTracker(t *testing.T) {
+func TestEvictedPendingDiscardResolvesItsTracker(t *testing.T) {
 	e := testNewInflightEnv(t, "f105-8a-m27")
 	e.sess.mu.Lock()
 	e.sess.c = nil
@@ -1586,16 +1586,16 @@ func TestF105EvictedPendingDiscardResolvesItsTracker(t *testing.T) {
 // competing settler finalizes it while our settlement is reading its slot — before our reload.
 // Our CONNECT executed no finalize of its own; the resident object is stale all the same, and
 // the trigger is the STATE (the authority serves another generation), not our act. Mutation M28.
-func TestF105CompetitorFinalizesUnderAResidentObject(t *testing.T) {
+func TestCompetitorFinalizesUnderAResidentObject(t *testing.T) {
 	const cid = "f105-8a-t18r"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	testF105HoldResident(t, asm, cid)
-	e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-	i := testF105Intent(t, e, "t18r")
-	testF105Prepare(t, e, i)
-	if _, err := asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))); err != nil {
+	testHoldResident(t, asm, cid)
+	e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+	i := testIntent(t, e, "t18r")
+	testPrepare(t, e, i)
+	if _, err := asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, testRecordSeq(t, e))); err != nil {
 		t.Fatalf("committing the foreign handoff: %v", err)
 	}
 	if i.Gen == oldGen {
@@ -1613,7 +1613,7 @@ func TestF105CompetitorFinalizesUnderAResidentObject(t *testing.T) {
 	}
 	mqttTestLoadLastMsgHookV.Store(&hook)
 	t.Cleanup(func() { mqttTestLoadLastMsgHookV.Store(nil) })
-	before := testF105ResidentObject(asm, cid)
+	before := testResidentObject(asm, cid)
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)},
 		o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
@@ -1621,10 +1621,10 @@ func TestF105CompetitorFinalizesUnderAResidentObject(t *testing.T) {
 	if !raced.Load() {
 		t.Fatal("the competitor never raced, so nothing here is tested")
 	}
-	if after := testF105ResidentObject(asm, cid); after == before {
+	if after := testResidentObject(asm, cid); after == before {
 		t.Fatal("the stale resident object is still the client's session")
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen != i.Gen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen != i.Gen {
 		t.Fatalf("the resume must serve the committed generation %q, got %q", i.Gen, rec.Gen)
 	}
 }
@@ -1634,7 +1634,7 @@ func TestF105CompetitorFinalizesUnderAResidentObject(t *testing.T) {
 // successor of it was established by this CONNECT, so its Will is not a takeover's to discard
 // (issue #86). A disposal that did nothing would leave the object to an ordinary takeover, which
 // discards the Will. Mutation M26.
-func TestF105StaleResidentIncumbentIsDisposedAsForeign(t *testing.T) {
+func TestStaleResidentIncumbentIsDisposedAsForeign(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -1650,12 +1650,12 @@ func TestF105StaleResidentIncumbentIsDisposedAsForeign(t *testing.T) {
 	defer c1.Close()
 	testMQTTReadConnAckV5(t, r1)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	testF105HoldResident(t, asm, cid)
-	e := &testF105Env{asm: asm, id: cid, epoch: epoch}
-	i := testF105Intent(t, e, "t2b")
-	testF105Prepare(t, e, i)
-	if _, err := asm.jsa.commitMetadataAttempt(testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))); err != nil {
+	epoch := testAccountEpoch(asm)
+	testHoldResident(t, asm, cid)
+	e := &testOutboundEnv{asm: asm, id: cid, epoch: epoch}
+	i := testIntent(t, e, "t2b")
+	testPrepare(t, e, i)
+	if _, err := asm.jsa.commitMetadataAttempt(testFreezeAttempt(t, e, i, testRecordSeq(t, e))); err != nil {
 		t.Fatalf("committing the foreign handoff: %v", err)
 	}
 
@@ -1669,7 +1669,7 @@ func TestF105StaleResidentIncumbentIsDisposedAsForeign(t *testing.T) {
 	if reason, _ := testMQTTReadDisconnectV5(t, r1); reason == mqttReasonSessionTakenOver {
 		t.Fatalf("the incumbent was disposed as a TAKEOVER (reason %#x); nothing established a successor", reason)
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen != i.Gen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen != i.Gen {
 		t.Fatalf("the resume must serve the committed generation %q, got %q", i.Gen, rec.Gen)
 	}
 }
@@ -1680,26 +1680,26 @@ func TestF105StaleResidentIncumbentIsDisposedAsForeign(t *testing.T) {
 // the acceptance has lost: it cleans up and REFUSES, with exactly one proposal made. (self) If
 // the slot was empty, this acceptance's own settlement aborts it; that is only the lost record
 // race, and the CONNECT re-drives against the winner and is accepted. Mutation M29.
-func TestF105PeerAbortedProposalIsNotReproposedByARedrive(t *testing.T) {
+func TestPeerAbortedProposalIsNotReproposedByARedrive(t *testing.T) {
 	for _, peer := range []bool{true, false} {
 		t.Run(fmt.Sprintf("peer=%v", peer), func(t *testing.T) {
 			cid := fmt.Sprintf("f105-8a-h1-%v", peer)
-			s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+			s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
 			var armed atomic.Bool
 			armed.Store(true)
-			testF105ArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
+			testArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
 				if a != mqttOwnershipPrepareHandoff || !armed.CompareAndSwap(true, false) {
 					return nil
 				}
 				if peer {
-					p := testF105IntentProposal(t, asm, cid, epoch)
+					p := testIntentProposal(t, asm, cid, epoch)
 					if v := asm.jsa.settleProposal(_EMPTY_, cid, epoch, p); v != mqttMetadataAborted {
 						t.Errorf("the peer's abort returned %v", v)
 					}
 				}
-				ps, _ := testF105StandingSessionOrNil(asm, cid)
+				ps, _ := testStandingSessionOrNil(asm, cid)
 				if ps == nil {
 					t.Error("no record to rewrite")
 					return nil
@@ -1721,11 +1721,11 @@ func TestF105PeerAbortedProposalIsNotReproposedByARedrive(t *testing.T) {
 			})
 			ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
 			if peer {
-				testF105RefusedConnectV5(t, o, ci)
+				testRefusedConnectV5(t, o, ci)
 				if n := prepares.Load(); n != 1 {
 					t.Fatalf("a CONNECT whose proposal another party aborted must not propose again: %d proposals", n)
 				}
-				testF105ServingAt(t, asm, cid, epoch) // its preparation was cancelled back
+				testServingAt(t, asm, cid, epoch) // its preparation was cancelled back
 				return
 			}
 			c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
@@ -1742,22 +1742,22 @@ func TestF105PeerAbortedProposalIsNotReproposedByARedrive(t *testing.T) {
 // this acceptance's proposal at the very read the settlement makes first, and that read is
 // made to fail: the acceptance's own create-only abort write then fails too, so it cannot show
 // the abort was its own — it LOST, refuses, and proposes exactly once. Mutation M30.
-func TestF105UnprovenSelfAbortIsALoss(t *testing.T) {
+func TestUnprovenSelfAbortIsALoss(t *testing.T) {
 	const cid = "f105-8a-h2a"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var receipt atomic.Value
 	var armed atomic.Bool
 	armed.Store(true)
-	testF105ArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
+	testArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
 		if a != mqttOwnershipPrepareHandoff || !armed.CompareAndSwap(true, false) {
 			return nil
 		}
-		p := testF105IntentProposal(t, asm, cid, epoch)
+		p := testIntentProposal(t, asm, cid, epoch)
 		receipt.Store(p)
 		// The record race this acceptance then loses: a rival's write moves its predecessor.
-		ps, _ := testF105StandingSessionOrNil(asm, cid)
+		ps, _ := testStandingSessionOrNil(asm, cid)
 		ps.WID = mqttNewInflightNonce()
 		body, _ := json.Marshal(ps)
 		if _, err := asm.jsa.storeSessionMsg(asm.domainTk, getHash(cid), 0, body); err != nil {
@@ -1786,7 +1786,7 @@ func TestF105UnprovenSelfAbortIsALoss(t *testing.T) {
 		}
 		return seq, err
 	})
-	testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
+	testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
 	if !peerDone.Load() {
 		t.Fatal("the peer's abort never ran at the settlement's read, so nothing here is tested")
 	}
@@ -1799,16 +1799,16 @@ func TestF105UnprovenSelfAbortIsALoss(t *testing.T) {
 // cleanup that follows fails with a retryable store error: the returned error must not be
 // classifiable as that contention, and the observation must record the loss, which the accept
 // loop checks before any retry arm. Mutation M31.
-func TestF105ObservedLossSurvivesARetryableCleanupError(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-8a-h2b")
+func TestObservedLossSurvivesARetryableCleanupError(t *testing.T) {
+	e, done := testNewEnv(t, "f105-8a-h2b")
 	defer done()
-	i := testF105Intent(t, e, "h2b")
-	testF105Prepare(t, e, i)
-	p := testF105Prop(t, i)
+	i := testIntent(t, e, "h2b")
+	testPrepare(t, e, i)
+	p := testProp(t, i)
 	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, p); v != mqttMetadataAborted {
 		t.Fatalf("the peer's abort returned %v", v)
 	}
-	detail := mqttSessSaveDetail{ownFrozen: testF105FreezeAttempt(t, e, i, testF105RecordSeq(t, e))}
+	detail := mqttSessSaveDetail{ownFrozen: testFreezeAttempt(t, e, i, testRecordSeq(t, e))}
 	contention := ApiErrors[JSStreamWrongLastSequenceConstantErr]
 	obs := &mqttOwnObservation{}
 	obs.noteOwn(p, mqttAuthorityPreparing) // the preparation landed
@@ -1834,25 +1834,25 @@ func TestF105ObservedLossSurvivesARetryableCleanupError(t *testing.T) {
 // acceptance's own abort write fails because the peer owns the slot. Nothing proves a self-abort,
 // so the CONNECT refuses with exactly one proposal; once reads recover, the proposal stands for
 // the next acceptance to settle. Mutation M33.
-func TestF105UnreadableSettlementIsNotARedrive(t *testing.T) {
+func TestUnreadableSettlementIsNotARedrive(t *testing.T) {
 	const cid = "f105-8a-h3"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var prop atomic.Value
 	var armed, failing atomic.Bool
 	armed.Store(true)
-	testF105ArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
+	testArmBeforeMetadata(t, asm, func(a mqttConnectOwnershipAction) error {
 		if a != mqttOwnershipPrepareHandoff || !armed.CompareAndSwap(true, false) {
 			return nil
 		}
-		p := testF105IntentProposal(t, asm, cid, epoch)
+		p := testIntentProposal(t, asm, cid, epoch)
 		if v := asm.jsa.settleProposal(_EMPTY_, cid, epoch, p); v != mqttMetadataAborted {
 			t.Errorf("the peer's abort returned %v", v)
 		}
 		prop.Store(p)
 		failing.Store(true)
-		ps, _ := testF105StandingSessionOrNil(asm, cid)
+		ps, _ := testStandingSessionOrNil(asm, cid)
 		ps.WID = mqttNewInflightNonce()
 		body, _ := json.Marshal(ps)
 		if _, err := asm.jsa.storeSessionMsg(asm.domainTk, getHash(cid), 0, body); err != nil {
@@ -1884,7 +1884,7 @@ func TestF105UnreadableSettlementIsNotARedrive(t *testing.T) {
 		return seq, err
 	})
 	ci := &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}
-	testF105RefusedConnectV5(t, o, ci)
+	testRefusedConnectV5(t, o, ci)
 	failing.Store(false)
 	if failed.Load() < 2 {
 		t.Fatalf("both settlement reads must have failed for this test to mean anything, %d did", failed.Load())
@@ -1893,7 +1893,7 @@ func TestF105UnreadableSettlementIsNotARedrive(t *testing.T) {
 		t.Fatalf("an acceptance that could not settle its proposal must not propose again: %d proposals", n)
 	}
 	p := prop.Load().(mqttOwnershipProposal)
-	if standing, _ := testF105StandingProposal(t, asm, cid, epoch); standing != p.ID {
+	if standing, _ := testStandingProposal(t, asm, cid, epoch); standing != p.ID {
 		t.Fatalf("the unsettled proposal %q must stand for the next acceptance, got %q", p.ID, standing)
 	}
 }
@@ -1902,7 +1902,7 @@ func TestF105UnreadableSettlementIsNotARedrive(t *testing.T) {
 // The acceptance's preparation lands and the step then fails with each retryable identity the
 // accept loop knows; the observation holds an own, unsettled proposal, so the CONNECT refuses
 // with exactly one proposal whatever the error claims. Mutation M32.
-func TestF105RedriveIsLicensedByTheObservationNotTheError(t *testing.T) {
+func TestRedriveIsLicensedByTheObservationNotTheError(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -1914,10 +1914,10 @@ func TestF105RedriveIsLicensedByTheObservationNotTheError(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cid := "f105-8a-gate-" + tc.name
-			s, asm, _, _, done := testF105CleanStartEnv(t, cid)
+			s, asm, _, _, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
-			testF105ArmBeforeMetadata(t, asm, func() func(mqttConnectOwnershipAction) error {
+			testArmBeforeMetadata(t, asm, func() func(mqttConnectOwnershipAction) error {
 				var armed atomic.Bool
 				armed.Store(true)
 				return func(a mqttConnectOwnershipAction) error {
@@ -1935,7 +1935,7 @@ func TestF105RedriveIsLicensedByTheObservationNotTheError(t *testing.T) {
 				}
 				return seq, err
 			})
-			testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
+			testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
 			if n := prepares.Load(); n != 1 {
 				t.Fatalf("a %s error over an unsettled own proposal must not license a re-drive: %d proposals", tc.name, n)
 			}
@@ -1947,9 +1947,9 @@ func TestF105RedriveIsLicensedByTheObservationNotTheError(t *testing.T) {
 // resolved (its response lost, its outcome unreadable) may stand, so it is this acceptance's own
 // proposal for the gate. The step fails with a retryable identity; the CONNECT still refuses
 // with exactly one proposal. Mutation M34.
-func TestF105UnresolvedPreparationCountsAsOwn(t *testing.T) {
+func TestUnresolvedPreparationCountsAsOwn(t *testing.T) {
 	const cid = "f105-8a-m34"
-	s, asm, _, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, _, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var prepares atomic.Int32
@@ -1976,7 +1976,7 @@ func TestF105UnresolvedPreparationCountsAsOwn(t *testing.T) {
 	}
 	mqttTestLoadLastMsgHookV.Store(&hook)
 	t.Cleanup(func() { mqttTestLoadLastMsgHookV.Store(nil) })
-	testF105RefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
+	testRefusedConnectV5(t, o, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)})
 	if txn.Load() == nil {
 		t.Fatal("the preparation's response was never lost, so nothing here is tested")
 	}

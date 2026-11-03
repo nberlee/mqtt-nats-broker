@@ -28,10 +28,10 @@ func testDisposalEnt(auth *mqttOutboundAuthority) mqttOutboundEntitlement {
 	return mqttOutboundEntitlement{Gen: auth.Gen, Tenure: auth.Tenure}
 }
 
-func testRequestDisposal(t *testing.T, e *testF105Env, auth *mqttOutboundAuthority, inc, txn string) {
+func testRequestDisposal(t *testing.T, e *testOutboundEnv, auth *mqttOutboundAuthority, inc, txn string) {
 	t.Helper()
 	if _, err := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
-		ID: e.id, Epoch: e.epoch, Txn: txn, Gen: testF105Gen, Inc: inc,
+		ID: e.id, Epoch: e.epoch, Txn: txn, Gen: testGen, Inc: inc,
 		Reason: mqttDisposalUnsubscribed, Entitlement: testDisposalEnt(auth),
 	}); err != nil {
 		t.Fatalf("disposing of %q was refused: %v", inc, err)
@@ -40,7 +40,7 @@ func testRequestDisposal(t *testing.T, e *testF105Env, auth *mqttOutboundAuthori
 
 // testDisposeBatch builds a dispose-resource transition carrying the given resource members over
 // the standing authority, for a direct boundary submission.
-func testDisposeBatch(t *testing.T, e *testF105Env, txn string, members ...mqttTransitionMember) *mqttAuthorityTransition {
+func testDisposeBatch(t *testing.T, e *testOutboundEnv, txn string, members ...mqttTransitionMember) *mqttAuthorityTransition {
 	t.Helper()
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	return &mqttAuthorityTransition{
@@ -58,7 +58,7 @@ func testDisposeBatch(t *testing.T, e *testF105Env, txn string, members ...mqttT
 	}
 }
 
-func testResourceMember(t *testing.T, e *testF105Env, r *mqttOutboundResource, seq uint64) mqttTransitionMember {
+func testResourceMember(t *testing.T, e *testOutboundEnv, r *mqttOutboundResource, seq uint64) mqttTransitionMember {
 	t.Helper()
 	b, err := json.Marshal(r)
 	if err != nil {
@@ -68,12 +68,12 @@ func testResourceMember(t *testing.T, e *testF105Env, r *mqttOutboundResource, s
 }
 
 // T4: an admission and a disposal contend on the resource record, in both orders.
-func TestF105DisposalRequestFencesAdmission(t *testing.T) {
+func TestDisposalRequestFencesAdmission(t *testing.T) {
 	t.Run("disposal first refuses the admission at the boundary", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-disp-t4a")
+		e, done := testNewEnv(t, "f105-disp-t4a")
 		defer done()
 		auth, _ := e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		testRequestDisposal(t, e, auth, "inc-src", "txn-disp")
 		// THROUGH THE OPERATION, which composes the edge without consulting the decision: the
 		// refusal is the boundary's (M6).
@@ -86,34 +86,34 @@ func TestF105DisposalRequestFencesAdmission(t *testing.T) {
 			Deps: []mqttAdmitDependency{{Inc: "inc-src", Role: mqttRoleSourceReplay}},
 		})
 		testRequireRefusal(t, err, "admits no new obligation")
-		testF105RequireDeps(t, e, "inc-src")
+		testRequireDeps(t, e, "inc-src")
 		// And readiness says so too, before any batch.
-		if rerr := testReadyForUse(&e.asm.jsa, e.id, e.epoch, testF105Gen, "inc-src"); rerr == nil {
+		if rerr := testReadyForUse(&e.asm.jsa, e.id, e.epoch, testGen, "inc-src"); rerr == nil {
 			t.Fatal("a disposed consumer was reported ready for use")
 		}
 	})
 	t.Run("admission first holds the retirement until its ending", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-disp-t4b")
+		e, done := testNewEnv(t, "f105-disp-t4b")
 		defer done()
 		auth, _ := e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		nonce, _, _, _ := testF105AdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		nonce, _, _, _ := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 		testRequestDisposal(t, e, auth, "inc-src", "txn-disp")
-		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-early", "op-a", testF105Gen, "inc-src"); err == nil {
+		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-early", "op-a", testGen, "inc-src"); err == nil {
 			t.Fatal("a disposed consumer was authorized while an obligation still holds it")
 		}
-		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, nonce, mqttExchangeTerminal); err != nil {
+		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
 			t.Fatalf("ending the obligation was refused: %v", err)
 		}
 		// The acknowledgement ending leaves its hold release-owed: still held until released.
-		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-owed", "op-a", testF105Gen, "inc-src"); err == nil {
+		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth-owed", "op-a", testGen, "inc-src"); err == nil {
 			t.Fatal("a disposed consumer was authorized while an ended obligation's hold is still owed")
 		}
 		testReleaseOwed(t, e, nonce)
-		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testF105Gen, "inc-src"); err != nil {
+		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testGen, "inc-src"); err != nil {
 			t.Fatalf("authorizing the disposed, released consumer was refused: %v", err)
 		}
-		r, _ := testF105LoadResource(t, e, "inc-src")
+		r, _ := testBoundaryLoadResource(t, e, "inc-src")
 		if r.State != mqttResourceDeleteAuthorized || r.Disposal == nil {
 			t.Fatalf("the authorized resource is %+v", r)
 		}
@@ -123,14 +123,14 @@ func TestF105DisposalRequestFencesAdmission(t *testing.T) {
 		}
 	})
 	t.Run("the decision is permanent", func(t *testing.T) {
-		e, done := testF105NewEnv(t, "f105-disp-t4c")
+		e, done := testNewEnv(t, "f105-disp-t4c")
 		defer done()
 		auth, _ := e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		testRequestDisposal(t, e, auth, "inc-src", "txn-disp")
 		// Idempotent: a second route finds the decision and stops.
 		testRequestDisposal(t, e, auth, "inc-src", "txn-disp-2")
-		r, seq := testF105LoadResource(t, e, "inc-src")
+		r, seq := testBoundaryLoadResource(t, e, "inc-src")
 		if r.Disposal.Txn != "txn-disp" {
 			t.Fatalf("a second decision replaced the first: %+v", r.Disposal)
 		}
@@ -142,14 +142,14 @@ func TestF105DisposalRequestFencesAdmission(t *testing.T) {
 }
 
 // T5: an idle serving consumer is not retired, and the refusal is made at both layers (M7, M8a, M8b).
-func TestF105IdleServingSourceIsNotRetired(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-disp-t5")
+func TestIdleServingSourceIsNotRetired(t *testing.T) {
+	e, done := testNewEnv(t, "f105-disp-t5")
 	defer done()
 	e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 
 	// The classifier withholds the cleanup of a serving consumer (M7).
-	v := e.asm.jsa.classifyResourceDuty(e.id, e.epoch, testF105Gen, false,
+	v := e.asm.jsa.classifyResourceDuty(e.id, e.epoch, testGen, false,
 		&mqttDutyEntry{Kind: mqttDutyCleanup, Ref: "inc-src"})
 	if v.Disposition != mqttDutyWithheld {
 		t.Fatalf("an idle serving consumer's cleanup was classified %+v, want withheld", v)
@@ -157,27 +157,27 @@ func TestF105IdleServingSourceIsNotRetired(t *testing.T) {
 
 	// The COMPOSER refuses, with its own reason — under M8a the batch would reach the boundary and
 	// be refused there instead, with a different one.
-	_, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testF105Gen, "inc-src")
+	_, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testGen, "inc-src")
 	testRequireRefusal(t, err, "no route has disposed of, so it is serving")
 
 	// And the BOUNDARY refuses a hand-built authorization that pairs the name retirement (M8b).
-	r, seq := testF105LoadResource(t, e, "inc-src")
+	r, seq := testBoundaryLoadResource(t, e, "inc-src")
 	auth := *r
 	auth.State, auth.AuthTxn = mqttResourceDeleteAuthorized, "txn-forged"
 	om, merr := mqttNameOwnershipMember(e.id, e.epoch, mqttOwnedStreamMsgs, r.Name, mqttNameOwnRetired,
-		testF105Gen, "inc-src", testF105OwnershipSeq(t, e, r.Name))
+		testGen, "inc-src", testOwnershipSeq(t, e, r.Name))
 	if merr != nil {
 		t.Fatal(merr)
 	}
 	_, err = e.asm.jsa.commitAuthorityTransition(testDisposeBatch(t, e, "txn-forged",
 		testResourceMember(t, e, &auth, seq), om))
 	testRequireRefusal(t, err, "which no route has disposed of")
-	if got, _ := testF105LoadResource(t, e, "inc-src"); got.State != mqttResourceLive {
+	if got, _ := testBoundaryLoadResource(t, e, "inc-src"); got.State != mqttResourceLive {
 		t.Fatalf("a refused authorization moved the resource to %d", got.State)
 	}
 }
 
-func testF105OwnershipSeq(t *testing.T, e *testF105Env, name string) uint64 {
+func testOwnershipSeq(t *testing.T, e *testOutboundEnv, name string) uint64 {
 	t.Helper()
 	_, seq, err := e.asm.jsa.loadNameOwnership(e.id, e.epoch, mqttOwnedStreamMsgs, name)
 	if err != nil {
@@ -187,14 +187,14 @@ func testF105OwnershipSeq(t *testing.T, e *testF105Env, name string) uint64 {
 }
 
 // T11: the deletion authorization and the name retirement ride one batch, both directions (M12a-c).
-func TestF105DisposalPairIsEnforced(t *testing.T) {
-	setup := func(t *testing.T, id string) (*testF105Env, func(), *mqttOutboundResource, uint64) {
-		e, done := testF105NewEnv(t, id)
+func TestDisposalPairIsEnforced(t *testing.T) {
+	setup := func(t *testing.T, id string) (*testOutboundEnv, func(), *mqttOutboundResource, uint64) {
+		e, done := testNewEnv(t, id)
 		auth, _ := e.bootstrap(t, "txn-1")
-		testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-		testF105PlantResource(t, e, "inc-two", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+		testPlantResource(t, e, "inc-two", mqttResourceSourceConsumer)
 		testRequestDisposal(t, e, auth, "inc-src", "txn-disp")
-		r, seq := testF105LoadResource(t, e, "inc-src")
+		r, seq := testBoundaryLoadResource(t, e, "inc-src")
 		return e, done, r, seq
 	}
 	authorized := func(r *mqttOutboundResource, txn string) *mqttOutboundResource {
@@ -213,16 +213,16 @@ func TestF105DisposalPairIsEnforced(t *testing.T) {
 		e, done, r, _ := setup(t, "f105-pair-b")
 		defer done()
 		om, _ := mqttNameOwnershipMember(e.id, e.epoch, mqttOwnedStreamMsgs, r.Name, mqttNameOwnRetired,
-			testF105Gen, "inc-src", testF105OwnershipSeq(t, e, r.Name))
+			testGen, "inc-src", testOwnershipSeq(t, e, r.Name))
 		_, err := e.asm.jsa.commitAuthorityTransition(testDisposeBatch(t, e, "txn-x", om))
 		testRequireRefusal(t, err, "without authorizing that resource's deletion")
 	})
 	t.Run("mismatched pair", func(t *testing.T) {
 		e, done, r, seq := setup(t, "f105-pair-c")
 		defer done()
-		two, _ := testF105LoadResource(t, e, "inc-two")
+		two, _ := testBoundaryLoadResource(t, e, "inc-two")
 		om, _ := mqttNameOwnershipMember(e.id, e.epoch, mqttOwnedStreamMsgs, two.Name, mqttNameOwnRetired,
-			testF105Gen, "inc-two", testF105OwnershipSeq(t, e, two.Name))
+			testGen, "inc-two", testOwnershipSeq(t, e, two.Name))
 		_, err := e.asm.jsa.commitAuthorityTransition(testDisposeBatch(t, e, "txn-x",
 			testResourceMember(t, e, authorized(r, "txn-x"), seq), om))
 		if err == nil {
@@ -232,23 +232,23 @@ func TestF105DisposalPairIsEnforced(t *testing.T) {
 	t.Run("the paired production authorization lands", func(t *testing.T) {
 		e, done, _, _ := setup(t, "f105-pair-d")
 		defer done()
-		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testF105Gen, "inc-src"); err != nil {
+		if _, err := e.asm.jsa.opAuthorizeDeletion(e.id, e.epoch, "txn-auth", "op-a", testGen, "inc-src"); err != nil {
 			t.Fatalf("the paired authorization was refused: %v", err)
 		}
 	})
 }
 
 // T7b-1: a decision is licensed by the entitlement it was taken under, at both layers (M17a/b).
-func TestF105DisposalStaleEntitlementContract(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-disp-stale")
+func TestDisposalStaleEntitlementContract(t *testing.T) {
+	e, done := testNewEnv(t, "f105-disp-stale")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 	stale := mqttOutboundEntitlement{Gen: auth.Gen, Tenure: "tenure-displaced"}
 
 	// The composer refuses with the typed reason the custodian drops on.
 	_, err := e.asm.jsa.opRequestDisposal(&mqttRequestDisposalRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-stale", Gen: testF105Gen, Inc: "inc-src",
+		ID: e.id, Epoch: e.epoch, Txn: "txn-stale", Gen: testGen, Inc: "inc-src",
 		Reason: mqttDisposalUnsubscribed, Entitlement: stale,
 	})
 	if !errors.Is(err, errMQTTDisposalEntitlementMoved) {
@@ -256,13 +256,13 @@ func TestF105DisposalStaleEntitlementContract(t *testing.T) {
 	}
 
 	// The boundary refuses the hand-built write.
-	r, seq := testF105LoadResource(t, e, "inc-src")
+	r, seq := testBoundaryLoadResource(t, e, "inc-src")
 	d := *r
 	d.Disposal = &mqttResourceDisposal{Txn: "txn-stale-b", Reason: mqttDisposalUnsubscribed,
 		Gen: stale.Gen, Tenure: stale.Tenure}
 	_, err = e.asm.jsa.commitAuthorityTransition(testDisposeBatch(t, e, "txn-stale-b", testResourceMember(t, e, &d, seq)))
 	testRequireRefusal(t, err, "which is not the serving one")
-	if got, _ := testF105LoadResource(t, e, "inc-src"); got.Disposal != nil {
+	if got, _ := testBoundaryLoadResource(t, e, "inc-src"); got.Disposal != nil {
 		t.Fatalf("a stale decision was written: %+v", got.Disposal)
 	}
 }
@@ -285,13 +285,13 @@ func (sess *mqttSession) retirementPendingFor(name string) bool {
 // entitlement licence and the introduction rule at once. The batch is the production
 // provisioning batch, complete with its duties and its name claim, with only the disposal
 // added on the way to the store: without the rule it would land.
-func TestF105ProvisionCarryingADisposalIsRefused(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-disp-create")
+func TestProvisionCarryingADisposalIsRefused(t *testing.T) {
+	e, done := testNewEnv(t, "f105-disp-create")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
 	hook := func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
 		for i := range tr.Extra {
-			if cls, ok := mqttF105ObligationClass(tr.Extra[i].subj); !ok || cls != mqttResourceClassTk {
+			if cls, ok := mqttOutboundObligationClass(tr.Extra[i].subj); !ok || cls != mqttResourceClassTk {
 				continue
 			}
 			var r mqttOutboundResource
@@ -307,29 +307,29 @@ func TestF105ProvisionCarryingADisposalIsRefused(t *testing.T) {
 	}
 	e.asm.jsa.testTransitionCommit.Store(&hook)
 	_, err := e.asm.jsa.opProvisionResource(e.id, e.epoch, "txn-prov", "op-prov",
-		testF105Gen, auth.Tenure, "inc-new", "$MQTT_inc-new", mqttResourceSourceConsumer)
+		testGen, auth.Tenure, "inc-new", "$MQTT_inc-new", mqttResourceSourceConsumer)
 	e.asm.jsa.testTransitionCommit.Store(nil)
 	testRequireRefusal(t, err, "already carrying a disposal decision")
-	if got, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testF105Gen, "inc-new"); got != nil {
+	if got, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, "inc-new"); got != nil {
 		t.Fatalf("a resource created with a disposal decision landed: %+v", got)
 	}
 }
 
 // A dispose-resource batch overwrites at most ONE resource: a legitimate step on one record may not
 // carry an unrelated change to another (the last angle of the H-1..H-3 class).
-func TestF105DisposeBatchActsOnOneResource(t *testing.T) {
-	e, done := testF105NewEnv(t, "f105-disp-one")
+func TestDisposeBatchActsOnOneResource(t *testing.T) {
+	e, done := testNewEnv(t, "f105-disp-one")
 	defer done()
 	auth, _ := e.bootstrap(t, "txn-1")
-	testF105PlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	testF105PlantUnsealedResource(t, e, "inc-other", mqttResourceSourceConsumer)
-	r, seq := testF105LoadResource(t, e, "inc-src")
+	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
+	testPlantUnsealedResource(t, e, "inc-other", mqttResourceSourceConsumer)
+	r, seq := testBoundaryLoadResource(t, e, "inc-src")
 	d := *r
 	d.Disposal = &mqttResourceDisposal{Txn: "txn-two", Reason: mqttDisposalUnsubscribed, Gen: auth.Gen, Tenure: auth.Tenure}
 	_, err := e.asm.jsa.commitAuthorityTransition(testDisposeBatch(t, e, "txn-two",
-		testResourceMember(t, e, &d, seq), testSealMember(t, &e.asm.jsa, e.id, e.epoch, testF105Gen, "inc-other")))
+		testResourceMember(t, e, &d, seq), testSealMember(t, &e.asm.jsa, e.id, e.epoch, testGen, "inc-other")))
 	testRequireRefusal(t, err, "overwrites at most one")
-	if got, _ := testF105LoadResource(t, e, "inc-other"); got.Prov == mqttProvisioningSealed {
+	if got, _ := testBoundaryLoadResource(t, e, "inc-other"); got.Prov == mqttProvisioningSealed {
 		t.Fatal("a dispose batch sealed an unrelated resource")
 	}
 }

@@ -76,8 +76,8 @@ func mqttBoundaryPrefetchSet(id string, extra []mqttTransitionMember) []string {
 		if e.expect != 0 {
 			add(e.subj)
 		}
-		if cls, ok := mqttF105ObligationClass(e.subj); ok && cls == mqttActionClassTk {
-			if toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], "."); len(toks) == 5 {
+		if cls, ok := mqttOutboundObligationClass(e.subj); ok && cls == mqttActionClassTk {
+			if toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], "."); len(toks) == 5 {
 				add(mqttExchangeSubject(getHash(id), toks[2], toks[3]))
 			}
 		}
@@ -88,7 +88,7 @@ func mqttBoundaryPrefetchSet(id string, extra []mqttTransitionMember) []string {
 // mqttIsInflightStreamSubject reports whether subject is one of $MQTT_inflight's: an issue #107 record,
 // a register or an unsent marker.
 func mqttIsInflightStreamSubject(subject string) bool {
-	if mqttIsF105Subject(subject) {
+	if mqttIsOutboundRecordSubject(subject) {
 		return true
 	}
 	if _, err := mqttParseInflightSubject(subject); err == nil {

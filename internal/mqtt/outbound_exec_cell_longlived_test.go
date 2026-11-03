@@ -543,19 +543,19 @@ func testExecCellEnv(t *testing.T, clientID string) (*testInflightEnv, *testFram
 	return e, testRow2Wire(e)
 }
 
-// TestF105ALongLivedConnectionRetainsNoTransmissionHistory drives complete exchanges of the repeated
+// TestALongLivedConnectionRetainsNoTransmissionHistory drives complete exchanges of the repeated
 // execution schedules (S1, S2, S3, S4, S5, S7) on ONE connection, phase 1 then a further, ten times
 // longer phase 2, and requires that every exchange ends with nothing left for its identifier and
 // that nothing reachable from the connection and its session is longer after phase 2 than after
 // phase 1.
-func TestF105ALongLivedConnectionRetainsNoTransmissionHistory(t *testing.T) {
+func TestALongLivedConnectionRetainsNoTransmissionHistory(t *testing.T) {
 	testLongLivedRun(t, "f105-longlived", (*testLongLived).iteration)
 }
 
-// TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp is the same for S6 and S8, the
+// TestALongLivedConnectionEndsRefusedPubRelsWithOnePubComp is the same for S6 and S8, the
 // schedules that end an entered PUBREL unwritten and then complete with ONE PUBCOMP: before issue #118 each
 // refusal left a send hold {no token, no action, pubCompOwed 1}, two per round, 220 after 110.
-func TestF116ALongLivedConnectionEndsRefusedPubRelsWithOnePubComp(t *testing.T) {
+func TestALongLivedConnectionEndsRefusedPubRelsWithOnePubComp(t *testing.T) {
 	testLongLivedRun(t, "f116-longlived", (*testLongLived).refusedIteration)
 }
 
@@ -765,7 +765,7 @@ func testLongLivedForeignGoroutines(goBase int) []string {
 		if testLongLivedGoroutineID(g) <= goBase {
 			continue
 		}
-		if !strings.Contains(g, "internal/mqtt.") || strings.Contains(g, "TestF105ALongLivedConnectionRetainsNoTransmissionHistory") {
+		if !strings.Contains(g, "internal/mqtt.") || strings.Contains(g, "TestALongLivedConnectionRetainsNoTransmissionHistory") {
 			continue
 		}
 		lines := strings.SplitN(g, "\n", 3)
@@ -884,7 +884,7 @@ func (h *testEnteredHolder) requireRefusedAfterEntry(t *testing.T, e *testInflig
 // S6. An ordinary PUBREL delivered through mqttDeliverPubRelCb enters its write and is refused by
 // the client's Maximum Packet Size before consuming its acquisition: relinquish records the exact
 // holder's acquisition ABANDONED, nothing is written, and the action drains.
-func TestF105AnEnteredPubRelRefusedBySizeIsAbandonedOnItsHolder(t *testing.T) {
+func TestAnEnteredPubRelRefusedBySizeIsAbandonedOnItsHolder(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f105-s6-size")
 	seed := testSeedRealPubRelReady(t, e)
 	gen := testRow2Gen(e)
@@ -908,7 +908,7 @@ func TestF105AnEnteredPubRelRefusedBySizeIsAbandonedOnItsHolder(t *testing.T) {
 // enters its write and is refused by the client's Maximum Packet Size before consuming its
 // acquisition: relinquish records the exact holder's acquisition ABANDONED, nothing is written, and
 // the action drains.
-func TestF105AnEnteredRetainedPubRelRefusedBySizeIsAbandonedOnItsHolder(t *testing.T) {
+func TestAnEnteredRetainedPubRelRefusedBySizeIsAbandonedOnItsHolder(t *testing.T) {
 	e, tc := testExecCellEnv(t, "f105-s8-size")
 	gen := testRow2Gen(e)
 	pi, subject, lin, pubAcq := testRetainedQoS2Replayed(t, e, tc, gen)

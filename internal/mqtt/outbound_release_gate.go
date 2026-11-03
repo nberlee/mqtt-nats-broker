@@ -98,7 +98,7 @@ var mqttGenCertMembers = map[string]struct{}{
 
 // mqttGenCertSubject returns one generation's completion certificate subject.
 func mqttGenCertSubject(idHash, gen string) string {
-	return mqttF105SubjectPrefix() + mqttGenCertClassTk + "." + idHash + "." + gen
+	return mqttOutboundRecordSubjectPrefix() + mqttGenCertClassTk + "." + idHash + "." + gen
 }
 
 // mqttGenCertClassTk is the completion certificate's record class.

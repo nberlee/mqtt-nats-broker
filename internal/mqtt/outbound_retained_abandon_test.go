@@ -167,12 +167,12 @@ func (rig *testRetainedAbandonRig) chargeOf(lin string) (held, released bool) {
 	return rig.sess.custody.holdsPI(rig.pi), e != nil && e.chargeReleased
 }
 
-// TestF105RetainedReplayTooLargeIsAbandonedQoS1: a possibly-sent retained QoS 1 replay that no longer
+// TestRetainedReplayTooLargeIsAbandonedQoS1: a possibly-sent retained QoS 1 replay that no longer
 // fits is never sent, is abandoned with the retained arm (packet-too-large), its charge released and
 // its identifier held, its copy reclaimed; a late PUBACK then completes the exchange and frees the
 // identifier. The late PUBACK settles no source: it installs no source owner, holds no identifier
 // past the exchange's ending, and the abandonment's own binding goes with the ending.
-func TestF105RetainedReplayTooLargeIsAbandonedQoS1(t *testing.T) {
+func TestRetainedReplayTooLargeIsAbandonedQoS1(t *testing.T) {
 	var sourceless *atomic.Int64
 	rig := testRetainedAbandonUpExpiring(t, "ret-ab-q1", 1, 60, func(rig *testRetainedAbandonRig) {
 		sourceless = testAnswerSourcelessAsUnknown(t, rig.asm)
@@ -235,10 +235,10 @@ func TestF105RetainedReplayTooLargeIsAbandonedQoS1(t *testing.T) {
 	}
 }
 
-// TestF105RetainedReplayTooLargeIsAbandonedQoS2: the QoS 2 variant, then a late PUBREC after the copy
+// TestRetainedReplayTooLargeIsAbandonedQoS2: the QoS 2 variant, then a late PUBREC after the copy
 // is reclaimed advances through the material-free abandoned arrow — the canonical PUBREL created
 // without the manifest — the PUBREL is emitted, and PUBCOMP removes the canonical and the register.
-func TestF105RetainedReplayTooLargeIsAbandonedQoS2(t *testing.T) {
+func TestRetainedReplayTooLargeIsAbandonedQoS2(t *testing.T) {
 	rig := testRetainedAbandonUp(t, "ret-ab-q2", 2)
 	defer rig.done()
 	reg, x := rig.abandoned(t)
@@ -273,10 +273,10 @@ func TestF105RetainedReplayTooLargeIsAbandonedQoS2(t *testing.T) {
 	}
 }
 
-// TestF105RetainedAbandonBoundaryRefusesForgedBatches: direct submissions of a retained abandonment
+// TestRetainedAbandonBoundaryRefusesForgedBatches: direct submissions of a retained abandonment
 // against a live retained register. The unmutated batch COMMITS — the control without which every
 // refusal below could be a composer that never builds a valid batch — and each forgery is refused.
-func TestF105RetainedAbandonBoundaryRefusesForgedBatches(t *testing.T) {
+func TestRetainedAbandonBoundaryRefusesForgedBatches(t *testing.T) {
 	for _, tc := range []struct {
 		name, want string
 		mutate     func(reg *mqttInflightRecord, x *mqttOutboundExchange) (regBody, xBody bool)
@@ -374,11 +374,11 @@ func TestF105RetainedAbandonBoundaryRefusesForgedBatches(t *testing.T) {
 	}
 }
 
-// TestF105RetainedAbandonedSurvivesARestart: after the abandonment and the copy's reclamation, a
+// TestRetainedAbandonedSurvivesARestart: after the abandonment and the copy's reclamation, a
 // broker restart restores the ACK-only identity — no PUBLISH replay, the identifier still held — and
 // a late PUBACK (QoS 1) or a late PUBREC then PUBCOMP (QoS 2) reaches the right allocation and
 // completes it with no material.
-func TestF105RetainedAbandonedSurvivesARestart(t *testing.T) {
+func TestRetainedAbandonedSurvivesARestart(t *testing.T) {
 	for _, qos := range []byte{1, 2} {
 		t.Run(map[byte]string{1: "qos1", 2: "qos2"}[qos], func(t *testing.T) {
 			rig := testRetainedAbandonUp(t, "ret-ab-restart-"+string('0'+qos), qos)
@@ -427,12 +427,12 @@ func TestF105RetainedAbandonedSurvivesARestart(t *testing.T) {
 	}
 }
 
-// TestF105RetainedUnservableProvenUnsentIsWithdrawn: an admitted retained delivery whose first send
+// TestRetainedUnservableProvenUnsentIsWithdrawn: an admitted retained delivery whose first send
 // never happened (the broker stopped between the admission and the transmission, so the unsent
 // marker stands) is restored after a restart with a Maximum Packet Size it no longer fits. It is
 // WITHDRAWN, not abandoned: nothing is sent, the exchange reads WithdrawnUnsent with no
 // abandonment fact, the identifier is released with the register, and the copy is reclaimed.
-func TestF105RetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
+func TestRetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer func() { testMQTTShutdownServer(s) }()
@@ -518,7 +518,7 @@ func TestF105RetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
 // production discarding close (opCloseTeardownGenerationWith), applied in the window a teardown
 // leaves between its closure and its register reap. (A clean start over a QoS 2 session cannot
 // reach it: issue #115.)
-func TestF105RetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
+func TestRetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 	for _, order := range []string{"discard-before-read", "discard-in-presend"} {
 		t.Run(order, func(t *testing.T) {
 			rig := testRetainedAbandonUp(t, "ret-ab-discard-"+order, 2)
@@ -616,13 +616,13 @@ func TestF105RetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 	}
 }
 
-// TestF105RetainedAbandonACLDenyThroughTheProducer (consult 103 2d): an acl-deny abandonment of a
+// TestRetainedAbandonACLDenyThroughTheProducer (consult 103 2d): an acl-deny abandonment of a
 // live retained register passes through the real producer (opAbandonDeniedDelivery's retained arm)
 // and the boundary, and reads back with its reason and its copy: the register at
 // delivery_abandoned with acl-deny, the exchange's fact the retained arm naming the same payload.
 // The permission refresh that would produce the decision is outside this coverage; the verdict
-// that reads it is TestF105RetainedReplayVerdict.
-func TestF105RetainedAbandonACLDenyThroughTheProducer(t *testing.T) {
+// that reads it is TestRetainedReplayVerdict.
+func TestRetainedAbandonACLDenyThroughTheProducer(t *testing.T) {
 	r := testRetainedRigUp(t, "ret-ab-acl", "rt/acl", 1, []byte("denied"))
 	defer r.done()
 	sub, subr := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: false}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -665,14 +665,14 @@ func TestF105RetainedAbandonACLDenyThroughTheProducer(t *testing.T) {
 	assertRetainedArm(t, after, x, mqttAbandonReasonACLDeny)
 }
 
-// TestF105RetainedLiveFirstSendUnservableIsWithdrawn (consult 103 2b): a LIVE first send judged
+// TestRetainedLiveFirstSendUnservableIsWithdrawn (consult 103 2b): a LIVE first send judged
 // unservable after its admission — here its frame no longer fits; on the live route the change a
 // production connection can actually see is a permission refresh, and the verdict reads both — is
 // WITHDRAWN: no PUBLISH, the exchange WithdrawnUnsent with no abandonment fact, the identifier and
 // the charge released, the copy reclaimed, and the replay queue goes on to deliver the next item.
 // The seam changes the connection's limit while the readLoop is idle, between the admission and
 // the transmission, so the snapshot's own size check passed.
-func TestF105RetainedLiveFirstSendUnservableIsWithdrawn(t *testing.T) {
+func TestRetainedLiveFirstSendUnservableIsWithdrawn(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -752,15 +752,15 @@ func TestF105RetainedLiveFirstSendUnservableIsWithdrawn(t *testing.T) {
 	}
 }
 
-// TestF105RetainedIndeterminateVerdictIsOwed (consult 103 2e, re-ruled by consult 106): a restored
+// TestRetainedIndeterminateVerdictIsOwed (consult 103 2e, re-ruled by consult 106): a restored
 // retained PUBLISH whose verdict is INDETERMINATE (no usable authorization snapshot) decides
 // nothing — no acquisition, no output, no withdrawal or abandonment, the reservation and the
 // restored entry kept — and it is OWED, not withheld: an indeterminate verdict proves no
 // settlement. (a) Authorization recovering on the same open connection delivers it there. (b) A
 // verdict that stays indeterminate past the bound closes the connection, and the usable resume
 // replays it. The verdict is forced through the seam; the verdict's own indeterminate arm is
-// TestF105RetainedReplayVerdict's.
-func TestF105RetainedIndeterminateVerdictIsOwed(t *testing.T) {
+// TestRetainedReplayVerdict's.
+func TestRetainedIndeterminateVerdictIsOwed(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		recover bool
@@ -869,7 +869,7 @@ func TestF105RetainedIndeterminateVerdictIsOwed(t *testing.T) {
 // T13 — CAPACITY. An admitted retained QoS 1 delivery is a LEDGER charge (custody holds its
 // identifier and its entry carries the charge), so with Receive Maximum 1 a live QoS 1 publication
 // to the same session is withheld until the retained one is acknowledged, then delivered.
-func TestF105RetainedAdmissionIsALedgerCharge(t *testing.T) {
+func TestRetainedAdmissionIsALedgerCharge(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -903,7 +903,7 @@ func TestF105RetainedAdmissionIsALedgerCharge(t *testing.T) {
 // T14 — DUPLICATE AND NEGATIVE PUBREC. A duplicate PUBREC at pubrel_ready re-emits the PUBREL from
 // the canonical; a PUBREC carrying a failure reason code rejects the retained exchange: no PUBREL,
 // the register removed, and the copy reclaimed.
-func TestF105RetainedPubRecDuplicateAndNegative(t *testing.T) {
+func TestRetainedPubRecDuplicateAndNegative(t *testing.T) {
 	setup := func(t *testing.T, id string) (*testRetainedRig, net.Conn, *mqttReader, uint16, *mqttInflightRecord) {
 		o := testMQTTDefaultOptionsV5()
 		s := testMQTTRunServer(t, o)
@@ -962,7 +962,7 @@ func TestF105RetainedPubRecDuplicateAndNegative(t *testing.T) {
 // once; with Retain Handling 0 the replacement adds its own snapshot, delivered after the inherited
 // one; an UNSUBSCRIBE then a fresh SUBSCRIBE departs the held item (never delivered) and the fresh
 // incarnation's own snapshot is the one copy that arrives.
-func TestF105RetainedSameSidReplacementInheritsTheReplay(t *testing.T) {
+func TestRetainedSameSidReplacementInheritsTheReplay(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		unsub   bool
@@ -1021,7 +1021,7 @@ func TestF105RetainedSameSidReplacementInheritsTheReplay(t *testing.T) {
 //
 // Mutations: the composer leaves it authority-free -> the composed arrow carries no authority;
 // the boundary guard removed -> the unfenced arrow lands.
-func TestF105RetainedAbandonedArrowFencesOnTheAuthority(t *testing.T) {
+func TestRetainedAbandonedArrowFencesOnTheAuthority(t *testing.T) {
 	rig := testRetainedAbandonUp(t, "ret-ab-fenced", 2)
 	defer rig.done()
 	reg0, _ := rig.abandoned(t)

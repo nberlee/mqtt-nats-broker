@@ -28,10 +28,10 @@ import (
 // every acceptance, the closing driver's order and withhold, the adoption's settlement and its
 // receiptless continuation, and P2. Mutation ledger: mutation-ledger-8b.md.
 
-// testF105_8bTenureOf returns the resident session's tenure, its acceptance fact's stream
+// test8bTenureOf returns the resident session's tenure, its acceptance fact's stream
 // sequence read independently by the fact's own subject, its entitlement, and its record
 // sequence.
-func testF105_8bTenureOf(t *testing.T, s *Server, cid string) (mqttSharedTenure, uint64, mqttOutboundEntitlement, uint64) {
+func test8bTenureOf(t *testing.T, s *Server, cid string) (mqttSharedTenure, uint64, mqttOutboundEntitlement, uint64) {
 	t.Helper()
 	asm, sess := testResidentSession(t, s, cid)
 	sess.mu.Lock()
@@ -47,12 +47,12 @@ func testF105_8bTenureOf(t *testing.T, s *Server, cid string) (mqttSharedTenure,
 	return tenure, smsg.Sequence, ent, recSeq
 }
 
-// testF105_8bAssertOneTenure asserts the consolidation: the ledger's standing tenure is the
+// test8bAssertOneTenure asserts the consolidation: the ledger's standing tenure is the
 // session's, its ID is the authority tenure the connection was accepted under, and its order is
 // the acceptance fact's own sequence — never the session record's.
-func testF105_8bAssertOneTenure(t *testing.T, s *Server, asm *mqttAccountSessionManager, cid, epoch string) {
+func test8bAssertOneTenure(t *testing.T, s *Server, asm *mqttAccountSessionManager, cid, epoch string) {
 	t.Helper()
-	tenure, factSeq, ent, recSeq := testF105_8bTenureOf(t, s, cid)
+	tenure, factSeq, ent, recSeq := test8bTenureOf(t, s, cid)
 	if tenure.ID != ent.Tenure {
 		t.Fatalf("the ledger tenure's ID %q is not the authority tenure %q the connection was accepted under", tenure.ID, ent.Tenure)
 	}
@@ -70,7 +70,7 @@ func testF105_8bAssertOneTenure(t *testing.T, s *Server, asm *mqttAccountSession
 
 // T1: ONE tenure per acceptance, installed, for a fresh client and for its resume. Mutations S1a
 // (the ledger ID minted as its own nonce) and S1b (the order taken from the session record).
-func TestF105_8bOneTenurePerAcceptance(t *testing.T) {
+func Test8bOneTenurePerAcceptance(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -79,16 +79,16 @@ func TestF105_8bOneTenurePerAcceptance(t *testing.T) {
 	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	testF105_8bAssertOneTenure(t, s, asm, cid, epoch)
-	first, _, _, _ := testF105_8bTenureOf(t, s, cid)
+	epoch := testAccountEpoch(asm)
+	test8bAssertOneTenure(t, s, asm, cid, epoch)
+	first, _, _, _ := test8bTenureOf(t, s, cid)
 	c.Close()
 	time.Sleep(150 * time.Millisecond)
 	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
-	testF105_8bAssertOneTenure(t, s, asm, cid, epoch)
-	second, _, _, _ := testF105_8bTenureOf(t, s, cid)
+	test8bAssertOneTenure(t, s, asm, cid, epoch)
+	second, _, _, _ := test8bTenureOf(t, s, cid)
 	if second.Seq <= first.Seq || second.ID == first.ID {
 		t.Fatalf("the resume's tenure %+v must succeed the first %+v", second, first)
 	}
@@ -97,9 +97,9 @@ func TestF105_8bOneTenurePerAcceptance(t *testing.T) {
 // T2: after a LOST RESPONSE to the metadata commit — the batch landed, its acknowledgement did
 // not, and the acceptance adopted it from the resolved commit — the tenure is still the
 // acceptance fact's. Mutation S1b.
-func TestF105_8bTenureSurvivesALostResponse(t *testing.T) {
+func Test8bTenureSurvivesALostResponse(t *testing.T) {
 	const cid = "f105-8b-t2"
-	s, asm, epoch, _, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, _, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
 	var armed atomic.Bool
@@ -117,13 +117,13 @@ func TestF105_8bTenureSurvivesALostResponse(t *testing.T) {
 	if armed.Load() {
 		t.Fatal("the lost response was never injected, so nothing here is tested")
 	}
-	testF105_8bAssertOneTenure(t, s, asm, cid, epoch)
+	test8bAssertOneTenure(t, s, asm, cid, epoch)
 }
 
 // T3: EVERY acceptance installs before it serves — a client with no record included. No
 // SUBSCRIBE runs, so the installation is the only thing that can have created the ledger.
 // Mutation M-install (the installation gated on a restored record).
-func TestF105_8bEveryAcceptanceInstalls(t *testing.T) {
+func Test8bEveryAcceptanceInstalls(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -132,8 +132,8 @@ func TestF105_8bEveryAcceptanceInstalls(t *testing.T) {
 	defer c.Close()
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
+	epoch := testAccountEpoch(asm)
+	gen := testServingAt(t, asm, cid, epoch).Gen
 	l := asm.jsa.loadSharedLedger(cid, epoch, gen)
 	if l.status != mqttOutboundValid || l.rec.State != mqttSharedLedgerOpen || len(l.rec.Acqs) != 0 {
 		t.Fatalf("a fresh acceptance must install an open, empty ledger before it serves, it reads %v %+v", l.status, l.rec)
@@ -145,7 +145,7 @@ func TestF105_8bEveryAcceptanceInstalls(t *testing.T) {
 // before the join fence, so no admission can win in an interval with the ledger sealed and the
 // authority still serving. Checked from the durable records at the driver's fence point, before
 // the closer is let go. Mutation S2 (the driver run before the receipted close).
-func TestF105_8bClosureLandsBeforeTheSeal(t *testing.T) {
+func Test8bClosureLandsBeforeTheSeal(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -153,8 +153,8 @@ func TestF105_8bClosureLandsBeforeTheSeal(t *testing.T) {
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
+	epoch := testAccountEpoch(asm)
+	gen := testServingAt(t, asm, cid, epoch).Gen
 	var reached atomic.Bool
 	var verdict atomic.Pointer[string]
 	// Observed at EVERY seal composition, wherever it is composed: the property is about the
@@ -164,7 +164,7 @@ func TestF105_8bClosureLandsBeforeTheSeal(t *testing.T) {
 			return
 		}
 		msg := "ok"
-		if !testF105ClosureDiscards(asm, cid, epoch, gen) {
+		if !testClosureDiscards(asm, cid, epoch, gen) {
 			msg = "the ledger seal was composed before the generation's discarding closure stood"
 		} else if al := asm.jsa.loadOutboundAuthority(cid, epoch); al.status == mqttOutboundValid && al.rec != nil &&
 			al.rec.State == mqttAuthorityServing && al.rec.Gen == gen {
@@ -176,7 +176,7 @@ func TestF105_8bClosureLandsBeforeTheSeal(t *testing.T) {
 	defer mqttTestSharedComposeHookV.Store(nil)
 	c.Close()
 	checkFor(t, 3*asm.jsa.timeout, 25*time.Millisecond, func() error {
-		if !testF105RecordGone(asm, cid) {
+		if !testRecordGone(asm, cid) {
 			return errors.New("the session record still stands")
 		}
 		return nil
@@ -189,8 +189,8 @@ func TestF105_8bClosureLandsBeforeTheSeal(t *testing.T) {
 	}
 }
 
-// testF105_8bMarked reports the client's record as a teardown marker, with its sequence.
-func testF105_8bMarked(asm *mqttAccountSessionManager, cid string) (*mqttPersistedSession, uint64, bool) {
+// test8bMarked reports the client's record as a teardown marker, with its sequence.
+func test8bMarked(asm *mqttAccountSessionManager, cid string) (*mqttPersistedSession, uint64, bool) {
 	smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
 	if err != nil || smsg == nil {
 		return nil, 0, false
@@ -202,21 +202,21 @@ func testF105_8bMarked(asm *mqttAccountSessionManager, cid string) (*mqttPersist
 	return ps, smsg.Sequence, true
 }
 
-func testF105_8bReceipt(asm *mqttAccountSessionManager, cid, gen string) (*mqttSessTeardownReceipt, mqttOutboundLoadStatus) {
+func test8bReceipt(asm *mqttAccountSessionManager, cid, gen string) (*mqttSessTeardownReceipt, mqttOutboundLoadStatus) {
 	r, _, st := asm.jsa.loadTeardownReceipt(asm.domainTk, getHash(cid), gen)
 	return r, st
 }
 
-func testF105_8bLedgerSealed(asm *mqttAccountSessionManager, cid, epoch, gen string) bool {
+func test8bLedgerSealed(asm *mqttAccountSessionManager, cid, epoch, gen string) bool {
 	l := asm.jsa.loadSharedLedger(cid, epoch, gen)
 	return l.status == mqttOutboundValid && l.rec.State == mqttSharedLedgerSealed
 }
 
-// testF105_8bResidue drives the T22 schedule on a session with the given expiry: an unresolved
+// test8bResidue drives the T22 schedule on a session with the given expiry: an unresolved
 // foreign preparation stands, its receipt subject cannot be answered, and a teardown runs —
 // the disconnect for a zero expiry, the expiry itself otherwise. It returns the account, epoch,
 // the retiring generation and the proposal, with the seam still armed.
-func testF105_8bResidue(t *testing.T, s *Server, cid string, expiry uint32) (*mqttAccountSessionManager, string, string, *mqttHandoffIntent) {
+func test8bResidue(t *testing.T, s *Server, cid string, expiry uint32) (*mqttAccountSessionManager, string, string, *mqttHandoffIntent) {
 	t.Helper()
 	o := s.getOpts()
 	ci := &mqttV5ConnInfo{clientID: cid}
@@ -226,9 +226,9 @@ func testF105_8bResidue(t *testing.T, s *Server, cid string, expiry uint32) (*mq
 	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
-	i := testF105PlantUnresolved(t, asm, cid, epoch, "8b-"+cid)
+	epoch := testAccountEpoch(asm)
+	gen := testServingAt(t, asm, cid, epoch).Gen
+	i := testPlantUnresolved(t, asm, cid, epoch, "8b-"+cid)
 	receipt := mqttHandoffOutcomeSubject(_EMPTY_, getHash(cid), i.ID)
 	drop := func(_ string, body []byte) bool { return strings.Contains(string(body), receipt) }
 	asm.jsa.testDropRequest.Store(&drop)
@@ -239,7 +239,7 @@ func testF105_8bResidue(t *testing.T, s *Server, cid string, expiry uint32) (*mq
 		wait += time.Duration(expiry) * time.Second
 	}
 	checkFor(t, wait, 50*time.Millisecond, func() error {
-		if _, _, marked := testF105_8bMarked(asm, cid); !marked {
+		if _, _, marked := test8bMarked(asm, cid); !marked {
 			return errors.New("the record is not marked yet")
 		}
 		return nil
@@ -251,26 +251,26 @@ func testF105_8bResidue(t *testing.T, s *Server, cid string, expiry uint32) (*mq
 // settlement leaves the proposal standing; the teardown claims receiptless, and the closing
 // driver has no licence: the record stays MARKED, no discarding closure, the ledger NOT sealed,
 // the proposal still stands. Mutation M-seal-unlicensed.
-func TestF105_8bReceiptlessTeardownWithholds(t *testing.T) {
+func Test8bReceiptlessTeardownWithholds(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 	const cid = "f105-8b-t9"
-	asm, epoch, gen, i := testF105_8bResidue(t, s, cid, 0)
+	asm, epoch, gen, i := test8bResidue(t, s, cid, 0)
 	time.Sleep(2 * asm.jsa.timeout)
-	if _, _, marked := testF105_8bMarked(asm, cid); !marked {
+	if _, _, marked := test8bMarked(asm, cid); !marked {
 		t.Fatal("the withheld teardown must leave the record MARKED")
 	}
-	if _, st := testF105_8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
+	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
 		t.Fatalf("the residue's teardown carries no receipt, it reads %v", st)
 	}
-	if testF105ClosureDiscards(asm, cid, epoch, gen) {
+	if testClosureDiscards(asm, cid, epoch, gen) {
 		t.Fatal("the residue must leave NO discarding closure")
 	}
-	if testF105_8bLedgerSealed(asm, cid, epoch, gen) {
+	if test8bLedgerSealed(asm, cid, epoch, gen) {
 		t.Fatal("an unlicensed closing SEALED the ledger with the generation still able to admit")
 	}
-	if standing, _ := testF105StandingProposal(t, asm, cid, epoch); standing != i.ID {
+	if standing, _ := testStandingProposal(t, asm, cid, epoch); standing != i.ID {
 		t.Fatalf("the unsettled proposal %q must still stand, got %q", i.ID, standing)
 	}
 }
@@ -280,19 +280,19 @@ func TestF105_8bReceiptlessTeardownWithholds(t *testing.T) {
 // expiry adoption settles the preparation (it cancels back to SERVING at the retiring
 // generation), authors the receipt with a CAS of the marker, closes discarding, seals and
 // releases the record. Mutation M-cont (no continuation: the adoption stalls).
-func TestF105_8bExpiryAdoptionContinuesReceiptless(t *testing.T) {
+func Test8bExpiryAdoptionContinuesReceiptless(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 	const cid = "f105-8b-t10"
-	asm, epoch, gen, i := testF105_8bResidue(t, s, cid, 1)
-	if _, st := testF105_8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
+	asm, epoch, gen, i := test8bResidue(t, s, cid, 1)
+	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
 		t.Fatalf("the first expiry teardown must be receiptless, the receipt reads %v", st)
 	}
-	if standing, _ := testF105StandingProposal(t, asm, cid, epoch); standing != i.ID {
+	if standing, _ := testStandingProposal(t, asm, cid, epoch); standing != i.ID {
 		t.Fatalf("the proposal must still stand after the first teardown, got %q", standing)
 	}
-	if obj := testF105ResidentObject(asm, cid); obj != nil {
+	if obj := testResidentObject(asm, cid); obj != nil {
 		asm.cancelSessionExpiry(getHash(cid))
 		asm.removeSession(obj, true)
 	}
@@ -313,18 +313,18 @@ func TestF105_8bExpiryAdoptionContinuesReceiptless(t *testing.T) {
 		t.Fatal("the record-based expiry adoption never reached the receiptless continuation")
 	}
 	checkFor(t, 3*asm.jsa.timeout, 50*time.Millisecond, func() error {
-		if !testF105RecordGone(asm, cid) {
+		if !testRecordGone(asm, cid) {
 			return errors.New("the continued adoption did not release the record")
 		}
 		return nil
 	})
-	if r, st := testF105_8bReceipt(asm, cid, gen); st != mqttOutboundValid || !r.Retire.Discard {
+	if r, st := test8bReceipt(asm, cid, gen); st != mqttOutboundValid || !r.Retire.Discard {
 		t.Fatalf("the continuation must author a discarding receipt, it reads %v", st)
 	}
-	if !testF105ClosureDiscards(asm, cid, epoch, gen) {
+	if !testClosureDiscards(asm, cid, epoch, gen) {
 		t.Fatal("the continued adoption did not close the generation discarding")
 	}
-	if !testF105_8bLedgerSealed(asm, cid, epoch, gen) {
+	if !test8bLedgerSealed(asm, cid, epoch, gen) {
 		t.Fatal("the continued adoption did not seal the ledger")
 	}
 }
@@ -332,17 +332,17 @@ func TestF105_8bExpiryAdoptionContinuesReceiptless(t *testing.T) {
 // T12: the continuation is ARBITRATED by the marker, not deduplicated by the receipt slot: an
 // adoption paused before its batch, whose marker is then displaced, writes NO receipt. Mutation
 // M-cont-cas (the receipt written create-only without the marker CAS member).
-func TestF105_8bContinuationLosesToADisplacedMarker(t *testing.T) {
+func Test8bContinuationLosesToADisplacedMarker(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 	const cid = "f105-8b-t12"
-	asm, _, gen, _ := testF105_8bResidue(t, s, cid, 0)
-	if obj := testF105ResidentObject(asm, cid); obj != nil {
+	asm, _, gen, _ := test8bResidue(t, s, cid, 0)
+	if obj := testResidentObject(asm, cid); obj != nil {
 		asm.removeSession(obj, true)
 	}
 	asm.jsa.testDropRequest.Store(nil)
-	ps, seq, marked := testF105_8bMarked(asm, cid)
+	ps, seq, marked := test8bMarked(asm, cid)
 	if !marked {
 		t.Fatal("no marker to adopt")
 	}
@@ -352,7 +352,7 @@ func TestF105_8bContinuationLosesToADisplacedMarker(t *testing.T) {
 		}
 		// DISPLACE the marker: a re-claim by another teardown, a byte-different marker at the
 		// next sequence.
-		cur, cseq, ok := testF105_8bMarked(asm, cid)
+		cur, cseq, ok := test8bMarked(asm, cid)
 		if !ok {
 			t.Errorf("the marker vanished before the displacement")
 			return
@@ -371,7 +371,7 @@ func TestF105_8bContinuationLosesToADisplacedMarker(t *testing.T) {
 	if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
 		t.Fatalf("an adoption whose marker was displaced must be superseded, got %v", err)
 	}
-	if _, st := testF105_8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
+	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
 		t.Fatalf("the losing continuation wrote a receipt (%v): the receipt slot deduplicated, it did not arbitrate", st)
 	}
 }
@@ -379,7 +379,7 @@ func TestF105_8bContinuationLosesToADisplacedMarker(t *testing.T) {
 // T10b: a RECEIPTED marker over a crash-left PREPARING is finished by an adopter with no CONNECT
 // ahead of it, because every adoption settles first. Mutation M-settle-receipted (settle only
 // when receiptless).
-func TestF105_8bReceiptedAdoptionSettlesFirst(t *testing.T) {
+func Test8bReceiptedAdoptionSettlesFirst(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -387,14 +387,14 @@ func TestF105_8bReceiptedAdoptionSettlesFirst(t *testing.T) {
 	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
-	gen := testF105ServingAt(t, asm, cid, epoch).Gen
+	epoch := testAccountEpoch(asm)
+	gen := testServingAt(t, asm, cid, epoch).Gen
 	// The owner's teardown claims WITH a receipt and then cannot close: a PREPARING planted
 	// between its claim and its close makes the close refuse.
 	var planted atomic.Bool
 	pre := func(tr *mqttAuthorityTransition) {
 		if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionCloseTeardown && planted.CompareAndSwap(false, true) {
-			testF105PlantUnresolved(t, asm, cid, epoch, "8b-t10b")
+			testPlantUnresolved(t, asm, cid, epoch, "8b-t10b")
 		}
 	}
 	asm.jsa.testTransitionPresend.Store(&pre)
@@ -404,36 +404,36 @@ func TestF105_8bReceiptedAdoptionSettlesFirst(t *testing.T) {
 		if !planted.Load() {
 			return errors.New("the owner's close never reached its send")
 		}
-		if _, _, marked := testF105_8bMarked(asm, cid); !marked {
+		if _, _, marked := test8bMarked(asm, cid); !marked {
 			return errors.New("the record is not marked")
 		}
 		return nil
 	})
 	asm.jsa.testTransitionPresend.Store(nil)
 	time.Sleep(asm.jsa.timeout)
-	ps, seq, marked := testF105_8bMarked(asm, cid)
+	ps, seq, marked := test8bMarked(asm, cid)
 	if !marked {
 		t.Skip("the owner's close won its race with the planted preparation; nothing to adopt")
 	}
-	if _, st := testF105_8bReceipt(asm, cid, gen); st != mqttOutboundValid {
+	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundValid {
 		t.Fatalf("the owner's claim must carry a receipt, it reads %v", st)
 	}
-	if obj := testF105ResidentObject(asm, cid); obj != nil {
+	if obj := testResidentObject(asm, cid); obj != nil {
 		asm.removeSession(obj, true)
 	}
 	if err := asm.finishAdoptedTeardown(ps, getHash(cid), seq, s.getOpts()); err != nil {
 		t.Fatalf("the adopter could not finish a receipted teardown over a PREPARING: %v", err)
 	}
-	if !testF105RecordGone(asm, cid) || !testF105ClosureDiscards(asm, cid, epoch, gen) {
+	if !testRecordGone(asm, cid) || !testClosureDiscards(asm, cid, epoch, gen) {
 		t.Fatal("the adoption did not close discarding and release the record")
 	}
 }
 
-// testF105_8bDivergeAffine makes the resident object's in-memory affine target differ from what
+// test8bDivergeAffine makes the resident object's in-memory affine target differ from what
 // its record names, the divergence P2 exists for.
-func testF105_8bDivergeAffine(t *testing.T, asm *mqttAccountSessionManager, cid string) (string, string) {
+func test8bDivergeAffine(t *testing.T, asm *mqttAccountSessionManager, cid string) (string, string) {
 	t.Helper()
-	sess := testF105ResidentObject(asm, cid)
+	sess := testResidentObject(asm, cid)
 	if sess == nil {
 		t.Fatalf("the session for %q must be resident", cid)
 	}
@@ -447,13 +447,13 @@ func testF105_8bDivergeAffine(t *testing.T, asm *mqttAccountSessionManager, cid 
 // T15: P2. A clean start over a resident object whose memory names an affine target its record
 // does not: the finalization's discarding closure enrols what the DISPLACED RECORD names, and the
 // CONNECT succeeds. Mutation P2 (the target taken from memory).
-func TestF105_8bCleanStartRetiresWhatTheRecordNames(t *testing.T) {
+func Test8bCleanStartRetiresWhatTheRecordNames(t *testing.T) {
 	const cid = "f105-8b-t15"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	testF105HoldResident(t, asm, cid)
-	memGen, memDur := testF105_8bDivergeAffine(t, asm, cid)
+	testHoldResident(t, asm, cid)
+	memGen, memDur := test8bDivergeAffine(t, asm, cid)
 	var retire atomic.Pointer[mqttRetirementRequest]
 	pre := func(tr *mqttAuthorityTransition) {
 		if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil && tr.Auth.Intent.Retire.Gen == oldGen {
@@ -466,7 +466,7 @@ func TestF105_8bCleanStartRetiresWhatTheRecordNames(t *testing.T) {
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTReadConnAckV5(t, r2)
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
 		t.Fatalf("the clean start must hand off to a fresh generation")
 	}
 	r := retire.Load()
@@ -483,13 +483,13 @@ func TestF105_8bCleanStartRetiresWhatTheRecordNames(t *testing.T) {
 // against the record that won, and the CONNECT is accepted (the re-drive machinery itself is
 // TestSessSupersededDiscardReDrivesTheCleanStart's). Here: the handoff that finally lands names
 // the winner's targets, never the stale object's.
-func TestF105_8bMovedDisplacedRecordProposesNoStaleHandoff(t *testing.T) {
+func Test8bMovedDisplacedRecordProposesNoStaleHandoff(t *testing.T) {
 	const cid = "f105-8b-t16"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	testF105HoldResident(t, asm, cid)
-	memGen, memDur := testF105_8bDivergeAffine(t, asm, cid)
+	testHoldResident(t, asm, cid)
+	memGen, memDur := test8bDivergeAffine(t, asm, cid)
 	var moved atomic.Bool
 	settle := func(id string, _ int) {
 		if id != cid || !moved.CompareAndSwap(false, true) {
@@ -504,7 +504,7 @@ func TestF105_8bMovedDisplacedRecordProposesNoStaleHandoff(t *testing.T) {
 			t.Errorf("moving the record: %v", err)
 		}
 	}
-	testF105ArmBoundarySettle(t, asm, settle)
+	testArmBoundarySettle(t, asm, settle)
 	var stale atomic.Bool
 	pre := func(tr *mqttAuthorityTransition) {
 		if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil &&
@@ -523,7 +523,7 @@ func TestF105_8bMovedDisplacedRecordProposesNoStaleHandoff(t *testing.T) {
 	if stale.Load() {
 		t.Fatal("a handoff was proposed carrying the stale object's in-memory targets")
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen == oldGen {
 		t.Fatal("the clean start must end serving a fresh generation")
 	}
 }
@@ -534,13 +534,13 @@ func TestF105_8bMovedDisplacedRecordProposesNoStaleHandoff(t *testing.T) {
 // naming the record's targets. Falling through to the discard instead would let its claim win at
 // the unmoved sequence and retire what memory names. Mutation P2-unreadable (a read error treated
 // as a moved record).
-func TestF105_8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
+func Test8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
 	const cid = "f105-8b-t15b"
-	s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+	s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 	defer done()
 	o := s.getOpts()
-	testF105HoldResident(t, asm, cid)
-	memGen, memDur := testF105_8bDivergeAffine(t, asm, cid)
+	testHoldResident(t, asm, cid)
+	memGen, memDur := test8bDivergeAffine(t, asm, cid)
 	sessSubj := mqttSessSubject(asm.domainTk, getHash(cid))
 	var armed, dropped atomic.Bool
 	drop := func(_ string, body []byte) bool {
@@ -553,7 +553,7 @@ func TestF105_8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
 	asm.jsa.testDropRequest.Store(&drop)
 	t.Cleanup(func() { asm.jsa.testDropRequest.Store(nil) })
 	var settled atomic.Bool
-	testF105ArmBoundarySettle(t, asm, func(id string, _ int) {
+	testArmBoundarySettle(t, asm, func(id string, _ int) {
 		if id == cid && settled.CompareAndSwap(false, true) {
 			armed.Store(true)
 		}
@@ -572,17 +572,17 @@ func TestF105_8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
 	asm.jsa.testTransitionPresend.Store(&pre)
 	t.Cleanup(func() { asm.jsa.testTransitionPresend.Store(nil) })
 	ci := &mqttV5ConnInfo{clientID: cid, cleanStart: true}
-	testF105RefusedConnectV5(t, o, ci)
+	testRefusedConnectV5(t, o, ci)
 	if !dropped.Load() {
 		t.Fatal("the P2 read was never failed, so nothing here is tested")
 	}
 	if claimed.Load() || retired.Load() != nil {
 		t.Fatal("a clean start whose displaced record could not be read went on to retire the generation")
 	}
-	if rec := testF105ServingAt(t, asm, cid, epoch); rec.Gen != oldGen {
+	if rec := testServingAt(t, asm, cid, epoch); rec.Gen != oldGen {
 		t.Fatalf("the refused clean start moved the authority to %q", rec.Gen)
 	}
-	if _, _, marked := testF105_8bMarked(asm, cid); marked {
+	if _, _, marked := test8bMarked(asm, cid); marked {
 		t.Fatal("the refused clean start claimed the record")
 	}
 	c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
@@ -604,16 +604,16 @@ func TestF105_8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
 // for a generation that may still serve. After the store recovers, the retry hands off naming
 // EXACTLY the displaced record's targets. Mutation P2-unresolved (an unresolved boundary load
 // falls through to the discard arm).
-func TestF105_8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
+func Test8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
 	for _, variant := range []string{"preparing", "indeterminate"} {
 		t.Run(variant, func(t *testing.T) {
 			cid := "f105-8b-t15c-" + variant
-			s, asm, epoch, oldGen, done := testF105CleanStartEnv(t, cid)
+			s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
 			defer done()
 			o := s.getOpts()
-			testF105HoldResident(t, asm, cid)
-			testF105_8bDivergeAffine(t, asm, cid)
-			obj := testF105ResidentObject(asm, cid)
+			testHoldResident(t, asm, cid)
+			test8bDivergeAffine(t, asm, cid)
+			obj := testResidentObject(asm, cid)
 			before, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
 			if err != nil {
 				t.Fatal(err)
@@ -636,7 +636,7 @@ func TestF105_8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
 					return
 				}
 				if variant == "preparing" {
-					i := testF105PlantUnresolved(t, asm, cid, epoch, "8b-t15c")
+					i := testPlantUnresolved(t, asm, cid, epoch, "8b-t15c")
 					subj := mqttHandoffOutcomeSubject(_EMPTY_, getHash(cid), i.ID)
 					drop.Store(&subj)
 					return
@@ -655,12 +655,12 @@ func TestF105_8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
 			asm.jsa.testTransitionPresend.Store(&pre)
 			t.Cleanup(func() { asm.jsa.testTransitionPresend.Store(nil) })
 			ci := &mqttV5ConnInfo{clientID: cid, cleanStart: true}
-			testF105RefusedConnectV5(t, o, ci)
+			testRefusedConnectV5(t, o, ci)
 			if !armed.Load() {
 				t.Fatal("the discard boundary was never reached, so nothing here is tested")
 			}
 			drop.Store(nil)
-			if _, _, marked := testF105_8bMarked(asm, cid); marked {
+			if _, _, marked := test8bMarked(asm, cid); marked {
 				t.Fatal("the clean start marked the record from memory behind an unresolved boundary")
 			}
 			after, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
@@ -677,7 +677,7 @@ func TestF105_8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
 			if terr := obj.endRecordTx(tok); terr != nil {
 				t.Fatalf("the refused clean start left the record transaction held: %v", terr)
 			}
-			if _, st := testF105_8bReceipt(asm, cid, oldGen); st != mqttOutboundAbsent {
+			if _, st := test8bReceipt(asm, cid, oldGen); st != mqttOutboundAbsent {
 				t.Fatalf("the refused clean start authored a teardown receipt (%v)", st)
 			}
 			c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
@@ -697,7 +697,7 @@ func TestF105_8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
 
 // T15d: the disposition's classification, row by row (consult 123). Mutations P2-unresolved and
 // P2-other-gen.
-func TestF105_8bCleanStartDispositionTable(t *testing.T) {
+func Test8bCleanStartDispositionTable(t *testing.T) {
 	const cid = "f105-8b-t15d"
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -706,7 +706,7 @@ func TestF105_8bCleanStartDispositionTable(t *testing.T) {
 	defer c.Close()
 	testMQTTReadConnAckV5(t, r)
 	asm, sess := testResidentSession(t, s, cid)
-	epoch := testF105AccountEpoch(asm)
+	epoch := testAccountEpoch(asm)
 	sess.mu.Lock()
 	gen := sess.gen
 	sess.mu.Unlock()

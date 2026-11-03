@@ -77,7 +77,7 @@ func testContinuityOffer(t *testing.T, e *testInflightEnv, deliveries int) (uint
 // W5a. A DEFINITE admission failure (the batch never leaves; resolution proves it never landed):
 // the ladder abandons, the source is re-offered, and the re-offer is admitted ONCE. The invariant
 // holds trivially - nothing of the first attempt landed.
-func TestF097ContinuityW5aDefiniteFailureAdmitsOnce(t *testing.T) {
+func TestContinuityW5aDefiniteFailureAdmitsOnce(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "f097-w5a")
 	testReadyForRealPubRelDelivery(t, e)
@@ -124,16 +124,16 @@ func TestF097ContinuityW5aDefiniteFailureAdmitsOnce(t *testing.T) {
 // its custody resolution stays unresolved, so the ladder exhausts and abandons the entry and its
 // source mapping; the source is re-offered. RECORDS whether the re-offer admits a SECOND lineage
 // for the same source delivery while the first stays at Publish (interleaving 3).
-func TestF097ContinuityW5bLandedThenUnreadable(t *testing.T) {
+func TestContinuityW5bLandedThenUnreadable(t *testing.T) {
 	t.Parallel()
-	t.Run("decided-by-the-record", func(t *testing.T) { t.Parallel(); testF097W5b(t, "f097-w5b", false) })
+	t.Run("decided-by-the-record", func(t *testing.T) { t.Parallel(); testW5b(t, "f097-w5b", false) })
 	t.Run("same-object-resume-serves-the-restored-entry", func(t *testing.T) {
 		t.Parallel()
-		testF097W5b(t, "f097-w5b-res", true)
+		testW5b(t, "f097-w5b-res", true)
 	})
 }
 
-func testF097W5b(t *testing.T, clientID string, resume bool) {
+func testW5b(t *testing.T, clientID string, resume bool) {
 	e := testNewInflightEnv(t, clientID)
 	testReadyForRealPubRelDelivery(t, e)
 	e.admissionPrerequisites(t, testRealPubRelSrcDur, 1)

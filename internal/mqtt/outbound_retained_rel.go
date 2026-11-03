@@ -38,11 +38,11 @@ const mqttRelClassTk = "rel"
 
 // mqttRetainedRelSubject is one retained exchange's canonical PUBREL subject.
 func mqttRetainedRelSubject(idHash, gen, nonce string) string {
-	return mqttF105SubjectPrefix() + mqttRelClassTk + "." + idHash + "." + gen + "." + nonce
+	return mqttOutboundRecordSubjectPrefix() + mqttRelClassTk + "." + idHash + "." + gen + "." + nonce
 }
 
 func mqttIsRetainedRelSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttF105SubjectPrefix()+mqttRelClassTk+".")
+	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix()+mqttRelClassTk+".")
 }
 
 // mqttRetainedRel is the record standing at that subject.
@@ -77,7 +77,7 @@ func mqttDecodeRetainedRel(data []byte, wantID, wantEpoch, wantGen, wantNonce st
 			r.ID, r.Epoch, r.Gen, r.Nonce, wantID, wantEpoch, wantGen, wantNonce)
 	case r.PI == 0:
 		return nil, fmt.Errorf("retained canonical PUBREL names no packet identifier")
-	case !mqttF105IdentTk(r.Identity):
+	case !mqttOutboundIdentTk(r.Identity):
 		return nil, fmt.Errorf("retained canonical PUBREL carries a malformed identity %q", r.Identity)
 	}
 	return r, nil
@@ -86,7 +86,7 @@ func mqttDecodeRetainedRel(data []byte, wantID, wantEpoch, wantGen, wantNonce st
 // mqttCheckRetainedRelMember is the per-member rule: an owned, well-formed, CREATE-ONLY record,
 // carried only by the advance that installs it.
 func mqttCheckRetainedRelMember(a *mqttTransitionAttempt, idHash string, e mqttTransitionMember) error {
-	toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+	toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 	if len(toks) != 4 {
 		return fmt.Errorf("transition %q carries a malformed canonical PUBREL subject %q", a.Txn, e.subj)
 	}
@@ -123,7 +123,7 @@ func (jsa *mqttJSA) checkRetainedRelMembers(a *mqttTransitionAttempt, extra []mq
 		if !mqttIsRetainedRelSubject(e.subj) {
 			continue
 		}
-		toks := strings.Split(e.subj[len(mqttF105SubjectPrefix()):], ".")
+		toks := strings.Split(e.subj[len(mqttOutboundRecordSubjectPrefix()):], ".")
 		if len(toks) != 4 {
 			return fmt.Errorf("transition %q carries a malformed canonical PUBREL subject %q", a.Txn, e.subj)
 		}
@@ -135,7 +135,7 @@ func (jsa *mqttJSA) checkRetainedRelMembers(a *mqttTransitionAttempt, extra []mq
 	}
 	used := map[string]bool{}
 	for _, e := range extra {
-		if mqttIsF105Subject(e.subj) || e.expect == 0 {
+		if mqttIsOutboundRecordSubject(e.subj) || e.expect == 0 {
 			continue
 		}
 		name, perr := mqttParseInflightSubject(e.subj)
