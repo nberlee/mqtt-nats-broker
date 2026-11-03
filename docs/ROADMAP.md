@@ -1466,7 +1466,9 @@ them in order where a later lint change depends on an earlier cleanup.
   acquisitions, not a grant term; the loss is a stated residual. Done 2026-11-02
   ([issue #159](https://github.com/nberlee/mqtt-nats-broker/issues/159)).
 
-- [ ] Cover `commitUnsub` releasing under the wrong record token
+- [x] Pin `commitUnsub`'s resolver token on the real shared and plain UNSUBSCRIBE release
+  paths: a verdict the release newly stages must be credited before the resolver's transaction
+  closes, or a crash can strand its identifier. Done 2026-11-03
   ([issue #160](https://github.com/nberlee/mqtt-nats-broker/issues/160)).
 
 - [ ] Correct the code comments that name identifiers which no longer exist

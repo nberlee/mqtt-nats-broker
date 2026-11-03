@@ -363,14 +363,9 @@ func TestMQTTUnsubAckSuppressedByADisplacementInTheWindow(t *testing.T) {
 // What this test does NOT do is guard the token: on this fixture the released consumer
 // has no pending registers, so `releaseSharedConsumer` never reaches its token-gated
 // record fallback and the durable is deleted either way. It is an end-to-end check that
-// commitUnsub runs from the RESOLUTION at all and releases what it owns.
-//
-// The token wiring rests on a convention instead: `commitUnsub` takes the record token
-// as a PARAMETER rather than using the packet's (see its comment), but as a closure it
-// could still capture the packet's transaction, and passing the wrong token remains
-// uncovered by any test. Closing that needs a fixture that forces the cancellation
-// tombstone to fall back to a record save AND can observe the consumer delete ordered
-// against the verdict's durability, which needs a seam the harness does not have.
+// commitUnsub runs from the RESOLUTION at all and releases what it owns. The token is
+// guarded by TestMQTTUnsubCommitResolverTokenRealRoute, which drives that fallback on both
+// release arms.
 func TestMQTTUnsubCommitReleasesUnderTheResolverToken(t *testing.T) {
 	o := testMQTTDefaultOptions()
 	s := testMQTTRunServer(t, o)
