@@ -1003,20 +1003,28 @@ func TestMQTTInboundPipeRegistrationsAndJoin(t *testing.T) {
 		}
 	})
 	t.Run("a store abandoned at shutdown releases its registration", func(t *testing.T) {
-		o := testMQTTDefaultOptionsV5()
-		// Long enough that the quit arm, not the timeout, ends the wait however long the
-		// shutdown takes under -race.
-		o.MQTT.JSAPITimeout = 25 * time.Second // below the delayed-Will claim lease (30 s)
-		s := testMQTTRunServer(t, o)
+		s := testMQTTRunServer(t, testMQTTDefaultOptionsV5())
 		asm := asmOf(t, s)
-		drop := func(string, []byte) bool { return true }
+		// Only this store goes unanswered. The background loops are already issuing requests,
+		// and one swallowed here would hold shutdown (the Will claim loop's scan, which Phase 2
+		// waits for) until its own timeout, past the quit this subtest is about.
+		subject := mqttStreamSubjectPrefix + "pipe.quit"
+		drop := func(subj string, _ []byte) bool { return subj == subject }
 		asm.jsa.testDropRequest.Store(&drop)
 		t.Cleanup(func() { asm.jsa.testDropRequest.Store(nil) })
-		p := asm.jsa.submitStoreMsg(mqttStreamSubjectPrefix+"pipe.quit", 0, []byte("x"))
+		p := asm.jsa.submitStoreMsg(subject, 0, []byte("x"))
 		asm.jsa.testDropRequest.Store(nil)
+		// Its wait is a failure watchdog far beyond a healthy shutdown, so within it the quit arm
+		// is its only exit: shutdown's own requests run on the default timeout and cannot tie it.
+		p.wait = 2 * time.Minute
 		got := inboundAwaitAsync(&p)
+		done := s.BeginShutdown()
+		err := <-got
+		// The embedded server is released only once every phase has run, and before any
+		// assertion can end the test with the lifecycle still using it.
+		<-done
 		testMQTTShutdownServer(s)
-		if err := <-got; !errors.Is(err, ErrServerNotRunning) {
+		if !errors.Is(err, ErrServerNotRunning) {
 			t.Fatalf("await returned %v at shutdown, want ErrServerNotRunning", err)
 		}
 		if _, ok := asm.jsa.replies.Load(p.reply); ok {

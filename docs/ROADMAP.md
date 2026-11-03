@@ -1578,9 +1578,11 @@ them in order where a later lint change depends on an earlier cleanup.
   Done 2026-11-03 ([issue #165](https://github.com/nberlee/mqtt-nats-broker/issues/165),
   [issue #169](https://github.com/nberlee/mqtt-nats-broker/issues/169)).
 
-- [ ] Trace why `TestMQTTInboundPipeRegistrationsAndJoin`'s shutdown-abandoned store
-  intermittently times out instead of returning `ErrServerNotRunning`; seen once under load
-  ([issue #168](https://github.com/nberlee/mqtt-nats-broker/issues/168)).
+- [x] `TestMQTTInboundPipeRegistrationsAndJoin`'s shutdown-abandoned store was a fixture:
+  its drop seam swallowed every request, so a Will claim scan caught in the window held
+  shutdown past the store's own timeout. The seam now drops only that store, whose wait
+  outlasts a healthy shutdown, and the server is released only after shutdown completes.
+  Done 2026-11-03 ([issue #168](https://github.com/nberlee/mqtt-nats-broker/issues/168)).
 
 ### NATS platform follow-ups
 
