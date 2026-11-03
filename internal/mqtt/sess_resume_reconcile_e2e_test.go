@@ -179,7 +179,9 @@ func TestMQTTReconcileResumeAfterReap(t *testing.T) {
 			c, _ := testReconcileSubscribe(t, o, cid, topic, qos)
 			defer c.Close()
 			oldDur := testReconcileConsDur(t, s, cid, sid)
+			takeovers := testReconcileCountTakeovers(t, s, cid)
 			c.Close()
+			testReconcileClientGone(t, s, cid)
 
 			asm := testMQTTGetGlobalASM(t, s)
 			testReconcileDeleteConsumer(t, asm, oldDur)
@@ -187,6 +189,7 @@ func TestMQTTReconcileResumeAfterReap(t *testing.T) {
 			c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 			defer c2.Close()
 			testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+			testReconcileExpectNoTakeover(t, takeovers, cid)
 			// Fence: the CONNACK's arrival does not order this read against the
 			// resume tail still running behind it.
 			testMQTTFlush(t, c2, nil, r2)
@@ -298,7 +301,9 @@ func TestMQTTReconcileMultiLevelCompanion(t *testing.T) {
 	mainSid, fwcSid := "foo.>", "foo"+mqttMultiLevelSidSuffix
 	mainDur := testReconcileConsDur(t, s, cid, mainSid)
 	fwcDur := testReconcileConsDur(t, s, cid, fwcSid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, fwcDur)
@@ -306,6 +311,7 @@ func TestMQTTReconcileMultiLevelCompanion(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 
 	// Only the companion was repaired; the main consumer was verified in place.
@@ -366,13 +372,16 @@ func TestMQTTReconcileChargeAccounting(t *testing.T) {
 		c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 		oldDur := testReconcileConsDur(t, s, cid, sid)
 		assertCharges(t, s, cid, oldDur, cap)
+		takeovers := testReconcileCountTakeovers(t, s, cid)
 		c.Close()
+		testReconcileClientGone(t, s, cid)
 
 		testReconcileDeleteConsumer(t, testMQTTGetGlobalASM(t, s), oldDur)
 
 		c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 		defer c2.Close()
 		testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+		testReconcileExpectNoTakeover(t, takeovers, cid)
 		testMQTTFlush(t, c2, nil, r2)
 
 		// The stale charge is gone WITH its key; the replacement holds exactly
@@ -427,7 +436,9 @@ func TestMQTTReconcileChargeAccounting(t *testing.T) {
 		const cid, topic, sid = "charge-undo", "charge/undo", "charge.undo"
 		c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 		oldDur := testReconcileConsDur(t, s, cid, sid)
+		takeovers := testReconcileCountTakeovers(t, s, cid)
 		c.Close()
+		testReconcileClientGone(t, s, cid)
 
 		asm := testMQTTGetGlobalASM(t, s)
 		testReconcileDeleteConsumer(t, asm, oldDur)
@@ -446,7 +457,7 @@ func TestMQTTReconcileChargeAccounting(t *testing.T) {
 			asm.mu.Unlock()
 		}()
 
-		// The CONNECT is REFUSED: a failure CONNACK, then the close.
+		// The CONNECT is REFUSED: a 3.1.1 connection is closed with no CONNACK.
 		testReconcileRefusedConnect(t, o, cid)
 
 		// The undo restored the old (absent) entry UNCHARGED and permanently
@@ -479,6 +490,7 @@ func TestMQTTReconcileChargeAccounting(t *testing.T) {
 		c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 		defer c3.Close()
 		testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+		testReconcileExpectNoTakeover(t, takeovers, cid)
 		testReconcileQoS1Publish(t, o, topic, []byte("repaired"))
 		testReconcileExpectQoS1(t, c3, r3, topic, []byte("repaired"))
 	})
@@ -592,7 +604,9 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 	}
 	// N: the stream sequence the register names.
 	regSeq := held.sseq
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, oldDur)
@@ -634,6 +648,7 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 		return nil
 	})
 	c2.Close()
+	testReconcileClientGone(t, s, cid)
 
 	// Second resume: the register still names X, X is still absent, so the
 	// verdict stays LOST and the identifier stays reserved. A same-name mutant
@@ -641,6 +656,7 @@ func TestMQTTReconcileRegisterIdentityInvariant(t *testing.T) {
 	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c3.Close()
 	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	sess = testMQTTResidentSession(t, s, cid)
 	sess.mu.Lock()
 	_, reserved := sess.pendingPublish[heldPI]
@@ -768,7 +784,9 @@ func TestMQTTReconcileSubscribeBeforeCreateAndInPlaceAdoption(t *testing.T) {
 	const cid, topic, sid = "order-pin", "order/pin", "order.pin"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, oldDur)
@@ -817,6 +835,7 @@ func TestMQTTReconcileSubscribeBeforeCreateAndInPlaceAdoption(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 
 	ob := obs.Load()
@@ -887,7 +906,9 @@ func TestMQTTReconcileInterestHeldBeforeLookup(t *testing.T) {
 	const cid, topic, sid = "hold-lookup", "hold/lookup", "hold.lookup"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	dur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	// The hook: sleep well past the threshold, then answer "present" — the
 	// answer a lookup that raced the reaper would have produced.
@@ -914,6 +935,7 @@ func TestMQTTReconcileInterestHeldBeforeLookup(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 
 	// The phase's interest carried the consumer through the sleep: same durable,
@@ -996,12 +1018,15 @@ func TestMQTTReconcileAdoptedDrainRepairedAtNextConnect(t *testing.T) {
 	}
 	testMQTTPublish(t, pc, pr, 1, false, false, "t9/a", 2, []byte("dead-entry"))
 	testMQTTExpectNothing(t, r)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	// The next CONNECT repairs the adopted entry...
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 	newDurA := testReconcileConsDur(t, s, cid, "t9.a")
 	if newDurA == durA {
@@ -1043,7 +1068,9 @@ func TestMQTTReconcileReapGapNotReplayed(t *testing.T) {
 	const cid, topic, sid = "gap-a", "gap/t", "gap.t"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	// The overlap: another persistent subscriber holds interest in the same
 	// subject, so the gap message is retained by ITS consumer.
@@ -1060,6 +1087,7 @@ func TestMQTTReconcileReapGapNotReplayed(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 
 	// The gap message is NOT replayed to the repaired subscription...
 	testMQTTExpectNothing(t, r2)
@@ -1118,6 +1146,13 @@ func testReconcileReadConnAck(t testing.TB, c net.Conn, sessp bool) *mqttReader 
 // torn down — the readLoop runs mqttHandleClosedClient BEFORE closeConnection
 // deregisters the client, so "gone from s.clients" fences the close
 // bookkeeping the assertions are about.
+//
+// It is also what makes the next CONNECT for cid a RESUME. A client-side Close
+// is a FIN the broker has not necessarily read: a CONNECT processed first finds
+// the old connection still attached and takes it over [MQTT-3.1.4-2], which is
+// a different path from the detached resume these tests exercise, and which
+// jails cid for mqttSessJailDur — a further CONNECT inside that window, before
+// the taker's own teardown clears the entry, is closed with no CONNACK.
 func testReconcileClientGone(t testing.TB, s *Server, cid string) {
 	t.Helper()
 	checkFor(t, 5*time.Second, 15*time.Millisecond, func() error {
@@ -1133,6 +1168,34 @@ func testReconcileClientGone(t testing.TB, s *Server, cid string) {
 		}
 		return nil
 	})
+}
+
+// testReconcileCountTakeovers counts the CONNECTs on s that took over a
+// still-attached connection for cid. A test whose reconnects are meant to be
+// resumes asserts the count is zero with testReconcileExpectNoTakeover, so a
+// missing close fence fails as the false premise it is rather than as a jailed
+// CONNECT much later. The seam is instance-scoped, so install it again after a
+// restart. The hook only counts: Shutdown can return before the lifecycle
+// ends, and a callback that ran after the test must not touch it.
+func testReconcileCountTakeovers(t testing.TB, s *Server, cid string) *atomic.Int32 {
+	t.Helper()
+	n := new(atomic.Int32)
+	testMQTTSetTakeoverDiscardSeam(testMQTTGetGlobalASM(t, s), func(clientID string) {
+		if clientID == cid {
+			n.Add(1)
+		}
+	})
+	return n
+}
+
+// testReconcileExpectNoTakeover fails the test if any CONNECT for cid was a
+// takeover. Call it after the last CONNACK for cid has been read: the seam runs
+// inside CONNECT processing, before the CONNACK, so the count is final there.
+func testReconcileExpectNoTakeover(t testing.TB, takeovers *atomic.Int32, cid string) {
+	t.Helper()
+	if n := takeovers.Load(); n != 0 {
+		t.Fatalf("%d CONNECT(s) for %q took over a still-attached connection; the reconnect under test was meant to be a resume", n, cid)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,7 +1220,9 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 	const cid, topic, sid = "park7", "park/7", "park.7"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 	testReconcileDeleteConsumer(t, testMQTTGetGlobalASM(t, s), oldDur)
 
 	parked := make(chan struct{})
@@ -1206,6 +1271,7 @@ func TestMQTTReconcileNothingBeforeConnAck(t *testing.T) {
 
 	unpark()
 	r := testReconcileReadConnAck(t, conn, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	// The delivery pushed while the save was parked WAITED on the restore verdict, so it
 	// arrives now rather than after AckWait, and (never transmitted before) at DUP = 0.
 	pi := testMQTTCheckPubMsgNoAck(t, conn, r, topic, mqttPubQos1, []byte("while-parked"))
@@ -1427,7 +1493,9 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	const cid, topic, sid = "t8-10164", "t8/contend", "t8.contend"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, oldDur)
 
@@ -1491,6 +1559,7 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 
 	mu.Lock()
@@ -1557,7 +1626,9 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	}
 	wantTmaxack := sess.tmaxack
 	sess.mu.Unlock()
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 
 	asm := testMQTTGetGlobalASM(t, s)
 	// The durable is gone AND unverifiable: exactly the state in which a repair
@@ -1627,6 +1698,7 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testReconcileQoS1Publish(t, o, topic, []byte("recovered"))
 	testReconcileExpectQoS1(t, c2, r2, topic, []byte("recovered"))
 }
@@ -1648,7 +1720,9 @@ func TestMQTTReconcileAmbiguousRepairSaveLanded(t *testing.T) {
 	const cid, topic, sid = "t12-landed", "t12/landed", "t12.landed"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, oldDur)
 
@@ -1697,6 +1771,7 @@ func TestMQTTReconcileAmbiguousRepairSaveLanded(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 	if got := testReconcileConsDur(t, s, cid, sid); got != keptDur {
 		t.Fatalf("the landed replacement %q was replaced again by %q", keptDur, got)
@@ -1725,7 +1800,9 @@ func TestMQTTReconcileAmbiguousRepairSaveIsSettledForward(t *testing.T) {
 	const cid, topic, sid = "t12-lost", "t12/lost", "t12.lost"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, oldDur)
 
@@ -1787,6 +1864,7 @@ func TestMQTTReconcileAmbiguousRepairSaveIsSettledForward(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c2, nil, r2)
 
 	settled := testReconcileConsDur(t, s, cid, sid)
@@ -2307,13 +2385,16 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 	testMQTTFlush(t, c2, nil, r2)
 	testReconcileQoS1Publish(t, o, staleTopic, []byte("dead"))
 	testMQTTExpectNothing(t, r2)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c2.Close()
+	testReconcileClientGone(t, s, cid)
 
 	// The next CONNECT reconciles it (the filter is in Subs now): absent ->
 	// repaired -> delivering.
 	c3, r3 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c3.Close()
 	testMQTTCheckConnAck(t, r3, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	testMQTTFlush(t, c3, nil, r3)
 	newDur := testReconcileConsDur(t, s, cid, staleSid)
 	if newDur == idHash+"_stalenonexistent" {
@@ -2347,7 +2428,7 @@ func TestMQTTReconcileStaleUnmatchedConsEntryResidual(t *testing.T) {
 // re-SUBSCRIBE matching a stale unmatched Cons entry — is untouched by issue #54 and
 // keeps its own statement in docs/CONFORMANCE.md.
 func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the restore-gate seam fenced below is package-global.
 	o := testMQTTDefaultOptions()
 	// Comfortably longer than the whole test: nothing here waits on an AckWait
 	// redelivery, and a short one would only add DUP copies of the backlog message
@@ -2363,8 +2444,28 @@ func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
 	dur := sess.cons[sid].Durable
 	pubRelDur := sess.pubRelConsumer.Durable
 	sess.mu.Unlock()
+	// The client leaves s.clients BEFORE its NATS subscriptions are unsubscribed, and a push
+	// still queued on one at that point is discarded without a callback, so it would wait out
+	// AckWait. The backlog is published only once JetStream holds no interest for the durable,
+	// and "no interest" is read only after JetStream has registered the connection's interest:
+	// the consumer's initial unbound state would otherwise satisfy the wait.
+	pushBound := func(want bool) {
+		t.Helper()
+		checkFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+			ci, err := testMQTTGetGlobalASM(t, s).jsa.lookupConsumer(mqttStreamName, dur)
+			if err != nil || ci == nil {
+				return fmt.Errorf("lookupConsumer %q: %v", dur, err)
+			}
+			if ci.PushBound != want {
+				return fmt.Errorf("durable %q PushBound = %v, want %v", dur, ci.PushBound, want)
+			}
+			return nil
+		})
+	}
+	pushBound(true)
 	c.Close()
 	testReconcileClientGone(t, s, cid)
+	pushBound(false)
 
 	// A message published while the client is away is held by the durable, so the
 	// resume that finally completes owes it as a first transmission.
@@ -2381,11 +2482,56 @@ func TestMQTTReconcileSkippedFilterRefusesTheResume(t *testing.T) {
 	sess.tmaxack = mqttMaxAckTotalLimit
 	sess.mu.Unlock()
 
+	// THE HELD DELIVERY IS PARKED AT THE RESTORE GATE BEFORE THE RESTORE FAILS. The verified
+	// durable pushes it once reconciliation installs its delivery interest, and the refusal's
+	// sweep unsubscribes that interest; a push still queued in the NATS client then is discarded
+	// without a callback, so nothing records it and it waits out AckWait (docs/CONFORMANCE.md).
+	// So the reconciliation lookup, which runs after the interest is installed and before the
+	// PUBREL setup fails, waits bounded until a delivery of this session is about to wait on a gate.
+	parked := make(chan struct{})
+	var parkOnce sync.Once
+	defer setMQTTTestGateAboutToWait(func(gs *mqttSession) {
+		if gs.id == cid {
+			parkOnce.Do(func() { close(parked) })
+		}
+	})()
+	var sawParked atomic.Bool
+	asm.mu.Lock()
+	asm.testResumeReconcileLookup = func(durs []string) ([]*ConsumerInfo, []bool, error) {
+		select {
+		case <-parked:
+			sawParked.Store(true)
+		case <-time.After(10 * time.Second):
+		}
+		return asm.jsa.lookupConsumersMulti(mqttStreamName, durs)
+	}
+	asm.mu.Unlock()
+
 	// REFUSED: no SUCCESS CONNACK and no DISCONNECT. The client is refused rather
 	// than told its session is present and then served nothing. (This fixture uses the
 	// 3.1.1 helper, which sees the bare close; a v5 client is additionally told why.)
 	testReconcileRefusedConnect(t, o, cid)
 	testReconcileClientGone(t, s, cid)
+	asm.mu.Lock()
+	asm.testResumeReconcileLookup = nil
+	asm.mu.Unlock()
+	if !sawParked.Load() {
+		t.Fatal("no delivery was parked at the restore gate before the restore failed")
+	}
+	// The marker, waited for rather than sampled: the refusal wakes the parked delivery to
+	// record itself, and a reconnect that binds before it does leaves the woken callback stale,
+	// so nothing records it and the message waits out AckWait (docs/CONFORMANCE.md). The next
+	// CONNECT must not race it.
+	checkFor(t, 15*time.Second, 25*time.Millisecond, func() error {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		for k := range sess.deferred {
+			if k.jsDur == dur {
+				return nil
+			}
+		}
+		return fmt.Errorf("the refusal did not record its withheld delivery for %q", dur)
+	})
 
 	// The verified consumer is untouched. The sweep withdraws interest; it never
 	// owns the durable, and a refusal must not turn into a deletion.
@@ -4155,7 +4301,9 @@ func TestMQTTReconcileRepairClaimSurvivesContention(t *testing.T) {
 	const cid, topic, sid = "repair-contended", "repair/contended", "repair.contended"
 	c, _ := testReconcileSubscribe(t, o, cid, topic, 1)
 	oldDur := testReconcileConsDur(t, s, cid, sid)
+	takeovers := testReconcileCountTakeovers(t, s, cid)
 	c.Close()
+	testReconcileClientGone(t, s, cid)
 	asm := testMQTTGetGlobalASM(t, s)
 	testReconcileDeleteConsumer(t, asm, oldDur)
 
@@ -4183,6 +4331,7 @@ func TestMQTTReconcileRepairClaimSurvivesContention(t *testing.T) {
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
 	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	testReconcileExpectNoTakeover(t, takeovers, cid)
 	if contended.Load() != 1 || attempts.Load() < 2 {
 		t.Fatalf("fixture: %d claim attempt(s), contended %v: the contention never cost an attempt",
 			attempts.Load(), contended.Load() == 1)

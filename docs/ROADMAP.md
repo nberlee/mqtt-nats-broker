@@ -1564,8 +1564,11 @@ them in order where a later lint change depends on an earlier cleanup.
 - [x] Repair three pre-existing intermittent reds: two fixture repairs, and foreground
   priority held by one coordinator per client identifier. Done 2026-11-01.
 
-- [ ] Trace why `TestMQTTReconcileRegisterIdentityInvariant` intermittently loses its third
-  CONNECT ("connection closed"); reproduced on HEAD under load
+- [x] `TestMQTTReconcileRegisterIdentityInvariant`'s lost third CONNECT was a fixture: an
+  unfenced close let the next CONNECT take over, and the flapper jail closed the one
+  after. Every plain close before a same-ID reconnect in that file is now fenced, and the
+  tests that lacked the fence also fail on a takeover; the refused-resume test there waits
+  for its withheld delivery before reconnecting. Done 2026-11-03
   ([issue #164](https://github.com/nberlee/mqtt-nats-broker/issues/164)).
 
 - [ ] Trace why `TestWillPendingArmAbortsThePassOnATransientFactOutage` intermittently finds

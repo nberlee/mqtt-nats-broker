@@ -3150,6 +3150,11 @@ Residuals:
     DUP is derived from the durable unsent marker at one site, so a stale woken callback
     cannot make a first transmission carry it
     ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)).
+    The same delay follows without any rebind when the push never reaches a callback:
+    the refusal's sweep unsubscribes the reconciliation subscription it did not adopt, and
+    the NATS client discards a delivery still queued on that subscription without
+    dispatching it. The durable survives and the message stays owed, but nothing was
+    withheld to record, so it too waits for AckWait.
     The lost prompt NAK and the AckWait delay are
     [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s
     own residual; closing it needs a real callback-admission boundary, which is not built.
