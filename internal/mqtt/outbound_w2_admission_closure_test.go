@@ -54,7 +54,7 @@ func testNewAdmitLosesToClosureRig(t *testing.T, clientID string) *testAdmitLose
 	}
 	e.c.nc, e.c.rawConn = tc, tc
 	e.sess.mu.Lock()
-	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1))
+	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1), mqttOfferOrigin{})
 	gen := e.sess.gen
 	e.sess.mu.Unlock()
 	if pi == 0 {

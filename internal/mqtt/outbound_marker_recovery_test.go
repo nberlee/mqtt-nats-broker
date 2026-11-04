@@ -35,7 +35,7 @@ func TestConsult75UnconfirmedMarkerTerminalHandoff(t *testing.T) {
 			}
 			e.asm.mu.Unlock()
 			e.sess.mu.Lock()
-			pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+			pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 			e.sess.mu.Unlock()
 			if pi == 0 || !isNew {
 				t.Fatalf("allocate: pi=%d isNew=%v", pi, isNew)

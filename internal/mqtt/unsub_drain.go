@@ -896,7 +896,7 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 	for k, ackSubject := range cancelled {
 		// An empty subject records nothing: there is nothing to NAK, and it must never
 		// reach sendMsg.
-		sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, ackSubject)
+		sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, ackSubject, mqttOfferOrigin{})
 	}
 	if len(d.seqs) == 0 {
 		// Nothing provably started. Same distinction as the empty-mapping return above: if
@@ -1114,7 +1114,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 		// The withheld markers, so a freed slot can NAK a delivery that does eventually go
 		// out forward. Same rule and same reason as staging's.
 		for k, ackSubject := range cancelled {
-			sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, ackSubject)
+			sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, ackSubject, mqttOfferOrigin{})
 		}
 	}
 	return withdrawn
@@ -2499,7 +2499,7 @@ func (sess *mqttSession) restoreDrains(c *client, skip map[string]bool) {
 		// it does. See mqttSub.filterKey.
 		_, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, mqttSidFilterKey(sid),
 			isMQTTReservedSubscription(d.subject), d.qos, d.noLocal, d.rap, false, d.subID,
-			d.cc.Durable, mqttDeliverMsgCbQoS12)
+			d.cc.Durable, mqttDeliverMsgCbQoS12, true)
 		if err != nil {
 			// Roll the registration back rather than leaving a drain nothing
 			// delivers for: the next resume retries.
@@ -3916,7 +3916,7 @@ func (sess *mqttSession) reclaimDrainDeliveryLocked(c *client, subject, sid stri
 	// below and decides No Local from then on. See mqttSub.filterKey.
 	if _, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, mqttSidFilterKey(sid),
 		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID,
-		d.cc.Durable, mqttDeliverMsgCbQoS12); err != nil {
+		d.cc.Durable, mqttDeliverMsgCbQoS12, true); err != nil {
 		// Nothing to roll back: no map was touched, and processSub unsubscribes its own
 		// NATS interest before c.subs[sid] is assigned, so no subscription survives.
 		return nil, err
@@ -4167,10 +4167,21 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 			continue
 		}
 
+		// A PRESERVATION, not a decision, so the ownership filter the marker readers apply
+		// (recordReferencedDurablesLocked) is deliberately not applied: stageDrain drops what is
+		// not re-installed, and filtering here would turn a reader into a deleter. The durable
+		// is the membership's own consumer, which the just-applied QoS 0 membership still
+		// references, so the filter would pass every marker anyway. A marker's late tag rides
+		// with it, so a re-install does not forget that its origin's drain owes the NAK
+		// (handOffLateMarkersLocked).
 		marks := make(map[mqttDeferredKey]string)
+		lateTags := make(map[mqttDeferredKey]mqttLateMarker)
 		for k, v := range sess.deferred {
 			if k.jsDur == dd.cc.Durable {
 				marks[k] = v
+				if t, ok := sess.deferredLate[k]; ok {
+					lateTags[k] = t
+				}
 			}
 		}
 		// c.mu inside sess.mu is the order closeSharedDeliveryLocked already uses. The
@@ -4183,7 +4194,14 @@ func (sess *mqttSession) convertDowngradeCandidatesLocked(c *client, dels []*mqt
 		staged := sess.stageDrain(dd.sid, dd.cc, sub, mqttLicenceOf(c))
 
 		for k, v := range marks {
-			sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, v)
+			if sess.recordWithheldAttemptLocked(k.jsDur, k.sseq, v, mqttOfferOrigin{}) == mqttWithheldRecorded {
+				if t, ok := lateTags[k]; ok {
+					if sess.deferredLate == nil {
+						sess.deferredLate = make(map[mqttDeferredKey]mqttLateMarker)
+					}
+					sess.deferredLate[k] = t
+				}
+			}
 		}
 		if !staged {
 			// Nothing provably started, or a held drain owns this sid. The ordinary

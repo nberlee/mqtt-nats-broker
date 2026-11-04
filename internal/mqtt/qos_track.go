@@ -107,9 +107,15 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 		key        mqttDeferredKey
 		ackSubject string
 	}
+	// Only markers of durables the record references (markerOwnedLocked). The others are
+	// skipped, and kept while their membership may only be tentatively removed: a definite
+	// save failure restoring it must find them.
+	own := sess.markerOwnershipLocked()
 	all := make([]deferredNak, 0, len(sess.deferred))
 	for k, subj := range sess.deferred {
-		all = append(all, deferredNak{k, subj})
+		if sess.markerOwnedLocked(&own, k) {
+			all = append(all, deferredNak{k, subj})
+		}
 	}
 	slices.SortFunc(all, func(a, b deferredNak) int {
 		switch {
@@ -148,19 +154,59 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 // The latest subject overwrites an earlier one; JetStream honours a NAK on any delivery of a
 // still-pending sequence, so either would do, and the latest is the attempt it re-offers next.
 //
-// Reports whether a marker was written. Lock held on entry.
-func (sess *mqttSession) recordWithheldAttemptLocked(dur string, sseq uint64, reply string) bool {
+// THE OFFER'S ORIGIN DECIDES WHO RE-OFFERS IT once a successor has read the markers (issue
+// #170). origin names the subscription and connection the offer reached; the zero origin is
+// the session's own bookkeeping (a cancellation, a marker re-installed around a staging) and
+// is treated as the session's own connection. A marker is read by the binding connection's
+// resume pass (resendPendingRedelivery), which records that read as sess.resumeReadBy. An
+// offer of ANOTHER connection decided after that read would wait for a freed slot or AckWait,
+// so:
+//
+//   - its subscription's drain ISSUED (the UNSUB is on the service connection ahead of any NAK
+//     published after this section), the durable one the session's record references
+//     (recordReferencesDurableLocked), and this source not yet late-NAKed under this cutoff:
+//     nothing is recorded and the caller owes the NAK, published after it unlocks;
+//   - otherwise the marker is recorded and tagged with its origin subscription, so the drain
+//     that subscription issues later NAKs it (handOffLateMarkersLocked).
+//
+// At most one late NAK per source per cutoff (sess.lateNAKed): a second decision for the same
+// source records a marker, which bounds what a reconnect re-routing the NAK back to a still
+// draining predecessor can repeat. Recording itself stays permissive; the readers skip a
+// marker whose durable the record no longer references.
+//
+// Lock held on entry.
+func (sess *mqttSession) recordWithheldAttemptLocked(dur string, sseq uint64, reply string, origin mqttOfferOrigin) mqttWithheldOutcome {
 	if dur == _EMPTY_ || sseq == 0 || reply == _EMPTY_ {
-		return false
+		return sess.withheldDecidedLocked(dur, sseq, origin, mqttWithheldRefused)
 	}
 	if pi, _ := sess.cpending.lookup(dur, sseq); pi != 0 {
-		return false
+		return sess.withheldDecidedLocked(dur, sseq, origin, mqttWithheldRefused)
+	}
+	key := mqttDeferredKey{dur, sseq}
+	// The zero origin (bookkeeping) carries no subscription, so it is never NAKed nor tagged.
+	late := origin.cc != sess.c && sess.resumeCutoffPassedLocked()
+	if late && origin.sub != nil && origin.sub.mqtt != nil && origin.sub.mqtt.drainIssued {
+		if _, spent := sess.lateNAKed[key]; !spent && sess.recordReferencesDurableLocked(dur) {
+			if sess.lateNAKed == nil {
+				sess.lateNAKed = make(map[mqttDeferredKey]struct{})
+			}
+			sess.lateNAKed[key] = struct{}{}
+			return sess.withheldDecidedLocked(dur, sseq, origin, mqttWithheldNAKOwed)
+		}
 	}
 	if sess.deferred == nil {
 		sess.deferred = make(map[mqttDeferredKey]string)
 	}
-	sess.deferred[mqttDeferredKey{dur, sseq}] = reply
-	return true
+	sess.deferred[key] = reply
+	if late && origin.sub != nil {
+		if sess.deferredLate == nil {
+			sess.deferredLate = make(map[mqttDeferredKey]mqttLateMarker)
+		}
+		sess.deferredLate[key] = mqttLateMarker{sub: origin.sub, readBy: sess.c, reply: reply}
+	} else {
+		delete(sess.deferredLate, key)
+	}
+	return sess.withheldDecidedLocked(dur, sseq, origin, mqttWithheldRecorded)
 }
 
 // mapSourceLocked maps (dur, sseq) to pi in cpending, and is the ONLY writer of that map. The
@@ -232,7 +278,7 @@ func (sess *mqttSession) trackPublishRetained(qos byte) uint16 {
 // returned marked regPending and MUST NOT be transmitted until
 // storeInflightRegister has confirmed it — the caller either confirms it or removes
 // it. See inflight_register.go.
-func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint16, isNew bool) {
+func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string, origin mqttOfferOrigin) (packetID uint16, isNew bool) {
 	var pi uint16
 
 	if jsAckSubject == _EMPTY_ || jsDur == _EMPTY_ {
@@ -340,7 +386,9 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			// At the in-flight cap: withhold the message and remember its ack
 			// subject so a freed slot can NAK it for prompt redelivery
 			// (deferredNaksLocked); AckWait remains the fallback. Spec5 [4.9].
-			sess.recordWithheldAttemptLocked(jsDur, sseq, jsAckSubject)
+			// The origin is the session's own connection (the caller checked sess.c == cc under
+			// this lock), so this always records: capacity withholding never NAKs.
+			sess.recordWithheldAttemptLocked(jsDur, sseq, jsAckSubject, origin)
 			return 0, false
 		}
 
@@ -372,7 +420,7 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string) (packetID uint
 			// the source works there: the cancellation frees the one and the other is
 			// re-offered. The fence records what custody looked like as the identifier was
 			// taken (markerOpaqueEligibleLocked).
-			entry = mqttNewAllocation(jsDur, sseq, jsAckSubject, mqttNewInflightNonce(), sess.allocationFenceLocked())
+			entry = mqttNewAllocation(jsDur, sseq, jsAckSubject, mqttNewInflightNonce(), sess.allocationFenceLocked(), origin)
 		}
 		if !sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectEmpty(), entry) {
 			return 0, false
@@ -902,11 +950,21 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// nothing is NAK'd twice or budgeted twice. It does not protect DUP: since issue #76 DUP
 	// is the entry's transmitted bit, so a first transmission carries DUP=0 whatever the
 	// delivery count.
+	//
+	// THIS READ IS THE RESUME CUTOFF (issue #170): a marker another connection's offer writes
+	// from here on is not in this snapshot, so the writer NAKs it, or tags it for its
+	// subscription's drain to NAK (recordWithheldAttemptLocked). Which of these markers is
+	// still the session's to NAK is decided at the final validation below, under the lock that
+	// sends them.
 	deferredNaks := make([]pendingNak, 0, len(sess.deferred))
 	for k, subj := range sess.deferred {
 		deferredNaks = append(deferredNaks, pendingNak{0, k.sseq, subj, k.jsDur})
 	}
+	sess.setResumeCutoffLocked(c)
 	sess.mu.Unlock()
+	if h := sess.drainAtDetachHooks(); h != nil && h.cutoff != nil {
+		h.cutoff(c)
+	}
 
 	// Reconcile against the messages stream: a QoS1/2 message whose Message Expiry
 	// TTL reaped it while it was delivered-but-unacked is gone from the stream, so it
@@ -1084,11 +1142,19 @@ func (sess *mqttSession) resendPendingRedelivery(c *client, resumePubs, resumeRe
 	// its marker then. A snapshot surviving that mapping would NAK a sequence that now has an
 	// exchange, from the deferred allowance, and leave a still-withheld one to AckWait (issue
 	// #162). The live subject is taken, which is the latest withheld attempt.
+	// And only a marker whose durable the record references (markerOwnedLocked), decided
+	// here, under the lock the NAK set is taken in: a predecessor's offer decided after the
+	// session stopped owning its durable, before this pass or while its lock was released, is
+	// skipped, and deleted once that absence is settled.
 	liveDeferred := deferredNaks[:0]
-	for _, n := range deferredNaks {
-		if subj, ok := sess.deferred[mqttDeferredKey{n.jsDur, n.sseq}]; ok {
-			n.ackSubject = subj
-			liveDeferred = append(liveDeferred, n)
+	if len(deferredNaks) > 0 {
+		own := sess.markerOwnershipLocked()
+		for _, n := range deferredNaks {
+			key := mqttDeferredKey{n.jsDur, n.sseq}
+			if subj, ok := sess.deferred[key]; ok && sess.markerOwnedLocked(&own, key) {
+				n.ackSubject = subj
+				liveDeferred = append(liveDeferred, n)
+			}
 		}
 	}
 	deferredNaks = liveDeferred

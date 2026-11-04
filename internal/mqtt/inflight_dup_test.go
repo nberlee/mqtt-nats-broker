@@ -1443,7 +1443,7 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	e.asm.testInflightMarkerLoad = func(string) (*StoredMsg, error) { return nil, errors.New("test: unreadable") }
 	e.asm.mu.Unlock()
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	nonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
@@ -1460,7 +1460,7 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	incomplete := e.sess.piSpaceIncomplete
 	_, mapped := e.sess.cpending[dur][sseq]
 	_, sendOK := e.sess.beginSendLocked(e.c, pi, dur, sseq)
-	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if !present || transmitted || !opaque || !incomplete || mapped || sendOK || rePI != 0 {
 		t.Fatalf("the marker-opaque reservation: present=%v transmitted=%v opaque=%v incomplete=%v mapped=%v sendOK=%v redelivery pi=%d",
@@ -1625,7 +1625,7 @@ func TestMQTTInflightSameDeliveryOccupantIsReplacedAsAPair(t *testing.T) {
 				t.Fatalf("persist B's record: %v", err)
 			}
 			sessB.mu.Lock()
-			piB, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+			piB, isNew := sessB.trackPublish(dur, testInflightAckSubject(dur, sseq, 2), mqttOfferOrigin{})
 			nonceB := _EMPTY_
 			if ack := sessB.pendingPublish[piB]; ack != nil {
 				nonceB = ack.regNonce
@@ -1819,7 +1819,7 @@ func TestMQTTInflightMarkerOpaqueEntryIsDeclinedEverywhere(t *testing.T) {
 	// at the fixture's pointer because the assertions below hold it.
 	*ack = *mqttNewMarkerOpaque(ack, ack.ev, ack.regSeq, ack.qos, ack.slot, true)
 	_, sendOK := e.sess.beginSendLocked(e.c, pi, dur, 900)
-	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 900, 2))
+	rePI, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 900, 2), mqttOfferOrigin{})
 	redeliverable := mqttPendingRedeliverable(ack)
 	e.sess.mu.Unlock()
 	if sendOK || rePI != 0 || redeliverable {
@@ -2164,7 +2164,7 @@ func TestMQTTInflightResumeReapRefusesAReplacedEntry(t *testing.T) {
 			t.Errorf("fixture: the candidate's custody must end with its exchange (lin %q)", lin)
 		}
 		e.sess.last_pi = pi - 1
-		got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, replacementSeq, 1))
+		got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, replacementSeq, 1), mqttOfferOrigin{})
 		if got != pi || !isNew {
 			t.Errorf("fixture: the replacement must reuse identifier %d, got %d isNew=%v", pi, got, isNew)
 		}

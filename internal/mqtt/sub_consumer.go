@@ -700,7 +700,7 @@ func (sess *mqttSession) processJSConsumer(c *client, tok recordTx, subject, sid
 		sess.chargeConsumerLocked(cc.Durable, charged)
 	}
 	sub, err := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, filterKey,
-		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID, cc.Durable, mqttDeliverMsgCbQoS12)
+		isMQTTReservedSubscription(subject), qos, noLocal, retainAsPublished, false, subID, cc.Durable, mqttDeliverMsgCbQoS12, true)
 	sess.mu.Unlock()
 
 	if err != nil {
@@ -1055,7 +1055,7 @@ func (sess *mqttSession) processSharedJSConsumer(c *client, group, subject, sid 
 
 	sess.mu.Lock()
 	sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), []byte(queue), _EMPTY_, // No Local never applies to a shared subscription [MQTT-3.8.3-4]
-		isMQTTReservedSubscription(subject), qos, false, retainAsPublished, true, subID, durable, mqttDeliverMsgCbQoS12)
+		isMQTTReservedSubscription(subject), qos, false, retainAsPublished, true, subID, durable, mqttDeliverMsgCbQoS12, false)
 	sess.mu.Unlock()
 	if err != nil {
 		c.Errorf("Unable to create subscription for shared JetStream consumer on %q: %v", subject, err)

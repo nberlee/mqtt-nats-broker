@@ -5762,12 +5762,15 @@ touches `sub.mqtt`:
   and the abort helper deliberately leaves `c.mqtt.sess` in place, so `sess.c`
   still names this connection. Waking the waiters is what lets a withheld QoS 1/2
   delivery record itself as withheld instead of waiting out its whole
-  bound — but that recording is **best-effort across a rebind, deliberately**. The
-  marker is scoped to the connection that withheld the delivery, and the refusal
-  returns and releases the ownership gate, so a reconnect can bind first and leave
-  the woken callback stale. The consequence is a **lost prompt NAK**, stated in
-  `docs/CONFORMANCE.md`. The race itself still stands; its DUP half does not follow from
-  it, because DUP derives from the durable unsent marker
+  bound. The refusal returns and releases the ownership gate, so a reconnect can bind
+  before a woken callback runs; that callback's offer is still the session's, and the
+  withheld-marker writer either records it for the successor's resume or NAKs it once the
+  refused connection's delivery subscription is drained ("Delivery subscriptions are
+  drained at detach"). A reconciliation subscription the refusal's cleanup unsubscribes
+  (`unsubscribePhase`, `sweepUnadoptedPhaseSubs`) is never drained, so its callback woken
+  after the successor's resume pass records a marker that waits for a freed slot, the next
+  resume or AckWait (`docs/CONFORMANCE.md`). The race itself still stands; its DUP half
+  does not follow from it, because DUP derives from the durable unsent marker
   ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), so a stale
   woken callback cannot make a first transmission carry DUP.
 
@@ -5779,7 +5782,7 @@ The four delivery callbacks, and why they differ:
 
 | Callback | Disposition while the verdict is armed and not opened |
 |---|---|
-| `mqttDeliverMsgCbQoS12` | **waits**, bounded by min(AckWait, `mqttPhaseGateWaitMax`); a withheld delivery is recorded — **when the connection that withheld it is still the session's**, which is best-effort across a rebind (above) — so a freed slot can NAK it forward; a re-offer of a sequence that already has an exchange records nothing, because that exchange owns its replay ("A withheld marker names an unmapped source"). The recording is shared with the post-verdict re-check arm (a connection that detached, or a subscription closed, after the verdict opened) through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
+| `mqttDeliverMsgCbQoS12` | **waits**, bounded by min(AckWait, `mqttPhaseGateWaitMax`); a withheld delivery is recorded, or NAKed by its writer when it reached a predecessor connection after the successor's resume read the markers ("Delivery subscriptions are drained at detach"), so a freed slot or the resume can NAK it forward; a re-offer of a sequence that already has an exchange records nothing, because that exchange owns its replay ("A withheld marker names an unmapped source"). The recording is shared with the post-verdict re-check arm (a connection that detached, or a subscription closed, after the verdict opened) through one helper, because both owe the client the same thing, and it is written only for a delivery still OWED (`!closed \|\| phaseOwned`), never for a durable being torn down |
 | `mqttDeliverMsgCbQoS0` | **drops.** QoS 0 has no redelivery, so parking a NATS delivery goroutine on an MQTT handshake would buy nothing |
 | `mqttDeliverPubRelCb` | **waits**, then disposes by WHY the wait ended. A refusal returns silently, so JetStream redelivers on its own schedule and nothing spins against a session with no client. A TIMEOUT **NAKs**: the bound is min(AckWait, cap), so with AckWait above the cap the wait ends long before any redelivery would, and a PUBREL carries no withheld marker — without the NAK an owed one sits unsent for the rest of that AckWait on a resume that SUCCEEDED. PUBREL carries no DUP ([MQTT-3.6.1-1] fixed-header flags are 0010), so nothing further is owed |
 | `mqttDeliverQ2AffineCb` | **waits**, then disposes by why the wait ended, exactly as PUBREL does above: silent on a refusal, **NAK** on a timeout. The NAK matters most for a copy that was materialized and never delivered — absent from the resume's pending snapshot, so nothing else re-drives it. No withheld bookkeeping: DUP is the entry's own `transmitted` bit, seeded on resume from the unsent marker ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), so a copy refused here before `trackPublish` writes no marker and its next offer is a first transmission. Waiting is what keeps the ordinary case out of it |
@@ -10298,8 +10301,10 @@ order. An offer is never held when nothing is queued behind it, so a delivery at
 processed by the callback that received it: there is no intentional coalescing delay. A
 re-offer of an offer still held is dropped and the held one keeps its position. A held
 offer is an unacknowledged JetStream delivery exactly like those still queued in nats.go:
-if the subscription stops (unsubscribe, a re-SUBSCRIBE replacing it, the connection
-closing) neither is processed and AckWait re-offers both. Shared subscriptions never hold.
+if the subscription is unsubscribed (an UNSUBSCRIBE, a re-SUBSCRIBE replacing it, a server
+shutdown) neither is processed and AckWait re-offers both. A connection that detaches DRAINS
+it instead, so both are processed and recorded or NAKed ("Delivery subscriptions are drained
+at detach"). Shared subscriptions never hold.
 
 **The whole flush runs under the callback's one lease**, inside the incarnation lease that
 callback acquired (`leasedHandler`), so a retirement of the connection (a takeover) waits
@@ -10508,6 +10513,84 @@ What a stop costs is a re-offer: the deliveries written before it are a prefix o
 flush in offer order, the rest come back by NAK or AckWait (on a clean start the session
 and its consumers are discarded), with the order a refused callback's re-offer already has
 ([issue #132](https://github.com/nberlee/mqtt-nats-broker/issues/132)).
+
+### Delivery subscriptions are drained at detach
+
+[issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170). A QoS 1/2 offer
+JetStream already routed to a connection that is detaching is owed to the session, not to
+the connection. Unsubscribing the delivery subscription discarded it: nats.go removes the
+subscription at once, dropping the offers queued for it and every offer the server routed
+before it processed the UNSUB, with no callback. JetStream counted each delivered, nothing
+in the broker recorded it, and the resume had nothing to NAK, so it waited for AckWait
+(`delivery_drain_at_detach.go`).
+
+**Which subscriptions.** The ordinary non-shared QoS 1/2 delivery subscription
+(`mqttDeliverMsgCbQoS12`): the ordinary install, the resume reconciliation install, and
+the two installs of an UNSUBSCRIBE drain's delivery subscription (a re-SUBSCRIBE can adopt
+one as ordinary membership in place). `processQOS12Sub` marks it (`drainAtDetach`) under
+the `sess.mu` its caller holds. Shared, session-affine QoS 2 and PUBREL deliveries keep
+the unsubscribe.
+
+**Drain, not unsubscribe.** `closeConnection` drains a marked subscription (nats.go writes
+the UNSUB, flushes, and keeps dispatching what the server routed before it). A takeover's
+successor drains the displaced live predecessor's marked subscriptions right after its
+bind (both bind writers), before the takeover tail and before restoring its own
+subscriptions, so the predecessor's queue is not left to the predecessor's own later
+close. A server shutdown unsubscribes, as before: a shutdown is not a resume. A
+subscription is drained at most once, in two states under `sess.mu`: `drainClaimed` before
+`Drain()` is called, `drainIssued` after it returned nil. Only issued licenses a NAK,
+because only then is the UNSUB already in the service connection's buffer ahead of it
+(late NAKs are published on the same service connection).
+
+**Who owns a drained offer.** A drained offer reaches the detached arm of the delivery
+callback, which never acks or transmits it; it goes to `recordWithheldAttemptLocked`, the
+only writer of `sess.deferred`, with its ORIGIN (subscription and connection). The
+allocation-abandon path passes the origin stored on the allocation (`mqttPending.origin`),
+never a routing lookup. After the existing refusals (a mapped sequence has an exchange
+that owns its replay):
+
+- **The resume cutoff.** `resendPendingRedelivery` sets `resumeReadBy` to its connection
+  in the `sess.mu` section in which it reads the markers. An offer whose origin is not the
+  session's bound connection, decided after that cutoff, from an origin whose drain is
+  issued, for a durable the record references, and not yet late-NAKed under this cutoff,
+  records nothing and is NAKed by the caller after unlocking (`publishLateNAKs`).
+  Otherwise it is recorded as before, tagged as late when the cutoff has passed.
+- **The drain-issue handoff.** In the section that sets `drainIssued`, the late-tagged
+  markers of that subscription (recorded after the cutoff while it was not yet issued) are
+  taken and NAKed. So a predecessor's offer on a drained subscription is either read by
+  the successor's resume or NAKed, without waiting for any completion. nats.go cannot
+  signal a drain's completion reliably (its closed handler is installed after dispatch
+  starts and never replayed), so nothing waits for one. A reconciliation subscription a
+  refused resume's cleanup unsubscribes is not drained and keeps the older behaviour.
+- **At most one late NAK per source per cutoff** (`lateNAKed`), from the writer or the
+  handoff; a second decision for the same source records a marker. That bounds the
+  repetition a reconnect can cause (below).
+- Live-capacity withholding and every offer of the bound connection record as before.
+
+**Only a durable the record references is honored.** `recordSelectionLocked` is the
+selection `buildPersistedSessionLocked` persists (ordinary memberships, active and staged
+drains that are not removal-marked, adopted drains whose held consumer is the
+membership's, shared group durables with their incarnation, the affine and PUBREL
+durables), and `recordReferencedDurablesLocked` is the durable set of that same selection.
+Every reader that decides from markers (the freed-slot NAK, the resume's final validation,
+the two custody predicates, the handoff) and the NAK-owed decision skip a marker whose
+durable it does not contain. A reader DELETES such a marker (and its late tag) only once
+the absence is settled: no record transaction open and no record write unresolved. Every
+path that removes a membership and can restore it on a definite save failure does both
+inside one open record transaction, and an ambiguous save keeps the removal and marks the
+write unresolved, so a tentative absence is only skipped and its marker survives a
+rollback. The writer never prunes. This replaces any list of the ways ownership ends. The
+check is per durable (`recordReferencesDurableLocked`, no set built; a pass over more than
+16 distinct durables builds the set once): about 80 µs under `sess.mu` at 2000
+memberships, 200 shared memberships and 500 markers with a transaction open
+(`BenchmarkReferencedDurablesUnderSessionLock`), and a settled pass prunes lingering
+markers so later passes pay nothing for them.
+
+What remains is in `docs/CONFORMANCE.md` ("A QoS 1 publish racing its subscriber's detach
+can still wait for AckWait"): the push consumer's `didNotDeliver` that does not requeue,
+the reconnect around a drain, the late-NAK duplicate, allocations in flight at the detach,
+unreferenced markers awaiting a settled reader pass, the unsubscribing classes, and a
+rejoined shared group.
 
 ### The PUBREL consumer's name is claimed under contention
 

@@ -509,7 +509,7 @@ func (e *testDeferredEnv) armLateSettle(t *testing.T) (settle func(), nonce func
 	t.Helper()
 	sseq2 := e.storeSource(t)
 	e.sess.mu.Lock()
-	pi2, isNew := e.sess.trackPublish(e.dur, testInflightAckSubject(e.dur, sseq2, 1))
+	pi2, isNew := e.sess.trackPublish(e.dur, testInflightAckSubject(e.dur, sseq2, 1), mqttOfferOrigin{})
 	var n2 string
 	if ack := e.sess.pendingPublish[pi2]; ack != nil {
 		n2 = ack.regNonce

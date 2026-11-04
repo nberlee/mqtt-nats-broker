@@ -46,6 +46,8 @@ was not repeated.
 | [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
+| PUSH-DIDNOTDELIVER | A push consumer that fails to route a delivery does not requeue it (the pull branch does), so it waits for AckWait | To be reported by the owner | a QoS 1/2 offer racing a subscriber's detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced on v2.15.2 with an embedded-server witness (6 of 200 rounds wait for AckWait); same source on `main` |
+| DRAIN-ACROSS-RECONNECT | nats.go re-sends SUB for a draining subscription on reconnect and later removes it locally without an UNSUB, leaving server interest | To be reported by the owner | delivery subscriptions drained at detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced with nats.go v1.55.0 (3 of 3, `ForceReconnect`); same source on `main` |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -255,3 +257,40 @@ with `connectionTypeAllowed`. The witness fails on v2.15.1 and passes on v2.15.2
 standard connection, and the broker reads the issued user's account and permissions
 itself. At the 2.15.2 floor a callout that restricts its issued users to `MQTT` alone
 refuses them on that standard connection, which `docs/AUTHENTICATION.md` now says.
+
+## PUSH-DIDNOTDELIVER: a push consumer does not requeue a delivery it knows failed
+
+**What.** nats-server `consumer.didNotDeliver` runs when a delivery could not be routed.
+In pull mode it puts a still-pending sequence on the redelivery queue ("we know it was not
+delivered"); in push mode it only clears `o.active` and rechecks interest, leaving the
+sequence pending, so it is redelivered only at AckWait. A push consumer learns of lost
+interest asynchronously (`loopAndGatherMsgs` gates on `o.active`, updated from the
+interest channel), so a message selected just after the last subscriber's UNSUB is routed
+to nobody.
+
+**Where.** `server/consumer.go` `didNotDeliver` and `loopAndGatherMsgs`, v2.15.2 and
+`main` (checked 2026-11-04). No existing upstream issue found. Witness (outside this repository):
+a racing publisher, the subscription drained before resubscribing; 6 of 200 rounds are
+redelivered only at AckWait.
+
+**Here.** The remaining part of a QoS 1/2 offer racing its subscriber's detach
+(`docs/CONFORMANCE.md`). The broker never sees a reply subject for such a push and does
+not work around it.
+
+## DRAIN-ACROSS-RECONNECT: a drained subscription keeps its server interest across a reconnect
+
+**What.** nats.go `Subscription.Drain` keeps the subscription in the connection's map
+until its queue is empty, suppresses the UNSUB while reconnecting, and
+`resendSubscriptions` re-sends SUB for every entry, draining ones included; `checkDrained`
+then removes it locally with no UNSUB. The server keeps the interest until the next
+reconnect and routes to a sid the client discards.
+
+**Where.** nats.go v1.55.0 and `main` (checked 2026-11-04): `unsubscribe` (drain mode),
+`checkDrained`, `resendSubscriptions`. No existing upstream issue found. Witness (outside
+this repository): server interest returns with the reconnect and survives the drain's local
+removal, 3 of 3 runs.
+
+**Here.** A delivery subscription drained at detach across a service-connection reconnect
+keeps a JetStream push consumer active while its session is offline; its messages are
+pushed and discarded on every AckWait cycle until the next reconnect
+(`docs/CONFORMANCE.md`). The broker does not work around it.

@@ -360,7 +360,7 @@ func TestAnAlreadyDeliveringDrainIsLeftToTheOrdinaryAdoption(t *testing.T) {
 	// helper declines to repair the one thing it exists for.
 	inbox := cfg.DeliverSubject
 	_, serr := sess.processQOS12Sub(c, []byte(inbox), []byte(inbox), nil, _EMPTY_, false, 1, false, false,
-		false, 0, dur, mqttDeliverMsgCbQoS12)
+		false, 0, dur, mqttDeliverMsgCbQoS12, true)
 	sess.mu.Unlock()
 	if serr != nil {
 		t.Fatalf("fixture subscription: %v", serr)

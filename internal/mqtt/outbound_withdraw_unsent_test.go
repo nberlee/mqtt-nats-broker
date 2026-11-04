@@ -736,7 +736,7 @@ func TestAdmissionIsPinnedToTheConnectionsEntitlement(t *testing.T) {
 	})
 	e := f.e
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq+11, 1))
+	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq+11, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d new=%v", pi, isNew)
@@ -838,7 +838,7 @@ func testOwnWriteEnded(t *testing.T, clientID string, lost bool) {
 	testWithdrawAdmitMore(t, e, testRealPubRelSrcSeq, 1)
 	sseq := testRealPubRelSrcSeq + 3
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1), mqttOfferOrigin{})
 	subject := mqttInflightSubject(e.sess.idHash, e.sess.gen, pi)
 	gen := e.sess.gen
 	e.sess.mu.Unlock()

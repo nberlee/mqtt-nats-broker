@@ -247,9 +247,9 @@ func (sess *mqttSession) allocationFenceLocked() mqttAllocationFence {
 
 // mqttNewAllocation is a new delivery's identifier, held while its register store is in flight
 // (R1). It acts for nothing until the landing promotes it.
-func mqttNewAllocation(jsDur string, sseq uint64, ackSubj, nonce string, fence mqttAllocationFence) *mqttPending {
+func mqttNewAllocation(jsDur string, sseq uint64, ackSubj, nonce string, fence mqttAllocationFence, origin mqttOfferOrigin) *mqttPending {
 	return &mqttPending{jsDur: jsDur, sseq: sseq, jsAckSubject: ackSubj, regPending: true, regNonce: nonce,
-		allocFence: fence}
+		allocFence: fence, origin: origin}
 }
 
 // mqttNewUnmintedHold is an entry for a source the session maps to an identifier with no entry

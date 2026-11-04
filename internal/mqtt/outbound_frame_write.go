@@ -288,6 +288,19 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 	// Admission FIRST, then the holder's execution cell: a holder that does not admit this
 	// execution — a nil one included — is refused before anything else is asked of it.
 	var cell *mqttExecCell
+	// What the PUBLISH holder said about its exchange's acknowledgement BEFORE this entry was
+	// decided, for the write-entry seam alone: an admitted execution that had already seen
+	// the exchange answered is one the entry decision should have refused.
+	var answeredBeforeEntry bool
+	var writeEntered *func(pi uint16, answeredBeforeEntry bool)
+	if r.Action.Kind == mqttActionPublish && c.mqtt != nil && c.mqtt.sess != nil {
+		writeEntered = c.mqtt.sess.testPublishWriteEntered.Load()
+	}
+	if writeEntered != nil {
+		if po, ok := r.Holder.(*mqttPublishOutput); ok && po != nil {
+			answeredBeforeEntry = po.answered.Load()
+		}
+	}
 	if r.Holder != nil && r.Holder.enterWrite(r.Action, c) {
 		cell = r.Holder.execCell()
 	}
@@ -303,6 +316,9 @@ func (c *client) writeAuthorizedFrame(r mqttFrameRequest) (mqttOutputResult, err
 		c.wmu.Unlock()
 		return mqttOutputPrevented, fmt.Errorf("action %q/%d has already executed",
 			r.Action.Nonce, r.Action.Acq)
+	}
+	if writeEntered != nil {
+		(*writeEntered)(r.Action.PI, answeredBeforeEntry)
 	}
 
 	var werr error

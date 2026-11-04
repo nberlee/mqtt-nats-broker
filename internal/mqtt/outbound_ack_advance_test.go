@@ -549,7 +549,7 @@ func TestAckRefusesAnOrdinarySlotWithoutItsExchange(t *testing.T) {
 			// The exchange-less ordinary register, deliberately, planted ALONE: e.track admits an
 			// ordinary obligation beside its exchange (issue #107 7b), which is not this test's shape.
 			e.sess.mu.Lock()
-			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 41, 1))
+			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 41, 1), mqttOfferOrigin{})
 			e.sess.mu.Unlock()
 			testOpenStoreCustody(t, e.sess, pi)
 			if !e.sess.storeInflightRegister(e.c, pi, qos, dur, 41, e.nonceOf(pi), _EMPTY_, _EMPTY_) {

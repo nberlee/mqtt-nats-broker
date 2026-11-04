@@ -891,6 +891,9 @@ func TestTerminalReleaseFreesTheIdentifier(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.rmax = 1
 	deferredKey := mqttDeferredKey{"SRC-DEFERRED", 99}
+	// The parked delivery's durable is one the session's record references: a marker is
+	// acted on only then (recordReferencedDurablesLocked).
+	testReferenceDurableLocked(e.sess, deferredKey.jsDur)
 	if e.sess.deferred == nil {
 		e.sess.deferred = make(map[mqttDeferredKey]string)
 	}

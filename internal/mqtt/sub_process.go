@@ -112,6 +112,25 @@ type mqttSub struct {
 	// The server injects it into every PUBLISH delivered because of this sub.
 	// Read in the delivery callbacks like noLocal. Spec5 [3.8.2.1.2].
 	subID int
+
+	// drainAtDetach marks the ORDINARY non-shared QoS 1/2 delivery subscription
+	// (mqttDeliverMsgCbQoS12 on a filter's own durable, the reconciliation phase's included):
+	// at a detach its offers already routed to this broker are owed to the session, so the
+	// subscription is DRAINED rather than unsubscribed and every such offer reaches its
+	// callback, which records it withheld or NAKs it (recordWithheldAttemptLocked). Affine
+	// QoS 2, shared, PUBREL and UNSUBSCRIBE-drain subscriptions are not marked and keep the
+	// unsubscribe. Set by processQOS12Sub's caller, the one that chose the callback, under
+	// sess.mu and before any detach can read it; immutable afterwards.
+	drainAtDetach bool
+	// drainClaimed and drainIssued are the two recorded states of the at-most-one Drain this
+	// subscription gets (drainDeliveriesAtDetach), guarded by sess.mu. Claimed is set before
+	// the lock is released to call Drain, so no second teardown issues another or falls back
+	// to an unsubscribe that would cancel it. Issued is set only after Drain returned nil, in
+	// the section that runs the handoff: from then on the UNSUB precedes, on the service
+	// connection, any NAK published for this subscription's offers, which is what licenses
+	// the writer's late NAK. Claimed alone licenses nothing.
+	drainClaimed bool
+	drainIssued  bool
 }
 
 // mqttSharedSubPrefix is the MQTT 5.0 Shared Subscription topic filter prefix
@@ -213,19 +232,29 @@ func (f *mqttFilter) sessionKey() string {
 // Helper to set the sub's mqtt fields and possibly serialize (pre-loaded)
 // retained messages.
 //
+// drainAtDetach is the caller's statement that h is the ordinary non-shared QoS 1/2
+// delivery callback (see mqttSub.drainAtDetach). It is set on the subscription before the
+// session lock the caller holds is released, so no detach can observe the subscription
+// without it.
+//
 // Session lock held on entry. Acquires the subs lock and holds it for
 // the duration. Non-MQTT messages coming into mqttDeliverMsgCbQoS0 will be
 // waiting.
 func (sess *mqttSession) processQOS12Sub(
 	c *client, // subscribing client.
 	subject, sid, queue []byte, filterKey string, isReserved bool, qos byte, noLocal, retainAsPublished, shared bool, subID int, jsDurName string, h msgHandler, // subscription parameters.
+	drainAtDetach bool,
 ) (*subscription, error) {
 	if hook := mqttTestQOS12SubFailHookV.Load(); hook != nil {
 		if err := (*hook)(jsDurName); err != nil {
 			return nil, err
 		}
 	}
-	return sess.processSub(c, subject, sid, queue, filterKey, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
+	sub, err := sess.processSub(c, subject, sid, queue, filterKey, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
+	if err == nil && sub != nil && sub.mqtt != nil {
+		sub.mqtt.drainAtDetach = drainAtDetach && !shared
+	}
+	return sub, err
 }
 
 func (sess *mqttSession) processSub(

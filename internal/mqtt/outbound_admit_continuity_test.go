@@ -64,7 +64,7 @@ func testContinuityOffer(t *testing.T, e *testInflightEnv, deliveries int) (uint
 	t.Helper()
 	reply := testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, deliveries)
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, reply)
+	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, reply, mqttOfferOrigin{})
 	var nonce string
 	if p := e.sess.pendingPublish[pi]; p != nil {
 		nonce = p.regNonce
@@ -174,7 +174,7 @@ func testW5bStandingPopulation(t *testing.T, clientID string) *testW5bStanding {
 	e.asm.mu.Unlock()
 	reply := testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1)
 	e.sess.mu.Lock()
-	w.pi1, _ = e.sess.trackPublish(testRealPubRelSrcDur, reply)
+	w.pi1, _ = e.sess.trackPublish(testRealPubRelSrcDur, reply, mqttOfferOrigin{})
 	w.nonce1 = e.sess.pendingPublish[w.pi1].regNonce
 	w.firstSubject = mqttInflightSubject(e.sess.idHash, e.sess.gen, w.pi1)
 	firstSubject.Store(w.firstSubject)
@@ -303,7 +303,7 @@ func TestContinuityW5bLandedThenUnreadable(t *testing.T) {
 			t.Fatalf("recovery over a live source must restore the first allocation's acting entry, got %+v", restored)
 		}
 		e.sess.mu.Lock()
-		piR, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 3))
+		piR, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 3), mqttOfferOrigin{})
 		left := e.sess.admissionContinuityLocked(testRealPubRelSrcDur, testRealPubRelSrcSeq)
 		e.sess.mu.Unlock()
 		if piR != w.pi1 || isNew || left != nil {
@@ -353,7 +353,7 @@ func TestContinuityColdPeerResumeFollowsTheSource(t *testing.T) {
 				t.Fatalf("B restored identifier %d for the withdrawn allocation: %+v", pi, p)
 			}
 		}
-		_, isNew := b.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 3))
+		_, isNew := b.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 3), mqttOfferOrigin{})
 		b.sess.mu.Unlock()
 		if !isNew {
 			t.Fatal("an offer after the withdrawal must be a fresh allocation")
@@ -374,7 +374,7 @@ func TestContinuityColdPeerResumeFollowsTheSource(t *testing.T) {
 			t.Fatalf("B's recovery must restore the never-sent obligation as an unsent acting entry, got %+v", restored)
 		}
 		b.sess.mu.Lock()
-		piB, isNew := b.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 3))
+		piB, isNew := b.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 3), mqttOfferOrigin{})
 		b.sess.mu.Unlock()
 		if piB != w.pi1 || isNew {
 			t.Fatalf("B's offer must continue the restored obligation (got identifier %d new %v, want %d)", piB, isNew, w.pi1)

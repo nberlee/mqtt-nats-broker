@@ -180,18 +180,19 @@ func (sess *mqttSession) noteCustodyReadLocked(gen, lin string, indeterminate bo
 }
 
 // noteAllocationSucceededLocked clears the latched demand once a withheld allocation has since
-// succeeded with nothing deferred (the demand it latched has been met). The other end of the
+// succeeded with nothing deferred (the demand it latched has been met). "Deferred" counts only a
+// marker whose durable the record references: one that outlived its ownership names no waiter. The other end of the
 // latch is its own deadline: see noAllocationCanBeWaitingLocked.
 //
 // Lock held on entry.
 func (sess *mqttSession) noteAllocationSucceededLocked() {
-	if sess.custodyDemand && len(sess.deferred) == 0 {
+	if sess.custodyDemand && !sess.referencedMarkerRemainsLocked() {
 		sess.custodyDemand, sess.custodyDemandDelay, sess.custodyDemandDueAt = false, 0, time.Time{}
 	}
 }
 
 // noAllocationCanBeWaitingLocked reports that a latched demand names no waiter any more: no
-// delivery is deferred, no identifier is unknown, and the ledger holds no admission and no
+// delivery is deferred under a durable the record references (recordReferencedDurablesLocked), no identifier is unknown, and the ledger holds no admission and no
 // exchange. A demand latches for a withheld allocation, and its waiter may leave without ever
 // being allocated (an UNSUBSCRIBE drain, a consumer teardown or a resume drops a deferred entry;
 // the retained downgrade and allocator exhaustion defer nothing at all). With nobody deferred,
@@ -201,7 +202,7 @@ func (sess *mqttSession) noteAllocationSucceededLocked() {
 //
 // Lock held on entry.
 func (sess *mqttSession) noAllocationCanBeWaitingLocked(ledger *mqttCustodyLedger) bool {
-	return len(sess.deferred) == 0 && !ledger.withholdsAllocation() && !ledger.holdsCustody()
+	return !sess.referencedMarkerRemainsLocked() && !ledger.withholdsAllocation() && !ledger.holdsCustody()
 }
 
 // mqttCustodyUnitKind is what one dispatcher unit does.

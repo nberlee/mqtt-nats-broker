@@ -4659,7 +4659,8 @@ func (sess *mqttSession) cancelPendingRegistrationsLocked(durable string, lic mq
 		out = append(out, mqttRegCancellation{pi: pi, nonce: ack.regNonce, durable: durable, sseq: sseq, reply: ack.registerSourceAckReply()})
 		// Unmapped FIRST: the writer refuses a sequence that still has an exchange (issue #162).
 		sess.cpending.deleteSeq(durable, sseq)
-		sess.recordWithheldAttemptLocked(durable, sseq, ack.jsAckSubject)
+		// The session's own bookkeeping (the zero origin): a cancellation records as today.
+		sess.recordWithheldAttemptLocked(durable, sseq, ack.jsAckSubject, mqttOfferOrigin{})
 		sess.setPendingLocked(mqttPendingPublishMap, pi, mqttExpectExactly(ack), mqttNewCancelledHold(ack.regNonce))
 	}
 	return out
@@ -6769,6 +6770,10 @@ func (sess *mqttSession) ownAllocationCancelled(pi uint16, nonce string) bool {
 // lic is the licence of the admitting connection whose ladder gives up (its callers'
 // mqttLicenceOf(c), read before the session lock): a continuity record's withdrawal carries it.
 func (sess *mqttSession) abandonInflightRegister(lic mqttDestroyLicence, pi uint16, jsDur string, sseq uint64, nonce string) {
+	// A late NAK the withholding owes is published after the unlock (registered first, so it
+	// runs after the deferred unlock below).
+	var lateNAK string
+	defer func() { sess.publishLateNAKs(lateNAK) }()
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	ack := sess.pendingPublish[pi]
@@ -6814,7 +6819,11 @@ func (sess *mqttSession) abandonInflightRegister(lic mqttDestroyLicence, pi uint
 		ackSubject, lic) {
 		return
 	}
-	sess.recordWithheldAttemptLocked(jsDur, sseq, ackSubject)
+	// The ALLOCATION'S origin, captured with it: the offer that made it, never whichever
+	// connection is bound now (recordWithheldAttemptLocked decides record or late NAK).
+	if sess.recordWithheldAttemptLocked(jsDur, sseq, ackSubject, ack.origin) == mqttWithheldNAKOwed {
+		lateNAK = ackSubject
+	}
 }
 
 // mqttStagedRelease is a recovery release the resume decided on, held until the resume has

@@ -28,6 +28,11 @@ type mqttPending struct {
 	sseq           uint64 // stream sequence
 	jsAckSubject   string // the ACK subject to send the ack to
 	jsDur          string // JS durable name
+	// origin is the subscription and connection whose offer made this ALLOCATION, captured
+	// with it (trackPublish) so an abandonment records or NAKs the source as that offer's
+	// withholding (abandonInflightRegister), never as whichever connection a later lookup
+	// finds bound. Process memory, set only by mqttNewAllocation.
+	origin mqttOfferOrigin
 	// Persisted lifecycle metadata; it does not imply a current delivery offer.
 	sourceAckReply string
 	// q2AffClaim is the subject of the assignment claim that authorized this

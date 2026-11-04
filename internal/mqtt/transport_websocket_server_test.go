@@ -286,8 +286,9 @@ func TestWSPahoV311(t *testing.T) {
 	ps.Disconnect(100)
 	// As in TestWSPahoV5Session: "published while offline" is after the broker has
 	// processed the DISCONNECT. paho's quiesce does not guarantee that under load (CI met
-	// it), and a publish racing the teardown is the residual docs/CONFORMANCE.md states
-	// ("A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait").
+	// it), and a publish racing the teardown is covered by its own tests
+	// (delivery_drain_at_detach_test.go) and the residual docs/CONFORMANCE.md states
+	// ("A QoS 1 publish racing its subscriber's detach can still wait for AckWait").
 	for start := time.Now(); wsHasClient(s, "ws-persist"); time.Sleep(10 * time.Millisecond) {
 		if time.Since(start) > 10*time.Second {
 			t.Fatal("the disconnected session's connection is still registered")
@@ -408,9 +409,9 @@ func TestWSPahoV5Session(t *testing.T) {
 	_ = ps.Disconnect(&paho.Disconnect{})
 	// "Published while offline" means after the broker has processed the DISCONNECT, so wait
 	// for that server-side fact: paho.golang's Disconnect returns once its bytes are written.
-	// A publish racing that teardown is the residual docs/CONFORMANCE.md states ("A QoS 1
-	// publish racing its subscriber's DISCONNECT waits for AckWait"), which this test
-	// deliberately does not cover.
+	// A publish racing that teardown has its own tests (delivery_drain_at_detach_test.go) and
+	// the residual docs/CONFORMANCE.md states ("A QoS 1 publish racing its subscriber's detach
+	// can still wait for AckWait"), which this test deliberately does not cover.
 	for start := time.Now(); wsHasClient(s, "ws-v5s-persist"); time.Sleep(10 * time.Millisecond) {
 		if time.Since(start) > 10*time.Second {
 			t.Fatal("the disconnected session's connection is still registered")

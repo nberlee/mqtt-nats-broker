@@ -295,7 +295,7 @@ func installClosedDelivery(t *testing.T, c *client, sess *mqttSession, cc *Consu
 	t.Helper()
 	sess.mu.Lock()
 	sub, err := sess.processQOS12Sub(c, []byte(cc.DeliverSubject), []byte(cc.DeliverSubject), nil, _EMPTY_,
-		false, qos, false, false, false, 0, cc.Durable, mqttDeliverMsgCbQoS12)
+		false, qos, false, false, false, 0, cc.Durable, mqttDeliverMsgCbQoS12, true)
 	if err == nil && sub != nil && sub.mqtt != nil {
 		sess.subsMu.Lock()
 		sub.mqtt.closed = true
@@ -775,7 +775,7 @@ func TestStagingCancelsAnAllocationWhoseStoreIsStillInFlight(t *testing.T) {
 	// lowering the barrier is one of the things the staging must be observed doing.
 	sess.mu.Lock()
 	if _, err := sess.processQOS12Sub(c, []byte(cfg.DeliverSubject), []byte(cfg.DeliverSubject), nil, _EMPTY_,
-		false, 1, false, false, false, 0, cfg.Durable, mqttDeliverMsgCbQoS12); err != nil {
+		false, 1, false, false, false, 0, cfg.Durable, mqttDeliverMsgCbQoS12, true); err != nil {
 		sess.mu.Unlock()
 		t.Fatalf("installing the delivery subscription: %v", err)
 	}
@@ -869,7 +869,7 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 	cfg := realDrainConsumer(t, sess, dur, sid)
 	sess.mu.Lock()
 	if _, err := sess.processQOS12Sub(c, []byte(cfg.DeliverSubject), []byte(cfg.DeliverSubject), nil, _EMPTY_,
-		false, 1, false, false, false, 0, cfg.Durable, mqttDeliverMsgCbQoS12); err != nil {
+		false, 1, false, false, false, 0, cfg.Durable, mqttDeliverMsgCbQoS12, true); err != nil {
 		sess.mu.Unlock()
 		t.Fatalf("installing the delivery subscription: %v", err)
 	}
@@ -928,7 +928,7 @@ func TestRollbackKeepsTheTransferredMarkerSoTheFirstSendIsNotDup(t *testing.T) {
 		// A REDELIVERY of that sequence: JetStream's delivery count is above one, and it
 		// says nothing about DUP — a fresh allocation's entry is not transmitted.
 		sess.mu.Lock()
-		rePI, _ := sess.trackPublish(dur, testInflightAckSubject(dur, tc.sseq, 2))
+		rePI, _ := sess.trackPublish(dur, testInflightAckSubject(dur, tc.sseq, 2), mqttOfferOrigin{})
 		transmitted := rePI != 0 && sess.pendingPublish[rePI].transmitted
 		sess.mu.Unlock()
 		if rePI == 0 || transmitted {

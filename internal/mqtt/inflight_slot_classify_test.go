@@ -382,7 +382,7 @@ func TestSlotClassifierDrivesTheLiveLadder(t *testing.T) {
 		dur := e.sess.idHash + "_" + nuid.Next()
 
 		e.sess.mu.Lock()
-		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 7700, 1))
+		pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, 7700, 1), mqttOfferOrigin{})
 		nonce := e.sess.pendingPublish[pi].regNonce
 		e.sess.mu.Unlock()
 		if pi == 0 {

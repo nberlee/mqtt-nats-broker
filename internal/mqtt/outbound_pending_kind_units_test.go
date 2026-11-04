@@ -28,7 +28,7 @@ func testAllocation(t *testing.T, e *testInflightEnv, sseq uint64) uint16 {
 	t.Helper()
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
-	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1), mqttOfferOrigin{})
 	if pi == 0 || !isNew {
 		t.Fatalf("fixture: no fresh allocation (pi %d, new %v)", pi, isNew)
 	}
@@ -636,7 +636,7 @@ func TestPendingClosureAffineReservationNeedsNoCustody(t *testing.T) {
 			testReadyForRealPubRelDelivery(t, e)
 			dur := mqttQ2AffineConsumerDurablePrefix + "test"
 			e.sess.mu.Lock()
-			pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 78, 1))
+			pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 78, 1), mqttOfferOrigin{})
 			gen := e.sess.gen
 			subject := mqttInflightSubject(e.sess.idHash, gen, pi)
 			e.sess.mu.Unlock()

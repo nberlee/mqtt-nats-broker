@@ -577,7 +577,7 @@ func (as *mqttAccountSessionManager) reconcileResumedConsumers(sess *mqttSession
 	subscribeClosed := func(e *mqttReconcileEntry, deliver, durable string) error {
 		sess.mu.Lock()
 		sub, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil, e.filterKey,
-			e.reserved, e.qos, e.noLocal, e.rap, false, e.subID, durable, mqttDeliverMsgCbQoS12)
+			e.reserved, e.qos, e.noLocal, e.rap, false, e.subID, durable, mqttDeliverMsgCbQoS12, true)
 		if err == nil {
 			sess.subsMu.Lock()
 			if sub.mqtt != nil {

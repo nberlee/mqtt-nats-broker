@@ -370,7 +370,7 @@ func TestVoidVerdictsDurableIgnoresRetirement(t *testing.T) {
 	_, _, dur := mqttSharedNames(group, filter, 1)
 
 	e.sess.mu.Lock()
-	pi, ok := e.sess.trackPublish(dur, testInflightAckSubject(dur, 2300, 1))
+	pi, ok := e.sess.trackPublish(dur, testInflightAckSubject(dur, 2300, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !ok {
 		t.Fatalf("trackPublish: pi=%d ok=%v", pi, ok)

@@ -291,8 +291,9 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 		if h := mqttTestDeliverySkippedHookV.Load(); h != nil {
 			(*h)(sub, reply)
 		}
-		sess.recordWithheldDeliveryLocked(cc, sub, reply)
+		nak := sess.recordWithheldDeliveryLocked(cc, sub, reply)
 		col.unlockAndFlush(sess)
+		sess.publishLateNAKs(nak)
 		return
 	}
 
@@ -769,7 +770,7 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 			return
 		}
 	}
-	pi, isNew := sess.trackPublish(sub.mqtt.jsDur, reply)
+	pi, isNew := sess.trackPublish(sub.mqtt.jsDur, reply, mqttOfferOrigin{sub: sub, cc: cc})
 	// The allocation's nonce, read under the same lock that allocated it: it is the
 	// identity every later reservation touch is guarded by, and reading it later would
 	// race the teardown that replaces the entry with a reservation.

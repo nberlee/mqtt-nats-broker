@@ -1105,7 +1105,7 @@ func TestDifferentSourceArmReservesAPossiblyAttemptedOccupant(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 600, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 600, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi != 11 || !isNew {
 		t.Fatalf("fixture: the allocation must land on the occupied identifier 11, got %d (new %v)", pi, isNew)
@@ -1297,7 +1297,7 @@ func TestInheritedReplacementCancellationEnrolsTheDrain(t *testing.T) {
 		t.Fatalf("fixture: consuming the inherited occupant's marker: %v", err)
 	}
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi != 11 || !isNew {
 		t.Fatalf("fixture: the re-offer must allocate the inherited identifier 11, got %d (new %v)", pi, isNew)
@@ -2044,7 +2044,7 @@ func testCancelledOccupantOn(t *testing.T, e *testInflightEnv, dur string, sseq 
 	}
 	o.occ, o.occSeq = cur, cmsg.Sequence
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi != 11 || !isNew {
 		t.Fatalf("fixture: the next allocation must take the occupied identifier 11, got %d (new %v)", pi, isNew)
@@ -2389,7 +2389,7 @@ func TestTakeoverFailedAdvanceReleasesOnThePeerWithoutTraffic(t *testing.T) {
 	testCustodyRM1(t, peer)
 	bReply := testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq+1, 1)
 	peer.mu.Lock()
-	bPI, _ := peer.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, _ := peer.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	peer.mu.Unlock()
 	if bPI != 0 {
 		t.Fatalf("fixture: B must withhold a further delivery while L holds the only slot, got identifier %d", bPI)
@@ -2437,7 +2437,7 @@ func TestTakeoverFailedAdvanceReleasesOnThePeerWithoutTraffic(t *testing.T) {
 	}
 	t.Logf("B released L's charge %v after A's landing (B units for L: %d)", time.Since(start), n)
 	peer.mu.Lock()
-	bPI, bNew := peer.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, bNew := peer.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	peer.mu.Unlock()
 	if bPI == 0 || !bNew {
 		t.Fatalf("the withheld delivery must be admitted once L's charge is released, got %d (new=%v)", bPI, bNew)

@@ -276,7 +276,7 @@ func TestMQTTInflightLostSourcePossiblyAttemptedKeepsItsSourceMapping(t *testing
 
 	// The dispatched callback's own call, at the same (durable, sequence).
 	e.sess.mu.Lock()
-	got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2))
+	got, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 2), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 
 	if isNew || got != pi {

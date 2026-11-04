@@ -119,7 +119,7 @@ func testDriverWithheld(t *testing.T, clientID string, qos byte) (*testWithdrawF
 	testCustodyRM1(t, f.e.sess)
 	bReply := testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq+1, 1)
 	f.e.sess.mu.Lock()
-	bPI, _ := f.e.sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, _ := f.e.sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	f.e.sess.mu.Unlock()
 	if bPI != 0 {
 		t.Fatalf("fixture: B must be withheld while A holds the only slot, got identifier %d", bPI)
@@ -391,7 +391,7 @@ func TestFailedObservationReleasesBeforeAckWait(t *testing.T) {
 	}
 	// Positive control: B is admitted through the gate now.
 	sess.mu.Lock()
-	bPI, bNew := sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, bNew := sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	sess.mu.Unlock()
 	if bPI == 0 || !bNew {
 		t.Fatalf("B must be admitted once A's charge is released, got %d (new=%v)", bPI, bNew)
@@ -654,7 +654,7 @@ func TestDriverCloseThenReopen(t *testing.T) {
 		t.Fatal("the release must come from a dispatcher run started after the reopen")
 	}
 	sess.mu.Lock()
-	bPI, _ := sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, _ := sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	sess.mu.Unlock()
 	if bPI == 0 {
 		t.Fatal("the withheld delivery must be admitted after the reopen")
@@ -1777,7 +1777,7 @@ func TestDriverGenerationDiscardCancelsTheArmedTick(t *testing.T) {
 	testCustodyRM1(t, sess)
 	bReply := testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq+1, 1)
 	sess.mu.Lock()
-	bPI, _ := sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, _ := sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	sess.mu.Unlock()
 	if bPI != 0 {
 		t.Fatalf("fixture: B must be withheld while A holds the only slot, got identifier %d", bPI)
@@ -1833,7 +1833,7 @@ func TestDriverDemandDeadlineSurvivesHintExits(t *testing.T) {
 	testCustodyRM1(t, sess)
 	bReply := testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq+1, 1)
 	sess.mu.Lock()
-	bPI, _ := sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, _ := sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	sess.mu.Unlock()
 	if bPI != 0 {
 		t.Fatalf("fixture: B must be withheld while A holds the only slot, got identifier %d", bPI)
@@ -2515,7 +2515,7 @@ func TestDriverDemandOfADrainedWaiterRetires(t *testing.T) {
 	const bDur = "SRCB"
 	bSeq := uint64(testRealPubRelSrcSeq + 1)
 	sess.mu.Lock()
-	bPI, _ := sess.trackPublish(bDur, testInflightAckSubject(bDur, bSeq, 1))
+	bPI, _ := sess.trackPublish(bDur, testInflightAckSubject(bDur, bSeq, 1), mqttOfferOrigin{})
 	_, deferred := sess.deferred[mqttDeferredKey{bDur, bSeq}]
 	latched := sess.custodyDemand
 	lastPI := sess.last_pi
@@ -2704,7 +2704,10 @@ func TestDriverDemandServedWhileAnAllocationMayWait(t *testing.T) {
 		sess.pendingPublish[f.pi+1] = filler
 		sess.rmax = 0
 		sess.maxp = uint16(len(sess.pendingPublish))
-		bPI, _ := sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq+1, 1))
+		// B's durable is one the session's record references: only such a marker names a
+		// waiter (recordReferencedDurablesLocked).
+		testReferenceDurableLocked(sess, testRealPubRelSrcDur)
+		bPI, _ := sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq+1, 1), mqttOfferOrigin{})
 		latched := sess.custodyDemand
 		sess.mu.Unlock()
 		t.Cleanup(func() {

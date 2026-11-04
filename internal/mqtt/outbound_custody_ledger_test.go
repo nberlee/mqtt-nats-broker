@@ -162,7 +162,7 @@ func TestCustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	regsBefore := f.e.countRegisters(t)
 	xchBefore := testCustodyCountExchanges(t, f.e, f.gen)
 	sess.mu.Lock()
-	bPI, bNew := sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, bNew := sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	_, deferred := sess.deferred[mqttDeferredKey{testRealPubRelSrcDur, bSeq}]
 	sess.mu.Unlock()
 	if bPI != 0 || bNew {
@@ -194,7 +194,7 @@ func TestCustodyMetadataRemovalReleasesNothing(t *testing.T) {
 	// THEN B IS ADMITTED through the same route: an identifier from the gate, and the admission
 	// lands its register beside its exchange at Publish.
 	sess.mu.Lock()
-	bPI, bNew = sess.trackPublish(testRealPubRelSrcDur, bReply)
+	bPI, bNew = sess.trackPublish(testRealPubRelSrcDur, bReply, mqttOfferOrigin{})
 	sess.mu.Unlock()
 	if bPI == 0 || !bNew {
 		t.Fatalf("B was not given an identifier after A's ending was observed: %d (new=%v)", bPI, bNew)
@@ -290,7 +290,7 @@ func TestCustodyRefusedAdmissionReleasesAtLadderEnd(t *testing.T) {
 	t.Cleanup(func() { e.asm.jsa.testTransitionCommit.Store(nil) })
 	e.installServingAuthority(t)
 	e.sess.mu.Lock()
-	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1))
+	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	nonce := e.nonceOf(pi)
 	e.acceptUnderServingAuthority(t)
@@ -477,7 +477,7 @@ func TestCustodyRefusalWithoutSubmissionReleases(t *testing.T) {
 	e.asm.mu.Unlock()
 	e.installServingAuthority(t)
 	e.sess.mu.Lock()
-	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1))
+	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	nonce := e.nonceOf(pi)
 	e.acceptUnderServingAuthority(t)
@@ -500,7 +500,7 @@ func TestCustodyRefusalWithoutSubmissionReleases(t *testing.T) {
 	e.asm.mu.Unlock()
 	sseq := testRealPubRelSrcSeq + 1
 	e.sess.mu.Lock()
-	pi2, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1))
+	pi2, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1), mqttOfferOrigin{})
 	nonce2 := e.sess.pendingPublish[pi2].regNonce
 	delete(e.sess.pendingPublish, pi2)
 	e.sess.mu.Unlock()
@@ -590,7 +590,7 @@ func TestCustodyLateCallbackOfAnOldGeneration(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 	e.sess.mu.Lock()
-	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1))
+	pi, _ := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	nonce := e.nonceOf(pi)
 	done := make(chan struct{})

@@ -1441,7 +1441,23 @@ func (c *client) closeConnection(reason ClosedState) {
 	c.subs = nil
 	c.mu.Unlock()
 	c.releaseDetachedRetainedFrames(retained)
+	// The ordinary QoS 1/2 delivery subscriptions are DRAINED, not unsubscribed (issue #170):
+	// an unsubscribe drops the offers already queued for, or already routed to, this
+	// connection with no callback, and JetStream then holds each one delivered until AckWait.
+	// A drained offer reaches the callback's detached arm, which records it withheld for the
+	// successor's resume or NAKs it, and never acks or transmits it, so the stale-handler
+	// concern above does not apply to it. Except at shutdown, which is not a resume.
+	teardown := make([]*subscription, 0, len(subs))
 	for _, sub := range subs {
+		teardown = append(teardown, sub)
+	}
+	if sess := c.mqttSessionForTeardown(); sess != nil {
+		if h := sess.drainAtDetachHooks(); h != nil && h.beforeTeardown != nil {
+			h.beforeTeardown(c)
+		}
+		teardown = sess.drainDeliveriesAtDetach(c, teardown, c.srv != nil && c.srv.isShuttingDown())
+	}
+	for _, sub := range teardown {
 		if ns, ok := sub.nsub.(*nats.Subscription); ok && ns != nil {
 			_ = ns.Unsubscribe()
 		}

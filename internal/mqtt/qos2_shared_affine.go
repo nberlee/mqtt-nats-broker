@@ -1958,7 +1958,7 @@ func (sess *mqttSession) ensureQ2AffineConsumerSubscription(c *client, tok recor
 	if !subscribed {
 		sess.mu.Lock()
 		_, err := sess.processQOS12Sub(c, []byte(deliver), []byte(deliver), nil, _EMPTY_, // session-wide: no single filter, and No Local never applies to shared
-			false, 2, false, false, false, 0, durable, mqttDeliverQ2AffineCb)
+			false, 2, false, false, false, 0, durable, mqttDeliverQ2AffineCb, false)
 		sess.mu.Unlock()
 		if err != nil {
 			c.Errorf("Unable to create subscription for the affine QoS 2 consumer on %q: %v", deliver, err)
@@ -3394,7 +3394,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Unlock()
 		return // a test-staged pre-tracking refusal; AckWait re-offers the copy
 	}
-	pi, isNew := sess.trackPublish(jsDur, reply)
+	pi, isNew := sess.trackPublish(jsDur, reply, mqttOfferOrigin{sub: sub, cc: cc})
 	// The allocation's nonce, read under the allocating lock (see mqttDeliverMsgCbQoS12),
 	// and whether the entry was transmitted, which gates the expiry discard below.
 	var regNonce string

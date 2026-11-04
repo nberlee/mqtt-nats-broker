@@ -184,7 +184,7 @@ func installLiveControlConsumer(t *testing.T, sess *mqttSession, c *client, sid,
 	}
 	sess.cons[sid] = cfg
 	_, err := sess.processQOS12Sub(c, []byte(mqttSubPrefix+dur), []byte(mqttSubPrefix+dur), nil, _EMPTY_,
-		false, 1, false, false, false, 0, dur, mqttDeliverMsgCbQoS12)
+		false, 1, false, false, false, 0, dur, mqttDeliverMsgCbQoS12, true)
 	sess.mu.Unlock()
 	if err != nil {
 		t.Fatalf("the live control subscription: %v", err)

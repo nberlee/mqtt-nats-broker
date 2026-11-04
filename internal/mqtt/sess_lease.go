@@ -688,13 +688,15 @@ func (sess *mqttSession) leasedHandler(h msgHandler, recordWithheld bool) msgHan
 // the one critical section that can settle them: the tracker must still be this session's, and
 // still be closing — with no lease held, a retired tracker's session may already be re-minted.
 func (sess *mqttSession) recordWithheldRefused(tr *mqttIncarnationTracker, sub *subscription, reply string) {
+	var nak string
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
 	if sess.leases == tr {
 		if isClosing, _ := tr.closingAndDecided(); isClosing {
-			sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
+			nak = sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
 		}
 	}
+	sess.mu.Unlock()
+	sess.publishLateNAKs(nak)
 }
 
 // recordWithheldStopped records an offer a LEASED callback did not process because its lifecycle
@@ -703,11 +705,13 @@ func (sess *mqttSession) recordWithheldRefused(tr *mqttIncarnationTracker, sub *
 // condition, whatever its state now. A reopen after the stop, or a connection that stopped serving
 // without a retirement, still owes the record (recordWithheldDeliveryLocked decides the rest).
 func (sess *mqttSession) recordWithheldStopped(life *mqttDeliveryLifecycle, sub *subscription, reply string) {
+	var nak string
 	sess.mu.Lock()
-	defer sess.mu.Unlock()
 	if life.tr != nil && sess.leases == life.tr {
-		sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
+		nak = sess.recordWithheldDeliveryLocked(sub.client, sub, reply)
 	}
+	sess.mu.Unlock()
+	sess.publishLateNAKs(nak)
 }
 
 // closingSignal is the CURRENT cycle's closing channel, for an in-route bounded wait

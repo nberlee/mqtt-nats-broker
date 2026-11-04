@@ -5175,7 +5175,7 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 	sess := &mqttSession{maxp: 10}
 	const dur = "S_C"
 	// $JS.ACK.<stream>.<consumer>.<deliveries>.<streamseq>.<consumerseq>.<ts>.<pending>
-	pi1, isNew1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0")
+	pi1, isNew1 := sess.trackPublish(dur, "$JS.ACK.S.C.1.100.1.0.0", mqttOfferOrigin{})
 	if pi1 == 0 || !isNew1 || sess.pendingPublish[pi1].transmitted {
 		t.Fatalf("first delivery: pi=%d isNew=%v transmitted=%v", pi1, isNew1, pi1 != 0 && sess.pendingPublish[pi1].transmitted)
 	}
@@ -5185,7 +5185,7 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 	if !sess.pendingPublish[pi1].regPending {
 		t.Fatalf("a newly allocated identifier must be regPending")
 	}
-	if pi, _ := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0"); pi != 0 {
+	if pi, _ := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0", mqttOfferOrigin{}); pi != 0 {
 		t.Fatalf("redelivery of an unconfirmed allocation: pi=%d (want 0)", pi)
 	}
 	// Confirm the register, as storeInflightRegister does, and record the transmission,
@@ -5197,7 +5197,7 @@ func TestMQTTSessionTrackPublishStarted(t *testing.T) {
 		0, true, mqttInflightSlotRef{}, false)
 
 	// Redelivery of the same stream sequence (deliveries=2).
-	pi2, isNew2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0")
+	pi2, isNew2 := sess.trackPublish(dur, "$JS.ACK.S.C.2.100.2.0.0", mqttOfferOrigin{})
 	if pi2 != pi1 || isNew2 || !sess.pendingPublish[pi2].transmitted {
 		t.Fatalf("redelivery: pi=%d (want %d) isNew=%v transmitted=%v", pi2, pi1, isNew2, sess.pendingPublish[pi2].transmitted)
 	}

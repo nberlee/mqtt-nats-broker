@@ -241,7 +241,7 @@ func TestMQTTRecoveryUncertainExchangeKeepsItsDelivery(t *testing.T) {
 				t.Fatalf("resolved live: the delivery must be restored with its mapping: present=%v mapped=%v", present, mapped)
 			}
 			f.e.sess.mu.Lock()
-			pi, isNew := f.e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq, 2))
+			pi, isNew := f.e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq, 2), mqttOfferOrigin{})
 			f.e.sess.mu.Unlock()
 			if pi != f.pi || isNew {
 				t.Fatalf("resolved live: the redelivery must return the original identifier %d, got %d (new=%v)", f.pi, pi, isNew)
@@ -332,7 +332,7 @@ func TestMQTTRecoveryDutyHoleKeepsItsDelivery(t *testing.T) {
 				t.Fatalf("resolved live: present=%v mapped=%v", present, mapped)
 			}
 			f.e.sess.mu.Lock()
-			pi, isNew := f.e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq, 2))
+			pi, isNew := f.e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq, 2), mqttOfferOrigin{})
 			f.e.sess.mu.Unlock()
 			if pi != f.pi || isNew {
 				t.Fatalf("resolved live: the redelivery must return identifier %d, got %d (new=%v)", f.pi, pi, isNew)
@@ -516,7 +516,7 @@ func TestMQTTRecoveryGateDrivenPassObservesARemoteCompletion(t *testing.T) {
 	}
 	// New traffic: the allocator withholds and asks for a pass.
 	f.e.sess.mu.Lock()
-	pi, _ := f.e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq+50, 1))
+	pi, _ := f.e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, f.sseq+50, 1), mqttOfferOrigin{})
 	f.e.sess.mu.Unlock()
 	if pi != 0 {
 		t.Fatalf("fixture: at Receive Maximum 1 with the old charge held, new traffic must be withheld, got %d", pi)

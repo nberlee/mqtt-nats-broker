@@ -61,7 +61,7 @@ func TestSourceRepresentedByAPubRelEntryIsNotAdmitted(t *testing.T) {
 	// first — the same session shape with no PUBREL entry admits the offer.
 	t.Run("control: an unrepresented source is admitted", func(t *testing.T) {
 		sess := &mqttSession{maxp: 10, pendingPubRel: map[uint16]*mqttPending{}}
-		got, isNew := sess.trackPublish(srcDur, testInflightAckSubject(srcDur, srcSeq, 2))
+		got, isNew := sess.trackPublish(srcDur, testInflightAckSubject(srcDur, srcSeq, 2), mqttOfferOrigin{})
 		if got == 0 || !isNew {
 			t.Fatalf("fixture: the staged session cannot allocate (pi=%d new=%v), so no decline here would discriminate", got, isNew)
 		}
@@ -84,7 +84,7 @@ func TestSourceRepresentedByAPubRelEntryIsNotAdmitted(t *testing.T) {
 			if sess.sourcePendingPubRelLocked(srcDur, otherSq) {
 				t.Fatalf("the %s represents a source it was not admitted for", tc.name)
 			}
-			got, isNew := sess.trackPublish(srcDur, testInflightAckSubject(srcDur, srcSeq, 2))
+			got, isNew := sess.trackPublish(srcDur, testInflightAckSubject(srcDur, srcSeq, 2), mqttOfferOrigin{})
 			if got != 0 || isNew {
 				t.Fatalf("a re-offer of a source past PUBREC was admitted: pi=%d new=%v", got, isNew)
 			}

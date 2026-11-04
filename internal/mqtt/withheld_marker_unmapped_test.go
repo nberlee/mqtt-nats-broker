@@ -33,6 +33,21 @@ func testWithheldMarkerEnv(t *testing.T) (*testInflightEnv, string) {
 	return e, e.sess.idHash + "_" + nuid.Next()
 }
 
+// testReferenceDurableLocked makes dur a durable the session's record references — an
+// ordinary consumer with its membership — so the marker readers act on its markers
+// (recordReferencedDurablesLocked). sess.mu held.
+func testReferenceDurableLocked(sess *mqttSession, dur string) {
+	filter := "withheld." + dur
+	if sess.cons == nil {
+		sess.cons = make(map[string]*ConsumerConfig)
+	}
+	if sess.subs == nil {
+		sess.subs = make(map[string]byte)
+	}
+	sess.cons[filter] = &ConsumerConfig{Durable: dur}
+	sess.subs[filter] = 1
+}
+
 func testHasWithheldMarker(sess *mqttSession, dur string, sseq uint64) bool {
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -81,8 +96,8 @@ func TestWithheldMarkerIsNeverRecordedBesideAMappedExchange(t *testing.T) {
 func TestMappingASourceConsumesItsWithheldMarker(t *testing.T) {
 	e, dur := testWithheldMarkerEnv(t)
 	e.sess.mu.Lock()
-	e.sess.recordWithheldAttemptLocked(dur, 5, testInflightAckSubject(dur, 5, 1))
-	e.sess.recordWithheldAttemptLocked(dur, 6, testInflightAckSubject(dur, 6, 1))
+	e.sess.recordWithheldAttemptLocked(dur, 5, testInflightAckSubject(dur, 5, 1), mqttOfferOrigin{})
+	e.sess.recordWithheldAttemptLocked(dur, 6, testInflightAckSubject(dur, 6, 1), mqttOfferOrigin{})
 	e.sess.mapSourceLocked(dur, 5, 77)
 	e.sess.mu.Unlock()
 	if testHasWithheldMarker(e.sess, dur, 5) {
@@ -104,9 +119,10 @@ func TestAFreedSlotNAKsTheWithheldNewDeliveryNotAStartedExchange(t *testing.T) {
 
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
+	testReferenceDurableLocked(e.sess, dur)
 	e.sess.maxp = 1
 	e.sess.recordWithheldDeliveryLocked(e.c, sub, testInflightAckSubject(dur, 5, 2))
-	if pi, _ := e.sess.trackPublish(dur, held); pi != 0 {
+	if pi, _ := e.sess.trackPublish(dur, held, mqttOfferOrigin{}); pi != 0 {
 		t.Fatalf("sequence 6 was allocated (pi %d) at a full in-flight cap", pi)
 	}
 	if _, ok := e.sess.deferred[mqttDeferredKey{dur, 6}]; !ok {
@@ -125,7 +141,7 @@ func TestACancelledRegistrationKeepsItsWithheldMarker(t *testing.T) {
 	e, dur := testWithheldMarkerEnv(t)
 	e.sess.mu.Lock()
 	defer e.sess.mu.Unlock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5, 1), mqttOfferOrigin{})
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
 	}
@@ -148,7 +164,7 @@ func TestAllocatingTheLastWithheldSequenceRetiresTheDemand(t *testing.T) {
 	defer e.sess.mu.Unlock()
 	e.sess.maxp = 0
 	reply := testInflightAckSubject(dur, 5, 1)
-	if pi, _ := e.sess.trackPublish(dur, reply); pi != 0 {
+	if pi, _ := e.sess.trackPublish(dur, reply, mqttOfferOrigin{}); pi != 0 {
 		t.Fatalf("allocated pi %d at a zero cap", pi)
 	}
 	if len(e.sess.deferred) != 1 {
@@ -156,7 +172,7 @@ func TestAllocatingTheLastWithheldSequenceRetiresTheDemand(t *testing.T) {
 	}
 	e.sess.custodyDemand = true
 	e.sess.maxp = 100
-	if pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5, 2)); pi == 0 || !isNew {
+	if pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5, 2), mqttOfferOrigin{}); pi == 0 || !isNew {
 		t.Fatalf("the re-offer was not allocated: pi=%d isNew=%v", pi, isNew)
 	}
 	if e.sess.custodyDemand {
@@ -227,9 +243,10 @@ func TestResumeNAKsOnlyTheWithheldSequencesStillUnmapped(t *testing.T) {
 	e, dur := testWithheldMarkerEnv(t)
 	allocated, stillHeld := testInflightAckSubject(dur, 5, 1), testInflightAckSubject(dur, 6, 1)
 	e.sess.mu.Lock()
+	testReferenceDurableLocked(e.sess, dur)
 	e.sess.maxp = 2
-	e.sess.recordWithheldAttemptLocked(dur, 5, allocated)
-	e.sess.recordWithheldAttemptLocked(dur, 6, stillHeld)
+	e.sess.recordWithheldAttemptLocked(dur, 5, allocated, mqttOfferOrigin{})
+	e.sess.recordWithheldAttemptLocked(dur, 6, stillHeld, mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 
 	acks, err := e.s.nrc.SubscribeSync("$JS.ACK." + mqttStreamName + "." + dur + ".>")
@@ -248,7 +265,7 @@ func TestResumeNAKsOnlyTheWithheldSequencesStillUnmapped(t *testing.T) {
 		staged = true
 		e.sess.mu.Lock()
 		defer e.sess.mu.Unlock()
-		if pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5, 2)); pi == 0 || !isNew {
+		if pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, 5, 2), mqttOfferOrigin{}); pi == 0 || !isNew {
 			t.Errorf("fixture: sequence 5 was not allocated in the gap: pi=%d isNew=%v", pi, isNew)
 		}
 	})

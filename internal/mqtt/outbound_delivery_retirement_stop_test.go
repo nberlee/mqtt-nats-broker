@@ -1207,6 +1207,10 @@ func TestDeliveryOfferStartsNoWorkAfterAStoppingFlush(t *testing.T) {
 	settlement := map[string]bool{
 		"submitSourceAck": true, "recordWithheldDelivery": true, "recordWithheldStopped": true,
 		"abandonInflightRegister": true, "mqttTestRestoreGateBlockedHook": true,
+		// The late NAK a withheld decision owes (recordWithheldDeliveryLocked) is that decision's
+		// settlement, published once the lock is released (issue #170).
+		"publishLateNAKs": true,
+
 		"Warnf": true, "Errorf": true, "Debugf": true, "Noticef": true,
 	}
 	callName := func(e ast.Expr) string {

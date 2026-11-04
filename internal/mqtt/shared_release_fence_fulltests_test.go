@@ -104,7 +104,7 @@ func testAdmitInBackground(t *testing.T, r *testSharedAdmitRig, dep *mqttAdmitSh
 	t.Helper()
 	e := r.e
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(r.dur, testInflightAckSubject(r.dur, r.sseq, 1))
+	pi, isNew := e.sess.trackPublish(r.dur, testInflightAckSubject(r.dur, r.sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)

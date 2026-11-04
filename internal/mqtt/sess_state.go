@@ -713,6 +713,30 @@ type mqttSession struct {
 	// consumers' MaxAckPending.
 	deferred map[mqttDeferredKey]string
 
+	// THE RESUME CUTOFF (issue #170). resumeReadBy is the binding connection whose
+	// resendPendingRedelivery has read sess.deferred, set in the same sess.mu section as that
+	// read; it means something only while it equals sess.c. After it, a marker another
+	// connection's offer writes is read by nobody until a freed slot or the next resume, so
+	// the writer NAKs it instead where its drain is issued (recordWithheldAttemptLocked).
+	// lateNAKed is the sources already late-NAKed under this cutoff (at most one each), and
+	// deferredLate tags the markers recorded after it by another connection's offer with
+	// their origin subscription, for that subscription's drain issue to NAK
+	// (handOffLateMarkersLocked). A tag is valid only while its marker still holds the same
+	// reply. All three are cleared whenever the cutoff is set, and with the incarnation.
+	// Process memory only.
+	resumeReadBy *client
+	lateNAKed    map[mqttDeferredKey]struct{}
+	deferredLate map[mqttDeferredKey]mqttLateMarker
+	// testDrainAtDetach is this session's seams around the drain at detach and the resume
+	// cutoff. Nil in production.
+	testDrainAtDetach atomic.Pointer[mqttDrainAtDetachTestHooks]
+	// testPublishWriteEntered observes each PUBLISH execution of this session that passed its
+	// holder's write entry and consumed its execution cell (so its bytes go out), with its
+	// packet identifier and whether the holder's exchange read as answered BEFORE the entry
+	// was decided (an admitted execution reporting true entered after the acknowledgement),
+	// under the connection's write lock. Nil in production.
+	testPublishWriteEntered atomic.Pointer[func(pi uint16, answeredBeforeEntry bool)]
+
 	// "Last used" publish packet identifier (PI). starting point searching for the next available.
 	last_pi uint16
 

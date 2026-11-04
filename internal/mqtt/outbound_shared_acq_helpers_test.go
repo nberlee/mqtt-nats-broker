@@ -54,7 +54,7 @@ func (e *testInflightEnv) trackSharedAdmitted(t *testing.T, dur string, sseq uin
 	e.installServingAuthority(t)
 	reply := testInflightAckSubject(dur, sseq, 1)
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, reply)
+	pi, isNew := e.sess.trackPublish(dur, reply, mqttOfferOrigin{})
 	var dep *mqttAdmitShared
 	if acq, ok := e.sess.sharedAcqForDeliveryLocked(dur); ok {
 		dep = &mqttAdmitShared{Acq: acq, Tenure: e.sess.sharedTenure}
@@ -126,7 +126,7 @@ func (e *testInflightEnv) trackSharedByGroupKey(t *testing.T, dur string, sseq u
 		ref = b.Acq
 	}
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)
@@ -143,7 +143,7 @@ func (e *testInflightEnv) trackSharedByGroupKey(t *testing.T, dur string, sseq u
 func (e *testInflightEnv) trackUnsupportedSharedShape(t *testing.T, dur string, sseq uint64, qos byte) uint16 {
 	t.Helper()
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish(%s/%d): pi=%d isNew=%v", dur, sseq, pi, isNew)

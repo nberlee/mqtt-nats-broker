@@ -63,7 +63,7 @@ func TestMQTTInheritingReplacementCarriesTheLineage(t *testing.T) {
 	// the occupant under a different identifier would never reach the replacement arm --
 	// the conflict is on the subject, and the subject is keyed by the identifier.
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
@@ -122,7 +122,7 @@ func TestMQTTProvenUnsentReplacementStartsAFreshLineage(t *testing.T) {
 	const sseq = uint64(11)
 
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
@@ -183,7 +183,7 @@ func TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage(t *testing.T) {
 	const sseq = uint64(21)
 
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)
@@ -385,7 +385,7 @@ func TestMQTTAmbiguousLandedRegisterInstallsThePersistedLineage(t *testing.T) {
 	const sseq = uint64(3)
 
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+	pi, isNew := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {
 		t.Fatalf("trackPublish: pi=%d isNew=%v", pi, isNew)

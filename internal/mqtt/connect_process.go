@@ -1339,6 +1339,12 @@ restoreSession:
 		// transmission that must not be redelivered on top of itself.
 		resumePubs, resumeRels = mqttPendingRefs(es.pendingPublish), mqttPendingRefs(es.pendingPubRel)
 		es.mu.Unlock()
+		// The displaced predecessor's ordinary delivery subscriptions are DRAINED now, after the
+		// bind and before this connection restores its own (issue #170): their routed offers
+		// reach the predecessor's callbacks, which record them for this connection's resume or,
+		// after its resume read the markers, NAK them. Left to the predecessor's own close, the
+		// offers would be queued behind whatever that close is waiting on.
+		es.drainDisplacedDeliveries(c, ec)
 		if capsule != nil && capsule.action != nil {
 			// A parked disconnect obligation OUTRANKS a live Will, because parking is
 			// what moved the Will off the connection: the action carries it along with
@@ -1376,12 +1382,17 @@ restoreSession:
 		// Spec [MQTT-3.2.2-3]: if the Server does not have stored Session state,
 		// it MUST set Session Present to 0 in the CONNACK packet.
 		es.mu.Lock()
+		displaced := es.c
 		es.c, es.clean = c, sessClean
 		// Same capture as the resident-session bind above (issue #40 unit 1).
 		c.mqtt.tracker = es.leases
 		es.expiryInterval = expiry
 		es.disconnectedAt = 0
 		es.mu.Unlock()
+		// The same drain of a displaced predecessor as the resident-session bind. A session
+		// that did not exist has none, so this is empty by construction; it is here so neither
+		// bind writer can move ownership without it.
+		es.drainDisplacedDeliveries(c, displaced)
 		// Now add this new session into the account sessions
 		asm.addSession(es, true)
 	}

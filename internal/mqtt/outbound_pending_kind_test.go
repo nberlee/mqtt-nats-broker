@@ -408,7 +408,7 @@ func TestPendingClosureAHoldActsForNothing(t *testing.T) {
 				testHoldCopy(t, e, mqttPendingPublishMap, pi)
 			}
 			e.sess.mu.Lock()
-			got, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 2))
+			got, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, sseq, 2), mqttOfferOrigin{})
 			e.sess.mu.Unlock()
 			if isNew || (got == pi) == hold {
 				t.Fatalf("a redelivery onto a %s tracked pi %d (new %v)", label, got, isNew)

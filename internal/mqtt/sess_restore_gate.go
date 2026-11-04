@@ -304,8 +304,9 @@ func (sess *mqttSession) refundSharedCharges(fromSubProto bool, charges []mqttSh
 
 // recordWithheldDelivery records that a QoS 1/2 delivery reached its callback and
 // was NOT transmitted, so a freed slot can NAK it forward instead of waiting out
-// AckWait. (DUP is not this record's to decide: since issue #76 it is the entry's
-// transmitted bit, [MQTT-3.3.1-1].)
+// AckWait, or NAKs it at once where the marker could no longer be read in time
+// (recordWithheldAttemptLocked). (DUP is not this record's to decide: since issue #76 it
+// is the entry's transmitted bit, [MQTT-3.3.1-1].)
 //
 // One helper for both of mqttDeliverQoS12Offer's withholding arms, deliberately: the
 // restore verdict's arm and the post-verdict re-check arm owe the client exactly the
@@ -314,46 +315,25 @@ func (sess *mqttSession) refundSharedCharges(fromSubProto bool, charges []mqttSh
 // No lock held on entry.
 func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, reply string) {
 	sess.mu.Lock()
-	sess.recordWithheldDeliveryLocked(cc, sub, reply)
+	nak := sess.recordWithheldDeliveryLocked(cc, sub, reply)
 	sess.mu.Unlock()
+	sess.publishLateNAKs(nak)
 }
 
 // recordWithheldDeliveryLocked is recordWithheldDelivery for a caller already
-// holding the session lock.
+// holding the session lock. It returns the reply the caller must NAK after it unlocks,
+// or empty: the NAK is never published under sess.mu.
 //
-// sess.c == nil is the refused-CONNECT case: the connection was detached before
-// this delivery woke, and the message is still owed to the SESSION, so the marker
-// belongs to it. A session rebound to a DIFFERENT client is that connection's to
-// account for, not this stale callback's.
-//
-// **That boundary is deliberately best-effort, and this change does not try to make
-// it more.** A refusal wakes its callbacks and then returns, releasing the ownership
-// gate, so a rebind can win that race on ordinary scheduler delay and the woken
-// callback is then stale — the delivery stays owed, nothing records it, and its
-// redelivery waits out AckWait instead of being NAKed forward.
-//
-// Two remedies were built and withdrawn, across three holistic rounds that each
-// faulted the previous one:
-//
-//   - DRAINING the woken callbacks before the refusal returns. A counter cannot be
-//     an admission barrier: a callback can be descheduled between loading the
-//     verdict and registering, or arrive after the drain has observed zero, and
-//     delivery interest stays live until teardown.
-//   - Deciding on a positive fact about the DURABLE instead of the client. That
-//     removes the rebind race but not the LATENESS — a descheduled callback can
-//     still record after the redelivery has gone out — and the set of places a
-//     durable can live is neither complete (a record-sourced shared membership's
-//     durable exists only through `sharedSubs` and an in-flight config, because
-//     `addJSConsToSess` runs after the whole filter succeeds) nor precise (a drain
-//     proves the durable survives, not that a given sequence is owed).
-//
-// So the guarantee is withdrawn rather than approximated a third time. HEAD already
-// treats this boundary as "defensive breadth rather than a pinned behavior" and
-// names the same consequence, and the population that reaches it through a REFUSED
-// resume is new to this change. The DUP flag is not at stake (since issue #76 it is the
-// entry's transmitted bit); the lost prompt NAK is, and it is stated as this change's
-// own residual in `docs/CONFORMANCE.md`. Closing it needs a real admission boundary, which is a
-// mechanism this item does not justify.
+// THE CONNECTION THE OFFER REACHED IS ITS ORIGIN, and the writer decides from it (issue
+// #170). sess.c == nil is the detached case: the offer is owed to the SESSION and the
+// marker belongs to it. A session already rebound to a DIFFERENT connection is no longer a
+// reason to record nothing: the predecessor's subscription is drained at the detach
+// (drainDeliveriesAtDetach), so its routed offers reach this callback after the rebind,
+// and each is still owed. recordWithheldAttemptLocked records it for the successor's resume
+// to read, or, once that resume has read the markers and this subscription's drain is
+// issued, reports a late NAK. Only a SAME-INCARNATION callback reaches here — the lease
+// (leasedHandler) and recordWithheldStopped's tracker check refuse a retired one — so a
+// marker never lands on a re-minted session (issue #40's property P).
 //
 // **A marker is written only for a delivery that is still OWED**, and the
 // predicate is `!closed || phaseOwned`. Both halves are load-bearing, and this
@@ -392,27 +372,33 @@ func (sess *mqttSession) recordWithheldDelivery(cc *client, sub *subscription, r
 // so a caller that recorded unconditionally would leave exactly the stranded
 // marker the undo exists to prevent.
 //
+// A marker that outlives its durable's ownership anyway — a predecessor's offer decided
+// after a teardown, a drain retirement or a shared release removed the durable from the
+// record — is skipped by every marker reader (markerOwnedLocked), never acted on, and
+// deleted by the first reader pass that finds its absence settled.
+//
 // sess.mu held on entry.
-func (sess *mqttSession) recordWithheldDeliveryLocked(cc *client, sub *subscription, reply string) {
-	if sess.c != cc && sess.c != nil {
-		return
-	}
+func (sess *mqttSession) recordWithheldDeliveryLocked(cc *client, sub *subscription, reply string) (lateNAK string) {
 	if sub == nil || sub.mqtt == nil || sub.mqtt.jsDur == _EMPTY_ {
-		return
+		return _EMPTY_
 	}
 	if sub.mqtt.closed && !sub.mqtt.phaseOwned {
-		return
+		return _EMPTY_
 	}
 	sseq, _, _, _, _ := ackReplyInfo(reply)
 	if sseq == 0 {
-		return
+		return _EMPTY_
 	}
 	// A re-offer of a sequence that already has an exchange is that exchange's to replay, and
 	// records nothing (issue #162): the writer refuses a mapped sequence.
-	recorded := sess.recordWithheldAttemptLocked(sub.mqtt.jsDur, sseq, reply)
+	outcome := sess.recordWithheldAttemptLocked(sub.mqtt.jsDur, sseq, reply, mqttOfferOrigin{sub: sub, cc: cc})
 	if h := mqttTestWithheldDecidedV.Load(); h != nil {
-		(*h)(sub.mqtt.jsDur, sseq, recorded)
+		(*h)(sub.mqtt.jsDur, sseq, outcome == mqttWithheldRecorded)
 	}
+	if outcome == mqttWithheldNAKOwed {
+		return reply
+	}
+	return _EMPTY_
 }
 
 // mqttTestWithheldDecidedV observes recordWithheldDeliveryLocked's decision for one offer, under

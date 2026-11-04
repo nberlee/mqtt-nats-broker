@@ -81,7 +81,7 @@ func newT36Fix(t *testing.T, clientID string) *t36Fix {
 func (f *t36Fix) track(t *testing.T) {
 	t.Helper()
 	f.e.sess.mu.Lock()
-	pi, isNew := f.e.sess.trackPublish(f.dur, testInflightAckSubject(f.dur, f.sseq, 1))
+	pi, isNew := f.e.sess.trackPublish(f.dur, testInflightAckSubject(f.dur, f.sseq, 1), mqttOfferOrigin{})
 	var nonce string
 	if p := f.e.sess.pendingPublish[pi]; p != nil {
 		nonce = p.regNonce

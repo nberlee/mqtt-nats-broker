@@ -3143,24 +3143,27 @@ Residuals:
     delivery race the CONNACK write and reach the client ahead of it, violating
     [MQTT-3.2.0-1]. For a **plain** filter the same drop happens, because no raw
     subscription exists in that window at all.
-  - **A QoS 1/2 delivery withheld by a REFUSED resume can lose its
-    never-transmitted marker to a rebind, and then waits out AckWait.** The refusal
-    wakes every withheld delivery so it can record itself, but it then returns and
-    releases the session's ownership gate, so a reconnect can bind before a woken
-    callback runs. That callback is stale — the marker is scoped to the connection that
-    withheld the delivery — so nothing records it. The message stays owed and is
-    redelivered, but it **waits for AckWait instead of being NAKed promptly forward**.
+  - **A QoS 1/2 delivery withheld by a REFUSED resume can still wait out AckWait.** The
+    refusal wakes every withheld delivery so it can record itself, then releases the
+    session's ownership gate, so a reconnect can bind before a woken callback runs. On a
+    delivery subscription the refused connection's close DRAINS, such a callback records
+    its marker for the successor's resume, or is NAKed by its writer
+    ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)). A
+    reconciliation subscription the refusal's own cleanup removes (`unsubscribePhase`,
+    `sweepUnadoptedPhaseSubs`) is unsubscribed, never drained: a callback of it woken after
+    the successor's resume read the markers records a marker that is neither read by that
+    resume nor NAKed by a drain handoff, and it waits for a freed slot, the next resume or
+    AckWait.
     DUP is derived from the durable unsent marker at one site, so a stale woken callback
     cannot make a first transmission carry it
     ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)).
-    The same delay follows without any rebind when the push never reaches a callback:
+    It still waits for AckWait when the push never reaches a callback:
     the refusal's sweep unsubscribes the reconciliation subscription it did not adopt, and
     the NATS client discards a delivery still queued on that subscription without
     dispatching it. The durable survives and the message stays owed, but nothing was
     withheld to record, so it too waits for AckWait.
-    The lost prompt NAK and the AckWait delay are
-    [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s
-    own residual; closing it needs a real callback-admission boundary, which is not built.
+    This sweep is an unsubscribe, not a drain, and its AckWait delay is
+    [issue #54](https://github.com/nberlee/mqtt-nats-broker/issues/54)'s own residual.
   - **A shared QoS 1/2 delivery loses that marker even without the rebind race.**
     The ordinary close of the refused connection runs `purgeSharedPending`, which
     removes withheld markers for shared durables — deliberate behaviour that stops a
@@ -4253,29 +4256,56 @@ the exchange continues only when it reconnects. A 3.1.1 connection still gets
 the AckWait resend. The synchronous rollback in the PUBREC handler ends the
 connection, so it has no such wait.
 
-### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
+### A QoS 1 publish racing its subscriber's detach can still wait for AckWait
 
-[issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170), an alpha blocker.
-Pre-existing and independent of the transport. A v5 client with a nonzero Session Expiry
-Interval holds a QoS 1 subscription and sends DISCONNECT, closing at once (paho.golang's
-`Disconnect` does). Another client publishes QoS 1 to the topic immediately, and the first
-reconnects with Clean Start 0. Session Present is 1, but in about half the runs the
-message published in that window arrives only around 30 s after the resume, which is the
-consumer's AckWait, instead of being resent with the session [MQTT-4.4.0-1]. It is
-latency, not loss: the message is redelivered. Measured over plain TCP as well (3 of 6
-runs not delivered within 10 s, one arrival at 30.02 s); with a 1 s pause between the
-DISCONNECT and the publish, 6 of 6 arrive within about 150 ms. The 30 s is the observed
-delay, not a proven bound.
+[issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170). A v5 client with a
+nonzero Session Expiry Interval holds a QoS 1 subscription and sends DISCONNECT, closing
+at once (paho.golang's `Disconnect` does); another client publishes QoS 1 to the topic
+immediately; the first resumes with Clean Start 0. The broker's own loss of that offer is
+fixed: the ordinary QoS 1/2 delivery subscription is DRAINED at detach rather than
+unsubscribed, so every offer the server routed to it before the UNSUB reaches a callback,
+and a predecessor's offer is either read by the successor's resume or NAKed by its writer
+(`docs/ARCHITECTURE.md`, "Delivery subscriptions are drained at detach"). Measured with
+that witness: 6 of 10 rounds waited for AckWait before the change; 7 of 36 still do. In
+the failing rounds traced, no offer reached any broker callback. These remain:
 
-The mechanism is untraced. A plausible one is that the publish is delivered to the old
-connection while its teardown runs, and the resume does not count it as unacknowledged.
-It is not [issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120),
-which is a packet identifier held by an undrained durable PUBLISH
-action. paho 3.1.1's `Disconnect(100)` waits before closing, which narrows the window
-without closing it: `TestWSPahoV311` met it in CI on 2026-10-26. `TestWSPahoV311` and
-`TestWSPahoV5Session` both wait for the old connection's deregistration before
-publishing, because "published while offline" means after the broker processed the
-DISCONNECT, so they deliberately do not cover this window.
+- **A push JetStream routes to no subscriber.** nats-server's push consumer learns of lost
+  interest asynchronously, so a message selected under stale interest, or routed after the
+  UNSUB, reaches no subscriber. Its `didNotDeliver` does not requeue the sequence in push
+  mode (the pull branch does), so the message is redelivered only at AckWait although the
+  server knows it was not delivered. Pinned v2.15.2 and `main` alike
+  (`docs/known-upstream-issues.md`, PUSH-DIDNOTDELIVER). The broker never sees a reply
+  subject for it. The remaining failing rounds are consistent with this; they are not
+  individually attributed.
+- **A service-connection reconnect around a drain.** nats.go suppresses the UNSUB while
+  reconnecting, re-sends SUB for a draining subscription and later removes it locally
+  without an UNSUB (`docs/known-upstream-issues.md`, DRAIN-ACROSS-RECONNECT). The server
+  keeps that interest until the next reconnect: an offline session's messages are pushed
+  to it and discarded on every AckWait cycle. A late NAK published across such a reconnect
+  can reach that interest (discarded, AckWait) or the still-draining predecessor, whose
+  second decision records a marker instead of NAKing again (at most one late NAK per
+  source per resume). No message is lost; its prompt redelivery is.
+- **A late NAK can duplicate.** A NAK decided before the successor mapped the same,
+  already routed offer is published after it: one extra copy with the same packet
+  identifier and DUP set.
+- **An allocation already in flight at the detach** (registration pending, or an open send
+  section) is not replayed by the resume and settles on its own path or at AckWait.
+- **A marker for a durable the session no longer references** is skipped by every reader
+  and stays in memory until the first reader pass at which the absence is settled (no
+  record transaction open, no record write unresolved), a purge of that durable or a
+  clear. A predecessor queue held across a reconnect-resent subscription can recreate
+  such markers beyond the consumer's MaxAckPending.
+- **Shared, session-affine QoS 2 and PUBREL deliveries** keep the unsubscribe at detach,
+  and a server shutdown unsubscribes every delivery subscription not already being
+  drained.
+- **A rejoined shared group** another member kept alive, rejoined before any settled
+  reader pass pruned the old marker, makes it eligible again; its NAK asks the group for
+  redelivery (one extra offer at most). After a settled pass the marker is gone and that
+  message is re-offered at AckWait.
+
+`TestWSPahoV311` and `TestWSPahoV5Session` still wait for the old connection's
+deregistration before publishing, because "published while offline" means after the broker
+processed the DISCONNECT.
 
 ### No Local is decided when the message is owned
 

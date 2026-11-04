@@ -683,7 +683,7 @@ func TestCancellationBeforeOpeningLeavesNoUnsettledPlaceholder(t *testing.T) {
 			e.admissionPrerequisites(t, dur, 1)
 			e.acceptUnderServingAuthority(t)
 			e.sess.mu.Lock()
-			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1))
+			pi, _ := e.sess.trackPublish(dur, testInflightAckSubject(dur, sseq, 1), mqttOfferOrigin{})
 			nonce := e.sess.pendingPublish[pi].regNonce
 			gen := e.sess.gen
 			e.sess.mu.Unlock()

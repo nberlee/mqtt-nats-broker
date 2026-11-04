@@ -813,10 +813,9 @@ there below are recorded in it.
   decided by a per-message stamp taken at ownership. Fixed 2026-10-14;
   [issue #119](https://github.com/nberlee/mqtt-nats-broker/issues/119).
 
-- [x] Moved `TestMQTTRedeliveryAckWait`'s untraced intermittent failure to the
-  [verification ledger](https://github.com/nberlee/mqtt-nats-broker/issues/136); its
-  corrective work is owed before CI can be green. Never loosen the assertion; treat it as
-  pre-existing when comparing suites. Moved 2026-10-12;
+- [x] Moved `TestMQTTRedeliveryAckWait`'s intermittent failure to the
+  [verification ledger](https://github.com/nberlee/mqtt-nats-broker/issues/136) on
+  2026-10-12; traced and closed by the §0.5 QoS 1 AckWait item on 2026-11-04;
   [issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120).
 
 - [x] Moved `TestDispatcherIsFairUnderContinuousHints`'s untraced intermittent failure
@@ -918,15 +917,12 @@ blocker: the gate's "every unconditional alpha blocker" box covers it.
 Added 2026-11-04 at the user's request: supported-path findings that no unchecked box
 carried, so document order never reached them. Each is an alpha blocker.
 
-- [ ] **Trace and fix the two QoS 1 waits for AckWait.**
-  [issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120):
-  `TestMQTTRedeliveryAckWait` fails intermittently with a packet identifier held by an
-  undrained durable PUBLISH action; its §0.4 box moved it to the verification ledger, and
-  its corrective work is owed before CI can be green.
-  [issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170): a QoS 1 publish
-  racing its subscriber's DISCONNECT is delivered only after AckWait in about half the
-  runs. Both mechanisms are untraced; investigate them together, since both end in a QoS
-  1 message waiting for AckWait. Never loosen either assertion.
+- [x] Traced and fixed the two QoS 1 waits for AckWait: a detaching connection's delivery
+  subscription is drained and a predecessor's offer is recorded or NAKed
+  ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)); the
+  `TestMQTTRedeliveryAckWait` map failure was fixed by 21eca60 and its stalled-PUBACK
+  read is fixed ([issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120)).
+  Done 2026-11-04.
 
 - [ ] Refuse a pre-release delayed-drain record shape instead of repairing it:
   `mqttPersistedDrainSeq.RegSeq` still repairs a record written before the field existed,

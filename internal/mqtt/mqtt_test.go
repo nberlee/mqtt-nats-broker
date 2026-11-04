@@ -2379,7 +2379,7 @@ func TestMQTTTrackPendingOverrun(t *testing.T) {
 	for i := 1; i <= 0xFFFF; i++ {
 		sess.pendingPublish[uint16(i)] = p
 	}
-	pi, _ = sess.trackPublish("test", "test")
+	pi, _ = sess.trackPublish("test", "test", mqttOfferOrigin{})
 	if pi != 0 {
 		t.Fatalf("Expected 0, got %v", pi)
 	}
@@ -3853,6 +3853,42 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 	testMQTTSub(t, 1, c, r, []*mqttFilter{{filter: "foo", qos: 1}}, []byte{1})
 
+	// Every PUBLISH execution of identifier 1 that passed its write entry, so its bytes went
+	// out. AckWait (250 ms) keeps retransmitting foo1 until the PUBACK is processed, and an
+	// execution that entered before that is a legitimate retransmission still on its way. The
+	// ordering is CHECKED, not assumed: each execution reports whether its exchange already
+	// read as answered before its entry was decided, and one that did is an execution the
+	// PUBACK should have refused, counted as a violation and never as an owed frame.
+	subc := testMQTTGetClient(t, s, "sub")
+	subc.mu.Lock()
+	subSess := subc.mqtt.sess
+	subc.mu.Unlock()
+	var foo1Executions atomic.Int64
+	var afterAnswerMu sync.Mutex
+	var enteredAfterAnswer []uint16
+	countFoo1 := func(pi uint16, answeredBeforeEntry bool) {
+		if answeredBeforeEntry {
+			afterAnswerMu.Lock()
+			enteredAfterAnswer = append(enteredAfterAnswer, pi)
+			afterAnswerMu.Unlock()
+			return
+		}
+		if pi == 1 {
+			foo1Executions.Add(1)
+		}
+	}
+	subSess.testPublishWriteEntered.Store(&countFoo1)
+	defer subSess.testPublishWriteEntered.Store(nil)
+	checkNoEntryAfterAnswer := func() {
+		t.Helper()
+		afterAnswerMu.Lock()
+		defer afterAnswerMu.Unlock()
+		if len(enteredAfterAnswer) != 0 {
+			t.Errorf("PUBLISH executions of identifiers %v entered their write after their exchange was answered",
+				enteredAfterAnswer)
+		}
+	}
+
 	cipub := &mqttConnInfo{clientID: "pub", cleanSess: true}
 	cp, rp := testMQTTConnect(t, cipub, o.MQTT.Host, o.MQTT.Port)
 	defer cp.Close()
@@ -3877,14 +3913,50 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 	}
 	// Ack first message
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c, 1)
-	// Redelivery should only be for second message now
-	for i := 0; i < 2; i++ {
-		flags := mqttPubQos1 | mqttPubFlagDup
-		pi := testMQTTCheckPubMsgNoAck(t, c, r, "foo", flags, []byte("foo2"))
+	// The foo1 retransmissions still owed to the wire are exactly those that entered their write
+	// before the PUBACK was processed, less the two already read: once the exchange is gone and
+	// its section closed, no further execution of identifier 1 can enter (the PUBACK refuses it at
+	// write entry), so the count is final.
+	for deadline := time.Now().Add(testMQTTTimeout); ; time.Sleep(2 * time.Millisecond) {
+		subSess.mu.Lock()
+		gone := subSess.pendingPublish[1] == nil
+		subSess.mu.Unlock()
+		if gone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the PUBACK of identifier 1 was never processed")
+		}
+	}
+	testMQTTWaitSendSectionClosed(t, subSess, 1)
+	owedFoo1 := foo1Executions.Load() - 2
+	// Redelivery should only be for second message now. A foo1 frame is one of the owed
+	// retransmissions (in any interleaving with foo2), and one beyond them fails.
+	for foo2 := 0; foo2 < 2; {
+		flags, pi, _, payload := testMQTTGetPubMsgEx(t, c, r, "foo", nil)
+		if string(payload) == "foo1" {
+			if owedFoo1 <= 0 {
+				t.Fatalf("Expected payload foo2, got foo1 beyond the %d retransmissions that entered "+
+					"their write before the PUBACK", foo1Executions.Load()-2)
+			}
+			owedFoo1--
+			if flags != mqttPubQos1|mqttPubFlagDup || pi != 1 {
+				t.Fatalf("Unexpected owed foo1 retransmission: flags %x, pi %v", flags, pi)
+			}
+			continue
+		}
+		if string(payload) != "foo2" {
+			t.Fatalf("Expected payload foo2, got %q", payload)
+		}
+		if flags != mqttPubQos1|mqttPubFlagDup {
+			t.Fatalf("Expected flags to be %x, got %x", mqttPubQos1|mqttPubFlagDup, flags)
+		}
 		if pi != 2 {
 			t.Fatalf("Unexpected pi to be 2, got %v", pi)
 		}
+		foo2++
 	}
+	checkNoEntryAfterAnswer()
 
 	// Restart client, should receive second message with pi==2
 	c.Close()
@@ -3923,6 +3995,7 @@ func TestMQTTRedeliveryAckWait(t *testing.T) {
 	if lpi != 0 || lsseq != 0 {
 		t.Fatalf("Maps should be empty, got %v, %v", lpi, lsseq)
 	}
+	checkNoEntryAfterAnswer()
 }
 
 // [MQTT-4.4.0-1] On reconnect with CleanSession=0, the server must re-send

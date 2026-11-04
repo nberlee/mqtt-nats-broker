@@ -302,7 +302,7 @@ func TestResumeDropsAPendingTombstoneWithoutAnExchange(t *testing.T) {
 	testReadyForRealPubRelDelivery(t, e)
 	e.acceptUnderServingAuthority(t)
 	e.sess.mu.Lock()
-	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1))
+	pi, isNew := e.sess.trackPublish(testRealPubRelSrcDur, testInflightAckSubject(testRealPubRelSrcDur, testRealPubRelSrcSeq, 1), mqttOfferOrigin{})
 	nonce := e.sess.pendingPublish[pi].regNonce
 	e.sess.mu.Unlock()
 	if pi == 0 || !isNew {

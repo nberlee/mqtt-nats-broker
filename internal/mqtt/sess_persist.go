@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -40,73 +39,12 @@ import (
 //     written with no matching Subs entry. The level-up sid "<X> fwc" maps back
 //     to the main membership key "<X>.>". Spec5 [4.8.2].
 func (sess *mqttSession) buildPersistedSessionLocked() mqttPersistedSession {
-	var cons map[string]*ConsumerConfig
-	// The retained adoptions this record must name in Drains, discovered from CURRENT
-	// state — the membership key's absence and the exact consumer identity — never from
-	// what this packet did. That is what makes duplicate occurrences of one filter, the
-	// QoS 0 exclusion and fork repair's adoption all resolve without a special case.
-	var adopted map[string]*mqttDrain
-	if len(sess.cons) > 0 {
-		cons = make(map[string]*ConsumerConfig, len(sess.cons))
-		for sid, cc := range sess.cons {
-			if cc.DeliverGroup != _EMPTY_ {
-				continue
-			}
-			key := sid
-			if strings.HasSuffix(key, mqttMultiLevelSidSuffix) {
-				key = strings.TrimSuffix(key, mqttMultiLevelSidSuffix) + ".>"
-			}
-			if _, ok := sess.subs[key]; !ok {
-				// No membership, so this consumer is not persisted in Cons — but if an
-				// adoption is holding it, the durable must still be NAMED, in Drains,
-				// or the next record leaves it referenced nowhere and a sibling sweep
-				// deletes it with its started deliveries (I8). Collected here and
-				// written below, where Drains is built.
-				if d := sess.adoptedDrainForLocked(sid); d != nil {
-					if adopted == nil {
-						adopted = make(map[string]*mqttDrain, 1)
-					}
-					adopted[sid] = d
-				}
-				continue
-			}
-			cons[sid] = cc
-		}
-		if len(cons) == 0 {
-			cons = nil
-		}
-	}
-	// Every drain is persisted, staged ones included: the staging packet's save is
-	// exactly what COMMITS a staged drain, and it must carry the membership change and
-	// the drain that replaces the consumer in the same record — either the filter is
-	// gone (or down at QoS 0) and the drain exists, or neither is persisted (I4). A failed save rolls both
-	// back in memory, so nothing intermediate is ever visible.
-	//
-	// Omission is owned by the RETIREMENT TRANSITION, and d.removalMarked is the only
-	// thing that authorizes it. I3's rule stands unchanged — the save that clears the last
-	// claim is the save that removes the entry, so the durable is unreferenced BEFORE it is
-	// deleted — but it is a property of that transition, which sets the mark before its own
-	// save, not of the claim count. Reading the count here instead let every other writer
-	// un-name a durable whose obligations were not yet established, and let an omission
-	// land while an unresolved reservation could still belong to it, which a sibling sweep
-	// then acts on.
+	sel := sess.recordSelectionLocked()
+	cons := sel.cons
 	var drains map[string]*mqttPersistedDrain
-	if len(sess.drains) > 0 {
-		for sid, d := range sess.drains {
-			if d.removalMarked {
-				continue
-			}
-			if drains == nil {
-				drains = make(map[string]*mqttPersistedDrain, len(sess.drains))
-			}
-			drains[sid] = d.persisted()
-		}
-	}
-	// The retained adoptions, named alongside the active drains and never instead of them:
-	// an adopted sid is absent from sess.drains by construction, so these cannot collide.
-	for sid, d := range adopted {
+	for sid, d := range sel.drains {
 		if drains == nil {
-			drains = make(map[string]*mqttPersistedDrain, len(adopted))
+			drains = make(map[string]*mqttPersistedDrain, len(sel.drains))
 		}
 		drains[sid] = d.persisted()
 	}
