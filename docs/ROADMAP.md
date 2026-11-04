@@ -1165,6 +1165,14 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
     restore direct slot-only coverage for the surviving arms or delete those arms with the
     mechanism. This is an evidence gap, not a demonstrated behaviour regression.
 
+  - [issue #166](https://github.com/nberlee/mqtt-nats-broker/issues/166): the
+    experimental `TestQ2AffineConsumerDeletesAreInventoried` fails closed on two
+    consumer deletes whose stream it cannot resolve statically,
+    `mqttSession.deleteRetiredConsumer` (source retirement, `1f9501f`) and
+    `mqttAccountSessionManager.deleteRecoveryConsumer` (recovery-owner retirement,
+    `764e22c`). Whether either can reach an affine `$MQTT_out` consumer is open; a guard
+    red, not a demonstrated behaviour regression.
+
   Before promotion, re-audit the current code rather than assuming this inventory stayed
   complete. Settle the affine persisted-data model and stream topology first, then declare
   the compatibility boundary that begins with the first release which actually supports
