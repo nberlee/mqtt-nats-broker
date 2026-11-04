@@ -11331,14 +11331,23 @@ own dispatcher row and the per-pass bound holds:
 that cannot be read was NOT reached by any witness for this population, so no disposition
 was built for it: the source's offers stay withheld (never doubled) and the record is
 retried at its backoff. A same-generation resume whose recovery restores the
-allocation's own entry supersedes the record: `trackPublish` then retires it and serves
-the restored entry rather than refusing the offer, and the dispatcher's next unit retires
-it too; this retirement is not route-witnessed (W5b's same-object-resume subtest
-skips). Otherwise only a generation change drops the records, with the ledger. W5b,
+allocation's own entry supersedes the record: `trackPublish` or the dispatcher's next
+unit, whichever runs first, retires it, and the restored entry serves the offer rather
+than the offer being refused. Recovery restores that entry only over a source that can
+still re-offer the delivery; W5b's same-object-resume subtest witnesses it over a live
+source. Otherwise only a generation change drops the records, with the ledger. W5b,
 with the record in place, observes the re-offer withheld, the first admission settled
-and withdrawn on its standing marker, then the source re-offered and admitted once;
-across a cold peer resume (`cold-peer-resume`), the peer's recovery withdraws the landed
-never-sent obligation itself and at most one un-ended exchange exists throughout.
+and withdrawn on its standing marker, then the source re-offered and admitted once.
+
+**Across a cold peer resume** the record is A's memory and dies with A. The peer's
+recovery classifies the landed never-sent obligation by its source, as it classifies any
+proven-unsent register: over a gone source (Complete or Lost) it withdraws it
+(`WithdrawnUnsent`), and a subsequent offer allocates afresh and requires a new
+admission; over a source that may still re-offer (Live, or Unknown) it restores an unsent
+acting entry, and the offer continues it under the same identifier. At most one un-ended
+exchange exists throughout. `TestContinuityColdPeerResumeFollowsTheSource` witnesses the
+gone and Live arms
+([issue #151](https://github.com/nberlee/mqtt-nats-broker/issues/151)).
 
 ### A shared exchange depends on its exact acquisition
 

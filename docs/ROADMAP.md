@@ -1830,11 +1830,9 @@ them in order where a later lint change depends on an earlier cleanup.
   teardown reap, with the sweep's closure licence and the displacement arm. Done 2026-11-03
   ([issue #148](https://github.com/nberlee/mqtt-nats-broker/issues/148)).
 
-- [ ] Settle what a cold peer resume does with a landed never-sent obligation: the
-  architecture says the peer's recovery withdraws it, `outbound_admit_continuity_test.go`
-  says it restores and continues it and asserts neither. Establish the behavior in code,
-  then align the doc and the test
-  ([issue #151](https://github.com/nberlee/mqtt-nats-broker/issues/151)).
+- [x] Settle what a cold peer resume does with a landed never-sent obligation: withdrawn
+  over a gone source, restored and continued over a live one, both arms witnessed. Done
+  2026-11-04 ([issue #151](https://github.com/nberlee/mqtt-nats-broker/issues/151)).
 
 ### Before the first push
 

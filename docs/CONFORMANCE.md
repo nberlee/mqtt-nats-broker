@@ -795,15 +795,18 @@ limits:
   for a landed never-sent obligation (register at `publish`, no token, exchange at
   `Publish`), withdraws it under the admitting connection's recorded licence (a successor's
   boundary refuses it, and the successor's recovery decides) and then NAKs the source, which
-  is re-offered and admitted once (witnessed by W5b, also across a cold peer resume).
+  is re-offered and admitted once (witnessed by W5b). Across a cold peer resume the record
+  dies with its broker and the peer's recovery decides by the source: it withdraws the
+  obligation over a gone source and restores and continues it over a live one
+  ([issue #151](https://github.com/nberlee/mqtt-nats-broker/issues/151)).
   **Residual:** for every other state of that first admission (possibly attempted, past
   PUBREC, an action token, unreadable) no disposition was built, because no
   witness reached one, so the refusal STANDS: the source delivery's offers are withheld
   (never delivered twice) while the record is retried at its backoff. A resume that
   restores this allocation's own entry (same identifier, nonce and source delivery)
-  supersedes the record: `trackPublish` retires it and serves the restored entry, and the
-  dispatcher's next unit retires it too (stated from the code; not route-witnessed, as
-  the same-object-resume subtest skips). Otherwise the record is dropped only with its
+  supersedes the record: `trackPublish` or the dispatcher's next unit, whichever runs
+  first, retires it, and the restored entry serves the offer (witnessed over a live source
+  by W5b's same-object-resume subtest). Otherwise the record is dropped only with its
   generation (a discard or a clean start). Only the ledger-admitted classes (ordinary and
   shared) install one; a retained delivery and an experimental affine one install no
   record (chapter P keeps the affine route's own behaviour).
