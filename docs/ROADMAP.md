@@ -915,6 +915,29 @@ blocker: the gate's "every unconditional alpha blocker" box covers it.
   ([issue #65](https://github.com/nberlee/mqtt-nats-broker/issues/65)), and closure
   certificates are joined at graceful shutdown. Done 2026-10-26.
 
+Added 2026-11-04 at the user's request: supported-path findings that no unchecked box
+carried, so document order never reached them. Each is an alpha blocker.
+
+- [ ] **Trace and fix the two QoS 1 waits for AckWait.**
+  [issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120):
+  `TestMQTTRedeliveryAckWait` fails intermittently with a packet identifier held by an
+  undrained durable PUBLISH action; its §0.4 box moved it to the verification ledger, and
+  its corrective work is owed before CI can be green.
+  [issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170): a QoS 1 publish
+  racing its subscriber's DISCONNECT is delivered only after AckWait in about half the
+  runs. Both mechanisms are untraced; investigate them together, since both end in a QoS
+  1 message waiting for AckWait. Never loosen either assertion.
+
+- [ ] Refuse a pre-release delayed-drain record shape instead of repairing it:
+  `mqttPersistedDrainSeq.RegSeq` still repairs a record written before the field existed,
+  against the compatibility boundary. A zero `RegSeq` is also a value the broker writes
+  today, so the fix must first tell a shape the broker no longer writes from a current
+  zero ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
+
+- [ ] Remove the `nonce` parameter that `reapRegisterGatedOutcome` never reads and
+  `reapRegisterWithVerdictGated` only forwards to it, from both and from their callers
+  ([issue #172](https://github.com/nberlee/mqtt-nats-broker/issues/172)).
+
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription
@@ -1119,6 +1142,11 @@ run — unexplained, recorded as such, and NOT claimed as a repair.
   one item owns all changes needed to make the experimental path supportable again. New
   affine-only regressions discovered by unrelated roadmap work are appended here rather
   than filed as alpha blockers or folded into that work.
+
+  The decision itself is
+  [issue #173](https://github.com/nberlee/mqtt-nats-broker/issues/173): retire the
+  experiment, keep it parked, or invest. It is the owner's, made after the first alpha
+  release.
 
   The starting inventory is:
 
@@ -1380,6 +1408,16 @@ documentation, and release artifacts. Make them before creating those surfaces.
   `VoidedRegs` (`voided_regs`) and `voidedRegNonces`, with no migration and no dual-key
   reader; a record carrying `cancelled_regs` decodes with no verdicts. Decided and done
   2026-10-17.
+
+### Default stream replica count
+
+- [ ] Decide what `-stream-replicas 0` means
+  ([issue #171](https://github.com/nberlee/mqtt-nats-broker/issues/171)). `0` creates new
+  streams with one replica and checks no existing stream's count, because the broker
+  cannot see the JetStream cluster's size, so a clustered deployment left at the default
+  has unreplicated broker state. Options: keep `0` as documented; discover the cluster's
+  capacity (the service identity has no `$SYS` access, so this needs a JetStream API
+  answer that carries it); or refuse `0` when the JetStream is clustered.
 
 ### Memory-limit strategy
 
@@ -2130,31 +2168,6 @@ follow-ups](https://github.com/nberlee/mqtt-nats-broker/issues/50).
   HERE can observe rather than a conformance residual. Closing it needs a seam in
   nats-server, so an upstream issue is the likelier route than anything in this
   repository.
-
-- [ ] **`reapRegisterWithVerdictGated`'s `nonce` parameter is dead.** Filed 2026-09-06 by
-  the [issue #92](https://github.com/nberlee/mqtt-nats-broker/issues/92) disposition. The
-  body gates on `ref.matchesRecord(cur)` and forgets against `cur.Nonce` from its own
-  fresh load (`internal/mqtt/inflight_register.go`), so the parameter is never read, while
-  every caller passes one, which reads as authority the code does not use. Either remove
-  the parameter and fix its callers, or state in the comment why it is kept. A signature
-  change touching every caller belongs with the suite run it deserves.
-
-- [ ] Decide what `-stream-replicas 0` means. Filed 2026-10-26 by the wiki item, which
-  corrected the documentation: `0` creates new streams with one replica and checks no
-  existing stream's count, because the broker cannot see the JetStream cluster's size
-  (`mqttDetermineReplicas` reads `Options.Routes`, which the command never sets). On a
-  clustered NATS left at the default, the broker state has no replication. Options: keep
-  `0` as documented; discover the cluster's capacity (the service identity has no `$SYS`
-  access, so this needs a JetStream API answer that carries it); or refuse `0` when the
-  JetStream is clustered. Not an alpha blocker: the setting works when given, and
-  `docs/CONFORMANCE.md` states the limitation.
-
-- [ ] Refuse a pre-release delayed-drain record shape instead of repairing it:
-  `mqttPersistedDrainSeq.RegSeq` still repairs a record written before the field existed,
-  against the compatibility boundary. A zero `RegSeq` is also a value the broker writes
-  today, so the fix must first tell a shape the broker no longer writes from a current
-  zero. Not an alpha blocker
-  ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
 
 - [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
   A schedule may publish only into its own stream, so the ADR must preserve

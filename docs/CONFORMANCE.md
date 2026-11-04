@@ -4255,6 +4255,7 @@ connection, so it has no such wait.
 
 ### A QoS 1 publish racing its subscriber's DISCONNECT waits for AckWait
 
+[issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170), an alpha blocker.
 Pre-existing and independent of the transport. A v5 client with a nonzero Session Expiry
 Interval holds a QoS 1 subscription and sends DISCONNECT, closing at once (paho.golang's
 `Disconnect` does). Another client publishes QoS 1 to the topic immediately, and the first
@@ -6510,7 +6511,8 @@ Not an MQTT conformance item; an operational limit of the replica setting in
   count. The Helm chart's external topology and the example manifests leave the setting
   at `0`; their documentation says to set the cluster size.
 - Whether `0` should stay the default, discover the cluster's capacity, or be refused
-  against a clustered JetStream is a post-alpha roadmap decision.
+  against a clustered JetStream is a decision owed before the alpha
+  ([issue #171](https://github.com/nberlee/mqtt-nats-broker/issues/171)).
 
 ### The Go memory limit is a GC target, not an OOM guarantee
 
