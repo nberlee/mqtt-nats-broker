@@ -289,3 +289,105 @@ func TestCleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) {
 		t.Fatalf("the recovery must leave a serving successor, got %+v", al)
 	}
 }
+
+// TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep is the clean-start
+// predecessor cleanup's row of docs/CONFORMANCE.md's teardown-reap table: the cleanup's register
+// reap REFUSES an in-bound register it cannot read, the refusal does not itself refuse the
+// CONNECT, and nothing adopts a retry, since the metadata batch displaced the predecessor record
+// and the finalization closed its generation discarding. What converges the register is the
+// orphan sweep, licensed by that discarding closure alone.
+func TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep(t *testing.T) {
+	const clientID = "cs-handoff-unreadable-register"
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID,
+		props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTReadConnAckV5(t, r)
+	testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "foo", opts: 1}})
+	asm, sess := testResidentSession(t, s, clientID)
+	sess.mu.Lock()
+	hash, predGen := sess.idHash, sess.gen
+	sess.mu.Unlock()
+
+	// One QoS 1 delivery the predecessor never acknowledges: its register stands.
+	pc, pr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID + "-pub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer pc.Close()
+	testMQTTReadConnAckV5(t, pr)
+	testMQTTPublishV5(t, pc, 1, 1, "foo", []byte("unacked"))
+	testMQTTReadPubAckV5(t, pr, 1)
+	_, pi := testMQTTReadPublishV5(t, r, "foo", []byte("unacked"))
+	regSubj := mqttInflightSubject(hash, predGen, pi)
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err != nil || smsg == nil {
+			return fmt.Errorf("the predecessor's register on %q does not stand: %v", regSubj, err)
+		}
+		return nil
+	})
+
+	// The session persists its close with a SERVING authority: the state the handoff is for. The
+	// disconnect is settled before anything is planted: the client is gone and its persisted record
+	// carries the disconnect at the predecessor generation.
+	c.Close()
+	testWaitSessionRecordSettled(t, s, asm, clientID)
+	if ps := testLoadPersistedSession(t, asm, clientID); ps.Gen != predGen {
+		t.Fatalf("fixture: the settled record carries generation %q, not the predecessor's %q", ps.Gen, predGen)
+	}
+	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
+		al := asm.jsa.loadOutboundAuthority(clientID, asm.sessStreamEpoch)
+		if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityServing || al.rec.Gen != predGen {
+			return fmt.Errorf("the predecessor authority does not serve %q: %+v", predGen, al)
+		}
+		return nil
+	})
+
+	// A body no broker in this tree writes, at the register's own subject.
+	corrupt := []byte(`{"pi":`)
+	ack, err := asm.jsa.storeMsg(regSubj, 0, corrupt)
+	if err != nil {
+		t.Fatalf("planting the unreadable register: %v", err)
+	}
+	corruptSeq := ack.Sequence
+	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); lerr != nil || smsg == nil ||
+		smsg.Sequence != corruptSeq || string(smsg.Data) != string(corrupt) {
+		t.Fatalf("fixture: the planted body is not what stands on %q: %+v, %v", regSubj, smsg, lerr)
+	}
+	if _, derr := mqttDecodeInflightRecord(corrupt); derr == nil {
+		t.Fatal("fixture: the planted body decodes, so nothing here is unreadable")
+	}
+
+	var reached atomic.Bool
+	testSetTeardownDeletesHook(t, func(tg *mqttTeardownTarget) {
+		if tg.idHash == hash && tg.gen == predGen {
+			reached.Store(true)
+		}
+	})
+
+	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	if sessp, rc, _ := testMQTTReadConnAckV5(t, r2); rc != mqttConnAckRCConnectionAccepted || sessp {
+		t.Fatalf("the clean start was answered rc=%#x sessionPresent=%v", rc, sessp)
+	}
+
+	if !reached.Load() {
+		t.Fatal("the clean-start predecessor cleanup never reached the predecessor generation's reap")
+	}
+	if cl, _, st := asm.jsa.loadGenClosure(clientID, asm.sessStreamEpoch, predGen); st != mqttOutboundValid || cl == nil || !cl.Discard {
+		t.Fatalf("the predecessor generation must be closed discarding, got %+v (status %v)", cl, st)
+	}
+	if w, _, st := asm.jsa.loadGenRetirement(asm.domainTk, hash); st == mqttRetirementValid && w.Gen == predGen {
+		t.Fatal("fixture: a watermark names the predecessor generation, so the closure is not the licence under test")
+	}
+	// The reap refused rather than deleted: the unreadable register still stands at its sequence.
+	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); lerr != nil || smsg == nil || smsg.Sequence != corruptSeq {
+		t.Fatalf("the unreadable register on %q did not survive the cleanup: %+v, %v", regSubj, smsg, lerr)
+	}
+
+	// Only now may the sweep qualify it: the background sweep runs at the default grace.
+	testOrphanSetGraces(t, asm, 0, 0)
+	testOrphanSettle(asm, s)
+	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); lerr == nil && smsg != nil {
+		t.Fatalf("the orphan sweep retained the unreadable register on %q at sequence %d", regSubj, smsg.Sequence)
+	}
+}

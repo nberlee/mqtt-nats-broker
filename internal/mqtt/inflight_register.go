@@ -1763,17 +1763,18 @@ type mqttInflightIdentity struct {
 //
 // A zero watermark is not a licence: with no bound available the pass deletes nothing and
 // reports failure. What that buys depends on the caller: a record-backed teardown keeps its
-// marked record, so a later attempt re-enumerates, while clear()'s no-record branch has
-// neither record nor marker and is not re-driven at all — there the orphan sweep is the only
-// cleanup. docs/CONFORMANCE.md states the split per call site.
+// marked record, so a later attempt re-enumerates, while clear()'s no-record branch and the
+// clean-start predecessor cleanup have no record or marker to re-drive from — there only the
+// orphan sweep, under a retirement proof, can reap what is left. docs/CONFORMANCE.md states
+// the split per call site.
 //
 // Failure semantics are fail-closed, and the caller's contract is the important half: an
 // unreadable or indeterminate occupant aborts with an error, so the teardown does not
 // release the record while a register of unknown status remains. That is a deliberate
-// wedge — a permanently unreadable record blocks this client's teardown until an operator
-// removes it — and it is the correct trade against releasing a record on a read that
-// failed. The diagnostic names the stream, the subject and the sequence for exactly that
-// reason.
+// wedge — while the marked record persistently cannot be displaced, a permanently
+// unreadable record blocks this client's teardown until an operator removes it — and it is
+// the correct trade against releasing a record on a read that failed. The diagnostic names
+// the stream, the subject and the sequence for exactly that reason.
 //
 // spareRetained spares RETAINED registers (issue #107 7d).
 // A DISCARDED generation's retained register is its exchange's discard cleanup's, not this

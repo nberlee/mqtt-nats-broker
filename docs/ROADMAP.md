@@ -1826,8 +1826,8 @@ them in order where a later lint change depends on an earlier cleanup.
   cut analysis stays in git history, linked from its finding's GitHub issue where one fits.
   Done 2026-11-01.
 
-- [ ] Add the clean-start predecessor cleanup to `docs/CONFORMANCE.md`'s list of callers
-  of the teardown reap, or state why it is excluded
+- [x] Add the clean-start predecessor cleanup to `docs/CONFORMANCE.md`'s callers of the
+  teardown reap, with the sweep's closure licence and the displacement arm. Done 2026-11-03
   ([issue #148](https://github.com/nberlee/mqtt-nats-broker/issues/148)).
 
 - [ ] Settle what a cold peer resume does with a landed never-sent obligation: the

@@ -1032,12 +1032,14 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// It also changes this function's failure posture, deliberately: an unreadable or
 	// indeterminate register now ABORTS the teardown rather than being purged blind, so
 	// the record is not released while a register of unknown status remains. What can then
-	// re-drive it is branch-specific: a record-backed teardown keeps its marked record and
+	// re-drive it is route-specific: a record-backed teardown keeps its marked record and
 	// its retirement watermark, so a later attempt re-enumerates, while clear()'s
-	// no-record branch (seq == 0) returns before the claim and has neither — there nothing
-	// re-drives it and the orphan sweep is the only cleanup. A permanently unreadable
-	// register therefore wedges this client's teardown until an operator removes it, which
-	// is stated per call site in docs/CONFORMANCE.md and is the right trade against
+	// no-record branch (seq == 0) returns before the claim and has neither, and the
+	// clean-start predecessor cleanup runs after its record is already displaced — there
+	// nothing re-drives it and only the orphan sweep, under a retirement proof, can reap
+	// what it left. A permanently unreadable register wedges this client's teardown until
+	// an operator acts only while its marked record persistently cannot be displaced;
+	// docs/CONFORMANCE.md states it per call site. That is the right trade against
 	// releasing a record on a read that failed.
 	//
 	// noWait no longer applies to this phase: a conditional delete must receive and

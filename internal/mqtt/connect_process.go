@@ -1603,17 +1603,20 @@ restoreSession:
 			return oerr
 		}
 	}
-	// A clean-start HANDOFF has now installed the successor SERVING authority; its
-	// finalization closed the predecessor generation with Discard, sealed its inventory ledger
-	// and enrolled its affine target for recovery, all in the batch that displaced the record;
-	// its source and PUBREL consumers were enrolled when they were provisioned. Its SHARED
-	// acquisition ledger, on $MQTT_shared, is not in that batch: the recovery executor seals and
-	// releases it under the same closure and certifies only once it reads sealed and empty
-	// (issue #107 7e). The classification transfers the rest to the recovery executor (issue #107 7d) and what remains
-	// here is the generation's inbound QoS 2 holds and ordinary registers, best-effort: anything
-	// left is the enrolled recovery's to finish, so a cleanup error never fails a CONNECT whose
-	// successor is already serving. Cleanup ownership stays partitioned; classification runs before any
-	// physical delete (Codex consult 6). See sess_teardown_partition.go.
+	// A clean-start HANDOFF has now installed the successor SERVING authority. The metadata
+	// batch displaced the predecessor record; the later finalization closed the predecessor
+	// generation with Discard, sealed its inventory ledger and enrolled its affine target for
+	// recovery; its source and PUBREL consumers were enrolled when they were provisioned. Its
+	// SHARED acquisition ledger, on $MQTT_shared, is in neither batch: the recovery executor seals
+	// and releases it under the same closure and certifies only once it reads sealed and empty
+	// (issue #107 7e). The classification transfers the rest to the recovery executor (issue #107 7d)
+	// and what remains here is the generation's inbound QoS 2 holds and ordinary registers,
+	// best-effort: no record of the predecessor generation is left to withhold and nothing adopts
+	// a retry, so a cleanup error does not itself fail a CONNECT whose successor is already
+	// serving, and what it leaves is the orphan sweep's, licensed by that discarding closure
+	// (docs/CONFORMANCE.md, "A session teardown fails closed on an unreadable in-flight
+	// register"). Cleanup ownership stays partitioned; classification runs before any physical
+	// delete (Codex consult 6). See sess_teardown_partition.go.
 	if cleanStartHandoff {
 		// The finalization committed the predecessor's discarding closure: its retirement is the
 		// recovery executor's, promptly (issue #107 7d).

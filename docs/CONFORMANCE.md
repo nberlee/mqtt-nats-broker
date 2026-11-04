@@ -6705,66 +6705,97 @@ identity, and deletes only at or below the watermark its own enumeration returne
 pass **cannot** proceed past a register it could not read, and the consequence is a
 deliberate liveness cost rather than an oversight.
 
-**What happens.** An unreadable or indeterminate register makes `deleteTeardownTargets`
-return an error, so the session record is **not released**. Every deletion that already
-landed stays landed, so progress is real.
+**What happens.** An unreadable or indeterminate register within the reap's enumeration
+bound makes `deleteTeardownTargets` return an error: the reap never deletes past an
+occupant it could not read. (A loaded register above that bound is spared before its body
+is decoded, and left to a later pass; a failed load refuses whatever the sequence.) The
+attempt that refused does not call `releaseTeardown`, so it releases no session record;
+every deletion that already landed stays landed, so progress is real. Whether the marked
+record then stays is not that attempt's to decide: a concurrent CONNECT may displace it
+(below).
 
-**Whether anything retries is BRANCH-SPECIFIC, and the table below is the statement of
+**Whether anything retries is ROUTE-SPECIFIC, and the table below is the statement of
 record.** On a record-backed teardown the generation-retirement watermark stands and the
-record stays marked, so a later attempt re-enumerates and finishes the remainder. On the
-**no-record** branch (`mqttPreparedClear.destroy`, `sess_clear.go`, `seq == 0`) there is
-no record and no marker to anchor anything: that branch returns before the claim, so
-nothing re-drives it and cleanup falls to the orphan sweep alone.
+record stays marked unless another actor displaces it, so a later attempt re-enumerates
+and finishes the remainder. On the **no-record** branch (`mqttPreparedClear.destroy`,
+`sess_clear.go`, `seq == 0`) there is no record and no marker to anchor anything: that
+branch returns before the claim, so nothing re-drives it. On the **clean-start
+predecessor cleanup** (`connect_process.go`, after a clean-start handoff) the predecessor
+record was already displaced by the handoff's metadata batch and the generation closed
+discarding by its finalization, so there is nothing to adopt either; the refusal is
+logged and does not itself refuse the CONNECT.
 
-**Who is affected.** Every caller of that path: the ordinary discard, a teardown
-**adopted** from a broker that vanished, session **expiry**, and the **orphan sweep**'s
-reach into the same state. None of them completes a teardown on a state it could not read
-— which is the guarantee. Which of them can RETRY it is the separate question the second
-table answers.
+**Who is affected.** Every caller of `deleteTeardownTargets`: the ordinary discard, a
+teardown **adopted** from a broker that vanished, session **expiry** (through the discard
+and the adoption), and the **clean-start predecessor cleanup**. None of them completes a
+teardown reap over an in-bound register it could not read — which is the guarantee. What
+reaps such a register without reading it is the **orphan sweep**, under its own licence:
+the register's generation referenced by no session record and no local resident in a
+complete walk, a stable observation across the construction grace, a retirement proof for
+that generation (a watermark naming it, or its own valid discarding closure), and a re-read
+at the exact candidate sequence. Which routes can reach that licence is the second table's
+question.
 
 **A refused register reap does not withhold a shared release.** On the record-backed
 routes the shared closing (seal the generation's acquisition ledger, release every
 listed acquisition, gate on the empty seal) runs BEFORE `deleteTeardownTargets`, right
 after `recordGenRetirement`; a refusal inside the shared closing withholds the record's
 release through its own gate instead, and the adoption repeats the closing from the
-ledger.
+ledger. The clean-start handoff runs no shared closing of its own: the recovery executor
+runs it, asynchronously, for the discarding closure its finalization wrote, so the
+predecessor cleanup's refusal says nothing about whether those acquisitions are released
+yet, and nothing waits on it.
 
-**What a refused reap leaves**, in the order `deleteTeardownTargets` performs it
-(`sess_teardown.go:903` onward):
+**What a refused reap leaves**, in the order `deleteTeardownTargets` performs it:
 
 | Step, in order | On a refused reap |
 |---|---|
-| `$MQTT_msgs` subscription consumers | delete ISSUED; confirmed only when `noWait` is false |
-| the PUBREL consumer on `$MQTT_out` | delete ISSUED, same caveat |
+| `$MQTT_msgs` subscription consumers | delete ISSUED, confirmed only when `noWait` is false; in a DISCARDING generation not issued here at all, since they are the recovery executor's |
+| the PUBREL consumer on `$MQTT_out` | its PUBREC proofs secured first; delete ISSUED, same caveat, or transferred in a discarding generation |
 | affine assignment claims | `discardQ2AffClaimsFor` has marked them DISCARDED; the reap of each is conditional, so a discarded-but-retained claim can remain |
-| the affine consumer on `$MQTT_out` | delete ISSUED, same caveat |
+| the affine consumer on `$MQTT_out` | delete ISSUED, same caveat, or deferred to the enrolled cleanup duty in a discarding generation |
 | inbound QoS 2 release claims | `arbitrateQoS2ReleaseClaims` has run and may deliberately leave a hold and claim for the orphan sweep |
-| **the register reap** | **REFUSES here — this is the abort point** |
-| the shared group durables | already released by the shared closing, which precedes this on the record-backed routes; on the no-record branch there is no generation to seal |
+| **the register reap** | **REFUSES here — this is the abort point**; in a discarding generation a RETAINED register is spared, its exchange's discard cleanup's |
+| the shared group durables | not here: released by the shared closing, inline before this on the record-backed routes, by the recovery executor on the clean-start route; the no-record branch has no shared acquisitions |
 
 **What can be retried, and by what.**
 
-| Call site | Marker/record after a refused reap | Adoption retry possible? |
+| Call site | Marker/record after a refused reap | Who can finish it |
 |---|---|---|
-| `mqttPreparedClear.destroy` (`sess_clear.go`), no record (`seq == 0`) | none exists — `releaseTeardown` is not part of this branch at all | **No.** Nothing anchors a retry; the orphan sweep is the only path |
-| `mqttPreparedClear.destroy` (`sess_clear.go`), ordinary discard | record and marker stand, since `releaseTeardown` was never reached | Yes |
-| `sess_teardown.go:1270`, adopted teardown | as above | Yes |
+| `mqttPreparedClear.destroy` (`sess_clear.go`), no record (`seq == 0`) | none exists — `releaseTeardown` is not part of this branch at all | No adoption anchor. The orphan sweep acts only under a retirement proof for that generation, which this branch does not write |
+| `mqttPreparedClear.destroy` (`sess_clear.go`), ordinary discard | record and marker stand unless another actor displaces them, since this attempt never reached `releaseTeardown` | An adopting CONNECT, expiry or sweep repeats the teardown. A CONNECT that finds the retirement durably owned displaces the record instead, and the orphan sweep then reaps the register under that generation's discarding closure |
+| `finishAdoptedTeardown` (`sess_teardown.go`), adopted teardown | as above | As above. The adoption itself can complete what makes the record displaceable (it writes a missing receipt, the watermark and the discarding close before its reap) |
+| clean-start predecessor cleanup (`connect_process.go`) | none: the metadata batch displaced the predecessor record, and the finalization wrote the generation's discarding closure | No adoption. The orphan sweep reaps the generation's registers, an unreadable one included, licensed by that discarding closure |
 
-**A successful attempt is ordered so a crash leaves work, not an orphan.** The order is
-seal → release every listed acquisition → gate on the empty seal → `releaseTeardown`
-deletes the record. A crash anywhere before the record delete leaves the record MARKED
-and the ledger sealed, so the adoption repeats the release from the ledger; a crash
-between an acquisition's release and its incarnation's consumer delete leaves a
-`retiring` entry in the group record that the orphan sweep's retirement pass finishes. A
-later joiner mounts a fresh incarnation and never adopts a retired one. A durable
-another member still holds is retained by the group record's count, never by a scan.
+A marked record is **displaced** rather than adopted when a CONNECT finds its retirement
+durably owned: valid targets, a valid teardown receipt, a watermark naming its generation
+at or past the marker, a discarding closure, and the release gate authorizing
+(`mqttMarkedRecordDisplaceable`, `sess_teardown_displace.go`). The successor's record CAS
+at the marker's sequence arbitrates it. A displaced generation is referenced by no record,
+which is what the sweep's licence starts from.
 
-**The cost, stated.** If the register is *permanently* unreadable — a shape no broker in
-this tree writes, which is what makes it unreadable — that client ID's teardown never
-completes on its own. The record stays marked, the client's next CONNECT is refused
-rather than resumed hollow, and **automatic convergence is impossible until an operator
-removes or repairs the record**. The diagnostic names the stream, the subject and the
-sequence for exactly that purpose.
+**A successful attempt is ordered so a crash leaves work, not an orphan.** On the
+record-backed routes the order is seal → release every listed acquisition → gate on the
+empty seal → `releaseTeardown` deletes the record. A crash anywhere before the record
+delete leaves the record MARKED, so the adoption repeats the closing from the ledger,
+unless a CONNECT displaced the record first, in which case the recovery executor finishes
+the closing for its discarding closure; a crash between an acquisition's
+release and its incarnation's consumer delete leaves a `retiring` entry in the group record
+that the orphan sweep's retirement pass finishes. On the clean-start route a crash between
+the metadata batch and the finalization leaves the predecessor record displaced and the
+generation not yet closed; the committed proposal is settled by finalizing it as proposed,
+after which the closure licenses the same convergence. A later joiner mounts a fresh
+incarnation and never adopts a retired one. A durable another member still holds is
+retained by the group record's count, never by a scan.
+
+**The cost, stated.** If a register is *permanently* unreadable — a shape no broker in
+this tree writes, which is what makes it unreadable — and no CONNECT can ever establish
+that its marked record's retirement is durably owned (a durable-ownership fact that is
+persistently missing, refused or unreadable), that client ID's teardown never completes on
+its own: the record stays marked, a CONNECT is refused rather than resumed hollow, and
+**automatic convergence is impossible until an operator removes or repairs what blocks
+it**. Where the record is displaced, or where none remains
+(the clean-start route), the orphan sweep converges the register without an operator.
 
 **Why this is the right trade.** The alternative is releasing the session record while a
 register of unknown status remains, which asserts that nothing is in flight on the
