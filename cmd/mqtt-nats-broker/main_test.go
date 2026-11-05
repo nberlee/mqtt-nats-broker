@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
+
+	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
 // TestWaitDrainGraceElapses verifies the grace period is actually honored (the
@@ -46,6 +48,14 @@ func TestWaitDrainGraceZeroReturnsImmediately(t *testing.T) {
 
 // reservedAddr returns a 127.0.0.1 address that nothing is listening on, by
 // binding an ephemeral port and immediately releasing it.
+// testConfig is config.Default with the one setting it cannot default, the stream replica
+// count (issue #171), at the one-server value these tests run against.
+func testConfig() *config.Config {
+	c := config.Default()
+	c.StreamReps = 1
+	return c
+}
+
 func reservedAddr(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -74,6 +84,7 @@ func TestRunFailsOnBadTLSBeforeStartup(t *testing.T) {
 	err := run([]string{
 		"-nats", "nats://" + natsAddr,
 		"-http-addr", httpAddr,
+		"-stream-replicas", "1",
 		"-tls-cert", missing,
 		"-tls-key", missing,
 	})
@@ -105,7 +116,6 @@ func TestRunRefusesInvalidMQTTOptionsBeforeStartup(t *testing.T) {
 		{name: "keepalive too big", args: []string{"-keepalive-max", "70000"}},
 		{name: "keepalive wraps to 0", args: []string{"-keepalive-max", "4294967296"}},
 		{name: "max conns negative", args: []string{"-max-conns", "-1"}},
-		{name: "stream replicas negative", args: []string{"-stream-replicas", "-1"}},
 		{name: "max conns negative from env", env: map[string]string{"MQTTNB_MAX_CONNS": "-1"}},
 		{name: "response info with NUL", args: []string{"-response-info", "resp/\x00"}},
 	} {
@@ -116,7 +126,7 @@ func TestRunRefusesInvalidMQTTOptionsBeforeStartup(t *testing.T) {
 			}
 			natsAddr := reservedAddr(t)
 			httpAddr := reservedAddr(t)
-			err := run(append([]string{"-nats", "nats://" + natsAddr, "-http-addr", httpAddr}, tc.args...))
+			err := run(append([]string{"-nats", "nats://" + natsAddr, "-http-addr", httpAddr, "-stream-replicas", "1"}, tc.args...))
 			if err == nil {
 				t.Fatal("run() = nil, want an invalid MQTT configuration error")
 			}
@@ -144,7 +154,7 @@ func TestRunRefusesNATSURLCredentialsBeforeStartup(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
 			httpAddr := reservedAddr(t)
-			err := run([]string{"-nats", fmt.Sprintf(tc.url, reservedAddr(t)), "-http-addr", httpAddr})
+			err := run([]string{"-nats", fmt.Sprintf(tc.url, reservedAddr(t)), "-http-addr", httpAddr, "-stream-replicas", "1"})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("run() = %v, want the URL refused (%q)", err, tc.want)
 			}
@@ -166,12 +176,44 @@ func TestRunRefusesNATSURLCredentialsBeforeStartup(t *testing.T) {
 func TestRunRefusesPlainPortWithoutTLSBeforeStartup(t *testing.T) {
 	isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
 	httpAddr := reservedAddr(t)
-	err := run([]string{"-nats", "nats://" + reservedAddr(t), "-http-addr", httpAddr, "-plain-port", "1883"})
+	err := run([]string{"-nats", "nats://" + reservedAddr(t), "-http-addr", httpAddr, "-stream-replicas", "1", "-plain-port", "1883"})
 	if err == nil || !strings.Contains(err.Error(), "plain-port requires tls-cert and tls-key") {
 		t.Fatalf("run() = %v, want the plain-port refusal", err)
 	}
 	if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
 		_ = c.Close()
 		t.Errorf("health server is listening on %s after a refused startup", httpAddr)
+	}
+}
+
+// TestRunRefusesAStreamReplicaCountBelowOne: the count has no default, so a missing one, 0 and a
+// negative one are refused with the guidance before NATS is dialed or the health port is bound
+// (issue #171).
+func TestRunRefusesAStreamReplicaCountBelowOne(t *testing.T) {
+	const want = "stream-replicas (MQTTNB_STREAM_REPLICAS) is required"
+	t.Setenv("MQTTNB_STREAM_REPLICAS", "")
+	if err := os.Unsetenv("MQTTNB_STREAM_REPLICAS"); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"missing", nil},
+		{"zero", []string{"-stream-replicas", "0"}},
+		{"negative", []string{"-stream-replicas", "-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateGoMemoryLimit(t, memlimit.Limit(1<<30))
+			httpAddr := reservedAddr(t)
+			err := run(append([]string{"-nats", "nats://" + reservedAddr(t), "-http-addr", httpAddr}, tc.args...))
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("run() = %v, want the stream replica refusal (%q)", err, want)
+			}
+			if c, err := net.DialTimeout("tcp", httpAddr, 2*time.Second); err == nil {
+				_ = c.Close()
+				t.Errorf("health server is listening on %s after a refused startup", httpAddr)
+			}
+		})
 	}
 }

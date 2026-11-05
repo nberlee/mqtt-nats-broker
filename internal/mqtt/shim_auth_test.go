@@ -65,7 +65,7 @@ func startAuthBrokerTuned(t *testing.T, tune func(*Options), dials *atomic.Int64
 	}
 	t.Cleanup(svc.Close)
 
-	o := &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}
+	o := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}
 	if tune != nil {
 		tune(o)
 	}

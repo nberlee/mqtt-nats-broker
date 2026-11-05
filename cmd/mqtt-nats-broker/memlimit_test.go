@@ -220,6 +220,7 @@ func TestRunDerivesGoMemoryLimitBeforeConnecting(t *testing.T) {
 			err := run([]string{
 				"-nats", "nats://" + reservedAddr(t),
 				"-http-addr", reservedAddr(t),
+				"-stream-replicas", "1",
 			})
 			if err == nil || !strings.Contains(err.Error(), "connect to NATS") {
 				t.Fatalf("run() error = %v, want the NATS connect error: startup must "+

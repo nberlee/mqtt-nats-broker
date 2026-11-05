@@ -57,8 +57,8 @@ import (
 // fatal only where a foreign record could occupy a protocol CAS slot — every
 // stream here except $MQTT_rmsgs, where it is a supported topology.
 //
-// wantReplicas is 0 when no explicit replica count is configured (skip that
-// check).
+// wantReplicas is the configured count, at least 1, and every stream must carry
+// exactly it.
 //
 // wantSubjects is the EXACT subject set, compared order-independently and
 // rejecting duplicates. Most owners name one subject; $MQTT_sess names two,
@@ -78,7 +78,7 @@ func validateBrokerOwnedStreamShape(cfg *StreamConfig, wantSubjects []string, wa
 	if cfg.Mirror != nil {
 		return fmt.Errorf("stream is a mirror (want none): a mirror rejects the owner's direct writes")
 	}
-	if wantReplicas > 0 && cfg.Replicas != wantReplicas {
+	if cfg.Replicas != wantReplicas {
 		return fmt.Errorf("replicas is %d (want %d)", cfg.Replicas, wantReplicas)
 	}
 	if cfg.Sealed {
@@ -662,9 +662,9 @@ type brokerStreamSpec struct {
 }
 
 // brokerStreamSpecs returns the ordered provisioning table for the ten
-// broker-owned $MQTT_* streams. wantReplicas is 0 when no explicit replica
-// count is configured; maxAckPending is the broker's effective per-consumer
-// cap.
+// broker-owned $MQTT_* streams. replicas is the operator's required count,
+// both the count a missing stream is created with and the count every existing
+// stream must carry; maxAckPending is the broker's effective per-consumer cap.
 //
 // The table carries no JetStream API and creates nothing itself: the retained
 // observer this function used to create as a post step now lives in
@@ -673,7 +673,7 @@ type brokerStreamSpec struct {
 // what it buys is that a reader confirms "no consumer is created until every
 // stream validated" at one call site rather than by auditing ten entries.
 func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
-	replicas, wantReplicas, maxAckPending int) []brokerStreamSpec {
+	replicas, maxAckPending int) []brokerStreamSpec {
 
 	// The provisioning loop prefixes every error with the stream and account, so
 	// the guidance here carries only the verdict and the recovery. The recovery is
@@ -853,7 +853,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			// what makes the ten one recreation unit.
 			cfg: sessCfg,
 			validate: func(si *StreamInfo) error {
-				if verr := validateSessStream(si, as.domainTk, wantReplicas); verr != nil {
+				if verr := validateSessStream(si, as.domainTk, replicas); verr != nil {
 					// $MQTT_sess MINTS the account's recovery epoch, so recreating it
 					// alone leaves every other stream stamped with an incarnation that
 					// no longer exists — and takes every permanent CONNECT acceptance
@@ -898,7 +898,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       willQCfg,
 			preCreate: stampEpoch(willQCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateWillQStream(si, as.domainTk, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateWillQStream(si, as.domainTk, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttWillQStreamName, "delayed-Will outbox")
 				}
 				return nil
@@ -914,7 +914,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       teardownCfg,
 			preCreate: stampEpoch(teardownCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateTeardownStream(si, as.domainTk, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateTeardownStream(si, as.domainTk, replicas, as.sessStreamEpoch); verr != nil {
 					// A MarkerSeq is a $MQTT_sess sequence, so these permanent watermarks
 					// are only comparable within the incarnation they were written under.
 					// That coupling is now the bundle's, not a private pair: an unfenced
@@ -930,7 +930,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       msgsCfg,
 			preCreate: stampEpoch(msgsCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateMsgsStream(si, wantReplicas, maxAckPending, as.sessStreamEpoch); verr != nil {
+				if verr := validateMsgsStream(si, replicas, maxAckPending, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttStreamName, "interest-retained messages")
 				}
 				return nil
@@ -951,7 +951,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       qos2InCfg,
 			preCreate: stampEpoch(qos2InCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateQoS2InStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateQoS2InStream(si, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttQoS2IncomingMsgsStreamName, "move-protocol")
 				}
 				return nil
@@ -967,7 +967,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       qos2AssignCfg,
 			preCreate: stampEpoch(qos2AssignCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateQoS2AssignStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateQoS2AssignStream(si, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttQoS2AssignStreamName, "assignment-claim")
 				}
 				return nil
@@ -985,7 +985,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       inflightCfg,
 			preCreate: stampEpoch(inflightCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateInflightStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateInflightStream(si, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttInflightStreamName, "in-flight register")
 				}
 				return nil
@@ -1003,7 +1003,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       sharedCfg,
 			preCreate: stampEpoch(sharedCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateSharedLifecycleStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateSharedLifecycleStream(si, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttSharedLifecycleStreamName, "shared-group lifecycle")
 				}
 				return nil
@@ -1022,7 +1022,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       outCfg,
 			preCreate: stampEpoch(outCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateOutStream(si, wantReplicas, maxAckPending, as.sessStreamEpoch); verr != nil {
+				if verr := validateOutStream(si, replicas, maxAckPending, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttOutStreamName, "interest-retained delivery")
 				}
 				return nil
@@ -1034,7 +1034,7 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			cfg:       retainedCfg,
 			preCreate: stampEpoch(retainedCfg),
 			validate: func(si *StreamInfo) error {
-				if verr := validateRetainedStream(si, wantReplicas, as.sessStreamEpoch); verr != nil {
+				if verr := validateRetainedStream(si, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttRetainedMsgsStreamName, "per-topic retained")
 				}
 				return nil

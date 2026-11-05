@@ -351,10 +351,10 @@ func TestValidateQoS2AssignStream(t *testing.T) {
 	if err := validateQoS2AssignStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateQoS2AssignStream(good(), 0, testBundleEpoch); err != nil {
-		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
+	if err := validateQoS2AssignStream(good(), 1, testBundleEpoch); err == nil {
+		t.Fatal("a replica mismatch must be rejected")
 	}
-	if err := validateQoS2AssignStream(nil, 0, testBundleEpoch); err == nil {
+	if err := validateQoS2AssignStream(nil, 3, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -415,10 +415,10 @@ func TestValidateOutStream(t *testing.T) {
 	if err := validateOutStream(good(), 3, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateOutStream(good(), 0, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
-		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
+	if err := validateOutStream(good(), 1, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
+		t.Fatal("a replica mismatch must be rejected")
 	}
-	if err := validateOutStream(nil, 0, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
+	if err := validateOutStream(nil, 3, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {

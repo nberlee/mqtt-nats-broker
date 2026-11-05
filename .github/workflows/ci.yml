@@ -525,7 +525,7 @@ jobs:
           echo "/tmp/mc/target/release" >> "$GITHUB_PATH"
       - name: run broker
         run: |
-          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 -port 1883 -auth-passthrough=false -log-level warn \
+          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 -stream-replicas 1 -port 1883 -auth-passthrough=false -log-level warn \
             > broker.log 2>&1 &
           echo $! > broker.pid
           for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
@@ -571,7 +571,7 @@ jobs:
         run: go build -o mqtt-nats-broker ./cmd/mqtt-nats-broker
       - name: run broker (auth passthrough + deny)
         run: |
-          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 \
+          ./mqtt-nats-broker -nats nats://127.0.0.1:4222 -stream-replicas 1 \
             -nats-user service -nats-pass service \
             -port 1883 -auth-passthrough -default-user mqtt -default-pass mqtt \
             -keepalive-max 60 -log-level warn > broker.log 2>&1 &

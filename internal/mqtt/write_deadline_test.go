@@ -531,7 +531,7 @@ func TestDrainReturnsWithAStalledClient(t *testing.T) {
 	t.Run("the stalled-write obstruction is removed", func(t *testing.T) {
 		budget := 10 * time.Second
 		testShortWriteDeadline(t, 300*time.Millisecond)
-		s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
+		s := &Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, clients: map[uint64]*client{}}
 
 		c, sc := testDrainableClient(t, s)
 		s.clients[1] = c
@@ -553,7 +553,7 @@ func TestDrainReturnsWithAStalledClient(t *testing.T) {
 
 	t.Run("the drain's budget caps the write when it is sooner", func(t *testing.T) {
 		testShortWriteDeadline(t, 30*time.Second)
-		s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
+		s := &Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, clients: map[uint64]*client{}}
 		c, sc := testDrainableClient(t, s)
 		sc.setWritable(true)
 		s.clients[1] = c
@@ -575,7 +575,7 @@ func TestDrainReturnsWithAStalledClient(t *testing.T) {
 
 	t.Run("mqttWriteDeadline.Get() caps the write when the budget is later", func(t *testing.T) {
 		testShortWriteDeadline(t, 200*time.Millisecond)
-		s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
+		s := &Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, clients: map[uint64]*client{}}
 		c, sc := testDrainableClient(t, s)
 		sc.setWritable(true)
 		s.clients[1] = c
@@ -594,7 +594,7 @@ func TestDrainReturnsWithAStalledClient(t *testing.T) {
 
 	t.Run("an already-spent budget is installed as-is", func(t *testing.T) {
 		testShortWriteDeadline(t, 30*time.Second)
-		s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
+		s := &Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, clients: map[uint64]*client{}}
 		c, sc := testDrainableClient(t, s)
 		sc.setWritable(true)
 		s.clients[1] = c
@@ -1006,7 +1006,7 @@ func TestDelayedWillSurvivesAWriteTimeoutClose(t *testing.T) {
 // before entering" and "computed after acquiring wmu" produce the same instant.
 func TestShutdownCapIsCapturedBeforeContending(t *testing.T) {
 	testShortWriteDeadline(t, 2*time.Second)
-	s := &Server{opts: &Options{}, clients: map[uint64]*client{}}
+	s := &Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, clients: map[uint64]*client{}}
 	c, sc := testDrainableClient(t, s)
 	s.clients[1] = c
 

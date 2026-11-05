@@ -204,26 +204,27 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 			Retention:  LimitsPolicy,
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
+			Replicas:   3,
 			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
 			// The PUBLISH-phase pair is one atomic batch (issue #76).
 			AllowAtomicPublish: true,
 		}}
 	}
-	if err := validateInflightStream(good(), 0, testBundleEpoch); err != nil {
+	if err := validateInflightStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the shipped configuration must validate: %v", err)
 	}
 	// T23, N-2.5: the stream must allow atomic publishes, or the pair cannot be committed.
 	si := good()
 	si.Config.AllowAtomicPublish = false
-	if err := validateInflightStream(si, 0, testBundleEpoch); err == nil || !strings.Contains(err.Error(), "allow_atomic") {
+	if err := validateInflightStream(si, 3, testBundleEpoch); err == nil || !strings.Contains(err.Error(), "allow_atomic") {
 		t.Fatalf("a stream without AllowAtomicPublish must be refused naming allow_atomic, got %v", err)
 	}
-	if err := validateInflightStream(nil, 0, testBundleEpoch); err == nil {
+	if err := validateInflightStream(nil, 3, testBundleEpoch); err == nil {
 		t.Fatalf("missing stream info must be rejected")
 	}
-	// Replicas are only checked when the deployment asked for a specific count.
-	if err := validateInflightStream(good(), 3, testBundleEpoch); err == nil {
-		t.Fatalf("a replica mismatch must be rejected when one is wanted")
+	// Every stream must carry the required count (issue #171).
+	if err := validateInflightStream(good(), 1, testBundleEpoch); err == nil {
+		t.Fatalf("a replica mismatch must be rejected")
 	}
 	si = good()
 	si.Config.Replicas = 3
@@ -262,7 +263,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateInflightStream(si, 0, testBundleEpoch); err == nil {
+			if err := validateInflightStream(si, 3, testBundleEpoch); err == nil {
 				t.Fatalf("%s must fail validation", tc.name)
 			}
 		})
@@ -273,7 +274,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 	// prerequisite the owner does not have would fail startups for no reason.
 	si = good()
 	si.Config.ConsumerLimits.InactiveThreshold = time.Minute
-	if err := validateInflightStream(si, 0, testBundleEpoch); err != nil {
+	if err := validateInflightStream(si, 3, testBundleEpoch); err != nil {
 		t.Fatalf("a consumer inactivity limit is irrelevant to a stream with no consumers: %v", err)
 	}
 
@@ -285,7 +286,7 @@ func TestMQTTValidateInflightStream(t *testing.T) {
 	// exists, so this test would fail if the rejection came back.
 	si = good()
 	si.Config.DenyPurge = true
-	if err := validateInflightStream(si, 0, testBundleEpoch); err != nil {
+	if err := validateInflightStream(si, 3, testBundleEpoch); err != nil {
 		t.Fatalf("deny_purge must be accepted since issue #38 replaced the filter purge with "+
 			"exact-sequence deletes: %v", err)
 	}

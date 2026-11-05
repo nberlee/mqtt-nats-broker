@@ -1,5 +1,7 @@
 # The dependency with its own Service name, namespace and client port.
 topology: external
+broker:
+  streamReplicas: 1
 nats:
   enabled: true
   fullnameOverride: jetstream

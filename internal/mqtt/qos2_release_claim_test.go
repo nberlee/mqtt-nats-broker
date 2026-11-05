@@ -33,7 +33,7 @@ func testNewRelClaimEnv(t *testing.T, clientID string) *testRelClaimEnv {
 
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1}},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1",
 	}

@@ -13,7 +13,7 @@ import (
 func startBroker(t *testing.T) (string, *Server) {
 	t.Helper()
 	_, nc := runNATS(t)
-	opts := &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}
+	opts := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}
 	s := NewServer(nc, opts, "e2e-node")
 	if err := s.Start(); err != nil {
 		t.Fatalf("start broker: %v", err)

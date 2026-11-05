@@ -14,7 +14,7 @@ equivalent. Installation and the NATS prerequisites are in
 | `-nats-user` / `-nats-pass` | `MQTTNB_NATS_USER` / `_PASS` | | NATS user/password (service conn); keep URL credential-less under auth passthrough |
 | `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-broker` | Connection name |
 | `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain; a single subject token. Baked into session subjects, so changing it later orphans existing sessions ([details](ARCHITECTURE.md#jetstream-domain)) |
-| `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | `0` | JetStream replicas of the ten broker-owned streams. Set it to the JetStream cluster size for HA (normally 3). `0` creates new streams with one replica and does not check an existing stream's count; it does not discover the cluster size ([details](#stream-replicas)) |
+| `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | none, required | JetStream replicas of the ten broker-owned streams: the JetStream cluster size (normally 3 for HA), `1` for a single server. Every existing broker-owned stream must have exactly this count ([details](#stream-replicas)) |
 | `-host` | `MQTTNB_HOST` | `0.0.0.0` | MQTT listen host |
 | `-port` | `MQTTNB_PORT` | `1883` | MQTT listen port |
 | `-max-conns` | `MQTTNB_MAX_CONNS` | `0` (∞) | Max concurrent clients |
@@ -64,22 +64,22 @@ in its account, and every durable consumer inherits it. It is the setting that m
 broker state survive the loss of a NATS server, so an HA deployment sets it explicitly:
 normally `3` on a three-server JetStream cluster.
 
-`0`, the default, is not automatic. It creates any stream that does not exist yet with
-**one** replica, and it does not check the replica count of streams that already exist.
-The broker cannot see the size of the NATS cluster and does not try to. On a clustered
-NATS a one-replica stream lives on one server: its data is unavailable while that server
-is down and lost with its storage. `docs/CONFORMANCE.md` states this as a limitation.
+There is no default. The broker cannot see the size of the NATS cluster, so it does not
+choose a count: startup refuses a missing count, `0` or a negative value before it
+connects to NATS. Use `1` for a single NATS server.
 
-A nonzero value is also checked: at startup every existing broker-owned stream must have
+The count is also checked: at startup every existing broker-owned stream must have
 exactly that many replicas, or the broker refuses to start. Changing the setting
 therefore does not change existing streams. The supported way to move to another count
 is the one for any nonconforming stream bundle: stop every broker for the account,
 delete all ten streams, and restart with the new value. That discards every session,
 retained message and in-flight QoS state ([Operations](OPERATIONS.md#the-ten-streams)).
 
-In the Helm chart the embedded topology sets the count to its peer count; the external
-topology leaves `broker.streamReplicas` at `0`, so set it to the NATS cluster size there
-([Kubernetes](KUBERNETES.md)).
+In the Helm chart the embedded topology sets the count itself, `1` for one server and
+the peer count for a cluster; the external topology requires `broker.streamReplicas`
+and refuses to render without it, so set it to the NATS cluster size there
+([Kubernetes](KUBERNETES.md)). The embedded image sets no count either, because a mounted
+cluster configuration would inherit it: state `1` for the one server it ships.
 
 ## Go memory limit
 

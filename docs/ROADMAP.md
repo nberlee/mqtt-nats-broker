@@ -1406,13 +1406,10 @@ documentation, and release artifacts. Make them before creating those surfaces.
 
 ### Default stream replica count
 
-- [ ] Decide what `-stream-replicas 0` means
-  ([issue #171](https://github.com/nberlee/mqtt-nats-broker/issues/171)). `0` creates new
-  streams with one replica and checks no existing stream's count, because the broker
-  cannot see the JetStream cluster's size, so a clustered deployment left at the default
-  has unreplicated broker state. Options: keep `0` as documented; discover the cluster's
-  capacity (the service identity has no `$SYS` access, so this needs a JetStream API
-  answer that carries it); or refuse `0` when the JetStream is clustered.
+- [x] Decide what `-stream-replicas 0` means: the count is required with no default, a
+  count below 1 is refused, and every existing stream must carry it; the chart's
+  external topology requires it. Decided and done 2026-11-05
+  ([issue #171](https://github.com/nberlee/mqtt-nats-broker/issues/171)).
 
 ### Memory-limit strategy
 

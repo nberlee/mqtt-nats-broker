@@ -62,7 +62,7 @@ func testNewOrphanEnvWithLogger(t *testing.T, clientID string, h slog.Handler) *
 
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1}},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1",
 	}

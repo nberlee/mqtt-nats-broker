@@ -399,9 +399,8 @@ func (s *Server) NodeName() string {
 
 // JetStreamIsClustered: the standalone broker always runs against external
 // JetStream and cannot see that cluster's size; "clustered" here means only that
-// the operator asked for more than one stream replica. With StreamReplicas 0 it
-// is false, so mqttDetermineReplicas creates new streams with one replica: 0 is
-// not a discovery of the cluster size (docs/CONFIGURATION.md, -stream-replicas).
+// the operator asked for more than one stream replica (docs/CONFIGURATION.md,
+// -stream-replicas).
 func (s *Server) JetStreamIsClustered() bool { return s.getOpts().StreamReplicas > 1 }
 
 // authorizeClient implements auth passthrough: it dials a per-client NATS

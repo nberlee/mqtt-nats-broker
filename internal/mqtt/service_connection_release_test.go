@@ -104,7 +104,7 @@ func (cc *callerConnection) assertHandedBack(t *testing.T, when string) {
 }
 
 func passthroughServer(cc *callerConnection, url string, port int) *Server {
-	s := NewServer(cc.nc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: port}}, "svc-release-node")
+	s := NewServer(cc.nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: port}}, "svc-release-node")
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(url, nats.UserInfo(user, pass))
 	})

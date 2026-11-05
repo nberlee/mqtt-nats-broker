@@ -440,8 +440,6 @@ const (
 // through a supported operation. What remains reachable is administrative deletion or
 // a partial restore, which the compatibility boundary does not support and which
 // docs/CONFORMANCE.md records.
-//
-// wantReplicas is 0 when no explicit replica count is configured (skip that check).
 func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")

@@ -56,7 +56,7 @@ func TestUpdateStreamHelperTakesDomainRoute(t *testing.T) {
 
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{MQTT: MQTTOpts{JsDomain: domain}},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1, JsDomain: domain}},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1",
 	}
@@ -150,7 +150,7 @@ func TestNoWaitConsumerDeleteTakesDomainRoute(t *testing.T) {
 	}
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{MQTT: MQTTOpts{JsDomain: domain}},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1, JsDomain: domain}},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1",
 	}

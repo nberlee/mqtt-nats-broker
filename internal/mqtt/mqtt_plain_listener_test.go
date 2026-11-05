@@ -122,7 +122,7 @@ func TestMQTTPlainListenerBindFailureReleasesEarlierListeners(t *testing.T) {
 	mqttPort, wsPort := free(), free()
 
 	m := testMQTTTLSMaterial(t)
-	o := &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: mqttPort, TLSConfig: m.serverCfg,
+	o := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: mqttPort, TLSConfig: m.serverCfg,
 		PlainPort: taken.Addr().(*net.TCPAddr).Port, Websocket: WebsocketOpts{Host: "127.0.0.1", Port: wsPort}}}
 	s := NewServer(nc, o, "plain-bind-failure")
 	if err := s.Start(); err == nil {

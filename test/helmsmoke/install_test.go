@@ -74,7 +74,7 @@ func TestExternalTLS(t *testing.T) {
 	cert, _ := testcerts.Write(dir, "tls.crt", certPEM)
 	key, _ := testcerts.Write(dir, "tls.key", keyPEM)
 	kubectl(t, "-n", ns, "create", "secret", "tls", "mqtt-nats-broker-tls", "--cert", cert, "--key", key)
-	install(t, ns, "tls", chartDir, writeValues(t, "topology: external\nnats:\n  enabled: true\nmqtt:\n  tls:\n    enabled: true\n    secretName: mqtt-nats-broker-tls\n"))
+	install(t, ns, "tls", chartDir, writeValues(t, "topology: external\nbroker:\n  streamReplicas: 1\nnats:\n  enabled: true\nmqtt:\n  tls:\n    enabled: true\n    secretName: mqtt-nats-broker-tls\n"))
 	fwd := portForward(t, ns, "svc/tls-mqtt-nats-broker", 8883)
 	cfg := &tls.Config{RootCAs: ca.Pool(), ServerName: "mqtt-nats-broker", MinVersion: tls.VersionTLS12}
 	eventually(t, time.Minute, "TLS round trip", func() error { return roundTripOnce(fwd.Addr(), "tls-rt", cfg) })

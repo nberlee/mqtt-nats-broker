@@ -69,9 +69,19 @@ env:
   value: {{ printf "[%s]" (join ", " $routes) | quote }}
 - name: MQTTNB_STREAM_REPLICAS
   value: {{ .Values.replicas | toString | quote }}
-{{- else if .Values.broker.streamReplicas }}
+{{- else if $embedded }}
+# The embedded standalone server is one JetStream server, so its count is 1.
 - name: MQTTNB_STREAM_REPLICAS
-  value: {{ .Values.broker.streamReplicas | toString | quote }}
+  value: "1"
+{{- else }}
+{{- /* The broker cannot see the cluster's size and has no default (issue #171). required
+refuses an absent value; it accepts a numeric 0 or a negative, hence the second check. */}}
+{{- $streamReplicas := required "broker.streamReplicas is required: set it to the JetStream cluster size, 1 for a single server" .Values.broker.streamReplicas }}
+{{- if le (int $streamReplicas) 0 }}
+{{- fail (printf "broker.streamReplicas must be at least 1 (the JetStream cluster size, 1 for a single server), got %v" $streamReplicas) }}
+{{- end }}
+- name: MQTTNB_STREAM_REPLICAS
+  value: {{ $streamReplicas | toString | quote }}
 {{- end }}
 - name: MQTTNB_LOG_LEVEL
   value: {{ .Values.broker.logLevel | quote }}

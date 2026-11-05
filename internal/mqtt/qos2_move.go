@@ -645,8 +645,6 @@ func (as *mqttAccountSessionManager) releaseQoS2Record(seq uint64) (mqttQoS2Rele
 // spanning both layouts, MaxMsgsPer:1 now makes each of the hold and the claim
 // its own single-slot register, and the walk filter's paging bound is a server
 // constant, not stream config.
-//
-// wantReplicas is 0 when no explicit replica count is configured (skip that check).
 func validateQoS2InStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
 	if si == nil {
 		return fmt.Errorf("stream info unavailable")

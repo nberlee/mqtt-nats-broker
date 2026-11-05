@@ -105,19 +105,19 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 		stream   string
 		validate func(*StreamInfo) error
 	}{
-		{mqttSessStreamName, func(si *StreamInfo) error { return validateSessStream(si, asm.domainTk, 0) }},
-		{mqttWillQStreamName, func(si *StreamInfo) error { return validateWillQStream(si, asm.domainTk, 0, e) }},
-		{mqttTeardownStreamName, func(si *StreamInfo) error { return validateTeardownStream(si, asm.domainTk, 0, e) }},
+		{mqttSessStreamName, func(si *StreamInfo) error { return validateSessStream(si, asm.domainTk, 1) }},
+		{mqttWillQStreamName, func(si *StreamInfo) error { return validateWillQStream(si, asm.domainTk, 1, e) }},
+		{mqttTeardownStreamName, func(si *StreamInfo) error { return validateTeardownStream(si, asm.domainTk, 1, e) }},
 		{mqttStreamName, func(si *StreamInfo) error {
-			return validateMsgsStream(si, 0, mqttDefaultMaxAckPending, e)
+			return validateMsgsStream(si, 1, mqttDefaultMaxAckPending, e)
 		}},
-		{mqttQoS2IncomingMsgsStreamName, func(si *StreamInfo) error { return validateQoS2InStream(si, 0, e) }},
-		{mqttQoS2AssignStreamName, func(si *StreamInfo) error { return validateQoS2AssignStream(si, 0, e) }},
-		{mqttInflightStreamName, func(si *StreamInfo) error { return validateInflightStream(si, 0, e) }},
+		{mqttQoS2IncomingMsgsStreamName, func(si *StreamInfo) error { return validateQoS2InStream(si, 1, e) }},
+		{mqttQoS2AssignStreamName, func(si *StreamInfo) error { return validateQoS2AssignStream(si, 1, e) }},
+		{mqttInflightStreamName, func(si *StreamInfo) error { return validateInflightStream(si, 1, e) }},
 		{mqttOutStreamName, func(si *StreamInfo) error {
-			return validateOutStream(si, 0, mqttDefaultMaxAckPending, e)
+			return validateOutStream(si, 1, mqttDefaultMaxAckPending, e)
 		}},
-		{mqttRetainedMsgsStreamName, func(si *StreamInfo) error { return validateRetainedStream(si, 0, e) }},
+		{mqttRetainedMsgsStreamName, func(si *StreamInfo) error { return validateRetainedStream(si, 1, e) }},
 	} {
 		si, err := asm.jsa.lookupStream(tc.stream)
 		if err != nil || si == nil {

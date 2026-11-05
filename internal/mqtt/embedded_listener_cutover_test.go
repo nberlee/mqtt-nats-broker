@@ -88,7 +88,7 @@ func TestEmbeddedListenerCutover(t *testing.T) {
 			t.Fatalf("delete %s: %v", name, err)
 		}
 	}
-	broker := NewServer(nc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}, "cutover-broker")
+	broker := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, "cutover-broker")
 	if err := broker.Start(); err != nil {
 		t.Fatalf("the broker did not start on the emptied account: %v", err)
 	}

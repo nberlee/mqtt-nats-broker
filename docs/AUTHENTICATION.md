@@ -94,7 +94,7 @@ broker refuses. The passwords come from the
 environment. Run the broker against it:
 
 ```sh
-mqtt-nats-broker -nats nats://nats:4222 \
+mqtt-nats-broker -nats nats://nats:4222 -stream-replicas 1 \
   -nats-user mqtt-broker -nats-pass "$SERVICE_PASSWORD" \
   -default-user anonymous -default-pass "$ANONYMOUS_PASSWORD"
 ```

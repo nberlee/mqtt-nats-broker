@@ -225,9 +225,10 @@ type broker struct {
 }
 
 // brokerArgs are the flags every broker here starts with: NATS by its network alias,
-// and no auth passthrough, since the fixture server has no users.
+// its one-server stream replica count, and no auth passthrough, since the fixture
+// server has no users.
 func brokerArgs(extra ...string) []string {
-	return append([]string{"-nats", "nats://nats:4222", "-auth-passthrough=false"}, extra...)
+	return append([]string{"-nats", "nats://nats:4222", "-stream-replicas", "1", "-auth-passthrough=false"}, extra...)
 }
 
 // runBroker starts the image under test as a pod would run it. dockerOpts carries

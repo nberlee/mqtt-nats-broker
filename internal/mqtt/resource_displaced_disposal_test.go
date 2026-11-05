@@ -68,7 +68,7 @@ func startPassthroughBroker(t *testing.T, url, node string) *passthroughBroker {
 	if err != nil {
 		t.Fatal(err)
 	}
-	o := &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1, AckWait: time.Second}}
+	o := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1, AckWait: time.Second}}
 	s := NewServer(nc, o, node)
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(url, nats.UserInfo(user, pass))

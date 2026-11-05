@@ -1,4 +1,5 @@
 # The external topology against a NATS the operator runs.
 topology: external
 broker:
+  streamReplicas: 3
   natsURLs: nats://nats:4222

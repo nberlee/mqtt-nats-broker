@@ -24,7 +24,7 @@ func testNewTeardownEnv(t *testing.T) (a, b *testTeardownEnv) {
 	newBroker := func(node string) *testTeardownEnv {
 		s := &Server{
 			nrc:      nc,
-			opts:     &Options{},
+			opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1}},
 			quitCh:   make(chan struct{}),
 			nodeName: node,
 			// Initialised HERE, before any goroutine exists, because the claim loop

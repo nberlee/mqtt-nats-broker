@@ -49,7 +49,7 @@ func startDenyReservedBroker(t *testing.T) (broker, natsURL string) {
 	}
 	t.Cleanup(svc.Close)
 
-	s := NewServer(svc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}, "deny-node")
+	s := NewServer(svc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, "deny-node")
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(natsURL, nats.UserInfo(user, pass))
 	})

@@ -90,7 +90,7 @@ func TestResolveTLSFailsClosedOnBadFiles(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := config.Default()
+			cfg := testConfig()
 			tc.mutate(cfg)
 			got, err := resolveTLS(cfg, nil)
 			if err == nil {
@@ -109,7 +109,7 @@ func TestResolveTLSFailsClosedOnBadFiles(t *testing.T) {
 func TestResolveTLSValid(t *testing.T) {
 	certPath, keyPath, caPath := tlsFiles(t)
 
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.TLSCert, cfg.TLSKey, cfg.TLSCA = certPath, keyPath, caPath
 	src, err := resolveTLS(cfg, nil)
 	if err != nil {
@@ -128,7 +128,7 @@ func TestResolveTLSValid(t *testing.T) {
 }
 
 func TestResolveTLSNoneConfigured(t *testing.T) {
-	src, err := resolveTLS(config.Default(), nil)
+	src, err := resolveTLS(testConfig(), nil)
 	if err != nil {
 		t.Fatalf("resolveTLS: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestResolveTLSNoneConfigured(t *testing.T) {
 }
 
 func TestMQTTOptionsDoNotEnableExperimentalSharedQoS2(t *testing.T) {
-	opts := mqttOptions(config.Default(), nil)
+	opts := mqttOptions(testConfig(), nil)
 	if opts.MQTT.ExperimentalSharedQoS2 {
 		t.Fatal("production options enabled experimental shared QoS2")
 	}
@@ -149,7 +149,7 @@ func TestMQTTOptionsDoNotEnableExperimentalSharedQoS2(t *testing.T) {
 func TestMQTTOptionsTLSApplied(t *testing.T) {
 	certPath, keyPath, _ := tlsFiles(t)
 
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.TLSCert, cfg.TLSKey = certPath, keyPath
 	src, err := resolveTLS(cfg, nil)
 	if err != nil {
@@ -177,7 +177,7 @@ func TestMQTTTLSHandshakeTimeoutValue(t *testing.T) {
 }
 
 func TestMQTTOptionsNoTLS(t *testing.T) {
-	cfg := config.Default()
+	cfg := testConfig()
 	src, err := resolveTLS(cfg, nil)
 	if err != nil {
 		t.Fatalf("resolveTLS: %v", err)
@@ -197,7 +197,7 @@ func TestMQTTOptionsNoTLS(t *testing.T) {
 // TestMQTTOptionsWireMaxConns pins -max-conns to the field the accept path reads. It used
 // to be written to an MQTTOpts field nothing read, so the flag was silently ignored (issue #56).
 func TestMQTTOptionsWireMaxConns(t *testing.T) {
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.MaxConns = 7
 	if got := mqttOptions(cfg, nil).MaxConn; got != cfg.MaxConns {
 		t.Fatalf("opts.MaxConn = %d, want %d", got, cfg.MaxConns)
@@ -220,21 +220,21 @@ func TestMQTTOptionsRefusedByTheCoreBoundary(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			cfg := config.Default()
+			cfg := testConfig()
 			mut(cfg)
 			if err := mqtt.ValidateOptions(mqttOptions(cfg, nil)); err == nil {
 				t.Fatal("ValidateOptions = nil, want a refusal")
 			}
 		})
 	}
-	if err := mqtt.ValidateOptions(mqttOptions(config.Default(), nil)); err != nil {
+	if err := mqtt.ValidateOptions(mqttOptions(testConfig(), nil)); err != nil {
 		t.Fatalf("default configuration refused: %v", err)
 	}
 }
 
 // The WebSocket listener rides the MQTT listener's TLS source, so one reload serves both.
 func TestMQTTOptionsWebSocket(t *testing.T) {
-	cfg := config.Default()
+	cfg := testConfig()
 	if ws := mqttOptions(cfg, nil).MQTT.Websocket; ws.Port != 0 || ws.Host != "" || ws.HandshakeTimeout != 0 {
 		t.Fatalf("WebSocket options with -ws-port unset = %+v, want disabled and empty", ws)
 	}
@@ -278,7 +278,7 @@ func TestMQTTOptionsWebSocket(t *testing.T) {
 // TestMQTTOptionsPlainPort: -plain-port reaches the core as the plaintext listener beside the
 // TLS one, on the MQTT host, and the pair passes the core's validation.
 func TestMQTTOptionsPlainPort(t *testing.T) {
-	cfg := config.Default()
+	cfg := testConfig()
 	if p := mqttOptions(cfg, nil).MQTT.PlainPort; p != 0 {
 		t.Fatalf("PlainPort with -plain-port unset = %d, want 0", p)
 	}

@@ -311,11 +311,12 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 			Retention:          LimitsPolicy,
 			Discard:            DiscardOld,
 			MaxMsgsPer:         1,
+			Replicas:           3,
 			AllowAtomicPublish: true,
 			Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 		}}
 	}
-	if err := validateSessStream(base(), domainTk, 0); err != nil {
+	if err := validateSessStream(base(), domainTk, 3); err != nil {
 		t.Fatalf("the baseline configuration must validate: %v", err)
 	}
 
@@ -353,7 +354,7 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := base()
 			tc.poison(&si.Config)
-			err := validateSessStream(si, domainTk, 0)
+			err := validateSessStream(si, domainTk, 3)
 			if err == nil {
 				t.Fatal("the validator must refuse this configuration")
 			}
@@ -372,7 +373,7 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 		mqttSessStreamSubjectPrefix + domainTk + ">",
 		mqttTeardownReceiptSubjectPrefix + domainTk + ">",
 	}
-	if err := validateSessStream(si, domainTk, 0); err != nil {
+	if err := validateSessStream(si, domainTk, 3); err != nil {
 		t.Fatalf("the subject set is order-independent: %v", err)
 	}
 }

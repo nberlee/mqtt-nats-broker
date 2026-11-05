@@ -33,7 +33,7 @@ func retainedBrokerWith(t *testing.T, url, node string, setup func(sm *mqttSessi
 		t.Fatalf("service connect: %v", err)
 	}
 	t.Cleanup(nc.Close)
-	s := NewServer(nc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}, node)
+	s := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, node)
 	lc := &logCapture{}
 	s.log.Store(slog.New(lc))
 	if setup != nil {

@@ -95,7 +95,7 @@ func TestJSDomainResolution(t *testing.T) {
 
 			s := &Server{
 				nrc:      nc,
-				opts:     &Options{MQTT: MQTTOpts{JsDomain: tc.jsDomain}},
+				opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1, JsDomain: tc.jsDomain}},
 				quitCh:   make(chan struct{}),
 				nodeName: "node1",
 			}
@@ -191,7 +191,7 @@ func TestJSAPIRequestsCarryNoClientInfo(t *testing.T) {
 
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1}},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1",
 	}

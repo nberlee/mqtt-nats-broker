@@ -74,7 +74,7 @@ func jsRawDeleteStream(t *testing.T, nc *nats.Conn, name string) {
 func testBundleConfigs(t *testing.T, domainTk string, replicas int) []*StreamConfig {
 	t.Helper()
 	as := &mqttAccountSessionManager{domainTk: domainTk}
-	specs := as.brokerStreamSpecs(&Server{}, replicas, replicas, mqttDefaultMaxAckPending)
+	specs := as.brokerStreamSpecs(&Server{}, replicas, mqttDefaultMaxAckPending)
 	if specs[0].post != nil {
 		_ = specs[0].post(&StreamInfo{Config: *specs[0].cfg})
 	}
@@ -171,7 +171,7 @@ func (st *testBundleLookupStub) lookupStream(name string) (*StreamInfo, error) {
 // stream added there is covered here without being restated.
 func testBundleSpecs() []brokerStreamSpec {
 	as := &mqttAccountSessionManager{}
-	return as.brokerStreamSpecs(&Server{}, 1, 1, mqttDefaultMaxAckPending)
+	return as.brokerStreamSpecs(&Server{}, 1, mqttDefaultMaxAckPending)
 }
 
 func testPresentInfo(name string) *StreamInfo {

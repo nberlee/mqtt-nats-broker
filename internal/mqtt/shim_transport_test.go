@@ -37,7 +37,7 @@ func runNATS(t *testing.T) (*natsserver.Server, *nats.Conn) {
 func TestTransportPubSub(t *testing.T) {
 	t.Parallel()
 	_, nc := runNATS(t)
-	s := &Server{nrc: nc, opts: &Options{}}
+	s := &Server{nrc: nc, opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}}
 	c := &client{srv: s, nrc: nc, acc: s.globalAccount()}
 
 	type delivery struct {
@@ -115,7 +115,7 @@ func TestTransportPubSub(t *testing.T) {
 func TestTransportUnsub(t *testing.T) {
 	t.Parallel()
 	_, nc := runNATS(t)
-	s := &Server{nrc: nc, opts: &Options{}}
+	s := &Server{nrc: nc, opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}}
 	c := &client{srv: s, nrc: nc, acc: s.globalAccount()}
 
 	var count int

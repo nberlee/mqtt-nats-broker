@@ -2104,7 +2104,7 @@ func TestWillUnsafeJSTimeoutRefusesTheAccount(t *testing.T) {
 			_, nc := runNATS(t)
 			s := &Server{
 				nrc:             nc,
-				opts:            &Options{MQTT: MQTTOpts{JSAPITimeout: tc.timeout}},
+				opts:            &Options{MQTT: MQTTOpts{StreamReplicas: 1, JSAPITimeout: tc.timeout}},
 				quitCh:          make(chan struct{}),
 				nodeName:        "timing-" + nuid.Next(),
 				willClaimStopCh: make(chan struct{}),

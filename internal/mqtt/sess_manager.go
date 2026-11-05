@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -1103,10 +1102,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		return nil, fmt.Errorf("MQTT delayed-Will timing is unsafe for account %q: %w", accName, verr)
 	}
 
+	// The operator states the count and every broker-owned stream must carry exactly it
+	// (ValidateOptions refuses less than 1): the broker cannot see the JetStream cluster's
+	// size, so no count is chosen for it (issue #171).
 	replicas := opts.MQTT.StreamReplicas
-	if replicas <= 0 {
-		replicas = s.mqttDetermineReplicas()
-	}
 	qname := fmt.Sprintf("[ACC:%s] MQTT ", accName)
 	as := &mqttAccountSessionManager{
 		sessions:        make(map[string]*mqttSession),
@@ -1229,10 +1228,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// which the table-coverage test refuses. Per-stream specials (the recovery
 	// epoch's generation, gate hooks and adoption, and the per-stream stamp that
 	// couples the ten) live in the entries, not around this loop.
-	wantReplicas := 0
-	if opts.MQTT.StreamReplicas != 0 {
-		wantReplicas = replicas
-	}
 	maxAckPending := int(opts.MQTT.MaxAckPending)
 	if maxAckPending == 0 {
 		maxAckPending = mqttDefaultMaxAckPending
@@ -1242,7 +1237,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// hand-maintained second list would drift from the table it is meant to police,
 	// and the table-coverage test proves the table's contents, not that some other
 	// list matches it.
-	specs := as.brokerStreamSpecs(s, replicas, wantReplicas, maxAckPending)
+	specs := as.brokerStreamSpecs(s, replicas, maxAckPending)
 
 	// Two lookup-only preflights, before anything is created, because the loop's own
 	// shape creates an absent stream before it validates one.
@@ -1374,35 +1369,6 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	success = true
 
 	return as, nil
-}
-
-// mqttDetermineReplicas chooses the count for new streams when -stream-replicas is 0.
-// cmd/mqtt-nats-broker never sets Options.Routes and its StreamReplicas 0 makes
-// JetStreamIsClustered false, so for this binary the answer is always 1; the route
-// count below applies only to a caller that sets both.
-func (s *Server) mqttDetermineReplicas() int {
-	// If not clustered, then replica will be 1.
-	if !s.JetStreamIsClustered() {
-		return 1
-	}
-	opts := s.getOpts()
-	replicas := 0
-	for _, u := range opts.Routes {
-		host := u.Hostname()
-		// If this is an IP just add one.
-		if net.ParseIP(host) != nil {
-			replicas++
-		} else {
-			addrs, _ := net.LookupHost(host)
-			replicas += len(addrs)
-		}
-	}
-	if replicas < 1 {
-		replicas = 1
-	} else if replicas > 3 {
-		replicas = 3
-	}
-	return replicas
 }
 
 // Adds this client ID to the flappers map, and if needed start the timer

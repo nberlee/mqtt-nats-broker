@@ -79,24 +79,24 @@ type chartVariant struct {
 	listen    chartListeners
 	nats      bool // the optional dependency is enabled
 	hpa       bool
-	// streamReplicas is the MQTTNB_STREAM_REPLICAS the variant sets; 0 leaves it unset.
+	// streamReplicas is the MQTTNB_STREAM_REPLICAS the variant renders; every variant renders one.
 	streamReplicas int
 }
 
 type chartListeners struct{ tls, plain, ws bool }
 
 var chartVariants = []chartVariant{
-	{file: "default-values.yaml", embedded: true, replicas: 1},
-	{file: "external-values.yaml", replicas: 3},
-	{file: "tls-values.yaml", replicas: 3, listen: chartListeners{tls: true}},
-	{file: "tls-plaintext-values.yaml", replicas: 3, listen: chartListeners{tls: true, plain: true}},
-	{file: "websocket-values.yaml", replicas: 3, listen: chartListeners{ws: true}},
-	{file: "autoscaling-values.yaml", replicas: 3, hpa: true},
-	{file: "optional-nats-values.yaml", replicas: 3, nats: true},
+	{file: "default-values.yaml", embedded: true, replicas: 1, streamReplicas: 1},
+	{file: "external-values.yaml", replicas: 3, streamReplicas: 3},
+	{file: "tls-values.yaml", replicas: 3, streamReplicas: 3, listen: chartListeners{tls: true}},
+	{file: "tls-plaintext-values.yaml", replicas: 3, streamReplicas: 3, listen: chartListeners{tls: true, plain: true}},
+	{file: "websocket-values.yaml", replicas: 3, streamReplicas: 3, listen: chartListeners{ws: true}},
+	{file: "autoscaling-values.yaml", replicas: 3, streamReplicas: 3, hpa: true},
+	{file: "optional-nats-values.yaml", replicas: 3, nats: true, streamReplicas: 1},
 	{file: "optional-nats-cluster-values.yaml", replicas: 3, nats: true, streamReplicas: 3},
-	{file: "optional-nats-fullname-values.yaml", replicas: 3, nats: true},
-	{file: "optional-nats-names-values.yaml", replicas: 3, nats: true},
-	{file: "embedded-values.yaml", embedded: true, replicas: 1},
+	{file: "optional-nats-fullname-values.yaml", replicas: 3, nats: true, streamReplicas: 1},
+	{file: "optional-nats-names-values.yaml", replicas: 3, nats: true, streamReplicas: 1},
+	{file: "embedded-values.yaml", embedded: true, replicas: 1, streamReplicas: 1},
 	{file: "embedded-cluster-values.yaml", embedded: true, clustered: true, replicas: 3, streamReplicas: 3},
 	{file: "embedded-cluster-tls-values.yaml", embedded: true, clustered: true, replicas: 3, streamReplicas: 3,
 		listen: chartListeners{tls: true}},
@@ -607,9 +607,7 @@ func checkChartEnvironment(t *testing.T, v chartVariant, c map[string]any, co ch
 	if v.listen.ws {
 		allowed = append(allowed, "MQTTNB_WS_PORT", "MQTTNB_WS_PATH")
 	}
-	if v.streamReplicas != 0 {
-		allowed = append(allowed, "MQTTNB_STREAM_REPLICAS")
-	}
+	allowed = append(allowed, "MQTTNB_STREAM_REPLICAS")
 	if v.clustered {
 		allowed = append(allowed, "MQTTNB_NATS_EMBEDDED_CONFIG", "MQTTNB_EMBEDDED_SERVER_NAME",
 			"MQTTNB_EMBEDDED_ROUTE_USER", "MQTTNB_EMBEDDED_ROUTE_PASS", "MQTTNB_EMBEDDED_ROUTES")
@@ -695,7 +693,7 @@ func checkChartEnvironment(t *testing.T, v chartVariant, c map[string]any, co ch
 			t.Errorf("env %s, which this variant sets, is missing", name)
 		}
 	}
-	if v.streamReplicas != 0 && out.values["MQTTNB_STREAM_REPLICAS"] != strconv.Itoa(v.streamReplicas) {
+	if v.streamReplicas < 1 || out.values["MQTTNB_STREAM_REPLICAS"] != strconv.Itoa(v.streamReplicas) {
 		t.Errorf("MQTTNB_STREAM_REPLICAS %q, want %d", out.values["MQTTNB_STREAM_REPLICAS"], v.streamReplicas)
 	}
 
@@ -1359,20 +1357,26 @@ func TestHelmChartRefusals(t *testing.T) {
 	bin := helmBin(t)
 	for _, tc := range []struct{ name, values, want string }{
 		{"UnknownTopology", "topology: sidecar\nbroker:\n  natsURLs: nats://nats:4222\n", "topology must be external or embedded"},
-		{"NoNATS", "topology: external\n", "broker.natsURLs"},
-		{"PlaintextWithoutTLS", "topology: external\nbroker:\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    plaintext: true\n", "mqtt.tls.plaintext"},
-		{"TLSWithoutSecret", "topology: external\nbroker:\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    enabled: true\n", "mqtt.tls.secretName"},
-		{"NoCredentials", "topology: external\nbroker:\n  natsURLs: nats://nats:4222\n  credentials:\n    secretName: \"\"\n", "broker.credentials.secretName"},
+		{"NoNATS", "topology: external\nbroker:\n  streamReplicas: 1\n", "broker.natsURLs"},
+		{"PlaintextWithoutTLS", "topology: external\nbroker:\n  streamReplicas: 1\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    plaintext: true\n", "mqtt.tls.plaintext"},
+		{"TLSWithoutSecret", "topology: external\nbroker:\n  streamReplicas: 1\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    enabled: true\n", "mqtt.tls.secretName"},
+		{"NoCredentials", "topology: external\nbroker:\n  streamReplicas: 1\n  natsURLs: nats://nats:4222\n  credentials:\n    secretName: \"\"\n", "broker.credentials.secretName"},
 		{"EmbeddedAutoscaling", "topology: embedded\nreplicas: 1\nautoscaling:\n  enabled: true\n", "autoscaling"},
 		{"EmbeddedWithDependency", "topology: embedded\nreplicas: 1\nnats:\n  enabled: true\n", "nats.enabled"},
 		{"EmbeddedUnclusteredReplicas", "topology: embedded\nreplicas: 3\n", "replicas: an unclustered embedded server is one pod"},
 		{"EmbeddedClusterEven", "topology: embedded\nreplicas: 4\nembedded:\n  cluster:\n    enabled: true\n", "odd count of at least 3"},
 		{"EmbeddedClusterOne", "topology: embedded\nreplicas: 1\nembedded:\n  cluster:\n    enabled: true\n", "odd count of at least 3"},
 		{"EmbeddedClusterNoRouteSecret", "topology: embedded\nreplicas: 3\nembedded:\n  cluster:\n    enabled: true\n    routeSecretName: \"\"\n", "embedded.cluster.routeSecretName"},
-		{"DependencyServiceDisabled", "topology: external\nnats:\n  enabled: true\n  service:\n    enabled: false\n", "nats.service.enabled is false"},
-		{"DependencyPortDisabled", "topology: external\nnats:\n  enabled: true\n  service:\n    ports:\n      nats:\n        enabled: false\n", "nats.service.ports.nats.enabled is false"},
-		{"DependencyClusterUnauthenticated", "topology: external\nnats:\n  enabled: true\n  config:\n    cluster:\n      enabled: true\n", "routes are unauthenticated"},
-		{"DependencySecretMismatch", "topology: external\nbroker:\n  credentials:\n    secretName: other\nnats:\n  enabled: true\n", "must come from broker.credentials.secretName"},
+		{"DependencyServiceDisabled", "topology: external\nbroker:\n  streamReplicas: 1\nnats:\n  enabled: true\n  service:\n    enabled: false\n", "nats.service.enabled is false"},
+		{"DependencyPortDisabled", "topology: external\nbroker:\n  streamReplicas: 1\nnats:\n  enabled: true\n  service:\n    ports:\n      nats:\n        enabled: false\n", "nats.service.ports.nats.enabled is false"},
+		{"DependencyClusterUnauthenticated", "topology: external\nbroker:\n  streamReplicas: 1\nnats:\n  enabled: true\n  config:\n    cluster:\n      enabled: true\n", "routes are unauthenticated"},
+		{"DependencySecretMismatch", "topology: external\nbroker:\n  streamReplicas: 1\n  credentials:\n    secretName: other\nnats:\n  enabled: true\n", "must come from broker.credentials.secretName"},
+		// The external topology has no stream replica default (issue #171): required refuses an
+		// absent value, and the positivity check a 0 or a negative one, which required accepts.
+		{"StreamReplicasMissing", "topology: external\nbroker:\n  natsURLs: nats://nats:4222\n", "broker.streamReplicas is required"},
+		{"StreamReplicasZero", "topology: external\nbroker:\n  natsURLs: nats://nats:4222\n  streamReplicas: 0\n", "broker.streamReplicas must be at least 1"},
+		{"StreamReplicasNegative", "topology: external\nbroker:\n  natsURLs: nats://nats:4222\n  streamReplicas: -1\n", "broker.streamReplicas must be at least 1"},
+		{"DependencyStreamReplicasMissing", "topology: external\nnats:\n  enabled: true\n", "broker.streamReplicas is required"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := helmRender(bin, helmChartDir, writeValues(t, tc.name, tc.values))
@@ -1391,7 +1395,7 @@ func TestHelmChartRefusals(t *testing.T) {
 // and that an append keeps every entry the chart renders.
 func TestHelmChartExtensionPoints(t *testing.T) {
 	bin := helmBin(t)
-	tlsBase := "topology: external\nbroker:\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    enabled: true\n    secretName: mqtt-nats-broker-tls\n"
+	tlsBase := "topology: external\nbroker:\n  natsURLs: nats://nats:4222\n  streamReplicas: 3\nmqtt:\n  tls:\n    enabled: true\n    secretName: mqtt-nats-broker-tls\n"
 	base := helmTemplate(t, bin, helmChartDir, writeValues(t, "base", tlsBase))
 	baseDep := findObject(t, base, "Deployment")
 	baseC := mustMap(t, baseDep, "spec", "template", "spec", "containers", 0)

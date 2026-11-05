@@ -31,8 +31,8 @@ and the JetStream API and allowed to ask who it is
 the broker's own service identity needs the grants in
 [Recommended NATS permissions](ARCHITECTURE.md#recommended-nats-permissions).
 
-**Stream replication.** Set `-stream-replicas` to the JetStream cluster size for HA; the
-default creates one-replica streams ([Configuration](CONFIGURATION.md#stream-replicas)).
+**Stream replication.** `-stream-replicas` is required: set it to the JetStream cluster
+size for HA, `1` for a single server ([Configuration](CONFIGURATION.md#stream-replicas)).
 
 ## Run it locally
 
@@ -48,8 +48,11 @@ A release publishes binaries for Linux and macOS on amd64 and arm64. From source
 
 ```sh
 go build ./cmd/mqtt-nats-broker
-./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -port 1883
+./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -stream-replicas 3 -port 1883
 ```
+
+`-stream-replicas` is the JetStream cluster size, `3` here; use `1` against a single
+server.
 
 The NATS URLs carry no credentials (they are refused); the service identity is given
 with `-nats-user`/`-nats-pass` or `-nats-creds`.
@@ -64,9 +67,11 @@ The external-NATS image:
 
 ```sh
 docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
-  -e MQTTNB_NATS_URLS=nats://nats:4222 \
+  -e MQTTNB_NATS_URLS=nats://nats:4222 -e MQTTNB_STREAM_REPLICAS=3 \
   ghcr.io/nberlee/mqtt-nats-broker:latest
 ```
+
+`MQTTNB_STREAM_REPLICAS` is the JetStream cluster size, as for the binary.
 
 A `tls://` NATS URL is verified against the image's CA bundle. For a NATS server under a
 private CA, mount the CA and name it with `SSL_CERT_FILE` (for example
@@ -82,11 +87,14 @@ JetStream API:
 
 ```sh
 docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
-  -v mqtt-data:/data \
+  -v mqtt-data:/data -e MQTTNB_STREAM_REPLICAS=1 \
   -e MQTTNB_NATS_USER=service -e MQTTNB_NATS_PASS=change-me \
   -e MQTTNB_DEFAULT_USER=mqtt -e MQTTNB_DEFAULT_PASS=change-me-too \
   ghcr.io/nberlee/mqtt-nats-broker:latest-embedded
 ```
+
+The image sets no stream replica count: `1` above is the one server its baked
+configuration runs, and a mounted cluster configuration takes the cluster size.
 
 Mount your own nats-server configuration and point `MQTTNB_NATS_EMBEDDED_CONFIG` at it
 for other accounts, TLS, or a cluster of broker pods (`embedded/nats-cluster.conf` is

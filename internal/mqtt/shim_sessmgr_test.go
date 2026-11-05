@@ -20,7 +20,7 @@ func TestSessionManagerBringUp(t *testing.T) {
 
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1}},
 		quitCh:   make(chan struct{}),
 		nodeName: "node1", // JSA reply routing id; must be non-empty & unique per instance
 	}

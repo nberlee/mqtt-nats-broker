@@ -170,7 +170,8 @@ JetStream cluster, start from `ci/optional-nats-cluster-values.yaml`: the routes
 authenticated (the chart refuses a cluster without route authorization, route credentials
 or route TLS), and that file takes the route credentials from the Secret
 `mqtt-nats-broker-routes` (`user`, `password`, URL-safe) without putting them in the
-rendered configuration. Set `broker.streamReplicas` to the server count. No NetworkPolicy
+rendered configuration. Set `broker.streamReplicas` to the server count; the external
+topology requires it. No NetworkPolicy
 is rendered for the dependency's route port; add one with `extraResources` where the
 network is shared.
 

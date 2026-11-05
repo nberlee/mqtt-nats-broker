@@ -1,6 +1,7 @@
 # MQTT over WebSocket beside plaintext MQTT.
 topology: external
 broker:
+  streamReplicas: 3
   natsURLs: nats://nats:4222
 mqtt:
   websocket:

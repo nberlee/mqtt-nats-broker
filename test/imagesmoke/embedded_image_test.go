@@ -26,9 +26,19 @@ var credentials = map[string]string{
 	"MQTTNB_DEFAULT_PASS": "anonpass",
 }
 
-// envOpts renders credentials as docker -e options, without skip and with override.
+// streamReplicas is the count the image does not supply (issue #171): the baked
+// configuration's one server, stated by every run here like any operator's.
+var streamReplicas = map[string]string{"MQTTNB_STREAM_REPLICAS": "1"}
+
+// envOpts renders credentials and the stream replica count as docker -e options, without
+// skip and with override.
 func envOpts(skip string, override map[string]string) []string {
 	var opts []string
+	for k, v := range streamReplicas {
+		if k != skip {
+			opts = append(opts, "-e", k+"="+v)
+		}
+	}
 	for k, v := range credentials {
 		if k == skip {
 			continue
@@ -121,13 +131,28 @@ func TestEmbeddedImageRefusesMissingCredentials(t *testing.T) {
 	}
 }
 
+// TestEmbeddedImageRefusesAMissingStreamReplicaCount: the image supplies no stream replica
+// count, because a mounted cluster configuration would inherit it (issue #171): a run that
+// states none is refused before the embedded server starts.
+func TestEmbeddedImageRefusesAMissingStreamReplicaCount(t *testing.T) {
+	f := newEmbeddedFixture(t)
+	b := f.runBroker(envOpts("MQTTNB_STREAM_REPLICAS", nil), nil)
+	if code := b.waitExit(time.Minute); code == 0 {
+		t.Fatal("exited 0 without a stream replica count")
+	}
+	if logs := b.logs(); !strings.Contains(logs, "stream-replicas (MQTTNB_STREAM_REPLICAS) is required") {
+		t.Fatalf("log lacks the stream replica refusal:\n%s", logs)
+	}
+}
+
 // TestEmbeddedImageNoUsersConfigKeepsThePassthroughError: a mounted configuration with
 // no users cannot name the broker's service identity, and auth passthrough refuses to
 // start with its existing error rather than serving anonymously.
 func TestEmbeddedImageNoUsersConfigKeepsThePassthroughError(t *testing.T) {
 	f := newEmbeddedFixture(t)
 	vol := f.volume("nousers", []tarEntry{{name: "nats.conf", body: []byte("listen: 127.0.0.1:4222\njetstream { store_dir: /data }\n")}})
-	b := f.runBroker([]string{"-v", vol + ":/etc/custom:ro", "-e", "MQTTNB_NATS_EMBEDDED_CONFIG=/etc/custom/nats.conf"}, nil)
+	b := f.runBroker([]string{"-v", vol + ":/etc/custom:ro", "-e", "MQTTNB_NATS_EMBEDDED_CONFIG=/etc/custom/nats.conf",
+		"-e", "MQTTNB_STREAM_REPLICAS=1"}, nil)
 	if code := b.waitExit(time.Minute); code == 0 {
 		t.Fatal("exited 0 with a configuration that names no user")
 	}

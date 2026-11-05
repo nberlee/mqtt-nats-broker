@@ -38,6 +38,7 @@ services:
       # over the per-client UserInfo (nats.go connectProto), so all clients would
       # inherit the service rights. Service creds go via MQTTNB_NATS_USER/PASS.
       MQTTNB_NATS_URLS: "nats://nats:4222"
+      MQTTNB_STREAM_REPLICAS: "1"
       MQTTNB_NATS_USER: "service"
       MQTTNB_NATS_PASS: "service"
       MQTTNB_HOST: "0.0.0.0"

@@ -14,7 +14,6 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
-	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
 // requireMQTTCannotAdministerJetStream attacks the broker's streams as an anonymous MQTT
@@ -212,7 +211,7 @@ func TestShippedACLsKeepMQTTIdentitiesOffBrokerSubjects(t *testing.T) {
 // attacks the broker's streams through MQTT.
 func TestRecommendedACLKeepsMQTTClientsOffTheJetStreamAPI(t *testing.T) {
 	srv := startConfiguredServer(t, "../../test/conformance/nats.conf", false)
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.NATSURLs = srv.ClientURL()
 	cfg.NATSUser, cfg.NATSPass = "service", "service"
 	cfg.DefaultUser, cfg.DefaultPass = "mqtt", "mqtt"

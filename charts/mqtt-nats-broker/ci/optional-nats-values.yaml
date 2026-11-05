@@ -1,4 +1,6 @@
 # The external topology with the official NATS chart beside it, one server.
 topology: external
+broker:
+  streamReplicas: 1
 nats:
   enabled: true

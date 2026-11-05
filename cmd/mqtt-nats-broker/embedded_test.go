@@ -73,7 +73,7 @@ accounts {
 // embeddedConfig is a broker configuration for an embedded server at path.
 func embeddedConfig(t *testing.T, path string) *config.Config {
 	t.Helper()
-	c := config.Default()
+	c := testConfig()
 	c.NATSEmbeddedConfig = path
 	c.NATSUser, c.NATSPass = "svc", "svcpass"
 	c.DefaultUser, c.DefaultPass = "anon", "anonpass"
@@ -553,7 +553,7 @@ func startBrokerProcess(t *testing.T, env []string, args ...string) *brokerProce
 		t.Fatal(err)
 	}
 	p := &brokerProcess{httpAddr: reservedAddr(t), mqttAddr: reservedAddr(t), exited: make(chan struct{})}
-	p.cmd = exec.Command(exe, append([]string{"-http-addr", p.httpAddr, "-port", portOf(t, p.mqttAddr)}, args...)...)
+	p.cmd = exec.Command(exe, append([]string{"-http-addr", p.httpAddr, "-port", portOf(t, p.mqttAddr), "-stream-replicas", "1"}, args...)...)
 	p.cmd.Env = append(append(os.Environ(), "MQTTNB_TEST_RUN_BROKER=1"), env...)
 	stdout, err := p.cmd.StdoutPipe()
 	if err != nil {

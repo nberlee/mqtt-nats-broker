@@ -20,7 +20,7 @@ import (
 func startConnectDeadlineBroker(t *testing.T, tune func(*Options)) (*Server, string) {
 	t.Helper()
 	_, nc := runNATS(t)
-	opts := &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}
+	opts := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}
 	if tune != nil {
 		tune(opts)
 	}
@@ -381,7 +381,7 @@ func TestMQTTConnectTimeoutResolution(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			o := &Options{AuthTimeout: test.top, MQTT: MQTTOpts{AuthTimeout: test.mqtt}}
+			o := &Options{AuthTimeout: test.top, MQTT: MQTTOpts{StreamReplicas: 1, AuthTimeout: test.mqtt}}
 			if got := mqttConnectTimeout(o); got != test.want {
 				t.Fatalf("mqttConnectTimeout(top=%v, mqtt=%v) = %v, want %v", test.top, test.mqtt, got, test.want)
 			}

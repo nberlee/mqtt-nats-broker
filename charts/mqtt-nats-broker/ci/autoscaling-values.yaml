@@ -1,6 +1,7 @@
 # The frontends scaled by a HorizontalPodAutoscaler.
 topology: external
 broker:
+  streamReplicas: 3
   natsURLs: nats://nats:4222
 autoscaling:
   enabled: true

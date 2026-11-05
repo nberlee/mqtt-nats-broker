@@ -905,7 +905,8 @@ func TestFulltestsHarnessStoreInputs(t *testing.T) {
 }
 
 // DefaultOptions mirrors upstream's server.DefaultOptions() for the fields the
-// upstream suite relies on.
+// upstream suite relies on, plus the one-server stream replica count this broker
+// requires (issue #171).
 func DefaultOptions() *Options {
-	return &Options{MaxPayload: MAX_PAYLOAD_SIZE}
+	return &Options{MaxPayload: MAX_PAYLOAD_SIZE, MQTT: MQTTOpts{StreamReplicas: 1}}
 }

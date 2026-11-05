@@ -97,7 +97,7 @@ func TestOwedDrainClearedOnStaleGeneration(t *testing.T) {
 func subscribeAfterCloseFixture(t *testing.T) (*client, *nats.Conn) {
 	t.Helper()
 	_, nc := runNATS(t)
-	s := &Server{nrc: nc, opts: &Options{}}
+	s := &Server{nrc: nc, opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}}
 	c := &client{srv: s, nrc: nc, acc: s.globalAccount()}
 	return c, nc
 }
@@ -246,7 +246,7 @@ func TestAcceptLoopSurvivesErrors(t *testing.T) {
 		after:  errors.New("still failing"),
 		closed: make(chan struct{}),
 	}
-	s := &Server{opts: &Options{}, quitCh: make(chan struct{})}
+	s := &Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, quitCh: make(chan struct{})}
 	s.running.Store(true)
 	accepted := make(chan net.Conn, 1)
 	exited := make(chan struct{})

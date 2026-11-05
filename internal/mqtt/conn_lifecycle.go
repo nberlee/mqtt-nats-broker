@@ -350,11 +350,11 @@ func ValidateOptions(o *Options) error {
 	if o.MaxConn < 0 {
 		return fmt.Errorf("mqtt max_conn must be >= 0 (0 = unlimited), got %d", o.MaxConn)
 	}
-	// A negative value is read as "choose" when the replica count is chosen and as an explicit
-	// requirement when the streams are checked, so it has no single meaning. The upper bound is the
-	// server's, which refuses it loudly.
-	if mo.StreamReplicas < 0 {
-		return fmt.Errorf("mqtt stream_replicas must be >= 0 (0 = the replica count mqttDetermineReplicas chooses), got %d", mo.StreamReplicas)
+	// The replica count is the operator's statement of the JetStream cluster size, which the broker
+	// cannot see: there is no default to fall back to, so anything below 1 is refused rather than
+	// read as one replica (issue #171). The upper bound is the server's, which refuses it loudly.
+	if mo.StreamReplicas < 1 {
+		return fmt.Errorf("mqtt stream_replicas must be >= 1 (the JetStream cluster size, 1 for a single server), got %d", mo.StreamReplicas)
 	}
 	for _, t := range []struct {
 		name string

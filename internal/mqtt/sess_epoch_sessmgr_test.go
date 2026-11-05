@@ -65,7 +65,7 @@ func newBringUpServerOn(t *testing.T, nc *nats.Conn, node string) (*Server, *cli
 	t.Helper()
 	s := &Server{
 		nrc:      nc,
-		opts:     &Options{},
+		opts:     &Options{MQTT: MQTTOpts{StreamReplicas: 1}},
 		quitCh:   make(chan struct{}),
 		nodeName: node,
 		// Initialized because the stop below follows Shutdown's phase order, and

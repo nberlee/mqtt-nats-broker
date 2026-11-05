@@ -989,11 +989,11 @@ recorded in `docs/CONFORMANCE.md`.
   to any instance; **session takeover** works across instances because it is
   mediated by a NATS-message mechanism, not in-memory state.
 - HA/durability guarantees come from JetStream **replicas** (`R3`/`R5`). Size the
-  NATS cluster, not the broker, and set `-stream-replicas` to it: the broker cannot see
-  the cluster's size, and `0` creates new streams with one replica and leaves an existing
-  stream's count unchecked (`mqttDetermineReplicas` reads only `Options.Routes`, which
-  this binary never sets). A nonzero count is enforced on every existing stream at
-  startup.
+  NATS cluster, not the broker, and set `-stream-replicas` to it. The count is required
+  and has no default, because the broker cannot see the cluster's size: the config layer
+  and `ValidateOptions` refuse a count below 1, a missing stream is created with the
+  count, and every existing broker-owned stream must carry exactly it at startup
+  ([issue #171](https://github.com/nberlee/mqtt-nats-broker/issues/171)).
 - `-stream-replicas` is the only replica setting. Durable MQTT consumers leave
   `Replicas` at 0 and inherit their stream's count: they all live on the
   interest-retention `$MQTT_msgs` and `$MQTT_out`, where JetStream refuses any
@@ -14957,7 +14957,7 @@ core subscriptions, and QoS 1 and 2 ride JetStream consumers.
 
 `Options` has one startup validation implementation, `ValidateOptions`. It checks
 the broker's local interpretation and encoding constraints: connection bounds,
-replica-count sentinel semantics, timeout conversion, supported protocol values,
+a stream replica count of at least 1, timeout conversion, supported protocol values,
 TLS pinning support, and Response Information encoding. It does not guarantee that
 every accepted option is usable by the backend or duplicate backend validation and
 timer arithmetic. Backend-owned limitations are recorded in `docs/CONFORMANCE.md`,
@@ -14970,7 +14970,8 @@ built, before dialing NATS or binding the health port. `internal/config` validat
 only the CLI contract and settings outside `Options`: a port greater than 0 (the
 core accepts 0 and -1 as ephemeral), a connect timeout greater than 0 (the core
 reads a nonpositive one as the default), NATS URLs without credentials (see "What a
-deployment must allow"), the JetStream domain token, TLS file
+deployment must allow"), the JetStream domain token, the stream replica count
+(at least 1, so a missing count is refused before NATS is dialed), TLS file
 pairing, the TLS reload interval (greater than 0), the drain delay, the log level,
 `-plain-port` (0 to 65535, only with TLS, not `-port`'s value), and
 the WebSocket flags (`-ws-port` 0 to 65535, `-ws-handshake-timeout` greater than 0, and no
@@ -16572,6 +16573,13 @@ operator runs (`broker.natsURLs`) or the official NATS chart as an optional depe
 container in the official NATS chart's own pods, which is not this chart but values for
 that one (`docs/deploy/nats-chart-shared-pod`). The chart is published only by a release
 tag, beside the images (see "Publication" below); no release exists yet.
+
+**The stream replica count is stated, never defaulted**
+([issue #171](https://github.com/nberlee/mqtt-nats-broker/issues/171)). The embedded
+topology renders it from its own shape, `1` for one server and the peer count for a
+cluster. The external topology requires `broker.streamReplicas`: Helm's `required`, plus
+a positivity check because `required` accepts a numeric 0, and the frontend count never
+supplies it. Neither image sets one, since a mounted configuration would inherit it.
 
 **Customization is the NATS chart's convention, with its helpers.** Every rendered object
 has a `merge` (deep-merged; a list in it replaces the chart's) and a `patch` (RFC 6902,

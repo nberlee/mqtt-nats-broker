@@ -1,6 +1,7 @@
 # TLS on 8883 with plaintext on 1883 beside it.
 topology: external
 broker:
+  streamReplicas: 3
   natsURLs: nats://nats:4222
 mqtt:
   tls:

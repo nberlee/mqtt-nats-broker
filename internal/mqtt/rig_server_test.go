@@ -33,7 +33,7 @@ import (
 // instead of hanging the binary.
 func testRigServer(t testing.TB, nc *nats.Conn, node string) *Server {
 	t.Helper()
-	s := NewServer(nc, &Options{}, node)
+	s := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, node)
 	t.Cleanup(func() { testRigServerDown(t, s) })
 	return s
 }

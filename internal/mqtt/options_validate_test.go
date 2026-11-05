@@ -25,7 +25,7 @@ var (
 )
 
 func validOptions() *Options {
-	return &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}
+	return &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}
 }
 
 func TestStartRefusesInvalidOptions(t *testing.T) {
@@ -45,7 +45,8 @@ func TestStartRefusesInvalidOptions(t *testing.T) {
 		{"keep alive maximum wrapping width", func(o *Options) { o.MQTT.KeepAliveMaximum = 4294967296 }, "keep_alive_maximum must be in [0..65535]"},
 		{"keep alive maximum negative", func(o *Options) { o.MQTT.KeepAliveMaximum = -1 }, "keep_alive_maximum must be in [0..65535]"},
 		{"max conn negative", func(o *Options) { o.MaxConn = -1 }, "max_conn must be >= 0"},
-		{"stream replicas negative", func(o *Options) { o.MQTT.StreamReplicas = -1 }, "stream_replicas must be >= 0"},
+		{"stream replicas negative", func(o *Options) { o.MQTT.StreamReplicas = -1 }, "stream_replicas must be >= 1"},
+		{"stream replicas zero", func(o *Options) { o.MQTT.StreamReplicas = 0 }, "stream_replicas must be >= 1"},
 		{"auth timeout NaN", func(o *Options) { o.MQTT.AuthTimeout = math.NaN() }, "mqtt auth_timeout must be a finite number"},
 		{"auth timeout +Inf", func(o *Options) { o.MQTT.AuthTimeout = math.Inf(1) }, "mqtt auth_timeout must be a finite number"},
 		{"auth timeout -Inf", func(o *Options) { o.MQTT.AuthTimeout = math.Inf(-1) }, "mqtt auth_timeout must be a finite number"},
@@ -188,7 +189,7 @@ func TestStartValidatesBeforeAnySideEffect(t *testing.T) {
 
 	// (b) An ephemeral port, so the listener would bind if startMQTT ran first.
 	t.Run("before the listener", func(t *testing.T) {
-		o := &Options{MaxConn: -1, MQTT: MQTTOpts{Host: "127.0.0.1", Port: 0}}
+		o := &Options{MaxConn: -1, MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: 0}}
 		s := NewServer(nc, o, "validate-listener")
 		err := s.Start()
 		if s.Addr() != nil {

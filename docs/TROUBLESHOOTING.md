@@ -21,6 +21,7 @@ reason names the setting:
 | `plain-port requires tls-cert and tls-key: ...` | `-plain-port` without TLS, where `-port` is already plaintext |
 | `ws-host, ws-path, ws-handshake-timeout, ws-no-tls and ws-allowed-origins require ws-port` | a WebSocket setting without the WebSocket listener |
 | `invalid js-domain (MQTTNB_JS_DOMAIN) ...: must be a single subject token, ...` | a JetStream domain with a dot, a wildcard or whitespace |
+| `stream-replicas (MQTTNB_STREAM_REPLICAS) is required: ...` | no replica count, or one below `1`; set the JetStream cluster size, `1` for a single server |
 | `invalid connect-timeout ... (must be > 0)` | the CONNECT deadline cannot be disabled |
 | `invalid log level ...` | anything but `debug`, `info`, `warn`, `error` |
 | `invalid MQTT configuration: ...` | an option the MQTT core refuses, such as a WebSocket path that is not an escaped absolute path |
@@ -130,9 +131,8 @@ particular streams instead of `$JS.ACK.>`. Grant `$JS.ACK.>`
 
 ## Broker state is lost when a NATS server fails
 
-The streams were created with one replica: `-stream-replicas` was left at `0`, which
-creates one-replica streams on a clustered NATS
-([Configuration](CONFIGURATION.md#stream-replicas)). Check with
+The streams were created with one replica: `-stream-replicas` was set to `1` on a
+clustered NATS ([Configuration](CONFIGURATION.md#stream-replicas)). Check with
 `nats stream info '$MQTT_sess'`. Moving to three replicas means recreating the ten
 streams, which discards the broker state.
 

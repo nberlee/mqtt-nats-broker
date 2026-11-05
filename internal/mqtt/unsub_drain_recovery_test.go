@@ -1589,7 +1589,7 @@ func TestForeignDispositionIsOwnershipGated(t *testing.T) {
 
 	// A REPLACEMENT is resident under the same client ID, as a CONNECT that already
 	// rebuilt from the authoritative record would have left things.
-	replacement, _, err := asm.createOrRestoreSession("foreign-gate", (&Server{opts: &Options{}}).getOpts())
+	replacement, _, err := asm.createOrRestoreSession("foreign-gate", (&Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}}).getOpts())
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
@@ -1766,7 +1766,7 @@ func TestForeignDispositionSparesARenboundClient(t *testing.T) {
 	t.Parallel()
 	_, oldClient, sess, _ := drainTestSession(t, "rebound")
 	asm := sess.asm
-	newClient := (&Server{opts: &Options{}, quitCh: make(chan struct{})}).createInternalAccountClient()
+	newClient := (&Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}, quitCh: make(chan struct{})}).createInternalAccountClient()
 
 	asm.mu.Lock()
 	if asm.sessions == nil {
@@ -1828,7 +1828,7 @@ func TestStaleDispositionSparesAReplacementExpiryTimer(t *testing.T) {
 	_, c, sess, _ := drainTestSession(t, "expiry-replacement")
 	asm := sess.asm
 
-	replacement, _, err := asm.createOrRestoreSession("expiry-replacement", (&Server{opts: &Options{}}).getOpts())
+	replacement, _, err := asm.createOrRestoreSession("expiry-replacement", (&Server{opts: &Options{MQTT: MQTTOpts{StreamReplicas: 1}}}).getOpts())
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}

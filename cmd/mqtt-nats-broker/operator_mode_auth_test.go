@@ -17,7 +17,6 @@ import (
 	"github.com/nats-io/nkeys"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
-	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
 
 // The operator (JWT) deployment docs/AUTHENTICATION.md documents, built in-process.
@@ -263,7 +262,7 @@ func TestOperatorModeAuthCallout(t *testing.T) {
 	logs := recordBrokerLog(t)
 
 	// W1: the service connects with a .creds file for a user of APP, and the broker serves.
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.NATSCreds = f.svcCreds
 	cfg.DefaultUser, cfg.DefaultPass = "anonymous", "anonpass"
 	addr := startExampleBroker(t, f.srv, cfg)
@@ -397,7 +396,7 @@ func TestOperatorModeAuthCallout(t *testing.T) {
 // no credentials, and the responder refuses it, so the broker does not start.
 func TestOperatorModeServiceNeedsItsCredentials(t *testing.T) {
 	f := startOperatorFixture(t, map[string]calloutUser{})
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.NATSURLs = f.srv.ClientURL()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

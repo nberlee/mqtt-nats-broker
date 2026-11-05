@@ -127,7 +127,7 @@ func TestUserPasswordExampleAuthorizesPerUserTopics(t *testing.T) {
 		requireOffBrokerSubjects(t, dial, u[0], u[1])
 	}
 
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.NATSUser, cfg.NATSPass = "mqtt-broker", "svcpass"
 	cfg.DefaultUser, cfg.DefaultPass = "anonymous", "anonpass"
 	addr := startExampleBroker(t, srv, cfg)
@@ -247,7 +247,7 @@ func TestCertificateOnlyClientIsTheDefaultIdentity(t *testing.T) {
 		return c, ack, err
 	}
 	newCfg := func() *config.Config {
-		cfg := config.Default()
+		cfg := testConfig()
 		cfg.NATSUser, cfg.NATSPass = "mqtt-broker", "svcpass"
 		cfg.TLSCert, cfg.TLSKey, cfg.TLSCA = write("server.pem", srvCert), write("server.key", srvKey), write("ca.pem", ca.CertPEM)
 		return cfg
@@ -305,7 +305,7 @@ func TestMQTTOnlyConnectionTypeIsRefusedThroughTheBroker(t *testing.T) {
 	}
 	t.Cleanup(func() { srv.Shutdown(); srv.WaitForShutdown() })
 
-	cfg := config.Default()
+	cfg := testConfig()
 	cfg.NATSUser, cfg.NATSPass = "svc", "svcpass"
 	addr := startExampleBroker(t, srv, cfg)
 	if _, ca, err := v5Connect(t, addr, "carol", "carol", "carolpass", nil); err != nil || ca.ReasonCode != 0 {

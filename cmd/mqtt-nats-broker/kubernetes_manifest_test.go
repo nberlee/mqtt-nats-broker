@@ -766,8 +766,8 @@ func anyStrings(v any) []string {
 // fields, the set is closed: another variable is a setting the checks may not judge.
 var (
 	exampleEnv = []string{
-		"MQTTNB_NATS_URLS", "MQTTNB_NATS_USER", "MQTTNB_NATS_PASS", "MQTTNB_DEFAULT_USER",
-		"MQTTNB_DEFAULT_PASS", "MQTTNB_LOG_LEVEL", "MQTTNB_DRAIN_DELAY",
+		"MQTTNB_NATS_URLS", "MQTTNB_STREAM_REPLICAS", "MQTTNB_NATS_USER", "MQTTNB_NATS_PASS",
+		"MQTTNB_DEFAULT_USER", "MQTTNB_DEFAULT_PASS", "MQTTNB_LOG_LEVEL", "MQTTNB_DRAIN_DELAY",
 	}
 	exampleTLSEnv   = []string{"MQTTNB_PORT", "MQTTNB_TLS_CERT", "MQTTNB_TLS_KEY"}
 	examplePlainEnv = []string{"MQTTNB_PLAIN_PORT"}

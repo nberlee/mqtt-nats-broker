@@ -25,7 +25,7 @@ import (
 func startWSBroker(t *testing.T, mod func(*Options)) (string, string, *Server) {
 	t.Helper()
 	_, nc := runNATS(t)
-	opts := &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1, Websocket: WebsocketOpts{Host: "127.0.0.1", Port: -1}}}
+	opts := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1, Websocket: WebsocketOpts{Host: "127.0.0.1", Port: -1}}}
 	if mod != nil {
 		mod(opts)
 	}
@@ -840,7 +840,7 @@ func TestWSListenerStartup(t *testing.T) {
 	free.Close()
 
 	_, nc := runNATS(t)
-	s := NewServer(nc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: mqttPort,
+	s := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: mqttPort,
 		Websocket: WebsocketOpts{Host: "127.0.0.1", Port: occupied.Addr().(*net.TCPAddr).Port}}}, "ws-startup")
 	if err := s.Start(); err == nil {
 		s.Shutdown()

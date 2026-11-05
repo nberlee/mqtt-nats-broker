@@ -19,7 +19,7 @@ func brokerOn(t *testing.T, url, node string) string {
 		t.Fatalf("service connect: %v", err)
 	}
 	t.Cleanup(nc.Close)
-	s := NewServer(nc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}, node)
+	s := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, node)
 	if err := s.Start(); err != nil {
 		t.Fatalf("start broker %s: %v", node, err)
 	}

@@ -44,6 +44,10 @@ spec:
           env:
             - name: MQTTNB_NATS_URLS
               value: nats://nats:4222
+            # Required: the JetStream cluster size (1 for a single server). Every
+            # existing broker-owned stream must have exactly this count.
+            - name: MQTTNB_STREAM_REPLICAS
+              value: "3"
             # The service identity. Its account must deny every MQTT identity
             # $MQTT.>, $JS.>, $KV.> and $O.> (docs/ARCHITECTURE.md, "What a
             # deployment must allow").

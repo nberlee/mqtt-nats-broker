@@ -191,7 +191,7 @@ func natsTLS(t *testing.T) (ca *testcerts.Authority, certPEM, keyPEM []byte) {
 	return ca, certPEM, keyPEM
 }
 
-var tlsNATSArgs = []string{"-nats", "tls://nats:4222", "-auth-passthrough=false"}
+var tlsNATSArgs = []string{"-nats", "tls://nats:4222", "-stream-replicas", "1", "-auth-passthrough=false"}
 
 // TestImageTrustsNATSThroughTheBakedBundlePath: the file the image ships its bundle at
 // is the file its Go runtime reads roots from. The test CA replaces the directory, and

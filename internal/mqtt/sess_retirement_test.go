@@ -830,16 +830,12 @@ func TestValidateTeardownStream(t *testing.T) {
 			Retention:  LimitsPolicy,
 			Discard:    DiscardOld,
 			MaxMsgsPer: 1,
+			Replicas:   3,
 			Metadata:   map[string]string{mqttSessEpochMetaKey: epoch},
 		}}
 	}
-	if err := validateTeardownStream(base(), domainTk, 0, epoch); err != nil {
+	if err := validateTeardownStream(base(), domainTk, 3, epoch); err != nil {
 		t.Fatalf("conformant stream must validate, got %v", err)
-	}
-	si := base()
-	si.Config.Replicas = 3
-	if err := validateTeardownStream(si, domainTk, 3, epoch); err != nil {
-		t.Fatalf("matching replicas must validate, got %v", err)
 	}
 
 	for _, tc := range []struct {
@@ -847,39 +843,39 @@ func TestValidateTeardownStream(t *testing.T) {
 		mutate func(si *StreamInfo)
 		want   int
 	}{
-		{"nil", func(si *StreamInfo) {}, 0}, // replaced below
-		{"wrongsubject", func(si *StreamInfo) { si.Config.Subjects = []string{"bogus.>"} }, 0},
-		{"twosubjects", func(si *StreamInfo) { si.Config.Subjects = []string{wantSubj, "extra.>"} }, 0},
-		{"memstorage", func(si *StreamInfo) { si.Config.Storage = MemoryStorage }, 0},
-		{"interestretention", func(si *StreamInfo) { si.Config.Retention = InterestPolicy }, 0},
-		{"discardnew", func(si *StreamInfo) { si.Config.Discard = DiscardNew }, 0},
-		{"maxmsgsper", func(si *StreamInfo) { si.Config.MaxMsgsPer = 2 }, 0},
-		{"maxmsgs", func(si *StreamInfo) { si.Config.MaxMsgs = 10 }, 0},
-		{"maxbytes", func(si *StreamInfo) { si.Config.MaxBytes = 1 << 20 }, 0},
-		{"maxage", func(si *StreamInfo) { si.Config.MaxAge = time.Hour }, 0},
-		{"mirror", func(si *StreamInfo) { si.Config.Mirror = &StreamSource{Name: mqttSessStreamName} }, 0},
-		{"sources", func(si *StreamInfo) { si.Config.Sources = []*StreamSource{{Name: mqttSessStreamName}} }, 0},
+		{"nil", func(si *StreamInfo) {}, 3}, // replaced below
+		{"wrongsubject", func(si *StreamInfo) { si.Config.Subjects = []string{"bogus.>"} }, 3},
+		{"twosubjects", func(si *StreamInfo) { si.Config.Subjects = []string{wantSubj, "extra.>"} }, 3},
+		{"memstorage", func(si *StreamInfo) { si.Config.Storage = MemoryStorage }, 3},
+		{"interestretention", func(si *StreamInfo) { si.Config.Retention = InterestPolicy }, 3},
+		{"discardnew", func(si *StreamInfo) { si.Config.Discard = DiscardNew }, 3},
+		{"maxmsgsper", func(si *StreamInfo) { si.Config.MaxMsgsPer = 2 }, 3},
+		{"maxmsgs", func(si *StreamInfo) { si.Config.MaxMsgs = 10 }, 3},
+		{"maxbytes", func(si *StreamInfo) { si.Config.MaxBytes = 1 << 20 }, 3},
+		{"maxage", func(si *StreamInfo) { si.Config.MaxAge = time.Hour }, 3},
+		{"mirror", func(si *StreamInfo) { si.Config.Mirror = &StreamSource{Name: mqttSessStreamName} }, 3},
+		{"sources", func(si *StreamInfo) { si.Config.Sources = []*StreamSource{{Name: mqttSessStreamName}} }, 3},
 		{"replicamismatch", func(si *StreamInfo) { si.Config.Replicas = 1 }, 3},
-		{"maxmsgsize", func(si *StreamInfo) { si.Config.MaxMsgSize = 1024 }, 0},
-		{"noack", func(si *StreamInfo) { si.Config.NoAck = true }, 0},
-		{"sealed", func(si *StreamInfo) { si.Config.Sealed = true }, 0},
+		{"maxmsgsize", func(si *StreamInfo) { si.Config.MaxMsgSize = 1024 }, 3},
+		{"noack", func(si *StreamInfo) { si.Config.NoAck = true }, 3},
+		{"sealed", func(si *StreamInfo) { si.Config.Sealed = true }, 3},
 		{"subjecttransform", func(si *StreamInfo) {
 			si.Config.SubjectTransform = &SubjectTransformConfig{Source: "a", Destination: "b"}
-		}, 0},
-		{"republish", func(si *StreamInfo) { si.Config.RePublish = &RePublish{Source: "a", Destination: "b"} }, 0},
-		{"allowmsgcounter", func(si *StreamInfo) { si.Config.AllowMsgCounter = true }, 0},
-		{"allowrollup", func(si *StreamInfo) { si.Config.AllowRollup = true }, 0},
-		{"asyncpersist", func(si *StreamInfo) { si.Config.PersistMode = AsyncPersistMode }, 0},
+		}, 3},
+		{"republish", func(si *StreamInfo) { si.Config.RePublish = &RePublish{Source: "a", Destination: "b"} }, 3},
+		{"allowmsgcounter", func(si *StreamInfo) { si.Config.AllowMsgCounter = true }, 3},
+		{"allowrollup", func(si *StreamInfo) { si.Config.AllowRollup = true }, 3},
+		{"asyncpersist", func(si *StreamInfo) { si.Config.PersistMode = AsyncPersistMode }, 3},
 		// The epoch coupling: a MarkerSeq is a $MQTT_sess sequence, so a stream from
 		// another incarnation of that stream carries watermarks nothing may compare.
-		{"noepoch", func(si *StreamInfo) { si.Config.Metadata = nil }, 0},
-		{"emptyepoch", func(si *StreamInfo) { si.Config.Metadata = map[string]string{mqttSessEpochMetaKey: ""} }, 0},
+		{"noepoch", func(si *StreamInfo) { si.Config.Metadata = nil }, 3},
+		{"emptyepoch", func(si *StreamInfo) { si.Config.Metadata = map[string]string{mqttSessEpochMetaKey: ""} }, 3},
 		{"malformedepoch", func(si *StreamInfo) {
 			si.Config.Metadata = map[string]string{mqttSessEpochMetaKey: "not-a-nuid"}
-		}, 0},
+		}, 3},
 		{"foreignepoch", func(si *StreamInfo) {
 			si.Config.Metadata = map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()}
-		}, 0},
+		}, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var si *StreamInfo
@@ -906,7 +902,7 @@ func TestValidateTeardownStream(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			si := base()
 			tc.mutate(si)
-			if err := validateTeardownStream(si, domainTk, 0, epoch); err != nil {
+			if err := validateTeardownStream(si, domainTk, 3, epoch); err != nil {
 				t.Fatalf("%s, but it was rejected: %v", tc.name, err)
 			}
 		})

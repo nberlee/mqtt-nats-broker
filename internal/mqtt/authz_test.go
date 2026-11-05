@@ -174,7 +174,7 @@ func authzBroker(t *testing.T, conf string) (broker string, s *Server) {
 		t.Fatalf("service connect: %v", err)
 	}
 	t.Cleanup(svc.Close)
-	s = NewServer(svc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}, "authz-node")
+	s = NewServer(svc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, "authz-node")
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(url, nats.UserInfo(user, pass))
 	})
@@ -772,7 +772,7 @@ func authzBrokerTrackingDials(t *testing.T, conf string) (broker string, dialed 
 
 	var mu sync.Mutex
 	conns := map[string]*nats.Conn{}
-	s := NewServer(svc, &Options{MQTT: MQTTOpts{Host: "127.0.0.1", Port: -1}}, "authz-dial-node")
+	s := NewServer(svc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, "authz-dial-node")
 	s.SetClientDialer(func(clientID, user, pass string) (*nats.Conn, error) {
 		nc, derr := nats.Connect(url, nats.UserInfo(user, pass), nats.MaxReconnects(0))
 		if derr == nil {

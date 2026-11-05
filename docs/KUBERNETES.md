@@ -25,12 +25,12 @@ They are independent, and confusing them is how an HA deployment ends up without
 
 The embedded topology ties the last two together: each pod is one JetStream server and
 the chart sets the stream replicas to the pod count. In the external topology the chart
-cannot see the NATS cluster: `broker.streamReplicas` defaults to `0`, which creates
-one-replica streams ([Configuration](CONFIGURATION.md#stream-replicas)), so set it to
-the NATS cluster size, normally `3`. The example manifests do not set it either: add
-`MQTTNB_STREAM_REPLICAS` to their Deployment. The shared-pod values set it to the NATS
-chart's cluster size. Set it before the first start: existing streams keep the count
-they were created with.
+cannot see the NATS cluster: `broker.streamReplicas` has no default and the chart
+refuses to render without it ([Configuration](CONFIGURATION.md#stream-replicas)), so set
+it to the NATS cluster size, normally `3`, or `1` for a single server. The example
+manifests set `MQTTNB_STREAM_REPLICAS` to `3` in their Deployment; change it to your
+cluster size. The shared-pod values set it to the NATS chart's cluster size. Set it
+before the first start: existing streams keep the count they were created with.
 
 To check what a running deployment has, ask NATS about the ten broker-owned streams,
 for example with the `nats` CLI as the broker's service user:

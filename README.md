@@ -41,11 +41,12 @@ Run a broker + NATS locally:
 docker compose -f test/conformance/docker-compose.yml up --build
 ```
 
-Or run the binary against an existing NATS cluster:
+Or run the binary against an existing NATS cluster, with `-stream-replicas` set to its
+JetStream cluster size (`1` for a single server):
 
 ```sh
 go build ./cmd/mqtt-nats-broker
-./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -port 1883
+./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -stream-replicas 3 -port 1883
 ```
 
 ## Documentation

@@ -101,7 +101,7 @@ soak: ## Paired flakiness soak: same gated tests on this tree vs a clean baselin
 		./test/soak.sh
 
 run: build ## Build and run against a local NATS on :4222 (serves MQTT on :1883)
-	./mqtt-nats-broker
+	./mqtt-nats-broker -stream-replicas 1
 
 docker: ## Build a single-arch image for the host
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) .

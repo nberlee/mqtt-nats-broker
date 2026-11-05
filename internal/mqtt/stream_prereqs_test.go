@@ -57,10 +57,10 @@ func TestValidateSessStream(t *testing.T) {
 	if err := validateSessStream(good(), "", 3); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateSessStream(good(), "", 0); err != nil {
-		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
+	if err := validateSessStream(good(), "", 1); err == nil || !strings.Contains(err.Error(), "replicas is 3 (want 1)") {
+		t.Fatalf("a replica mismatch must be rejected: %v", err)
 	}
-	if err := validateSessStream(nil, "", 0); err == nil {
+	if err := validateSessStream(nil, "", 3); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 
@@ -176,7 +176,7 @@ func TestValidateWillQStream(t *testing.T) {
 	if err := validateWillQStream(good(), "", 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateWillQStream(nil, "", 0, testBundleEpoch); err == nil {
+	if err := validateWillQStream(nil, "", 3, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -254,7 +254,7 @@ func TestValidateMsgsStream(t *testing.T) {
 	if err := validateMsgsStream(good(), 3, mqttDefaultMaxAckPending, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateMsgsStream(nil, 0, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
+	if err := validateMsgsStream(nil, 3, mqttDefaultMaxAckPending, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -350,7 +350,7 @@ func TestValidateRetainedStream(t *testing.T) {
 	if err := validateRetainedStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateRetainedStream(nil, 0, testBundleEpoch); err == nil {
+	if err := validateRetainedStream(nil, 3, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 	for _, tc := range []struct {
@@ -582,9 +582,12 @@ var mqttTestBrokerStreamNames = []string{
 //
 // So: build, run entry 0's post over its own config to adopt, then run the
 // remaining preCreate hooks. The returned table is what the broker would create.
-func testBrokerStreamSpecs() []brokerStreamSpec {
+func testBrokerStreamSpecs() []brokerStreamSpec { return testBrokerStreamSpecsAt(3) }
+
+// testBrokerStreamSpecsAt is testBrokerStreamSpecs at a required replica count of replicas.
+func testBrokerStreamSpecsAt(replicas int) []brokerStreamSpec {
 	as := &mqttAccountSessionManager{}
-	specs := as.brokerStreamSpecs(&Server{}, 3, 3, mqttDefaultMaxAckPending)
+	specs := as.brokerStreamSpecs(&Server{}, replicas, mqttDefaultMaxAckPending)
 	if len(specs) == 0 || specs[0].name != mqttSessStreamName {
 		panic("the provisioning table must start with " + mqttSessStreamName + ": it mints the recovery epoch")
 	}
@@ -597,6 +600,58 @@ func testBrokerStreamSpecs() []brokerStreamSpec {
 		}
 	}
 	return specs
+}
+
+// TestBrokerStreamsEnforceARequestedSingleReplica: a required count of 1 is enforced on every
+// one of the ten streams like any other count. There is no count that skips the comparison
+// (issue #171), so a stream created at another count is refused at 1 as it is at 3.
+func TestBrokerStreamsEnforceARequestedSingleReplica(t *testing.T) {
+	t.Parallel()
+	for _, spec := range testBrokerStreamSpecsAt(1) {
+		if spec.cfg.Replicas != 1 {
+			t.Fatalf("entry %q creates at %d replicas, want the required 1", spec.name, spec.cfg.Replicas)
+		}
+		at := *spec.cfg
+		if err := spec.validate(&StreamInfo{Config: at}); err != nil {
+			t.Fatalf("entry %q rejects its own one-replica configuration: %v", spec.name, err)
+		}
+		at.Replicas = 3
+		if err := spec.validate(&StreamInfo{Config: at}); err == nil ||
+			!strings.Contains(err.Error(), "replicas is 3 (want 1)") {
+			t.Fatalf("entry %q at 3 replicas against a required 1 = %v, want the replica refusal", spec.name, err)
+		}
+	}
+}
+
+// TestStartupRefusesABundleAtAnotherReplicaCount: a broker whose required count differs from the
+// one the account's streams were created with refuses to start, through the production
+// provisioning path, and changes nothing (issue #171). One server suffices: the streams exist,
+// so nothing is created at the new count.
+func TestStartupRefusesABundleAtAnotherReplicaCount(t *testing.T) {
+	_, nc := runNATS(t)
+	newBroker := func(node string, replicas int) (*Server, *client) {
+		s := &Server{
+			nrc:             nc,
+			opts:            &Options{MQTT: MQTTOpts{StreamReplicas: replicas}},
+			quitCh:          make(chan struct{}),
+			nodeName:        node,
+			willClaimStopCh: make(chan struct{}),
+			willTimers:      make(map[string]*time.Timer),
+		}
+		s.running.Store(true)
+		s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
+		t.Cleanup(func() { close(s.quitCh) })
+		return s, s.createInternalAccountClient()
+	}
+	s1, c1 := newBroker("one-replica", 1)
+	if _, err := s1.getOrCreateMQTTAccountSessionManager(c1); err != nil {
+		t.Fatalf("provisioning the bundle at 1 replica: %v", err)
+	}
+	s2, c2 := newBroker("two-replicas", 2)
+	_, err := s2.getOrCreateMQTTAccountSessionManager(c2)
+	if err == nil || !strings.Contains(err.Error(), "replicas is 1 (want 2)") {
+		t.Fatalf("a broker requiring 2 replicas over a one-replica bundle = %v, want the replica refusal", err)
+	}
 }
 
 // With provisioning table-driven, bypassing ensureBrokerStream requires

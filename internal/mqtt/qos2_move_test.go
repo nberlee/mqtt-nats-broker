@@ -438,10 +438,10 @@ func TestValidateQoS2InStream(t *testing.T) {
 	if err := validateQoS2InStream(good(), 3, testBundleEpoch); err != nil {
 		t.Fatalf("the create path's own configuration was rejected: %v", err)
 	}
-	if err := validateQoS2InStream(good(), 0, testBundleEpoch); err != nil {
-		t.Fatalf("unexpected rejection with no replica expectation: %v", err)
+	if err := validateQoS2InStream(good(), 1, testBundleEpoch); err == nil {
+		t.Fatal("a replica mismatch must be rejected")
 	}
-	if err := validateQoS2InStream(nil, 0, testBundleEpoch); err == nil {
+	if err := validateQoS2InStream(nil, 3, testBundleEpoch); err == nil {
 		t.Fatal("expected nil stream info to be rejected")
 	}
 
@@ -560,7 +560,7 @@ func TestQoS2InStreamMisconfigurationFailsStartup(t *testing.T) {
 	if rierr != nil || rsi == nil {
 		t.Fatalf("lookup the recreated stream: si=%v err=%v", rsi, rierr)
 	}
-	if verr := validateQoS2InStream(rsi, 0, asm.sessStreamEpoch); verr != nil {
+	if verr := validateQoS2InStream(rsi, 1, asm.sessStreamEpoch); verr != nil {
 		t.Fatalf("the recreated stream does not satisfy the validator: %v", verr)
 	}
 }

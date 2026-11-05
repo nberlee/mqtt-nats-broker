@@ -10,6 +10,48 @@ import (
 	"time"
 )
 
+// TestMain gives every Load in this package the stream replica count the broker requires
+// (issue #171), so a test fails only on the setting it is about.
+// TestValidateRequiresStreamReplicas unsets it to test the requirement itself.
+func TestMain(m *testing.M) {
+	if err := os.Setenv("MQTTNB_STREAM_REPLICAS", "1"); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
+
+// validDefault is Default with the one setting it cannot default: the stream replica count.
+func validDefault() *Config {
+	c := Default()
+	c.StreamReps = 1
+	return c
+}
+
+func TestValidateRequiresStreamReplicas(t *testing.T) {
+	const want = "stream-replicas (MQTTNB_STREAM_REPLICAS) is required"
+	for _, n := range []int{0, -1} {
+		c := validDefault()
+		c.StreamReps = n
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate with stream replicas %d = %v, want a refusal containing %q", n, err, want)
+		}
+	}
+	if err := validDefault().Validate(); err != nil {
+		t.Errorf("Validate with stream replicas 1 = %v, want accepted", err)
+	}
+	t.Setenv("MQTTNB_STREAM_REPLICAS", "")
+	if err := os.Unsetenv("MQTTNB_STREAM_REPLICAS"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(nil); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("Load with no stream replica count = %v, want a refusal containing %q", err, want)
+	}
+	c, err := Load([]string{"-stream-replicas", "3"})
+	if err != nil || c.StreamReps != 3 {
+		t.Errorf("Load(-stream-replicas 3) = %+v, %v; want 3 accepted", c, err)
+	}
+}
+
 func TestLoadDrainDelay(t *testing.T) {
 	// Default is 0 (drain immediately).
 	c, err := Load(nil)
@@ -107,16 +149,17 @@ func TestLoadV5Knobs(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	cases := map[string]func(*Config){
-		"bad port":     func(c *Config) { c.MQTTPort = 0 },
-		"empty nats":   func(c *Config) { c.NATSURLs = "" },
-		"bad loglevel": func(c *Config) { c.LogLevel = "trace" },
-		"tls half-set": func(c *Config) { c.TLSCert = "x" },
-		"tls ca only":  func(c *Config) { c.TLSCA = "x" },
-		"tls reload 0": func(c *Config) { c.TLSReloadInterval = 0 },
+		"bad port":           func(c *Config) { c.MQTTPort = 0 },
+		"empty nats":         func(c *Config) { c.NATSURLs = "" },
+		"bad loglevel":       func(c *Config) { c.LogLevel = "trace" },
+		"tls half-set":       func(c *Config) { c.TLSCert = "x" },
+		"tls ca only":        func(c *Config) { c.TLSCA = "x" },
+		"tls reload 0":       func(c *Config) { c.TLSReloadInterval = 0 },
+		"no stream replicas": func(c *Config) { c.StreamReps = 0 },
 	}
 	for name, mut := range cases {
 		t.Run(name, func(t *testing.T) {
-			c := Default()
+			c := validDefault()
 			mut(c)
 			if err := c.Validate(); err == nil {
 				t.Errorf("expected validation error for %q", name)
@@ -133,7 +176,7 @@ func TestValidateJSDomain(t *testing.T) {
 	valid := []string{"", "HUB", "hub-1", "_x", "leaf_2", "京都"}
 	for _, d := range valid {
 		t.Run("valid/"+d, func(t *testing.T) {
-			c := Default()
+			c := validDefault()
 			c.JSDomain = d
 			if err := c.Validate(); err != nil {
 				t.Errorf("JSDomain %q: unexpected error: %v", d, err)
@@ -157,7 +200,7 @@ func TestValidateJSDomain(t *testing.T) {
 	}
 	for name, d := range invalid {
 		t.Run("invalid/"+name, func(t *testing.T) {
-			c := Default()
+			c := validDefault()
 			c.JSDomain = d
 			if err := c.Validate(); err == nil {
 				t.Errorf("JSDomain %q: expected a validation error", d)
@@ -356,7 +399,7 @@ func TestValidateRefusesNATSURLCredentials(t *testing.T) {
 		{"two plain", "nats://a:4222, nats://b:4222", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := Default()
+			c := validDefault()
 			c.NATSURLs = tc.urls
 			err := c.Validate()
 			if tc.want == "" {
@@ -375,8 +418,8 @@ func TestValidateRefusesNATSURLCredentials(t *testing.T) {
 			}
 		})
 	}
-	if err := Default().Validate(); err != nil {
-		t.Fatalf("the default configuration is refused: %v", err)
+	if err := validDefault().Validate(); err != nil {
+		t.Fatalf("the default configuration with its required stream replica count is refused: %v", err)
 	}
 }
 
