@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"time"
+	"weak"
 )
 
 // errMQTTClearRefusedUnresolved is the sentinel clear returns when it refused BEFORE its
@@ -235,7 +236,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	sess.deferred = nil
 	// The resume cutoff and its late-NAK bookkeeping name the discarded incarnation's
 	// connections and markers.
-	sess.resumeReadBy, sess.lateNAKed, sess.deferredLate = nil, nil, nil
+	sess.resumeReadBy, sess.lateNAKed, sess.deferredLate = weak.Pointer[client]{}, nil, nil
 	// Retired sources belonged to the discarded incarnation's consumers, which are being
 	// deleted: nothing can redeliver them, so nothing needs settling.
 	sess.srcAckOwed = nil

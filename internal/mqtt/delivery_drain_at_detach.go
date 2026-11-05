@@ -20,15 +20,49 @@ package mqtt
 
 import (
 	"strings"
+	"weak"
 
 	"github.com/nats-io/nats.go"
 )
 
 // mqttOfferOrigin is the subscription and connection an offer reached. The zero value is the
 // session's own bookkeeping, which records as the session's own connection does.
+//
+// It NAMES them and never keeps them: an origin outlives its connection on a pending exchange
+// (mqttPending.origin) and in a late tag, and a strong reference there kept the whole
+// disconnected client — its read buffer, its per-client NATS connection — reachable for as long
+// as the session stayed resident. Identity survives collection (two weak pointers made from the
+// same object compare equal, before and after it is reclaimed), and the one fact a decision
+// reads from the subscription, its drain state, is the drain cell, which holds no reference
+// back.
 type mqttOfferOrigin struct {
-	sub *subscription
-	cc  *client
+	sub   weak.Pointer[subscription]
+	cc    weak.Pointer[client]
+	drain *mqttDetachDrain
+}
+
+// mqttOriginOf names the offer's subscription and connection.
+func mqttOriginOf(sub *subscription, cc *client) mqttOfferOrigin {
+	o := mqttOfferOrigin{sub: weak.Make(sub), cc: weak.Make(cc)}
+	if sub != nil && sub.mqtt != nil {
+		o.drain = sub.mqtt.drain
+	}
+	return o
+}
+
+// mqttDetachDrain is the drain-at-detach state of one ordinary non-shared QoS 1/2 delivery
+// subscription: its at-most-one Drain (drainDeliveriesAtDetach), guarded by sess.mu. Claimed is
+// set before the lock is released to call Drain, so no second teardown issues another or falls
+// back to an unsubscribe that would cancel it. Issued is set only after Drain returned nil, in
+// the section that runs the handoff: from then on the UNSUB precedes, on the service
+// connection, any NAK published for this subscription's offers, which is what licenses the
+// writer's late NAK. Claimed alone licenses nothing.
+//
+// A cell rather than fields of the subscription so that an origin can read the drain state
+// after the subscription and its connection are gone, without keeping either.
+type mqttDetachDrain struct {
+	claimed bool
+	issued  bool
 }
 
 // mqttWithheldOutcome is what recordWithheldAttemptLocked decided for one withheld offer.
@@ -47,8 +81,8 @@ const (
 // mqttLateMarker tags a marker another connection's offer recorded after the resume cutoff
 // readBy: its origin subscription's drain, once issued, NAKs it (handOffLateMarkersLocked).
 type mqttLateMarker struct {
-	sub    *subscription
-	readBy *client
+	sub    weak.Pointer[subscription]
+	readBy weak.Pointer[client]
 	reply  string
 }
 
@@ -95,7 +129,7 @@ func (sess *mqttSession) withheldDecidedLocked(dur string, sseq uint64, origin m
 //
 // Lock held on entry.
 func (sess *mqttSession) resumeCutoffPassedLocked() bool {
-	return sess.c != nil && sess.resumeReadBy == sess.c
+	return sess.c != nil && sess.resumeReadBy == weak.Make(sess.c)
 }
 
 // setResumeCutoffLocked records that c's resume pass has read the markers. A new cutoff starts
@@ -104,7 +138,7 @@ func (sess *mqttSession) resumeCutoffPassedLocked() bool {
 //
 // Lock held on entry.
 func (sess *mqttSession) setResumeCutoffLocked(c *client) {
-	sess.resumeReadBy = c
+	sess.resumeReadBy = weak.Make(c)
 	sess.lateNAKed = nil
 	sess.deferredLate = nil
 }
@@ -406,11 +440,11 @@ func (sess *mqttSession) drainDeliveriesAtDetach(c *client, subs []*subscription
 	for _, sub := range subs {
 		ns, _ := sub.nsub.(*nats.Subscription)
 		sess.mu.Lock()
-		drainClass := sub.mqtt != nil && sub.mqtt.drainAtDetach
-		claimedElsewhere := drainClass && sub.mqtt.drainClaimed
+		drainClass := sub.mqtt != nil && sub.mqtt.drain != nil
+		claimedElsewhere := drainClass && sub.mqtt.drain.claimed
 		claim := drainClass && !claimedElsewhere && !shutdown && ns != nil
 		if claim {
-			sub.mqtt.drainClaimed = true
+			sub.mqtt.drain.claimed = true
 		}
 		sess.mu.Unlock()
 		switch {
@@ -436,7 +470,7 @@ func (sess *mqttSession) drainDeliveriesAtDetach(c *client, subs []*subscription
 		var handoff []string
 		sess.mu.Lock()
 		if err == nil {
-			sub.mqtt.drainIssued = true
+			sub.mqtt.drain.issued = true
 			handoff = sess.handOffLateMarkersLocked(sub)
 		}
 		sess.mu.Unlock()
@@ -481,7 +515,7 @@ func (sess *mqttSession) drainDisplacedDeliveries(successor, predecessor *client
 	var drainClass []*subscription
 	sess.mu.Lock()
 	for _, sub := range subs {
-		if sub.mqtt != nil && sub.mqtt.drainAtDetach {
+		if sub.mqtt != nil && sub.mqtt.drain != nil {
 			drainClass = append(drainClass, sub)
 		}
 	}
@@ -504,8 +538,9 @@ func (sess *mqttSession) handOffLateMarkersLocked(sub *subscription) []string {
 	}
 	own := sess.markerOwnershipLocked()
 	var naks []string
+	id := weak.Make(sub)
 	for k, t := range sess.deferredLate {
-		if t.sub != sub {
+		if t.sub != id {
 			continue
 		}
 		// A tag is a fact only while its marker still holds what was tagged, under this

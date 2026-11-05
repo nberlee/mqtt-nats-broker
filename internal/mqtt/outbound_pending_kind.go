@@ -13,7 +13,10 @@
 
 package mqtt
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"weak"
+)
 
 // ---------------------------------------------------------------------------
 // A pending entry's authority is its kind (issue #107 cutover, pending-entry structural closure)
@@ -225,11 +228,12 @@ func (sess *mqttSession) pendingMapLocked(which mqttPendingMapID) map[uint16]*mq
 // mqttAllocationFence is the custody state an allocation was taken under: the generation, the
 // connection, the ledger and its holder epoch. The allocator never hands out an identifier the
 // ledger holds, so at allocation no lineage on this identifier is a holder; an unchanged fence
-// carries that fact forward.
+// carries that fact forward. The connection is named, not kept: the fence lives on a pending
+// exchange that outlives its connection (mqttOfferOrigin says why).
 type mqttAllocationFence struct {
 	valid       bool
 	gen         string
-	c           *client
+	c           weak.Pointer[client]
 	ledger      *mqttCustodyLedger
 	holderEpoch uint64
 }
@@ -238,7 +242,7 @@ type mqttAllocationFence struct {
 //
 // Lock held on entry.
 func (sess *mqttSession) allocationFenceLocked() mqttAllocationFence {
-	f := mqttAllocationFence{valid: true, gen: sess.gen, c: sess.c, ledger: sess.custody}
+	f := mqttAllocationFence{valid: true, gen: sess.gen, c: weak.Make(sess.c), ledger: sess.custody}
 	if sess.custody != nil {
 		f.holderEpoch = sess.custody.holderEpoch
 	}

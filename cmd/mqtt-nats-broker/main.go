@@ -101,13 +101,19 @@ func run(args []string) error {
 	if cfg.HTTPAddr != "" {
 		httpSrv = startHTTP(cfg.HTTPAddr, be, &ready, log)
 	}
+	// The profiler, when asked for, lives exactly as long as the health endpoint.
+	var pprofSrv *http.Server
+	if cfg.PprofAddr != "" {
+		pprofSrv, _ = startPprof(cfg.PprofAddr, log)
+	}
 	shutdownHTTP := func() {
-		if httpSrv == nil {
-			return
-		}
 		sctx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
 		defer cancel()
-		_ = httpSrv.Shutdown(sctx)
+		for _, srv := range []*http.Server{httpSrv, pprofSrv} {
+			if srv != nil {
+				_ = srv.Shutdown(sctx)
+			}
+		}
 	}
 
 	// Start the MQTT listener backed by the NATS/JetStream connection. On failure

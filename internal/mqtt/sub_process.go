@@ -113,24 +113,16 @@ type mqttSub struct {
 	// Read in the delivery callbacks like noLocal. Spec5 [3.8.2.1.2].
 	subID int
 
-	// drainAtDetach marks the ORDINARY non-shared QoS 1/2 delivery subscription
-	// (mqttDeliverMsgCbQoS12 on a filter's own durable, the reconciliation phase's included):
-	// at a detach its offers already routed to this broker are owed to the session, so the
-	// subscription is DRAINED rather than unsubscribed and every such offer reaches its
-	// callback, which records it withheld or NAKs it (recordWithheldAttemptLocked). Affine
-	// QoS 2, shared, PUBREL and UNSUBSCRIBE-drain subscriptions are not marked and keep the
-	// unsubscribe. Set by processQOS12Sub's caller, the one that chose the callback, under
-	// sess.mu and before any detach can read it; immutable afterwards.
-	drainAtDetach bool
-	// drainClaimed and drainIssued are the two recorded states of the at-most-one Drain this
-	// subscription gets (drainDeliveriesAtDetach), guarded by sess.mu. Claimed is set before
-	// the lock is released to call Drain, so no second teardown issues another or falls back
-	// to an unsubscribe that would cancel it. Issued is set only after Drain returned nil, in
-	// the section that runs the handoff: from then on the UNSUB precedes, on the service
-	// connection, any NAK published for this subscription's offers, which is what licenses
-	// the writer's late NAK. Claimed alone licenses nothing.
-	drainClaimed bool
-	drainIssued  bool
+	// drain marks the ORDINARY non-shared QoS 1/2 delivery subscription
+	// (mqttDeliverMsgCbQoS12 on a filter's own durable, the reconciliation phase's included)
+	// and carries its drain-at-detach state (mqttDetachDrain): at a detach its offers already
+	// routed to this broker are owed to the session, so the subscription is DRAINED rather
+	// than unsubscribed and every such offer reaches its callback, which records it withheld
+	// or NAKs it (recordWithheldAttemptLocked). Affine QoS 2, shared, PUBREL and
+	// UNSUBSCRIBE-drain subscriptions have none and keep the unsubscribe. Set by
+	// processQOS12Sub's caller, the one that chose the callback, under sess.mu and before any
+	// detach can read it; the pointer is immutable afterwards, its fields guarded by sess.mu.
+	drain *mqttDetachDrain
 }
 
 // mqttSharedSubPrefix is the MQTT 5.0 Shared Subscription topic filter prefix
@@ -251,8 +243,8 @@ func (sess *mqttSession) processQOS12Sub(
 		}
 	}
 	sub, err := sess.processSub(c, subject, sid, queue, filterKey, isReserved, qos, noLocal, retainAsPublished, shared, subID, jsDurName, h, false, nil, false, nil)
-	if err == nil && sub != nil && sub.mqtt != nil {
-		sub.mqtt.drainAtDetach = drainAtDetach && !shared
+	if err == nil && sub != nil && sub.mqtt != nil && drainAtDetach && !shared {
+		sub.mqtt.drain = &mqttDetachDrain{}
 	}
 	return sub, err
 }

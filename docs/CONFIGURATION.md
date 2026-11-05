@@ -20,7 +20,8 @@ equivalent. Installation and the NATS prerequisites are in
 | `-max-conns` | `MQTTNB_MAX_CONNS` | `0` (∞) | Max concurrent clients |
 | `-connect-timeout` | `MQTTNB_CONNECT_TIMEOUT` | `5s` | How long an accepted connection may send no CONNECT before it is closed. Must be `> 0`: the bound is fail-closed and cannot be disabled ([details](ARCHITECTURE.md#connection-liveness-bounds)) |
 | `-drain-delay` | `MQTTNB_DRAIN_DELAY` | `0` (immediate) | How long after SIGTERM the broker waits, with `/readyz` already answering 503, before it disconnects clients; a second signal ends the wait. Set it behind a load balancer or a Kubernetes Service ([Operations](OPERATIONS.md#shutdown)). Must be `>= 0` |
-| `-auth-passthrough` | `MQTTNB_AUTH_PASSTHROUGH` | `true` | Dial per-client NATS conn from MQTT creds |
+| `-auth-passthrough` | `MQTTNB_AUTH_PASSTHROUGH` | `true` | Dial per-client NATS conn from MQTT creds; costs one NATS connection per client ([details](#what-auth-passthrough-costs)) |
+| `-max-ack-pending` | `MQTTNB_MAX_ACK_PENDING` | `1024` | QoS 1/2 push window: deliveries a subscription's consumer sends without an acknowledgement, `1`-`65535`. Applies to consumers created from then on, and to a shared group's durable on a fresh join ([details](#the-qos-12-push-window)) |
 | `-default-user` / `-default-pass` | `MQTTNB_DEFAULT_USER` / `_PASS` | | NATS creds for anonymous MQTT clients |
 | `-keepalive-max` | `MQTTNB_KEEPALIVE_MAX` | `0` (no override) | MQTT 5.0 Server Keep Alive cap (seconds) |
 | `-response-info` | `MQTTNB_RESPONSE_INFO` | | MQTT 5.0 Response Information base topic |
@@ -36,6 +37,7 @@ equivalent. Installation and the NATS prerequisites are in
 | `-ws-allowed-origins` | `MQTTNB_WS_ALLOWED_ORIGINS` | (same-origin) | Comma-separated browser origins, `scheme://host[:port]`, replacing the same-origin default |
 | `-log-level` | `MQTTNB_LOG_LEVEL` | `info` | `debug`\|`info`\|`warn`\|`error`, for every record the broker writes ([Operations](OPERATIONS.md#logging)) |
 | `-http-addr` | `MQTTNB_HTTP_ADDR` | `:8080` | Health and readiness, `/healthz` and `/readyz`; empty disables them. There is no metrics endpoint ([Operations](OPERATIONS.md#health-and-readiness)) |
+| `-pprof-addr` | `MQTTNB_PPROF_ADDR` | (off) | Serve Go runtime profiles (`net/http/pprof`) on this address, a literal loopback IP and port such as `127.0.0.1:6060`; any other host is refused ([Operations](OPERATIONS.md#profiling)) |
 
 ## How flags and the environment combine
 
@@ -48,7 +50,8 @@ successfully parsed environment value. Two exceptions follow from that order:
   before the flags are.
 - A malformed integer or boolean variable (`MQTTNB_PORT=abc`,
   `MQTTNB_AUTH_PASSTHROUGH=maybe`) is ignored and the default applies, with no message.
-  Check the values you set.
+  Check the values you set. `MQTTNB_MAX_ACK_PENDING` is the exception: a malformed value
+  aborts startup, because the default would be a push window you did not choose.
 
 A flag the broker does not define, or a flag value that does not parse, is refused as
 `invalid command line: <kind> (-<flag>)`, without echoing the value.
@@ -56,6 +59,51 @@ A flag the broker does not define, or a flag value that does not parse, is refus
 After both are read the whole configuration is validated, and startup stops on the
 first inconsistency; [Troubleshooting](TROUBLESHOOTING.md#the-broker-does-not-start)
 lists the messages.
+
+## The QoS 1/2 push window
+
+`-max-ack-pending` is the `MaxAckPending` of every QoS 1/2 consumer the broker creates:
+how many deliveries JetStream sends a subscription without an acknowledgement. It is also
+the session's in-flight cap (lowered further by an MQTT 5.0 client's Receive Maximum), and
+it is what scales the memory a slow subscriber costs: deliveries the broker has not yet
+processed wait decoded in the NATS client library, so their scale is subscriptions x push
+window x message size. That is a scale, not a ceiling; [Conformance](CONFORMANCE.md#a-slow-subscriber-can-hold-the-client-librarys-pending-buffer-per-subscription)
+states what bounds it and what does not. A lower value trades per-subscriber throughput for
+less outstanding data.
+
+`-max-ack-pending` supplies the push window for newly created QoS 1/2 consumers. A new
+non-shared subscription consumer's window is reduced further by the client's Receive
+Maximum when that is lower. Existing non-shared subscription and PUBREL consumers retain
+their configured windows across reconnects, takeovers and restarts; recreating a missing
+consumer uses the running broker's setting.
+
+A fresh shared-group join creates or updates the group durable using the joining broker's
+`-max-ack-pending` value, even when that durable already exists. This changes the window
+for the whole group. Resuming an existing membership adopts the live durable's
+configuration; it does not restore that member's earlier window. Use the same setting on
+all brokers serving the group to avoid join-driven changes. If settings differ, the latest
+applied create-or-update determines the group window.
+
+The session's local in-flight cap follows the running broker's setting, reduced further by
+the client's Receive Maximum. Lowering that cap does not necessarily lower an existing
+durable's JetStream push window.
+
+The 65535 cumulative check is an admission check against charges recorded by the current
+in-memory session object, including charges for PUBREL consumer creation and shared-group
+joins. Recorded charges are refunded when released. Restoring an existing consumer does
+not add its window to this accounting, and subsequent changes to a shared durable's window
+do not recompute earlier members' charges. Consequently, this check does not cap the sum
+of all live consumer windows belonging to a persistent session.
+
+## What auth passthrough costs
+
+With `-auth-passthrough` (the default) every connected MQTT client has its own NATS
+connection, dialed with its credentials: its read and write buffers and two goroutines in
+the broker, and a client on the NATS server (in [embedded mode](ARCHITECTURE.md#embedded-nats)
+that client lives in the same process, behind an in-memory pipe). That is a large share of
+a connected session's memory. `-auth-passthrough=false` puts every client on the shared
+service connection instead, and gives up per-client NATS authorization
+([Authentication](AUTHENTICATION.md)).
 
 ## Stream replicas
 

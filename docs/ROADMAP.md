@@ -1585,14 +1585,14 @@ them in order where a later lint change depends on an earlier cleanup.
   performance report. Done 2026-10-30
   ([issue #132](https://github.com/nberlee/mqtt-nats-broker/issues/132)).
 
-- [ ] Bring per-session memory under control, measured 2026-11-05 at about 450 KB resident
-  per connected session: release a disconnected client's read buffer and passthrough
-  connection, which stay reachable
-  ([issue #174](https://github.com/nberlee/mqtt-nats-broker/issues/174)); bound the
-  delivery backlog nats.go holds decoded per subscription
-  ([issue #175](https://github.com/nberlee/mqtt-nats-broker/issues/175)); and reduce the
-  per-session baseline behind an opt-in profiler
-  ([issue #176](https://github.com/nberlee/mqtt-nats-broker/issues/176)).
+- [x] Brought per-session memory under control: a disconnected client is released while its
+  session stays (session state names connections by weak pointer; finished retained work
+  releases them), the read buffer follows traffic from 512 bytes, `-max-ack-pending`
+  sets the QoS 1/2 push window (a scale, not a backlog bound) and `-pprof-addr` serves
+  loopback profiles. Done 2026-11-05
+  ([#174](https://github.com/nberlee/mqtt-nats-broker/issues/174),
+  [#175](https://github.com/nberlee/mqtt-nats-broker/issues/175),
+  [#176](https://github.com/nberlee/mqtt-nats-broker/issues/176)).
 
 ### Connection close
 

@@ -10538,8 +10538,8 @@ in the broker recorded it, and the resume had nothing to NAK, so it waited for A
 **Which subscriptions.** The ordinary non-shared QoS 1/2 delivery subscription
 (`mqttDeliverMsgCbQoS12`): the ordinary install, the resume reconciliation install, and
 the two installs of an UNSUBSCRIBE drain's delivery subscription (a re-SUBSCRIBE can adopt
-one as ordinary membership in place). `processQOS12Sub` marks it (`drainAtDetach`) under
-the `sess.mu` its caller holds. Shared, session-affine QoS 2 and PUBREL deliveries keep
+one as ordinary membership in place). `processQOS12Sub` marks it (its drain cell, `mqttDetachDrain`)
+under the `sess.mu` its caller holds. Shared, session-affine QoS 2 and PUBREL deliveries keep
 the unsubscribe.
 
 **Drain, not unsubscribe.** `closeConnection` drains a marked subscription (nats.go writes
@@ -10548,17 +10548,19 @@ successor drains the displaced live predecessor's marked subscriptions right aft
 bind (both bind writers), before the takeover tail and before restoring its own
 subscriptions, so the predecessor's queue is not left to the predecessor's own later
 close. A server shutdown unsubscribes, as before: a shutdown is not a resume. A
-subscription is drained at most once, in two states under `sess.mu`: `drainClaimed` before
-`Drain()` is called, `drainIssued` after it returned nil. Only issued licenses a NAK,
-because only then is the UNSUB already in the service connection's buffer ahead of it
-(late NAKs are published on the same service connection).
+subscription is drained at most once, in two states of the cell under `sess.mu`:
+`claimed` before `Drain()` is called, `issued` after it returned nil. Only issued
+licenses a NAK, because only then is the UNSUB already in the service connection's
+buffer ahead of it (late NAKs are published on the same service connection).
 
 **Who owns a drained offer.** A drained offer reaches the detached arm of the delivery
 callback, which never acks or transmits it; it goes to `recordWithheldAttemptLocked`, the
 only writer of `sess.deferred`, with its ORIGIN (subscription and connection). The
 allocation-abandon path passes the origin stored on the allocation (`mqttPending.origin`),
-never a routing lookup. After the existing refusals (a mapped sequence has an exchange
-that owns its replay):
+never a routing lookup. An origin names the subscription and connection by weak pointer and
+carries the subscription's drain cell, so it decides the same after both are collected and
+keeps neither (see "Resource lifetime and shutdown release"). After the existing refusals
+(a mapped sequence has an exchange that owns its replay):
 
 - **The resume cutoff.** `resendPendingRedelivery` sets `resumeReadBy` to its connection
   in the `sess.mu` section in which it reads the markers. An offer whose origin is not the
@@ -10566,7 +10568,7 @@ that owns its replay):
   issued, for a durable the record references, and not yet late-NAKed under this cutoff,
   records nothing and is NAKed by the caller after unlocking (`publishLateNAKs`).
   Otherwise it is recorded as before, tagged as late when the cutoff has passed.
-- **The drain-issue handoff.** In the section that sets `drainIssued`, the late-tagged
+- **The drain-issue handoff.** In the section that sets `issued`, the late-tagged
   markers of that subscription (recorded after the cutoff while it was not yet issued) are
   taken and NAKed. So a predecessor's offer on a drained subscription is either read by
   the successor's resume or NAKed, without waiting for any completion. nats.go cannot
@@ -16226,10 +16228,51 @@ it. A replaced configuration and its client-CA pool are referenced only by the c
 admitted under them. The soak counts goroutines rooted in that package with the broker's,
 and requires every superseded configuration and pool to be collected.
 
+**Session state names a connection; it never keeps one.** A persistent session stays
+resident after its client disconnects, so anything it holds that points at the connection
+keeps the whole client reachable: its read buffer and, under auth passthrough, its NATS
+connection ([issue #174](https://github.com/nberlee/mqtt-nats-broker/issues/174)). The
+resume cutoff (`resumeReadBy`), a late tag (`mqttLateMarker`), a pending exchange's origin
+(`mqttOfferOrigin`) and its allocation fence (`mqttAllocationFence`) only ever compare a
+connection or a subscription with another, so each holds a `weak.Pointer`: two weak pointers
+made from the same object compare equal before and after it is collected, and a new object
+never equals an old one. The one fact a decision reads from an origin's subscription, its
+drain state, is the subscription's drain cell (`mqttDetachDrain`), shared with the
+origin and pointing back at nothing. An AST guard
+(`TestSessionStateHoldsNoConnectionReference`) keeps `*client` and `*subscription` out
+of those types, the session's bound connection `c` aside, and
+`TestDisconnectedClientIsCollected` requires a disconnected client to be collected while
+its session stays resident: after a drop or a DISCONNECT, with an unacknowledged QoS 1 or
+QoS 2 delivery, after a retained replay, and after a takeover on the same or another broker.
+
+**Finished work releases what it held.** A worker that acts on a connection keeps it while
+the work is unresolved, and no longer. The retained driver lives as long as its session:
+its replay worker forgets its connection in the section that ends it, a popped replay
+object's slot is cleared before the queue is resliced, and a finished abandonment or owed
+transmission is removed with `slices.Delete`, which clears the vacated slot, an emptied list
+being dropped outright.
+
+**A connection's read buffer follows its traffic.** `readLoop` starts with 512 bytes,
+doubles the buffer after a read that fills it up to 32 KiB, and halves it after more than
+two consecutive reads under half of it, never below 512, as nats-server's own read loop
+does (`mqttNextReadBufSize`). An idle connection holds 512 bytes rather than the ceiling.
+The parser copies a partial packet into its own buffer, so the read buffer may change
+between reads.
+
+**The per-session cost that stays.** One JetStream durable per QoS 1/2 subscription: it is
+the subscription's single ordered carrier (`docs/CONFORMANCE.md`, "Per-(Topic, QoS) delivery
+order"), with nats-server's per-consumer cost. One nats.go dispatch goroutine per delivery
+subscription, which is the library's model for an asynchronous subscription. Under auth
+passthrough, one NATS connection per client (`docs/CONFIGURATION.md`, "What auth passthrough
+costs"). A broker started with `-pprof-addr` serves `net/http/pprof` on a loopback listener
+of its own, so these are measured on a running broker rather than inferred.
+
 **What the census leaves as stated residuals.** A session object removed from the maps
 without its reset keeps working while its work is unresolved (see "Session incarnations and
-teardown" and `docs/CONFORMANCE.md`); a subscription's client-library buffer is bounded only
-by the library's defaults; per-CONNECT records accumulate in JetStream. A soak measuring the
+teardown" and `docs/CONFORMANCE.md`); a subscription's client-library buffer is held to the
+library's defaults, its scale set by the consumer's push window (`-max-ack-pending`,
+[issue #175](https://github.com/nberlee/mqtt-nats-broker/issues/175)); per-CONNECT records
+accumulate in JetStream. A soak measuring the
 process heap sees the last of these as the embedded nats-server's file-store caches and
 subject index, which is why it asserts the broker-allocated share.
 

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -45,6 +46,12 @@ type Config struct {
 	// there is no value that disables the bound, so 0 and negative are refused
 	// rather than read as "unlimited".
 	ConnectTimeout time.Duration
+	// MaxAckPending is the push window of every QoS 1/2 consumer the broker creates: how many
+	// deliveries JetStream sends without an acknowledgement, and the session's in-flight cap.
+	// It is also what scales the decoded backlog the client library holds per subscription.
+	// A consumer keeps the window it was created with; a changed value applies to consumers
+	// created from then on (docs/CONFIGURATION.md).
+	MaxAckPending int
 
 	// Shutdown.
 	// DrainDelay is the grace period after SIGTERM before the broker disconnects
@@ -100,6 +107,9 @@ type Config struct {
 	// Observability.
 	LogLevel string // debug|info|warn|error
 	HTTPAddr string // health endpoint bind address (empty = disabled)
+	// PprofAddr serves net/http/pprof on its own listener when set; a literal loopback IP and
+	// port only (validatePprofAddr). Empty = disabled.
+	PprofAddr string
 }
 
 // Default returns a Config populated with sensible defaults.
@@ -112,6 +122,7 @@ func Default() *Config {
 		MQTTPort:           1883,
 		MaxConns:           0,
 		ConnectTimeout:     5 * time.Second,
+		MaxAckPending:      1024,
 		AuthPassthrough:    true,
 		TLSReloadInterval:  10 * time.Second,
 		WSHandshakeTimeout: 5 * time.Second,
@@ -145,6 +156,19 @@ func envInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// envIntStrict reads an integer from the environment and, like envDuration and unlike envInt,
+// refuses a present-but-malformed value rather than falling back to the default.
+func envIntStrict(key string, fallback int) (int, error) {
+	if v, ok := os.LookupEnv(key); ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s: %q is not an integer", key, v)
+		}
+		return n, nil
+	}
+	return fallback, nil
 }
 
 // envDuration reads a Go duration (e.g. "5s") from the environment. Unlike env,
@@ -196,7 +220,11 @@ func Load(args []string) (*Config, error) {
 	c.WSAllowedOrigins = env("MQTTNB_WS_ALLOWED_ORIGINS", c.WSAllowedOrigins)
 	c.LogLevel = env("MQTTNB_LOG_LEVEL", c.LogLevel)
 	c.HTTPAddr = env("MQTTNB_HTTP_ADDR", c.HTTPAddr)
+	c.PprofAddr = env("MQTTNB_PPROF_ADDR", c.PprofAddr)
 	var err error
+	if c.MaxAckPending, err = envIntStrict("MQTTNB_MAX_ACK_PENDING", c.MaxAckPending); err != nil {
+		return nil, err
+	}
 	if c.DrainDelay, err = envDuration("MQTTNB_DRAIN_DELAY", c.DrainDelay); err != nil {
 		return nil, err
 	}
@@ -301,6 +329,8 @@ func registerFlags(fs *flag.FlagSet, c *Config) {
 	fs.StringVar(&c.WSAllowedOrigins, "ws-allowed-origins", c.WSAllowedOrigins, "comma-separated browser origins allowed on the WebSocket listener, scheme://host[:port] (empty=same-origin only)")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug|info|warn|error")
 	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health endpoint bind address, /healthz and /readyz (empty=disabled)")
+	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "serve net/http/pprof on this loopback IP:port, e.g. 127.0.0.1:6060 (empty=disabled)")
+	fs.IntVar(&c.MaxAckPending, "max-ack-pending", c.MaxAckPending, "QoS 1/2 consumer push window: deliveries sent without an acknowledgement, 1-65535; applies to consumers created from then on")
 	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
 	fs.DurationVar(&c.ConnectTimeout, "connect-timeout", c.ConnectTimeout, "how long an accepted connection may send no CONNECT before it is closed (must be > 0)")
 
@@ -375,6 +405,36 @@ func (c *Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("invalid log level %q", c.LogLevel)
+	}
+	// The core's field is a uint16 and reads 0 as its default, so the range is checked here,
+	// before any conversion could wrap or silently substitute a value.
+	if c.MaxAckPending < 1 || c.MaxAckPending > 65535 {
+		return fmt.Errorf("invalid max-ack-pending %d (must be 1-65535)", c.MaxAckPending)
+	}
+	if err := validatePprofAddr(c.PprofAddr); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePprofAddr accepts an empty address (disabled) or a literal loopback IP with a port.
+// Profiles expose process memory, and the health listener is reachable from the cluster
+// network, so the profiler binds loopback only; a host name, localhost included, is refused
+// so the bound address never depends on name resolution.
+func validatePprofAddr(addr string) error {
+	if addr == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid pprof-addr %q: want a loopback IP and port, e.g. 127.0.0.1:6060", addr)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("invalid pprof-addr %q: the host must be a literal loopback IP (127.0.0.0/8 or ::1)", addr)
+	}
+	if p, err := strconv.Atoi(port); err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("invalid pprof-addr %q: bad port", addr)
 	}
 	return nil
 }

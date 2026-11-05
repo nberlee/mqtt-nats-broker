@@ -148,3 +148,25 @@ asked for Keep Alive 0 is never timed out. `-keepalive-max` applies to MQTT 5.0 
 only: one asking for more than the maximum, or for 0, is given the maximum as its Server
 Keep Alive and disconnected when it stays silent longer; without `-keepalive-max` an MQTT
 5.0 client asking for 0 is never timed out either.
+
+A connected session's memory is mostly its JetStream consumers (one per QoS 1/2
+subscription), its NATS connection under auth passthrough
+([Configuration](CONFIGURATION.md#what-auth-passthrough-costs)), and the deliveries a slow
+subscriber has not taken yet, scaled by `-max-ack-pending`
+([Configuration](CONFIGURATION.md#the-qos-12-push-window)). A disconnected client's own
+memory is released when it disconnects, even while its persistent session stays.
+
+## Profiling
+
+`-pprof-addr 127.0.0.1:6060` serves the Go runtime profiles (`/debug/pprof/`) on a
+listener of its own. The address must be a literal loopback IP: profiles expose process
+memory, so they are never served to the network or on the health port. In Kubernetes, reach
+it with a port-forward and take a heap profile:
+
+```bash
+kubectl port-forward pod/<broker-pod> 6060:6060
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+```
+
+The profiler is off by default and stops with the health endpoint at shutdown. A port that
+cannot be bound is logged and the broker starts without it.

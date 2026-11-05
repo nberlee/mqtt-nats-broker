@@ -31,6 +31,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"weak"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
@@ -191,7 +192,7 @@ func (p *drainProbe) decisionsFrom(dur string, sseq uint64, cc *client) []mqttWi
 	defer p.mu.Unlock()
 	var out []mqttWithheldOutcome
 	for _, d := range p.decisions {
-		if d.dur == dur && d.sseq == sseq && d.origin.cc == cc {
+		if d.dur == dur && d.sseq == sseq && d.origin.cc == weak.Make(cc) {
 			out = append(out, d.outcome)
 		}
 	}
@@ -678,7 +679,7 @@ func TestAbandonedAllocationCarriesItsOrigin(t *testing.T) {
 	for pi, ack := range rig.sess.pendingPublish {
 		if ack.jsDur == dur && ack.regPending {
 			sseq = ack.sseq
-			if ack.origin.cc == nil || ack.origin.sub == nil {
+			if ack.origin.cc == (weak.Pointer[client]{}) || ack.origin.sub == (weak.Pointer[subscription]{}) {
 				rig.sess.mu.Unlock()
 				t.Fatalf("allocation %d carries no origin", pi)
 			}
@@ -732,7 +733,7 @@ func TestCapacityWithholdingStillRecords(t *testing.T) {
 	for sseq2 == 0 && time.Now().Before(deadline) {
 		probe.mu.Lock()
 		for _, d := range probe.decisions {
-			if d.dur == dur && d.origin.cc == succ {
+			if d.dur == dur && d.origin.cc == weak.Make(succ) {
 				if d.outcome != mqttWithheldRecorded {
 					probe.mu.Unlock()
 					t.Fatalf("the capacity withholding decided %v, want recorded", d.outcome)
@@ -773,7 +774,7 @@ func TestShutdownCloseUnsubscribesDeliveryInterest(t *testing.T) {
 	defer probe.mu.Unlock()
 	var seen []string
 	for _, op := range probe.ops {
-		if op.c == cli && op.sub.mqtt != nil && op.sub.mqtt.drainAtDetach {
+		if op.c == cli && op.sub.mqtt != nil && op.sub.mqtt.drain != nil {
 			seen = append(seen, op.op)
 		}
 	}
@@ -874,8 +875,7 @@ func newTestDrainUnitEnv(t *testing.T) *testDrainUnitEnv {
 	e, dur := testWithheldMarkerEnv(t)
 	e.bind()
 	pred := &client{}
-	predSub := &subscription{client: pred, mqtt: &mqttSub{qos: 1, jsDur: dur, drainAtDetach: true,
-		drainClaimed: true, drainIssued: true}}
+	predSub := &subscription{client: pred, mqtt: &mqttSub{qos: 1, jsDur: dur, drain: &mqttDetachDrain{claimed: true, issued: true}}}
 	e.sess.mu.Lock()
 	testReferenceDurableLocked(e.sess, dur)
 	e.sess.setResumeCutoffLocked(e.sess.c)
@@ -898,53 +898,53 @@ func TestWithheldWriterRule(t *testing.T) {
 	}
 	cases := []tc{
 		{"positive control: foreign, after the cutoff, drain issued, referenced, unmapped",
-			func(u *testDrainUnitEnv) mqttOfferOrigin { return mqttOfferOrigin{u.predSub, u.pred} }, mqttWithheldNAKOwed},
+			func(u *testDrainUnitEnv) mqttOfferOrigin { return mqttOriginOf(u.predSub, u.pred) }, mqttWithheldNAKOwed},
 		{"mapped sequence", func(u *testDrainUnitEnv) mqttOfferOrigin {
 			u.track(t, u.dur, 7, 1)
-			return mqttOfferOrigin{u.predSub, u.pred}
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRefused},
 		{"unreferenced durable", func(u *testDrainUnitEnv) mqttOfferOrigin {
 			u.sess.mu.Lock()
 			u.sess.cons, u.sess.subs = nil, nil
 			u.sess.mu.Unlock()
-			return mqttOfferOrigin{u.predSub, u.pred}
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 		{"own origin", func(u *testDrainUnitEnv) mqttOfferOrigin {
-			own := &subscription{client: u.c, mqtt: &mqttSub{qos: 1, jsDur: u.dur, drainAtDetach: true, drainClaimed: true, drainIssued: true}}
-			return mqttOfferOrigin{own, u.c}
+			own := &subscription{client: u.c, mqtt: &mqttSub{qos: 1, jsDur: u.dur, drain: &mqttDetachDrain{claimed: true, issued: true}}}
+			return mqttOriginOf(own, u.c)
 		}, mqttWithheldRecorded},
 		{"zero origin (bookkeeping)", func(u *testDrainUnitEnv) mqttOfferOrigin { return mqttOfferOrigin{} }, mqttWithheldRecorded},
 		{"nil binding, never resumed", func(u *testDrainUnitEnv) mqttOfferOrigin {
 			u.sess.mu.Lock()
-			u.sess.c, u.sess.resumeReadBy = nil, nil
+			u.sess.c, u.sess.resumeReadBy = nil, weak.Pointer[client]{}
 			u.sess.mu.Unlock()
-			return mqttOfferOrigin{u.predSub, u.pred}
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 		{"before the cutoff", func(u *testDrainUnitEnv) mqttOfferOrigin {
 			u.sess.mu.Lock()
-			u.sess.resumeReadBy = nil
+			u.sess.resumeReadBy = weak.Pointer[client]{}
 			u.sess.mu.Unlock()
-			return mqttOfferOrigin{u.predSub, u.pred}
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 		{"cutoff read by a different connection", func(u *testDrainUnitEnv) mqttOfferOrigin {
 			u.sess.mu.Lock()
-			u.sess.resumeReadBy = &client{}
+			u.sess.resumeReadBy = weak.Make(&client{})
 			u.sess.mu.Unlock()
-			return mqttOfferOrigin{u.predSub, u.pred}
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 		{"drain claimed, not issued", func(u *testDrainUnitEnv) mqttOfferOrigin {
-			u.predSub.mqtt.drainIssued = false
-			return mqttOfferOrigin{u.predSub, u.pred}
+			u.predSub.mqtt.drain.issued = false
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 		{"not draining", func(u *testDrainUnitEnv) mqttOfferOrigin {
-			u.predSub.mqtt.drainIssued, u.predSub.mqtt.drainClaimed = false, false
-			return mqttOfferOrigin{u.predSub, u.pred}
+			u.predSub.mqtt.drain.issued, u.predSub.mqtt.drain.claimed = false, false
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 		{"source already late-NAKed under this cutoff", func(u *testDrainUnitEnv) mqttOfferOrigin {
 			u.sess.mu.Lock()
 			u.sess.lateNAKed = map[mqttDeferredKey]struct{}{{u.dur, 7}: {}}
 			u.sess.mu.Unlock()
-			return mqttOfferOrigin{u.predSub, u.pred}
+			return mqttOriginOf(u.predSub, u.pred)
 		}, mqttWithheldRecorded},
 	}
 	for _, c := range cases {
@@ -968,15 +968,15 @@ func TestWithheldWriterRule(t *testing.T) {
 // starts a fresh late-NAK allowance.
 func TestCutoffOfAnEarlierBindingDoesNotApply(t *testing.T) {
 	u := newTestDrainUnitEnv(t) // bound: B (u.c), cutoff read by B
-	notDraining := &subscription{client: u.pred, mqtt: &mqttSub{qos: 1, jsDur: u.dur, drainAtDetach: true}}
-	if got := u.decide(7, mqttOfferOrigin{notDraining, u.pred}); got != mqttWithheldRecorded {
+	notDraining := &subscription{client: u.pred, mqtt: &mqttSub{qos: 1, jsDur: u.dur, drain: &mqttDetachDrain{}}}
+	if got := u.decide(7, mqttOriginOf(notDraining, u.pred)); got != mqttWithheldRecorded {
 		t.Fatalf("fixture: A's offer under B's cutoff decided %v", got)
 	}
 	u.sess.mu.Lock()
-	tagged := u.sess.deferredLate[mqttDeferredKey{u.dur, 7}].readBy == u.c
+	tagged := u.sess.deferredLate[mqttDeferredKey{u.dur, 7}].readBy == weak.Make(u.c)
 	cBind := &client{}
 	u.sess.c = cBind // C binds; its resume pass has not run
-	notDraining.mqtt.drainClaimed, notDraining.mqtt.drainIssued = true, true
+	notDraining.mqtt.drain.claimed, notDraining.mqtt.drain.issued = true, true
 	handoff := u.sess.handOffLateMarkersLocked(notDraining)
 	u.sess.mu.Unlock()
 	if !tagged {
@@ -985,7 +985,7 @@ func TestCutoffOfAnEarlierBindingDoesNotApply(t *testing.T) {
 	if len(handoff) != 0 {
 		t.Fatalf("A's drain issue under C handed off %v from B's cutoff", handoff)
 	}
-	if got := u.decide(8, mqttOfferOrigin{notDraining, u.pred}); got != mqttWithheldRecorded {
+	if got := u.decide(8, mqttOriginOf(notDraining, u.pred)); got != mqttWithheldRecorded {
 		t.Fatalf("A's offer after C bound, before C's pass, decided %v, want recorded", got)
 	}
 	u.sess.mu.Lock()
@@ -996,7 +996,7 @@ func TestCutoffOfAnEarlierBindingDoesNotApply(t *testing.T) {
 	if spent {
 		t.Fatal("C's resume pass kept the earlier cutoff's late-NAK allowance")
 	}
-	if got := u.decide(9, mqttOfferOrigin{notDraining, u.pred}); got != mqttWithheldNAKOwed {
+	if got := u.decide(9, mqttOriginOf(notDraining, u.pred)); got != mqttWithheldNAKOwed {
 		t.Fatalf("A's offer after C's pass decided %v, want NAK-owed", got)
 	}
 }
@@ -1569,7 +1569,7 @@ func TestSettledUnreferencedMarkerIsPrunedAtTheNextReaderPass(t *testing.T) {
 				u.sess.mu.Unlock()
 				// The predecessor's drain is issued and the cutoff passed, so the writer
 				// records the unreferenced offer and tags it for the drain's handoff.
-				if got := u.decide(7, mqttOfferOrigin{u.predSub, u.pred}); got != mqttWithheldRecorded {
+				if got := u.decide(7, mqttOriginOf(u.predSub, u.pred)); got != mqttWithheldRecorded {
 					t.Fatalf("fixture: decision = %v, want recorded", got)
 				}
 				u.sess.mu.Lock()

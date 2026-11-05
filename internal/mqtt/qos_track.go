@@ -19,6 +19,7 @@ package mqtt
 import (
 	"errors"
 	"slices"
+	"weak"
 )
 
 func (sess *mqttSession) bumpPI() uint16 {
@@ -184,8 +185,8 @@ func (sess *mqttSession) recordWithheldAttemptLocked(dur string, sseq uint64, re
 	}
 	key := mqttDeferredKey{dur, sseq}
 	// The zero origin (bookkeeping) carries no subscription, so it is never NAKed nor tagged.
-	late := origin.cc != sess.c && sess.resumeCutoffPassedLocked()
-	if late && origin.sub != nil && origin.sub.mqtt != nil && origin.sub.mqtt.drainIssued {
+	late := origin.cc != weak.Make(sess.c) && sess.resumeCutoffPassedLocked()
+	if late && origin.drain != nil && origin.drain.issued {
 		if _, spent := sess.lateNAKed[key]; !spent && sess.recordReferencesDurableLocked(dur) {
 			if sess.lateNAKed == nil {
 				sess.lateNAKed = make(map[mqttDeferredKey]struct{})
@@ -198,11 +199,11 @@ func (sess *mqttSession) recordWithheldAttemptLocked(dur string, sseq uint64, re
 		sess.deferred = make(map[mqttDeferredKey]string)
 	}
 	sess.deferred[key] = reply
-	if late && origin.sub != nil {
+	if late && origin.sub != (weak.Pointer[subscription]{}) {
 		if sess.deferredLate == nil {
 			sess.deferredLate = make(map[mqttDeferredKey]mqttLateMarker)
 		}
-		sess.deferredLate[key] = mqttLateMarker{sub: origin.sub, readBy: sess.c, reply: reply}
+		sess.deferredLate[key] = mqttLateMarker{sub: origin.sub, readBy: weak.Make(sess.c), reply: reply}
 	} else {
 		delete(sess.deferredLate, key)
 	}

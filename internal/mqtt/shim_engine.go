@@ -1110,6 +1110,36 @@ func (c *client) bindMQTTReader() {
 // mqttTestReaderReadV runs in readLoop immediately before each socket Read. Nil in production.
 var mqttTestReaderReadV atomic.Pointer[func(c *client)]
 
+// The read buffer follows the connection's traffic, as nats-server's readLoop sizes its own: an
+// idle or lightly used connection holds mqttReadBufStart bytes rather than the ceiling, a read
+// that fills the buffer doubles it up to mqttReadBufMax, and a run of reads under half of it
+// halves it again, never below mqttReadBufStart.
+const (
+	mqttReadBufStart       = 512
+	mqttReadBufMax         = 32 * 1024
+	mqttReadShortsToShrink = 2
+)
+
+// mqttNextReadBufSize is the buffer size for the read after one that returned n bytes into a
+// buffer of size cur, and the updated count of consecutive short reads.
+func mqttNextReadBufSize(cur, n, shorts int) (int, int) {
+	switch {
+	case n >= cur:
+		if cur < mqttReadBufMax {
+			return min(cur*2, mqttReadBufMax), 0
+		}
+		return cur, 0
+	case n < cur/2:
+		shorts++
+		if shorts > mqttReadShortsToShrink && cur > mqttReadBufStart {
+			return max(cur/2, mqttReadBufStart), 0
+		}
+		return cur, shorts
+	default:
+		return cur, 0
+	}
+}
+
 // readLoop reads from the client socket and feeds the MQTT parser. The
 // mqttReader accumulates partial packets across reads.
 func (c *client) readLoop(pre []byte) {
@@ -1150,7 +1180,8 @@ func (c *client) readLoop(pre []byte) {
 			return
 		}
 	}
-	buf := make([]byte, 32*1024)
+	buf := make([]byte, mqttReadBufStart)
+	shorts := 0
 	for {
 		if h := mqttTestReaderReadV.Load(); h != nil {
 			(*h)(c)
@@ -1165,6 +1196,12 @@ func (c *client) readLoop(pre []byte) {
 				}
 				disconnect()
 				return
+			}
+			// The parse is done with buf (a partial packet was copied into the reader's own
+			// buffer), so the next read may use a buffer of another size.
+			var size int
+			if size, shorts = mqttNextReadBufSize(len(buf), n, shorts); size != len(buf) {
+				buf = make([]byte, size)
 			}
 		}
 		if err != nil {

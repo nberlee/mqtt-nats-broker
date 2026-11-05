@@ -391,7 +391,7 @@ func (sess *mqttSession) recordWithheldDeliveryLocked(cc *client, sub *subscript
 	}
 	// A re-offer of a sequence that already has an exchange is that exchange's to replay, and
 	// records nothing (issue #162): the writer refuses a mapped sequence.
-	outcome := sess.recordWithheldAttemptLocked(sub.mqtt.jsDur, sseq, reply, mqttOfferOrigin{sub: sub, cc: cc})
+	outcome := sess.recordWithheldAttemptLocked(sub.mqtt.jsDur, sseq, reply, mqttOriginOf(sub, cc))
 	if h := mqttTestWithheldDecidedV.Load(); h != nil {
 		(*h)(sub.mqtt.jsDur, sseq, outcome == mqttWithheldRecorded)
 	}

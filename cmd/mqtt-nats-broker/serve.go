@@ -50,6 +50,8 @@ func mqttOptions(cfg *config.Config, tlsSrc *tlsreload.Source) *mqtt.Options {
 			JsDomain:            cfg.JSDomain,
 			KeepAliveMaximum:    cfg.KeepAliveMax,
 			ResponseInformation: cfg.ResponseInfo,
+			// In range by config.Validate (1-65535), so the conversion cannot wrap.
+			MaxAckPending: uint16(cfg.MaxAckPending),
 		},
 		StreamReplicas: cfg.StreamReps,
 	}

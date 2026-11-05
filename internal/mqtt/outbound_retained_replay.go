@@ -14,6 +14,7 @@
 package mqtt
 
 import (
+	"slices"
 	"sync"
 	"time"
 )
@@ -122,6 +123,50 @@ type mqttRetainedDriver struct {
 	owed        []*mqttRetainedOwed
 	contRunning bool
 	kick        chan struct{}
+}
+
+// The driver lives as long as its session, which outlives every connection that queued work on
+// it, so finished work must not stay reachable from it: an idle replay worker forgets its
+// connection, and a popped or removed entry leaves no pointer behind in its slice's backing
+// array (an entry reaches its connection, directly or through its subscription).
+
+// popReplayLocked takes the next replay object and its connection, or reports none and forgets
+// the connection, in the section that ends the replay worker.
+//
+// d.mu held.
+func (d *mqttRetainedDriver) popReplayLocked() (*mqttRetainedReplay, *client, bool) {
+	if len(d.queue) == 0 {
+		d.queue, d.conn = nil, nil
+		return nil, nil, false
+	}
+	r, c := d.queue[0], d.conn
+	d.queue[0] = nil
+	d.queue = d.queue[1:]
+	return r, c, true
+}
+
+// removeAbandonLocked removes a finished abandonment.
+//
+// d.mu held.
+func (d *mqttRetainedDriver) removeAbandonLocked(a *mqttRetainedAbandonment) {
+	if i := slices.Index(d.abandons, a); i >= 0 {
+		d.abandons = slices.Delete(d.abandons, i, i+1)
+	}
+	if len(d.abandons) == 0 {
+		d.abandons = nil
+	}
+}
+
+// removeOwedLocked removes a finished owed transmission.
+//
+// d.mu held.
+func (d *mqttRetainedDriver) removeOwedLocked(o *mqttRetainedOwed) {
+	if i := slices.Index(d.owed, o); i >= 0 {
+		d.owed = slices.Delete(d.owed, i, i+1)
+	}
+	if len(d.owed) == 0 {
+		d.owed = nil
+	}
 }
 
 // startContinuationLocked marks the continuation worker running and reports whether the caller must
@@ -377,13 +422,12 @@ func (sess *mqttSession) runRetainedDriver() {
 	d := &sess.retainedDriver
 	for {
 		d.mu.Lock()
-		if len(d.queue) == 0 {
+		r, c, ok := d.popReplayLocked()
+		if !ok {
 			d.running = false
 			d.mu.Unlock()
 			return
 		}
-		r, c := d.queue[0], d.conn
-		d.queue = d.queue[1:]
 		d.mu.Unlock()
 		sess.replayObject(c, r)
 	}
@@ -453,12 +497,7 @@ func (sess *mqttSession) runRetainedContinuations() {
 					closeOf = due.c
 				}
 			} else {
-				for i, a := range d.abandons {
-					if a == due {
-						d.abandons = append(d.abandons[:i], d.abandons[i+1:]...)
-						break
-					}
-				}
+				d.removeAbandonLocked(due)
 			}
 			d.mu.Unlock()
 			if closeOf != nil {
@@ -474,12 +513,7 @@ func (sess *mqttSession) runRetainedContinuations() {
 			done := sess.stepRetainedOwed(dueOwed)
 			d.mu.Lock()
 			if done {
-				for i, o := range d.owed {
-					if o == dueOwed {
-						d.owed = append(d.owed[:i], d.owed[i+1:]...)
-						break
-					}
-				}
+				d.removeOwedLocked(dueOwed)
 			} else if dueOwed.closing {
 				dueOwed.nextAt = time.Now().Add(mqttRetainedClosingPoll)
 			} else {

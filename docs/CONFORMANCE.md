@@ -6421,14 +6421,35 @@ is settled, whether or not the exchange record still exists (`docs/ARCHITECTURE.
 
 A delivery is written to the client synchronously under the write deadline, so a client
 that reads just fast enough for each write to finish inside it is never disconnected.
-Meanwhile each of its NATS subscriptions queues undelivered messages in the client library
-up to the library's defaults (500,000 messages or 64 MiB per subscription; the broker sets
-no other limit), so the bound is that per subscription, times subscriptions, times such
-clients. A subscription that overflows it drops messages as a slow consumer: QoS 0 is
-lost, QoS 1 and 2 are redelivered by their consumer after AckWait. A drop on the service
-connection is now logged; one on a per-client connection is not. A lower limit would turn
-that memory into silent drops and redeliveries, a delivery-policy change this residual
-does not make.
+Meanwhile the deliveries the broker has not processed yet wait, decoded, in the NATS client
+library's pending queue of their subscription.
+
+For QoS 1 and 2 the operator sets the scale of that queue: each JetStream consumer sends at
+most its MaxAckPending distinct unacknowledged deliveries, and `-max-ack-pending` /
+`MQTTNB_MAX_ACK_PENDING` (1 to 65535, default 1024) is the value consumers are created with
+([issue #175](https://github.com/nberlee/mqtt-nats-broker/issues/175)). An existing
+non-shared subscription or PUBREL consumer keeps its value across reconnects, takeovers and
+restarts; nothing migrates it. A fresh shared-group join creates or updates the group
+durable with the joining broker's value, which changes the window for the whole group, so
+brokers serving one group should run one setting. Receive Maximum can lower the value a new
+non-shared consumer is created with. The 65535 per-session check is an admission check on
+the charges the in-memory session object recorded; restored consumers are not counted, so
+it does not cap the sum of a persistent session's live windows
+(`docs/CONFIGURATION.md`, "The QoS 1/2 push window").
+
+Without redelivery copies, the memory scale is subscriptions x the consumer's MaxAckPending
+x decoded message size. That is a scale, not a bound: a delivery still queued when AckWait
+expires is redelivered and queued again, so a subscription stalled long enough can hold
+more than its window, up to the library's own limits. The broker keeps those limits, 500,000
+messages or 64 MiB of accounted payload and encoded headers per subscription; the decoded
+objects cost more than that accounting. A subscription that overflows them drops the newest
+arrival as a slow consumer: QoS 0 is lost, and a QoS 1 or 2 delivery is redelivered by its
+consumer after AckWait and can arrive after later messages. A drop on the service connection
+is logged; one on a per-client connection is not. QoS 0 has no push window.
+
+A lower pending limit would turn that memory into drops of first deliveries, a
+delivery-policy change this residual does not make; a hard backlog budget chosen by the
+operator would need flow control or demand-driven fetching on the delivery path.
 
 ### A connection that never sends CONNECT is closed; a connected one may still be silent forever
 

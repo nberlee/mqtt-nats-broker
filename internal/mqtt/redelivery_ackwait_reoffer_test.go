@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"weak"
 )
 
 // What TestMQTTRedeliveryAckWait's two historic failures were made of, each forced:
@@ -40,7 +41,7 @@ func testOutboundMapsDump(sess *mqttSession) (lpi, lsseq int, dump string) {
 		lines = append(lines, fmt.Sprintf("pendingPublish[%d]: dur=%s sseq=%d kind=%v regPending=%v regNonce=%s regSeq=%d "+
 			"transmitted=%v sendNonce=%q originConn=%v originSub=%v ackSubject=%s",
 			pi, ack.jsDur, ack.sseq, ack.kind, ack.regPending, ack.regNonce, ack.regSeq,
-			ack.transmitted, ack.sendNonce, ack.origin.cc != nil, ack.origin.sub != nil, ack.jsAckSubject))
+			ack.transmitted, ack.sendNonce, ack.origin.cc != (weak.Pointer[client]{}), ack.origin.sub != (weak.Pointer[subscription]{}), ack.jsAckSubject))
 	}
 	for dur, seqs := range sess.cpending {
 		for sseq, pi := range seqs {

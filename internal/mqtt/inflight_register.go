@@ -149,6 +149,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/nats-io/nuid"
 )
@@ -6727,7 +6728,7 @@ func (sess *mqttSession) markerOpaqueEligibleLocked(alloc *mqttPending, ev mqttP
 		return sess.ordinaryHeldLocked(ev)
 	}
 	f := alloc.allocFence
-	return f.valid && f.gen == sess.gen && f.c == sess.c && f.ledger == sess.custody &&
+	return f.valid && f.gen == sess.gen && f.c == weak.Make(sess.c) && f.ledger == sess.custody &&
 		sess.custody != nil && f.holderEpoch == sess.custody.holderEpoch &&
 		!sess.custody.hasExchange(sess.gen, ev.lin)
 }

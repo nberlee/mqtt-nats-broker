@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 )
 
 type mqttSession struct {
@@ -724,7 +725,7 @@ type mqttSession struct {
 	// (handOffLateMarkersLocked). A tag is valid only while its marker still holds the same
 	// reply. All three are cleared whenever the cutoff is set, and with the incarnation.
 	// Process memory only.
-	resumeReadBy *client
+	resumeReadBy weak.Pointer[client]
 	lateNAKed    map[mqttDeferredKey]struct{}
 	deferredLate map[mqttDeferredKey]mqttLateMarker
 	// testDrainAtDetach is this session's seams around the drain at detach and the resume

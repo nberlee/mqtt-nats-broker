@@ -550,3 +550,58 @@ func TestPlainPort(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadMaxAckPending(t *testing.T) {
+	c, err := Load(nil)
+	if err != nil || c.MaxAckPending != 1024 {
+		t.Fatalf("default MaxAckPending = %d, %v; want 1024", c.MaxAckPending, err)
+	}
+	t.Setenv("MQTTNB_MAX_ACK_PENDING", "64")
+	if c, err = Load(nil); err != nil || c.MaxAckPending != 64 {
+		t.Fatalf("env MaxAckPending = %d, %v; want 64", c.MaxAckPending, err)
+	}
+	if c, err = Load([]string{"-max-ack-pending", "32"}); err != nil || c.MaxAckPending != 32 {
+		t.Fatalf("flag over env MaxAckPending = %d, %v; want 32", c.MaxAckPending, err)
+	}
+	for _, v := range []string{"1", "65535"} {
+		if _, err = Load([]string{"-max-ack-pending", v}); err != nil {
+			t.Errorf("-max-ack-pending %s refused: %v", v, err)
+		}
+	}
+	for _, v := range []string{"0", "-1", "65536"} {
+		if _, err = Load([]string{"-max-ack-pending", v}); err == nil {
+			t.Errorf("-max-ack-pending %s accepted", v)
+		}
+	}
+}
+
+func TestLoadMaxAckPendingMalformedEnvErrors(t *testing.T) {
+	// A malformed value is an error, never the default: the default would be a push window
+	// the operator did not choose.
+	t.Setenv("MQTTNB_MAX_ACK_PENDING", "lots")
+	if _, err := Load(nil); err == nil {
+		t.Fatal("malformed MQTTNB_MAX_ACK_PENDING was accepted")
+	}
+}
+
+func TestValidatePprofAddr(t *testing.T) {
+	for _, addr := range []string{"", "127.0.0.1:6060", "127.0.0.1:0", "127.1.2.3:6060", "[::1]:6060"} {
+		c := validDefault()
+		c.PprofAddr = addr
+		if err := c.Validate(); err != nil {
+			t.Errorf("pprof-addr %q refused: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"localhost:6060", ":6060", "0.0.0.0:6060", "[::]:6060", "10.0.0.1:6060",
+		"127.0.0.1", "127.0.0.1:http", "127.0.0.1:70000"} {
+		c := validDefault()
+		c.PprofAddr = addr
+		if err := c.Validate(); err == nil {
+			t.Errorf("pprof-addr %q accepted", addr)
+		}
+	}
+	t.Setenv("MQTTNB_PPROF_ADDR", "127.0.0.1:6061")
+	if c, err := Load(nil); err != nil || c.PprofAddr != "127.0.0.1:6061" {
+		t.Fatalf("env PprofAddr = %q, %v", c.PprofAddr, err)
+	}
+}

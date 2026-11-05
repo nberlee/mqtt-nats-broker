@@ -3394,7 +3394,7 @@ func mqttDeliverQ2AffineCb(sub *subscription, pc *client, _ *Account, subject, r
 		sess.mu.Unlock()
 		return // a test-staged pre-tracking refusal; AckWait re-offers the copy
 	}
-	pi, isNew := sess.trackPublish(jsDur, reply, mqttOfferOrigin{sub: sub, cc: cc})
+	pi, isNew := sess.trackPublish(jsDur, reply, mqttOriginOf(sub, cc))
 	// The allocation's nonce, read under the allocating lock (see mqttDeliverMsgCbQoS12),
 	// and whether the entry was transmitted, which gates the expiry discard below.
 	var regNonce string
