@@ -226,7 +226,9 @@ func TestRefusedResumeInstallsNoDrainObservation(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.drains = map[string]*mqttDrain{sid: {
 		cc: cc, qos: 2,
-		seqs: map[uint64]*drainSeq{testRealPubRelSrcSeq: {claimed: true, pi: pi, regSeq: 999}},
+		// A SENTINEL the scan would never install: one register on the entry's own identifier
+		// is unambiguous, so an apply that ran for this refused walk would RESET the flag.
+		seqs: map[uint64]*drainSeq{testRealPubRelSrcSeq: {claimed: true, pi: pi, regAmbiguous: true}},
 	}}
 	e.sess.drainByDur = map[string]*mqttDrain{testRealPubRelSrcDur: e.sess.drains[sid]}
 	e.sess.mu.Unlock()
@@ -246,10 +248,10 @@ func TestRefusedResumeInstallsNoDrainObservation(t *testing.T) {
 		t.Fatal("fixture: the superseded resume must be refused")
 	}
 	e.sess.mu.Lock()
-	regSeq := e.sess.drains[sid].seqs[testRealPubRelSrcSeq].regSeq
+	ambiguous := e.sess.drains[sid].seqs[testRealPubRelSrcSeq].regAmbiguous
 	e.sess.mu.Unlock()
-	if regSeq != 999 {
-		t.Fatalf("a refused resume must not install its drain observation: regSeq 999 -> %d", regSeq)
+	if !ambiguous {
+		t.Fatal("a refused resume must not install its drain observation: the preset ambiguity was reset")
 	}
 }
 

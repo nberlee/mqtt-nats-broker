@@ -132,16 +132,10 @@ type mqttPersistedDrainSeq struct {
 	PubRel  bool   `json:"pubrel,omitempty"`
 	PI      uint16 `json:"pi,omitempty"`
 	Attempt uint64 `json:"attempt,omitempty"`
-	// RegSeq is the exact sequence of this delivery's outbound in-flight register on
-	// $MQTT_inflight, so the drain can RELEASE it when the exchange completes. Without
-	// it the register outlives the drain's consumer, and the next resume — finding a
-	// register whose consumer is gone — reserves its identifier indefinitely, which under
-	// a Receive Maximum of 1 stops the session delivering anything at all.
-	//
-	// Optional: a record written before this field existed carries none, and the resume
-	// barrier repairs it from the register scan rather than treating it as "no register".
-	// See inflight_register.go.
-	RegSeq uint64 `json:"reg_seq,omitempty"`
+	// No register sequence is persisted. The drain's register is the one PI names: the
+	// release addresses it by that subject and removes only an identity-matched occupant
+	// (finalizeDrainDelivery), so an absolute $MQTT_inflight sequence here would decide
+	// nothing and would name an unrelated register once that stream is recreated.
 
 	// OwnerNonce is the EXCHANGE identity this drained delivery owns, persisted with the
 	// intent and BEFORE the PUBREL is stored.
@@ -313,14 +307,12 @@ type drainSeq struct {
 	// outbound QoS 1/2 allocation withheld for the session. What this change stops is the
 	// drain FINALIZING over that state, not the state itself.
 	//
-	// It is a field rather than the absence of regSeq because issue #38's review found the two
-	// being conflated. The release used to run only when regSeq was nonzero, and recovery
-	// zeroes regSeq for exactly this ambiguous case — so the finalize skipped
-	// classification and went on to remove the claim and acknowledge the source while both
-	// registers survived behind a consumer about to be deleted. That is the indefinite
-	// identifier reservation this change exists to prevent, reached through the guard meant
-	// to prevent it. regSeq is a hint and may never authorize progress, including by being
-	// zero.
+	// It is a positive flag rather than the absence of some remembered register because
+	// issue #38's review found the two being conflated: the release used to run only when a
+	// remembered register sequence was nonzero, recovery zeroed it for exactly this
+	// ambiguous case, and the finalize then removed the claim and acknowledged the source
+	// while both registers survived behind a consumer about to be deleted. An absence may
+	// never authorize progress.
 	regAmbiguous bool
 	// ownerUnusable means this sequence's PERSISTED INTENT carries no usable exchange
 	// identity, so nothing may be finalized on it.
@@ -332,9 +324,6 @@ type drainSeq struct {
 	// This one is derived from the record's own bytes, not from a scan, so nothing
 	// recomputes it away.
 	ownerUnusable bool
-	// regSeq is this delivery's in-flight register (see mqttPersistedDrainSeq.RegSeq).
-	// The drain owns it from staging until the exchange completes, and releases it there.
-	regSeq uint64
 	// ownerNonce is the exchange identity (see mqttPersistedDrainSeq.OwnerNonce). Set with
 	// the intent, and what a recreate must write so the record names the same exchange the
 	// owner slot does.
@@ -442,7 +431,7 @@ func (d *mqttDrain) startedSeqs() []mqttPersistedDrainSeq {
 			continue
 		}
 		out = append(out, mqttPersistedDrainSeq{
-			Seq: seq, PubRel: st.intent, PI: st.pi, Attempt: st.attempt, RegSeq: st.regSeq,
+			Seq: seq, PubRel: st.intent, PI: st.pi, Attempt: st.attempt,
 			OwnerNonce: st.ownerNonce, Rel: st.rel,
 		})
 	}
@@ -518,7 +507,7 @@ func mqttDrainFromPersisted(pd *mqttPersistedDrain) *mqttDrain {
 		// duplicate of an exchange the client has already answered. An unsupported shape
 		// must never be interpreted as the SAFE-looking one.
 		ds := &drainSeq{
-			claimed: true, intent: s.owesPubRel(), pi: s.PI, attempt: s.Attempt, regSeq: s.RegSeq,
+			claimed: true, intent: s.owesPubRel(), pi: s.PI, attempt: s.Attempt,
 			ownerNonce: s.OwnerNonce,
 		}
 		if s.Rel != nil {
@@ -862,10 +851,9 @@ func (sess *mqttSession) stageDrain(sid string, cc *ConsumerConfig, sub *subscri
 			sess.excludeIdentifierLocked(pi, sess.inflightSubjectLocked(pi), ack.regNonce)
 			sess.untrackPublishEntry(pi, mqttUntrackUnanswered) // marker standing: no binding
 		default:
+			// A transmitted delivery: the drain releases the register its pi names when the
+			// exchange completes (finalizeDrainDelivery).
 			d.seqs[sseq] = &drainSeq{claimed: true, pi: pi, ack: ack.jsAckSubject}
-			// The register of a transmitted delivery, so the drain can release it when
-			// the exchange completes (finding 1 below).
-			d.seqs[sseq].regSeq = ack.regSeq
 		}
 	}
 	// The withheld-attempt markers are dropped, not enrolled (I5): enrolment above came
@@ -1030,11 +1018,11 @@ func (sess *mqttSession) enrolFloorClaimsLocked(recovery ...*mqttDisposal) {
 			if d.seqs == nil {
 				d.seqs = make(map[uint64]*drainSeq, 1)
 			}
-			// Built from the ENTRY's own identity. The register hint comes from here
-			// rather than from the annotation pass, which runs before the marker
-			// classification and whose view is therefore the wrong one to enrol on.
+			// Built from the ENTRY's own identity rather than from the annotation pass,
+			// which runs before the marker classification and whose view is therefore the
+			// wrong one to enrol on.
 			d.seqs[sseq] = &drainSeq{
-				claimed: true, pi: pi, ack: ack.jsAckSubject, regSeq: ack.regSeq,
+				claimed: true, pi: pi, ack: ack.jsAckSubject,
 			}
 			for _, w := range recovery {
 				if sess.disposalCurrentLocked(w) && w.key.pi == pi &&
@@ -1107,7 +1095,7 @@ func (sess *mqttSession) reclassifyReactivatedDrainsLocked(durables []string, li
 					d.seqs = make(map[uint64]*drainSeq, 1)
 				}
 				d.seqs[sseq] = &drainSeq{
-					claimed: true, pi: pi, ack: ack.jsAckSubject, regSeq: ack.regSeq,
+					claimed: true, pi: pi, ack: ack.jsAckSubject,
 				}
 			}
 		}
@@ -1368,8 +1356,8 @@ func (sess *mqttSession) retireDrainReleaseRequest(jsDur string, sseq uint64, ol
 //
 // It captures the target from the slot ITSELF rather than from anything remembered: the
 // subject the identifier names, and the nonce and transmission counter the occupant
-// currently carries. `RegSeq` is not consulted — it is a hint and may never select or
-// authorize a deletion (issue #38).
+// currently carries. The drain remembers no register sequence: a remembered one may never
+// select or authorize a deletion (issue #38).
 //
 // AN AMBIGUOUS SAVE RETAINS THE REQUEST, and the retry may never RECAPTURE the identity.
 // It re-attempts the originally captured target even if the slot has since moved, because
@@ -1716,9 +1704,6 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	if ackSubject != _EMPTY_ {
 		st.ack = ackSubject
 	}
-	// regSeq is deliberately NOT read here. It is a hint, and the release addresses the
-	// register by the subject the packet identifier names; reading it into a local was how
-	// an earlier revision came to gate the release on it.
 	ack := st.ack
 	sess.mu.Unlock()
 
@@ -1735,31 +1720,27 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	// ordering here has: an unconfirmed delete followed by a completed exchange is exactly
 	// the state that leaves a phantom behind. A failure withholds the whole finalize, so
 	// the next redelivery retries it — nothing is acked and nothing is lost.
-	// Addressed by SUBJECT, not by the recorded sequence (issue #38).
+	// Addressed by SUBJECT, never by a remembered sequence (issue #38).
 	//
-	// `regSeq` used to address this delete directly, and that was the defect: the store
-	// path's replacement branch rewrites a register for the same (Dur, Seq) at a NEW
-	// sequence, and after $MQTT_inflight is recreated the recorded sequence names an
-	// unrelated register belonging to another session. Deleting there destroyed it —
-	// which issue #70's table had already recorded, assigning the consequence to "that
-	// mechanism's owner", i.e. here.
+	// A remembered register sequence used to address this delete directly, and that was the
+	// defect: the store path's replacement branch rewrites a register for the same
+	// (Dur, Seq) at a NEW sequence, and after $MQTT_inflight is recreated the recorded
+	// sequence names an unrelated register belonging to another session. Deleting there
+	// destroyed it — which issue #70's table had already recorded, assigning the
+	// consequence to "that mechanism's owner", i.e. here.
 	//
 	// The subject is derived from this delivery's own packet identifier, which the record
-	// persists for every started entry, so this needs no new persisted field. `regSeq`
-	// survives as a HINT only: it may never select or authorize a deletion.
+	// persists for every started entry, so the drain persists no register sequence at all
+	// (issue #71).
 	//
 	// A MISMATCH is not a failure. It means the occupant belongs to another exchange —
 	// commonly a later one on the same identifier — so it is preserved and this drain has
 	// nothing to release. Only an unreadable or indeterminate occupant withholds the
 	// finalize, on the same reasoning every ordering here has: an unconfirmed disposal
 	// followed by a completed exchange is what leaves a phantom behind.
-	// The register release is NOT keyed on regSeq. issue #38's review found that guard was
-	// itself the defect: recovery zeroes regSeq for the AMBIGUOUS duplicate-register case,
-	// so `regSeq != 0` skipped classification entirely and the finalize went on to remove
-	// the claim and acknowledge the source while both registers survived behind a consumer
-	// about to be deleted — the indefinite reservation this change exists to prevent,
-	// reached through the guard meant to prevent it. regSeq is a hint and may never
-	// authorize progress, including by being zero.
+	// The register release is gated on the regAmbiguous OBSERVATION, never on the absence
+	// of a remembered register: issue #38's review found a nonzero-sequence guard skipping
+	// classification for exactly the ambiguous duplicate-register case.
 	// Captured inside the release block below and re-checked after the fence, so they are
 	// declared here. capturedIdentity is false only when there is no account manager and
 	// hence no register to release; the drain-currency half of the second check still runs.
@@ -1834,7 +1815,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 				"its in-flight register cannot be named (idHash=%q gen=%q)", sseq, sess.id, idHash, gen)
 			return true
 		default:
-			// Addressed by the identifier, never by regSeq. Pinned on the production path
+			// Addressed by the identifier. Pinned on the production path
 			// by TestFinalizeDrainDeliveryAddressesByPacketIdentifier.
 			subject := mqttInflightSubject(idHash, gen, pi)
 			// THE POSITIVE RELEASE REQUEST is recorded INSIDE the release, from the
@@ -1860,11 +1841,6 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 				// Released, or provably not ours. Either way this drain owes nothing
 				// further on that register, so the progress below is authorized.
 			}
-			sess.mu.Lock()
-			if cur := d.seqs[sseq]; cur != nil {
-				cur.regSeq = 0 // resolved; nothing may address a remembered sequence again
-			}
-			sess.mu.Unlock()
 			// THE REQUEST IS NOT CONSUMED HERE. It is cleared with the claim removal, inside
 			// the transaction below, and RESTORED with it on a definite failure (holistic
 			// review round 4, finding 1). Clearing it at this point survives neither a fence
@@ -1908,6 +1884,24 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 		}
 		mqttWarnf(c, "MQTT: withholding the completion of drained sequence %d for client %q: "+
 			"the session was cleared while its in-flight register was being released", sseq, sess.id)
+		return true
+	}
+	// AMBIGUITY IS RE-READ UNDER THE FENCE, because the read above may be older than the
+	// observation it relies on. A retry can read the flag before a resume's census apply
+	// installs it, stall in the release, and take the fence only once that resume's accept
+	// transaction has ended — and removing the claim then would finalize over a register set
+	// the session now knows is ambiguous (issue #71). The release above cannot be undone, but
+	// withholding keeps the claim and leaves the source unacknowledged, so the surviving
+	// registers stay reserved.
+	sess.mu.Lock()
+	nowAmbiguous := st.regAmbiguous || st.ownerUnusable
+	sess.mu.Unlock()
+	if nowAmbiguous {
+		if terr := sess.endRecordTx(tok); terr != nil && c != nil {
+			c.Errorf("MQTT: %v", terr)
+		}
+		mqttWarnf(c, "MQTT: withholding the completion of drained sequence %d for client %q: "+
+			"more than one in-flight register names it, so none may be released", sseq, sess.id)
 		return true
 	}
 	// The guard goes on WITH the mutation, not after the save. A delivery or a

@@ -924,11 +924,9 @@ carried, so document order never reached them. Each is an alpha blocker.
   read is fixed ([issue #120](https://github.com/nberlee/mqtt-nats-broker/issues/120)).
   Done 2026-11-04.
 
-- [ ] Refuse a pre-release delayed-drain record shape instead of repairing it:
-  `mqttPersistedDrainSeq.RegSeq` still repairs a record written before the field existed,
-  against the compatibility boundary. A zero `RegSeq` is also a value the broker writes
-  today, so the fix must first tell a shape the broker no longer writes from a current
-  zero ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
+- [x] Deleted the drain's persisted register sequence instead of refusing a shape: a
+  pre-field record and a current zero were byte-identical, and nothing read the field.
+  Done 2026-11-04 ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
 
 - [ ] Remove the `nonce` parameter that `reapRegisterGatedOutcome` never reads and
   `reapRegisterWithVerdictGated` only forwards to it, from both and from their callers

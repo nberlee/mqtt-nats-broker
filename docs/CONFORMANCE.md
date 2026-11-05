@@ -4676,8 +4676,8 @@ What it does NOT do:
     per-sequence progression is not repaired.** The CLAIMS are safe either way: the base
     was already draining, a committed drain adds no fresh claims and completion only
     removes them, so the survivor still names everything it says is owed. What is not
-    repaired is a fact ABOUT one of those claims — a PUBREL intent, a packet identifier, a
-    store attempt or an in-flight register sequence — that our branch acknowledged and the
+    repaired is a fact ABOUT one of those claims — a PUBREL intent, a packet identifier
+    or a store attempt — that our branch acknowledged and the
     survivor's did not. The visible consequence is the survivor's own: recovery treats a
     delivery whose intent it does not hold as still in the PUBLISH phase and may resend
     the payload, which is the state the survivor's branch would have reached with no fork
@@ -7060,6 +7060,12 @@ duplicate pair recorded. A session that never resumes stays degraded, which is t
 only by "the next resume that completes its scans and finds nothing unaccountable". While
 allocation is withheld, an exchange already bound to its acknowledgement still completes
 and releases its custody ([issue #99](https://github.com/nberlee/mqtt-nats-broker/issues/99)).
+Every readable register the scan finds naming the delivery counts, whatever recovery then
+does with it: still in the PUBLISH phase, quarantined, handed off to its stored PUBREL, or
+already past PUBREC, so a pair stays ambiguous on every resume that finds both. Only a
+cancellation fence, a retained register and a terminal PUBLISH, whose ended exchange its own
+cleanup owns, do not count
+([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
 
 So the cost is one drained exchange that does not complete until the session resumes, on a
 session the broker has already declared unable to allocate. The alternative — completing it

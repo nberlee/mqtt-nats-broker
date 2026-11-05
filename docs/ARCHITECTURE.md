@@ -7738,10 +7738,14 @@ The invariants, in the order they matter:
   reinstated: nothing was transmitted, the source simply re-offers under a fresh
   allocation, so its verdict stands on every branch.
 - **A drained exchange's release accepts both "already absent" answers.** The drain
-  holds its register's sequence in its own persisted state and releases it — confirmed,
-  before the claim removal and the ack — in its finalizer. That retry must read BOTH
-  authoritative shapes of "the sequence is already gone" as success, or a crash between
-  the delete and the claim save would withhold the exchange's completion forever.
+  persists no register sequence: its finalizer releases the register its packet
+  identifier names, by subject and only for an identity-matched occupant, confirmed
+  before the claim removal and the ack; a past-PUBREC exchange's slot is instead kept
+  for PUBCOMP terminal cleanup
+  ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
+  That retry must read BOTH authoritative shapes of "the sequence is already gone" as
+  success, or a crash between the delete and the claim save would withhold the
+  exchange's completion forever.
 - **The drain's release is fenced against its own session being cleared, twice.** The
   finalizer captures its drain and sequence, unlocks, and does JetStream work; `clear()`
   meanwhile nils the drain maps, RE-MINTS the generation, and resets the
@@ -7758,12 +7762,19 @@ The invariants, in the order they matter:
   since the release itself is irreversible. Neither check arbitrates a genuinely LIVE
   owner of the same register — that stays
   [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s predicate.
+- **The drain re-reads ambiguity under the fence.** Its first read can predate the
+  resume census that marks the delivery ambiguous: a retry can read the flag, stall in the
+  release, and take the fence once that resume's accept transaction has ended. So the
+  flag is read again after the fence opens, and an ambiguous delivery is withheld there,
+  before any claim removal, save or acknowledgement
+  ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
 - **Ownership transfers explicitly, it is never assumed.** Three teardown paths take a
   register out of the ordinary terminal path's reach, and each takes the delete with it.
   A **drained** QoS 2 exchange holds its source claim until its PUBREL is proven, so
-  nothing else reaches the delete: the drain records the register's sequence in its own
-  state (persisted, so it survives a restart) and releases it — confirmed, before the
-  claim removal and the ack — in its finalizer. A **consumer teardown** releases both the
+  nothing else reaches the delete: the drain's finalizer releases the register its
+  packet identifier names, by subject and identity-conditioned, confirmed before the
+  claim removal and the ack, and keeps a past-PUBREC slot for PUBCOMP terminal cleanup.
+  A **consumer teardown** releases both the
   registers its `cpending` entries name and those of its *retired* sources, which are not
   in `cpending` at all. And an **UNSUBSCRIBE that races a first-delivery register write**
   cancels that allocation rather than skipping it, so the store's own ownership

@@ -354,8 +354,8 @@ func mqttClonePersistedDrain(pd *mqttPersistedDrain) *mqttPersistedDrain {
 // mqttPersistedDrainSeq field: startedSeqs builds its slice by ranging a map
 // (unsub_drain.go), so slice order carries no meaning and a positional comparison would
 // report differences that do not exist. Every field of an entry is persisted protocol state
-// — PubRel/PI are the QoS 2 second phase's intent, Attempt its store generation, RegSeq the
-// in-flight register the drain owes a release to — so "same sequences" is not "same drain".
+// — PubRel/PI are the QoS 2 second phase's intent, Attempt its store generation, OwnerNonce
+// the exchange the intent names — so "same sequences" is not "same drain".
 //
 // The consumer config is compared by DURABLE only, which is the same line the grant
 // predicate draws: the durable is the drain's identity, inseparable from its started

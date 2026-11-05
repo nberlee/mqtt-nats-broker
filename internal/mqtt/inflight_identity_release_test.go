@@ -4,22 +4,19 @@
 // register delete is addressed by SUBJECT and removes only the exact sequence that
 // subject currently holds, and only when the occupant's identity matches.
 //
-// The defect the contract replaces, from issue #70's own table: `RegSeq` is an absolute
-// $MQTT_inflight sequence persisted in the session record, and the drain's release used
-// to delete it directly "with no subject or record identity check at all". After that
-// stream is recreated the sequence names an unrelated register — another session's — and
-// the delete destroyed it.
+// The defect the contract replaces, from issue #70's own table: the drain used to persist an
+// absolute $MQTT_inflight sequence in the session record, and its release deleted that
+// sequence directly "with no subject or record identity check at all". After that stream is
+// recreated the sequence names an unrelated register — another session's — and the delete
+// destroyed it. The drain now persists no register sequence at all (issue #71), so there is
+// nothing remembered to address.
 //
-// The mutations these pair with are the load-bearing part, and they are DIFFERENT
-// invariants that an earlier draft conflated into one:
+// Two invariants remain, and an earlier draft conflated them into one:
 //
-//	M7  removes the identity COMPARISON   -> the victim is destroyed
-//	M7b restores RegSeq ADDRESSING        -> the victim is destroyed, even with the
-//	                                        comparison still in place
-//
-// M7b exists because review found that M7 alone proves only occupant checking: a
-// sequence-addressed implementation that KEPT the comparison would pass M7 while
-// reproducing the phantom, because it would compare the wrong record.
+//	subject isolation  -> a register on another subject is never reached, whatever
+//	                      absolute sequence it occupies
+//	M7 removes the identity COMPARISON -> a foreign occupant of our own subject is
+//	                                      destroyed
 
 package mqtt
 
@@ -243,15 +240,15 @@ func TestInflightIdentityReleaseContract(t *testing.T) {
 	}
 }
 
-// TestInflightIdentityReleaseSparesAReusedSequence is the fixture M7 and M7b both
-// mutate, and it is written to fail for the RIGHT reason under each.
+// TestInflightIdentityReleaseSparesAReusedSequence is the fixture M7 mutates, written to
+// fail for the RIGHT reason.
 //
 // The staging is the recreation: our register is GONE (the stream was recreated), and an
-// unrelated session's register now occupies the absolute sequence our record still
-// remembers. Two distinct facts are asserted:
+// unrelated session's register now occupies the absolute sequence ours once held. Two
+// distinct facts are asserted:
 //
-//  1. addressing by our SUBJECT finds nothing, so we release nothing — which is what
-//     M7b breaks by addressing the remembered sequence instead;
+//  1. addressing by our SUBJECT finds nothing, so we release nothing: the reused sequence
+//     is out of reach;
 //  2. if the subject is instead occupied by a FOREIGN register, the identity comparison
 //     spares it — which is what M7 breaks by deleting whatever it finds.
 func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
@@ -261,24 +258,24 @@ func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
 		victimSubject = mqttInflightStreamSubjectPrefix + "zyxwvuts.hhhhhhhhhhhhhhhhhhhhhh.9"
 		ourDur        = "$MQTT_abc"
 		ourSeq        = uint64(41)
-		rememberedSeq = uint64(500) // what the drain record still carries as RegSeq
+		reusedSeq     = uint64(500) // the absolute sequence our register held before the recreation
 	)
 
 	t.Run("our subject is empty after the recreation, so nothing is released", func(t *testing.T) {
 		t.Parallel()
 		as := &mqttAccountSessionManager{}
-		// The victim occupies the sequence our record remembers, but on ITS OWN
+		// The victim occupies the sequence our register once held, but on ITS OWN
 		// subject. Addressing by subject cannot reach it.
 		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
 			victimSubject: {rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 9, Dur: "$MQTT_victim", Seq: 77,
-				QoS: 2, Nonce: mqttNewInflightNonce()}), seq: rememberedSeq},
+				QoS: 2, Nonce: mqttNewInflightNonce()}), seq: reusedSeq},
 		}, nil)
 
 		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
 			t.Fatalf("outcome = %d, want AlreadyGone", got)
 		}
 		if len(*deleted) != 0 {
-			t.Fatalf("the victim at sequence %d was destroyed: deletes = %v", rememberedSeq, *deleted)
+			t.Fatalf("the victim at sequence %d was destroyed: deletes = %v", reusedSeq, *deleted)
 		}
 	})
 
@@ -287,7 +284,7 @@ func TestInflightIdentityReleaseSparesAReusedSequence(t *testing.T) {
 		as := &mqttAccountSessionManager{}
 		deleted := testPlantInflight(t, as, map[string]testInflightOccupant{
 			ourSubject: {rec: freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish, PI: 7, Dur: "$MQTT_victim", Seq: 77,
-				QoS: 2, Nonce: mqttNewInflightNonce()}), seq: rememberedSeq},
+				QoS: 2, Nonce: mqttNewInflightNonce()}), seq: reusedSeq},
 		}, nil)
 
 		if got := as.releaseInflightRegisterByIdentity(nil, &mqttSession{asm: as}, ourSubject, ourDur, ourSeq); got != mqttInflightAlreadyGone {
@@ -844,8 +841,8 @@ func TestReapIncarnationRegistersResamplesAZeroWatermark(t *testing.T) {
 // PRODUCTION PATH, which is what holistic review round 2 required.
 //
 // An earlier test called the former drainRegisterSubject helper directly, so a regression that
-// pointed finalizeDrainDelivery back at deleteInflightRegisterConfirmed(regSeq) — leaving the
-// helper intact but unused — would have passed it. That is
+// pointed finalizeDrainDelivery back at a sequence-addressed delete — leaving the helper intact
+// but unused — would have passed it. That is
 // feedback_fixture_must_reach_its_route exactly: a green test that never reaches the code
 // it names.
 //
@@ -856,12 +853,11 @@ func TestReapIncarnationRegistersResamplesAZeroWatermark(t *testing.T) {
 func TestFinalizeDrainDeliveryAddressesByPacketIdentifier(t *testing.T) {
 	t.Parallel()
 	const (
-		idHash        = "abcdefgh"
-		gen           = "gggggggggggggggggggggg"
-		jsDur         = "$MQTT_drain_abc"
-		sourceSeq     = uint64(41)
-		pi            = uint16(7)
-		rememberedSeq = uint64(500) // the stale RegSeq a recreation made meaningless
+		idHash    = "abcdefgh"
+		gen       = "gggggggggggggggggggggg"
+		jsDur     = "$MQTT_drain_abc"
+		sourceSeq = uint64(41)
+		pi        = uint16(7)
 	)
 
 	as := &mqttAccountSessionManager{}
@@ -883,7 +879,7 @@ func TestFinalizeDrainDeliveryAddressesByPacketIdentifier(t *testing.T) {
 	d := &mqttDrain{
 		cc: &ConsumerConfig{Durable: jsDur},
 		seqs: map[uint64]*drainSeq{
-			sourceSeq: {claimed: true, pi: pi, regSeq: rememberedSeq},
+			sourceSeq: {claimed: true, pi: pi},
 		},
 	}
 	sess.drainByDur = map[string]*mqttDrain{jsDur: d}
@@ -897,13 +893,7 @@ func TestFinalizeDrainDeliveryAddressesByPacketIdentifier(t *testing.T) {
 	want := mqttInflightSubject(idHash, gen, pi)
 	if asked[0] != want {
 		t.Errorf("the release addressed %q, want %q — the production path must derive the "+
-			"subject from the packet identifier, never from the remembered sequence %d",
-			asked[0], want, rememberedSeq)
-	}
-	// And the remembered sequence must not appear in the address at all, which is the
-	// discriminating half: a subject built from it would name a different identifier.
-	if asked[0] == mqttInflightSubject(idHash, gen, uint16(rememberedSeq%65535+1)) {
-		t.Errorf("the release addressed a subject derived from the remembered sequence: %q", asked[0])
+			"subject from the packet identifier", asked[0], want)
 	}
 }
 
@@ -1048,18 +1038,17 @@ func TestReapIncarnationRegistersAggregatesFailures(t *testing.T) {
 	}
 }
 
-// TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq covers the defect holistic review round
-// 3 found: the release used to run only when the stale `regSeq` hint was NONZERO.
+// TestFinalizeDrainDeliveryReleasesByIdentifierAndHoldsOnAmbiguity covers the defect holistic
+// review round 3 found: the release used to run only when a remembered register sequence was
+// NONZERO.
 //
-// That guard was itself the bug. Recovery zeroes `regSeq` for the AMBIGUOUS duplicate-register
-// case, so a zero hint meant "do not release", and the finalize read it as "nothing to
-// release" — skipping classification and continuing into durable claim removal and source
-// acknowledgement while the registers survived behind a consumer about to be deleted. That
-// is the indefinite identifier reservation the whole change exists to prevent, reached
-// through the guard meant to prevent it.
-//
-// Two states, two required behaviours, and the point is that a zero hint decides NEITHER.
-func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
+// That guard was itself the bug. Recovery zeroed the remembered sequence for the AMBIGUOUS
+// duplicate-register case, so its absence meant "do not release", and the finalize read it as
+// "nothing to release" — skipping classification and continuing into durable claim removal and
+// source acknowledgement while the registers survived behind a consumer about to be deleted.
+// The drain now remembers no register sequence (issue #71), and the two states below are told
+// apart by the regAmbiguous observation alone.
+func TestFinalizeDrainDeliveryReleasesByIdentifierAndHoldsOnAmbiguity(t *testing.T) {
 	t.Parallel()
 	const (
 		idHash    = "abcdefgh"
@@ -1070,7 +1059,7 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 	)
 	subject := mqttInflightSubject(idHash, gen, pi)
 
-	t.Run("regSeq zero with a MATCHING occupant still releases it", func(t *testing.T) {
+	t.Run("an unambiguous delivery with a MATCHING occupant releases it", func(t *testing.T) {
 		t.Parallel()
 		as := &mqttAccountSessionManager{}
 		var deleted []uint64
@@ -1087,7 +1076,7 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 				// The confirming re-read is made indeterminate on purpose: the release
 				// then withholds and the finalize returns BEFORE opening a record
 				// transaction, keeping this fixture to the one decision under test —
-				// that a zero hint did not skip the release. The delete has already
+				// that the release ran. The delete has already
 				// happened by then, which is what the assertion checks.
 				return nil, nil, fmt.Errorf("test: indeterminate confirming read")
 			}
@@ -1101,20 +1090,18 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 		as.mu.Unlock()
 		// The occupant's own marker. Nothing in this scenario requires prior transmission —
 		// the drain is releasing a delivery whose PUBLISH never left — so this is the
-		// truthful store state, and it is what licenses the deletion of 90 that the zero
-		// hint must not skip.
+		// truthful store state, and it is what licenses the deletion of 90.
 		testPlantUnsentMarkers(as, map[string]string{subject: nonce})
 
-		sess := &mqttSession{id: "zero-hint", idHash: idHash, gen: gen, asm: as}
+		sess := &mqttSession{id: "unambiguous", idHash: idHash, gen: gen, asm: as}
 		d := &mqttDrain{cc: &ConsumerConfig{Durable: jsDur}, seqs: map[uint64]*drainSeq{
-			// The hint is ZERO, and there is nonetheless a register of ours to release.
-			sourceSeq: {claimed: true, pi: pi, regSeq: 0},
+			sourceSeq: {claimed: true, pi: pi},
 		}}
 		sess.drainByDur = map[string]*mqttDrain{jsDur: d}
 
 		_ = sess.finalizeDrainDelivery(nil, jsDur, sourceSeq, _EMPTY_)
 		if len(deleted) != 1 || deleted[0] != 90 {
-			t.Fatalf("deleted %v, want [90] — a zero hint must not skip the release", deleted)
+			t.Fatalf("deleted %v, want [90] — the register its identifier names must be released", deleted)
 		}
 	})
 
@@ -1136,7 +1123,7 @@ func TestFinalizeDrainDeliveryDoesNotTrustAZeroRegSeq(t *testing.T) {
 		as.mu.Unlock()
 
 		sess := &mqttSession{id: "ambiguous", idHash: idHash, gen: gen, asm: as}
-		st := &drainSeq{claimed: true, pi: pi, regSeq: 0, regAmbiguous: true}
+		st := &drainSeq{claimed: true, pi: pi, regAmbiguous: true}
 		d := &mqttDrain{cc: &ConsumerConfig{Durable: jsDur}, seqs: map[uint64]*drainSeq{sourceSeq: st}}
 		sess.drainByDur = map[string]*mqttDrain{jsDur: d}
 
@@ -1283,7 +1270,7 @@ func TestDrainAmbiguityClearsWhenTheDuplicatesVanish(t *testing.T) {
 		jsDur     = "$MQTT_drain_abc"
 		sourceSeq = uint64(41)
 	)
-	st := &drainSeq{claimed: true, pi: 7, regSeq: 0, regAmbiguous: true}
+	st := &drainSeq{claimed: true, pi: 7, regAmbiguous: true}
 	d := &mqttDrain{cc: &ConsumerConfig{Durable: jsDur}, seqs: map[uint64]*drainSeq{sourceSeq: st}}
 	sess := &mqttSession{id: "converge", drains: map[string]*mqttDrain{"filter": d}}
 
@@ -1565,10 +1552,6 @@ func TestDrainAmbiguityStaysWhenTheSurvivorIsOnAnotherPI(t *testing.T) {
 			t.Error("the entry stayed ambiguous even though the one surviving register is the " +
 				"identifier it addresses: no scan can ever finalize this delivery")
 		}
-		if st.regSeq != regSeq {
-			t.Errorf("the register hint is %d, want the scanned sequence %d: without it the "+
-				"release has nothing to address", st.regSeq, regSeq)
-		}
 	})
 
 	t.Run("the survivor is on ANOTHER identifier", func(t *testing.T) {
@@ -1589,9 +1572,6 @@ func TestDrainAmbiguityStaysWhenTheSurvivorIsOnAnotherPI(t *testing.T) {
 				"entry was read as settled: the release will find its own identifier absent, " +
 				"take that for completion, and leave the survivor as a phantom holding a " +
 				"Receive Maximum slot")
-		}
-		if st.regSeq != 0 {
-			t.Errorf("the register hint is %d: an ambiguous entry must address nothing", st.regSeq)
 		}
 	})
 }

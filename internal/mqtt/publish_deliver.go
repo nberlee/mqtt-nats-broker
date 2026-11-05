@@ -814,14 +814,6 @@ func mqttDeliverQoS12Offer(sub *subscription, pc *client, subject, reply string,
 				// provably complete — a later PUBREL intent must name the identifier
 				// actually on the wire.
 				st.pi = pi
-				// Repair the register sequence from the live entry. A drain record written
-				// before RegSeq existed carries none, and a drain that acquired its register
-				// through recovery rather than through staging has it only here. The drain
-				// releases the register when the exchange completes, so a zero left in place
-				// would leak it (finalizeDrainDelivery).
-				if ack := sess.pendingPublish[pi]; ack != nil && ack.regSeq != 0 {
-					st.regSeq = ack.regSeq
-				}
 			}
 		}
 	}

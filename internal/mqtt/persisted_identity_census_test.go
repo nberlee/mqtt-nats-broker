@@ -376,7 +376,7 @@ func censusManifest() map[string]map[string]censusDisposition {
 				"alone could address a record a later attempt wrote"},
 		"PubRelStreamSeq": {kind: identityCrossStream, issuer: mqttOutStreamName, encoding: encJSON,
 			reason: "an absolute $MQTT_out sequence naming the CANONICAL PUBREL record, so recreating " +
-				"that stream strands it — the same hazard class as mqttPersistedDrainSeq.RegSeq. It is " +
+				"that stream strands it — the hazard class of issue #38's V1 defect. It is " +
 				"taken from the stored message or an exact readback and NEVER from Nats-Msg-Id, a drain " +
 				"attempt counter or the source sequence. Under issue #38 it may not by itself select or " +
 				"authorize a destructive operation: the slot subject and the exchange nonce do that, and " +
@@ -425,16 +425,6 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Attempt": {kind: notAnIdentity, encoding: encJSON, reason: "the deduplication attempt counter; a dedupe entry outlives its message, so a verified-absent recreate bumps this rather than trusting the window"},
 		"OwnerNonce": {kind: identityLocal, encoding: encJSON,
 			reason: "the EXCHANGE identity this drained delivery owns, persisted with the intent and before the PUBREL store. Not redundant with the record's own header: recovery may find the record missing and have to recreate it, and minting a replacement nonce there would create a DIFFERENT exchange that the durable owner slot does not name and could therefore never act"},
-		// The issue #70 oracle pass corrected this. An earlier draft called it
-		// notAnIdentity on the ground that issue #38 demoted it to a hint — but demoting
-		// what a mechanism RELIES on does not stop the field being a cross-stream
-		// reference, and issue #70's table records it as one. Both facts belong in the row.
-		"RegSeq": {kind: identityCrossStream, issuer: mqttInflightStreamName, encoding: encJSON,
-			reason: "an absolute $MQTT_inflight sequence, so recreating that stream strands it — which is " +
-				"exactly the V1 defect issue #38 closed, since the drain's release used to ADDRESS its delete " +
-				"by this value and would then destroy an unrelated register at the reused sequence. " +
-				"issue #38 demotes it to a HINT: it may never select or authorize a deletion, and the subject " +
-				"derived from PI does that instead. It remains a cross-stream reference either way"},
 	}
 
 	m["mqttPersistedDrain"] = map[string]censusDisposition{
@@ -1332,9 +1322,10 @@ func isCensusTypeName(s string) bool {
 // already carry is a census DEFECT.
 //
 // It has already earned its keep: the first oracle pass found mqttQ2AffClaim missing
-// from the manifest entirely, RegSeq dispositioned as notAnIdentity when the sample
-// records it as a cross-stream reference, and no way to express that VoidedRegs'
-// ELEMENTS are $MQTT_inflight identities.
+// from the manifest entirely, the drain's register sequence (since deleted, issue #71)
+// dispositioned as notAnIdentity when the sample records it as a cross-stream
+// reference, and no way to express that VoidedRegs' ELEMENTS are $MQTT_inflight
+// identities.
 type censusOracleRow struct {
 	holder string // the stream whose records hold the reference
 	what   string // the sample's own description of the carrier
@@ -1410,11 +1401,8 @@ var censusSample = []censusOracleRow{
 		holder: mqttSessStreamName, what: "body drain durable, Started[].Seq", issuer: mqttStreamName,
 		satisfiedBy: []string{"ConsumerConfig.Durable", "mqttPersistedDrainSeq.Seq"},
 	},
-	{
-		holder: mqttSessStreamName, what: "body drain Started[].RegSeq", issuer: mqttInflightStreamName,
-		satisfiedBy: []string{"mqttPersistedDrainSeq.RegSeq"},
-		reason:      "this is the carrier of issue #38's own V1 defect; the census records it as a cross-stream reference even though issue #38 demotes it to a hint",
-	},
+	// The sample's "body drain Started[].RegSeq" row has no carrier: issue #71 deleted the
+	// field, because nothing read it and its absolute sequence stranded on recreation.
 	{
 		holder: mqttSessStreamName, what: "body VoidedRegs[]", issuer: mqttInflightStreamName,
 		satisfiedBy: []string{"mqttPersistedSession.VoidedRegs"},
@@ -1431,7 +1419,10 @@ func TestPersistedIdentityCensusRediscoversSample(t *testing.T) {
 	t.Parallel()
 	manifest := censusManifest()
 
-	// FIFTEEN, and the fifteenth is the one this file predicted. The durable QoS 2 owner
+	// FOURTEEN. The sample's drain Started[].RegSeq row went with its field (issue #71), by the
+	// rule stated below: a row asserting a coupling no record carries is a claim about nothing.
+	//
+	// The last row added is the one this file predicted. The durable QoS 2 owner
 	// slot couples `$MQTT_inflight` body PubRelDurable/PubRelStreamSeq to `$MQTT_out`, and
 	// it is a genuinely NEW coupling: the pre-existing Dur/Seq row couples this record to a
 	// SOURCE DELIVERY, where this names one specific PUBREL RECORD's sequence in a specific
@@ -1442,8 +1433,8 @@ func TestPersistedIdentityCensusRediscoversSample(t *testing.T) {
 	// They are back, with the admission half that writes them, so the row is back too.
 	// ActionClaim/ActionClaimSeq still have no row of their own: they are members of the
 	// arbitration relation the ClaimSeq row carries, not a second coupling to $MQTT_sess.
-	if len(censusSample) != 15 {
-		t.Fatalf("the oracle carries %d rows; issue #70's sample has 15. A row was dropped or added "+
+	if len(censusSample) != 14 {
+		t.Fatalf("the oracle carries %d rows; issue #70's sample, less its deleted carriers, has 14. A row was dropped or added "+
 			"without re-reading the dossier", len(censusSample))
 	}
 
@@ -1477,7 +1468,7 @@ func TestPersistedIdentityCensusRediscoversSample(t *testing.T) {
 			}
 			// The row must be recorded as carrying an identity of some kind. A sample
 			// row dispositioned notAnIdentity is the disagreement the first oracle
-			// pass caught on RegSeq.
+			// pass caught on the drain's since-deleted register sequence.
 			switch d.kind {
 			case identityCrossStream, identityComposite, identityLocal, container:
 			default:

@@ -1269,21 +1269,18 @@ func (as *mqttAccountSessionManager) deleteInflightRegister(seq uint64) {
 	_ = as.jsa.deleteMsg(mqttInflightStreamName, seq, false)
 }
 
-// mqttDrainRegObservation is one claimed drain entry's register hint as a scan found it: the
-// entry it is about (by identity), and the register sequence or the ambiguity.
+// mqttDrainRegObservation is one claimed drain entry a scan found AMBIGUOUS: the entry it is
+// about, by identity, so apply installs the flag only on the entry the scan saw.
 type mqttDrainRegObservation struct {
-	dur       string
-	seq       uint64
-	st        *drainSeq
-	regSeq    uint64
-	ambiguous bool
+	dur string
+	seq uint64
+	st  *drainSeq
 }
 
 // computeDrainRegisterStateLocked is the recomputation's READ half: which keys come out owned and
 // which ambiguous, and the observations applyDrainRegisterStateLocked would install. It writes
 // NOTHING (issue #107 7b): the resume walk classifies with it before apply and installs only once
-// apply has proven the walk still serves, because regSeq and regAmbiguous gate drain finalization
-// and are serialized in the session record.
+// apply has proven the walk still serves, because regAmbiguous gates drain finalization.
 //
 // sess.mu must be held.
 func (sess *mqttSession) computeDrainRegisterStateLocked(
@@ -1306,10 +1303,9 @@ func (sess *mqttSession) computeDrainRegisterStateLocked(
 		o := mqttDrainRegObservation{dur: fr.rec.Dur, seq: fr.rec.Seq, st: st}
 		if len(group) > 1 {
 			// More than one register names this delivery, on different identifiers. Record
-			// the AMBIGUITY explicitly: zeroing the hint alone used to be the whole signal,
-			// and the drain's release then read a zero hint as "nothing to do" and
+			// the AMBIGUITY explicitly: an absent register sequence used to be the whole
+			// signal, and the drain's release then read that absence as "nothing to do" and
 			// finalized anyway.
-			o.ambiguous = true
 			ambiguous[key] = true
 			obs = append(obs, o)
 			continue
@@ -1324,14 +1320,11 @@ func (sess *mqttSession) computeDrainRegisterStateLocked(
 		// register is unknown; it is that this entry cannot say which identifier the client
 		// holds, which is the same fact the duplicate case records.
 		if fr.rec.PI != st.pi {
-			o.ambiguous = true
 			ambiguous[key] = true
 			obs = append(obs, o)
 			continue
 		}
-		o.regSeq = fr.seq
 		owned[key] = true
-		obs = append(obs, o)
 	}
 	return owned, ambiguous, obs
 }
@@ -1356,11 +1349,7 @@ func (sess *mqttSession) applyDrainRegisterStateLocked(obs []mqttDrainRegObserva
 		if d == nil || d.seqs[o.seq] != o.st {
 			continue
 		}
-		if o.ambiguous {
-			o.st.regSeq, o.st.regAmbiguous = 0, true
-			continue
-		}
-		o.st.regSeq = o.regSeq
+		o.st.regAmbiguous = true
 	}
 }
 
@@ -9994,6 +9983,8 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 
 	// The pending cancellation fences the walk diverts before any classification (issue #90).
 	var pendingFences []mqttRecoveredInflightReg
+	// Every source-naming register the walk reads, for the drain grouping (see where it is taken).
+	var drainCensus []mqttRecoveredInflightReg
 	// (3) Classification, from registers observed before the scan above.
 	for _, smsg := range loaded {
 		name, perr := mqttParseInflightSubject(smsg.Subject)
@@ -10067,6 +10058,19 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		if mqttValidPendingFence(smsg.Subject, rec) {
 			pendingFences = append(pendingFences, mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence})
 			continue
+		}
+		// THE DRAIN CENSUS is taken HERE, once per slot, before any later route can divert a
+		// record out of sight: every readable, shape-valid register naming a source counts toward
+		// that source's drain grouping, whatever happens to it next — refused, quarantined,
+		// handed off to its PUBREL, or already past PUBREC. A grouping assembled from the routes'
+		// own lists missed each route nobody listed, and a missed duplicate let a drain finalize
+		// over a register it cannot release (issue #71). Only three are not exchanges a drained
+		// delivery could be duplicated by: the fence above, a retained register (no ordinary
+		// source coordinates; issue #107 7c), and a terminal PUBLISH, an ended exchange whose
+		// own continuation owns its delete — counting it would withhold the very finalize that
+		// cleanup is waiting for.
+		if !rec.retainedSource() && rec.State != mqttInflightPublishTerminal {
+			drainCensus = append(drainCensus, mqttRecoveredInflightReg{rec: rec, seq: smsg.Sequence})
 		}
 		// AN UNSUPPORTED SHARED SHAPE IS REFUSED BEFORE ANYTHING INTERPRETS IT (7a). A shared
 		// register exists only as a QoS 1 delivery admitted beside an exchange naming its exact
@@ -10415,38 +10419,28 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 
 	// A register a DRAIN claims is the drain's, and recovery must not touch the record.
 	// The reason is I2b, NOT the drain's release addressing: finalizeDrainDelivery
-	// (unsub_drain.go) ignores the persisted RegSeq and releases by IDENTITY through
+	// (unsub_drain.go) remembers no register sequence and releases by IDENTITY through
 	// releaseInflightRegisterByIdentity, following a rewrite, so a moved sequence would not
 	// by itself strand it (N-11). What retiring the record here WOULD do is duplicate the
 	// drain's own suppression, which I2b governs: only a CONFIRMED PUBREL may release a
 	// drained claim, so recovery re-phasing or dropping the record would let a source be
 	// re-offered or acked that the drain still owes a PUBREL for.
 	//
-	// So the register is left alone here and its sequence is REPAIRED into the drain state
-	// instead, which also brings records written before RegSeq existed up to date. The
-	// identifier is still reserved: past PUBREC by the PUBREL loop below, and otherwise by
-	// the ordinary live-register path.
-	// A drain holds ONE register sequence per claimed delivery, so more than one register
-	// naming a drained source cannot be represented: assigning each in turn would leave the
-	// drain releasing only the last, and the others would survive its consumer as phantoms.
+	// So the register is left alone here. The identifier is still reserved: past PUBREC by
+	// the PUBREL loop below, and otherwise by the ordinary live-register path.
+	// A drain entry names ONE register per claimed delivery, the one its packet identifier
+	// addresses, so more than one register naming a drained source cannot be represented:
+	// releasing the addressed one would leave the others surviving its consumer as phantoms.
 	// That state means a superseded broker wrote a second register, and it is the same
 	// ambiguity the duplicate-source rule already fails closed on — so these are routed
 	// there instead: every identifier reserved, every record kept, nothing deleted, and
-	// allocation withheld. The drain's own sequence is cleared so it cannot release one of
-	// them and orphan the rest.
+	// allocation withheld. The drain entry is marked ambiguous so it cannot finalize over
+	// one of them and orphan the rest.
+	// Grouped by source from the census the scan took (see drainCensus), one member per slot.
 	drainRegs := make(map[string][]mqttRecoveredInflightReg)
-	for _, fr := range regs {
-		drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)] = append(
-			drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)], fr)
-	}
-	// Route B removes its PUBLISH-shaped slot from regs before source classification,
-	// but a drain still needs the original observed register sequence repaired into its
-	// non-authoritative hint. Omitting these records reset an old-format drain's RegSeq
-	// to zero even though recovery had just found and re-phased its exact slot.
-	for _, handoff := range routeB {
-		fr := handoff.reg
-		drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)] = append(
-			drainRegs[mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)], fr)
+	for _, fr := range drainCensus {
+		key := mqttPubRelSourceKey(fr.rec.Dur, fr.rec.Seq)
+		drainRegs[key] = append(drainRegs[key], fr)
 	}
 	sess.mu.Lock()
 	// READ ONLY here (issue #107 7b): the observations are installed by apply, after the walk has

@@ -81,8 +81,8 @@ func TestFloorEnrolsAPossiblyAttemptedPostAdoptionDelivery(t *testing.T) {
 		t.Fatal("a possibly-attempted delivery on a restored drain's durable must be ENROLLED: " +
 			"the client may hold it, and the unclaimed arm would otherwise destroy the source")
 	}
-	if st.pi != 12 || st.regSeq != 900 {
-		t.Fatalf("the claim is built from the ENTRY's own identity, got pi=%d regSeq=%d", st.pi, st.regSeq)
+	if st.pi != 12 {
+		t.Fatalf("the claim is built from the ENTRY's own identity, got pi=%d", st.pi)
 	}
 }
 

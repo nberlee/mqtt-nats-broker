@@ -751,7 +751,7 @@ func TestForkRepairReassertedRemovalKeepsItsDrain(t *testing.T) {
 			s.subs = nil
 			delete(s.cons, "d/a")
 			testInstallDrain(s, "d/a", testPersistedDrain("d-a-dur",
-				mqttPersistedDrainSeq{Seq: 11, PI: 3, RegSeq: 7}))
+				mqttPersistedDrainSeq{Seq: 11, PI: 3}))
 		}, nil)
 
 	sess := e.reconnect(t)
@@ -771,8 +771,8 @@ func TestForkRepairReassertedRemovalKeepsItsDrain(t *testing.T) {
 	if d.cc.Durable != "d-a-dur" {
 		t.Fatalf("the drain must keep its own durable, got %q", d.cc.Durable)
 	}
-	if st := d.seqs[11]; st == nil || !st.claimed || st.regSeq != 7 {
-		t.Fatalf("the started delivery and its in-flight register must survive, got %+v", st)
+	if st := d.seqs[11]; st == nil || !st.claimed || st.pi != 3 {
+		t.Fatalf("the started delivery and its packet identifier must survive, got %+v", st)
 	}
 	// buildPersistedSessionLocked persists a claiming drain regardless of membership, so the
 	// accept save keeps the durable referenced.
@@ -837,7 +837,6 @@ func TestForkRepairRefusesTwoDifferingDrains(t *testing.T) {
 			OwnerNonce: "xxxxxxxxxxxxxxxxxxxxxx"}},
 		{"the packet identifier", mqttPersistedDrainSeq{Seq: 31, PI: 6}},
 		{"the store attempt", mqttPersistedDrainSeq{Seq: 31, PI: 5, Attempt: 2}},
-		{"the in-flight register", mqttPersistedDrainSeq{Seq: 31, PI: 5, RegSeq: 99}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -862,10 +861,10 @@ func TestForkRepairRefusesTwoDifferingDrains(t *testing.T) {
 				t.Fatal("the survivor's started delivery must be untouched")
 			}
 			if st.intent != base.owesPubRel() || st.pi != base.PI ||
-				st.attempt != base.Attempt || st.regSeq != base.RegSeq {
+				st.attempt != base.Attempt {
 				t.Fatalf("comparing drains by sequence MEMBERSHIP alone would merge two "+
-					"different drains: got intent=%v pi=%d attempt=%d reg=%d",
-					st.intent, st.pi, st.attempt, st.regSeq)
+					"different drains: got intent=%v pi=%d attempt=%d",
+					st.intent, st.pi, st.attempt)
 			}
 		})
 	}
@@ -1028,7 +1027,7 @@ func TestForkRepairAReassertedDrainKeepsItsOwnDurable(t *testing.T) {
 			s.subs = nil
 			delete(s.cons, "d/i")
 			testInstallDrain(s, "d/i", testPersistedDrain("d-i-A",
-				mqttPersistedDrainSeq{Seq: 71, PI: 2, RegSeq: 13}))
+				mqttPersistedDrainSeq{Seq: 71, PI: 2}))
 		},
 		func(ps, parent *mqttPersistedSession) {
 			// The survivor holds a LIVE consumer for the same sid, on a different durable.
@@ -1047,7 +1046,7 @@ func TestForkRepairAReassertedDrainKeepsItsOwnDurable(t *testing.T) {
 	if !indexed {
 		t.Fatal("drainByDur must be keyed by the drain's own durable")
 	}
-	if st := d.seqs[71]; st == nil || st.regSeq != 13 {
+	if st := d.seqs[71]; st == nil || st.pi != 2 {
 		t.Fatalf("the started sequences belong to that durable, got %+v", st)
 	}
 	sess.mu.Lock()

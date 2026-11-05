@@ -2070,9 +2070,8 @@ func TestMQTTInflightStageDrainCancelKeepsFirstSendDupClear(t *testing.T) {
 // forever.
 //
 // If the release lands and the broker dies before persisting the claim removal, recovery
-// restores the record's old reg_seq with no register left to repair it from. A retry that
-// read "sequence not found" as a failure would withhold that exchange's completion for
-// good.
+// restores the claim with no register left behind it. A retry that read "sequence not found"
+// as a failure would withhold that exchange's completion for good.
 //
 // Mutation check: use the bare deleteMsg here instead of the confirmed helper and the
 // completion is withheld.
@@ -2087,12 +2086,12 @@ func TestMQTTInflightDrainCompletesWhenRegisterAlreadyGone(t *testing.T) {
 	e.sess.mu.Lock()
 	regSeq := e.sess.pendingPublish[pi].regSeq
 	ackSubject := e.sess.pendingPublish[pi].jsAckSubject
-	// A drain claiming it, with the register sequence recorded — and the register itself
-	// already deleted, which is the post-crash state.
+	// A drain claiming it — and the register itself already deleted, which is the
+	// post-crash state.
 	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
 	e.sess.drains = map[string]*mqttDrain{sid: {
 		cc: cc, qos: 2,
-		seqs: map[uint64]*drainSeq{sseq: {claimed: true, pi: pi, regSeq: regSeq, ack: ackSubject}},
+		seqs: map[uint64]*drainSeq{sseq: {claimed: true, pi: pi, ack: ackSubject}},
 	}}
 	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
 	e.sess.mu.Unlock()
@@ -2112,11 +2111,61 @@ func TestMQTTInflightDrainCompletesWhenRegisterAlreadyGone(t *testing.T) {
 	}
 }
 
-// Two registers naming ONE drained delivery fail closed: a drain holds a single register
-// sequence, so releasing one would orphan the rest as phantoms after its consumer goes.
+// A finalize that read its delivery as UNAMBIGUOUS before a resume's census apply marked it
+// ambiguous re-reads the flag under the record fence and withholds. The read before the
+// release can be older than the observation: a retry can read the flag, stall in the
+// release while the apply lands, and take the fence once the resume's accept transaction
+// has ended.
 //
-// Mutation check: assign each register to the drain in turn (the original) and only one
-// sequence survives, so the others are neither reserved nor released.
+// Mutation check: drop the re-read under the fence and the claim is removed over a delivery
+// the session now knows is ambiguous.
+func TestDrainFinalizeRereadsAmbiguityUnderTheFence(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-drain-stale-ambiguity")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sid = "foo"
+
+	sseq := e.publishSource(t, dur)
+	pi := e.track(t, dur, sseq, 2)
+	e.sess.mu.Lock()
+	regSeq := e.sess.pendingPublish[pi].regSeq
+	ackSubject := e.sess.pendingPublish[pi].jsAckSubject
+	st := &drainSeq{claimed: true, pi: pi, ack: ackSubject}
+	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
+	e.sess.drains = map[string]*mqttDrain{sid: {cc: cc, qos: 2, seqs: map[uint64]*drainSeq{sseq: st}}}
+	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
+	e.sess.mu.Unlock()
+	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, regSeq, true); err != nil {
+		t.Fatalf("pre-delete the register: %v", err)
+	}
+	// The apply lands DURING the release: the finalize has already read the flag as clear.
+	e.asm.mu.Lock()
+	e.asm.testInflightLoad = func(subject string) (*mqttInflightRecord, *StoredMsg, error) {
+		e.sess.mu.Lock()
+		st.regAmbiguous = true
+		e.sess.mu.Unlock()
+		return e.asm.jsa.loadInflightRecord(subject)
+	}
+	e.asm.mu.Unlock()
+
+	if !e.sess.finalizeDrainDelivery(e.c, dur, sseq, ackSubject) {
+		t.Fatalf("the drain must handle its own sequence")
+	}
+	e.sess.mu.Lock()
+	claimed := st.claimed && !st.unclaimUnconfirmed
+	e.sess.mu.Unlock()
+	if !claimed {
+		t.Fatalf("the claim was removed over a delivery the session marked ambiguous during the release")
+	}
+}
+
+// Two registers naming ONE drained delivery fail closed: a drain entry addresses the single
+// register its packet identifier names, so releasing that one would orphan the rest as
+// phantoms after its consumer goes. The entry is marked ambiguous, which withholds its
+// finalize.
+//
+// Mutation check: treat a multi-register group as owned rather than ambiguous and the
+// entry is left finalizable over registers it cannot all release.
 func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-drain-ambiguous")
@@ -2133,7 +2182,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.drains = map[string]*mqttDrain{sid: {
 		cc: cc, qos: 2,
-		seqs: map[uint64]*drainSeq{sseq: {claimed: true, pi: 3, regSeq: 999}},
+		seqs: map[uint64]*drainSeq{sseq: {claimed: true, pi: 3}},
 	}}
 	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
 	e.sess.mu.Unlock()
@@ -2146,7 +2195,7 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	_, kept3 := e.sess.pendingPublish[3]
 	_, kept4 := e.sess.pendingPublish[4]
 	incomplete := e.sess.piSpaceIncomplete
-	drainRegSeq := e.sess.drains[sid].seqs[sseq].regSeq
+	drainAmbiguous := e.sess.drains[sid].seqs[sseq].regAmbiguous
 	e.sess.mu.Unlock()
 	if !kept3 || !kept4 {
 		t.Fatalf("both identifiers must be reserved (3=%v 4=%v)", kept3, kept4)
@@ -2154,8 +2203,8 @@ func TestMQTTInflightRecoveryDrainAmbiguousRegistersFailClosed(t *testing.T) {
 	if !incomplete {
 		t.Fatalf("an undeterminable drained identifier leaves the identifier space incomplete")
 	}
-	if drainRegSeq != 0 {
-		t.Fatalf("the drain must not hold one of several sequences (%d): releasing it would orphan the others", drainRegSeq)
+	if !drainAmbiguous {
+		t.Fatalf("the drain entry must be ambiguous: finalizing over one of several registers would orphan the others")
 	}
 	// Both records are kept: each is evidence that its identifier may be in use.
 	e.waitRegisterCount(t, 2)
@@ -4987,9 +5036,9 @@ func TestMQTTInflightSourceCacheAppliesTheLookupContract(t *testing.T) {
 }
 
 // A stored exact PUBREL moves even a drain-owned PUBLISH slot through recovery route B.
-// The drain's RegSeq is only a hint and terminal cleanup addresses the whole-life slot by
-// identity, so preserving an obsolete PUBLISH phase would strand admission under the
-// predecessor's custody after restart.
+// The drain remembers no register sequence and terminal cleanup addresses the whole-life
+// slot by identity, so preserving an obsolete PUBLISH phase would strand admission under
+// the predecessor's custody after restart.
 func TestMQTTInflightRecoveryCompletesDrainOwnedPubRelHandoff(t *testing.T) {
 	t.Parallel()
 	e := testNewInflightEnv(t, "client-drain-owned")
@@ -5009,8 +5058,7 @@ func TestMQTTInflightRecoveryCompletesDrainOwnedPubRelHandoff(t *testing.T) {
 	}
 	regSeq := regMsg.Sequence
 
-	// A drain claiming that delivery, with NO RegSeq — the shape of a record written
-	// before the field existed.
+	// A drain claiming that delivery past PUBREC.
 	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
 	e.sess.mu.Lock()
 	e.sess.drains = map[string]*mqttDrain{sid: {
@@ -5044,14 +5092,162 @@ func TestMQTTInflightRecoveryCompletesDrainOwnedPubRelHandoff(t *testing.T) {
 	if rec.State != mqttInflightPubRelReady || rec.PubRelStreamSeq == 0 {
 		t.Fatalf("the drain-owned slot did not become canonical PUBREL authority: %+v", rec)
 	}
-	// The old hint may remain: it never selects or authorizes a release, and §10.5 skips
-	// the drain-side slot release once intent proves this exchange is past PUBREC.
+	// One register on the entry's own identifier: the drain entry is settled, not ambiguous.
 	e.sess.mu.Lock()
-	got := e.sess.drains[sid].seqs[sseq].regSeq
+	ambiguous := e.sess.drains[sid].seqs[sseq].regAmbiguous
 	e.sess.mu.Unlock()
-	if got != regSeq {
-		t.Fatalf("the drain's non-authoritative register hint is %d, want original %d", got, regSeq)
+	if ambiguous {
+		t.Fatalf("a single handed-off register on the entry's own identifier was read as ambiguous")
 	}
+}
+
+// A register recovery hands off through route B is still a register naming the drained
+// source. Route B removes such slots from the ordinary scan before source classification, so
+// they reach the drain's register grouping only through their own path; two of them on
+// different identifiers for one drained delivery must leave that delivery AMBIGUOUS, or its
+// finalize would release the one its identifier names and orphan the other.
+//
+// Mutation check: drop the route-B registers from the drain grouping and the entry is not
+// marked ambiguous. The reservations alone do not discriminate: PUBREL recovery reserves
+// both identifiers either way.
+func TestRecoveredPubRelHandoffCountsTowardDrainAmbiguity(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-drain-handoff-ambiguous")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sid = "foo"
+
+	sseq := e.publishSource(t, dur)
+	// Two admitted registers, one source, different identifiers: a superseded broker wrote one.
+	nonces := map[uint16]string{3: mqttNewInflightNonce(), 4: mqttNewInflightNonce()}
+	for _, pi := range []uint16{3, 4} {
+		e.landAdmission(t, pi, 2, dur, sseq, nonces[pi])
+	}
+	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
+	e.sess.mu.Lock()
+	e.sess.drains = map[string]*mqttDrain{sid: {
+		cc: cc, qos: 2,
+		seqs: map[uint64]*drainSeq{sseq: {claimed: true, intent: true, pi: 3}},
+	}}
+	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
+	e.sess.mu.Unlock()
+
+	// An exact stored PUBREL for each, so both slots take route B.
+	e.subscribePubRel(t)
+	e.endPubRelDelivery(t)
+	for _, pi := range []uint16{3, 4} {
+		msg, hdrLen := mqttNewCorrelatedPubRel(pi, nonces[pi], dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+		if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
+			t.Fatalf("store the PUBREL record for %d: %v", pi, err)
+		}
+	}
+	e.forgetInMemory()
+
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("recoverInflightRegisters: %v", err)
+	}
+	e.sess.mu.Lock()
+	_, kept3 := e.sess.pendingPubRel[3]
+	_, kept4 := e.sess.pendingPubRel[4]
+	ambiguous := e.sess.drains[sid] != nil && e.sess.drains[sid].seqs[sseq] != nil &&
+		e.sess.drains[sid].seqs[sseq].regAmbiguous
+	e.sess.mu.Unlock()
+	if !kept3 || !kept4 {
+		t.Fatalf("both identifiers must be reserved past PUBREC (3=%v 4=%v)", kept3, kept4)
+	}
+	if !ambiguous {
+		t.Fatalf("two handed-off registers name one drained delivery on different identifiers, " +
+			"and the entry was not marked ambiguous: its finalize would orphan one of them")
+	}
+
+	// The NEXT resume finds both slots already past PUBREC rather than handing them off, and
+	// the ambiguity is an observation every complete scan recomputes from scratch: those
+	// registers must still count, or the reset clears it and the finalize below proceeds.
+	e.forgetInMemory()
+	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+		t.Fatalf("the second recoverInflightRegisters: %v", err)
+	}
+	e.sess.mu.Lock()
+	ambiguous = e.sess.drains[sid] != nil && e.sess.drains[sid].seqs[sseq] != nil &&
+		e.sess.drains[sid].seqs[sseq].regAmbiguous
+	e.sess.mu.Unlock()
+	if !ambiguous {
+		t.Fatalf("a later resume found the same two past-PUBREC registers and cleared the ambiguity")
+	}
+	if !e.sess.finalizeDrainDelivery(e.c, dur, sseq, _EMPTY_) {
+		t.Fatalf("the drain must handle its own sequence")
+	}
+	e.sess.mu.Lock()
+	claimed := e.sess.drains[sid] != nil && e.sess.drains[sid].seqs[sseq] != nil &&
+		e.sess.drains[sid].seqs[sseq].claimed
+	e.sess.mu.Unlock()
+	if !claimed {
+		t.Fatalf("the claim was removed over two registers naming one drained delivery")
+	}
+	e.waitRegisterCount(t, 2)
+}
+
+// Two registers name one drained delivery, and only ONE has its exact stored PUBREL: that one
+// is handed off through route B, while the other, a PUBLISH-shaped register whose source the
+// PUBREL names but whose exchange it does not, is quarantined. Neither route lists its record
+// among the ordinary registers, so the drain grouping sees the pair only through the census
+// the scan takes. The drain entry names the handed-off identifier, so the singleton rule
+// cannot stand in for the missed duplicate.
+//
+// Mutation check: drop the census append and the entry is read as owning a singleton on its
+// own identifier, so the finalize removes the claim while the quarantined register survives.
+func TestMixedPhaseDuplicateRegistersKeepADrainAmbiguous(t *testing.T) {
+	t.Parallel()
+	e := testNewInflightEnv(t, "client-drain-mixed-phase")
+	dur := e.sess.idHash + "_" + nuid.Next()
+	const sid = "foo"
+
+	sseq := e.publishSource(t, dur)
+	nonces := map[uint16]string{3: mqttNewInflightNonce(), 4: mqttNewInflightNonce()}
+	for _, pi := range []uint16{3, 4} {
+		e.landAdmission(t, pi, 2, dur, sseq, nonces[pi])
+	}
+	cc := &ConsumerConfig{Durable: dur, DeliverSubject: mqttSubPrefix + nuid.Next()}
+	e.sess.mu.Lock()
+	e.sess.drains = map[string]*mqttDrain{sid: {
+		cc: cc, qos: 2,
+		seqs: map[uint64]*drainSeq{sseq: {claimed: true, intent: true, pi: 3}},
+	}}
+	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
+	e.sess.mu.Unlock()
+
+	// An exact stored PUBREL for identifier 3 only.
+	e.subscribePubRel(t)
+	e.endPubRelDelivery(t)
+	msg, hdrLen := mqttNewCorrelatedPubRel(3, nonces[3], dur, sseq, _EMPTY_, _EMPTY_, _EMPTY_)
+	if _, err := e.asm.jsa.storeMsg(e.sess.pubRelSubject, hdrLen, msg); err != nil {
+		t.Fatalf("store the PUBREL record: %v", err)
+	}
+
+	for resume := 1; resume <= 2; resume++ {
+		e.forgetInMemory()
+		if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
+			t.Fatalf("resume %d: recoverInflightRegisters: %v", resume, err)
+		}
+		e.sess.mu.Lock()
+		ambiguous := e.sess.drains[sid] != nil && e.sess.drains[sid].seqs[sseq] != nil &&
+			e.sess.drains[sid].seqs[sseq].regAmbiguous
+		e.sess.mu.Unlock()
+		if !ambiguous {
+			t.Fatalf("resume %d: a handed-off register and a quarantined one name one drained "+
+				"delivery on different identifiers, and the entry was not marked ambiguous", resume)
+		}
+	}
+	if !e.sess.finalizeDrainDelivery(e.c, dur, sseq, _EMPTY_) {
+		t.Fatalf("the drain must handle its own sequence")
+	}
+	e.sess.mu.Lock()
+	claimed := e.sess.drains[sid] != nil && e.sess.drains[sid].seqs[sseq] != nil &&
+		e.sess.drains[sid].seqs[sseq].claimed
+	e.sess.mu.Unlock()
+	if !claimed {
+		t.Fatalf("the claim was removed over two registers naming one drained delivery")
+	}
+	e.waitRegisterCount(t, 2)
 }
 
 // An enumeration that fails for ANY reason — including a missing stream — leaves the

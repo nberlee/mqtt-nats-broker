@@ -314,7 +314,7 @@ func TestConsult73PubRelCallbackRecoveryGate(t *testing.T) {
 			sourceAck := testInflightAckSubject(testRealPubRelSrcDur, seed.sseq, 1)
 			relAck := seed.reply(1)
 			st := &drainSeq{
-				claimed: true, intent: true, pi: seed.pi, regSeq: sm.Sequence,
+				claimed: true, intent: true, pi: seed.pi,
 				ownerNonce: seed.nonce, phase: drainPubRelUncertain, ack: sourceAck,
 			}
 			d := &mqttDrain{
