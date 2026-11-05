@@ -94,10 +94,10 @@ func (sess *mqttSession) withdrawRetainedOnce(c *client, snap *mqttPending, back
 	}
 	var out mqttReapOutcome
 	if background {
-		out = sess.reapRegisterGatedOutcome(seq, snap.regNonce, true, &slot, mqttSlotDeleteComplete,
+		out = sess.reapRegisterGatedOutcome(seq, true, &slot, mqttSlotDeleteComplete,
 			mqttLicenceOf(c).withAdmission(sess.admitBackgroundAuthority))
 	} else {
-		out = sess.reapRegisterGatedOutcome(seq, snap.regNonce, true, &slot, mqttSlotDeleteComplete, mqttLicenceOf(c))
+		out = sess.reapRegisterGatedOutcome(seq, true, &slot, mqttSlotDeleteComplete, mqttLicenceOf(c))
 	}
 	switch out {
 	case mqttReapRefused:

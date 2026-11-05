@@ -768,7 +768,7 @@ func (sess *mqttSession) clearRetiredSourceMatching(c *client, jsDur string, sse
 			}
 		}
 		// No licence: a retired register is past PUBREC, never an unsent obligation.
-		sess.reapRegisterWithVerdictGated(regSeq, nonce, false, slot, mqttSlotDeleteComplete, mqttDestroyLicence{})
+		sess.reapRegisterWithVerdictGated(regSeq, false, slot, mqttSlotDeleteComplete, mqttDestroyLicence{})
 	}
 	c.Debugf("MQTT: settled retired QoS 2 source %s/%d for client %q", jsDur, sseq, sess.id)
 }

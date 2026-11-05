@@ -2537,7 +2537,7 @@ func (sess *mqttSession) recoverPublishTerminalSlot(c *client, subject string, s
 		}
 	}
 	// No licence: a terminal register is completion evidence and never an unsent obligation.
-	switch sess.reapRegisterGatedOutcome(seq, rec.Nonce, true, ref, mqttSlotDeletePublishTerminal, mqttDestroyLicence{}) {
+	switch sess.reapRegisterGatedOutcome(seq, true, ref, mqttSlotDeletePublishTerminal, mqttDestroyLicence{}) {
 	case mqttReapDeleted:
 		// Deleted at the sequence this caller named. The subject is confirmed below, because
 		// an exact-sequence delete reads an ALREADY-ABSENT sequence as success, and a
@@ -2969,7 +2969,7 @@ func mqttSlotAdmitsDisposition(cur *mqttInflightRecord, ref *mqttInflightSlotRef
 // closed with mqttReapRefused: it is not an absence and not a licence to delete.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, nonce string, mustConfirm bool,
+func (sess *mqttSession) reapRegisterGatedOutcome(seq uint64, mustConfirm bool,
 	ref *mqttInflightSlotRef, d mqttInflightDisposition, lic mqttDestroyLicence) mqttReapOutcome {
 
 	if sess == nil || seq == 0 {
@@ -3305,10 +3305,10 @@ const (
 // allocation gone, so a moved sequence refuses it.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, nonce string, mustConfirm bool,
+func (sess *mqttSession) reapRegisterWithVerdictGated(seq uint64, mustConfirm bool,
 	ref *mqttInflightSlotRef, d mqttInflightDisposition, lic mqttDestroyLicence) bool {
 
-	switch sess.reapRegisterGatedOutcome(seq, nonce, mustConfirm, ref, d, lic) {
+	switch sess.reapRegisterGatedOutcome(seq, mustConfirm, ref, d, lic) {
 	case mqttReapRefused:
 		return false
 	case mqttReapPreservedMoved:
@@ -3786,7 +3786,7 @@ func (sess *mqttSession) deleteInflightRegisterFor(ack *mqttPending, d mqttInfli
 	// precondition is that the register half is already GONE, so it has to be proven gone
 	// here. A delete that cannot be confirmed reaps no marker: both halves are left to the
 	// sweep rather than acted on without proof.
-	if !sess.reapRegisterWithVerdictGated(ack.regSeq, ack.regNonce, true, slot, d, lic) {
+	if !sess.reapRegisterWithVerdictGated(ack.regSeq, true, slot, d, lic) {
 		return false
 	}
 	var c *client
@@ -4049,7 +4049,7 @@ func (sess *mqttSession) resolveRetiredSource(c *client, key mqttDeferredKey) bo
 			}
 		}
 		// No licence: a retired register is past PUBREC, never an unsent obligation.
-		sess.reapRegisterWithVerdictGated(cur.regSeq, cur.nonce, false, slot, mqttSlotDeleteComplete, mqttDestroyLicence{})
+		sess.reapRegisterWithVerdictGated(cur.regSeq, false, slot, mqttSlotDeleteComplete, mqttDestroyLicence{})
 	}
 	c.Debugf("MQTT: retirement of QoS 2 source %s/%d for client %q resolved: the acknowledgement had landed after all",
 		key.jsDur, key.sseq, sess.id)
@@ -4477,7 +4477,7 @@ func (sess *mqttSession) voidRegistersOnStream(c *client, voided []mqttVoidedReg
 				}
 			}
 		}
-		if sess.reapRegisterWithVerdictGated(v.seq, v.nonce, true, slot, mqttSlotDeleteNeverTransmitted, lic) {
+		if sess.reapRegisterWithVerdictGated(v.seq, true, slot, mqttSlotDeleteNeverTransmitted, lic) {
 			// The register half is proven; the marker half follows (N-5.8), capture first:
 			// a never-transmitted pair's marker is present by construction, and it is
 			// deleted only if its sibling is now authoritatively absent (row 24).
@@ -6442,7 +6442,7 @@ func (sess *mqttSession) confirmInflightRegister(c *client, l mqttLandedRegister
 					dur: jsDur, sseq: sseq,
 				}
 			}
-			if deleted := sess.reapRegisterWithVerdictGated(regSeq, nonce, true, slot,
+			if deleted := sess.reapRegisterWithVerdictGated(regSeq, true, slot,
 				mqttSlotDeleteNeverTransmitted, mqttLicenceOf(c)); !deleted {
 				derr := fmt.Errorf("the landed register could not be identity- and phase-confirmed as never transmitted")
 				// The delete is what this path wants, and it could not be proven. So the fact
@@ -12070,7 +12070,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 				// Census C28: gated through the same helper. Recovery proved the source
 				// complete, which licenses dropping the RETIREMENT; the exchange's slot
 				// is a separate question and the gate is what keeps the two apart.
-				sess.reapRegisterWithVerdictGated(cur.regSeq, cur.nonce, false,
+				sess.reapRegisterWithVerdictGated(cur.regSeq, false,
 					mqttSlotRefFromRecord(mqttInflightSubject(sess.idHash, sess.gen, cur.pi), cur.regSeq,
 						&mqttInflightRecord{PI: cur.pi, Dur: fr.rec.Dur, Seq: fr.rec.Seq,
 							QoS: 2, State: fr.rec.State, Nonce: cur.nonce,
@@ -12107,7 +12107,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		// mqttSlotDeleteNeverTransmitted refuses a same-exchange rewrite and so does not
 		// reach this cleanup at all, which is correct, because a register this pass
 		// declined to delete must not have its marker reaped out from beside it.
-		if sess.reapRegisterWithVerdictGated(rd.seq, rd.nonce, false, rd.ref, rd.disp, mqttLicenceOf(c)) && rd.ref != nil {
+		if sess.reapRegisterWithVerdictGated(rd.seq, false, rd.ref, rd.disp, mqttLicenceOf(c)) && rd.ref != nil {
 			as.reapMarkerCaptureFirst(c, mqttMarkerCallerResume, rd.ref.name.subject, false)
 		}
 		// The exclusion installed for this candidate in the apply phase is lifted HERE and
@@ -12150,7 +12150,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		// Census C27: GATED, same correction as C26. Confirmation stays forced — the verdict
 		// names this register and the delete must be proven — but proof of deletion is not
 		// proof that the right record was addressed.
-		if !sess.reapRegisterWithVerdictGated(cd.seq, cd.nonce, true, cd.ref, mqttSlotDeleteComplete, mqttLicenceOf(c)) {
+		if !sess.reapRegisterWithVerdictGated(cd.seq, true, cd.ref, mqttSlotDeleteComplete, mqttLicenceOf(c)) {
 			c.Warnf("MQTT: keeping the void-register verdict for sequence %d of client %q: "+
 				"its register could not be deleted with proof", cd.seq, sess.id)
 		}

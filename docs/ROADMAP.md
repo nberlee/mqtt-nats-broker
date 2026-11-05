@@ -928,8 +928,9 @@ carried, so document order never reached them. Each is an alpha blocker.
   pre-field record and a current zero were byte-identical, and nothing read the field.
   Done 2026-11-04 ([issue #71](https://github.com/nberlee/mqtt-nats-broker/issues/71)).
 
-- [ ] Remove the `nonce` parameter that `reapRegisterGatedOutcome` never reads and
-  `reapRegisterWithVerdictGated` only forwards to it, from both and from their callers
+- [x] Removed the `nonce` parameter `reapRegisterGatedOutcome` never read, from it,
+  `reapRegisterWithVerdictGated` and their callers: the door matches on the reference and
+  deletes against its own load. Done 2026-11-05
   ([issue #172](https://github.com/nberlee/mqtt-nats-broker/issues/172)).
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)

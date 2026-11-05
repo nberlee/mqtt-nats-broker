@@ -492,7 +492,7 @@ func TestUnmarkedCancelledRegisterIsRefused(t *testing.T) {
 	}
 	ref := &mqttInflightSlotRef{name: mqttInflightName{idHash: e.sess.idHash, gen: e.sess.gen, pi: pi, subject: subject},
 		seq: smsg.Sequence, nonce: unmarked.Nonce, state: mqttInflightPublish, dur: dur, sseq: 4}
-	if out := e.sess.reapRegisterGatedOutcome(smsg.Sequence, unmarked.Nonce, true, ref, mqttSlotDeleteNeverTransmitted,
+	if out := e.sess.reapRegisterGatedOutcome(smsg.Sequence, true, ref, mqttSlotDeleteNeverTransmitted,
 		mqttLicenceOf(e.c)); out != mqttReapRefused {
 		t.Fatalf("the door must refuse an unreadable record, got %v", out)
 	}

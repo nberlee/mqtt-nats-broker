@@ -5919,7 +5919,7 @@ func TestMQTTInflightIllegalShapeWithholdsEveryDestructiveReader(t *testing.T) {
 		// Reader two: the generic gated reap, given a reference built from the record
 		// itself — the most favourable input it can get.
 		ref := mqttSlotRefFromRecord(subject, resp.Sequence, rec)
-		if e.sess.reapRegisterWithVerdictGated(resp.Sequence, nonce, true, ref, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
+		if e.sess.reapRegisterWithVerdictGated(resp.Sequence, true, ref, mqttSlotDeleteComplete, mqttTestLicence(e.sess, nil)) {
 			t.Errorf("%s: reapRegisterWithVerdictGated reported success; an illegal body is not an "+
 				"absence and not a licence to delete", sh.name)
 		}

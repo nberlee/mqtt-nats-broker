@@ -2229,7 +2229,7 @@ func (as *mqttAccountSessionManager) disposeSettledAffineRegister(name *mqttInfl
 	// reference is built from the record this sweep just read, so the gate re-proves the
 	// state at the point of the delete rather than trusting the sweep's earlier read.
 	// No licence: an affine (slot-only) register never takes the unsent-obligation ending.
-	if !sess.reapRegisterWithVerdictGated(seq, rec.Nonce, false,
+	if !sess.reapRegisterWithVerdictGated(seq, false,
 		mqttSlotRefFromRecord(name.subject, seq, rec), mqttSlotDeleteComplete, mqttDestroyLicence{}) {
 		return false
 	}

@@ -317,7 +317,7 @@ func (sess *mqttSession) continueRecoveredRetainedTerminals(c *client, rrs []mqt
 					if rr.kind == mqttRecoveredRetainedWithdrawn {
 						d = mqttSlotDeleteComplete
 					}
-					done = sess.reapRegisterWithVerdictGated(rr.seq, rr.rec.Nonce, true, ref, d, mqttDestroyLicence{})
+					done = sess.reapRegisterWithVerdictGated(rr.seq, true, ref, d, mqttDestroyLicence{})
 					if done {
 						sess.wakeRetainedReclaimForPayload(ref.name.gen, rr.rec.Payload)
 					}

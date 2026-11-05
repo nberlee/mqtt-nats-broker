@@ -2294,7 +2294,7 @@ func (sess *mqttSession) finalizeTerminalSlotObserved(c *client, ref mqttInfligh
 		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	// No licence: a terminal slot is completion evidence, never an unsent obligation.
-	if !sess.reapRegisterWithVerdictGated(smsg.Sequence, cur.Nonce, true, &ref, mqttSlotDeleteTerminal, mqttDestroyLicence{}) {
+	if !sess.reapRegisterWithVerdictGated(smsg.Sequence, true, &ref, mqttSlotDeleteTerminal, mqttDestroyLicence{}) {
 		return mqttTerminalIndeterminate, _EMPTY_
 	}
 	if retainedSlot {

@@ -1480,14 +1480,14 @@ func TestEveryDestructiveRouteEndsOrPreserves(t *testing.T) {
 		}},
 		{"reapRegisterWithVerdictGated", func(f *testWithdrawFix, cur *mqttInflightRecord, seq uint64, d mqttInflightDisposition) string {
 			ref := mqttSlotRefFromRecord(f.subject, seq, cur)
-			if f.e.sess.reapRegisterWithVerdictGated(seq, f.nonce, true, ref, d, mqttLicenceOf(f.e.c)) {
+			if f.e.sess.reapRegisterWithVerdictGated(seq, true, ref, d, mqttLicenceOf(f.e.c)) {
 				return "true"
 			}
 			return "false"
 		}},
 		{"reapRegisterGatedOutcome", func(f *testWithdrawFix, cur *mqttInflightRecord, seq uint64, d mqttInflightDisposition) string {
 			ref := mqttSlotRefFromRecord(f.subject, seq, cur)
-			return itoa(int(f.e.sess.reapRegisterGatedOutcome(seq, f.nonce, true, ref, d, mqttLicenceOf(f.e.c))))
+			return itoa(int(f.e.sess.reapRegisterGatedOutcome(seq, true, ref, d, mqttLicenceOf(f.e.c))))
 		}},
 	}
 	dispositions := []struct {

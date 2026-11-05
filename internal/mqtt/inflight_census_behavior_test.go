@@ -58,7 +58,7 @@ func TestMQTTGatedReapRefusesAnUnpermittedTransition(t *testing.T) {
 	rec, subject := testCensusSlot(mqttInflightPubRelReady)
 	sess, deleted := testCensusSessionForSlot(t, rec, subject, 91)
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
-	if sess.reapRegisterWithVerdictGated(91, rec.Nonce, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)) {
+	if sess.reapRegisterWithVerdictGated(91, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)) {
 		t.Fatal("source completion must not reap a slot that is already past PUBREC")
 	}
 	if len(*deleted) != 0 {
@@ -100,7 +100,7 @@ func TestGatedReapUsesSlotPhaseNotRetiredSourceFact(t *testing.T) {
 	// client holds is the catastrophic direction.
 	testPlantUnsentMarkers(sess.asm, map[string]string{subject: rec.Nonce})
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
-	if got := sess.reapRegisterGatedOutcome(91, rec.Nonce, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)); got != mqttReapRefused {
+	if got := sess.reapRegisterGatedOutcome(91, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)); got != mqttReapRefused {
 		t.Fatalf("a retired PUBLISH slot was released on non-transmission evidence, outcome %d: "+
 			"the client's own PUBREC backs the retirement, so the identifier may still be held", got)
 	}
@@ -134,7 +134,7 @@ func TestMQTTGatedReapDeletesOnlyThePermittedSequence(t *testing.T) {
 	ref := mqttSlotRefFromRecord(subject, 91, rec)
 	// The legacy remembered sequence is deliberately different. The loaded subject
 	// sequence is both the freshness observation and the deletion target.
-	if !sess.reapRegisterWithVerdictGated(999, rec.Nonce, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)) {
+	if !sess.reapRegisterWithVerdictGated(999, false, ref, mqttSlotDeleteComplete, mqttTestLicence(sess, nil)) {
 		t.Fatal("a matching PUBLISH-phase completion must be reapable")
 	}
 	if len(*deleted) != 1 || (*deleted)[0] != 91 {

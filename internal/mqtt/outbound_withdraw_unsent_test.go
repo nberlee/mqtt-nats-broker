@@ -209,7 +209,7 @@ func TestWithdrawAtBothDoorEntrances(t *testing.T) {
 	t.Parallel()
 	t.Run("gated", func(t *testing.T) {
 		f := testWithdrawAdmitted(t, "withdraw-door-gated", 1)
-		if !f.e.sess.reapRegisterWithVerdictGated(f.ref(t).seq, f.nonce, true, f.ref(t), mqttSlotDeleteNeverTransmitted, mqttTestLicence(f.e.sess, nil)) {
+		if !f.e.sess.reapRegisterWithVerdictGated(f.ref(t).seq, true, f.ref(t), mqttSlotDeleteNeverTransmitted, mqttTestLicence(f.e.sess, nil)) {
 			t.Fatal("the gated door refused a proven-unsent destruction")
 		}
 		f.requireWithdrawnAndGone(t)

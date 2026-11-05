@@ -298,7 +298,7 @@ func TestGatedEntranceConvertsAndFencesTheDisposal(t *testing.T) {
 	rec, fseq := testWriteFence(t, f.e, f.pi, f.dur, f.sseq+100, other)
 	ref := mqttSlotRefFromRecord(f.subject, fseq, rec)
 	stale := mqttLicenceOf(staleClient(t, f))
-	if f.e.sess.reapRegisterWithVerdictGated(fseq, other, false, ref, mqttSlotDeleteNeverTransmitted, stale) {
+	if f.e.sess.reapRegisterWithVerdictGated(fseq, false, ref, mqttSlotDeleteNeverTransmitted, stale) {
 		t.Fatal("the gated entrance must refuse a displaced licence's converted disposal")
 	}
 	if ok, seq := f.fenceStands(t); !ok || seq != fseq {
@@ -307,7 +307,7 @@ func TestGatedEntranceConvertsAndFencesTheDisposal(t *testing.T) {
 	if adv, _ := advances(); adv != 0 {
 		t.Fatalf("a displaced licence must commit no advance, %d committed", adv)
 	}
-	if !f.e.sess.reapRegisterWithVerdictGated(fseq, other, false, ref, mqttSlotDeleteNeverTransmitted, mqttLicenceOf(f.e.c)) {
+	if !f.e.sess.reapRegisterWithVerdictGated(fseq, false, ref, mqttSlotDeleteNeverTransmitted, mqttLicenceOf(f.e.c)) {
 		t.Fatal("the gated entrance must dispose of the fence for the serving licence")
 	}
 	if ok, _ := f.fenceStands(t); ok {
