@@ -1425,6 +1425,52 @@ documentation, and release artifacts. Make them before creating those surfaces.
   mechanism and limits in `docs/ARCHITECTURE.md` and `docs/CONFORMANCE.md`. Decided and
   done 2026-10-17.
 
+### Contracts in place by the first release
+
+Added 2026-11-06 at the user's request. Every interface one broker, or a later version,
+reads gets its version and its written rules before the first release: without a version
+from day one, a later release has to infer what wrote a record. Each item is an alpha
+blocker.
+
+**The alpha guarantees no version compatibility; the guarantee starts at beta.** During
+alpha a breaking change is decided case by case, weighing what compatibility would cost
+to build against how destructive the break is for an operator (a refusal with recreate
+guidance, a purge, a migration). From beta, the contracts below are kept. The migration
+machinery itself waits for the first breaking change that needs one; until a second
+format exists there is nothing to migrate. Until the first release, the compatibility
+boundary's "no compatibility" rule stands, and this policy is written into it when the
+first item below lands.
+
+- [ ] **Persisted format.** Stamp a format version into every store and refuse an unknown
+  one at startup (check whether the per-stream stamp and recovery epoch can carry it);
+  state in `docs/ARCHITECTURE.md` "Compatibility boundary" what counts as the format
+  (streams, subject layouts, record encodings, consumer naming and metadata) and the
+  change rules (additive needs no bump; a breaking change bumps the version and ships a
+  migration or a refusal with guidance, never "retain and ignore"); golden fixtures of
+  each released format, which every later release tests against for the outcome chosen
+  for it: during alpha a successful read or migration, or an explicit refusal with
+  guidance, decided per break; from beta a successful read.
+
+- [ ] **Broker-to-broker protocol.** A rolling upgrade of a multi-frontend deployment is
+  a mixed fleet on one store: version the coordination records (claims, leases, the
+  Will outbox, teardown, the reserved `$MQTT.>` subjects) and state the rule a release
+  keeps with its predecessor (coexist during an upgrade, or refuse cleanly). This
+  retires the "a mixed fleet does not exist" rule at the release it takes effect.
+
+- [ ] **NATS dependency floor.** State the supported nats-server versions and JetStream
+  API level and the required server settings, and check them at startup so an
+  unsupported server is refused with a clear message.
+
+- [ ] **Configuration surface.** Freeze the `MQTTNB_` variables, flags and defaults and
+  the Helm values schema, with a deprecation rule (a renamed setting keeps working, with
+  a warning, for one release).
+
+- [ ] **Permission contract.** Freeze the reserved `$MQTT.>` namespace and the ACLs
+  deployments are told to set, so a hardened deployment's permissions survive upgrades.
+
+- [ ] **Operational interface.** Freeze what `/healthz` and `/readyz` mean (including
+  their bodies), the exit codes, and the JSON log fields operators can alert on.
+
 ## 2. Make the MQTT core maintainable
 
 - [x] Split `internal/mqtt/mqtt.go` along stable responsibilities, move-only: `mqtt.go`

@@ -23,11 +23,16 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
   rather than migrated
   ([issue #60](https://github.com/nberlee/mqtt-nats-broker/issues/60),
   [issue #61](https://github.com/nberlee/mqtt-nats-broker/issues/61),
-  [issue #62](https://github.com/nberlee/mqtt-nats-broker/issues/62)). There are
-  no releases and no
-  pushes, so a mixed fleet is a population that does not exist; reasoning about
-  one costs review rounds and invites preserving behavior for a broker that will
-  never run.
+  [issue #62](https://github.com/nberlee/mqtt-nats-broker/issues/62)). There is
+  no release yet, so a mixed fleet is a population that does not exist; reasoning
+  about one costs review rounds and invites preserving behavior for a broker that
+  will never run. After the first release the phases in that section apply:
+  **alpha** still guarantees no version compatibility and decides each break case
+  by case (what compatibility would cost to build against how destructive the
+  break is for an operator); **beta** keeps the contracts and guarantees
+  compatibility within them. The contracts themselves (format and protocol
+  versions, the NATS floor, configuration, permissions, operational interface)
+  are in place before the first release: `docs/ROADMAP.md` §1.
 
 Any change to a mechanism updates `docs/ARCHITECTURE.md`; any behavior gap it
 leaves updates `docs/CONFORMANCE.md`. Both in the same change, not later.

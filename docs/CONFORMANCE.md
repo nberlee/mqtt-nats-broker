@@ -14,6 +14,10 @@ The rule applies throughout this document: every residual below states what a br
 running this code does, and a limit that is real is stated as the scope of the
 mechanism that enforces it, not as a property of a fleet's version mix.
 
+That holds until the first release. Alpha still promises no version compatibility and
+decides each break case by case; beta keeps the contracts and guarantees compatibility
+within them. See "Release phases" under the compatibility boundary.
+
 ## Supported-alpha boundary for shared subscriptions
 
 The alpha supports shared subscriptions through granted QoS 1. By production default, a

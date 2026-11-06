@@ -56,6 +56,17 @@ schema changes may require development streams to be recreated; designs should
 not carry migration, legacy-format, or mixed-version rolling-upgrade machinery
 unless a concrete released contract is identified first.
 
+**Release phases.** The rule above holds until the first release. **Alpha** still
+guarantees no version compatibility: each breaking change is decided case by case,
+weighing what compatibility would cost to build against how destructive the break is for
+an operator (a refusal with recreate guidance, a purge, a migration). What makes later
+compatibility possible is in place by the first release, though: versions on the
+persisted format and the broker-to-broker records, a checked NATS floor, and frozen
+configuration, permission and operational interfaces (`docs/ROADMAP.md` §1, "Contracts in
+place by the first release"). **Beta** keeps those contracts: compatibility is guaranteed
+within them from then on, and this section is rewritten as that contract when beta is
+cut.
+
 The backend support target is the **latest JetStream** represented by the
 current `nats-server/v2` dependency in `go.mod` and exercised in CI. The broker
 does not maintain alternate code paths for older JetStream APIs or semantics.
