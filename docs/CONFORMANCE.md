@@ -5942,6 +5942,9 @@ established:
   `recoverQ2AffineStorageConflict`, which is entered after a create has already failed.
   That is [issue #98](https://github.com/nberlee/mqtt-nats-broker/issues/98), and it is
   affine-only.
+  The persisted-format stamp is judged the same way: a stamp edited after a manager
+  initialized is seen at the next initialization, and only there (see "The persisted
+  format" in `docs/ARCHITECTURE.md`).
 
 - **A server-side consumer cap is invisible to this validation.** Four of the
   validators require their stream to leave `MaxConsumers` unlimited, because each of

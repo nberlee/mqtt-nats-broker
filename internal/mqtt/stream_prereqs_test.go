@@ -451,8 +451,10 @@ func (s *stubStreamAPI) createStream(_ *StreamConfig) (*StreamInfo, bool, error)
 func TestEnsureBrokerStream(t *testing.T) {
 	t.Parallel()
 	notFound := func() (*StreamInfo, error) { return nil, ApiErrors[JSStreamNotFoundErr] }
-	infoA := &StreamInfo{Config: StreamConfig{Name: "A"}}
-	infoB := &StreamInfo{Config: StreamConfig{Name: "B"}}
+	// Both carry this build's persisted format, so the format check passes and the
+	// validator is what these cases discriminate.
+	infoA := &StreamInfo{Config: StreamConfig{Name: "A", Metadata: mqttBundleMetadata(mqttGenSessEpoch())}}
+	infoB := &StreamInfo{Config: StreamConfig{Name: "B", Metadata: mqttBundleMetadata(mqttGenSessEpoch())}}
 	cfg := &StreamConfig{Name: "$MQTT_test"}
 
 	t.Run("winner validates the re-read, not the create response", func(t *testing.T) {

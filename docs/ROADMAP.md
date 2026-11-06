@@ -1438,18 +1438,14 @@ to build against how destructive the break is for an operator (a refusal with re
 guidance, a purge, a migration). From beta, the contracts below are kept. The migration
 machinery itself waits for the first breaking change that needs one; until a second
 format exists there is nothing to migrate. Until the first release, the compatibility
-boundary's "no compatibility" rule stands, and this policy is written into it when the
-first item below lands.
+boundary's "no compatibility" rule stands, and this policy is written into it as its
+"Release phases" and "The persisted format".
 
-- [ ] **Persisted format.** Stamp a format version into every store and refuse an unknown
-  one at startup (check whether the per-stream stamp and recovery epoch can carry it);
-  state in `docs/ARCHITECTURE.md` "Compatibility boundary" what counts as the format
-  (streams, subject layouts, record encodings, consumer naming and metadata) and the
-  change rules (additive needs no bump; a breaking change bumps the version and ships a
-  migration or a refusal with guidance, never "retain and ignore"); golden fixtures of
-  each released format, which every later release tests against for the outcome chosen
-  for it: during alpha a successful read or migration, or an explicit refusal with
-  guidance, decided per break; from beta a successful read.
+- [x] **Persisted format.** Every broker-owned stream carries `mqtt_nats_broker_format`
+  (format `1`) beside the recovery epoch, and a missing or other value is refused at startup
+  before the shape is judged; the format's definition, change rules and golden fixtures
+  (`internal/mqtt/testdata/storeformat/`, regenerated until format 1 freezes at the first
+  release) are in `docs/ARCHITECTURE.md` "The persisted format". Done 2026-11-06.
 
 - [ ] **Broker-to-broker protocol.** A rolling upgrade of a multi-frontend deployment is
   a mixed fleet on one store: version the coordination records (claims, leases, the

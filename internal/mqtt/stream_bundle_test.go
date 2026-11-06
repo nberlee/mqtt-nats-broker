@@ -122,7 +122,13 @@ func testBundleThenPoisonEpoch(t *testing.T, s *Server, c *client, nc *nats.Conn
 	if cfg == nil {
 		t.Fatalf("%s is not a member of the broker-owned bundle", name)
 	}
-	cfg.Metadata = meta
+	// The persisted-format stamp is kept: it is not the defect under test, and a
+	// member without it would be refused by the format check before the epoch
+	// comparison these fixtures exist to reach.
+	cfg.Metadata = map[string]string{mqttStoreFormatMetaKey: mqttStoreFormat}
+	for k, v := range meta {
+		cfg.Metadata[k] = v
+	}
 	jsRawDeleteStream(t, nc, name)
 	jsRawCreateStream(t, nc, cfg)
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
@@ -174,8 +180,10 @@ func testBundleSpecs() []brokerStreamSpec {
 	return as.brokerStreamSpecs(&Server{}, 1, mqttDefaultMaxAckPending)
 }
 
+// testPresentInfo is a member as this build creates it: stamped with the persisted
+// format, so the preflight's format check admits it and the count rule is what judges.
 func testPresentInfo(name string) *StreamInfo {
-	return &StreamInfo{Config: StreamConfig{Name: name}}
+	return &StreamInfo{Config: StreamConfig{Name: name, Metadata: mqttBundleMetadata(mqttGenSessEpoch())}}
 }
 
 // testBundleRefusalLists extracts the refusal's own "present: [...]" and

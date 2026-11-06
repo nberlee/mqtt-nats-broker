@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof soak resource-soak run docker docker-multiarch conformance wiki tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -83,6 +83,9 @@ cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v
 
 depproof: ## Dependency canary: JetStream write-contract regressions plus every mutation
 	./test/depproof/run.sh --matrix
+
+store-format-fixture: ## Regenerate the golden store of the persisted format this build writes (internal/mqtt/testdata/storeformat/<format>); never for a released format — see docs/ARCHITECTURE.md "The persisted format"
+	MQTTNB_WRITE_STORE_FORMAT_FIXTURE=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -run '^TestWriteStoreFormatFixture$$' ./internal/mqtt/
 
 bench-inbound: ## Inbound QoS 1/2 acknowledgement throughput, standalone and R3 (MQTTNB_INBOUND_ACK_BENCH_OUT=<csv> to record rows).
 	MQTTNB_INBOUND_ACK_BENCH=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -v -timeout 90m -run '^TestMQTTInboundAckThroughput$$' ./internal/mqtt/

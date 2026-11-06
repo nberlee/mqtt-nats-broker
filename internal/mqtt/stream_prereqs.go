@@ -30,6 +30,7 @@ package mqtt
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -192,6 +193,15 @@ func ensureBrokerStream(api brokerStreamAPI, cfg *StreamConfig,
 	}
 	if si == nil {
 		return nil, fmt.Errorf("stream %q not found after create", cfg.Name)
+	}
+	// The persisted format is judged BEFORE the shape. A later format may change a
+	// stream's shape, and the validator's error carries the reset guidance; for a
+	// store another format wrote, that guidance would destroy state the broker that
+	// wrote it can still read. So the format verdict, with its own guidance, comes
+	// first — and here, on the authoritative re-read, it also covers a stream a
+	// create-race winner made after the bundle preflight scanned.
+	if ferr := mqttRefuseForeignStoreFormat(&si.Config); ferr != nil {
+		return nil, ferr
 	}
 	if verr := validate(si); verr != nil {
 		return nil, verr
@@ -391,6 +401,75 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 	return nil
 }
 
+// mqttBundleMetadata is the stream metadata every broker-owned stream is created
+// with: the account's recovery epoch and the persisted format this build writes. One
+// constructor for both routes that stamp a create — the $MQTT_sess literal, which
+// mints the epoch, and the other nine's preCreate, which adopts it — so the two
+// cannot drift apart on what a member carries.
+func mqttBundleMetadata(epoch string) map[string]string {
+	return map[string]string{
+		mqttSessEpochMetaKey:   epoch,
+		mqttStoreFormatMetaKey: mqttStoreFormat,
+	}
+}
+
+// mqttRefuseForeignStoreFormat refuses a broker-owned stream that does not carry
+// the persisted format this build reads.
+//
+// Its predicate, mqttStoreFormatReadable, is applied at the two places that see a
+// member before the broker uses it: the bundle preflight, on every present member
+// before the count rule judges the vector, naming every such member at once through
+// mqttForeignStoreFormatRefusal (so a partial bundle another format wrote is named as
+// that, not waited on and then refused as partial); and here, from ensureBrokerStream,
+// on the authoritative re-read before the shape validator (so a stream made after the
+// scan is covered, and the format verdict precedes the validator's reset guidance).
+// One predicate, two observation points; neither repairs or stamps anything.
+//
+// The guidance differs by arm. A stream with no stamp was written before the format
+// existed or not by this broker, and the compatibility boundary refuses that shape
+// rather than migrating it, so the recovery is the bundle reset. A stream stamped
+// with another value was written by a broker that reads that format: deleting it
+// would destroy state that broker can still serve, so the reset is offered last and
+// named as destructive.
+func mqttRefuseForeignStoreFormat(cfg *StreamConfig) error {
+	if mqttStoreFormatReadable(cfg) {
+		return nil
+	}
+	return mqttForeignStoreFormatRefusal([]*StreamConfig{cfg})
+}
+
+// mqttStoreFormatReadable is the one predicate both observation points apply: the
+// stream carries exactly the persisted format this build reads.
+func mqttStoreFormatReadable(cfg *StreamConfig) bool {
+	return cfg.Metadata[mqttStoreFormatMetaKey] == mqttStoreFormat
+}
+
+// mqttForeignStoreFormatRefusal is the refusal for broker-owned streams not in the
+// format this build reads, naming each with the stamp it carries. Any member stamped
+// with another value makes it the other-format refusal: that store is some broker's,
+// so the reset is offered last and named as destructive.
+func mqttForeignStoreFormatRefusal(foreign []*StreamConfig) error {
+	found := make([]string, 0, len(foreign))
+	stamped := _EMPTY_
+	for _, cfg := range foreign {
+		got := cfg.Metadata[mqttStoreFormatMetaKey]
+		found = append(found, fmt.Sprintf("%s=%q", cfg.Name, got))
+		if got != _EMPTY_ && stamped == _EMPTY_ {
+			stamped = got
+		}
+	}
+	if stamped == _EMPTY_ {
+		return fmt.Errorf("broker-owned streams carry no %q metadata (%s): they were written before the persisted format was versioned, or not by this broker, and this broker reads format %q only. "+
+			"They cannot be read or converted: stop ALL brokers for this account, delete ALL the broker-owned streams (%s) and restart, "+
+			"which discards every session, retained message and in-flight QoS state (see docs/ARCHITECTURE.md \"The persisted format\")",
+			mqttStoreFormatMetaKey, strings.Join(found, ", "), mqttStoreFormat, mqttBrokerStreamBundleList)
+	}
+	return fmt.Errorf("broker-owned streams are in another persisted format (%q metadata: %s), and this broker reads format %q only. "+
+		"Run a broker release that reads format %q against this account. "+
+		"Only to discard the account's state entirely — every session, retained message and in-flight QoS state — stop ALL brokers, delete ALL the broker-owned streams (%s) and restart (see docs/ARCHITECTURE.md \"The persisted format\")",
+		mqttStoreFormatMetaKey, strings.Join(found, ", "), mqttStoreFormat, stamped, mqttBrokerStreamBundleList)
+}
+
 // mqttPreflightBrokerStreamBundle refuses an account whose broker-owned streams
 // are a PROPER SUBSET of the ten, before anything is created.
 //
@@ -522,6 +601,7 @@ const mqttBundleRescanInterval = 250 * time.Millisecond
 func mqttScanBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec, scan int, quit <-chan struct{}) (present, absent []string, err error) {
 	present = make([]string, 0, len(specs))
 	absent = make([]string, 0, len(specs))
+	var foreign []*StreamConfig
 	for _, spec := range specs {
 		select {
 		case <-quit:
@@ -534,6 +614,9 @@ func mqttScanBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamS
 		}
 		switch {
 		case si != nil:
+			if !mqttStoreFormatReadable(&si.Config) {
+				foreign = append(foreign, &si.Config)
+			}
 			present = append(present, spec.name)
 		case err == nil:
 			return nil, nil, fmt.Errorf("checking the broker-owned stream bundle: the server answered for %s "+
@@ -544,6 +627,14 @@ func mqttScanBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamS
 		default:
 			absent = append(absent, spec.name)
 		}
+	}
+	// A member in another persisted format refuses the scan outright, before the count
+	// rule judges its vector: a partial bundle another format wrote would otherwise be
+	// waited on and then refused with the partial-bundle reset, which for a store a
+	// broker of that format can still read is the destructive answer. Judged over the
+	// whole scan, so the refusal names every such member.
+	if len(foreign) > 0 {
+		return nil, nil, mqttForeignStoreFormatRefusal(foreign)
 	}
 	return present, absent, nil
 }
@@ -709,15 +800,15 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 	// same epoch from the same session-stream re-read.
 	//
 	// An unstamped config is left unstamped rather than guessed when the epoch is
-	// somehow missing, so the validator refuses the stream instead of admitting an
-	// uncomparable one. That is unreachable in the provisioning order and is
+	// somehow missing, so the stream is refused — by the format check on its re-read,
+	// ahead of the validator — instead of admitted as an uncomparable one. That is unreachable in the provisioning order and is
 	// written down as fail-closed rather than as an invariant.
 	stampEpoch := func(cfg *StreamConfig) func() {
 		return func() {
 			if as.sessStreamEpoch == _EMPTY_ {
 				return
 			}
-			cfg.Metadata = map[string]string{mqttSessEpochMetaKey: as.sessStreamEpoch}
+			cfg.Metadata = mqttBundleMetadata(as.sessStreamEpoch)
 		}
 	}
 
@@ -750,10 +841,10 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		// Required, not optional: the accept batch carries Nats-Batch-* headers,
 		// which a stream without this rejects.
 		AllowAtomicPublish: true,
-		// The account's recovery epoch, MINTED here. This is the only stream that
-		// generates one; the other nine are stamped with the value adopted from
-		// this stream's authoritative re-read.
-		Metadata: map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+		// The account's recovery epoch, MINTED here, and the persisted format. This
+		// is the only stream that generates an epoch; the other nine are stamped with
+		// the value adopted from this stream's authoritative re-read.
+		Metadata: mqttBundleMetadata(mqttGenSessEpoch()),
 	}
 	willQCfg := &StreamConfig{
 		Name:       mqttWillQStreamName,

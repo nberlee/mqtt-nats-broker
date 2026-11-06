@@ -249,6 +249,17 @@ const (
 	mqttSessEpochMetaKey    = "mqtt_sess_epoch"
 	mqttSessEpochNUIDPrefix = "nuid:"
 
+	// Reserved stream metadata key naming the persisted format every broker-owned
+	// stream was written in, and the one format this build writes and reads. The
+	// format is everything the broker writes into the ten streams and every rule a
+	// reader applies to it (docs/ARCHITECTURE.md, "The persisted format"). It is a
+	// separate fact from the recovery epoch: a reset changes the incarnation and
+	// keeps the format, and a migration would change the format and keep the
+	// incarnation. Compared by string equality, never parsed or ordered — a broker
+	// cannot know whether a format it does not implement is compatible with its own.
+	mqttStoreFormatMetaKey = "mqtt_nats_broker_format"
+	mqttStoreFormat        = "1"
+
 	// Stream name and subject for incoming MQTT QoS2 messages
 	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"
 	mqttQoS2IncomingMsgsStreamSubjectPrefix = mqttPrefix + "qos2.in."

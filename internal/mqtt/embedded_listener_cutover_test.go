@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,21 +50,27 @@ func TestEmbeddedListenerCutover(t *testing.T) {
 		t.Fatalf("the embedded listener created %v, want exactly %v", got, sortedCopy(embeddedListenerStreams))
 	}
 
-	// 2. This broker refuses the account by its bundle preflight: five of its ten names
-	//    are present. The refusal must be the preflight's, not a per-stream validator
-	//    rejecting the listener's shapes, which would also refuse but for another reason.
+	// 2. This broker refuses the account by its bundle preflight: none of the five names
+	//    present carries this broker's persisted-format stamp, so the scan refuses them as
+	//    written by something else before the count rule judges the vector. The refusal
+	//    must be the preflight's, naming all five — the provisioning loop's own format
+	//    check would stop at the first member, and a per-stream validator would refuse
+	//    the listener's shapes for another reason.
 	b, bc, _ := newBringUpServerOn(t, nc, "cutover-refused")
 	_, err := b.getOrCreateMQTTAccountSessionManager(bc)
 	if err == nil {
 		t.Fatal("the broker started on the embedded listener's streams")
 	}
-	present, absent := testBundleRefusalLists(t, err)
-	slices.Sort(present)
-	if !slices.Equal(present, sortedCopy(embeddedListenerStreams)) {
-		t.Fatalf("the refusal lists %v as present, want the embedded listener's %v: %v", present, embeddedListenerStreams, err)
+	if !strings.Contains(err.Error(), mqttStoreFormatMetaKey) {
+		t.Fatalf("the refusal is not the persisted-format refusal: %v", err)
 	}
-	if len(absent) != len(mqttBrokerStreamNames(testBundleSpecs()))-len(embeddedListenerStreams) {
-		t.Fatalf("the refusal lists %v as absent: %v", absent, err)
+	for _, name := range embeddedListenerStreams {
+		if !strings.Contains(err.Error(), fmt.Sprintf("%s=%q", name, "")) {
+			t.Fatalf("the refusal does not name the listener's %s as unstamped: %v", name, err)
+		}
+	}
+	if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
+		t.Fatalf("the refusal came from the count rule, not the format check: %v", err)
 	}
 	testStopBringUpServer(t, b)
 

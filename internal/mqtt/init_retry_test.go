@@ -325,7 +325,7 @@ func TestStartFailsAtOnceOnAPermanentInitializationError(t *testing.T) {
 				js, _ := jetstream.New(nc)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: mqttOutStreamName, Subjects: []string{"partial.bundle.>"}}); err != nil {
+				if _, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: mqttOutStreamName, Subjects: []string{"partial.bundle.>"}, Metadata: map[string]string{mqttStoreFormatMetaKey: mqttStoreFormat}}); err != nil {
 					t.Fatalf("create one broker-owned stream: %v", err)
 				}
 				s.bundleSettleBudget = 200 * time.Millisecond
@@ -551,7 +551,7 @@ func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 			t.Fatal(err)
 		}
 		js, _ := jetstream.New(nc)
-		if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{Name: mqttOutStreamName, Subjects: []string{"partial.bundle.>"}}); err != nil {
+		if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{Name: mqttOutStreamName, Subjects: []string{"partial.bundle.>"}, Metadata: map[string]string{mqttStoreFormatMetaKey: mqttStoreFormat}}); err != nil {
 			t.Fatal(err)
 		}
 		nc.Close()

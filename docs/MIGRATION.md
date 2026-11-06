@@ -36,17 +36,16 @@ creates them) or all ten, and refuses anything in between (see
 [The ten streams are one recreation unit](ARCHITECTURE.md#the-ten-streams-are-one-recreation-unit)).
 `-js-domain` does not separate them: stream names carry no domain.
 
-Started on an account the embedded listener has used, the broker rescans for 30 s
-and then stops with:
+Started on an account the embedded listener has used, the broker stops at once with:
 
 ```text
-this account holds 5 of the 10 broker-owned streams — present: [$MQTT_sess $MQTT_msgs $MQTT_qos2in $MQTT_out $MQTT_rmsgs]; absent: [$MQTT_willq $MQTT_teardown $MQTT_qos2assign $MQTT_inflight $MQTT_shared] — and no rescan over 30s saw all 10. Another broker may still be provisioning this account: ...
+broker-owned streams carry no "mqtt_nats_broker_format" metadata ($MQTT_sess="", $MQTT_msgs="", $MQTT_qos2in="", $MQTT_out="", $MQTT_rmsgs=""): they were written before the persisted format was versioned, or not by this broker, ...
 ```
 
-During a migration that message has one meaning. The five "present" streams are
-the embedded listener's, no other broker is provisioning anything, and waiting will
-not change it: delete those five (step 5 below). The rest of the message, which
-describes recovering this broker's own bundle, does not apply yet.
+During a migration that message has one meaning: the five streams it names are the
+embedded listener's, and nothing this broker wrote is in the account. Delete those five
+(step 5 below). The rest of the message, which describes resetting this broker's own
+bundle, does not apply yet.
 
 `TestEmbeddedListenerCutover` in `internal/mqtt` runs this whole sequence against a
 real nats-server: the embedded listener creating its streams, the broker's refusal,

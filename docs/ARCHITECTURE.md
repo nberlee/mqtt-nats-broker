@@ -61,7 +61,8 @@ guarantees no version compatibility: each breaking change is decided case by cas
 weighing what compatibility would cost to build against how destructive the break is for
 an operator (a refusal with recreate guidance, a purge, a migration). What makes later
 compatibility possible is in place by the first release, though: versions on the
-persisted format and the broker-to-broker records, a checked NATS floor, and frozen
+persisted format (in place: see "The persisted format" below) and the broker-to-broker
+records, a checked NATS floor, and frozen
 configuration, permission and operational interfaces (`docs/ROADMAP.md` §1, "Contracts in
 place by the first release"). **Beta** keeps those contracts: compatibility is guaranteed
 within them from then on, and this section is rewritten as that contract when beta is
@@ -104,6 +105,100 @@ stream" under the JetStream behaviors below, and [issue #97](https://github.com/
 This boundary applies only to broker persistence and its JetStream backend. MQTT
 3.1.1 and 5.0 wire-protocol compatibility remains a product requirement and is
 covered by the conformance suites.
+
+### The persisted format
+
+Every broker-owned stream carries, in its stream metadata, the **persisted format** it was
+written in: `mqtt_nats_broker_format`, beside the recovery epoch. This build writes and
+reads format `1` and nothing else (`mqttStoreFormat`, `internal/mqtt/mqtt.go`). The value
+is compared by string equality and never parsed or ordered: a broker cannot know whether a
+format it does not implement is compatible with its own, and an ordering invites a "higher
+is compatible" shortcut.
+
+**Why a key of its own, not the epoch.** The epoch says which *incarnation* of the bundle
+a stream belongs to and is compared for equality wherever a sequence is used as an
+identity. The format says which *encoding* wrote it. A reset changes the incarnation and
+keeps the format; a migration would change the format and keep the incarnation. Two facts,
+two keys, on the same carrier: both are set on the create configuration, by the
+`$MQTT_sess` literal and the other nine's stamp from one constructor
+(`mqttBundleMetadata`), and both are read from the authoritative re-read. Nothing ever
+writes stream metadata after the create, so a stream without the stamp is refused, never
+stamped.
+
+**What the format is.** Format 1 is, as a whole:
+
+- the ten stream names and the configurations the provisioning table creates (subjects,
+  retention, flags, metadata keys);
+- every subject layout written into them;
+- **every record class written on those subjects**, the outbound authority's classes on
+  `$MQTT_inflight`, the handoff outcomes, the teardown receipts and the name ownerships
+  included: its encoding (a JSON body, `Nmqtt-*` headers, a raw body), its required-member
+  rules (several decoders refuse unknown members), its enum values, and the identities it
+  derives and references;
+- consumer naming and consumer metadata: durable-name derivations and the
+  `mqtt_nats_broker_*` keys.
+
+The definition is categorical on purpose. The persisted-identity census
+(`persisted_identity_census_test.go`) is a cross-stream identity audit, not a record
+inventory, and its roots omit classes this definition covers; it is not the format's
+enumeration.
+
+**Where the refusal sits.** One predicate, `mqttRefuseForeignStoreFormat`, at the two
+places that see a member before the broker uses it:
+
+- the bundle preflight, on every present member before the count rule judges the vector,
+  so a partial bundle another format wrote is named as that at once rather than waited on
+  and then refused as partial, and every such member is named;
+- `ensureBrokerStream`, on the authoritative re-read and **before the shape validator**,
+  so a stream a create-race winner made after the scan is covered too.
+
+Before the shape, because a later format may change a stream's shape, and a shape
+validator's error carries the reset guidance. For a store another format wrote, that
+guidance would destroy state the broker that wrote it can still read. So the format
+verdict comes first, with its own guidance in two arms: a stream with **no stamp**
+(written before the format was versioned, or not by this broker — nats-server's own MQTT
+listener's streams are refused this way) is refused with the bundle reset, which is the
+compatibility boundary's answer to an unsupported shape; a stream stamped with **another
+value** is refused naming that value, telling the operator to run a release that reads it,
+with the reset offered last and named as destructive. Like every startup check, both are a
+snapshot: a stamp edited after a manager initialized is seen at the next initialization.
+
+**The change rules** take effect at the first release:
+
+- An **additive** change needs no bump, and is narrow: a field or record class is additive
+  only if a broker of the earlier format decodes it, ignores it with unchanged decisions,
+  and preserves it on every read-modify-write it performs. A decoder that refuses unknown
+  members makes a new field there a breaking change, and so does a compare-and-set rewrite
+  that drops it.
+- **Adding a required bundle member is breaking.** The preflight looks up only its own
+  table's names, so an earlier broker finding its ten members beside an eleventh would
+  admit; the format bump on the existing members is what makes it refuse. A later broker
+  meeting the earlier ten refuses through the count rule anyway.
+- A **breaking** change bumps the format and ships, per the release phases above, either a
+  migration or a refusal with guidance — never "retain and ignore", reading a store whose
+  meaning changed and skipping what the reader does not understand.
+- **Before the first release** format 1 is not frozen: a change may rewrite it in place,
+  and its golden fixture is regenerated with it. At the first release format 1 freezes,
+  and its fixture with it.
+
+**The golden fixtures.** `internal/mqtt/testdata/storeformat/<format>/` holds a
+nats-server store directory that a broker of that format's build wrote while running a
+fixed scenario, and an `outcome` file naming what every later build must do with it:
+`read` or `refuse` (during alpha a read, a migration or an explicit refusal, decided per
+break; from beta a read). `TestStoreFormatFixtures` starts a broker on a copy of each and
+holds it to the outcome. A `read` is read back through the broker, not by decoding the
+store: a persistent session's queued QoS 1 message, a retained message, an inbound QoS 2
+exchange held between PUBREC and PUBREL, an outbound QoS 2 exchange resuming at PUBREL, a
+shared-group member's restored subscription, and a discarded session's teardown watermark.
+`$MQTT_willq` and `$MQTT_qos2assign` are empty in the scenario (a delayed Will needs a
+session-expiry clock; the assignment stream is affine-only), so the fixture tests their
+configuration and stamps only. The fixture is a store directory rather than a logical dump
+because sequences are identities in this design and a replay would renumber them; that a
+later nats-server opens the floor version's store is nats-server's own contract (see
+"Trusting the backend"), and the reader reports a store nats-server cannot open apart from
+a format verdict. `make store-format-fixture` regenerates the current format's fixture,
+and its `README` records the commit, the nats-server module version, the scenario and
+every file's digest.
 
 ### Shared-subscription QoS boundary
 
@@ -747,7 +842,9 @@ provisioning table iterated by a single loop, so none can be provisioned outside
 the shape. A stream that fails its validator **fails account-manager
 initialization** with recreate guidance; nothing is repaired or updated in place,
 because a store another broker may still be serving must not be mutated under it
-(see "Compatibility boundary").
+(see "Compatibility boundary"). Before any validator, the re-read must carry the
+persisted format this build reads, or it is refused with the format's own guidance (see
+"The persisted format").
 
 Each validator's list is **derived from what that stream's owner actually does**
 — the stores, CAS writes, deletes, purges, consumers and scans in its feature
@@ -884,6 +981,11 @@ epoch sees agreement. That is the forgery case, outside what this enforcement
 claims (see "What the enforcement does not buy"), and doing it reinstates exactly
 the stale-identity hazard the epoch exists to detect.
 
+Every member also carries the persisted-format stamp beside the epoch, set by the same
+create routes and judged before the epoch and the shape. It is a separate fact, not a third
+recreation-unit mechanism: it says which encoding wrote a member, not which incarnation it
+belongs to (see "The persisted format").
+
 **What the preflight does NOT promise, because it is ten independent lookups
 rather than an atomic snapshot.** Under create-only concurrency — every other actor
 a broker running this same ordered provisioning — an admission cannot wrongfully
@@ -908,9 +1010,11 @@ running a supported administrative variation — a `Sources` topology on
 
 nats-server's own MQTT listener keeps its state in `$MQTT_sess`, `$MQTT_msgs`,
 `$MQTT_rmsgs`, `$MQTT_qos2in` and `$MQTT_out`: five of the ten names, in the same
-account. An account that listener has served therefore holds five members and is
-refused as a partial bundle; the migration procedure deletes them before the broker
-starts (`docs/MIGRATION.md`, witnessed by `TestEmbeddedListenerCutover`).
+account. An account that listener has served therefore holds five members, none carrying
+this broker's persisted-format stamp, and the preflight refuses them by that stamp before
+the count rule judges the vector (see "The persisted format"); the migration procedure
+deletes them before the broker starts (`docs/MIGRATION.md`, witnessed by
+`TestEmbeddedListenerCutover`).
 
 A tenth stream, `$MQTT_origin`, is not a member: it is retired state, refused by its
 own lookup-only preflight with delete guidance, for the same reason the bundle

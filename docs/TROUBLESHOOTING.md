@@ -47,12 +47,19 @@ the reply subjects under `$MQTT.>`.
 `replicas is 1 (want 3)`, `storage is memory (want file)` or a `max_consumers` limit. The
 streams are one unit and are not repaired in place: stop every broker for the account,
 delete all ten streams, and start again, which discards the broker state
-([Operations](OPERATIONS.md#the-ten-streams)). Two related refusals:
+([Operations](OPERATIONS.md#the-ten-streams)). Related refusals:
 
+- `broker-owned streams are in another persisted format (...)`: the streams were written
+  by a broker release that uses another format, named in the message. Run a release that
+  reads it; deleting the streams discards all the state that release can still read
+  ([The persisted format](ARCHITECTURE.md#the-persisted-format)).
+- `broker-owned streams carry no "mqtt_nats_broker_format" metadata (...)`: the streams
+  were written before the format was versioned, or by something else — nats-server's own
+  MQTT listener leaves such streams ([Migration](MIGRATION.md)). They cannot be read:
+  with every broker stopped, delete all ten.
 - `this account holds N of the 10 broker-owned streams ...`: a partial set that stayed
   partial for 30 s. If another broker is starting, wait for it and restart this one;
-  only with every broker stopped, delete all ten. Migrating from nats-server's own MQTT
-  listener leaves such a set ([Migration](MIGRATION.md)).
+  only with every broker stopped, delete all ten.
 - `this account still holds $MQTT_origin, ...`: a stream an earlier build created;
   stop every broker and delete it.
 

@@ -62,7 +62,7 @@ func jsRawStreamConfig(t *testing.T, nc *nats.Conn, name string) *StreamConfig {
 
 // testBundleThenReplace brings a manager up so the account holds a real bundle
 // under the epoch that manager adopted, then replaces the named members,
-// STAMPING each replacement with that same epoch. For a defect that is not
+// STAMPING each replacement with that same epoch and this build's persisted format. For a defect that is not
 // about the epoch: the preflight admits ten-present and the per-stream
 // validator is what refuses, which is the production shape.
 func testBundleThenReplace(t *testing.T, s *Server, c *client, nc *nats.Conn, cfgs map[string]*StreamConfig) string {
@@ -78,6 +78,7 @@ func testBundleThenReplace(t *testing.T, s *Server, c *client, nc *nats.Conn, cf
 			cfg.Metadata = map[string]string{}
 		}
 		cfg.Metadata[mqttSessEpochMetaKey] = epoch
+		cfg.Metadata[mqttStoreFormatMetaKey] = mqttStoreFormat
 		jsRawCreateStream(t, nc, cfg)
 	}
 	s.mqtt.sessmgr.sessions = make(map[string]*mqttAccountSessionManager)
@@ -326,7 +327,7 @@ func TestSessCreateRaceLoserValidatesWinnersStream(t *testing.T) {
 		Replicas:           1,
 		AllowAtomicPublish: true,
 		DenyDelete:         true, // the single deviation the loser must detect
-		Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
+		Metadata:           mqttBundleMetadata(mqttGenSessEpoch()),
 	})
 	close(release)
 
