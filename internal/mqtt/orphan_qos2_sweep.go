@@ -1618,6 +1618,13 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 	var markers []*mqttInflightMarkerCandidate
 	var pubRels []*mqttPubRelCandidate
 	records := 0
+	// Unattributable registers are counted and reported once per pass, with the first one
+	// as a sample: a store holding a retired subject shape would otherwise write one line
+	// per record on every pass.
+	unattributable := 0
+	var firstUnattributable string
+	var firstUnattributableSeq uint64
+	var firstUnattributableErr error
 	last := start
 
 	// [start, LastSeq] then [FirstSeq, start): one wrap, so a full pass covers the
@@ -1689,7 +1696,11 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			} else if name, perr := mqttParseInflightSubject(smsg.Subject); perr != nil {
 				// Retained, never swept: an unattributable subject has no provable owner,
 				// so nothing here may decide it is an orphan.
-				s.Warnf("MQTT orphaned QoS 2 sweep: retaining an unattributable in-flight register on %q at sequence %d: %v",
+				if unattributable == 0 {
+					firstUnattributable, firstUnattributableSeq, firstUnattributableErr = smsg.Subject, smsg.Sequence, perr
+				}
+				unattributable++
+				s.Debugf("MQTT orphaned QoS 2 sweep: retaining an unattributable in-flight register on %q at sequence %d: %v",
 					smsg.Subject, smsg.Sequence, perr)
 			} else {
 				// Decoded here because these bytes are already in hand. A decode failure
@@ -1726,6 +1737,10 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 	as.inflightSweepCursor = next
 	as.mu.Unlock()
 
+	if unattributable > 0 {
+		s.Warnf("MQTT orphaned QoS 2 sweep: retaining %d unattributable in-flight register(s) this pass, the first on %q at sequence %d: %v",
+			unattributable, firstUnattributable, firstUnattributableSeq, firstUnattributableErr)
+	}
 	s.Debugf("MQTT orphaned QoS 2 sweep: in-flight register scan visited %d record(s), %d candidate(s), %d unsent marker(s), %d retired PUBREL name(s)",
 		records, len(out), len(markers), len(pubRels))
 	return out, markers, pubRels, nil
