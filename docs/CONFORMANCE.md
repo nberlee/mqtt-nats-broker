@@ -6602,9 +6602,12 @@ External mode is unaffected.
 - **Identities that need a client certificate, a source CIDR or a proxy cannot
   authenticate the broker's own connections**, which are in-process and present
   neither.
-- **The JetStream wait has no overall timeout.** A cluster whose routes never connect
-  keeps the broker waiting, logging every 10 s, with HTTP not yet served; the
-  orchestrator's startupProbe is the bound.
+- **Neither the JetStream wait nor the MQTT initialization's retries has an overall
+  timeout** ([issue #177](https://github.com/nberlee/mqtt-nats-broker/issues/177)). A
+  cluster whose routes never connect, or whose assets never elect leaders, keeps the
+  broker waiting with `/healthz` answering and `/readyz` 503, logging every 10 s, until a
+  signal ends it; no probe bounds it. An error the broker misclassifies as "not answered
+  yet" waits the same way instead of exiting.
 
 ### The Helm chart: what it leaves to the operator, and what the install does not show
 
@@ -7109,6 +7112,26 @@ Each of these is a liveness cost on one identifier or one session, accepted for 
 reason as the teardown refusal above: releasing an identifier on the strength of a record
 that could not be read is a silent loss, and a refusal an operator can see is not.
 
+### Startup retries: what they do not decide
+
+Not an MQTT conformance item; the limits of `docs/ARCHITECTURE.md` "Startup retries"
+([issue #177](https://github.com/nberlee/mqtt-nats-broker/issues/177)).
+
+- **A permission denial on a publication is caught by a snapshot.** A denied request
+  times out; the initialization attempt fails, and startup ends, when the service
+  connection's last error is a permission violation newer than the attempt's baseline at
+  the attempt's end. A violation that a later error replaced before the check is missed:
+  that request keeps timing out and startup keeps retrying, while the backend's error
+  handler has logged the violation as it happened. Denied subscriptions of the manager
+  itself are checked synchronously and always end startup.
+- **A signal ends startup within one subscription flush,** not instantly: a flush in
+  progress (nats.go, up to 10 s) does not observe the cancellation.
+- **A request already waiting when `Start` succeeds can report the startup cancellation
+  once** if `Start`'s context ended at that moment; the manager's callers treat it as any
+  failed request.
+- **A failed `Start` waits for the server's whole shutdown lifecycle** before it returns,
+  with no bound of its own; the orchestrator's SIGKILL is the final one.
+
 ### Ephemeral-consumer cleanup is guaranteed per server RUN, and time-based across runs
 
 The broker's two per-account ephemeral consumers — the retained observer on
@@ -7132,14 +7155,16 @@ first statement is not usable without the rest:
    consumers that attempt CONFIRMABLY created. That rollback is best-effort, not part of
    the guarantee: its own delete can be lost and nothing retries it. Nor is a failed
    `Start` always the last attempt of its run: the listener opens first, so a CONNECT can
-   be queued on the manager mutex while the eager initialization fails.
+   be queued on the manager mutex while the eager initialization fails. Such an attempt
+   observes the startup cancellation the refusing attempt closed before it released the
+   mutex, and
    `getOrCreateMQTTAccountSessionManager` refuses to CREATE a manager once the server is
    marked not-running, which closes that path for every CONNECT that reaches it after
-   `BeginShutdown`; one that passed the check in the instant before the flag flipped can
-   still complete a SUCCESSFUL initialization, and the success path has no rollback, so
-   its two consumers wait out `InactiveThreshold`. That window is stated rather than
-   closed with a second mechanism, because its cost is exactly the five minutes
-   statement 3 already governs.
+   `BeginShutdown`; a CONNECT attempt that had already finished every request before the
+   cancellation closed completes a SUCCESSFUL initialization, and the success path has no
+   rollback, so its two consumers wait out `InactiveThreshold`. That window is stated
+   rather than closed with a second mechanism, because its cost is exactly the five
+   minutes statement 3 already governs.
 3. **`InactiveThreshold` (five minutes) still governs everything else** — a consumer
    stranded by a crash, by a replacement, by a lost rollback delete, by an ambiguous
    create that no same-run retry reconciles, or by the **normal shutdown of a

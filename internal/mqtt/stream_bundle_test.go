@@ -215,7 +215,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 
 	t.Run("zero present admits", func(t *testing.T) {
 		st := &testBundleLookupStub{}
-		if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
+		if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err != nil {
 			t.Fatalf("an empty account is initial creation and must admit: %v", err)
 		}
 	})
@@ -225,7 +225,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 		for _, n := range names {
 			st.info[n] = testPresentInfo(n)
 		}
-		if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
+		if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err != nil {
 			t.Fatalf("a complete bundle must admit: %v", err)
 		}
 	})
@@ -264,7 +264,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 					t.Fatalf("shape %s selected %d streams at k=%d: the selector must be a "+
 						"permutation of the index space", shape.label, len(st.info), k)
 				}
-				err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil)
+				err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil)
 				if err == nil {
 					t.Fatalf("a proper subset (%d of %d) must be refused", len(st.info), len(names))
 				}
@@ -292,7 +292,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 	for _, n := range names {
 		t.Run("only "+n+" refuses", func(t *testing.T) {
 			st := &testBundleLookupStub{info: map[string]*StreamInfo{n: testPresentInfo(n)}}
-			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err == nil {
+			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err == nil {
 				t.Fatalf("an account holding only %s must be refused", n)
 			}
 		})
@@ -303,7 +303,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 					st.info[m] = testPresentInfo(m)
 				}
 			}
-			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err == nil {
+			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err == nil {
 				t.Fatalf("an account missing only %s must be refused", n)
 			}
 		})
@@ -345,7 +345,7 @@ func TestBrokerStreamBundlePreflightUndecidedFailsClosed(t *testing.T) {
 				}
 				delete(st.info, n)
 				arm.poison(st, n)
-				err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil)
+				err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil)
 				if err == nil {
 					t.Fatalf("an undecided lookup for %s must fail startup, never read as absent", n)
 				}
@@ -382,7 +382,7 @@ func TestBrokerStreamBundlePreflightPresentWinsOverError(t *testing.T) {
 				st.info[n] = testPresentInfo(n)
 				st.err[n] = tc.err
 			}
-			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
+			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err != nil {
 				t.Fatalf("ten present-with-%s must admit: %v", tc.label, err)
 			}
 		})
@@ -394,7 +394,7 @@ func TestBrokerStreamBundlePreflightUsesTheSpecTable(t *testing.T) {
 	t.Parallel()
 	specs := testBundleSpecs()
 	st := &testBundleLookupStub{}
-	if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil); err != nil {
+	if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err != nil {
 		t.Fatalf("empty account: %v", err)
 	}
 	want := mqttBrokerStreamNames(specs)
@@ -602,7 +602,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{
 			testVector(names, func(i int) bool { return i != 0 }), all,
 		}}
-		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil); err != nil {
+		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil, nil); err != nil {
 			t.Fatalf("a rescan saw all ten and must admit: %v", err)
 		}
 		if st.scan < 1 {
@@ -620,7 +620,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 			quit := make(chan struct{})
 			done := make(chan error, 1)
 			start := time.Now()
-			go func() { done <- mqttPreflightBrokerStreamBundle(st, specs, budget, quit) }()
+			go func() { done <- mqttPreflightBrokerStreamBundle(st, specs, budget, quit, nil) }()
 			var err error
 			select {
 			case err = <-done:
@@ -650,7 +650,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 			testVector(names, func(i int) bool { return i < half }),
 			testVector(names, func(i int) bool { return i >= half }),
 		}}
-		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil); err == nil {
+		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil, nil); err == nil {
 			t.Fatal("each scan saw only part of the bundle; accumulating them admitted a vector that never existed")
 		}
 	})
@@ -660,7 +660,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 			testVector(names, func(i int) bool { return i < 3 }), none,
 		}}
 		start := time.Now()
-		err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil)
+		err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "only a deletion produces") {
 			t.Fatalf("partial then zero = %v, want the deletion refusal", err)
 		}
@@ -672,7 +672,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 	t.Run("an undecided lookup on a rescan fails closed", func(t *testing.T) {
 		st := &testScriptedBundleStub{first: names[0], errFrom: 1, err: map[string]error{names[3]: errors.New("lookup outage")},
 			vectors: []map[string]bool{testVector(names, func(i int) bool { return i < 3 })}}
-		err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil)
+		err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil, nil)
 		if err == nil || !strings.Contains(err.Error(), "lookup outage") {
 			t.Fatalf("an outage on a rescan = %v, want the undecided failure", err)
 		}
@@ -683,7 +683,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 		st := &testScriptedBundleStub{first: names[0], vectors: []map[string]bool{all}}
 		var looked []string
 		stop := &testStoppingLookup{inner: st, stopAfter: names[2], quit: quit, looked: &looked}
-		err := mqttPreflightBrokerStreamBundle(stop, specs, time.Minute, quit)
+		err := mqttPreflightBrokerStreamBundle(stop, specs, time.Minute, quit, nil)
 		if err == nil || !strings.Contains(err.Error(), "stopped while waiting") {
 			t.Fatalf("a stop during the scan = %v, want the stopped error", err)
 		}
@@ -699,7 +699,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 		quit := make(chan struct{})
 		time.AfterFunc(100*time.Millisecond, func() { close(quit) })
 		start := time.Now()
-		err := mqttPreflightBrokerStreamBundle(st, specs, time.Minute, quit)
+		err := mqttPreflightBrokerStreamBundle(st, specs, time.Minute, quit, nil)
 		if err == nil || !strings.Contains(err.Error(), "stopped while waiting") {
 			t.Fatalf("stopping = %v, want the stopped error", err)
 		}

@@ -134,8 +134,9 @@ ports:
 - name: health
   containerPort: 8080
 {{- if $embedded }}
-# The JetStream wait runs before HTTP is served and has no timeout of its own: this
-# bounds it at ten minutes.
+# The health port is bound before the embedded server starts, so this bounds only the
+# bootstrap before it binds; store recovery, the JetStream wait and the MQTT
+# initialization's retries come after, with /healthz answering (issue #177).
 startupProbe:
   httpGet:
     path: /healthz

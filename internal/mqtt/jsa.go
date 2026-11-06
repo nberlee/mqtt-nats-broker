@@ -76,6 +76,11 @@ type mqttJSACore struct {
 	domain  string
 	timeout time.Duration
 
+	// startupAbandon is Start's startup cancellation while this assistant belongs to an
+	// initialization attempt inside Start's retry window; nil otherwise. Every reply wait
+	// observes it beside quitCh. See init_retry.go.
+	startupAbandon atomic.Pointer[chan struct{}]
+
 	// subsBarrier lets QoS 1/2 message stores wait out any SUBSCRIBE that is
 	// still being processed in this account. See mqttSubsBarrier.
 	subsBarrier mqttSubsBarrier
@@ -308,6 +313,7 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 	start := time.Now()
 	t := time.NewTimer(wait)
 	defer t.Stop()
+	abandon := jsa.startupAbandonCh()
 	for {
 		select {
 		case r := <-responseCh:
@@ -321,6 +327,12 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 		case <-jsa.quitCh:
 			return nil, ErrServerNotRunning
 
+		case <-abandon:
+			for reply := range r2i {
+				jsa.replies.Delete(reply)
+			}
+			return responses, errMQTTStartupCancelled
+
 		case <-t.C:
 			var reply string
 			now := time.Now()
@@ -333,9 +345,9 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 				first = subjects[0]
 			}
 			if len(msgs) == 1 {
-				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply))
+				return responses, jsa.requestTimeout(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)", now.Sub(start), kind, first, reply))
 			} else {
-				return responses, jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs)))
+				return responses, jsa.requestTimeout(fmt.Errorf("timeout after %v: request type %q on %q: got %d out of %d", now.Sub(start), kind, first, c, len(msgs)))
 			}
 		}
 	}
@@ -415,9 +427,12 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind string, msgs []mqttBatchMsg) (any
 	case <-jsa.quitCh:
 		jsa.replies.Delete(reply)
 		return nil, ErrServerNotRunning
+	case <-jsa.startupAbandonCh():
+		jsa.replies.Delete(reply)
+		return nil, errMQTTStartupCancelled
 	case <-t.C:
 		jsa.replies.Delete(reply)
-		return nil, jsa.timeoutError(fmt.Errorf("timeout after %v: atomic batch request type %q on %q (reply=%q)",
+		return nil, jsa.requestTimeout(fmt.Errorf("timeout after %v: atomic batch request type %q on %q (reply=%q)",
 			time.Since(start), kind, msgs[len(msgs)-1].subj, reply))
 	}
 }
@@ -1097,9 +1112,12 @@ func (p *mqttPendingStore) await() (*JSPubAckResponse, error) {
 	case <-jsa.quitCh:
 		jsa.replies.Delete(p.reply)
 		return jsa.storeMsgResult(p.subject, nil, ErrServerNotRunning)
+	case <-jsa.startupAbandonCh():
+		jsa.replies.Delete(p.reply)
+		return jsa.storeMsgResult(p.subject, nil, errMQTTStartupCancelled)
 	case <-t.C:
 		jsa.replies.Delete(p.reply)
-		err := jsa.timeoutError(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)",
+		err := jsa.requestTimeout(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)",
 			time.Since(p.start), mqttJSAMsgStore, p.subject, p.reply))
 		return jsa.storeMsgResult(p.subject, nil, err)
 	}
@@ -1398,7 +1416,10 @@ func mqttJSARequestHeader(accName string) []byte {
 // enqueued. nil in production.
 var mqttTestJSSendPublishHookV atomic.Pointer[func(subject string)]
 
-func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, accName string, closeCh chan struct{}) {
+// done is closed when the loop has returned, so a failed initialization attempt can wait
+// until nothing it queued can still be published (init_retry.go).
+func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, accName string, closeCh chan struct{}, done chan struct{}) {
+	defer close(done)
 	as.mu.RLock()
 	sendq := as.jsa.sendq
 	quitCh := as.jsa.quitCh
@@ -1484,6 +1505,13 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 				// The JSA send loop, not an application publication: there is no
 				// MQTT publish to retain, and the retained update is never made here.
 				c.processInboundClientMsg(msg)
+				// A request the connection definitely refused to publish never reached
+				// JetStream and never will. Inside Start's window that ends startup
+				// directly, whether or not its waiter is still waiting. See init_retry.go.
+				refused := c.takePublishRefusal()
+				if refused != nil && mqttDefiniteLocalRefusal(refused) && jsa.startupAbandonCh() != nil {
+					s.failStartup(fmt.Errorf("the NATS service connection refused to publish %q: %w", r.subj, refused))
+				}
 				c.flushClients(0)
 			}
 			sendq.recycle(&pmis)

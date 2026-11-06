@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -674,7 +675,7 @@ func TestARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 	c.Close()
 	s.Shutdown()
 	s = testMQTTRestartServerSameStore(t, s, o)
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("restarting the broker: %v", err)
 	}
 	defer testMQTTShutdownServer(s)

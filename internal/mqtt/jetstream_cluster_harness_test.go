@@ -17,6 +17,7 @@
 package mqtt
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -431,7 +432,7 @@ func (c *testJetStreamCluster) startBroker(t *testing.T, preferred int, tweaks .
 	}
 
 	s := NewServer(nc, opts, node)
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		nc.Close()
 		t.Fatalf("broker start: %v", err)
 	}

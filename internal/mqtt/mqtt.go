@@ -540,6 +540,9 @@ type srvMQTT struct {
 	// across initialization attempts and resets, so no two of them ever share a deliver
 	// subject or a sid. See retained_index.go.
 	rmObsGen atomic.Uint64
+	// startup is Start's retry window: the startup cancellation every initialization
+	// attempt inside it observes. See init_retry.go.
+	startup mqttStartupWindow
 }
 
 type mqtt struct {

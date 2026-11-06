@@ -628,7 +628,7 @@ func authzBrokerWithOpts(t *testing.T, conf string, o *Options) (ns *natsserver.
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(url, nats.UserInfo(user, pass))
 	})
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)

@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -25,7 +26,7 @@ func startConnectDeadlineBroker(t *testing.T, tune func(*Options)) (*Server, str
 		tune(opts)
 	}
 	s := NewServer(nc, opts, "connect-deadline-node")
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)

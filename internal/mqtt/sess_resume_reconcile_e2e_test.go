@@ -3,6 +3,7 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,7 +148,7 @@ func testReconcileRestart(t *testing.T, s *Server, o *Options) *Server {
 	t.Helper()
 	s.Shutdown()
 	s = testMQTTRestartServerSameStore(t, s, o)
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("restart the broker: %v", err)
 	}
 	return s

@@ -28,6 +28,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -448,10 +449,17 @@ func validateBundleEpochStamp(cfg *StreamConfig, wantEpoch string) error {
 // peer slower than the budget) is refused, and a scan that sees ZERO after a partial
 // one is refused at once: presence only grows under creation, so streams that vanished
 // were deleted while this broker was starting.
-func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec, budget time.Duration, quit <-chan struct{}) error {
+//
+// abandon is Start's startup cancellation (init_retry.go), nil outside it: like quit it
+// ends the wait, but with errMQTTStartupCancelled, which a caller reads as "startup ended",
+// not as a verdict on the bundle.
+func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec, budget time.Duration, quit <-chan struct{}, abandon <-chan struct{}) error {
 	deadline := time.Now().Add(budget)
 	sawPartial := false
 	for scan := 0; ; scan++ {
+		if mqttAbandoned(abandon) {
+			return errMQTTStartupCancelled
+		}
 		present, absent, err := mqttScanBrokerStreamBundle(jsa, specs, scan, quit)
 		if err != nil {
 			return err
@@ -482,6 +490,9 @@ func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerSt
 		case <-quit:
 			t.Stop()
 			return mqttBundleStopped(present, absent)
+		case <-abandon:
+			t.Stop()
+			return errMQTTStartupCancelled
 		case <-t.C:
 		}
 		if time.Until(deadline) <= 0 {
@@ -1072,7 +1083,9 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 // nothing else. See mqttEphemeralCreated for why an errored create licenses nothing.
 //
 // See sess_record_watch.go for what the watch is and why the broker needs one.
-func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner string, created mqttEphemeralCreated) error {
+//
+// abandon is Start's startup cancellation, nil outside Start's retry window.
+func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner string, created mqttEphemeralCreated, abandon <-chan struct{}) error {
 	// The retained observer first, the watch second — the order the $MQTT_rmsgs
 	// post step and this function had between them before the move.
 	//
@@ -1102,9 +1115,22 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 	if rmconfirmed {
 		created.confirm(mqttEphemeralRetainedObserver)
 	}
+	if rmerr != nil && IsNatsErr(jsAPIError(rmerr), JSConsumerAlreadyExists) {
+		// A different config under OUR derived name: either another run's consumer, or an
+		// earlier attempt of THIS run whose CREATE was accepted and applied after the
+		// definite delete above (its response was what timed out). Only the owner nonce
+		// tells them apart; see mqttResolveObserverOccupant.
+		if oerr := as.mqttResolveObserverOccupant(mqttRetainedMsgsStreamName, rmname, ephemeralOwner, abandon); oerr != nil {
+			rmerr = fmt.Errorf("%w (%w)", oerr, rmerr)
+		}
+	}
 	if rmerr != nil {
 		as.rollbackEphemeralConsumers(created)
-		return fmt.Errorf("create retained messages consumer for account %q: %v", accName, rmerr)
+		return fmt.Errorf("create retained messages consumer for account %q: %w", accName, rmerr)
+	}
+	if mqttAbandoned(abandon) {
+		as.rollbackEphemeralConsumers(created)
+		return fmt.Errorf("create session-record watch consumer for account %q: %w", accName, errMQTTStartupCancelled)
 	}
 	if sm := as.retainedSeams(); sm != nil && sm.testRetainedInitHook != nil {
 		sm.testRetainedInitHook(as)
@@ -1134,9 +1160,62 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 		// attempt of this run (which adopts it, being config-identical) or to
 		// InactiveThreshold.
 		as.rollbackEphemeralConsumers(created)
-		return fmt.Errorf("create session-record watch consumer for account %q: %v", accName, err)
+		return fmt.Errorf("create session-record watch consumer for account %q: %w", accName, err)
 	}
 	return nil
+}
+
+// mqttTestObserverOccupantLookupHookV replaces the result of the occupant lookup
+// mqttResolveObserverOccupant makes. nil in production.
+var mqttTestObserverOccupantLookupHookV atomic.Pointer[func(ci *ConsumerInfo, err error) (*ConsumerInfo, error)]
+
+// mqttResolveObserverOccupant decides what holds the retained observer's derived name
+// after a CREATE was refused as JSConsumerAlreadyExists. It returns
+// errMQTTOwnEphemeralStray when the occupant carries THIS run's owner nonce — an earlier
+// attempt's consumer, which the next attempt's definite delete removes —
+// errMQTTObserverOccupantGone when nothing holds the name any more, and nil when the
+// occupant is positively someone else's or cannot be decided, so the caller keeps the
+// refusal.
+//
+// The info read is a positive observation of a present record, not an absence; it adopts
+// nothing, and the delete that follows stays unconditional by stream and name, exactly as
+// ephemeral_identity.go states. A lookup that JetStream did not answer yet (the meta leader
+// can refuse the CREATE on an in-flight assignment before consumer info answers) is
+// retried here, inside Start's window, WITHOUT another delete in between, until it
+// answers; each round applies Start's permission policy, so a denied CONSUMER.INFO ends
+// startup instead of looping. Outside the window it is read once.
+func (as *mqttAccountSessionManager) mqttResolveObserverOccupant(stream, name, owner string, abandon <-chan struct{}) error {
+	wait := mqttStartupBackoffInitial
+	for {
+		ci, err := as.jsa.lookupConsumer(stream, name)
+		if h := mqttTestObserverOccupantLookupHookV.Load(); h != nil {
+			ci, err = (*h)(ci, err)
+		}
+		switch {
+		case err == nil && ci != nil:
+			if ci.Config != nil && ci.Config.Metadata[mqttEphemeralRunKey] == owner {
+				return errMQTTOwnEphemeralStray
+			}
+			return nil
+		case err != nil && IsNatsErr(jsAPIError(err), JSConsumerNotFoundErr):
+			return errMQTTObserverOccupantGone
+		case err != nil && errors.Is(err, errMQTTStartupCancelled):
+			return err
+		case err == nil || abandon == nil || !mqttStartupRetryable(err):
+			return nil
+		}
+		if perr := as.startupPermissionViolation(); perr != nil {
+			return perr
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-abandon:
+			t.Stop()
+			return errMQTTStartupCancelled
+		case <-t.C:
+		}
+		wait = min(wait*2, mqttStartupBackoffMax)
+	}
 }
 
 // rollbackEphemeralConsumers removes the per-broker ephemeral consumers this FAILED

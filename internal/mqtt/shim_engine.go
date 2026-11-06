@@ -784,6 +784,11 @@ type client struct {
 	// ownNRC is true when nrc is a per-client connection this client owns and
 	// must close on disconnect (as opposed to the shared service connection).
 	ownNRC bool
+	// publishRefusal is the error nrc returned for the last message processInboundClientMsg
+	// published, or nil. Only the JSA send loop reads it (takePublishRefusal), on its own
+	// goroutine, right after each publish; that loop is this field's only writer too, for
+	// the account's internal client. A connection's own publishes leave it unread.
+	publishRefusal error
 
 	wmu sync.Mutex // serializes writes to nc from parse + delivery goroutines
 	// connectTimer is the CONNECT deadline (connect_deadline.go), and
@@ -1887,9 +1892,17 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	}
 	if err := c.nrc.PublishMsg(m); err != nil {
 		c.Errorf("nats publish to %q failed: %v", m.Subject, err)
+		c.publishRefusal = err
 		return false, false
 	}
 	return true, false
+}
+
+// takePublishRefusal returns and clears the error the last publish returned.
+func (c *client) takePublishRefusal() error {
+	err := c.publishRefusal
+	c.publishRefusal = nil
+	return err
 }
 
 // mqttTestFanOutFailV makes mqttFanOut report a failed live send for an MQTT publisher on

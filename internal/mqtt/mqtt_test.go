@@ -18,6 +18,7 @@ package mqtt
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -651,7 +652,7 @@ func testMQTTRunServer(t testing.TB, o *Options) *Server {
 		t.Fatalf("Error connecting to embedded nats-server: %v", err)
 	}
 	s := NewServer(nc, o, testServerName(o))
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		nc.Close()
 		t.Fatalf("Error starting MQTT server: %v", err)
 	}
@@ -701,7 +702,7 @@ func TestMQTTStart(t *testing.T) {
 	defer s2.Shutdown()
 	l := &captureFatalLogger{fatalCh: make(chan string, 1)}
 	s2.SetLogger(l, false, false)
-	_ = s2.Start() // the listen failure is reported through the fatal logger, which is what this test reads
+	_ = s2.Start(context.Background()) // the listen failure is reported through the fatal logger, which is what this test reads
 
 	select {
 	case e := <-l.fatalCh:
@@ -3761,7 +3762,7 @@ func TestMQTTRestoreRetainedMsgs(t *testing.T) {
 	s = testMQTTRestartServerSameStore(t, s, o)
 	l := &captureWarnLogger{warn: make(chan string, 10)}
 	s.SetLogger(l, false, false)
-	require_NoError(t, s.Start())
+	require_NoError(t, s.Start(context.Background()))
 	defer testMQTTShutdownServer(s)
 
 	time.Sleep(500 * time.Millisecond)

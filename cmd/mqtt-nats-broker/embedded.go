@@ -6,12 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 )
+
+// embeddedStartHookV runs just before the embedded server starts, so a test can hold the
+// window nats-server spends recovering its store (inside Start, before it accepts
+// connections). nil in production.
+var embeddedStartHookV atomic.Pointer[func()]
 
 // startEmbeddedNATS loads the operator's nats-server configuration, enforces the
 // broker's server prerequisites on it, starts the server and waits until it accepts
@@ -33,6 +39,9 @@ func startEmbeddedNATS(ctx context.Context, cfg *config.Config, log *slog.Logger
 		return nil, fmt.Errorf("embedded NATS server: %w", err)
 	}
 	srv.SetLoggerV2(natsLogger{log.With("component", "nats-server")}, opts.Debug, opts.Trace, false)
+	if h := embeddedStartHookV.Load(); h != nil {
+		(*h)()
+	}
 	go srv.Start()
 	for !srv.ReadyForConnections(250 * time.Millisecond) {
 		if ctx.Err() != nil {

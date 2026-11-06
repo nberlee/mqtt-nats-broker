@@ -3,6 +3,7 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -110,7 +111,7 @@ func jsPathStandalone(t *testing.T) *jsPathRig {
 		defer jsPathWaitStarted(t, mark)
 		r.s.Shutdown()
 		r.s = testMQTTRestartServerSameStore(t, r.s, o)
-		if err := r.s.Start(); err != nil {
+		if err := r.s.Start(context.Background()); err != nil {
 			t.Fatalf("restart: %v", err)
 		}
 		r.port = o.MQTT.Port

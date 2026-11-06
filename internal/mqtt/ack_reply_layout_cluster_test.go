@@ -120,7 +120,7 @@ func (c *testJetStreamCluster) startAckLayoutBroker(t *testing.T, preferred int,
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(urls, nats.UserInfo(user, pass), nats.DontRandomize())
 	})
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		nc.Close()
 		t.Fatalf("broker start: %v", err)
 	}

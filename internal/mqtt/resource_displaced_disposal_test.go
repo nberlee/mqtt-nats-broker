@@ -23,6 +23,7 @@ package mqtt
 // (the witness https://github.com/nberlee/mqtt-nats-broker/issues/138 records).
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -73,7 +74,7 @@ func startPassthroughBroker(t *testing.T, url, node string) *passthroughBroker {
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(url, nats.UserInfo(user, pass))
 	})
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		nc.Close()
 		t.Fatalf("start %s: %v", node, err)
 	}

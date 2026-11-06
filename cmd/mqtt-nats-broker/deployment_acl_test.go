@@ -223,7 +223,7 @@ func TestRecommendedACLKeepsMQTTClientsOffTheJetStreamAPI(t *testing.T) {
 	t.Cleanup(be.Close)
 	addr := reservedAddr(t)
 	cfg.MQTTHost, cfg.MQTTPort = "127.0.0.1", mustPort(t, addr)
-	ms, err := serveMQTT(cfg, be, mqttOptions(cfg, nil), log)
+	ms, err := serveMQTT(context.Background(), cfg, be, mqttOptions(cfg, nil), log)
 	if err != nil {
 		t.Fatalf("serveMQTT: %v", err)
 	}

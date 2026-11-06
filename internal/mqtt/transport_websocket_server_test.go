@@ -30,7 +30,7 @@ func startWSBroker(t *testing.T, mod func(*Options)) (string, string, *Server) {
 		mod(opts)
 	}
 	s := NewServer(nc, opts, "ws-node")
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)
@@ -842,7 +842,7 @@ func TestWSListenerStartup(t *testing.T) {
 	_, nc := runNATS(t)
 	s := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: mqttPort,
 		Websocket: WebsocketOpts{Host: "127.0.0.1", Port: occupied.Addr().(*net.TCPAddr).Port}}}, "ws-startup")
-	if err := s.Start(); err == nil {
+	if err := s.Start(context.Background()); err == nil {
 		s.Shutdown()
 		t.Fatal("Start succeeded with the WebSocket port taken")
 	}

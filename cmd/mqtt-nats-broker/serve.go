@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -87,7 +88,10 @@ func mqttOptions(cfg *config.Config, tlsSrc *tlsreload.Source) *mqtt.Options {
 // (whose BeginShutdown/ShutdownContext expose completion so the caller can wait
 // for the full drain before tearing down dependencies) or an error if the
 // listener failed to start. On error nothing is left running.
-func serveMQTT(cfg *config.Config, be *backend.Backend, opts *mqtt.Options, log *slog.Logger) (*mqtt.Server, error) {
+//
+// ctx ends startup: Start retries its initialization while JetStream is not answering yet,
+// until it succeeds, meets a refusal, or ctx ends.
+func serveMQTT(ctx context.Context, cfg *config.Config, be *backend.Backend, opts *mqtt.Options, log *slog.Logger) (*mqtt.Server, error) {
 	nodeName, _ := os.Hostname()
 	if nodeName == "" {
 		nodeName = cfg.NATSName
@@ -100,8 +104,10 @@ func serveMQTT(cfg *config.Config, be *backend.Backend, opts *mqtt.Options, log 
 	if cfg.AuthPassthrough {
 		s.SetClientDialer(be.DialClient)
 	}
-	if err := s.Start(); err != nil {
-		// Tear the half-started server down so it leaks nothing on the error path.
+	if err := s.Start(ctx); err != nil {
+		// Start has completed the server's shutdown lifecycle on its error path; this
+		// Shutdown is a no-op for it and only covers a Start that failed before
+		// beginning one.
 		s.Shutdown()
 		return nil, fmt.Errorf("start MQTT listener: %w", err)
 	}

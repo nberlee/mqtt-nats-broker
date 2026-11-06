@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func startBroker(t *testing.T) (string, *Server) {
 	_, nc := runNATS(t)
 	opts := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}
 	s := NewServer(nc, opts, "e2e-node")
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)

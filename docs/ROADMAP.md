@@ -933,6 +933,14 @@ carried, so document order never reached them. Each is an alpha blocker.
   deletes against its own load. Done 2026-11-05
   ([issue #172](https://github.com/nberlee/mqtt-nats-broker/issues/172)).
 
+Added 2026-11-05 at the user's request: an embedded rolling upgrade that does not
+converge. An alpha blocker: the embedded StatefulSet is a supported deployment.
+
+- [x] MQTT initialization retries availability failures within the server run, without a
+  budget (decided against), and `/healthz` is bound before the embedded server starts, so
+  neither an unanswered request nor a probe cuts recovery short. Done 2026-11-05
+  ([issue #177](https://github.com/nberlee/mqtt-nats-broker/issues/177)).
+
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription

@@ -4,6 +4,7 @@
 package mqtt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -31,7 +32,7 @@ func testInflightRestart(t *testing.T, s *Server, o *Options) *Server {
 	t.Helper()
 	s.Shutdown()
 	s = testMQTTRestartServerSameStore(t, s, o)
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("restart the broker: %v", err)
 	}
 	return s

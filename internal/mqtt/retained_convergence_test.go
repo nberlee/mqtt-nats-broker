@@ -93,7 +93,7 @@ func retainedBrokerGated(t *testing.T, url, node string, gate func(subject strin
 	lc := &logCapture{}
 	s.log.Store(slog.New(lc))
 	s.mqtt.sessmgr.testRetainedApplyGate = gate
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker %s: %v", node, err)
 	}
 	t.Cleanup(s.Shutdown)

@@ -53,7 +53,7 @@ func startDenyReservedBroker(t *testing.T) (broker, natsURL string) {
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(natsURL, nats.UserInfo(user, pass))
 	})
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)

@@ -408,12 +408,13 @@ func chartShutdownBudget() time.Duration {
 }
 
 // checkStartupProbe requires the embedded topology's startupProbe on a path the health
-// handler serves, bounding the JetStream wait, and no startupProbe otherwise.
+// handler serves, and no startupProbe otherwise. Since the health port is bound before the
+// embedded server starts it bounds only that bootstrap, not the JetStream wait (issue #177).
 func checkStartupProbe(t *testing.T, c map[string]any, embedded bool) {
 	t.Helper()
 	sp, has := c["startupProbe"]
 	if has != embedded {
-		t.Fatalf("startupProbe present=%v, want %v: only the embedded topology waits for JetStream before serving HTTP", has, embedded)
+		t.Fatalf("startupProbe present=%v, want %v: only the embedded topology runs a server in-process", has, embedded)
 	}
 	if !has {
 		return
@@ -426,7 +427,7 @@ func checkStartupProbe(t *testing.T, c map[string]any, embedded bool) {
 	period, _ := mustField(t, sp, "periodSeconds").(int)
 	failures, _ := mustField(t, sp, "failureThreshold").(int)
 	if period*failures < 60 {
-		t.Errorf("startupProbe allows %d s; a clustered cold start needs its quorum to form", period*failures)
+		t.Errorf("startupProbe allows %d s; the bootstrap before the health port binds needs at least a minute on a slow node", period*failures)
 	}
 }
 

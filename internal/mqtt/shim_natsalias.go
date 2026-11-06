@@ -44,38 +44,45 @@ const (
 	// ActionCreate makes a named consumer create REFUSE an existing consumer whose
 	// config differs, instead of adopting it at its current position as the zero
 	// value (create-or-update) does. See ephemeral_identity.go.
-	ActionCreate              = server.ActionCreate
-	AckExplicit               = server.AckExplicit
-	AckNone                   = server.AckNone
-	AsyncPersistMode          = server.AsyncPersistMode
-	ClientClosed              = server.ClientClosed
-	ClientInfoHdr             = server.ClientInfoHdr
-	CR_LF                     = server.CR_LF
-	MAX_CONTROL_LINE_SIZE     = server.MAX_CONTROL_LINE_SIZE
-	DefaultPersistMode        = server.DefaultPersistMode
-	DeliverNew                = server.DeliverNew
-	DiscardNew                = server.DiscardNew
-	DiscardOld                = server.DiscardOld
-	DuplicateClientID         = server.DuplicateClientID
-	FileStorage               = server.FileStorage
-	InterestPolicy            = server.InterestPolicy
-	JETSTREAM                 = server.JETSTREAM
-	JSApiConsumerCreateT      = server.JSApiConsumerCreateT
-	JSApiConsumerDeleteT      = server.JSApiConsumerDeleteT
-	JSApiConsumerInfoT        = server.JSApiConsumerInfoT
-	JSApiConsumerListT        = server.JSApiConsumerListT
-	JSApiDurableCreateT       = server.JSApiDurableCreateT
-	JSApiMsgDeleteT           = server.JSApiMsgDeleteT
-	JSApiMsgGetT              = server.JSApiMsgGetT
-	JSApiPrefix               = server.JSApiPrefix
-	JSApiStreamCreateT        = server.JSApiStreamCreateT
-	JSApiStreamInfoT          = server.JSApiStreamInfoT
-	JSApiStreamPurgeT         = server.JSApiStreamPurgeT
-	JSBatchCommit             = server.JSBatchCommit
-	JSBatchId                 = server.JSBatchId
-	JSBatchSeq                = server.JSBatchSeq
-	JSConsumerCreateErrF      = server.JSConsumerCreateErrF
-	JSConsumerNotFoundErr     = server.JSConsumerNotFoundErr
+	ActionCreate          = server.ActionCreate
+	AckExplicit           = server.AckExplicit
+	AckNone               = server.AckNone
+	AsyncPersistMode      = server.AsyncPersistMode
+	ClientClosed          = server.ClientClosed
+	ClientInfoHdr         = server.ClientInfoHdr
+	CR_LF                 = server.CR_LF
+	MAX_CONTROL_LINE_SIZE = server.MAX_CONTROL_LINE_SIZE
+	DefaultPersistMode    = server.DefaultPersistMode
+	DeliverNew            = server.DeliverNew
+	DiscardNew            = server.DiscardNew
+	DiscardOld            = server.DiscardOld
+	DuplicateClientID     = server.DuplicateClientID
+	FileStorage           = server.FileStorage
+	InterestPolicy        = server.InterestPolicy
+	JETSTREAM             = server.JETSTREAM
+	JSApiConsumerCreateT  = server.JSApiConsumerCreateT
+	JSApiConsumerDeleteT  = server.JSApiConsumerDeleteT
+	JSApiConsumerInfoT    = server.JSApiConsumerInfoT
+	JSApiConsumerListT    = server.JSApiConsumerListT
+	JSApiDurableCreateT   = server.JSApiDurableCreateT
+	JSApiMsgDeleteT       = server.JSApiMsgDeleteT
+	JSApiMsgGetT          = server.JSApiMsgGetT
+	JSApiPrefix           = server.JSApiPrefix
+	JSApiStreamCreateT    = server.JSApiStreamCreateT
+	JSApiStreamInfoT      = server.JSApiStreamInfoT
+	JSApiStreamPurgeT     = server.JSApiStreamPurgeT
+	JSBatchCommit         = server.JSBatchCommit
+	JSBatchId             = server.JSBatchId
+	JSBatchSeq            = server.JSBatchSeq
+	JSConsumerCreateErrF  = server.JSConsumerCreateErrF
+	JSConsumerNotFoundErr = server.JSConsumerNotFoundErr
+	// The availability answers a starting broker waits out (init_retry.go): no meta
+	// leader, and a stream or consumer with no serving leader yet. And the refusal of an
+	// ActionCreate whose name is held under a different config.
+	JSClusterNotAvailErr      = server.JSClusterNotAvailErr
+	JSStreamOfflineErr        = server.JSStreamOfflineErr
+	JSConsumerOfflineErr      = server.JSConsumerOfflineErr
+	JSConsumerAlreadyExists   = server.JSConsumerAlreadyExists
 	JSExpectedLastSubjSeq     = server.JSExpectedLastSubjSeq
 	JSMessageTTL              = server.JSMessageTTL
 	JSMsgId                   = server.JSMsgId

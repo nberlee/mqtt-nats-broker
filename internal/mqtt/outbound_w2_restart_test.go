@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"context"
 	"testing"
 )
 
@@ -107,7 +108,7 @@ func TestARestartedBrokerRetiresADiscardedGenerationsConsumers(t *testing.T) {
 	f.s.Shutdown()
 	s2 := testMQTTRestartServerSameStore(t, f.s, o)
 	t.Cleanup(func() { testMQTTShutdownServer(s2) })
-	if err := s2.Start(); err != nil {
+	if err := s2.Start(context.Background()); err != nil {
 		t.Fatalf("restarting the broker: %v", err)
 	}
 	probe, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "w2-restart-probe", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)

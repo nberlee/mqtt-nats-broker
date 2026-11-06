@@ -178,7 +178,7 @@ func authzBroker(t *testing.T, conf string) (broker string, s *Server) {
 	s.SetClientDialer(func(_, user, pass string) (*nats.Conn, error) {
 		return nats.Connect(url, nats.UserInfo(user, pass))
 	})
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)
@@ -782,7 +782,7 @@ func authzBrokerTrackingDials(t *testing.T, conf string) (broker string, dialed 
 		}
 		return nc, derr
 	})
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker: %v", err)
 	}
 	t.Cleanup(s.Shutdown)

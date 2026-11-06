@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"slices"
@@ -89,7 +90,7 @@ func TestEmbeddedListenerCutover(t *testing.T) {
 		}
 	}
 	broker := NewServer(nc, &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: -1}}, "cutover-broker")
-	if err := broker.Start(); err != nil {
+	if err := broker.Start(context.Background()); err != nil {
 		t.Fatalf("the broker did not start on the emptied account: %v", err)
 	}
 	t.Cleanup(broker.Shutdown)

@@ -65,7 +65,11 @@ helm install broker charts/mqtt-nats-broker -f charts/mqtt-nats-broker/ci/option
   service-account token, no Service links. The dependency's pod runs Restricted too.
 - Probes on the health port, which no Service exposes: readiness on `/readyz`, withdrawn
   after one failure, liveness on `/healthz`, and in the embedded topology a startupProbe
-  bounding the JetStream wait at ten minutes.
+  for the bootstrap before the health port binds. `/healthz` answers through store
+  recovery, the JetStream wait and the MQTT initialization's retries, so no probe restarts
+  a recovering pod.
+- A memory limit of 256Mi, a default rather than a sizing: an embedded broker's recovery
+  holds its stored streams and consumers in memory, so size it to the store.
 - A termination grace of 60 s (75 s embedded), the broker's shutdown budgets plus
   headroom. Raise it with `broker.drainDelay`.
 - A PodDisruptionBudget of one pod; an optional HorizontalPodAutoscaler for the external

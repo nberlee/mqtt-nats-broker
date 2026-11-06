@@ -19,6 +19,7 @@ package mqtt
 // connection that outlives it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -117,7 +118,7 @@ func TestShutdownReleasesServiceConnection(t *testing.T) {
 	t.Run("after a successful start", func(t *testing.T) {
 		cc := newCallerConnection(t, url)
 		s := passthroughServer(cc, url, -1)
-		if err := s.Start(); err != nil {
+		if err := s.Start(context.Background()); err != nil {
 			t.Fatalf("start: %v", err)
 		}
 		// The control: the broker really did install subscriptions and handlers on it.
@@ -143,7 +144,7 @@ func TestShutdownReleasesServiceConnection(t *testing.T) {
 		failIdentity := func() ([]byte, error) { return nil, errors.New("identity unavailable") }
 		mqttTestUserInfoHookV.Store(&failIdentity)
 		for i := 0; i < 3; i++ {
-			if err := passthroughServer(cc, url, -1).Start(); err == nil {
+			if err := passthroughServer(cc, url, -1).Start(context.Background()); err == nil {
 				t.Fatal("start succeeded with identity discovery failing")
 			}
 			cc.assertHandedBack(t, fmt.Sprintf("identity failure %d", i+1))
@@ -157,7 +158,7 @@ func TestShutdownReleasesServiceConnection(t *testing.T) {
 		}
 		defer taken.Close()
 		port := taken.Addr().(*net.TCPAddr).Port
-		if err := passthroughServer(cc, url, port).Start(); err == nil {
+		if err := passthroughServer(cc, url, port).Start(context.Background()); err == nil {
 			t.Fatal("start succeeded on a port that is taken")
 		}
 		cc.assertHandedBack(t, "listener failure")
@@ -171,7 +172,7 @@ func TestShutdownReleasesServiceConnection(t *testing.T) {
 		cc := newCallerConnection(t, noJS)
 		s := passthroughServer(cc, noJS, -1)
 		s.opts.MQTT.JSAPITimeout = time.Second
-		err := s.Start()
+		err := s.Start(context.Background())
 		if err == nil {
 			s.Shutdown()
 			t.Fatal("start succeeded on an account without JetStream")

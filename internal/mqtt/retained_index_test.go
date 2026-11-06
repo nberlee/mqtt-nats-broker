@@ -39,7 +39,7 @@ func retainedBrokerWith(t *testing.T, url, node string, setup func(sm *mqttSessi
 	if setup != nil {
 		setup(&s.mqtt.sessmgr)
 	}
-	if err := s.Start(); err != nil {
+	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("start broker %s: %v", node, err)
 	}
 	t.Cleanup(s.Shutdown)

@@ -54,14 +54,23 @@ func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 	return s
 }
 
-// Start begins listening for MQTT connections. It returns any listener setup
-// error (Fatalf in the shim only logs).
-func (s *Server) Start() error {
+// Start begins listening for MQTT connections and initializes the account's session
+// manager, retrying that initialization while JetStream is not answering yet (see
+// init_retry.go) until it succeeds, fails with a refusal, or ctx ends. It returns any
+// listener setup error (Fatalf in the shim only logs). A Start that returns nil has a
+// running server, even if ctx ended in the same instant; a Start that returns an error has
+// completed the server's shutdown lifecycle first.
+func (s *Server) Start(ctx context.Context) error {
 	// First, before the service identity, the listener and any goroutine: a refused
 	// configuration leaves nothing to tear down. See ValidateOptions.
 	if err := ValidateOptions(s.opts); err != nil {
 		return err
 	}
+	// The startup window opens before the listener accepts anything: a CONNECT that
+	// arrives before the eager initialization begins drives an attempt of its own, and
+	// that attempt must observe the same cancellation. See init_retry.go.
+	stopWatch := s.openStartupWindow(ctx)
+	defer stopWatch()
 	// Before the listener, never after it. Under auth passthrough every CONNECT is
 	// judged against the account the broker's own streams ride, so a listener
 	// opened first would accept connections the broker cannot yet judge -- a
@@ -72,25 +81,33 @@ func (s *Server) Start() error {
 			// The handlers were armed before the request; a failed Start leaves the
 			// caller's connection as it was handed over.
 			s.restoreServiceIdentityHandlers()
+			s.closeStartupWindow()
 			return fmt.Errorf("MQTT auth passthrough: %w", err)
 		}
 	}
 	s.startMQTT()
 	if s.mqtt.listenerErr != nil {
 		s.restoreServiceIdentityHandlers()
+		s.cancelStartup()
 		return s.mqtt.listenerErr
+	}
+	if h := mqttTestStartupBeforeEagerHookV.Load(); h != nil {
+		(*h)()
 	}
 	// Eagerly initialize the (single global) account session manager so every
 	// replica runs the delayed-Will claim loop regardless of client traffic —
 	// otherwise a surviving replica would not fire a handed-off Will until some
 	// client happened to initialize the account. See will_outbox.go.
-	if _, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient()); err != nil {
+	if err := s.initializeWithRetries(ctx); err != nil {
 		// Atomic startup contract: tear down the already-open listener and any
 		// account-manager goroutines before returning, so a failed Start leaves
-		// nothing running for direct callers (not just serveMQTT).
-		s.Shutdown()
-		// Phase 4 restores them too; Shutdown's wait is bounded, so this does not rely on
-		// the lifecycle having reached it.
+		// nothing running for direct callers (not just serveMQTT). The retry loop has
+		// already cancelled startup, so a CONNECT that initializes in the meantime
+		// abandons its attempt; then the WHOLE lifecycle, not the bounded Shutdown, because the caller tears
+		// the NATS connection and an embedded server down next and nothing of this
+		// server may still be running under them. Unbounded, like run's own shutdown
+		// wait: the orchestrator's SIGKILL is the final bound.
+		<-s.BeginShutdown()
 		s.restoreServiceIdentityHandlers()
 		return err
 	}

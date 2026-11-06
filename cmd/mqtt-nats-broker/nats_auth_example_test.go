@@ -61,7 +61,7 @@ func startExampleBroker(t *testing.T, srv *server.Server, cfg *config.Config) st
 	}
 	addr := reservedAddr(t)
 	cfg.MQTTHost, cfg.MQTTPort = "127.0.0.1", mustPort(t, addr)
-	ms, err := serveMQTT(cfg, be, mqttOptions(cfg, tlsSrc), log)
+	ms, err := serveMQTT(context.Background(), cfg, be, mqttOptions(cfg, tlsSrc), log)
 	if err != nil {
 		t.Fatalf("serveMQTT: %v", err)
 	}

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server/stree"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 )
 
@@ -119,10 +120,14 @@ type mqttSessionManager struct {
 }
 
 type mqttAccountSessionManager struct {
-	mu         sync.RWMutex
-	sessions   map[string]*mqttSession // key is MQTT client ID
-	sessByHash map[string]*mqttSession // key is MQTT client ID hash
-	sessLocked map[string]struct{}     // key is MQTT client ID and indicate that a session can not be taken by a new client at this time
+	// startupBaseline is the service connection's LastError when this manager's
+	// initialization attempt began inside Start's retry window; the attempt's permission
+	// verdicts compare against it. Written once at construction. See init_retry.go.
+	startupBaseline error
+	mu              sync.RWMutex
+	sessions        map[string]*mqttSession // key is MQTT client ID
+	sessByHash      map[string]*mqttSession // key is MQTT client ID hash
+	sessLocked      map[string]struct{}     // key is MQTT client ID and indicate that a session can not be taken by a new client at this time
 	// sessGateWaiters holds, per client ID, the channel the next release of its sessLocked gate
 	// closes; see sess_gate_wait.go.
 	sessGateWaiters map[string]chan struct{}
@@ -1057,8 +1062,21 @@ func (s *Server) getOrCreateMQTTAccountSessionManager(c *client) (*mqttAccountSe
 		return nil, fmt.Errorf("MQTT server is shutting down")
 	}
 	// Need to create one here.
+	baseline := s.serviceLastError()
 	asm, err := s.mqttCreateAccountSessionManager(acc, quitCh)
 	if err != nil {
+		// Inside Start's window a terminal failure ends startup whichever caller drove the
+		// attempt — Start's own, or a CONNECT's before the eager initialization or during
+		// Start's backoff, which Start would otherwise never see and retry past. Recorded
+		// before the manager lock is released, so no later attempt can begin first. A
+		// permission violation the attempt recorded counts as terminal even when the
+		// attempt ended on something retryable; Start's next attempt would otherwise take
+		// it as its own baseline. See init_retry.go.
+		if perr := s.startupPermissionViolationSince(baseline, err); perr != nil {
+			s.failStartup(perr)
+		} else if s.startupAbandonCh() != nil && !mqttStartupRetryable(err) && !errors.Is(err, errMQTTStartupCancelled) {
+			s.failStartup(err)
+		}
 		return nil, err
 	}
 	sm.sessions[accName] = asm
@@ -1144,9 +1162,30 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		s.Noticef("Creating MQTT streams/consumers with replicas %v for account %q", replicas, accName)
 	}
 
+	// Inside Start's retry window this attempt observes the startup cancellation: every
+	// reply wait of its assistant, the bundle preflight, and the steps below. See
+	// init_retry.go.
+	abandon := s.startupAbandonCh()
+	if abandon != nil {
+		as.jsa.startupAbandon.Store(&abandon)
+		// This attempt's permission baseline: attempts are serialized by the manager
+		// lock, so a violation recorded from here on is this attempt's, whichever caller
+		// drives it. See init_retry.go.
+		as.startupBaseline = s.serviceLastError()
+	}
+	if h := mqttTestStartupAttemptHookV.Load(); h != nil {
+		(*h)(&as.jsa)
+	}
+
 	var subs []*subscription
 	var success bool
 	closeCh := make(chan struct{})
+	// senderDone is closed when the JSA send loop has returned. A failed attempt waits for
+	// it, so nothing it queued can be published after the next attempt began — a CREATE
+	// published late would land after that attempt's definite delete. Only once the loop
+	// was launched: the subscriptions below come first and can fail before it.
+	senderDone := make(chan struct{})
+	senderStarted := false
 
 	defer func() {
 		if success {
@@ -1158,6 +1197,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 			}
 		}
 		close(closeCh)
+		if senderStarted {
+			<-senderDone
+		}
 	}()
 
 	// We create all subscriptions before starting the go routine that will do
@@ -1168,8 +1210,11 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// This is a subscription that will process all JS API replies. We could split to
 	// individual subscriptions if needed, but since there is a bit of common code,
 	// that seemed like a good idea to be all in one place.
-	if err := as.createSubscription(jsa.rplyr+">",
-		as.processJSAPIReplies, &sid, &subs); err != nil {
+	//
+	// processSub does not flush a "$MQTT.JSA." subscription, so this one gets its own
+	// barrier: a denial must be seen here, not as every reply going missing.
+	if err := as.createServiceSubscription(jsa.rplyr+">",
+		as.processJSAPIReplies, &sid, &subs, true); err != nil {
 		return nil, err
 	}
 
@@ -1186,7 +1231,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// returns. See retained_index.go.
 	ephemeralID, ephemeralOwner := s.ephemeralIdentity()
 	rmsubj := mqttRetainedObserverDeliverSubject(ephemeralID, s.mqtt.rmObsGen.Add(1))
-	if err := as.createSubscription(rmsubj, as.processRetainedMsg, &sid, &subs); err != nil {
+	if err := as.createServiceSubscription(rmsubj, as.processRetainedMsg, &sid, &subs, false); err != nil {
 		return nil, err
 	}
 	as.rmObs.sub = subs[len(subs)-1]
@@ -1201,7 +1246,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// Derived from the same per-run token as the retained observer's, for the same
 	// reason. See sess_record_watch.go and ephemeral_identity.go.
 	srwsubj := mqttSessRecordWatchDeliverSubject(ephemeralID)
-	if err := as.createSubscription(srwsubj, as.processSessionRecordDelivery, &sid, &subs); err != nil {
+	if err := as.createServiceSubscription(srwsubj, as.processSessionRecordDelivery, &sid, &subs, false); err != nil {
 		return nil, err
 	}
 
@@ -1210,8 +1255,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// Start the go routine that will send JS API requests.
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
-		as.sendJSAPIrequests(s, c, accName, closeCh)
+		as.sendJSAPIrequests(s, c, accName, closeCh, senderDone)
 	})
+	senderStarted = true
 
 	// Start the go routine that will clean up cached retained messages that expired.
 	s.startGoRoutine(func() {
@@ -1251,7 +1297,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
-	if err := mqttPreflightBrokerStreamBundle(jsa, specs, s.bundleSettleBudget, s.quitCh); err != nil {
+	if err := mqttPreflightBrokerStreamBundle(jsa, specs, s.bundleSettleBudget, s.quitCh, abandon); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
 	// Which purposes this attempt CONFIRMABLY created, which is the rollback's only
@@ -1265,6 +1311,9 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// remove.
 	created := mqttEphemeralCreated{}
 	for _, spec := range specs {
+		if mqttAbandoned(abandon) {
+			return nil, errMQTTStartupCancelled
+		}
 		si, err := ensureBrokerStream(jsa, spec.cfg, spec.validate, spec.preCreate, spec.observe)
 		if err != nil {
 			return nil, fmt.Errorf("MQTT %s stream for account %q: %w", spec.txt, accName, err)
@@ -1287,8 +1336,21 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// that window drives initialization itself. What a retry must not do is mint
 	// another consumer, which is why both names are derived. See
 	// mqttProvisionEphemeralConsumers and ephemeral_identity.go.
-	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner, created); err != nil {
+	if mqttAbandoned(abandon) {
+		return nil, errMQTTStartupCancelled
+	}
+	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner, created, abandon); err != nil {
 		return nil, err
+	}
+	// Every startup request of the attempt has been answered. A denial it recorded on
+	// the service connection on the way — a delivery subscription the server never
+	// registered, a publication refused — still fails it, before anything is installed
+	// or started; its confirmed consumers are rolled back like any failed attempt's.
+	if abandon != nil {
+		if perr := as.startupPermissionViolation(); perr != nil {
+			as.rollbackEphemeralConsumers(created)
+			return nil, perr
+		}
 	}
 
 	// Re-arm session-expiry timers, without delaying the connecting client. Then
@@ -1590,6 +1652,55 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cut
 }
 
 // Helper to create a subscription. It updates the sid and array of subscriptions.
+// createServiceSubscription is createSubscription for the manager's own subscriptions on
+// the service connection, with the denial made synchronous: a permission violation the
+// connection records for this SUB fails initialization outright instead of surfacing as
+// deliveries or replies that never arrive. The baseline is taken BEFORE the SUB, since a
+// fast denial can arrive before any later baseline. The barrier is processSub's own flush
+// for a "$MQTT.sub." subject; flush adds one for a subject processSub does not flush, so
+// no subscription costs more than one flush.
+func (as *mqttAccountSessionManager) createServiceSubscription(subject string, cb msgHandler, sid *int64, subs *[]*subscription, flush bool) error {
+	// Startup cancellation is checked before each SUB and after its barrier, so a signal
+	// costs at most the one flush in progress, never the next ones.
+	abandon := as.jsa.startupAbandonCh()
+	if mqttAbandoned(abandon) {
+		return errMQTTStartupCancelled
+	}
+	if h := mqttTestServiceSubscriptionHookV.Load(); h != nil {
+		(*h)(subject)
+	}
+	nrc := as.jsa.c.nrc
+	var before error
+	if nrc != nil {
+		before = nrc.LastError()
+	}
+	if err := as.createSubscription(subject, cb, sid, subs); err != nil {
+		return err
+	}
+	if nrc != nil {
+		if flush {
+			if err := nrc.Flush(); err != nil {
+				return err
+			}
+		}
+		after := nrc.LastError()
+		if after != nil && after != before && errors.Is(after, nats.ErrPermissionViolation) {
+			return fmt.Errorf("subscribing to %q on the NATS service connection: %w", subject, after)
+		}
+		// The server's subscription limit refuses the SUB asynchronously while the flush
+		// succeeds. nats.go records it as one sentinel value, so a repeat cannot be told
+		// from an earlier one by identity; a connection whose last error is that refusal
+		// is at its limit, and this SUB is refused with it.
+		if errors.Is(after, nats.ErrMaxSubscriptionsExceeded) {
+			return fmt.Errorf("subscribing to %q on the NATS service connection: %w", subject, after)
+		}
+	}
+	if mqttAbandoned(abandon) {
+		return errMQTTStartupCancelled
+	}
+	return nil
+}
+
 func (as *mqttAccountSessionManager) createSubscription(subject string, cb msgHandler, sid *int64, subs *[]*subscription) error {
 	// An internal deliver-subject subscription: it carries no retained frames, so the
 	// displaced identifiers are always empty here.

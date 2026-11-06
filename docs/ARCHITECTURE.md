@@ -1658,11 +1658,13 @@ live peer's consumer. A create whose RESPONSE was lost is therefore left alone; 
 next attempt of the same run reconciles it (the observer deletes it definitely, the
 watch adopts it as config-identical), and failing that `InactiveThreshold` does. The
 rollback is BEST-EFFORT and is not part of the cardinality guarantee: what it buys is
-promptness for the attempt no retry follows — `Start`'s own, after which the process
-exits. That "no retry follows" is the common case rather than a guarantee, because a
-CONNECT can be queued on the manager mutex while the eager initialization fails;
-`getOrCreateMQTTAccountSessionManager` refuses to create a manager once the server is
-marked not-running, and what remains is a stated residual.
+promptness for the attempt no retry follows — `Start`'s last, after a refusal or a
+cancelled start (`Start` retries every availability failure within the run; see "Startup
+retries"). That "no retry follows" is the common case rather than a guarantee, because a
+CONNECT can be queued on the manager mutex while the eager initialization fails; the
+startup cancellation abandons such an attempt, `getOrCreateMQTTAccountSessionManager`
+refuses to create a manager once the server is marked not-running, and what remains is a
+stated residual.
 
 **What this guarantees, and what it does not.** Where an initialization attempt is
 repeated within one server run, cardinality stays at AT MOST ONE consumer per (server
@@ -1678,6 +1680,89 @@ on every create, because a create-or-update that omits custom keys WIPES them. I
 machine reader is the server's own equality check; no broker code branches on it, and
 an operator or a future sweep is the human reader. A `_schema` mismatch REFUSES, so an
 unsupported shape is never adopted or rewritten.
+
+### Startup retries
+
+Tracked in [issue #177](https://github.com/nberlee/mqtt-nats-broker/issues/177);
+`internal/mqtt/init_retry.go`.
+
+`Start` initializes the account's session manager eagerly (every replica runs the
+delayed-Will claim loop without client traffic), and that initialization is the first
+thing that needs every broker-owned stream and both ephemeral consumers answering. A
+JetStream that answers `$JS.API.INFO` can still have assets whose raft groups are
+electing leaders, so one request can go unanswered. `Start` therefore RETRIES the
+initialization within the same server run — the per-run identity above is what keeps
+retries at one consumer per purpose — until it succeeds, meets a refusal, or its context
+ends. There is no budget: an exit in embedded mode shuts the local JetStream peer down
+and restarts the recovery being waited for, and no finite default can tell slow recovery
+from permanent unavailability. `/readyz` stays 503 meanwhile; a warning names the attempt
+and its error, at most every 10 s, with a backoff of 1 s doubling to 15 s.
+
+**What is retried, and nothing else** (`mqttStartupRetryable`): a JSA request that timed
+out (`errMQTTJSARequestTimeout`, which every reply wait's timeout matches, its message
+unchanged); a subscription flush that timed out or ran during a reconnect; a transport
+no-responders status (503 with no JetStream code); JetStream 10008, 10118 and 10119 (no
+meta leader, stream or consumer offline) — not 10194/10195, which the server also uses for
+assets it does not support; and the two observer-occupant answers below. A request the
+connection refuses to publish before writing anything (`ErrMaxPayload`, `ErrBadSubject`,
+`ErrHeadersNotSupported`) ends startup: the sender records that refusal on the startup
+window itself, so it ends startup whether or not the request's waiter is still waiting;
+any other publish error is as ambiguous as the timeout it ends in. A service
+subscription the server refuses for the connection's subscription limit
+(`ErrMaxSubscriptionsExceeded`, recorded while the flush succeeds) ends startup too:
+nats.go records that refusal as one value, so a connection whose last error is it counts
+as at its limit. Every refusal — a nonconforming stream, the partial-bundle refusal (which
+a timed-out first creation can leave behind; whole-attempt retry does not get past it),
+`JSConsumerAlreadyExists` from another run, an unsafe Will timing — ends startup.
+
+**Retry-safe ordering.** A failed attempt joins its JSA sender before it returns, so
+nothing it queued is published after the next attempt began. A CREATE the server accepted
+can still APPLY after the next attempt's definite delete; the observer's next CREATE then
+meets a consumer whose delivery subject (a per-attempt generation) differs and is refused
+as `JSConsumerAlreadyExists`. The attempt reads that consumer's info — a positive
+observation of a present record — and if its `mqtt_nats_broker_run` metadata is this
+run's owner nonce, fails retryably (`errMQTTOwnEphemeralStray`) so the next attempt's
+definite delete removes it; a consumer gone by then is retryable too; a foreign nonce
+keeps the refusal. A lookup JetStream does not answer yet is repeated in place, with no
+delete in between, until it does. The read adopts nothing and proves no absence; the
+delete that follows stays unconditional by stream and name, as above.
+
+**Cancellation.** One server-level startup cancellation covers every attempt in the
+window — `Start`'s and a CONNECT's — because a manager can only be created inside it; the
+window opens before the listener accepts anything, so a CONNECT that drives an attempt
+before the eager initialization begins observes it too. It is closed when `Start`'s
+context ends, and when any attempt in the window — `Start`'s or a CONNECT's — meets a
+refusal or a permission failure: that attempt records the failure on the window and
+cancels before it releases the manager lock, so `Start` returns it and no further attempt
+begins. Every reply wait of an attempt's JSA assistant, the bundle preflight, the steps
+between streams and consumers, and each service subscription (before its SUB and after
+its barrier) observe it; a subscription flush in progress (nats.go, up to 10 s) does not,
+so a signal ends startup within one flush. On success the window closes and the installed
+manager's assistant is disarmed: a request that begins waiting afterwards cannot observe
+it, and one already waiting on the success race reports it once. A context that ends at
+the moment of success leaves the success standing; `run`'s own shutdown follows.
+
+**A failed `Start` returns ownership only when nothing of it runs.** It waits for the
+server's whole shutdown lifecycle (`BeginShutdown`'s completion, not the bounded
+`Shutdown`) before returning, because the caller closes the NATS connection and the
+embedded server next. Unbounded, like `run`'s own shutdown wait; the orchestrator's SIGKILL
+is the final bound.
+
+**The permission policy is a policy, not an attribution.** The verdict belongs to the
+ATTEMPT, whichever caller drives it: attempts are serialized by the manager lock, and each
+records the service connection's `LastError` as its baseline when it begins. The
+manager's own service subscriptions are checked synchronously: `LastError` is recorded
+before each SUB and compared after a barrier (`processSub`'s flush for a `$MQTT.sub.`
+subject, a new one for the `$MQTT.JSA.` reply subscription, so no subscription costs more
+than one flush). Publication denials are asynchronous — a denied request times out — so a
+`LastError` that is a permission violation and differs from the attempt's baseline fails
+the attempt when it ends, inside the occupant lookup's loop, and before a successful
+attempt installs anything (its confirmed consumers are rolled back). A permission failure
+of any attempt in the window, a CONNECT's during `Start`'s backoff included, is recorded on
+the window and cancels startup, so `Start` returns it; its own next attempt never takes
+that violation as a fresh baseline. A violation a later error replaced before the check is
+missed, and that request keeps timing out; the backend's asynchronous error handler has
+already logged it.
 
 ### The retained index is ordered by stream sequence (issue #63)
 
@@ -16419,9 +16504,10 @@ lists the prerequisites. All configuration is environment, so that the TLS compo
 adds to it and the test evaluates it with the binary's own loader.
 
 **The termination grace is a budget, not a bound.** After SIGTERM, `run` waits
-`MQTTNB_DRAIN_DELAY`, then for `BeginShutdown` to complete, then shuts the health server
-down (`httpShutdownTimeout`, 5 s), then the deferred TLS watcher stop and backend close
-(`backend.ServiceCloseBudget`, 20 s, the 10 s NATS drain included). The lifecycle's
+`MQTTNB_DRAIN_DELAY`, then for `BeginShutdown` to complete, then the deferred TLS watcher
+stop and backend close (`backend.ServiceCloseBudget`, 20 s, the 10 s NATS drain
+included), and last shuts the health server down (`httpShutdownTimeout`, 5 s), which is
+bound before everything else and so outlives it. The lifecycle's
 client drain works to `mqtt.ShutdownDrainTimeout` (10 s), but its phase waits are
 unbounded by design (see "Resource lifetime and shutdown release"). So the example's
 60 s is 10 + 10 + 5 + 20 = 45 s of named budgets plus 15 s of headroom, and the
@@ -16431,10 +16517,11 @@ kubelet's SIGKILL is the final bound for a phase that does not finish.
 readiness probe withdraws the endpoint after one failure (period 2 s, failure threshold
 1). The drain delay that follows is a best-effort allowance for the endpoint to leave
 the Service and the load balancer. Nothing proves propagation has finished. Liveness is
-`/healthz`. There is no startup probe: in this mode the health server starts after the
-NATS connection and the JetStream probe, which fail fast and exit. The stream-bundle
-preflight (up to 30 s) runs with `/healthz` already answering, so liveness never restarts
-a pod for it.
+`/healthz`. There is no startup probe: the health server is bound before NATS is dialed
+(see "Startup retries"), so `/healthz` answers from the process's first moments and
+`/readyz` stays 503 (`starting`, then `draining` until the broker serves) through the
+JetStream probe, the stream-bundle preflight and the MQTT initialization's retries; no
+probe restarts a pod for any of them.
 
 **Security.** The pod meets the Restricted Pod Security standard: `runAsNonRoot` with
 the image's uid and gid 65532, the RuntimeDefault seccomp profile, all capabilities
@@ -16540,7 +16627,13 @@ injects account traffic past every client ACL; and a password user with an empty
 password (an environment reference set to `""`). There is no SIGHUP reload: a
 configuration change takes a restart.
 
-**Startup order.** The server starts after the broker's own configuration is validated
+**Startup order.** The health endpoint is bound first, after configuration, TLS and MQTT
+option validation, so `/healthz` answers while nats-server recovers its store (which it
+does inside `Start`, before it accepts connections) and through every wait below; no
+liveness or startup probe can restart a pod for recovering
+([issue #177](https://github.com/nberlee/mqtt-nats-broker/issues/177)). A deployment
+written by hand needs no startupProbe for recovery, and none should be relied on to bound
+it. The server starts after the broker's own configuration is validated
 and before anything dials it, and the broker waits for it to accept connections. Then
 `backend.Connect` waits for JetStream, because in a clustered cold start each pod is
 part of the quorum it waits for: failing on the first probe would turn every cold start
@@ -16551,9 +16644,11 @@ another domain), API error 10008 (no meta leader), and a probe timeout unless th
 connection recorded a permission violation (nats.go records a refused publish or reply
 subscription there; it identifies this probe's violation because the probe runs on a
 fresh, private connection). Everything else, including JetStream disabled for the
-account, fails startup at once. The wait logs every 10 s, has no overall timeout (an
-orchestrator's startupProbe bounds it; HTTP is not served yet), and ends on a signal.
-External mode keeps the single probe.
+account, fails startup at once. The wait logs every 10 s, has no overall timeout and no
+probe bounds it, and ends on a signal. External mode keeps the single probe. The MQTT
+initialization that follows retries the same way within its own run (see "Startup
+retries"): an exit here would shut the local peer down and restart the recovery it waits
+for.
 
 **Shutdown order.** The MQTT drain runs first, unchanged; then `backend.Close` drains
 and flushes the service connection ("NATS service connection closed"); only then is the
@@ -16577,7 +16672,9 @@ the example the cluster smoke test runs. On Kubernetes this needs a StatefulSet 
 `publishNotReadyAddresses: true` (route names must resolve before any pod is ready),
 a volume per pod (`fsGroup: 65532` for a PVC, storage-driver dependent), a
 PodDisruptionBudget allowing one disruption (two peers lost at once lose quorum for R3
-assets), and a startupProbe for the JetStream wait. Brokers that leave the wait together
+assets), and memory for recovery (see "The Helm chart" for what was observed). No probe
+needs to cover the JetStream wait or recovery, since `/healthz` answers from the start.
+Brokers that leave the wait together
 create the stream bundle concurrently, which the bundle preflight's rescans absorb (see
 "The ten streams are one recreation unit").
 
@@ -16662,7 +16759,8 @@ credentials Secret on the server's container other than the broker's.
 **Embedded.** The StatefulSet carries what "Embedded NATS" lists for Kubernetes:
 `podManagementPolicy: Parallel`, a headless Service with `publishNotReadyAddresses`, a
 claim `data` per pod at the image's `/data` with `fsGroup: 65532`, a startupProbe on
-`/healthz` bounding the JetStream wait at ten minutes, a PodDisruptionBudget of one, and
+`/healthz` (it bounds only the bootstrap before the health port binds; the JetStream wait
+and recovery come after, with `/healthz` answering), a PodDisruptionBudget of one, and
 when clustered a NetworkPolicy admitting the route port only from the broker's pods. One
 server runs the image's baked configuration, which has no `server_name`: a standalone
 server has no peer that names it. A cluster runs `embedded/nats-cluster.conf` from a
@@ -16675,6 +16773,14 @@ expands from the variables declared before. Both must therefore be URL-safe. The
 replicas are the peer count. A configuration change rolls the pods (a checksum
 annotation), since the embedded server has no reload. Autoscaling is refused, and so is
 an even or sub-three peer count.
+
+**Memory.** The default limit is 256Mi in every topology, and it is a default, not a
+sizing: an embedded broker's recovery holds its stored streams and consumers in memory.
+One observation, not a measured minimum: a three-peer R3 cluster recovering about 530
+consumers was OOMKilled at a 384Mi limit and was not at 512Mi — while its
+`$MQTT_inflight` stream held 1.16M records (533 MiB), most of them retired records an
+operator purge later removed. The derived Go soft limit (90 % of the limit) is a GC
+target, so a pod's peak memory tracks the limit it is given rather than what it needs.
 
 **Shared pod: NATS must outlive the broker.** The NATS chart's `nats` container enters
 lame duck mode in its preStop hook, which the kubelet runs while it signals the broker,

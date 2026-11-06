@@ -175,7 +175,10 @@ podTemplate:
 ############################################################
 container:
   # The broker derives its Go soft memory limit from limits.memory (90 %); set GOMEMLIMIT
-  # in broker.env only to override that.
+  # in broker.env only to override that. A default, not a sizing: an embedded broker's
+  # recovery holds its stored streams and consumers in memory. Observed once, not a
+  # minimum: a three-peer R3 recovery of ~530 consumers was OOMKilled at 384Mi and not at
+  # 512Mi, while its inflight stream held 1.16M records (533 MiB) since purged.
   resources:
     requests:
       cpu: 100m

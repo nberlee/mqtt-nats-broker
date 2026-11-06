@@ -3,6 +3,7 @@
 package mqtt
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -125,7 +126,7 @@ func TestMQTTPlainListenerBindFailureReleasesEarlierListeners(t *testing.T) {
 	o := &Options{MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: mqttPort, TLSConfig: m.serverCfg,
 		PlainPort: taken.Addr().(*net.TCPAddr).Port, Websocket: WebsocketOpts{Host: "127.0.0.1", Port: wsPort}}}
 	s := NewServer(nc, o, "plain-bind-failure")
-	if err := s.Start(); err == nil {
+	if err := s.Start(context.Background()); err == nil {
 		s.Shutdown()
 		t.Fatal("Start() = nil with the plaintext port taken")
 	}

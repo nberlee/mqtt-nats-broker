@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"math"
@@ -105,7 +106,7 @@ func TestStartRefusesInvalidOptions(t *testing.T) {
 			o := validOptions()
 			tc.mut(o)
 			s := NewServer(nc, o, "validate-refuse")
-			err := s.Start()
+			err := s.Start(context.Background())
 			if s.Addr() != nil {
 				s.Shutdown()
 				t.Fatalf("Start opened a listener for an invalid configuration (err=%v)", err)
@@ -149,7 +150,7 @@ func TestStartAcceptsBoundaryOptions(t *testing.T) {
 			o := validOptions()
 			tc.mut(o)
 			s := NewServer(nc, o, "validate-accept")
-			if err := s.Start(); err != nil {
+			if err := s.Start(context.Background()); err != nil {
 				s.Shutdown()
 				t.Fatalf("Start() = %v, want a running broker", err)
 			}
@@ -178,7 +179,7 @@ func TestStartValidatesBeforeAnySideEffect(t *testing.T) {
 		s.SetClientDialer(func(string, string, string) (*nats.Conn, error) {
 			return nil, errors.New("the dialer must not be reached by a refused Start")
 		})
-		err = s.Start()
+		err = s.Start(context.Background())
 		if s.Addr() != nil {
 			s.Shutdown()
 		}
@@ -191,7 +192,7 @@ func TestStartValidatesBeforeAnySideEffect(t *testing.T) {
 	t.Run("before the listener", func(t *testing.T) {
 		o := &Options{MaxConn: -1, MQTT: MQTTOpts{StreamReplicas: 1, Host: "127.0.0.1", Port: 0}}
 		s := NewServer(nc, o, "validate-listener")
-		err := s.Start()
+		err := s.Start(context.Background())
 		if s.Addr() != nil {
 			s.Shutdown()
 			t.Fatalf("Start opened a listener before refusing (err=%v)", err)

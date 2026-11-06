@@ -234,7 +234,7 @@ func startEmbeddedBroker(t *testing.T, cfg *config.Config) *embeddedBroker {
 	addr := reservedAddr(t)
 	cfg.MQTTHost = "127.0.0.1"
 	cfg.MQTTPort = mustPort(t, addr)
-	ms, err := serveMQTT(cfg, be, mqttOptions(cfg, nil), log)
+	ms, err := serveMQTT(context.Background(), cfg, be, mqttOptions(cfg, nil), log)
 	if err != nil {
 		t.Fatalf("serveMQTT: %v", err)
 	}
@@ -776,7 +776,7 @@ func TestEmbeddedClusterFormsAfterFirstProbeFails(t *testing.T) {
 		addr := reservedAddr(t)
 		nodes[i].cfg.MQTTHost = "127.0.0.1"
 		nodes[i].cfg.MQTTPort = mustPort(t, addr)
-		ms, err := serveMQTT(nodes[i].cfg, nodes[i].be, mqttOptions(nodes[i].cfg, nil), slog.New(slog.DiscardHandler))
+		ms, err := serveMQTT(context.Background(), nodes[i].cfg, nodes[i].be, mqttOptions(nodes[i].cfg, nil), slog.New(slog.DiscardHandler))
 		if err != nil {
 			t.Fatalf("serveMQTT on node %d: %v", i, err)
 		}

@@ -9,6 +9,7 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -410,7 +411,7 @@ func TestBrokerStreamBundleStartRefusesThenRestartConverges(t *testing.T) {
 	}
 
 	s1 := newBroker("bundle-refuse")
-	err := s1.Start()
+	err := s1.Start(context.Background())
 	if err == nil {
 		<-s1.BeginShutdown()
 		t.Fatal("Start must FAIL against a partial bundle: the recovery guidance rests on a " +
@@ -434,7 +435,7 @@ func TestBrokerStreamBundleStartRefusesThenRestartConverges(t *testing.T) {
 	// The restart. A FRESH Server: the shutdown lifecycle is one-shot, so in
 	// production this is a new process.
 	s2 := newBroker("bundle-restart")
-	if rerr := s2.Start(); rerr != nil {
+	if rerr := s2.Start(context.Background()); rerr != nil {
 		t.Fatalf("a restart against the completed bundle must succeed: %v", rerr)
 	}
 	t.Cleanup(func() { <-s2.BeginShutdown() })
