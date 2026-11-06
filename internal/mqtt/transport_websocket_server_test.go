@@ -233,12 +233,56 @@ func wsClientCount(s *Server) int {
 	return len(s.clients)
 }
 
+// wsDescribeClients is the state of every connection the server holds, one line each, so
+// a connection that outlives its bound is attributable from the failure alone: which
+// transport it is, whether it sent CONNECT, its keep-alive, the read deadline its
+// WebSocket carries, whether it is closed, and its age.
+func wsDescribeClients(s *Server) string {
+	s.mu.Lock()
+	clients := make([]*client, 0, len(s.clients))
+	for _, c := range s.clients {
+		clients = append(clients, c)
+	}
+	s.mu.Unlock()
+	var b strings.Builder
+	for _, c := range clients {
+		c.mu.Lock()
+		connected := c.flags.isSet(connectReceived)
+		var ka uint16
+		// The CONNECT parser writes the client ID without c.mu; it publishes it, with the
+		// CONNECT proto, by setting connectReceived under c.mu. So the ID is read only once
+		// that flag is seen — before then it is not this goroutine's to read.
+		id := "(no CONNECT yet)"
+		if connected && c.mqtt != nil {
+			id = c.mqtt.cid
+			if c.mqtt.cp != nil {
+				ka = c.mqtt.cp.ka
+			}
+		}
+		age := time.Since(c.start)
+		nc := c.nc
+		c.mu.Unlock()
+		transport, readDL := "tcp", "-"
+		if w, ok := nc.(*wsConn); ok {
+			transport = "websocket"
+			w.dmu.Lock()
+			if !w.readDL.IsZero() {
+				readDL = fmt.Sprintf("%v from now", time.Until(w.readDL).Round(time.Millisecond))
+			}
+			w.dmu.Unlock()
+		}
+		fmt.Fprintf(&b, "  cid=%d id=%q transport=%s connected=%v keepalive=%ds readDeadline=%s closed=%v age=%v\n",
+			c.cid, id, transport, connected, ka, readDL, c.isClosed(), age.Round(time.Millisecond))
+	}
+	return b.String()
+}
+
 func wsWaitClients(t testing.TB, s *Server, n int, within time.Duration) time.Duration {
 	t.Helper()
 	start := time.Now()
 	for wsClientCount(s) != n {
 		if time.Since(start) > within {
-			t.Fatalf("server holds %d connections after %v, want %d", wsClientCount(s), within, n)
+			t.Fatalf("server holds %d connections after %v, want %d:\n%s", wsClientCount(s), within, n, wsDescribeClients(s))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
