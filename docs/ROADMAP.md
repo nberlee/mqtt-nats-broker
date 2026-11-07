@@ -1681,6 +1681,12 @@ them in order where a later lint change depends on an earlier cleanup.
   outlasts a healthy shutdown, and the server is released only after shutdown completes.
   Done 2026-11-03 ([issue #168](https://github.com/nberlee/mqtt-nats-broker/issues/168)).
 
+- [x] Three more reds were test defects, each reproduced on demand: the peer-witness
+  recorder dropped a transition whose reply was lost though it landed, and now decides it
+  by its outcome record; the WebSocket Pong wait parsed a half-written frame as final; and
+  the three `MaxConn = 1` tests ran in parallel, where another test's dial to a reused port
+  took the one slot, so they run sequentially. Done 2026-11-07.
+
 ### NATS platform follow-ups
 
 - [x] Move the pin and the floor to nats-server 2.15.2 and the toolchain to Go 1.27; the

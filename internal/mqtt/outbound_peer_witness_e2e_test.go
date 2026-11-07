@@ -786,10 +786,21 @@ type testPeerLandedTransition struct {
 	closureSeqAtSnd uint64
 	// phase is the exchange phase the batch WROTE for the obligation (an exchange-moving batch).
 	phase mqttExchangePhase
+	// uncertain: the send has not returned, or returned an error, so the batch may or may not
+	// have landed. landed()
+	// keeps it only once the transition's own permanent outcome reads COMMITTED, and then seq is
+	// the highest sequence of the batch's messages it can read back — the outcome, and for a
+	// closing batch the closure it wrote — standing in for the batch acknowledgement it lost.
+	uncertain bool
 }
 
 // recordTransitions arms both brokers' transition seams to record every committed
 // transition that writes the generation's closure or moves the obligation's exchange.
+//
+// A send that returns an error is not proof the batch did not land: a reply lost under load
+// leaves a committed batch the broker settles from its outcome record. So every attempt is
+// recorded as uncertain before it is sent, confirmed when its send succeeds, and landed()
+// decides an unconfirmed one by that same record, never by the error or by its absence.
 func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountSessionManager) func() []testPeerLandedTransition {
 	t.Helper()
 	var mu sync.Mutex
@@ -820,11 +831,18 @@ func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountS
 					rec.closureAtSend, rec.closureSeqAtSnd = c, cseq
 				}
 			}
+			// Recorded as uncertain BEFORE the send: a batch whose reply is lost is readable in
+			// the store while send() is still waiting out its timeout, and a snapshot taken then
+			// must already see the attempt.
+			rec.uncertain = true
+			mu.Lock()
+			idx := len(landed)
+			landed = append(landed, rec)
+			mu.Unlock()
 			seq, err := send()
 			if err == nil {
-				rec.seq = seq
 				mu.Lock()
-				landed = append(landed, rec)
+				landed[idx].seq, landed[idx].uncertain = seq, false
 				mu.Unlock()
 			}
 			return seq, err
@@ -834,9 +852,35 @@ func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountS
 	arm("B", &asmB.jsa)
 	return func() []testPeerLandedTransition {
 		mu.Lock()
-		defer mu.Unlock()
-		return append([]testPeerLandedTransition(nil), landed...)
+		recs := append([]testPeerLandedTransition(nil), landed...)
+		mu.Unlock()
+		var out []testPeerLandedTransition
+		for _, rec := range recs {
+			if rec.uncertain {
+				o, oseq, st := w.liveJSA(asmA, asmB).loadTransitionOutcome(w.cid, w.epoch, rec.txn)
+				if st != mqttOutboundValid || o == nil || o.Verdict != mqttOutcomeCommitted {
+					continue
+				}
+				rec.seq, rec.uncertain = oseq, false
+				if rec.closure != nil {
+					if c, cseq, cst := w.liveJSA(asmA, asmB).loadGenClosure(w.cid, w.epoch, w.gen); cst == mqttOutboundValid && c != nil && c.Txn == rec.txn && cseq > rec.seq {
+						rec.seq = cseq
+					}
+				}
+			}
+			out = append(out, rec)
+		}
+		return out
 	}
+}
+
+// liveJSA is a JetStream assistant of a broker still running: the store is shared, so either
+// reads the same outcome, but a test may have shut one of them down.
+func (w *testPeerWorld) liveJSA(asmA, asmB *mqttAccountSessionManager) *mqttJSA {
+	if !w.sB.isShuttingDown() {
+		return &asmB.jsa
+	}
+	return &asmA.jsa
 }
 
 // A QoS 2 obligation whose PUBREC was taken on broker A is ended only UNDER THE DISCARDING CLOSURE

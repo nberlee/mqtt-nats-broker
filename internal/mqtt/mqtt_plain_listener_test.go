@@ -184,7 +184,9 @@ func TestMQTTPlainListenerClosedByBeginShutdown(t *testing.T) {
 // TestMQTTPlainListenerSharesMaxConn: MaxConn counts the clients of every listener, in
 // either admission order.
 func TestMQTTPlainListenerSharesMaxConn(t *testing.T) {
-	t.Parallel()
+	// Not parallel: with MaxConn = 1 any foreign connection decides the verdict, and a parallel
+	// test dialing an address its own stopped server freed can land on this server's reused
+	// ephemeral port and hold the one slot. Go never runs a sequential test beside parallel ones.
 	for _, plainFirst := range []bool{false, true} {
 		t.Run("plainFirst="+strconv.FormatBool(plainFirst), func(t *testing.T) {
 			m := testMQTTTLSMaterial(t)
@@ -230,7 +232,9 @@ func TestMQTTPlainListenerSharesMaxConn(t *testing.T) {
 // a CONNECT, is closed by the CONNECT deadline (not the much longer TLS timeout: the plaintext
 // listener never handshakes), and the admission slot it held is released.
 func TestMQTTPlainListenerConnectDeadline(t *testing.T) {
-	t.Parallel()
+	// Not parallel: with MaxConn = 1 any foreign connection decides the verdict, and a parallel
+	// test dialing an address its own stopped server freed can land on this server's reused
+	// ephemeral port and hold the one slot. Go never runs a sequential test beside parallel ones.
 	m := testMQTTTLSMaterial(t)
 	o := testMQTTPlainBesideTLSOptions(m)
 	o.MaxConn = 1

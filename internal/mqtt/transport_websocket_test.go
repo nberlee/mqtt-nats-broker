@@ -438,6 +438,29 @@ func (c *wsTestConn) currentWriteDL() time.Time {
 
 func (c *wsTestConn) frames(t testing.TB) []wsTestServerFrame {
 	t.Helper()
+	out, err := c.parseFrames()
+	if err != nil {
+		t.Fatalf("server output does not parse as whole frames: %v", err)
+	}
+	return out
+}
+
+// wholeFramesSoFar is the frames written in full so far, for a wait that polls while the
+// writer may be between the two writes of one frame (net.Buffers writes header and payload
+// separately on this conn). A truncated tail is "not yet", never a verdict: the final
+// assertion reads frames, which refuses one.
+func (c *wsTestConn) wholeFramesSoFar(t testing.TB) int {
+	t.Helper()
+	out, err := c.parseFrames()
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("server output does not parse as frames: %v", err)
+	}
+	return len(out)
+}
+
+// parseFrames reads the server output as frames, returning the whole ones and the error that
+// stopped it, if any.
+func (c *wsTestConn) parseFrames() ([]wsTestServerFrame, error) {
 	c.mu.Lock()
 	r := bytes.NewReader(c.out.Bytes())
 	c.mu.Unlock()
@@ -445,11 +468,11 @@ func (c *wsTestConn) frames(t testing.TB) []wsTestServerFrame {
 	for r.Len() > 0 {
 		f, err := wsTestReadServerFrame(r)
 		if err != nil {
-			t.Fatalf("server output does not parse as whole frames: %v", err)
+			return out, err
 		}
 		out = append(out, f)
 	}
-	return out
+	return out, nil
 }
 
 // holdPayload gates the next write that is exactly payload p.
@@ -488,7 +511,7 @@ func TestWSConnPongWaitsForAHalfWrittenFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for len(tc.frames(t)) < 2 && time.Now().Before(deadline) {
+	for tc.wholeFramesSoFar(t) < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	fs := tc.frames(t)

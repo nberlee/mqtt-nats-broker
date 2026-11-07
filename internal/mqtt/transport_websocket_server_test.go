@@ -859,7 +859,9 @@ func TestWSShutdownAtEverySetupStage(t *testing.T) {
 
 // MaxConn bounds both listeners together.
 func TestWSMaxConnCountsBothListeners(t *testing.T) {
-	t.Parallel()
+	// Not parallel: with MaxConn = 1 any foreign connection decides the verdict, and a parallel
+	// test dialing an address its own stopped server freed can land on this server's reused
+	// ephemeral port and hold the one slot. Go never runs a sequential test beside parallel ones.
 	tcp, wsAddr, _ := startWSBroker(t, func(o *Options) { o.MaxConn = 1 })
 	wsPahoClient(t, tcp, "only-one", true, nil)
 	if c, err := wsTestDialErr(wsAddr); err == nil {
