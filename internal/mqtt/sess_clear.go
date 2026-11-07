@@ -706,6 +706,10 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 		// does with no gate from the expiry path and the sweep.
 		if onRetirementDurable != nil {
 			onRetirementDurable()
+			// The gate is released: from here no CONNECT waits on this teardown's hold walk, so
+			// it runs narrower rather than competing with every CONNECT (see
+			// mqttQoS2DiscardWalkWidthReleased).
+			target.holdWalkWidth = mqttQoS2DiscardWalkWidthReleased
 			if h := mqttTestTeardownGateReleasedHookV.Load(); h != nil {
 				if herr := (*h)(sess); herr != nil {
 					return herr

@@ -337,7 +337,7 @@ func TestQoS2DiscardArbitrationUsesTheBoundedWalk(t *testing.T) {
 
 		go func() {
 			defer close(done)
-			walkErr = e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen)
+			walkErr = e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth)
 		}()
 		// Registered after the env, so it runs before the env's own shutdown.
 		t.Cleanup(func() {
@@ -394,7 +394,7 @@ func TestQoS2DiscardArbitrationUsesTheBoundedWalk(t *testing.T) {
 		}
 		e.asm.mu.Unlock()
 
-		err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen)
+		err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth)
 		if !errors.Is(err, errInjected) {
 			t.Fatalf("arbitrateQoS2ReleaseClaims error = %v, want one wrapping %v", err, errInjected)
 		}
@@ -454,7 +454,7 @@ func TestQoS2DiscardWalkUnderReleasingClaims(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 	}
 	mu.Lock()
@@ -478,6 +478,52 @@ func TestQoS2DiscardWalkUnderReleasingClaims(t *testing.T) {
 		}
 		if cur, _ := e.loadClaim(t, h); cur == nil || cur.State != mqttQoS2RelStateReleasing {
 			t.Fatalf("claim on %q = %+v, want the releaser's claim left standing", h, cur)
+		}
+	}
+}
+
+// TestQoS2ReleasedWidthWalkPreservesContestedHoldsPastTheDeadline pins the narrower walk's cost
+// and its safety. Nine holds whose release is in flight on a peer, ordered before twenty
+// uncontested ones, are walked at mqttQoS2DiscardWalkWidthReleased: eight of them occupy every
+// slot until the walk's one release-wait deadline, so the ninth gets none of it. Every contested
+// hold is PRESERVED with its releaser's claim standing (left to the orphan sweep, never destroyed
+// under a live release), every uncontested hold is still discarded, and the walk returns nil.
+func TestQoS2ReleasedWidthWalkPreservesContestedHoldsPastTheDeadline(t *testing.T) {
+	t.Parallel()
+	if mqttQoS2DiscardWalkWidthReleased >= 9 {
+		t.Fatalf("mqttQoS2DiscardWalkWidthReleased = %d: the fixture needs more contested holds than slots", mqttQoS2DiscardWalkWidthReleased)
+	}
+	e := testNewRelClaimEnv(t, "walk-released-deadline")
+	holds, _ := testWalkHolds(t, e, 29)
+	contested, uncontested := holds[:9], holds[9:]
+	for _, h := range contested {
+		e.putClaim(t, h, mqttNewQoS2RelClaim(mqttQoS2RelStateReleasing, nuid.Next(), "peer", 0))
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidthReleased)
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(testWalkWatchdog):
+		t.Fatal("the walk did not return: its release waits are not bounded by the deadline")
+	}
+	if err != nil {
+		t.Fatalf("arbitrateQoS2ReleaseClaims: %v (an expired release wait preserves its hold; it is not an error)", err)
+	}
+	for _, h := range contested {
+		if !e.holdPresent(t, h) {
+			t.Fatalf("hold %q was destroyed under a standing releasing claim", h)
+		}
+		if cur, _ := e.loadClaim(t, h); cur == nil || cur.State != mqttQoS2RelStateReleasing {
+			t.Fatalf("claim on %q = %+v, want the releaser's claim left standing", h, cur)
+		}
+	}
+	for _, h := range uncontested {
+		if e.holdPresent(t, h) {
+			t.Fatalf("uncontested hold %q survived the walk", h)
 		}
 	}
 }

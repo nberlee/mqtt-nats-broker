@@ -323,6 +323,10 @@ func (c *client) mqttConnectTrace(cp *mqttConnectProto) string {
 // Runs from the client's readLoop.
 // No lock held on entry.
 func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool) (connErr error) {
+	// Where this CONNECT spends its time. Registered FIRST so it reports LAST, after every
+	// deferred cleanup, with the final error (read through the closure, not at defer time).
+	tl := newMQTTConnectTimeline(time.Now)
+	defer func() { mqttReportConnectTimeline(c, tl, connErr) }()
 	sendConnAck := func(rc byte, sessp bool, reasonStr string) bool {
 		// A delivered success CONNACK is recorded by mqttWriteConnAckFrame itself,
 		// under the same c.mu hold as the write, so a concurrent takeover
@@ -371,6 +375,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// certAsm is the account the refusal certifier reports to a test seam through, once known.
 	var certAsm *mqttAccountSessionManager
 	defer func() {
+		tl.cleanup("abandon")
 		if owedAbandon != nil && connErr != nil {
 			owedAbandon()
 		}
@@ -383,6 +388,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// is left to its caller, which owes the client a v5 DISCONNECT with the reason and then
 	// closes through closeConnection, which certifies; sealing here would suppress that DISCONNECT.
 	defer func() {
+		tl.cleanup("certify")
 		if connErr == nil {
 			return
 		}
@@ -401,6 +407,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 			}
 		}
 	}()
+	tl.begin("authorize")
 	if refusal, ok := s.authorizeClient(c); !ok {
 		// Tell the client which refusal it was before the close (issue #65): 3.1.1 [3.1.4] says
 		// the Server SHOULD, 5.0 [3.1.4] that it MAY. sendConnAck traces it only if written.
@@ -442,6 +449,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// Get the account's level MQTT sessions manager. If it does not exists yet,
 	// this will create it along with the streams where sessions and messages
 	// are stored.
+	tl.begin("account")
 	asm, err := s.getOrCreateMQTTAccountSessionManager(c)
 	certAsm = asm
 	if err != nil {
@@ -513,6 +521,7 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	// add the client ID to a "locked" map so that the connect somewhere else
 	// is put on hold until its holder releases it. See sess_gate_wait.go.
 	waited := false
+	tl.begin("gate")
 
 CHECK:
 	asm.mu.Lock()
@@ -585,6 +594,7 @@ CHECK:
 	// goroutine; here it simply runs at the end, on this readLoop. issue #86.
 	var connTail func()
 	defer func() {
+		tl.cleanup("conn-tail")
 		if connTail != nil {
 			connTail()
 		}
@@ -594,6 +604,7 @@ CHECK:
 	asm.sessLocked[cid] = struct{}{}
 	// And remove it on exit, regardless of error or not.
 	defer func() {
+		tl.cleanup("gate-release")
 		asm.mu.Lock()
 		asm.releaseSessGateLocked(cid)
 		// The resident session, read in the same critical section as the release, for the
@@ -671,6 +682,7 @@ CHECK:
 	// HELD, so nothing rebinds between the disposal and the Will it owes. issue #86.
 	var connWillPhase func()
 	defer func() {
+		tl.cleanup("will")
 		if connWillPhase != nil {
 			connWillPhase()
 		}
@@ -757,7 +769,10 @@ CHECK:
 		registerDisposalPhases(func() { d.applyWill(target, asm) }, tail)
 	}
 
-	defer endAcceptTx()
+	defer func() {
+		tl.cleanup("accept-tx")
+		endAcceptTx()
+	}()
 
 	// The ownership budget was constructed above the client-ID gate; see ownBudget there.
 	// The authority-step re-attempt allowance, per CONNECT and for the same reason: every drive
@@ -791,6 +806,7 @@ CHECK:
 	// that read too: carried over, they would report a session present that the second
 	// pass discarded, and re-send deliveries belonging to a dead incarnation.
 restoreSession:
+	tl.begin("session")
 	// SETTLE ANY STANDING OWNERSHIP PROPOSAL FIRST, before the restore, the uncertain-record
 	// resolution, the retirement and the clean-start block (issue #107 8a). Each of those may destroy
 	// or re-propose over what a crashed or concurrent acceptance left mid-flight — a committed
@@ -1490,6 +1506,7 @@ restoreSession:
 			// backing-resource targets ride the discarding handoff's closing batch (issue #107 row 9).
 			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
 		}
+		tl.begin("ownership")
 		ogen, otenure, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
 			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK, stepAllow, ownState)
 		// A REFUSAL THAT LEAVES THIS ACCEPTANCE'S OWN ABORTED PROPOSAL STANDING owes its
@@ -1629,6 +1646,7 @@ restoreSession:
 	// register"). Cleanup ownership stays partitioned; classification runs before any physical
 	// delete (Codex consult 6). See sess_teardown_partition.go.
 	if cleanStartHandoff {
+		tl.begin("predecessor")
 		// The finalization committed the predecessor's discarding closure: its retirement is the
 		// recovery executor's, promptly (issue #107 7d).
 		asm.kickRecoveryRoot(cid, asm.sessStreamEpoch, cshRetiringGen)
@@ -1663,6 +1681,7 @@ restoreSession:
 	// checked against its group. A refusal — superseded by a newer tenure, a generation being
 	// closed, an unreadable fact or ledger — refuses the CONNECT before the CONNACK, as every
 	// other pre-CONNACK disposition does.
+	tl.begin("tenure")
 	es.mu.Lock()
 	servingTenure := es.boundEnt.Tenure
 	es.mu.Unlock()
@@ -1674,6 +1693,7 @@ restoreSession:
 		asm.removeSession(es, true)
 		return ierr
 	}
+	tl.begin("bind")
 	// The connection is now accepted, and the permanent fact of that acceptance is
 	// durable with it. NOTHING further is done here to suppress a prior delayed Will,
 	// and the two writes that used to be are both gone:
@@ -1837,6 +1857,7 @@ restoreSession:
 	// An abandoned verdict is left installed on purpose, so the next arm is the
 	// only thing that replaces it: arming conditionally would leave a reused
 	// session object's later live subscriptions behind a dead verdict forever.
+	tl.begin("resume")
 	es.armRestoreGate()
 	// The recovery-reservation releases this resume's register walk staged, held FRAME-LOCAL
 	// until the resume has actually succeeded. Recovery runs long before the success
@@ -1888,7 +1909,10 @@ restoreSession:
 		}
 		phaseSubs = r.installed
 		if len(phaseSubs) > 0 {
-			defer es.sweepUnadoptedPhaseSubs(c, phaseSubs)
+			defer func() {
+				tl.cleanup("phase-subs")
+				es.sweepUnadoptedPhaseSubs(c, phaseSubs)
+			}()
 		}
 	}
 
@@ -2031,6 +2055,9 @@ restoreSession:
 			refuseRestore(serr)
 			return formatError(serr)
 		}
+		// The subscriptions are restored; what follows is the checks and writes before the
+		// CONNACK — the shared groups' post-pass, the membership ownership CAS.
+		tl.begin("finish")
 		// A record write the restore made was refused by its per-subject CAS. Until this
 		// path wrote nothing there was nothing to report and the bit was never read here;
 		// the restore-side drain conversion and the teardowns behind it are record writes,
@@ -2165,6 +2192,7 @@ restoreSession:
 			return formatError(rerr)
 		}
 	}
+	tl.beginUnlessOpen("finish")
 	mqttTestRestorePauseHook("before-connack")
 
 	// PREFLIGHT the shared memberships a 3.1.1 resume is about to force-leave, BEFORE the
@@ -2256,6 +2284,7 @@ restoreSession:
 		abortAcceptedResume()
 		return fmt.Errorf("unable to deliver the success CONNACK")
 	}
+	tl.connAck()
 	mqttTestRestorePauseHook("before-open")
 
 	// The restore verdict does NOT open here, and the delay is deliberate.

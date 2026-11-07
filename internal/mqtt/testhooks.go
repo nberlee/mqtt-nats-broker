@@ -459,3 +459,11 @@ var mqttTestRetainedFlushBlockV atomic.Pointer[func([]*subscription)]
 // may already have been delivered, whose response was lost — which the pre-store
 // hook cannot model at all, since it prevents the store from happening.
 var mqttTestStoreMsgResultHookV atomic.Pointer[func(subject string, resp *JSPubAckResponse, err error) (*JSPubAckResponse, error)]
+
+// mqttTestSlowConnectThresholdV, when set, replaces mqttSlowConnectThreshold, so a test decides
+// which CONNECTs are reported without depending on host load. nil in production.
+var mqttTestSlowConnectThresholdV atomic.Pointer[time.Duration]
+
+// mqttTestConnectReportHookV is called by every CONNECT's timeline reporter at its return, with
+// the rendered line and whether it was logged. nil in production.
+var mqttTestConnectReportHookV atomic.Pointer[func(clientID, line string, slow bool)]

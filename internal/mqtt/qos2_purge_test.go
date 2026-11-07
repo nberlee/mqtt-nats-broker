@@ -125,7 +125,7 @@ func TestSessionClearPurgesQoS2Hold(t *testing.T) {
 	// This is the arbitration walk now, and it is scoped by the retired generation, so it
 	// cannot name the NEW incarnation's subjects. (A peer still serving the retiring
 	// generation is a different matter: issue #66.)
-	if err := asm.arbitrateQoS2ReleaseClaims(s, sess.idHash, retiringGen); err != nil {
+	if err := asm.arbitrateQoS2ReleaseClaims(s, sess.idHash, retiringGen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("replaying the retired incarnation's arbitration: %v", err)
 	}
 	if stored, err = sess2.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, subject2); err != nil {

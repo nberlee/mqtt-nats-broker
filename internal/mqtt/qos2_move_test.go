@@ -1692,7 +1692,7 @@ func TestQoS2InEveryWriteCarriesItsExpectation(t *testing.T) {
 	cl.mqtt.sess.mu.Lock()
 	idHash, gen := cl.mqtt.sess.idHash, cl.mqtt.sess.gen
 	cl.mqtt.sess.mu.Unlock()
-	if err := b.asm.arbitrateQoS2ReleaseClaims(b.s, idHash, gen); err != nil {
+	if err := b.asm.arbitrateQoS2ReleaseClaims(b.s, idHash, gen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 	}
 }

@@ -93,13 +93,18 @@ type mqttSessTeardown struct {
 // generation's sealed acquisition ledger (closeSharedGeneration), never from a list a
 // teardown object derived from its own membership.
 type mqttTeardownTarget struct {
-	id        string
-	idHash    string
-	gen       string
-	durs      []string // plain (and drain) durables on $MQTT_msgs
-	pubRelDur string
-	q2AffGen  string
-	q2AffDur  string
+	id     string
+	idHash string
+	gen    string
+	// holdWalkWidth is how many inbound QoS 2 hold arbitrations the walk keeps in flight; zero
+	// means mqttQoS2DiscardWalkWidth. Only a clean close's continuation sets it, to
+	// mqttQoS2DiscardWalkWidthReleased, once its gate is released: from then no CONNECT waits on
+	// this walk, and a wide one only competes with every other CONNECT's requests.
+	holdWalkWidth int
+	durs          []string // plain (and drain) durables on $MQTT_msgs
+	pubRelDur     string
+	q2AffGen      string
+	q2AffDur      string
 	// deferAffineDelete transfers this generation's affine consumer to the recovery pass
 	// (issue #107, row 8). Set ONLY by the teardown's own classification, and only where that
 	// generation's closure DISCARDS and its affine target is enrolled with both a resource
@@ -988,7 +993,11 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// direction is stated once, in issue #40 and issue #66 (https://github.com/nberlee/mqtt-nats-broker/issues/131); this
 	// paragraph covers neither.
 	if sess.asm != nil {
-		if err := sess.asm.arbitrateQoS2ReleaseClaims(sess.asm.server(), t.idHash, t.gen); err != nil {
+		width := t.holdWalkWidth
+		if width == 0 {
+			width = mqttQoS2DiscardWalkWidth
+		}
+		if err := sess.asm.arbitrateQoS2ReleaseClaims(sess.asm.server(), t.idHash, t.gen, width); err != nil {
 			return fmt.Errorf("unable to arbitrate the inbound QoS2 releases of session %q: %w", t.id, err)
 		}
 	}

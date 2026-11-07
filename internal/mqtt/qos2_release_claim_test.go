@@ -727,7 +727,7 @@ func TestQoS2DiscardArbitration(t *testing.T) {
 			holdSubject, holdSeq := e.hold(t, 1, nuid.Next(), "payload")
 			tc.setup(t, e, holdSubject, holdSeq)
 
-			err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen)
+			err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth)
 			if tc.wantErr != (err != nil) {
 				t.Fatalf("arbitrateQoS2ReleaseClaims error = %v, wantErr %v", err, tc.wantErr)
 			}
@@ -753,7 +753,7 @@ func TestQoS2DiscardArbitration(t *testing.T) {
 			return 0, fmt.Errorf("stream unavailable")
 		}
 		e.asm.mu.Unlock()
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err == nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err == nil {
 			t.Fatal("an unresolvable claim must fail the discard, not be reported as cleaned up")
 		}
 	})
@@ -783,7 +783,7 @@ func TestQoS2DiscardClaimsBeforePurging(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 	}
 	mu.Lock()
@@ -819,7 +819,7 @@ func TestQoS2DiscardReadsNoPayloads(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 	}
 	if n := loads.Load(); n != 0 {
@@ -1225,7 +1225,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 		}
 		e.asm.mu.Unlock()
 
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 			t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 		}
 		if lateSeq == 0 {
@@ -1276,7 +1276,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 		}
 		e.asm.mu.Unlock()
 
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 			t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 		}
 		if lateSeq == 0 {
@@ -1318,7 +1318,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 			t.Fatalf("this fixture needs the later hold above the marker's fence: %d <= %d", lateSeq, firstSeq)
 		}
 
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 			t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 		}
 		if got := e.holdSeqOf(t, holdSubject); got != lateSeq {
@@ -1349,7 +1349,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 		// The walk's State sample predates that hold; its Subjects sample includes it.
 		e.setSubjectsSeam(t, func(uint64) uint64 { return firstSeq })
 
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 			t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 		}
 		if got := e.holdSeqOf(t, holdSubject); got != aboveSeq {
@@ -1398,7 +1398,7 @@ func TestQoS2TeardownPurgeSparesAPostEnumerationHold(t *testing.T) {
 		// T1 enumerated earlier, below the hold, and now adopts T2's marker.
 		e.setSubjectsSeam(t, func(uint64) uint64 { return firstSeq })
 
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 			t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 		}
 		if got := e.holdSeqOf(t, holdSubject); got != 0 {
@@ -1444,7 +1444,7 @@ func TestQoS2DiscardZeroWatermarkWritesNoMarker(t *testing.T) {
 		}
 		e.asm.mu.Unlock()
 
-		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+		if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 			t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 		}
 		if samples < 2 {
@@ -1643,7 +1643,7 @@ func TestQoS2AwaitedReleaseDoesNotInheritAStaleClaimsEntitlement(t *testing.T) {
 	}
 	e.asm.mu.Unlock()
 
-	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v", err)
 	}
 	if reaped == 0 {
@@ -1703,7 +1703,7 @@ func TestQoS2DiscardRepairsAMaximalFenceMarker(t *testing.T) {
 	// TestQoS2RelClaimIdentityValidation; what THIS test measures is the repair.
 	//
 	// The walk must COMPLETE rather than fail the clear.
-	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen); err != nil {
+	if err := e.asm.arbitrateQoS2ReleaseClaims(e.s, e.sess.idHash, e.sess.gen, mqttQoS2DiscardWalkWidth); err != nil {
 		t.Fatalf("arbitrateQoS2ReleaseClaims: %v — a maximal fence must be repaired, not "+
 			"stranded; that error IS the permanent client-ID lockout this refusal exists to "+
 			"avoid, because every later adoption and sweep pass repeats it", err)

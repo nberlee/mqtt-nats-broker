@@ -707,7 +707,7 @@ func (as *mqttAccountSessionManager) reapQoS2RelClaim(claimSeq uint64) {
 // This is the ONLY thing a discard does to $MQTT_qos2in. There is no filter purge
 // beside it, and there must not be: one would destroy exactly what the arbitration
 // preserves.
-func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHash, gen string) error {
+func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHash, gen string, width int) error {
 	// Unreachable: a session without an incarnation generation cannot exist, since
 	// mqttSessGenFromRecord rejects a record that carries none. Kept as a guard, and
 	// deliberately NOT an error — a missing generation leaves records behind for the
@@ -746,7 +746,7 @@ func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHas
 	// commute. They run concurrently because this walk sits under the teardown that the next
 	// same-ID CONNECT waits for, and serially it cost two JS round trips per hold: a session
 	// at the default Receive Maximum discarded 1024 holds in about a second.
-	i, err := mqttWalkBounded(len(holds), mqttQoS2DiscardWalkWidth, func(i int) error {
+	i, err := mqttWalkBounded(len(holds), width, func(i int) error {
 		return as.discardQoS2Hold(s, holds[i], upTo, deadline)
 	})
 	if err != nil {
@@ -766,6 +766,18 @@ func (as *mqttAccountSessionManager) arbitrateQoS2ReleaseClaims(s *Server, idHas
 // latency. That headroom is a heuristic, not a measurement: replicated or remote servers and
 // simultaneous teardowns were not measured.
 const mqttQoS2DiscardWalkWidth = 32
+
+// mqttQoS2DiscardWalkWidthReleased is the walk's width once a clean close has released the
+// client-ID gate (destroyReleasing): no CONNECT waits on the walk then, and the width above only
+// makes it compete with every other CONNECT's JetStream requests. Measured on one rig (single-node
+// file store on NFS with sync_interval: always, 1024 holds, three interleaved runs): the walk took
+// the same time at 8 as at 32 (it is server-bound, about 1.3 s), the CONNECTs made during it fell
+// from a mean of about 115 ms to about 93 ms (idle about 90-100 ms), and a graceful shutdown during
+// it took about 6% longer. PROVISIONAL: one rig; replicated and remote stores were not measured.
+// The cost: holds whose release is in flight on a peer share the walk's one release-wait deadline,
+// so with 8 of them occupying every slot, later ones get less of it and are preserved for the
+// orphan sweep rather than resolved here.
+const mqttQoS2DiscardWalkWidthReleased = 8
 
 // mqttWalkBounded calls visit(i) for every i in [0, n), admitting them in index order with at
 // most width in flight, and returns the LOWEST failing index with its error, or (-1, nil). It

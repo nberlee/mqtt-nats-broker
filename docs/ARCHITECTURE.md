@@ -3383,8 +3383,10 @@ so it is load-bearing rather than an optimisation.
 (`arbitrateQoS2ReleaseClaims`) runs under the teardown that a later CONNECT for the same
 client ID waits for, so its duration is the CONNACK latency of that client's reconnect.
 Each hold is its own arbitration over its own hold subject and claim sibling, so the walk
-hands them to `mqttWalkBounded`, at most `mqttQoS2DiscardWalkWidth` (32) at once. Every
-per-hold decision above is unchanged:
+hands them to `mqttWalkBounded`, at most `mqttQoS2DiscardWalkWidth` (32) at once. A clean
+close's continuation that has already released the client-ID gate walks narrower, at
+`mqttQoS2DiscardWalkWidthReleased` (8): see "A clean close releases the client-ID gate once
+its retirement is durably owned". Every per-hold decision above is unchanged:
 
 - the claim still strictly precedes the purge;
 - every hold shares the one enumeration watermark;
@@ -9253,6 +9255,26 @@ batch's record CAS at that exact sequence, the authority's reservation CAS and t
 permanent metadata slot arbitrate it: a continuation that released the record first makes
 the CAS fail and the CONNECT re-drives into a record-absent create. Anything short of the
 five facts, or an undecidable read, keeps the inline adoption.
+
+**The continuation's hold walk runs narrower once the gate is released.** From the
+release no CONNECT waits on that walk, so its width no longer shortens anyone's
+CONNACK and only makes it compete with every other CONNECT's JetStream requests.
+`destroyReleasing` sets the target's walk width to `mqttQoS2DiscardWalkWidthReleased`
+(8) right after the release; every teardown that keeps the gate to its end — session
+expiry's plain `destroy`, a receiptless teardown, an inline adoption, the orphan
+sweep's — keeps `mqttQoS2DiscardWalkWidth` (32). This bounds ONE invocation, not the
+generation's cleanup: an adopter or the sweep may walk the same generation at 32
+beside it. Measured on one rig (a single-node file store on NFS syncing every write,
+1024 holds, three interleaved runs): the walk took the same time at 8 as at 32, about
+1.3 s, because it is server-bound; the CONNECTs made after the disconnect fell from a
+mean of about 115 ms to about 93 ms (idle is about 90–100 ms), and with two such walks
+overlapping from about 149 ms to about 107 ms; a graceful shutdown during the walk
+took about 6% longer. The width is provisional: replicated and remote stores were not
+measured. Its cost is on holds whose release is in flight on a peer: they share the
+walk's one release-wait deadline, and with eight of them occupying every slot, later
+ones get less of it and are preserved for the orphan sweep rather than resolved by the
+walk (`TestQoS2ReleasedWidthWalkPreservesContestedHoldsPastTheDeadline`). The walk
+still returns nil, and uncontested holds are still purged.
 
 **After a crash in the continuation** the predecessor's consumers and exchanges are its
 recovery executor's, and its inbound QoS 2 holds and remaining registers are the orphan
@@ -15176,6 +15198,31 @@ reported. Counts and bytes are deterministic and are what a request reduction is
 overlap is judged by the committed hold tests; latency and wall time are descriptive. Session
 recovery's counts are descriptive too: whether an exclusion-reclaim pass lands inside a round
 varies with its backoff.
+
+### A slow CONNECT names its steps
+
+When a CONNECT takes `mqttSlowConnectThreshold` (250 ms) or longer to its success
+CONNACK — or to its return, when it wrote none — the broker logs one WARN line naming
+where the time went (`internal/mqtt/connect_timeline.go`). `mqttProcessConnect` begins
+a span at the entry of each step: `admit`, `authorize`, `account` (the account manager
+and its streams), `gate` (the client-ID gate and the flapper jail), `session` (the
+record load and restore, numbered `session#2` on a re-drive), `ownership` (each
+ownership drive, numbered per attempt), `predecessor` (a clean-start handoff's
+predecessor cleanup), `tenure` (minting and installing the acceptance tenure), `bind`,
+`resume` (register recovery, consumer reconciliation and subscription restore),
+`finish` (from the restored subscriptions to the CONNACK: the shared groups' post-pass,
+the membership ownership CAS and the other checks and writes) and, after the CONNACK,
+`after-connack`. Every deferred cleanup is its own `cleanup:<name>` span, and the body
+step the function returned from is marked, with "(failed here)" when it returned an
+error. The reporter is the function's first defer, so it runs last and reads the final
+error.
+
+The line is diagnostic text, not part of the operational interface: its wording and
+fields may change until §1 "Operational interface" freezes what operators alert on.
+The threshold is provisional — below the Paho suite's 0.3 s CONNACK window and above
+the ≈100 ms a clean-start CONNECT measured on a store that syncs every write. The line
+explains a slow CONNECT after the fact; it does not warn before a client's timeout,
+and its clock starts once the CONNECT packet is parsed.
 
 ## JetStream domain
 

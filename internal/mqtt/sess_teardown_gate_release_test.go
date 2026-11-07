@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -295,6 +296,7 @@ func TestMQTTCleanStartRedrivesWhenPredecessorReleasesFirst(t *testing.T) {
 
 	pred.c.Close()
 	park.waitParked(t)
+	reports := testCaptureConnectReport(t, id)
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	t.Cleanup(func() { c2.Close() })
 	select {
@@ -322,6 +324,10 @@ func TestMQTTCleanStartRedrivesWhenPredecessorReleasesFirst(t *testing.T) {
 	rec, _ := testCleanStartRecord(t, asm, pred.hash)
 	if rec == nil || rec.Teardown != nil || rec.Gen != succGen || succGen == pred.gen {
 		t.Fatalf("the successor's record is %+v, want its own fresh generation %q unmarked", rec, succGen)
+	}
+	// The re-drive is visible in the successor's timeline: its restore ran twice.
+	if rep := testAwaitConnectReport(t, reports); !strings.Contains(rep.line, " session#2 ") {
+		t.Fatalf("the successor's timeline shows no re-driven restore: %s", rep.line)
 	}
 }
 

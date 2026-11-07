@@ -1644,6 +1644,17 @@ them in order where a later lint change depends on an earlier cleanup.
   [#175](https://github.com/nberlee/mqtt-nats-broker/issues/175),
   [#176](https://github.com/nberlee/mqtt-nats-broker/issues/176)).
 
+- [x] A slow CONNECT names its steps: a CONNECT reaching 250 ms to its CONNACK logs one
+  diagnostic line with every step's duration. A clean close's continuation walks its
+  inbound QoS 2 holds at a provisional width of 8 once the gate is released, which cut
+  the measured CONNECT slowdown during a predecessor's reclamation; adopters and the
+  sweep keep width 32 (`docs/ARCHITECTURE.md`). Done 2026-11-07.
+
+- [ ] Overlap a clean-start CONNECT's independent JetStream reads. Its requests run one
+  at a time (about 22 reads beside three durable commits); the reads that do not depend
+  on each other can be issued together, shortening the CONNECT on slow storage and the
+  number of serial waits a stalled store can hit.
+
 ### Connection close
 
 - [x] Carry the error-DISCONNECT linger to the inbound-pipeline worker's failure arm, by
