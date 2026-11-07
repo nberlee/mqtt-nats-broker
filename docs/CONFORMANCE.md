@@ -6048,6 +6048,27 @@ the compatibility boundary (no released contract exists for either):
   `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
   every other broker-owned stream.
 
+### Cross-version coexistence is excluded by procedure, not detected
+
+The broker-to-broker protocol is versioned by the persisted format's key (see "The
+broker-to-broker protocol" in `docs/ARCHITECTURE.md`), and the version lives on the store,
+not on the brokers. What follows from that, stated rather than implied:
+
+- **A running broker never re-reads the stamp.** The format is checked at account-manager
+  initialization, like every stream prerequisite above, so a bundle converted or reset
+  beneath a running broker is not detected by that broker. Stopping every broker on the
+  account before a conversion or reset is the prerequisite, as it is for any
+  post-initialization mutation.
+- **No broker is told a peer's version.** Two releases that carry the same version while
+  their decision rules or live envelope have diverged are not detected at all: the rule
+  that such a change bumps the version is a release discipline. The channel census
+  (`broker_protocol_channels_test.go`) proves only that every direct use of a nats.go
+  function or method in the default production build is classified and that the header
+  and naming vocabulary is the documented one.
+- **A live publication carries no version.** A broker refused at initialization serves no
+  connection and so publishes nothing, but nothing on the wire says which version wrote a
+  live `Nmqtt-*` envelope.
+
 ### A resumed shared subscription proves its group durable, repairs it, and arbitrates
 
 A resume verifies the JetStream group durable behind every shared subscription whose

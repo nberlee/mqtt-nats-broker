@@ -62,7 +62,8 @@ weighing what compatibility would cost to build against how destructive the brea
 an operator (a refusal with recreate guidance, a purge, a migration). What makes later
 compatibility possible is in place by the first release, though: versions on the
 persisted format (in place: see "The persisted format" below) and the broker-to-broker
-records, a checked NATS floor, and frozen
+records (in place, the same version: see "The broker-to-broker protocol" below),
+a checked NATS floor, and frozen
 configuration, permission and operational interfaces (`docs/ROADMAP.md` §1, "Contracts in
 place by the first release"). **Beta** keeps those contracts: compatibility is guaranteed
 within them from then on, and this section is rewritten as that contract when beta is
@@ -113,7 +114,8 @@ written in: `mqtt_nats_broker_format`, beside the recovery epoch. This build wri
 reads format `1` and nothing else (`mqttStoreFormat`, `internal/mqtt/mqtt.go`). The value
 is compared by string equality and never parsed or ordered: a broker cannot know whether a
 format it does not implement is compatible with its own, and an ordering invites a "higher
-is compatible" shortcut.
+is compatible" shortcut. The same value versions the broker-to-broker protocol (see "The
+broker-to-broker protocol" below).
 
 **Why a key of its own, not the epoch.** The epoch says which *incarnation* of the bundle
 a stream belongs to and is compared for equality wherever a sequence is used as an
@@ -199,6 +201,117 @@ later nats-server opens the floor version's store is nats-server's own contract 
 a format verdict. `make store-format-fixture` regenerates the current format's fixture,
 and its `README` records the commit, the nats-server module version, the scenario and
 every file's digest.
+
+### The broker-to-broker protocol
+
+The brokers of one deployment never address each other: there is no presence record, no
+broker identity a peer looks up, and no request one broker answers for another. They meet
+on the account, and everything one broker writes, publishes or names that a peer reads or
+acts on is the **broker-to-broker protocol**:
+
+- **the store**, exactly as "The persisted format" defines it: every coordination record
+  on the ten streams (session records and acceptance facts, the Will outbox, teardown
+  watermarks and receipts, the QoS 2 move and release claims, assignment claims, in-flight
+  registers and unsent markers, the shared group records and acquisition ledgers, the
+  outbound authority's records), consumer names and metadata, and the deliver subjects
+  the consumers publish to;
+- **the decision rules** each broker applies to records a peer wrote: which record
+  arbitrates what, who owns an obligation, what licenses a destructive act, the timing
+  relations (the Will outbox's publish lease, `owner`/`until`, is a cross-broker
+  wall-clock lease; the incarnation completion lease in `sess_lease.go` is in-process and
+  not part of the protocol), and how recovery reads what a crashed peer left;
+- **the live publication**: each issuance of an accepted MQTT PUBLISH is published on its
+  user subject over core NATS (`mqttFanOut`, from `mqttIssuePublication`), and every peer
+  whose client subscribed to it reads the `Nmqtt-*` envelope (`mqttDeliverMsgCbQoS0`, and
+  the shared raw QoS 0 queue subscription). An issuance can repeat — a QoS 2 PUBREL
+  retried after its terminal commit failed issues the publication again — so the live
+  fan-out is at-least-once there (`docs/CONFORMANCE.md`, "Inbound QoS 2 PUBREL is
+  at-least-once across the unresolved move interval"). A non-retained QoS 0 publication
+  has no other copy: this channel is broker-to-broker and nothing stores it. One live
+  publication takes another route: a retained Sparkplug NBIRTH or DBIRTH's derived
+  certificate publication (`$sparkplug/certificates/...`, `mqttHandlePubRetain`) is sent
+  through the JSA queue (`jsa.sendMsg`) as a bare payload with no `Nmqtt-*` envelope,
+  and a peer reads it as it reads any publication without one;
+- **the names** peers must derive identically: delivery subjects, the shared queue group
+  (`$mqttshare.`), consumer durables, and the MQTT-topic-to-subject mapping.
+
+Outside it, because they are exchanges with the backend rather than with a peer: the JSA
+transport (`processInboundClientMsg`) — JetStream API requests and their
+`$MQTT.JSA.<node id>.*` replies, consumer acknowledgements and confirmed acknowledgements,
+and store publications — as transport mechanics, while the payloads, names and decision
+rules it carries are protocol, and so is the derived Sparkplug publication it also
+carries; the startup JetStream probe (`internal/backend`,
+`$MQTT.inbox.>`); and the identity query on `$SYS.REQ.USER.INFO` (`authz_identity.go`).
+Those are governed by the NATS floor and the permission contract.
+
+The `Nmqtt-*` headers, each with where it is carried (a header written into the live
+envelope is stored with it on `$MQTT_msgs`):
+
+| Header | Carried on | Meaning |
+|---|---|---|
+| `Nmqtt-Pub` | live publication, `$MQTT_msgs`, the QoS 2 HOLD on `$MQTT_qos2in`, the affine copy on `$MQTT_out` | the message came from MQTT; its value is the QoS |
+| `Nmqtt-NoLocal` | live publication, `$MQTT_msgs`, HOLD | the No Local stamp taken at ownership; verifiable only by the run that wrote it |
+| `Nmqtt-Ret` | live publication, `$MQTT_msgs`, HOLD, affine copy | published with RETAIN, for Retain As Published |
+| `Nmqtt-Props` | live publication, `$MQTT_msgs`, HOLD, affine copy | the MQTT 5.0 PUBLISH properties, base64 |
+| `Nmqtt-Subject` | HOLD, affine copy | the original subject |
+| `Nmqtt-Mapped` | HOLD | the subject mapping applied at PUBLISH |
+| `Nmqtt-Q2Gen` | HOLD, the terminal tombstone on `$MQTT_qos2in` | the inbound exchange's immutable generation |
+| `Nmqtt-Q2Done` | terminal tombstone | the exchange ended; exactly `1` |
+| `Nmqtt-PubRel` | stored PUBREL on `$MQTT_out` | the packet identifier the PUBREL completes |
+| `Nmqtt-Q2SrcDur` | stored PUBREL | the source delivery's durable |
+| `Nmqtt-Q2SrcSeq` | stored PUBREL | the source delivery's stream sequence |
+| `Nmqtt-Q2Owner` | stored PUBREL | the outbound exchange nonce; mandatory |
+| `Nmqtt-Q2AffClaim` | stored PUBREL | the affine assignment claim answered |
+| `Nmqtt-Q2AffCopy` | stored PUBREL | the affine copy subject delivered |
+| `Nmqtt-Q2Claim` | affine copy | the claim that authorizes the copy |
+| `Nmqtt-Q2Aff` | affine copy | the winning session generation |
+| `Nmqtt-SubId` | affine copy | the MQTT 5.0 Subscription Identifier decided at move time |
+| `Nmqtt-RTopic` | retained record on `$MQTT_rmsgs` | the MQTT topic |
+| `Nmqtt-ROrigin` | retained record | the JSA identity of the broker that stored it |
+| `Nmqtt-RFlags` | retained record | the PUBLISH flags |
+| `Nmqtt-RSource` | retained record | the publisher's user name |
+| `Nmqtt-RSession` | retained record | the publisher session's No Local origin marker |
+| `Nmqtt-RProps` | retained record | the MQTT 5.0 properties, base64 |
+| `Nmqtt-RExp` | retained record | the absolute expiry, Unix nanoseconds |
+
+**One version.** The persisted format's key, `mqtt_nats_broker_format`, is the protocol's
+version too. A second key would state a second fact that has to change with the first: a
+coordination rule is part of what a record means, and a live header is decoded by the same
+broker that decodes the stored copy beside it. Two keys invite the half-bump; one key on
+the carrier every broker already checks does not.
+
+**The predecessor rule**, effective from the first release: two releases carrying the same
+version **coexist in both directions** — concurrent writes, cleanup and decisions over each
+other's records, and each other's live publications. The additive rule in "The persisted
+format" extends to the decision rules and to the live envelope: a change an earlier broker
+of the same version would decide differently on, or a live header it would misread, is
+breaking and bumps the version, even when no record's encoding changes. A broker meeting a
+store stamped with another version refuses at initialization, whichever of the two
+releases is newer.
+
+**Across a bump, an offline transition.** Stop every broker on the account; convert the
+bundle (when that break ships a migration) or reset it; then start only brokers of the new
+version. No rolling upgrade crosses a version change. Alpha decides, per break, between a
+migration and a refusal with guidance; beta keeps its commitments (see "Release phases").
+
+**When the pre-release rule expires.** "A mixed fleet does not exist" holds until the first
+release. From the first release a mixed fleet exists **within one version**, and every
+change that keeps the version owes coexistence with its predecessor.
+
+**What enforces it, and what does not.** The initialization refusal enforces the version
+on the store. `broker_protocol_channels_test.go` holds the protocol's channels and
+vocabulary to this section: every nats.go function or method the default production build
+uses is classified, and every use that sends, subscribes or requests is a counted site
+with its channel; every live publication writer is censused — the two publish wrappers'
+callers, every direct reference to a member of the JSA queue's type outside
+`shim_small.go`, and every caller of its no-API send entry points with what it sends;
+the `Nmqtt-*` names in the code are exactly the table's; and the names above are pinned to
+literal values. It does not prove
+that two releases' decision rules agree, that a row's carrier or meaning is right, that a
+change inside `shim_small.go` or to the data flowing through an existing site is safe, or
+anything about a call routed through a broker-defined interface or reflection. What a
+running broker does not detect is stated in `docs/CONFORMANCE.md`, "Cross-version
+coexistence is excluded by procedure, not detected".
 
 ### Shared-subscription QoS boundary
 

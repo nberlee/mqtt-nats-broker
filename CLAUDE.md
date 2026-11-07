@@ -30,7 +30,10 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
   **alpha** still guarantees no version compatibility and decides each break case
   by case (what compatibility would cost to build against how destructive the
   break is for an operator); **beta** keeps the contracts and guarantees
-  compatibility within them. The contracts themselves (format and protocol
+  compatibility within them. From the first release a mixed fleet exists within
+  one format version, which is also the broker-to-broker protocol's version
+  (`docs/ARCHITECTURE.md`, "The broker-to-broker protocol").
+  The contracts themselves (format and protocol
   versions, the NATS floor, configuration, permissions, operational interface)
   are in place before the first release: `docs/ROADMAP.md` §1.
 

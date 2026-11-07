@@ -257,6 +257,9 @@ const (
 	// keeps the format, and a migration would change the format and keep the
 	// incarnation. Compared by string equality, never parsed or ordered — a broker
 	// cannot know whether a format it does not implement is compatible with its own.
+	// The same value versions the broker-to-broker protocol: the decision rules peers
+	// apply to each other's records, the live publication's Nmqtt-* envelope and the
+	// names peers derive (docs/ARCHITECTURE.md, "The broker-to-broker protocol").
 	mqttStoreFormatMetaKey = "mqtt_nats_broker_format"
 	mqttStoreFormat        = "1"
 

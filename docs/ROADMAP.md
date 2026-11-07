@@ -1447,11 +1447,11 @@ boundary's "no compatibility" rule stands, and this policy is written into it as
   (`internal/mqtt/testdata/storeformat/`, regenerated until format 1 freezes at the first
   release) are in `docs/ARCHITECTURE.md` "The persisted format". Done 2026-11-06.
 
-- [ ] **Broker-to-broker protocol.** A rolling upgrade of a multi-frontend deployment is
-  a mixed fleet on one store: version the coordination records (claims, leases, the
-  Will outbox, teardown, the reserved `$MQTT.>` subjects) and state the rule a release
-  keeps with its predecessor (coexist during an upgrade, or refuse cleanly). This
-  retires the "a mixed fleet does not exist" rule at the release it takes effect.
+- [x] **Broker-to-broker protocol.** `mqtt_nats_broker_format` versions the protocol too:
+  the store, peers' decision rules, the live `Nmqtt-*` envelope and derived names; same
+  version coexists, a bump is an offline transition; channels pinned by
+  `broker_protocol_channels_test.go` (`docs/ARCHITECTURE.md` "The broker-to-broker
+  protocol"). Done 2026-11-06.
 
 - [ ] **NATS dependency floor.** State the supported nats-server versions and JetStream
   API level and the required server settings, and check them at startup so an
