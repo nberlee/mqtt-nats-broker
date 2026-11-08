@@ -901,6 +901,13 @@ there below are recorded in it.
   lost; accepted as a latency residual in `docs/CONFORMANCE.md`, not fixed. Classified
   2026-11-02; [issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156).
 
+- [ ] Name the cause of the periodic `$MQTT_sess` JetStream API stalls a production
+  deployment logs: one request of about 3.3 s per broker per 15-minute sweep tick, and
+  past the 5 s request timeout they refuse CONNECTs. Broker access pattern or upstream
+  store is open; the evidence to collect (a cold-versus-warm read, a goroutine dump during
+  a stall) needs the deployment. Observed 2026-11-08
+  ([issue #179](https://github.com/nberlee/mqtt-nats-broker/issues/179)).
+
 ### 0.5 Small pre-alpha fixes
 
 Added 2026-10-26 at the user's request: three gaps `docs/CONFORMANCE.md` states that are
@@ -940,6 +947,15 @@ converge. An alpha blocker: the embedded StatefulSet is a supported deployment.
   budget (decided against), and `/healthz` is bound before the embedded server starts, so
   neither an unanswered request nor a probe cuts recovery short. Done 2026-11-05
   ([issue #177](https://github.com/nberlee/mqtt-nats-broker/issues/177)).
+
+Added 2026-11-08 at the user's request: a supported-path defect a production deployment
+logged. An alpha blocker: it surfaces as an ERROR every few hours.
+
+- [ ] Settle the acquisition-ledger seal against its competitor: a clean close's inline
+  discard loses the seal to the recovery visit it kicked, runs out of four back-to-back
+  attempts while the store still refuses the in-process subject (10164), logs an ERROR and
+  leaves its teardown to the sweep, where `docs/ARCHITECTURE.md` says the closing re-reads
+  and seals ([issue #178](https://github.com/nberlee/mqtt-nats-broker/issues/178)).
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 

@@ -1196,11 +1196,12 @@ store is answering, and no timeout is substituted for one that is not.
 classes on `$MQTT_inflight`: the per-client authority (rewritten by compare-and-swap),
 generation closures, transition outcomes, name ownership, closure certificates, generation
 completion certificates, resources, exchanges, actions, generation ledgers, duty entries and
-directory shards. The only `$MQTT_inflight` deletes are exact-sequence deletes of
-registers, unsent markers, retained `rel` records, retained material, recovery roots (after
-their completion certificate) and a discarded obligation's register and `rel`. This storage
-is accumulated, not a ceiling: it grows with the epoch's activity, nothing reclaims it, and
-no fixed bound is claimed.
+directory shards, except the exchanges and duty entries a live generation retires behind
+its inventory floor (above). The only other `$MQTT_inflight` deletes are exact-sequence
+deletes of registers, unsent markers, retained `rel` records, retained material, recovery
+roots (after their completion certificate) and a discarded obligation's register and
+`rel`. This storage is accumulated, not a ceiling: it grows with the epoch's activity,
+nothing reclaims it, and no fixed bound is claimed.
 
 - **Already by the first accepted CONNECT,** not only once an obligation is admitted. An
   accepted CONNECT runs at least two authority transitions, so it makes at least two
@@ -5596,7 +5597,10 @@ Residuals and hard requirements:
   streams hold. `$MQTT_teardown` recreated ALONE is not admitted: an account holding nine
   of the ten is refused before anything is provisioned
   ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)). Watermark storage
-  is permanent and bounded by the client-ID population.
+  is permanent and bounded by the client-ID population whose sessions are torn down, which
+  clean-session churn under fresh identifiers leaves unbounded: one watermark per such
+  connection, beside its per-CONNECT records
+  ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
 - **A PUBREL durable standing under a RETIRED name is reaped, and the PUBRELs it held go
   with it.** The licence is the name's RETIRED ownership record, which only the batch
   authorizing the resource's deletion writes (every hold released, a disposal decision
