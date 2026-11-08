@@ -89,6 +89,13 @@ func Connect(ctx context.Context, cfg *config.Config, inProcess nats.InProcessCo
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
 	}
+	// The dialed server is judged on its INFO before any JetStream request: an unsupported
+	// server is named as such rather than failing later on whatever it lacks. A refusal is
+	// a configuration error, never waited on.
+	if err := connectedServerMeetsFloor(nc.ConnectedServerVersion(), nc.HeadersSupported()); err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("unsupported NATS server: %w", err)
+	}
 
 	var js jetstream.JetStream
 	if cfg.JSDomain != "" {
@@ -105,16 +112,23 @@ func Connect(ctx context.Context, cfg *config.Config, inProcess nats.InProcessCo
 	// without permissions on the service account. This is the only check that runs
 	// before the MQTT listener opens: the mqtt package's first JetStream request is
 	// made after it, when the account's session manager is created.
+	var info *jetstream.AccountInfo
 	if inProcess != nil {
-		err = waitJetStream(ctx, cfg, nc, js, log)
+		info, err = waitJetStream(ctx, cfg, nc, js, log)
 	} else {
 		pctx, cancel := context.WithTimeout(ctx, cfg.JSTimeout)
-		_, err = js.AccountInfo(pctx)
+		info, err = js.AccountInfo(pctx)
 		cancel()
 	}
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("JetStream not available on service connection: %w", err)
+	}
+	// The probe's answer carries the API level of the server that gave it: the meta leader
+	// in a cluster, which the dialed server's version says nothing about.
+	if err := jetStreamAPILevelMeetsFloor(info.API.Level); err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("unsupported NATS server: %w", err)
 	}
 
 	urls := cfg.NATSURLs
@@ -125,6 +139,8 @@ func Connect(ctx context.Context, cfg *config.Config, inProcess nats.InProcessCo
 		"urls", urls,
 		"in_process", inProcess != nil,
 		"server", nc.ConnectedServerName(),
+		"server_version", nc.ConnectedServerVersion(),
+		"jetstream_api_level", info.API.Level,
 		"cluster", nc.ConnectedClusterName(),
 		"js_domain", cfg.JSDomain,
 	)
@@ -149,20 +165,20 @@ const jsWaitLogEvery = 10 * time.Second
 // subscribed on it but these probes: a permission violation is read from nc.LastError,
 // which is connection-wide and sticky, and is this probe's only because nothing else
 // can have caused one yet.
-func waitJetStream(ctx context.Context, cfg *config.Config, nc *nats.Conn, js jetstream.JetStream, log *slog.Logger) error {
+func waitJetStream(ctx context.Context, cfg *config.Config, nc *nats.Conn, js jetstream.JetStream, log *slog.Logger) (*jetstream.AccountInfo, error) {
 	var lastLogged time.Time
 	for {
 		pctx, cancel := context.WithTimeout(ctx, cfg.JSTimeout)
-		_, err := js.AccountInfo(pctx)
+		info, err := js.AccountInfo(pctx)
 		cancel()
 		if err == nil {
-			return nil
+			return info, nil
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 		if !jetStreamNotReadyYet(err, nc) {
-			return err
+			return nil, err
 		}
 		if now := time.Now(); lastLogged.IsZero() || now.Sub(lastLogged) >= jsWaitLogEvery {
 			log.Info("waiting for JetStream", "err", err)
@@ -172,7 +188,7 @@ func waitJetStream(ctx context.Context, cfg *config.Config, nc *nats.Conn, js je
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-t.C:
 		}
 	}

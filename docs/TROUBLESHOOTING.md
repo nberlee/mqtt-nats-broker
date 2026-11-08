@@ -36,6 +36,17 @@ The broker never falls back to plaintext ([TLS](TLS.md)).
 JetStream did not answer within 5 s: JetStream is off, the account has none, or
 `-js-domain` names a domain the server does not serve.
 
+**The NATS server is unsupported.** Messages start with `unsupported NATS server:`
+([details](ARCHITECTURE.md#compatibility-boundary)):
+
+- `nats-server <version> is below this broker's floor <floor>; ...`: the server the broker
+  connected to is older than the release the broker was built against. Upgrade every peer.
+- `nats-server <version> has header support disabled (no_header_support); ...`: remove
+  `no_header_support` from that server's configuration.
+- `JetStream API level <n> (reported by the server answering $JS.API.INFO, the meta leader
+  in a cluster) is below this broker's floor <m>; ...`: the meta leader runs an older
+  release than the server the broker connected to. Upgrade every peer.
+
 **The service identity cannot ask who it is.** With auth passthrough the broker starts by
 asking NATS for its own identity: `MQTT auth passthrough: identifying the service
 connection: ...` means the service user is missing a permission from

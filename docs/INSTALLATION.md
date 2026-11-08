@@ -10,11 +10,16 @@ setting is in [Configuration](CONFIGURATION.md).
 unsupported: not degraded, not fallback-handled. The broker's durability guarantees rest
 on specific JetStream behaviors (per-subject CAS, interest retention, deduplication,
 per-message TTL, double ack); those are asserted against the supported line, and the
-streams' prerequisites are validated at startup rather than worked around. The external
-cluster's version is an operator prerequisite: the broker cannot see it, and a
+streams' prerequisites are validated at startup rather than worked around. The broker
+refuses to start when the NATS server it connects to is older, or when the server answering
+JetStream (the meta leader in a cluster) reports a JetStream API level below 5; it cannot
+see the other peers, so the version on every peer stays the operator's prerequisite, and a
 mixed-version cluster is unsupported. `go.mod` pins the exact version tested; "JetStream
 behaviors this design depends on" in [Architecture](ARCHITECTURE.md) lists what a
 version bump has to re-verify.
+
+**Header support.** Do not set `no_header_support` on any peer; the broker refuses a
+connected server that has it.
 
 **One server option.** Configure `jetstream { limits { default_max_consumers: -1 } }` on
 every peer, or give the account tier an explicit positive `max_consumers` above your

@@ -5976,6 +5976,18 @@ established:
   prerequisite: the policy choice is closed, the limitation is not, and the broker still
   cannot validate the server setting through its own API access.
 
+- **The NATS dependency floor is checked on two servers, once.** At startup the broker
+  refuses a dialed server below the floor or with header support disabled, and a
+  JetStream API level below the floor on the server that answers its `$JS.API.INFO`
+  probe, which in a cluster is the meta leader (see "Compatibility boundary" in
+  `docs/ARCHITECTURE.md`). Any other peer below the floor is not detected: the broker
+  cannot enumerate peers without the system account. Neither is a later reconnect of the
+  service connection to another server, a meta-leader change, or a peer downgraded while
+  the broker runs; nor the server a client's auth-passthrough connection lands on. A
+  2.15.0 or 2.15.1 meta leader passes, because it reports the same API level as 2.15.2.
+  What such a peer does to the broker is whatever it lacks, surfacing as the request
+  that needed it failing. The version on every peer stays a deployment prerequisite.
+
 - **This project's own external conformance environments meet both prerequisites,
   and assert them.** All three launches — the two CI conformance jobs
   (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` — run

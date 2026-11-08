@@ -103,6 +103,8 @@ var classifiedNATSObjects = map[string]natsUseClass{
 	"(*github.com/nats-io/nats.go.Conn).LastError":               natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).ConnectedClusterName":    natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).ConnectedServerName":     natsUseLifecycle,
+	"(*github.com/nats-io/nats.go.Conn).ConnectedServerVersion":  natsUseLifecycle,
+	"(*github.com/nats-io/nats.go.Conn).HeadersSupported":        natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).DisconnectErrHandler":    natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).ReconnectHandler":        natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).SetClosedHandler":        natsUseLifecycle,

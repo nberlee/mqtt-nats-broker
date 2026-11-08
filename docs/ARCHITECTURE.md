@@ -76,11 +76,42 @@ When the dependency advances, plans may adopt the new current behavior directly.
 
 The floor is **nats-server 2.15.2**. Older releases are unsupported outright: there
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
-is unsupported. Stream-shape prerequisites are validated at startup and fail closed,
-but the broker cannot infer every peer's binary version from one client connection,
-so the cluster-wide version floor is an explicit deployment prerequisite. An embedded
-server (see "Embedded NATS") is the pinned module itself, so it meets the floor by
-construction.
+is unsupported. An embedded server (see "Embedded NATS") is the pinned module itself, so
+it meets the floor by construction.
+
+**The NATS dependency contract.** What every JetStream peer must provide, stated once:
+
+- **Version:** nats-server at or above the floor, ordered by SemVer 2.0.0 precedence: a
+  prerelease of the floor (`2.15.2-RC.1`) is below it, a prerelease of a later release
+  (`2.15.3-RC.1`) above it, and a version that is not a semantic version is refused rather
+  than ordered.
+- **JetStream API level:** at or above the pinned server's `JSApiLevel`, which is **5** at
+  2.15.2. One level spans a release line (2.15.0 to 2.15.2 all report 5), so the level
+  cannot stand in for the version; it is checked because it reaches a peer the version
+  check does not.
+- **Server settings:** JetStream enabled for the service account; header support not
+  disabled (`no_header_support` unset: the broker's atomic batches, `Nmqtt-*` envelopes and
+  `Nats-TTL` all ride headers, and the startup probe itself is headerless); and
+  `jetstream { limits { default_max_consumers: -1 } }`, or an explicit positive account
+  `max_consumers` above the working set (see "A server-side default caps consumers per
+  stream" below).
+
+The floor is not a constant of its own: `internal/backend/server_floor.go` reads it from
+the linked module (`server.VERSION`, `server.JSApiLevel`), which is the pin, so a pin bump
+raises it with no second value to keep equal.
+
+**What startup checks.** `backend.Connect` judges the server the service connection
+dialed on its INFO before any JetStream request (its version, then its header support),
+and the startup `$JS.API.INFO` probe's answer on its API level. In a cluster that answer
+comes only from the meta leader (`jsAccountInfoRequest` returns without answering on any
+other server), so the two checks reach the dialed server and the meta leader, at startup.
+Each refusal names the reported value and the floor, ends startup (exit 1), and is never
+waited on or retried, in either topology. What the checks do not reach stays an explicit
+deployment prerequisite: every other peer (the broker cannot enumerate peers without the
+system account, which the service identity does not hold), a later reconnect to another
+server or a meta-leader change (a snapshot, like the stream prerequisites), and
+`default_max_consumers`, which no client can read
+([issue #97](https://github.com/nberlee/mqtt-nats-broker/issues/97)).
 
 The floor makes the `default_max_consumers` prerequisite
 ([issue #97](https://github.com/nberlee/mqtt-nats-broker/issues/97)) unconditional. The
@@ -16919,7 +16950,10 @@ another domain), API error 10008 (no meta leader), and a probe timeout unless th
 connection recorded a permission violation (nats.go records a refused publish or reply
 subscription there; it identifies this probe's violation because the probe runs on a
 fresh, private connection). Everything else, including JetStream disabled for the
-account, fails startup at once. The wait logs every 10 s, has no overall timeout and no
+account, fails startup at once. The NATS dependency floor's refusals (see "Compatibility
+boundary") are outside the wait too: the in-process server's version and header support
+are judged before the first probe, and the API level on the first successful answer, after
+the wait has returned. The wait logs every 10 s, has no overall timeout and no
 probe bounds it, and ends on a signal. External mode keeps the single probe. The MQTT
 initialization that follows retries the same way within its own run (see "Startup
 retries"): an exit here would shut the local peer down and restart the recovery it waits

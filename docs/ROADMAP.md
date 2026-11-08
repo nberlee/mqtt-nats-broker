@@ -1453,9 +1453,10 @@ boundary's "no compatibility" rule stands, and this policy is written into it as
   `broker_protocol_channels_test.go` (`docs/ARCHITECTURE.md` "The broker-to-broker
   protocol"). Done 2026-11-06.
 
-- [ ] **NATS dependency floor.** State the supported nats-server versions and JetStream
-  API level and the required server settings, and check them at startup so an
-  unsupported server is refused with a clear message.
+- [x] **NATS dependency floor.** Contract (version, JetStream API level 5, settings) in
+  `docs/ARCHITECTURE.md` "Compatibility boundary", read from the linked module; startup
+  refuses the dialed server's version and header support and the meta leader's API level.
+  Done 2026-11-08.
 
 - [ ] **Configuration surface.** Freeze the `MQTTNB_` variables, flags and defaults and
   the Helm values schema, with a deprecation rule (a renamed setting keeps working, with

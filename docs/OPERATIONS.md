@@ -34,8 +34,11 @@ status 1:
 3. The TLS material is read; an invalid certificate, key or CA is fatal.
 4. In the embedded topology, the NATS server starts and the broker waits for its
    JetStream, logging `waiting for JetStream` every 10 s, with no overall timeout.
-5. The broker connects to NATS and checks that JetStream answers
-   (`connected to NATS backend`).
+5. The broker connects to NATS, refuses a server below the NATS floor or with header
+   support disabled, checks that JetStream answers, and refuses a JetStream API level below
+   the floor ([Troubleshooting](TROUBLESHOOTING.md#the-broker-does-not-start)). None of
+   these refusals is waited on. `connected to NATS backend` reports `server_version` and
+   `jetstream_api_level`.
 6. The health server starts.
 7. The MQTT listener starts. With auth passthrough, the broker first asks NATS which
    account its own service identity belongs to; it then checks the ten broker-owned
