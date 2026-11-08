@@ -31,6 +31,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // Files names the listener's TLS material. An empty CA means no client
@@ -219,8 +221,8 @@ func (s *Source) check() Outcome {
 		return s.refuse(err)
 	}
 	s.publish(m)
-	s.log.Info("MQTT TLS configuration reloaded", "subject", m.subject, "serial", m.serial,
-		"not_after", m.notAfter, "generation", m.gen)
+	operational.TLSReloaded.Log(s.log, operational.Str(m.subject), operational.Str(m.serial),
+		operational.At(m.notAfter), operational.Uint(m.gen))
 	return Applied
 }
 
@@ -238,7 +240,7 @@ func (s *Source) refuse(err error) Outcome {
 	// One line per run of identical refusals: a projection that stays broken
 	// does not log every interval, and any other outcome in between ends the run.
 	if cause != s.lastRefusal {
-		s.log.Error("MQTT TLS reload refused; keeping the active configuration", "err", cause)
+		operational.TLSReloadRefused.Log(s.log, operational.Reason(cause))
 	}
 	s.lastRefusal = cause
 	return Refused
@@ -253,8 +255,8 @@ func (s *Source) warnIfActiveExpired() {
 		return
 	}
 	m.expiryWarned = true
-	s.log.Warn("MQTT TLS certificate has expired and no valid replacement is on disk",
-		"subject", m.subject, "serial", m.serial, "not_after", m.notAfter)
+	operational.TLSCertificateExpired.Log(s.log, operational.Str(m.subject), operational.Str(m.serial),
+		operational.At(m.notAfter))
 }
 
 func (s *Source) readAll() (contents, error) {

@@ -75,6 +75,30 @@ func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
 
+// loggedRecord reports whether a record at level was written with exactly message msg
+// and exactly the attributes kv (key, value as text, ...).
+func (h *recordingHandler) loggedRecord(level slog.Level, msg string, kv ...string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level != level || r.Message != msg || r.NumAttrs()*2 != len(kv) {
+			continue
+		}
+		got := map[string]string{}
+		r.Attrs(func(a slog.Attr) bool { got[a.Key] = a.Value.String(); return true })
+		match := true
+		for i := 0; i < len(kv); i += 2 {
+			if v, ok := got[kv[i]]; !ok || v != kv[i+1] {
+				match = false
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // logged reports whether a record at level was written whose message contains
 // fragment.
 func (h *recordingHandler) logged(level slog.Level, fragment string) bool {

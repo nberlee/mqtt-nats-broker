@@ -22,6 +22,7 @@ import (
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // httpShutdownTimeout bounds the health server's shutdown after the MQTT lifecycle has
@@ -32,10 +33,43 @@ const httpShutdownTimeout = 5 * time.Second
 var version = "dev"
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "fatal:", err)
-		os.Exit(1)
+	status, report := exitStatus(run(os.Args[1:]))
+	if report != "" {
+		fmt.Fprintln(os.Stderr, report)
 	}
+	os.Exit(status)
+}
+
+// exitStatus is the exit status run's outcome gives, and the stderr line that reports it:
+// a stop is not a failure, whether the broker served or was stopped while starting.
+func exitStatus(err error) (int, string) {
+	var stopped *startupStopped
+	if err == nil || errors.As(err, &stopped) {
+		return operational.ExitStopped, ""
+	}
+	return operational.ExitFailed, operational.FatalPrefix + err.Error()
+}
+
+// startupStopped is a startup that a shutdown signal ended before the broker served.
+type startupStopped struct{ err error }
+
+func (e *startupStopped) Error() string { return "startup stopped: " + e.err.Error() }
+func (e *startupStopped) Unwrap() error { return e.err }
+
+// startupOutcome is what a startup step's error means once the step has returned: a
+// cancellation while the signal context is done is a requested stop, anything else is the
+// failure it reports. A definite refusal never wraps a cancellation, so a signal that
+// arrives while one is being returned leaves it a failure. The MQTT core's sentinel covers
+// a startup it abandoned, whose cause need not be context.Canceled.
+func startupOutcome(ctx context.Context, log *slog.Logger, err error) error {
+	if err == nil || ctx.Err() == nil {
+		return err
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, mqtt.ErrStartupCancelled) {
+		return err
+	}
+	operational.StartupStopped.Log(log, operational.Err(err))
+	return &startupStopped{err}
 }
 
 func run(args []string) error {
@@ -54,7 +88,7 @@ func runContext(parent context.Context, args []string) error {
 	}
 
 	log := newLogger(cfg.LogLevel)
-	log.Info("starting mqtt-nats-broker", "version", version)
+	operational.BrokerStarting.Log(log, operational.Str(version))
 
 	// The soft memory limit is in place before anything allocates on the
 	// broker's behalf, so the GC paces against the container ceiling from the
@@ -80,21 +114,22 @@ func runContext(parent context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// ready gates /readyz: false until the MQTT listener is up and initialized, and
-	// flipped back to false on shutdown so a load balancer / k8s Service deregisters
-	// this instance before its connections are drained. backendRef is the backend once
-	// it is connected, for /readyz's connection check; nil before.
-	var ready atomic.Bool
+	// readiness is Starting until the MQTT listener is up and initialized, then Serving.
+	// A requested stop is ctx ending, which /readyz reads itself, so a load balancer / k8s
+	// Service deregisters this instance from the signal on, in every phase, before its
+	// connections are drained. backendRef is the backend once it is connected, for
+	// /readyz's connection check; nil before.
+	var readiness atomic.Int32
 	var backendRef atomic.Pointer[backend.Backend]
 
 	// The health endpoint is bound BEFORE the embedded server starts, synchronously so a
 	// taken port fails startup here: /healthz then answers through local store recovery,
 	// the JetStream wait and the MQTT initialization's retries, none of which is bounded
 	// by a probe any more (issue #177); /readyz stays 503 until the broker serves.
-	// Readiness = ready flag AND NATS connected. There is no metrics endpoint.
+	// There is no metrics endpoint.
 	var httpSrv *http.Server
 	if cfg.HTTPAddr != "" {
-		httpSrv, err = startHTTP(cfg.HTTPAddr, &backendRef, &ready, log)
+		httpSrv, err = startHTTP(ctx, cfg.HTTPAddr, &backendRef, &readiness, log)
 		if err != nil {
 			return err
 		}
@@ -121,7 +156,7 @@ func runContext(parent context.Context, args []string) error {
 	// that needed it: the defers run LIFO, so the backend's drain finishes first.
 	ns, err := startEmbeddedNATS(ctx, cfg, log)
 	if err != nil {
-		return err
+		return startupOutcome(ctx, log, err)
 	}
 	defer stopEmbeddedNATS(ns)
 	var inProcess nats.InProcessConnProvider
@@ -131,7 +166,7 @@ func runContext(parent context.Context, args []string) error {
 
 	be, err := backend.Connect(ctx, cfg, inProcess, log)
 	if err != nil {
-		return err
+		return startupOutcome(ctx, log, err)
 	}
 	defer be.Close()
 	backendRef.Store(be)
@@ -142,7 +177,7 @@ func runContext(parent context.Context, args []string) error {
 	// leaks nothing.
 	srv, err := serveMQTT(ctx, cfg, be, opts, log)
 	if err != nil {
-		return err
+		return startupOutcome(ctx, log, err)
 	}
 	// The TLS files are re-read from here until the server has fully stopped: the
 	// listener still accepts during the drain grace period, so a renewal landing
@@ -152,10 +187,10 @@ func runContext(parent context.Context, args []string) error {
 		tlsSrc.Start(cfg.TLSReloadInterval)
 		defer tlsSrc.Stop()
 	}
-	ready.Store(true)
+	readiness.Store(int32(operational.Serving))
 
 	<-ctx.Done()
-	log.Info("shutdown signal received, draining")
+	operational.ShutdownSignalReceived.Log(log)
 	// The first signal already cancelled ctx. To let a genuine second signal cut
 	// the grace period short, install the replacement handler BEFORE releasing the
 	// original NotifyContext handler with stop(): registering after stop() would
@@ -169,13 +204,12 @@ func runContext(parent context.Context, args []string) error {
 	}
 	stop()
 
-	// Flip readiness off immediately, then (optionally) wait out the pre-drain
+	// /readyz has answered draining since ctx ended; (optionally) wait out the pre-drain
 	// grace period so the Service/LB stops routing new connections here before we
 	// disconnect existing clients. The health server stays up through the drain
 	// returning 503, not connection-refused.
-	ready.Store(false)
 	if cfg.DrainDelay > 0 {
-		log.Info("draining, waiting for endpoint deregistration", "delay", cfg.DrainDelay)
+		operational.DrainDelayWaiting.Log(log, operational.Dur(cfg.DrainDelay))
 		waitDrainGrace(cfg.DrainDelay, sigCh)
 		signal.Stop(sigCh)
 	}
@@ -221,57 +255,40 @@ func newLogger(level string) *slog.Logger {
 
 // startHTTP binds the health endpoint synchronously and serves it in the background: a
 // port that cannot be bound is a startup error, not a log line, so "the health port is
-// answering" holds from the moment this returns.
-func startHTTP(addr string, be *atomic.Pointer[backend.Backend], ready *atomic.Bool, log *slog.Logger) (*http.Server, error) {
+// answering" holds from the moment this returns. stop is the signal context.
+func startHTTP(stop context.Context, addr string, be *atomic.Pointer[backend.Backend], readiness *atomic.Int32, log *slog.Logger) (*http.Server, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("health server: %w", err)
 	}
-	srv := &http.Server{Addr: addr, Handler: healthMux(be, ready), ReadHeaderTimeout: 5 * time.Second}
+	connected := func() bool {
+		b := be.Load()
+		return b != nil && b.Conn().IsConnected()
+	}
+	srv := &http.Server{Addr: addr, Handler: healthMux(stop, readiness, connected), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Info("health server listening", "addr", l.Addr().String())
+		operational.HealthServerListening.Log(log, operational.Addr(l.Addr()))
 		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("health server error", "err", err)
+			operational.HealthServerError.Log(log, operational.Err(err))
 		}
 	}()
 	return srv, nil
 }
 
-// healthMux serves the probe endpoints: /healthz answers while the process serves HTTP,
-// /readyz only while ready is set and the service connection is up. be is nil until the
-// backend is connected, which /readyz answers as not ready.
-func healthMux(be *atomic.Pointer[backend.Backend], ready *atomic.Bool) *http.ServeMux {
+// healthMux serves the probe endpoints from the operational interface's definition:
+// /healthz whenever the server serves, /readyz from readiness, whether stop has ended,
+// and connected, which is consulted only once the broker serves.
+func healthMux(stop context.Context, readiness *atomic.Int32, connected func() bool) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+	mux.HandleFunc(operational.HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
+		status, body := operational.Healthz()
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		// Ready only when the listener is up (and not draining) AND NATS is
-		// connected. During shutdown ready flips false so probes see 503 while the
-		// listener is still accepting, giving the LB time to deregister.
-		var b *backend.Backend
-		if be != nil {
-			b = be.Load()
-		}
-		if b == nil {
-			// Bound before the embedded server starts: recovery and the JetStream wait.
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("starting"))
-			return
-		}
-		if !ready.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte("draining"))
-			return
-		}
-		if b.Conn().IsConnected() {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ready"))
-			return
-		}
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("nats disconnected"))
+	mux.HandleFunc(operational.ReadyzPath, func(w http.ResponseWriter, _ *http.Request) {
+		status, body := operational.Readyz(operational.Readiness(readiness.Load()), stop.Err() != nil, connected())
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
 	})
 	return mux
 }

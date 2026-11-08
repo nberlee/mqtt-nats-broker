@@ -19,7 +19,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -483,7 +482,7 @@ func checkStartupProbe(t *testing.T, c map[string]any, embedded bool) {
 		return
 	}
 	rec := httptest.NewRecorder()
-	healthMux(nil, new(atomic.Bool)).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, str(mustField(t, sp, "httpGet", "path")), nil))
+	startingHealthMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, str(mustField(t, sp, "httpGet", "path")), nil))
 	if rec.Code != http.StatusOK || mustField(t, sp, "httpGet", "port") != "health" {
 		t.Errorf("startupProbe %v: the health handler answers %d; want 200 on the health port", sp, rec.Code)
 	}

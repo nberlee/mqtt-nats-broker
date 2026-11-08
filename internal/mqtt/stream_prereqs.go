@@ -530,14 +530,14 @@ func mqttForeignStoreFormatRefusal(foreign []*StreamConfig) error {
 // were deleted while this broker was starting.
 //
 // abandon is Start's startup cancellation (init_retry.go), nil outside it: like quit it
-// ends the wait, but with errMQTTStartupCancelled, which a caller reads as "startup ended",
+// ends the wait, but with ErrStartupCancelled, which a caller reads as "startup ended",
 // not as a verdict on the bundle.
 func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerStreamSpec, budget time.Duration, quit <-chan struct{}, abandon <-chan struct{}) error {
 	deadline := time.Now().Add(budget)
 	sawPartial := false
 	for scan := 0; ; scan++ {
 		if mqttAbandoned(abandon) {
-			return errMQTTStartupCancelled
+			return ErrStartupCancelled
 		}
 		present, absent, err := mqttScanBrokerStreamBundle(jsa, specs, scan, quit)
 		if err != nil {
@@ -571,7 +571,7 @@ func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerSt
 			return mqttBundleStopped(present, absent)
 		case <-abandon:
 			t.Stop()
-			return errMQTTStartupCancelled
+			return ErrStartupCancelled
 		case <-t.C:
 		}
 		if time.Until(deadline) <= 0 {
@@ -1221,7 +1221,7 @@ func (as *mqttAccountSessionManager) mqttProvisionEphemeralConsumers(accName, sr
 	}
 	if mqttAbandoned(abandon) {
 		as.rollbackEphemeralConsumers(created)
-		return fmt.Errorf("create session-record watch consumer for account %q: %w", accName, errMQTTStartupCancelled)
+		return fmt.Errorf("create session-record watch consumer for account %q: %w", accName, ErrStartupCancelled)
 	}
 	if sm := as.retainedSeams(); sm != nil && sm.testRetainedInitHook != nil {
 		sm.testRetainedInitHook(as)
@@ -1290,7 +1290,7 @@ func (as *mqttAccountSessionManager) mqttResolveObserverOccupant(stream, name, o
 			return nil
 		case err != nil && IsNatsErr(jsAPIError(err), JSConsumerNotFoundErr):
 			return errMQTTObserverOccupantGone
-		case err != nil && errors.Is(err, errMQTTStartupCancelled):
+		case err != nil && errors.Is(err, ErrStartupCancelled):
 			return err
 		case err == nil || abandon == nil || !mqttStartupRetryable(err):
 			return nil
@@ -1302,7 +1302,7 @@ func (as *mqttAccountSessionManager) mqttResolveObserverOccupant(stream, name, o
 		select {
 		case <-abandon:
 			t.Stop()
-			return errMQTTStartupCancelled
+			return ErrStartupCancelled
 		case <-t.C:
 		}
 		wait = min(wait*2, mqttStartupBackoffMax)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 	"github.com/nberlee/mqtt-nats-broker/internal/testcerts"
 )
 
@@ -189,7 +190,7 @@ func TestUserPasswordExampleAuthorizesPerUserTopics(t *testing.T) {
 		t.Fatal("a user from another account was admitted")
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return logs.logged(slog.LevelWarn, `refusing CONNECT for client "outsider": $SYS.REQ.USER.INFO: nats: timeout`)
+		return logs.loggedRecord(slog.LevelWarn, operational.ConnectRefused.Msg, "client_id", "outsider", "reason", "$SYS.REQ.USER.INFO: nats: timeout")
 	})
 }
 

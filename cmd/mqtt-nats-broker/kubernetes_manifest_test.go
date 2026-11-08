@@ -18,7 +18,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -914,7 +913,7 @@ func containerPorts(t *testing.T, c map[string]any, want listeners) map[string]i
 // answer 200, readiness 503, and a path the handler does not serve 404.
 func checkProbes(t *testing.T, c map[string]any) {
 	t.Helper()
-	mux := healthMux(nil, new(atomic.Bool))
+	mux := startingHealthMux()
 	get := func(p string) (int, string) {
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))

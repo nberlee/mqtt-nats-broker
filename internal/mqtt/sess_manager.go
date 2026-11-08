@@ -1074,7 +1074,7 @@ func (s *Server) getOrCreateMQTTAccountSessionManager(c *client) (*mqttAccountSe
 		// it as its own baseline. See init_retry.go.
 		if perr := s.startupPermissionViolationSince(baseline, err); perr != nil {
 			s.failStartup(perr)
-		} else if s.startupAbandonCh() != nil && !mqttStartupRetryable(err) && !errors.Is(err, errMQTTStartupCancelled) {
+		} else if s.startupAbandonCh() != nil && !mqttStartupRetryable(err) && !errors.Is(err, ErrStartupCancelled) {
 			s.failStartup(err)
 		}
 		return nil, err
@@ -1316,7 +1316,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	created := mqttEphemeralCreated{}
 	for _, spec := range specs {
 		if mqttAbandoned(abandon) {
-			return nil, errMQTTStartupCancelled
+			return nil, ErrStartupCancelled
 		}
 		si, err := ensureBrokerStream(jsa, spec.cfg, spec.validate, spec.preCreate, spec.observe)
 		if err != nil {
@@ -1341,7 +1341,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// another consumer, which is why both names are derived. See
 	// mqttProvisionEphemeralConsumers and ephemeral_identity.go.
 	if mqttAbandoned(abandon) {
-		return nil, errMQTTStartupCancelled
+		return nil, ErrStartupCancelled
 	}
 	if err := as.mqttProvisionEphemeralConsumers(accName, srwsubj, rmsubj, ephemeralID, ephemeralOwner, created, abandon); err != nil {
 		return nil, err
@@ -1668,7 +1668,7 @@ func (as *mqttAccountSessionManager) createServiceSubscription(subject string, c
 	// costs at most the one flush in progress, never the next ones.
 	abandon := as.jsa.startupAbandonCh()
 	if mqttAbandoned(abandon) {
-		return errMQTTStartupCancelled
+		return ErrStartupCancelled
 	}
 	if h := mqttTestServiceSubscriptionHookV.Load(); h != nil {
 		(*h)(subject)
@@ -1700,7 +1700,7 @@ func (as *mqttAccountSessionManager) createServiceSubscription(subject string, c
 		}
 	}
 	if mqttAbandoned(abandon) {
-		return errMQTTStartupCancelled
+		return ErrStartupCancelled
 	}
 	return nil
 }

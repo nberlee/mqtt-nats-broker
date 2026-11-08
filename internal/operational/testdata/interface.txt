@@ -1,0 +1,122 @@
+# The operational interface (docs/ARCHITECTURE.md, "The operational interface").
+# Regenerate with `make operational-interface-fixture`; never edit by hand.
+
+healthz /healthz 200 "ok"
+readyz /readyz state=starting stopped=false connected=false 503 "starting"
+readyz /readyz state=starting stopped=false connected=true 503 "starting"
+readyz /readyz state=starting stopped=true connected=false 503 "draining"
+readyz /readyz state=starting stopped=true connected=true 503 "draining"
+readyz /readyz state=serving stopped=false connected=false 503 "nats disconnected"
+readyz /readyz state=serving stopped=false connected=true 200 "ready"
+readyz /readyz state=serving stopped=true connected=false 503 "draining"
+readyz /readyz state=serving stopped=true connected=true 503 "draining"
+
+exit 0 "the broker stopped as asked: a shutdown signal, at any phase after its handlers are registered, and the shutdown or the startup's unwinding returned; also `-h`. Not a promise that every buffered publication reached NATS: the service connection's close is bounded"
+exit 1 "the broker could not start, or the embedded NATS server stopped it: `fatal: <reason>` on stderr, except the embedded server's own fatal error, which is an `ERROR` record with `component: nats-server`. A startup step that does not observe a signal (the NATS dial, the first service-identity request, both bounded) reports its own failure here"
+exit fatal-prefix "fatal: "
+
+envelope time "RFC 3339 with fractional seconds, in the host's time zone (UTC in the published images)"
+envelope level "`DEBUG`, `INFO`, `WARN` or `ERROR`"
+envelope msg "the record's message; frozen only for the records below"
+envelope component "`nats-server` on the embedded NATS server's records, absent otherwise"
+
+kind string "a JSON string"
+kind integer "a JSON number"
+kind boolean "a JSON boolean"
+kind duration "a JSON number of nanoseconds"
+kind time "an RFC 3339 JSON string"
+kind text "a JSON string; its wording is not part of the interface"
+
+record "starting mqtt-nats-broker" level=INFO
+  field version string
+  when "once, first"
+record "health server listening" level=INFO
+  field addr string
+  when "once, when the health port is bound"
+record "health server error" level=ERROR
+  field err text
+  when "when the health server stops serving other than at shutdown"
+record "profiler listening" level=INFO
+  field addr string
+  when "once, with `-pprof-addr`"
+record "profiler listener could not bind" level=ERROR
+  field addr string
+  field err text
+  when "once, with `-pprof-addr`; the broker starts without the profiler"
+record "profiler error" level=ERROR
+  field err text
+  when "when the profiler stops serving other than at shutdown"
+record "embedded NATS server ready" level=INFO
+  field server string
+  field config string
+  when "once, in the embedded topology"
+record "waiting for JetStream" level=INFO
+  field err text
+  when "at most every 10 s while the embedded server's JetStream does not answer"
+record "connected to NATS backend" level=INFO
+  field urls string
+  field in_process boolean
+  field server string
+  field server_version string
+  field jetstream_api_level integer
+  field cluster string
+  field js_domain string
+  when "once, when the service connection passed the NATS floor and JetStream answered"
+record "MQTT initialization did not complete; retrying" level=WARN
+  field attempt integer
+  field err text
+  when "at most every 10 s while the MQTT initialization is retried"
+record "shutdown signal received during startup" level=INFO
+  field err text
+  when "once, when a shutdown signal ends startup before the broker served"
+record "MQTT listener started" level=INFO
+  field addr string
+  field node string
+  field tls boolean
+  when "once, when the broker serves"
+record "MQTT over WebSocket listener started" level=INFO
+  field addr string
+  field tls boolean
+  when "once, with `-ws-port`"
+record "shutdown signal received, draining" level=INFO
+  when "once, at the first shutdown signal after the broker served"
+record "draining, waiting for endpoint deregistration" level=INFO
+  field delay duration
+  when "once, with `-drain-delay`"
+record "NATS service connection error" level=WARN
+  field err text
+  when "per asynchronous error the service connection reports"
+record "MQTT: the service connection reconnected but could not be identified; no CONNECT is accepted" level=ERROR
+  field err text
+  when "per reconnect whose identity request fails; `/readyz` still answers `200 ready`"
+record "MQTT: the service connection dropped while it was being re-identified; the account stays unknown" level=WARN
+  when "per occurrence"
+record "MQTT: the service connection reconnected into another account; disconnecting every auth-passthrough client" level=ERROR
+  field account string
+  field previous_account string
+  when "per occurrence"
+record "MQTT: refusing CONNECT: the service connection's account is not currently established" level=WARN
+  when "per CONNECT refused for it"
+record "MQTT: refusing CONNECT" level=WARN
+  field client_id string
+  field reason text
+  when "per CONNECT whose identity cannot be established or is bound to another account"
+record "MQTT TLS configuration reloaded" level=INFO
+  field subject string
+  field serial string
+  field not_after time
+  field generation integer
+  when "per applied TLS reload"
+record "MQTT TLS reload refused; keeping the active configuration" level=ERROR
+  field err text
+  when "once per run of identical refusals, not per attempt"
+record "MQTT TLS certificate has expired and no valid replacement is on disk" level=WARN
+  field subject string
+  field serial string
+  field not_after time
+  when "once per served certificate, not repeated"
+record "NATS service connection did not finish closing in time; closing it now" level=WARN
+  field wait duration
+  when "at most once, at shutdown"
+record "NATS service connection closed" level=INFO
+  when "once, at shutdown"

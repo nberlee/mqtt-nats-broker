@@ -34,6 +34,9 @@ import (
 // MQTTNB_TEST_RUN_BROKER set it is main(), reading its flags from os.Args.
 func TestMain(m *testing.M) {
 	if os.Getenv("MQTTNB_TEST_RUN_BROKER") == "1" {
+		if os.Getenv(embeddedFatalEnv) == "1" {
+			runEmbeddedFatal()
+		}
 		main()
 		os.Exit(0)
 	}
@@ -670,8 +673,8 @@ func TestEmbeddedShutdownOrder(t *testing.T) {
 			t.Fatal("the process exited within 1s of SIGTERM, inside a 2s drain grace")
 		default:
 		}
-		if code := p.readyz(); code != http.StatusServiceUnavailable {
-			t.Errorf("/readyz during the grace = %d, want 503", code)
+		if code, body := probe(p.httpAddr, "/readyz"); code != http.StatusServiceUnavailable || body != "draining" {
+			t.Errorf("/readyz during the grace = %d %q, want 503 \"draining\"", code, body)
 		}
 		if code := p.waitExit(t, 30*time.Second); code != 0 {
 			t.Fatalf("exit code %d, want 0", code)
@@ -688,15 +691,22 @@ func TestEmbeddedShutdownOrder(t *testing.T) {
 		if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			t.Fatal(err)
 		}
-		if code := p.waitExit(t, 30*time.Second); code != 1 {
-			t.Fatalf("exit code %d, want 1 (startup did not complete)", code)
+		// A requested stop is not a failure, whether or not the broker served
+		// (docs/ARCHITECTURE.md, "The operational interface").
+		if code := p.waitExit(t, 30*time.Second); code != 0 {
+			t.Fatalf("exit code %d, want 0 (a requested stop)", code)
 		}
 		if p.index("Initiating Shutdown") < 0 {
 			t.Error("the embedded server was not shut down on the way out")
 		}
-		if !strings.Contains(p.stderr.String(), "fatal:") || !strings.Contains(p.stderr.String(), "context canceled") {
-			t.Errorf("stderr = %q, want the fatal cancellation", p.stderr.String())
+		if r := requireRecord(t, p, "shutdown signal received during startup", "INFO", map[string]any{"err": ""}); r != nil &&
+			!strings.Contains(r["err"].(string), "context canceled") {
+			t.Errorf("StartupStopped err = %v, want the cancelled JetStream wait", r["err"])
 		}
+		if strings.Contains(p.stderr.String(), "fatal:") {
+			t.Errorf("stderr = %q, want no fatal line", p.stderr.String())
+		}
+		p.requireOneJSONStream(t)
 	})
 }
 

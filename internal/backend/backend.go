@@ -24,6 +24,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // Backend holds the service connection to NATS.
@@ -79,7 +80,7 @@ func Connect(ctx context.Context, cfg *config.Config, inProcess nats.InProcessCo
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
 			// Asynchronous errors had no handler at all, so a drain that timed out at
 			// shutdown — or a subscription that fell behind — was silent.
-			log.Warn("NATS service connection error", "err", err)
+			operational.ServiceConnectionError.Log(log, operational.Err(err))
 		}),
 	)
 	if inProcess != nil {
@@ -135,14 +136,14 @@ func Connect(ctx context.Context, cfg *config.Config, inProcess nats.InProcessCo
 	if inProcess != nil {
 		urls = "" // not dialed
 	}
-	log.Info("connected to NATS backend",
-		"urls", urls,
-		"in_process", inProcess != nil,
-		"server", nc.ConnectedServerName(),
-		"server_version", nc.ConnectedServerVersion(),
-		"jetstream_api_level", info.API.Level,
-		"cluster", nc.ConnectedClusterName(),
-		"js_domain", cfg.JSDomain,
+	operational.ConnectedToNATS.Log(log,
+		operational.Str(urls),
+		operational.Flag(inProcess != nil),
+		operational.Str(nc.ConnectedServerName()),
+		operational.Str(nc.ConnectedServerVersion()),
+		operational.Int(int64(info.API.Level)),
+		operational.Str(nc.ConnectedClusterName()),
+		operational.Str(cfg.JSDomain),
 	)
 	return &Backend{cfg: cfg, log: log, nc: nc, inProcess: inProcess, closed: closed}, nil
 }
@@ -174,14 +175,17 @@ func waitJetStream(ctx context.Context, cfg *config.Config, nc *nats.Conn, js je
 		if err == nil {
 			return info, nil
 		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+		// The answer is judged before the context: a definite refusal that arrives as a
+		// signal ends startup stays the refusal, and a request the signal cut short
+		// answers context.Canceled, which is not "not answering yet" either.
 		if !jetStreamNotReadyYet(err, nc) {
 			return nil, err
 		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if now := time.Now(); lastLogged.IsZero() || now.Sub(lastLogged) >= jsWaitLogEvery {
-			log.Info("waiting for JetStream", "err", err)
+			operational.WaitingForJetStream.Log(log, operational.Err(err))
 			lastLogged = now
 		}
 		t := time.NewTimer(jsReadyRetryWait)
@@ -316,12 +320,11 @@ func (b *Backend) Close() {
 	select {
 	case <-b.closed:
 	case <-t.C:
-		b.log.Warn("NATS service connection did not finish closing in time; closing it now",
-			"wait", serviceCloseWait)
+		operational.ServiceConnectionCloseTimedOut.Log(b.log, operational.Dur(serviceCloseWait))
 		b.nc.Close()
 	}
 	// An embedded server is stopped only after this line: the drain above needed it.
-	b.log.Info("NATS service connection closed")
+	operational.ServiceConnectionClosed.Log(b.log)
 }
 
 // testCloseWaitEntered runs when Close has started the drain and is about to wait for it.

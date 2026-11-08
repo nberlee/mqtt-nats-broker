@@ -7,43 +7,67 @@ their causes are in [Troubleshooting](TROUBLESHOOTING.md).
 ## Health and readiness
 
 The broker serves two endpoints on `-http-addr` (default `:8080`; empty disables both).
-Keep that port off any Service the clients use.
+Keep that port off any Service the clients use. Both answers, the exit status and the
+records below are the broker's operational interface: one definition
+(`internal/operational`) states them, and they change only with it
+([details](ARCHITECTURE.md#the-operational-interface)).
 
-| Endpoint | Answers |
+The health server is bound first, before the embedded NATS server starts and before NATS
+is dialed, and answers until the broker has closed its NATS connection. A port that
+cannot be bound stops startup (exit 1).
+
+`/healthz` answers `200 ok` whenever the health server serves.
+
+### Readiness answers
+
+| `/readyz` answers | When |
 |---|---|
-| `/healthz` | `200 ok` whenever the HTTP server is running |
-| `/readyz` | `200 ready` while the MQTT listener is up and the broker's NATS service connection is connected; `503 nats disconnected` while that connection is down; `503 draining` before startup has finished and from the first shutdown signal on |
+| `503 draining` | a shutdown signal has been received, whether or not the broker served |
+| `503 starting` | the broker has not served yet: the JetStream wait, the dial, the stream checks, the MQTT initialization and its retries, and a failed start's unwinding |
+| `200 ready` | the broker serves and its NATS service connection is connected |
+| `503 nats disconnected` | the broker serves and its NATS service connection is down |
 
-The HTTP server starts once the NATS connection is up (in the embedded topology, once
-JetStream answers), so neither endpoint answers while the broker dials NATS. It does
-answer while the MQTT listener starts, which includes checking the broker-owned streams
-for up to 30 s, and `/readyz` reports `503 draining` until that is done. Readiness
-reflects only the broker's own NATS connection: a client's per-connection NATS link
-going down does not change it. A failure to bind the health port is logged
-(`health server error`) and the broker keeps running without it.
-
-There is no metrics endpoint.
+Readiness reflects the broker's own NATS connection, not its identity: a client's
+per-connection NATS link going down does not change it, and a service connection that
+reconnected but could not be identified answers `200 ready` while every auth-passthrough
+CONNECT is refused (the `could not be identified` record below says so). There is no
+metrics endpoint.
 
 ## Startup
 
-In order, and any failure stops the process with `fatal: <reason>` on stderr and exit
-status 1:
+In order; a failure stops the process with `fatal: <reason>` on stderr and exit status
+1, and a shutdown signal during startup stops it with exit status 0
+([Exit status](#exit-status)):
 
 1. The configuration is read and validated.
 2. The Go memory limit is set ([Configuration](CONFIGURATION.md#go-memory-limit)).
 3. The TLS material is read; an invalid certificate, key or CA is fatal.
-4. In the embedded topology, the NATS server starts and the broker waits for its
+4. The health server starts; `/readyz` answers `503 starting`.
+5. In the embedded topology, the NATS server starts and the broker waits for its
    JetStream, logging `waiting for JetStream` every 10 s, with no overall timeout.
-5. The broker connects to NATS, refuses a server below the NATS floor or with header
+6. The broker connects to NATS, refuses a server below the NATS floor or with header
    support disabled, checks that JetStream answers, and refuses a JetStream API level below
    the floor ([Troubleshooting](TROUBLESHOOTING.md#the-broker-does-not-start)). None of
    these refusals is waited on. `connected to NATS backend` reports `server_version` and
    `jetstream_api_level`.
-6. The health server starts.
 7. The MQTT listener starts. With auth passthrough, the broker first asks NATS which
    account its own service identity belongs to; it then checks the ten broker-owned
-   streams ([below](#the-ten-streams)) and creates any that do not exist yet.
-8. TLS reloading starts, and `/readyz` turns ready.
+   streams ([below](#the-ten-streams)), waiting up to 30 s on a partial set, and creates
+   any that do not exist yet. An initialization JetStream does not answer yet is retried
+   with no overall timeout.
+8. TLS reloading starts, and `/readyz` turns `200 ready`.
+
+## Exit status
+
+| Status | Meaning |
+|---|---|
+| 0 | the broker stopped as asked: a shutdown signal, at any phase after its handlers are registered, and the shutdown or the startup's unwinding returned; also `-h`. Not a promise that every buffered publication reached NATS: the service connection's close is bounded |
+| 1 | the broker could not start, or the embedded NATS server stopped it: `fatal: <reason>` on stderr, except the embedded server's own fatal error, which is an `ERROR` record with `component: nats-server`. A startup step that does not observe a signal (the NATS dial, the first service-identity request, both bounded) reports its own failure here |
+
+A signal that arrives before the broker has registered its handlers (while it reads its
+configuration and TLS material), a later signal once the drain delay's wait has ended (or
+any second signal without a drain delay), a Go runtime panic (status 2) and the
+orchestrator's SIGKILL end the process outside this table.
 
 ## Shutdown
 
@@ -124,20 +148,67 @@ configuration's `debug` or `trace` setting, and `-log-level debug`, since both a
 as debug records. A startup failure is
 the exception: it is printed to stderr as `fatal: <reason>`.
 
-Timestamps are in the host's time zone, which in the published images is UTC. Records
-about one client connection start with its label, such as `cid:12`; no client
+Records about one client connection start with its label, such as `cid:12`; no client
 address is logged.
 
-Records worth watching:
+### Record envelope
 
-| Record | Meaning |
+| Key | Value |
 |---|---|
-| `MQTT listener started` | the broker is serving; carries the address, the node name and whether TLS is on |
-| `NATS service connection error` | the broker's own NATS connection reported an error |
-| `MQTT TLS reload refused; keeping the active configuration` | a TLS update on disk is invalid ([TLS](TLS.md#certificate-rollover)) |
-| `MQTT TLS certificate has expired and no valid replacement is on disk` | the served certificate has expired |
-| `MQTT: refusing CONNECT for client ...` | a CONNECT was refused, with the reason ([Troubleshooting](TROUBLESHOOTING.md#a-client-is-refused-at-connect)) |
-| `MQTT: the service connection reconnected into account ...` | the service identity's account changed; every auth-passthrough client is disconnected |
+| `time` | RFC 3339 with fractional seconds, in the host's time zone (UTC in the published images) |
+| `level` | `DEBUG`, `INFO`, `WARN` or `ERROR` |
+| `msg` | the record's message; frozen only for the records below |
+| `component` | `nats-server` on the embedded NATS server's records, absent otherwise |
+
+### Field kinds
+
+| Kind | Encoded as |
+|---|---|
+| string | a JSON string |
+| integer | a JSON number |
+| boolean | a JSON boolean |
+| duration | a JSON number of nanoseconds |
+| time | an RFC 3339 JSON string |
+| text | a JSON string; its wording is not part of the interface |
+
+### Records
+
+Alert on these: their `msg`, `level` and fields are the interface, matched exactly. Every
+other record's text, the core's per-connection records included, can change in any
+release.
+
+| `msg` | `level` | Fields | When |
+|---|---|---|---|
+| `starting mqtt-nats-broker` | `INFO` | `version` (string) | once, first |
+| `health server listening` | `INFO` | `addr` (string) | once, when the health port is bound |
+| `health server error` | `ERROR` | `err` (text) | when the health server stops serving other than at shutdown |
+| `profiler listening` | `INFO` | `addr` (string) | once, with `-pprof-addr` |
+| `profiler listener could not bind` | `ERROR` | `addr` (string), `err` (text) | once, with `-pprof-addr`; the broker starts without the profiler |
+| `profiler error` | `ERROR` | `err` (text) | when the profiler stops serving other than at shutdown |
+| `embedded NATS server ready` | `INFO` | `server` (string), `config` (string) | once, in the embedded topology |
+| `waiting for JetStream` | `INFO` | `err` (text) | at most every 10 s while the embedded server's JetStream does not answer |
+| `connected to NATS backend` | `INFO` | `urls` (string), `in_process` (boolean), `server` (string), `server_version` (string), `jetstream_api_level` (integer), `cluster` (string), `js_domain` (string) | once, when the service connection passed the NATS floor and JetStream answered |
+| `MQTT initialization did not complete; retrying` | `WARN` | `attempt` (integer), `err` (text) | at most every 10 s while the MQTT initialization is retried |
+| `shutdown signal received during startup` | `INFO` | `err` (text) | once, when a shutdown signal ends startup before the broker served |
+| `MQTT listener started` | `INFO` | `addr` (string), `node` (string), `tls` (boolean) | once, when the broker serves |
+| `MQTT over WebSocket listener started` | `INFO` | `addr` (string), `tls` (boolean) | once, with `-ws-port` |
+| `shutdown signal received, draining` | `INFO` | none | once, at the first shutdown signal after the broker served |
+| `draining, waiting for endpoint deregistration` | `INFO` | `delay` (duration) | once, with `-drain-delay` |
+| `NATS service connection error` | `WARN` | `err` (text) | per asynchronous error the service connection reports |
+| `MQTT: the service connection reconnected but could not be identified; no CONNECT is accepted` | `ERROR` | `err` (text) | per reconnect whose identity request fails; `/readyz` still answers `200 ready` |
+| `MQTT: the service connection dropped while it was being re-identified; the account stays unknown` | `WARN` | none | per occurrence |
+| `MQTT: the service connection reconnected into another account; disconnecting every auth-passthrough client` | `ERROR` | `account` (string), `previous_account` (string) | per occurrence |
+| `MQTT: refusing CONNECT: the service connection's account is not currently established` | `WARN` | none | per CONNECT refused for it |
+| `MQTT: refusing CONNECT` | `WARN` | `client_id` (string), `reason` (text) | per CONNECT whose identity cannot be established or is bound to another account |
+| `MQTT TLS configuration reloaded` | `INFO` | `subject` (string), `serial` (string), `not_after` (time), `generation` (integer) | per applied TLS reload |
+| `MQTT TLS reload refused; keeping the active configuration` | `ERROR` | `err` (text) | once per run of identical refusals, not per attempt |
+| `MQTT TLS certificate has expired and no valid replacement is on disk` | `WARN` | `subject` (string), `serial` (string), `not_after` (time) | once per served certificate, not repeated |
+| `NATS service connection did not finish closing in time; closing it now` | `WARN` | `wait` (duration) | at most once, at shutdown |
+| `NATS service connection closed` | `INFO` | none | once, at shutdown |
+
+A refused CONNECT is explained in
+[Troubleshooting](TROUBLESHOOTING.md#a-client-is-refused-at-connect), a refused TLS reload
+in [TLS](TLS.md#certificate-rollover).
 
 ## Memory and connection limits
 

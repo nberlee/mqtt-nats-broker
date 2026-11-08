@@ -331,7 +331,7 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 			for reply := range r2i {
 				jsa.replies.Delete(reply)
 			}
-			return responses, errMQTTStartupCancelled
+			return responses, ErrStartupCancelled
 
 		case <-t.C:
 			var reply string
@@ -429,7 +429,7 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind string, msgs []mqttBatchMsg) (any
 		return nil, ErrServerNotRunning
 	case <-jsa.startupAbandonCh():
 		jsa.replies.Delete(reply)
-		return nil, errMQTTStartupCancelled
+		return nil, ErrStartupCancelled
 	case <-t.C:
 		jsa.replies.Delete(reply)
 		return nil, jsa.requestTimeout(fmt.Errorf("timeout after %v: atomic batch request type %q on %q (reply=%q)",
@@ -1114,7 +1114,7 @@ func (p *mqttPendingStore) await() (*JSPubAckResponse, error) {
 		return jsa.storeMsgResult(p.subject, nil, ErrServerNotRunning)
 	case <-jsa.startupAbandonCh():
 		jsa.replies.Delete(p.reply)
-		return jsa.storeMsgResult(p.subject, nil, errMQTTStartupCancelled)
+		return jsa.storeMsgResult(p.subject, nil, ErrStartupCancelled)
 	case <-t.C:
 		jsa.replies.Delete(p.reply)
 		err := jsa.requestTimeout(fmt.Errorf("timeout after %v: request type %q on %q (reply=%q)",

@@ -357,7 +357,7 @@ func TestStartFailsAtOnceOnAPermanentInitializationError(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			err := startWithin(t, s, ctx, 60*time.Second)
-			if err == nil || errors.Is(err, errMQTTStartupCancelled) {
+			if err == nil || errors.Is(err, ErrStartupCancelled) {
 				t.Fatalf("Start = %v, want the refusal (a retry loop ends only by cancellation)", err)
 			}
 			if !strings.Contains(err.Error(), tc.want) {
@@ -481,7 +481,7 @@ func TestStartFailsOnServiceConnectionPermissionViolations(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			err := startWithin(t, s, ctx, 60*time.Second)
-			if err == nil || errors.Is(err, errMQTTStartupCancelled) {
+			if err == nil || errors.Is(err, ErrStartupCancelled) {
 				t.Fatalf("Start = %v, want the permission violation", err)
 			}
 			if !errors.Is(err, nats.ErrPermissionViolation) {
@@ -496,10 +496,18 @@ func TestStartFailsOnServiceConnectionPermissionViolations(t *testing.T) {
 func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 	const within = 3 * time.Second
 	timeout15 := func(o *Options) { o.MQTT.JSAPITimeout = 15 * time.Second }
+	var runWithCause func(t *testing.T, s *Server, entered <-chan struct{}, cause error) error
 
 	run := func(t *testing.T, s *Server, entered <-chan struct{}) error {
 		t.Helper()
-		ctx, cancel := context.WithCancel(context.Background())
+		return runWithCause(t, s, entered, context.Canceled)
+	}
+	// runWithCause ends the startup context with cause, as signal.NotifyContext ends it
+	// with the signal: the caller must still recognise a startup the context ended.
+	runWithCause = func(t *testing.T, s *Server, entered <-chan struct{}, cause error) error {
+		t.Helper()
+		ctx, cancelCause := context.WithCancelCause(context.Background())
+		cancel := func() { cancelCause(cause) }
 		done := make(chan error, 1)
 		go func() { done <- s.Start(ctx) }()
 		select {
@@ -538,8 +546,31 @@ func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 			return err
 		}))
 		s := startupTestServer(t, ns.ClientURL(), "node-a", "", "", timeout15)
-		if err := run(t, s, entered); !errors.Is(err, errMQTTStartupCancelled) {
+		if err := run(t, s, entered); !errors.Is(err, ErrStartupCancelled) {
 			t.Fatalf("Start = %v, want the startup cancellation", err)
+		}
+	})
+
+	// The command reads a startup that ends this way as a requested stop by the exported
+	// sentinel, because the backoff carries the context's cause, which need not be
+	// context.Canceled.
+	t.Run("during the backoff, ended with a cause that is not context.Canceled", func(t *testing.T) {
+		ns := runJetStreamServerHA(t)
+		setStartupBackoff(t, time.Minute)
+		entered := make(chan struct{})
+		var once sync.Once
+		setStartupBackoffHook(t, func(int, error) { once.Do(func() { close(entered) }) })
+		t.Cleanup(setMQTTTestConsumerCreateResultHook(func(ccr *CreateConsumerRequest, err error) error {
+			if isObserverCreate(ccr) {
+				return lostResponse()
+			}
+			return err
+		}))
+		s := startupTestServer(t, ns.ClientURL(), "node-a", "", "", timeout15)
+		cause := errors.New("stopped for a reason of its own")
+		err := runWithCause(t, s, entered, cause)
+		if !errors.Is(err, ErrStartupCancelled) || !errors.Is(err, cause) || errors.Is(err, context.Canceled) {
+			t.Fatalf("Start = %v, want the startup cancellation carrying the cause and not context.Canceled", err)
 		}
 	})
 
@@ -564,7 +595,7 @@ func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 		})
 		s := startupTestServer(t, ns.ClientURL(), "node-a", "", "", timeout15)
 		s.bundleSettleBudget = time.Minute
-		if err := run(t, s, entered); !errors.Is(err, errMQTTStartupCancelled) {
+		if err := run(t, s, entered); !errors.Is(err, ErrStartupCancelled) {
 			t.Fatalf("Start = %v, want the startup cancellation", err)
 		}
 	})
@@ -585,7 +616,7 @@ func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 			jsa.testDropRequest.Store(&drop)
 		})
 		s := startupTestServer(t, ns.ClientURL(), "node-a", "", "", timeout15)
-		if err := run(t, s, entered); !errors.Is(err, errMQTTStartupCancelled) {
+		if err := run(t, s, entered); !errors.Is(err, ErrStartupCancelled) {
 			t.Fatalf("Start = %v, want the startup cancellation", err)
 		}
 	})
@@ -615,7 +646,7 @@ func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 		close(release)
 		select {
 		case err := <-done:
-			if !errors.Is(err, errMQTTStartupCancelled) {
+			if !errors.Is(err, ErrStartupCancelled) {
 				t.Fatalf("Start = %v, want the startup cancellation", err)
 			}
 		case <-time.After(within):
@@ -670,7 +701,7 @@ func TestStartReturnsPromptlyWhenCancelled(t *testing.T) {
 				SetClientID("early").SetConnectTimeout(30 * time.Second).SetConnectRetry(false))
 			c.Connect().WaitTimeout(30 * time.Second)
 		}()
-		if err := run(t, s, entered); !errors.Is(err, errMQTTStartupCancelled) {
+		if err := run(t, s, entered); !errors.Is(err, ErrStartupCancelled) {
 			t.Fatalf("Start = %v, want the startup cancellation", err)
 		}
 	})
@@ -1128,7 +1159,7 @@ func TestStartupRetryableClassification(t *testing.T) {
 		{"consumer already exists", wrap(&ApiError{Code: 400, ErrCode: 10148}), false},
 		{"this run's stray", fmt.Errorf("%w (%w)", errMQTTOwnEphemeralStray, &ApiError{Code: 400, ErrCode: 10148}), true},
 		{"an occupant that is gone", fmt.Errorf("%w (%w)", errMQTTObserverOccupantGone, &ApiError{Code: 400, ErrCode: 10148}), true},
-		{"a startup cancellation", fmt.Errorf("x: %w", errMQTTStartupCancelled), false},
+		{"a startup cancellation", fmt.Errorf("x: %w", ErrStartupCancelled), false},
 		{"a permission violation", fmt.Errorf("x: %w", nats.ErrPermissionViolation), false},
 		{"a plain refusal", errors.New("nonconforming stream"), false},
 	} {
@@ -1242,7 +1273,7 @@ func TestAConnectBeforeTheEagerInitializationObservesStartupCancellation(t *test
 	cancel()
 	select {
 	case err := <-done:
-		if !errors.Is(err, errMQTTStartupCancelled) {
+		if !errors.Is(err, ErrStartupCancelled) {
 			t.Fatalf("Start = %v, want the startup cancellation", err)
 		}
 		if d := time.Since(cancelled); d > 3*time.Second {
@@ -1275,7 +1306,7 @@ func TestStartupCancellationStopsBetweenServiceSubscriptions(t *testing.T) {
 		}
 	})
 	s := startupTestServer(t, ns.ClientURL(), "node-a", "", "", nil)
-	if err := startWithin(t, s, ctx, 60*time.Second); !errors.Is(err, errMQTTStartupCancelled) {
+	if err := startWithin(t, s, ctx, 60*time.Second); !errors.Is(err, ErrStartupCancelled) {
 		t.Fatalf("Start = %v, want the startup cancellation", err)
 	}
 	mu.Lock()

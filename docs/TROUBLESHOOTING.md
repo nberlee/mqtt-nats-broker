@@ -6,7 +6,8 @@ prints, with the variable parts elided; its records are JSON on stdout
 
 ## The broker does not start
 
-A startup failure prints `fatal: <reason>` on stderr and exits with status 1.
+A startup failure prints `fatal: <reason>` on stderr and exits with status 1; a shutdown
+signal during startup exits with status 0 ([Operations](OPERATIONS.md#exit-status)).
 
 **A setting is refused.** The configuration is validated before anything starts, and the
 reason names the setting:
@@ -92,8 +93,10 @@ The broker answers a refused CONNECT with a CONNACK, then closes the connection:
 | The client's identity is one the broker will not act on (another account, malformed, expired) | 0x05 | 0x87 | `not authorized` |
 | Admission could not complete: the broker's own account is not established, the client's NATS connection dropped, or the identity request went unanswered | 0x03 | 0x88 | `server unavailable` |
 
-The log says which: `MQTT: refusing CONNECT for client ...: <reason>`. A refused password
-is logged only at `debug`, as `MQTT auth passthrough rejected client ...`.
+The log says which: `MQTT: refusing CONNECT`, with the `client_id` and the `reason`, or
+`MQTT: refusing CONNECT: the service connection's account is not currently established`.
+A refused password is logged only at `debug`, as `MQTT auth passthrough rejected client
+...`.
 
 - **0x03 / 0x88 for every client:** the client identities cannot publish to
   `$SYS.REQ.USER.INFO`. A publish deny on `$SYS.>` causes it, and cannot be carved back
@@ -143,9 +146,9 @@ particular streams instead of `$JS.ACK.>`. Grant `$JS.ACK.>`
 - **Reason 0x8B (server shutting down):** the broker is stopping.
 - **Without a reason:** the client's own NATS connection dropped (each client has one
   under auth passthrough), or the client could not take a write within 10 s.
-- **Every client at once, with** `MQTT: the service connection reconnected into account
-  ...`: the broker's own NATS connection came back in another account, so no identity
-  checked against the old one stands.
+- **Every client at once, with** `MQTT: the service connection reconnected into another
+  account; ...`: the broker's own NATS connection came back in another account, so no
+  identity checked against the old one stands.
 
 ## Broker state is lost when a NATS server fails
 

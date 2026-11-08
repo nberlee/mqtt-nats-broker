@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 var (
@@ -30,9 +32,12 @@ var (
 	// own message is unchanged (mqttJSATimeoutError).
 	errMQTTJSARequestTimeout = errors.New("JetStream API request timed out")
 
-	// errMQTTStartupCancelled ends an initialization attempt whose startup was cancelled:
-	// Start's context ended, or Start met a refusal and is tearing the server down.
-	errMQTTStartupCancelled = errors.New("MQTT startup cancelled")
+	// ErrStartupCancelled ends an initialization attempt whose startup was cancelled:
+	// Start's context ended, or Start met a refusal and is tearing the server down. It is
+	// exported because the command reads it, with its signal context done, as a requested
+	// stop rather than a failure: the backoff wraps context.Cause, which need not be
+	// context.Canceled.
+	ErrStartupCancelled = errors.New("MQTT startup cancelled")
 
 	// errMQTTOwnEphemeralStray is the retained observer's CREATE refused because THIS run's
 	// earlier attempt still holds the name: its CREATE was accepted and applied after this
@@ -230,7 +235,7 @@ func mqttAbandoned(ch <-chan struct{}) bool {
 // did not answer yet: a request with no answer, or an asset with no serving leader. Every
 // other error is a refusal and ends startup.
 func mqttStartupRetryable(err error) bool {
-	if err == nil || errors.Is(err, errMQTTStartupCancelled) {
+	if err == nil || errors.Is(err, ErrStartupCancelled) {
 		return false
 	}
 	// A request with no answer in time. A request the connection DEFINITELY refused to
@@ -341,13 +346,13 @@ func (s *Server) initializeWithRetries(ctx context.Context) (err error) {
 			return perr
 		}
 		if ctx.Err() != nil {
-			return fmt.Errorf("%w: %w (last attempt: %v)", errMQTTStartupCancelled, ctx.Err(), err)
+			return fmt.Errorf("%w: %w (last attempt: %v)", ErrStartupCancelled, ctx.Err(), err)
 		}
 		if !mqttStartupRetryable(err) {
 			return err
 		}
 		if now := time.Now(); lastLogged.IsZero() || now.Sub(lastLogged) >= mqttStartupLogEvery {
-			s.Warnf("MQTT: initialization attempt %d did not complete, JetStream is not answering yet; retrying: %v", attempt, err)
+			operational.MQTTInitializationRetry.Log(s.logger(), operational.Int(int64(attempt)), operational.Err(err))
 			lastLogged = now
 		}
 		if h := mqttTestStartupBackoffHookV.Load(); h != nil {
@@ -361,7 +366,7 @@ func (s *Server) initializeWithRetries(ctx context.Context) (err error) {
 			if perr := s.startupFailure(); perr != nil {
 				return perr
 			}
-			return fmt.Errorf("%w: %w (last attempt: %v)", errMQTTStartupCancelled, context.Cause(ctx), err)
+			return fmt.Errorf("%w: %w (last attempt: %v)", ErrStartupCancelled, context.Cause(ctx), err)
 		case <-t.C:
 		}
 		backoff = min(backoff*2, mqttStartupBackoffMax)

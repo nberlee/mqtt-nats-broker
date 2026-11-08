@@ -115,6 +115,9 @@ func TestRunServesHealthDuringTheJetStreamWait(t *testing.T) {
 		if err == nil || !errors.Is(err, context.Canceled) {
 			t.Fatalf("run = %v, want the cancelled JetStream wait", err)
 		}
+		if status, report := exitStatus(err); status != 0 || report != "" {
+			t.Errorf("exit %d %q, want a stop (0, nothing on stderr)", status, report)
+		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("run did not return after its context ended")
 	}

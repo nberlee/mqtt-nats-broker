@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"testing"
 )
 
@@ -40,8 +39,7 @@ func TestProfilerServesOnlyItsOwnListener(t *testing.T) {
 		t.Fatalf("heap profile: status %d, %d bytes", resp.StatusCode, len(body))
 	}
 
-	var ready atomic.Bool
-	health := healthMux(nil, &ready)
+	health := startingHealthMux()
 	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap"} {
 		req, _ := http.NewRequest(http.MethodGet, path, nil)
 		if _, pattern := health.Handler(req); pattern != "" {

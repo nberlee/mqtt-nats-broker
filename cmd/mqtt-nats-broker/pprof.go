@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"time"
+
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // pprofMux serves the runtime profiles on a mux of its own. The net/http/pprof import also
@@ -31,15 +33,15 @@ func pprofMux() *http.ServeMux {
 func startPprof(addr string, log *slog.Logger) (*http.Server, net.Addr) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Error("profiler listener could not bind", "addr", addr, "err", err)
+		operational.ProfilerBindFailed.Log(log, operational.Str(addr), operational.Err(err))
 		return nil, nil
 	}
 	// No write timeout: a CPU profile or trace streams for as long as it was asked to.
 	srv := &http.Server{Handler: pprofMux(), ReadHeaderTimeout: 5 * time.Second}
-	log.Info("profiler listening", "addr", ln.Addr().String())
+	operational.ProfilerListening.Log(log, operational.Addr(ln.Addr()))
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("profiler error", "err", err)
+			operational.ProfilerError.Log(log, operational.Err(err))
 		}
 	}()
 	return srv, ln.Addr()

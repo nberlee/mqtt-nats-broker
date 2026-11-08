@@ -1470,8 +1470,11 @@ boundary's "no compatibility" rule stands, and this policy is written into it as
   breaks on a dotted host name (`docs/ARCHITECTURE.md` "The permission contract"). Done
   2026-11-08.
 
-- [ ] **Operational interface.** Freeze what `/healthz` and `/readyz` mean (including
-  their bodies), the exit codes, and the JSON log fields operators can alert on.
+- [x] **Operational interface.** One definition (`internal/operational`) of the probe
+  answers (`starting` until the broker serves, `draining` from the signal), the exit
+  statuses (a stop during startup is 0, a refusal 1) and the frozen JSON records with
+  typed fields; pinned, rendered into `docs/OPERATIONS.md`, producers censused
+  (`docs/ARCHITECTURE.md` "The operational interface"). Done 2026-11-08.
 
 ## 2. Make the MQTT core maintainable
 

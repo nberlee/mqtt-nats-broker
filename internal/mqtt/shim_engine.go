@@ -21,6 +21,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
+
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // ---------------------------------------------------------------------------
@@ -439,7 +441,7 @@ func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
 	// cannot tell us where a buffered write would land.
 	svcAccount, svcOK := s.serviceAccount()
 	if !svcOK {
-		s.Warnf("MQTT: refusing CONNECT: the service connection's account is not currently established")
+		operational.ConnectRefusedAccountUnknown.Log(s.logger())
 		return mqttRefusalServerUnavailable, false
 	}
 	var user, pass string
@@ -491,7 +493,7 @@ func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
 
 	id, ierr := mqttFetchIdentity(nc, s.nrc)
 	if ierr != nil {
-		s.Warnf("MQTT: refusing CONNECT for client %q: %v", cid, ierr)
+		operational.ConnectRefused.Log(s.logger(), operational.Str(cid), operational.Err(ierr))
 		if errors.Is(ierr, errMQTTIdentityUnavailable) {
 			return mqttRefusalServerUnavailable, false
 		}
@@ -502,8 +504,8 @@ func (s *Server) authorizeClient(c *client) (mqttConnectRefusal, bool) {
 		// nothing checked it, so credentials valid in another account
 		// authenticated while every durable operation landed in this one's
 		// streams. issue #82.
-		s.Warnf("MQTT: refusing CONNECT for client %q: identity %q is bound to account %q, not the service account %q",
-			cid, id.user, id.account, svcAccount)
+		operational.ConnectRefused.Log(s.logger(), operational.Str(cid), operational.Reason(fmt.Sprintf(
+			"identity %q is bound to account %q, not the service account %q", id.user, id.account, svcAccount)))
 		return mqttRefusalNotAuthorized, false
 	}
 	// The window the handler could not cover: a drop between arming and here is

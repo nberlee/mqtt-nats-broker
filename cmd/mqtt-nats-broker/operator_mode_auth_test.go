@@ -17,6 +17,7 @@ import (
 	"github.com/nats-io/nkeys"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // The operator (JWT) deployment docs/AUTHENTICATION.md documents, built in-process.
@@ -353,7 +354,7 @@ func TestOperatorModeAuthCallout(t *testing.T) {
 			t.Fatal("an identity the callout placed in another account was admitted")
 		}
 		waitFor(t, 5*time.Second, func() bool {
-			return logs.logged(slog.LevelWarn, `refusing CONNECT for client "mallory": $SYS.REQ.USER.INFO: nats: timeout`)
+			return logs.loggedRecord(slog.LevelWarn, operational.ConnectRefused.Msg, "client_id", "mallory", "reason", "$SYS.REQ.USER.INFO: nats: timeout")
 		})
 	})
 

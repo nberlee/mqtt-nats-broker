@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof config-surface-fixture store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof config-surface-fixture operational-interface-fixture store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -86,6 +86,9 @@ depproof: ## Dependency canary: JetStream write-contract regressions plus every 
 
 config-surface-fixture: ## Regenerate internal/config/testdata/surface.txt, the pinned configuration surface, with a change to it (docs/ARCHITECTURE.md "The configuration surface")
 	MQTTNB_WRITE_CONFIG_SURFACE_FIXTURE=1 go test -count 1 -run '^TestWriteConfigurationSurfaceFixture$$' ./internal/config/
+
+operational-interface-fixture: ## Regenerate internal/operational/testdata/interface.txt, the pinned operational interface, with a change to it (docs/ARCHITECTURE.md "The operational interface")
+	MQTTNB_WRITE_OPERATIONAL_INTERFACE_FIXTURE=1 go test -count 1 -run '^TestWriteOperationalInterfaceFixture$$' ./internal/operational/
 
 store-format-fixture: ## Regenerate the golden store of the persisted format this build writes (internal/mqtt/testdata/storeformat/<format>); never for a released format — see docs/ARCHITECTURE.md "The persisted format"
 	MQTTNB_WRITE_STORE_FORMAT_FIXTURE=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -run '^TestWriteStoreFormatFixture$$' ./internal/mqtt/

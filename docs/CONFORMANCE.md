@@ -6094,6 +6094,26 @@ contract"); what keeps the contract true is a set of tests, and they reach this 
   the denied operation failing (a startup that does not finish, a delivery that never
   arrives, an acknowledgement that never lands), with the denial in nats-server's log.
 
+### Only the named records are an operational interface
+
+The probes, the exit status and the frozen records are one definition
+(`docs/ARCHITECTURE.md`, "The operational interface"). What it does not cover:
+
+- **Every other record's text can change in any release**, the MQTT core's per-connection
+  records included: they are printf text with the client label (`cid:N`) inside `msg`,
+  and a `text` field's wording (an error, a reason) is not frozen either.
+- **`/readyz` reports connectivity, not identity.** A service connection that reconnected
+  and could not be identified answers `200 ready` while every auth-passthrough CONNECT is
+  refused; only the `could not be identified` and `refusing CONNECT: the service
+  connection's account is not currently established` records show it.
+- **No record reports the service connection's disconnect or reconnect** as such; `/readyz`
+  answers `503 nats disconnected` while it is down.
+- **A stop during startup is exit 0 only once a step observes it.** The NATS dial and the
+  first service-identity request are bounded but do not observe the signal; a failure of
+  their own while it is pending is reported as exit 1.
+- **Emission is witnessed for the records the tests drive**, not for every path that
+  reaches a producer; the census pins producers by function, not by branch.
+
 ### Cross-version coexistence is excluded by procedure, not detected
 
 The broker-to-broker protocol is versioned by the persisted format's key (see "The

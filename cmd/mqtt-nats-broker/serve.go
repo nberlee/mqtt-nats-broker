@@ -9,6 +9,7 @@ import (
 	"github.com/nberlee/mqtt-nats-broker/internal/backend"
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
 	"github.com/nberlee/mqtt-nats-broker/internal/mqtt"
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 	"github.com/nberlee/mqtt-nats-broker/internal/tlsreload"
 )
 
@@ -111,9 +112,11 @@ func serveMQTT(ctx context.Context, cfg *config.Config, be *backend.Backend, opt
 		s.Shutdown()
 		return nil, fmt.Errorf("start MQTT listener: %w", err)
 	}
-	log.Info("MQTT listener started", "addr", s.Addr(), "node", nodeName, "tls", opts.MQTT.TLSConfig != nil)
+	operational.MQTTListenerStarted.Log(log, operational.Addr(s.Addr()), operational.Str(nodeName),
+		operational.Flag(opts.MQTT.TLSConfig != nil))
 	if wa := s.WSAddr(); wa != nil {
-		log.Info("MQTT over WebSocket listener started", "addr", wa, "tls", opts.MQTT.TLSConfig != nil && !opts.MQTT.Websocket.NoTLS)
+		operational.WebSocketListenerStarted.Log(log, operational.Addr(wa),
+			operational.Flag(opts.MQTT.TLSConfig != nil && !opts.MQTT.Websocket.NoTLS))
 	}
 	return s, nil
 }

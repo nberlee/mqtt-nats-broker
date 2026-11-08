@@ -12,6 +12,7 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 
 	"github.com/nberlee/mqtt-nats-broker/internal/config"
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // embeddedStartHookV runs just before the embedded server starts, so a test can hold the
@@ -38,7 +39,7 @@ func startEmbeddedNATS(ctx context.Context, cfg *config.Config, log *slog.Logger
 	if err != nil {
 		return nil, fmt.Errorf("embedded NATS server: %w", err)
 	}
-	srv.SetLoggerV2(natsLogger{log.With("component", "nats-server")}, opts.Debug, opts.Trace, false)
+	srv.SetLoggerV2(embeddedServerLogger(log), opts.Debug, opts.Trace, false)
 	if h := embeddedStartHookV.Load(); h != nil {
 		(*h)()
 	}
@@ -49,7 +50,7 @@ func startEmbeddedNATS(ctx context.Context, cfg *config.Config, log *slog.Logger
 			return nil, fmt.Errorf("embedded NATS server not ready: %w", ctx.Err())
 		}
 	}
-	log.Info("embedded NATS server ready", "server", srv.Name(), "config", cfg.NATSEmbeddedConfig)
+	operational.EmbeddedNATSReady.Log(log, operational.Str(srv.Name()), operational.Str(cfg.NATSEmbeddedConfig))
 	return srv, nil
 }
 
@@ -149,6 +150,12 @@ func enforceEmbeddedOptions(opts *server.Options, jsDomain string) error {
 // process emits one stream of JSON lines.
 type natsLogger struct{ log *slog.Logger }
 
+// embeddedServerLogger is the embedded server's logger: the broker's, with every record
+// marked as the server's.
+func embeddedServerLogger(log *slog.Logger) natsLogger {
+	return natsLogger{log.With(operational.KeyComponent, operational.ComponentNATSServer)}
+}
+
 func (l natsLogger) Noticef(format string, v ...any) { l.log.Info(fmt.Sprintf(format, v...)) }
 func (l natsLogger) Warnf(format string, v ...any)   { l.log.Warn(fmt.Sprintf(format, v...)) }
 func (l natsLogger) Errorf(format string, v ...any)  { l.log.Error(fmt.Sprintf(format, v...)) }
@@ -159,5 +166,5 @@ func (l natsLogger) Tracef(format string, v ...any)  { l.log.Debug(fmt.Sprintf(f
 // continue and does not expect it to return.
 func (l natsLogger) Fatalf(format string, v ...any) {
 	l.log.Error(fmt.Sprintf(format, v...))
-	os.Exit(1)
+	os.Exit(operational.ExitFailed)
 }

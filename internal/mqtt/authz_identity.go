@@ -12,6 +12,8 @@ import (
 	server "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
+
+	"github.com/nberlee/mqtt-nats-broker/internal/operational"
 )
 
 // The authenticated identity's NATS account and permissions, which the broker
@@ -480,7 +482,7 @@ func (s *Server) armServiceIdentityHandlers() {
 	s.nrc.SetReconnectHandler(func(nc *nats.Conn) {
 		id, err := mqttFetchIdentity(nc, nc)
 		if err != nil {
-			s.Warnf("MQTT: the service connection reconnected but could not be identified, so no CONNECT is accepted: %v", err)
+			operational.ServiceConnectionUnidentified.Log(s.logger(), operational.Err(err))
 			return
 		}
 		// Re-checked before believing the answer. NATS serialises connection
@@ -490,7 +492,7 @@ func (s *Server) armServiceIdentityHandlers() {
 		// is already gone, and publication gates would accept the stale account
 		// until the queued handler finally ran.
 		if !nc.IsConnected() {
-			s.Warnf("MQTT: the service connection dropped again while it was being re-identified; leaving the account unknown")
+			operational.ServiceConnectionDroppedWhileIdentifying.Log(s.logger())
 			return
 		}
 		s.svcID.mu.Lock()
@@ -514,7 +516,7 @@ func (s *Server) armServiceIdentityHandlers() {
 		// Not a routine event: the broker's streams are account-scoped, so a
 		// different account is a different broker. Existing clients are cut loose
 		// rather than left writing into it.
-		s.Errorf("MQTT: the service connection reconnected into account %q, not %q; disconnecting every auth-passthrough client", id.account, was)
+		operational.ServiceAccountChanged.Log(s.logger(), operational.Str(id.account), operational.Str(was))
 		s.invalidateAuthPassthroughClients()
 	})
 }

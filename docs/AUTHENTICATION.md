@@ -31,10 +31,10 @@ including the ones that run over the service connection (stored QoS 1 and QoS 2
 messages, retained messages, Wills). The permissions are read once, at CONNECT.
 
 A user in another account authenticates to NATS but is refused, and what an
-operator sees is a two-second delay and this log line, not an account mismatch:
+operator sees is a two-second delay and this log record, not an account mismatch:
 
 ```text
-MQTT: refusing CONNECT for client "<client id>": $SYS.REQ.USER.INFO: nats: timeout
+{"level":"WARN","msg":"MQTT: refusing CONNECT","client_id":"<client id>","reason":"$SYS.REQ.USER.INFO: nats: timeout"}
 ```
 
 The server answers the identity request in the client's own account, and the broker

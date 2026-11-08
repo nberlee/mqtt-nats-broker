@@ -66,8 +66,8 @@ records (in place, the same version: see "The broker-to-broker protocol" below),
 a checked NATS floor, and frozen
 configuration (in place: see "The configuration surface" below),
 permissions (in place: see "The permission contract" below), and the
-operational interface (`docs/ROADMAP.md` §1, "Contracts in place by the first
-release"). **Beta** keeps those contracts: compatibility is guaranteed
+operational interface (in place: see "The operational interface" below). **Beta** keeps
+those contracts: compatibility is guaranteed
 within them from then on, and this section is rewritten as that contract when beta is
 cut.
 
@@ -465,6 +465,76 @@ attempted broker operation stays within those grants. The census detects unclass
 violations on a best-effort basis. Unobserved asynchronous operations can escape both,
 including operations outside the grant under an already-classified root (the residual in
 `docs/CONFORMANCE.md`, "The permission contract is witnessed, not enforced").
+
+### The operational interface
+
+The operational interface is what an operator's tooling reads from a running broker:
+the probe endpoints' answers, the exit status and the JSON log records an alert can match.
+It has one definition, `internal/operational`, which the producers read and from which
+its pin and its documentation are rendered.
+
+**The probes.** `/healthz` answers `200 ok` whenever the health server serves: it is bound
+first, before the embedded server starts and NATS is dialed (see "Startup retries"), and
+shut down last. `/readyz` is a function of three inputs, `operational.Readyz`: the stored
+readiness (`Starting` from the bind, `Serving` once the MQTT listener is up and TLS
+reloading has started), whether the signal context has ended, and whether the service
+connection is connected, consulted only once the broker serves. A stop answers
+`503 draining`; not yet served, `503 starting`; serving, `200 ready` or
+`503 nats disconnected`. The stop is not stored: the probe reads the signal context
+itself, so no write can order itself before or after the signal, and a context that ends
+at the moment `Start` succeeds never answers `200 ready`. A failed start's unwinding,
+which `Start` completes before returning, answers `starting`: the broker has not served.
+`200 ready` claims connectivity, not identity: a service connection that reconnected and
+could not be identified answers it while every auth-passthrough CONNECT is refused (the
+residual in `docs/CONFORMANCE.md`, "Only the named records are an operational
+interface").
+
+**The exit status.** 0 for a stop the broker completed, 1 for a failure with
+`fatal: <reason>` on stderr; the embedded server's own `Fatalf` exits 1 after an `ERROR`
+record marked `component: nats-server`, with no stderr line. A startup error is a stop
+only when it is a cancellation and the signal context has ended (`startupOutcome`):
+`context.Canceled`, or the MQTT core's `mqtt.ErrStartupCancelled`, which carries the
+context's cause rather than `context.Canceled` from its backoff and alone from its stream
+preflight. A definite refusal never wraps either, so a refusal stays exit 1 even when a
+signal arrives meanwhile; the embedded JetStream wait judges a request's answer before
+the context for that reason. Two bounded startup steps do not observe the signal, the
+NATS dial and `Start`'s first service-identity request: a failure of their own is exit 1.
+Outside the contract: a signal before the handlers are registered, a signal after the
+drain delay's handler is released (any second signal without a drain delay), a panic
+(the Go runtime's 2) and SIGKILL. Exit 0 says the shutdown sequence returned, not that
+every buffered publication reached NATS: the service connection's close is bounded.
+
+**The records.** Every record carries `time`, `level` and `msg`, and the embedded
+server's carry `component: nats-server`. The frozen records are `operational.Records`:
+each a message, a level, typed fields and when it is written. A producer logs one through
+`Record.Log` with one `Value` per field, and a `Value` comes only from the constructor of
+a kind (`Str`, `Addr`, `Int`, `Uint`, `Flag`, `Dur`, `At`, `Reason`, `Err`), so a field's
+JSON type is the definition's: an address is its text, a duration its nanoseconds. A
+`text` field's wording (an error, a reason) is not part of the interface. The CONNECT
+refusals, the service identity's failures, the account change and the initialization
+retry are structured records for this reason: their facts used to be formatted into
+`msg`. Every other record, the core's per-connection printf records with their `cid:N`
+label included, is outside the interface.
+
+**What keeps it true, and how far.** `internal/operational/testdata/interface.txt` is
+rendered from the definition (every `/readyz` combination, the exit statuses, the
+envelope, the kinds and each record) and byte-compared by
+`TestOperationalInterfaceIsPinned`; `make operational-interface-fixture` regenerates it.
+`TestOperationsDocumentStatesTheOperationalInterface` requires `docs/OPERATIONS.md` to carry
+each rendered table verbatim. `TestEveryFrozenRecordHasItsNamedProducers` parses the
+production source: each record is logged by exactly its named producer functions, with
+the constructor of each field's kind, and no literal outside the definition starts with
+a frozen message or with a text a frozen record replaced. `TestHealthEndpointsAnswerEachState`,
+`TestReadinessFollowsTheLifecycle`, `TestStartupOutcomeClassifiesCancellation`, the exit
+witnesses and the record witnesses assert literal expectations against the real handler,
+`run` and processes. A producer's emission condition is witnessed for the records those
+tests drive, not for every path that reaches it; the census pins producers by function,
+not by the branch inside it.
+
+**How it changes, until the first release.** By editing the definition: the pin is
+regenerated and the docs follow, in one change, with no alias for a former message and no
+dual emission. What applies from the first release is decided then, under "Release
+phases" above.
 
 ### Shared-subscription QoS boundary
 
@@ -16959,7 +17029,7 @@ readiness probe withdraws the endpoint after one failure (period 2 s, failure th
 the Service and the load balancer. Nothing proves propagation has finished. Liveness is
 `/healthz`. There is no startup probe: the health server is bound before NATS is dialed
 (see "Startup retries"), so `/healthz` answers from the process's first moments and
-`/readyz` stays 503 (`starting`, then `draining` until the broker serves) through the
+`/readyz` stays 503 `starting` until the broker serves, through the
 JetStream probe, the stream-bundle preflight and the MQTT initialization's retries; no
 probe restarts a pod for any of them.
 
