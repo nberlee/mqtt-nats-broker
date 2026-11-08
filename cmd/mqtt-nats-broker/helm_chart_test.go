@@ -1334,8 +1334,8 @@ func loadNATSChartConfig(t *testing.T, conf string, vars map[string]string) *ser
 }
 
 // checkBrokerNATSOptions requires a NATS configuration the broker can run on: JetStream,
-// no default consumer cap, and the default user (anonymous MQTT) denied the broker's
-// internals both ways.
+// no default consumer cap, and the default user (anonymous MQTT) held to the permission
+// contract.
 func checkBrokerNATSOptions(t *testing.T, opts *server.Options, replicas int) {
 	t.Helper()
 	// More than one server: the route listener is authenticated, and every route presents
@@ -1361,7 +1361,6 @@ func checkBrokerNATSOptions(t *testing.T, opts *server.Options, replicas int) {
 	if opts.JetStreamLimits.DefaultMaxConsumers != -1 {
 		t.Errorf("default_max_consumers %d, want -1: the broker's streams carry one consumer per subscription", opts.JetStreamLimits.DefaultMaxConsumers)
 	}
-	internals := []string{"$MQTT.>", "$JS.>", "$KV.>", "$O.>"}
 	var found bool
 	for _, u := range opts.Users {
 		if u.Username != "fixture-default_user" {
@@ -1371,20 +1370,15 @@ func checkBrokerNATSOptions(t *testing.T, opts *server.Options, replicas int) {
 		if u.Account == nil || u.Account.Name != "MQTT" {
 			t.Errorf("the default user is in account %v, want MQTT", u.Account)
 		}
-		for dir, p := range map[string]*server.SubjectPermission{"publish": permDir(u.Permissions, true), "subscribe": permDir(u.Permissions, false)} {
-			var deny []string
-			if p != nil {
-				deny = p.Deny
-			}
-			for _, s := range internals {
-				if !slices.Contains(deny, s) {
-					t.Errorf("the default user may %s %s", dir, s)
-				}
-			}
-		}
 	}
 	if !found {
 		t.Error("no default user (MQTTNB_DEFAULT_USER) in the NATS configuration")
+	}
+	// Every identity the rendered configuration defines: the service user's grant pinned
+	// (the chart does not fix the passthrough mode, so it grants everything), every other
+	// user held to the MQTT identity rules.
+	for _, p := range contractIdentityProblems(opts, "fixture-nats_user", "all", "all") {
+		t.Error(p)
 	}
 	var service bool
 	for _, u := range opts.Users {
@@ -1393,16 +1387,6 @@ func checkBrokerNATSOptions(t *testing.T, opts *server.Options, replicas int) {
 	if !service {
 		t.Error("no service user (MQTTNB_NATS_USER) in the account MQTT")
 	}
-}
-
-func permDir(p *server.Permissions, publish bool) *server.SubjectPermission {
-	if p == nil {
-		return nil
-	}
-	if publish {
-		return p.Publish
-	}
-	return p.Subscribe
 }
 
 // writeValues writes a values file for one test case.

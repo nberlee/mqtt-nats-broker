@@ -29,9 +29,6 @@ import (
 // authorization service: it checks a user name and password against a table and issues
 // a user JWT, signed by the target account, carrying that user's permissions.
 
-// mqttReservedDenies are the subjects every MQTT identity is denied in both directions.
-var mqttReservedDenies = []string{"$MQTT.>", "$JS.>", "$KV.>", "$O.>"}
-
 // calloutUser is one row of the fixture responder's table.
 type calloutUser struct {
 	password string
@@ -229,9 +226,9 @@ default_sentinel: %s
 		}
 		uc := jwt.NewUserClaims(req.UserNkey)
 		uc.Name = co.Username
-		uc.Pub.Deny.Add(mqttReservedDenies...)
+		uc.Pub.Deny.Add(mqttIdentityDenies()...)
 		uc.Pub.Deny.Add(u.pubDeny...)
-		uc.Sub.Deny.Add(mqttReservedDenies...)
+		uc.Sub.Deny.Add(mqttIdentityDenies()...)
 		uc.Sub.Deny.Add(u.subDeny...)
 		ujwt, err := uc.Encode(signers[u.account])
 		if err != nil {
@@ -368,8 +365,8 @@ func TestOperatorModeAuthCallout(t *testing.T) {
 		dir := t.TempDir()
 		_, bearerJWT, bkp := userCreds(t, dir, "bearer", f.appKP, func(uc *jwt.UserClaims) {
 			uc.BearerToken = true
-			uc.Pub.Deny.Add(mqttReservedDenies...)
-			uc.Sub.Deny.Add(mqttReservedDenies...)
+			uc.Pub.Deny.Add(mqttIdentityDenies()...)
+			uc.Sub.Deny.Add(mqttIdentityDenies()...)
 		})
 		seed, _ := bkp.Seed()
 		if acc := natsUserAccount(t, f.srv.ClientURL(), nats.UserJWTAndSeed(bearerJWT, string(seed))); acc != f.app {

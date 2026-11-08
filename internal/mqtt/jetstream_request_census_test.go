@@ -246,7 +246,7 @@ func jsCensusBrokerClass(m *nats.Msg) (string, bool) {
 		return _EMPTY_, false
 	}
 	if strings.HasPrefix(subj, mqttJSARepliesPrefix) {
-		// $MQTT.JSA.<node>.<kind>.<nuid>
+		// $MQTT.JSA.<run id>.<kind>.<nuid>
 		if tk := strings.Split(subj, "."); len(tk) >= 5 {
 			return "reply:" + tk[3], true
 		}

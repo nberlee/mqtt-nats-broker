@@ -1463,8 +1463,12 @@ boundary's "no compatibility" rule stands, and this policy is written into it as
   defaults, and `values.schema.json` the chart's values; no deprecation path before the
   first release (`docs/ARCHITECTURE.md` "The configuration surface"). Done 2026-11-08.
 
-- [ ] **Permission contract.** Freeze the reserved `$MQTT.>` namespace and the ACLs
-  deployments are told to set, so a hardened deployment's permissions survive upgrades.
+- [x] **Permission contract.** One definition (`internal/mqtt/permission_contract.go`) of
+  the MQTT identities' denies, the service identity's grant per auth-passthrough mode and
+  domain, and the no-response-permissions rule; shipped ACLs checked against it, a runtime
+  witness under the exact grant, a `$`-root census; the JetStream reply token no longer
+  breaks on a dotted host name (`docs/ARCHITECTURE.md` "The permission contract"). Done
+  2026-11-08.
 
 - [ ] **Operational interface.** Freeze what `/healthz` and `/readyz` mean (including
   their bodies), the exit codes, and the JSON log fields operators can alert on.

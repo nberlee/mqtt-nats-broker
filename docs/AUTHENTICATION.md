@@ -70,11 +70,18 @@ all carry over:
 
 ## What every MQTT identity needs
 
+These are the permission contract's MQTT-identity rules
+([The permission contract](ARCHITECTURE.md#the-permission-contract)), which also states the
+service identity's grant.
+
 - **Denied, publish and subscribe: `$MQTT.>`, `$JS.>`, `$KV.>` and `$O.>`.** An
   MQTT topic maps onto a NATS subject, so without these an MQTT client could forge
   the broker's state or, publishing to `$JS/API/STREAM/DELETE/$MQTT_sess`, delete
   its streams. The broker cannot check this for you; it is a deployment requirement
   ([What a deployment must allow](ARCHITECTURE.md#what-a-deployment-must-allow)).
+- **No response permissions.** nats-server checks `allow_responses` after an explicit
+  deny, so an identity allowed responses can answer a request into `$MQTT.>` despite
+  denying it, and forge another client's identity reply.
 - **Allowed to publish `$SYS.REQ.USER.INFO`.** A publish deny on `$SYS.>` refuses
   every CONNECT, and NATS evaluates deny before allow, so it cannot be carved back.
 - **Subscribe permissions written for both levels of a `/#` filter.** In MQTT,
@@ -82,6 +89,9 @@ all carry over:
   `sensors` and `sensors.>`, and an allow list naming only `sensors.>` refuses the
   whole filter (SUBACK 0x80). nats-server's own listener maps filters the same way,
   so ACLs written for it should already carry both.
+- **Queue-scoped subscribe permissions admitting `$mqttshare.*`**, if any are written:
+  every shared subscription joins a queue group of that name, and a queue-scoped allow
+  that matches the subject replaces a plain allow's verdict for queue subscriptions.
 
 ## Example: users and passwords
 
@@ -143,7 +153,7 @@ Who signs what:
 
 | JWT | Signed by | Carries |
 |---|---|---|
-| The service user | `APP` (or a signing key of it) | nothing special; give it full rights in `APP` |
+| The service user | `APP` (or a signing key of it) | full rights in `APP`, or the permission contract's service grant |
 | The responder's user | `AUTH` | the identity your callout service connects with |
 | The default sentinel | `AUTH` | `bearer_token`, publish and subscribe deny `>` |
 | The authorization response | `AUTH` | the issued user JWT, or an error |

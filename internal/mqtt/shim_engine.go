@@ -45,8 +45,8 @@ const hasMappings readCacheFlag = 1 << iota
 func (rf readCacheFlag) isSet(c readCacheFlag) bool { return rf&c != 0 }
 
 // ---------------------------------------------------------------------------
-// Permissions. Delivery and persistence ride the full-rights SERVICE connection,
-// so NATS cannot police them and the broker does it here, from the identity
+// Permissions. Delivery and persistence ride the SERVICE connection, which holds the
+// service identity's grant rather than the client's, so NATS cannot police them and the broker does it here, from the identity
 // snapshot authorizeClient takes at CONNECT (authz_identity.go). NATS still
 // enforces the client's own connection: SUBSCRIBE admission, and QoS 0 on a user
 // topic. issue #81, issue #82, issue #83.
@@ -385,9 +385,10 @@ func (s *Server) startGoRoutine(f func()) bool {
 	return true
 }
 
-// NodeName returns this instance's unique id, used as the JSA reply-routing
-// token. It must be non-empty and unique per broker instance; if unset, a stable
-// id is generated lazily so JSA subjects are always valid.
+// NodeName returns this instance's id, the origin stamped on the records it writes and
+// the owner it names in a claim. It must be non-empty and unique per broker instance; if
+// unset, one is generated lazily. It is never a subject token: it is a host name and may
+// carry dots, so the JSA reply prefix uses the run's identity instead.
 func (s *Server) NodeName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1739,8 +1740,8 @@ func (c *client) processSub(subject, queue, sid []byte, cb msgHandler, noForward
 		// the PONG that Flush waits for. So a Flush round-trip makes a new
 		// permission-violation LastError observable synchronously; we surface it as
 		// a subscribe error, which the SUBSCRIBE handler turns into a SUBACK failure
-		// (0x80). Only per-client connections are permission-scoped; the shared
-		// service connection has full rights.
+		// (0x80). Only per-client connections are scoped to the client's permissions;
+		// the shared service connection holds the service identity's grant.
 		//
 		// The $MQTT. exclusion is structural rather than an exemption: such a
 		// subject was just routed to the service connection above, so it is never

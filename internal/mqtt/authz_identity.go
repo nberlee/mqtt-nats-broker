@@ -21,7 +21,8 @@ import (
 // client's rights, and for SUBSCRIBE admission it does. Everything else — the
 // $MQTT_msgs store, the retained store, the QoS 2 hold, QoS 1/2 delivery,
 // retained replay, and an internally replayed Will — rides the SERVICE
-// connection, which holds full rights by design. So the broker has to enforce
+// connection, whose grant is the service identity's, not the client's (the permission
+// contract, permission_contract.go). So the broker has to enforce
 // those itself, and to enforce anything it first has to know who the client is.
 //
 // $SYS.REQ.USER.INFO answers exactly that, on the client's own connection: the

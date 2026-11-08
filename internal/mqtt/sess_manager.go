@@ -1094,6 +1094,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	c.acc = acc
 
 	id := s.NodeName()
+	// The reply prefix carries the run's identity, not the node name: the kind is read
+	// at a fixed token after it, so the token must be exactly one, and a node name is a
+	// host name, which may carry dots.
+	runID, _ := s.ephemeralIdentity()
 
 	mqttJSAPITimeout := opts.MQTT.JSAPITimeout
 	if mqttJSAPITimeout == 0 {
@@ -1135,7 +1139,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		jsa: mqttJSA{mqttJSACore: &mqttJSACore{
 			id:      id,
 			c:       c,
-			rplyr:   mqttJSARepliesPrefix + id + ".",
+			rplyr:   mqttJSARepliesPrefix + runID + ".",
 			sendq:   newIPQueue[*mqttJSPubMsg](s, qname+"send"),
 			nuid:    nuid.New(),
 			quitCh:  quitCh,

@@ -78,6 +78,11 @@ func streamMsgs(ctx context.Context, t *testing.T, js jetstream.JetStream, name 
 	return info.State.Msgs
 }
 
+// serviceInbox puts a test's own service-identity connection's replies where the broker's
+// go, inside the reserved namespace: the permission contract lets the service identity
+// subscribe there and nowhere else (docs/ARCHITECTURE.md, "The permission contract").
+var serviceInbox = nats.CustomInboxPrefix("$MQTT.inbox")
+
 // startConfiguredServer starts a server from a shipped configuration file with only what
 // a test process needs changed: ephemeral ports, a temporary store, no signals, no
 // monitoring port, and JetStream domain d so domain-qualified API subjects are real.
@@ -196,7 +201,7 @@ func TestShippedACLsKeepMQTTIdentitiesOffBrokerSubjects(t *testing.T) {
 			if _, err := who.Request("$SYS.REQ.USER.INFO", nil, 2*time.Second); err != nil {
 				t.Errorf("%s cannot ask who it is, which auth passthrough needs: %v", tc.mqttUser, err)
 			}
-			svc := dial(tc.svcUser, tc.svcPass)
+			svc := dial(tc.svcUser, tc.svcPass, serviceInbox)
 			for _, subj := range []string{"$JS.API.INFO", "$JS.d.API.INFO"} {
 				if _, err := svc.Request(subj, nil, 5*time.Second); err != nil {
 					t.Errorf("the service identity is not answered on %s: %v", subj, err)
@@ -228,7 +233,7 @@ func TestRecommendedACLKeepsMQTTClientsOffTheJetStreamAPI(t *testing.T) {
 		t.Fatalf("serveMQTT: %v", err)
 	}
 	t.Cleanup(func() { <-ms.BeginShutdown() })
-	svc, err := nats.Connect(srv.ClientURL(), nats.UserInfo("service", "service"))
+	svc, err := nats.Connect(srv.ClientURL(), nats.UserInfo("service", "service"), serviceInbox)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -32,7 +32,8 @@ services:
     depends_on:
       - nats
     environment:
-      # Service connection (JetStream assets) uses the full-rights "service" user.
+      # Service connection (JetStream assets) uses the "service" user, granted the
+      # permission contract's service grant for auth passthrough.
       # Keep the URL credential-less: DialClient reuses MQTTNB_NATS_URLS for every
       # per-client auth-passthrough dial, and a URL-embedded userinfo would win
       # over the per-client UserInfo (nats.go connectProto), so all clients would

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -23,35 +25,49 @@ func mqttTopicFor(prefix string) string {
 	return strings.ReplaceAll(prefix, ".", "/") + "#"
 }
 
-// reservedPrefixes is every subject prefix inside the broker's reserved
-// namespace that carries real traffic. Kept as one list so a new internal
-// prefix is a visible omission here rather than a silent hole.
-//
-// Four entries below were added after that intent had already been missed once
-// each: teardown, qos2 assign, inflight and affine delivery were introduced
-// with their features and never registered here. The
-// guards deny "$MQTT.>" wholesale rather than enumerating prefixes, so none of
-// them was ever a live hole — but a list whose whole purpose is to make an
-// omission visible only does that if it is complete. The two affine prefixes
-// under "$MQTT.out." are covered by the outbound entry's own wildcard.
-var reservedPrefixes = map[string]string{
-	"deliver subject":   mqttSubPrefix,
-	"pubrel delivery":   mqttPubRelDeliverySubjectPrefix,
-	"affine delivery":   mqttQ2AffineDeliverPrefix,
-	"shared deliver":    mqttSharedSubDeliverPrefix,
-	"sessions":          mqttSessStreamSubjectPrefix,
-	"messages":          mqttStreamSubjectPrefix,
-	"retained messages": mqttRetainedMsgsStreamSubject,
-	"jsa replies":       mqttJSARepliesPrefix,
-	"will queue":        mqttWillQSubjectPrefix,
-	"accept facts":      mqttAcceptSubjectPrefix,
-	"handoff outcomes":  mqttHandoffSubjectPrefix,
-	"teardown":          mqttTeardownSubjectPrefix,
-	"qos2 inbound":      mqttQoS2IncomingMsgsStreamSubjectPrefix,
-	"qos2 assign":       mqttQoS2AssignStreamSubjectPrefix,
-	"inflight":          mqttInflightStreamSubjectPrefix,
-	"outbound":          mqttOutSubjectPrefix,
-	"pubrel outbound":   mqttPubRelSubjectPrefix,
+// documentedReservedFamilies is the literal head of every subject pattern in
+// docs/ARCHITECTURE.md's "Reserved `$MQTT.>` namespace" table (the text before the
+// first "<" or "["), so the subscribe deny is exercised on every documented family
+// without a second hand-kept list. The deny is a prefix rule on the whole namespace;
+// the table is descriptive and is not proved complete (see "The permission contract").
+func documentedReservedFamilies(t *testing.T) map[string]string {
+	t.Helper()
+	doc, err := os.ReadFile("../../docs/ARCHITECTURE.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(doc)
+	start := strings.Index(text, "## Reserved `$MQTT.>` namespace")
+	if start < 0 {
+		t.Fatal("docs/ARCHITECTURE.md has no reserved-namespace section")
+	}
+	pattern := regexp.MustCompile("`([^`]+)`")
+	families := map[string]string{}
+	inTable := false
+	for _, line := range strings.Split(text[start:], "\n") {
+		if !strings.HasPrefix(line, "|") {
+			if inTable {
+				break
+			}
+			continue
+		}
+		inTable = true
+		cells := strings.Split(line, "|")
+		if len(cells) < 3 {
+			continue
+		}
+		for _, m := range pattern.FindAllStringSubmatch(cells[1], -1) {
+			head := m[1]
+			if i := strings.IndexAny(head, "<["); i >= 0 {
+				head = head[:i]
+			}
+			families[m[1]] = head
+		}
+	}
+	if len(families) == 0 {
+		t.Fatal("no subject patterns in the reserved-namespace table")
+	}
+	return families
 }
 
 // TestMQTTDenySubscribeToReservedNamespace covers the whole "$MQTT.>" namespace,
@@ -70,7 +86,7 @@ func TestMQTTDenySubscribeToReservedNamespace(t *testing.T) {
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 
 	pi := uint16(1)
-	for name, prefix := range reservedPrefixes {
+	for name, prefix := range documentedReservedFamilies(t) {
 		t.Run(name, func(t *testing.T) {
 			testMQTTSub(t, pi, mc, r,
 				[]*mqttFilter{{filter: mqttTopicFor(prefix), qos: 1}},

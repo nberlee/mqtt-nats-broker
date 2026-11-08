@@ -234,8 +234,8 @@ func (jsa *mqttJSA) newRequest(kind, subject string, hdr int, msg []byte) (any, 
 func (jsa *mqttJSA) prefixDomain(subject string) string {
 	if jsa.domain != _EMPTY_ {
 		// rewrite js api prefix with domain
-		if sub := strings.TrimPrefix(subject, JSApiPrefix+"."); sub != subject {
-			subject = fmt.Sprintf("$JS.%s.API.%s", jsa.domain, sub)
+		if sub := strings.TrimPrefix(subject, mqttJSAPIPrefix(_EMPTY_)); sub != subject {
+			subject = mqttJSAPIPrefix(jsa.domain) + sub
 		}
 	}
 	return subject

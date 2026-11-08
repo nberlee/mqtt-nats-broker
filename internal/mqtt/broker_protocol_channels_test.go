@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -276,6 +277,9 @@ type brokerCensus struct {
 	jsaSends     map[jsaSendCaller]int
 	// headerNames is every Nmqtt-* header literal in any production package.
 	headerNames map[string]bool
+	// dollarLiterals maps every string literal in any production package that begins with
+	// "$" to one place it appears (the permission contract's root census reads it).
+	dollarLiterals map[string]string
 }
 
 var (
@@ -323,12 +327,13 @@ func takeBrokerCensus() (*brokerCensus, error) {
 	}
 
 	c := &brokerCensus{
-		usedObjects:  map[string]string{},
-		sites:        map[natsTransportSite]int{},
-		wrapperRefs:  map[string]map[string]int{},
-		queueMembers: map[jsaQueueMember]int{},
-		jsaSends:     map[jsaSendCaller]int{},
-		headerNames:  map[string]bool{},
+		usedObjects:    map[string]string{},
+		sites:          map[natsTransportSite]int{},
+		wrapperRefs:    map[string]map[string]int{},
+		queueMembers:   map[jsaQueueMember]int{},
+		jsaSends:       map[jsaSendCaller]int{},
+		headerNames:    map[string]bool{},
+		dollarLiterals: map[string]string{},
 	}
 	for _, p := range module {
 		rel := strings.TrimPrefix(p.ImportPath, brokerModulePath+"/")
@@ -362,6 +367,12 @@ func (c *brokerCensus) addPackage(p brokerListedPackage, rel string, exports map
 			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 				if v := strings.Trim(lit.Value, "\"`"); envelopeHeaderName.MatchString(v) {
 					c.headerNames[v] = true
+				}
+				if v, err := strconv.Unquote(lit.Value); err == nil && strings.HasPrefix(v, "$") {
+					if _, seen := c.dollarLiterals[v]; !seen {
+						pos := fset.Position(lit.Pos())
+						c.dollarLiterals[v] = fmt.Sprintf("%s/%s:%d", rel, filepath.Base(pos.Filename), pos.Line)
+					}
 				}
 			}
 			return true

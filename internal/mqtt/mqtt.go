@@ -370,8 +370,9 @@ const (
 	mqttJSARepliesPrefix = mqttPrefix + "JSA."
 
 	// The kind tokens of a JS API reply subject, which is always
-	// "$MQTT.JSA.<node id>.<kind>.<nuid>": "$MQTT.JSA.<node id>.SC.<nuid>" answers
-	// a stream create, "$MQTT.JSA.<node id>.SL.<nuid>" a stream lookup, and so on.
+	// "$MQTT.JSA.<run id>.<kind>.<nuid>": "$MQTT.JSA.<run id>.SC.<nuid>" answers
+	// a stream create, "$MQTT.JSA.<run id>.SL.<nuid>" a stream lookup, and so on. The
+	// run id is one token (ephemeralIdentity), which is what fixes the kind's position.
 	// processJSAPIReplies reads only the kind, at mqttJSATokenPos, and correlates
 	// on the whole subject; the nuid alone makes it unique.
 	mqttJSATokenPos       = 4

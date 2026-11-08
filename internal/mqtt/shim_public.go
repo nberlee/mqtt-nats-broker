@@ -23,8 +23,8 @@ const ShutdownDrainTimeout = 10 * time.Second
 
 // NewServer builds an MQTT broker server bound to nc (the external NATS/JetStream
 // service connection). opts carries the MQTT listener configuration; if nil,
-// defaults are used. nodeName must be unique per instance (used for JSA reply
-// routing); empty means one is generated.
+// defaults are used. nodeName must be unique per instance (the origin its records
+// carry); empty means one is generated.
 func NewServer(nc *nats.Conn, opts *Options, nodeName string) *Server {
 	if opts == nil {
 		opts = &Options{}

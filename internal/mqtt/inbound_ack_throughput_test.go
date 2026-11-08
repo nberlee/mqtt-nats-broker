@@ -207,7 +207,7 @@ func inboundAckCensusClass(m *nats.Msg) (string, bool) {
 	subj, reply := m.Subject, m.Reply
 	for _, p := range []string{"$MQTT.JSA.", "$MQTT.inbox."} {
 		if strings.HasPrefix(subj, p) {
-			// A reply to the broker: $MQTT.JSA.<node>.<kind>.<nuid> is classed by kind.
+			// A reply to the broker: $MQTT.JSA.<run id>.<kind>.<nuid> is classed by kind.
 			if tk := strings.Split(subj, "."); p == "$MQTT.JSA." && len(tk) >= 5 {
 				return "reply:" + tk[3], true
 			}

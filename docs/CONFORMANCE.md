@@ -6073,6 +6073,27 @@ The settings are read strictly and the chart's values are checked against their 
   by Kubernetes names, `extraResources`, the `nats` subtree) are passed through unchecked
   by the schema; a misspelled key there is rendered as written.
 
+### The permission contract is witnessed, not enforced
+
+The broker checks no deployment's grants (`docs/ARCHITECTURE.md`, "The permission
+contract"); what keeps the contract true is a set of tests, and they reach this far:
+
+- **The runtime witness shows the asserted outcomes, not every write.** It demonstrates
+  the asserted scenario outcomes under the specified grants and observes an attributed
+  denial when each exercised grant entry is removed. It does not prove that every attempted
+  broker operation stays within those grants. The census detects unclassified `$`-prefixed
+  literal roots; the trailing violation check detects additional violations on a
+  best-effort basis. Unobserved asynchronous operations can escape both, including
+  operations outside the grant under an already-classified root, so a change can come to
+  need a permission the contract does not name without a test failing.
+- **The domain-qualified API grant is not exercised.** The witness's server runs the
+  JetStream domain itself and judges the request after mapping it onto `$JS.API.`, so the
+  `$JS.<domain>.API.>` entry, needed where the domain is reached over a leaf node, is
+  stated from the server's behavior rather than witnessed.
+- **A shortfall in a deployment's grants is not reported by the broker.** It shows up as
+  the denied operation failing (a startup that does not finish, a delivery that never
+  arrives, an acknowledgement that never lands), with the denial in nats-server's log.
+
 ### Cross-version coexistence is excluded by procedure, not detected
 
 The broker-to-broker protocol is versioned by the persisted format's key (see "The

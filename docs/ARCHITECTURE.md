@@ -65,8 +65,9 @@ persisted format (in place: see "The persisted format" below) and the broker-to-
 records (in place, the same version: see "The broker-to-broker protocol" below),
 a checked NATS floor, and frozen
 configuration (in place: see "The configuration surface" below),
-permission and operational interfaces (`docs/ROADMAP.md` §1, "Contracts in
-place by the first release"). **Beta** keeps those contracts: compatibility is guaranteed
+permissions (in place: see "The permission contract" below), and the
+operational interface (`docs/ROADMAP.md` §1, "Contracts in place by the first
+release"). **Beta** keeps those contracts: compatibility is guaranteed
 within them from then on, and this section is rewritten as that contract when beta is
 cut.
 
@@ -269,7 +270,7 @@ acts on is the **broker-to-broker protocol**:
 
 Outside it, because they are exchanges with the backend rather than with a peer: the JSA
 transport (`processInboundClientMsg`) — JetStream API requests and their
-`$MQTT.JSA.<node id>.*` replies, consumer acknowledgements and confirmed acknowledgements,
+`$MQTT.JSA.<run id>.*` replies, consumer acknowledgements and confirmed acknowledgements,
 and store publications — as transport mechanics, while the payloads, names and decision
 rules it carries are protocol, and so is the derived Sparkplug publication it also
 carries; the startup JetStream probe (`internal/backend`,
@@ -393,6 +394,77 @@ no refusal that names a former setting. A removed flag meets the flag package's 
 refusal of an undefined flag, a removed variable is simply not read, and a removed chart
 value meets the schema's refusal of an unknown key. What applies from the first release is
 decided then, under "Release phases" above.
+
+### The permission contract
+
+The permission contract is the NATS permissions a deployment grants the broker's service
+identity and denies its MQTT identities. A hardened deployment writes its ACLs against it,
+so it is what an upgrade must not outgrow. It has one definition,
+`internal/mqtt/permission_contract.go`, and the broker checks none of it: a deployment's
+grants are the server's to enforce.
+
+**The reserved namespace is `$MQTT.>`, granted or denied whole.** Everything the broker owns
+on the wire is under it (see "Reserved `$MQTT.>` namespace" for its families, which are the
+persisted format's and the broker-to-broker protocol's and change with the format version).
+
+**Every MQTT identity** (the `-default-user` identity and every identity a client
+authenticates as under auth passthrough):
+
+| Rule | Subjects | Status |
+|---|---|---|
+| Denied, publish and subscribe | `$MQTT.>`, `$JS.>` | required |
+| Denied, publish and subscribe | `$KV.>`, `$O.>` | recommended; every shipped configuration denies them |
+| Publishable | `$SYS.REQ.USER.INFO` | required under auth passthrough |
+| No response permissions | `allow_responses` unset | required |
+| Queue groups | a subscribe permission that names queue groups admits `$mqttshare.*` | required for shared subscriptions |
+
+`$JS.>` covers the domain-qualified API and the acknowledgement subjects. Response
+permissions are excluded because nats-server consults them **after** an explicit publish
+deny (`pubAllowedFullCheck`): an identity allowed responses that is sent a request with a
+`$MQTT.` reply can publish that reply despite denying `$MQTT.>`
+(`TestResponsePermissionsBypassTheReservedDeny` witnesses both arms). A plain subscribe
+allow admits every queue group; a queue-scoped allow on the same subject replaces that
+verdict for queue subscriptions (`canSubscribeInternal`), which is why the queue rule is
+stated, and `TestSharedSubscriptionsNeedTheirQueueGroupAdmitted` witnesses it (admitted,
+another group named, and a plain allow overridden). The reasons for each deny are under
+"What a deployment must allow".
+
+**The service identity:**
+
+| Direction | Grant |
+|---|---|
+| Publish | `$MQTT.>`; `$JS.API.>` and, with `-js-domain`, also `$JS.<domain>.API.>`; `$JS.ACK.>`; `$SYS.REQ.USER.INFO` under auth passthrough; the deployment's application subjects |
+| Subscribe | `$MQTT.>` under auth passthrough; without it, also the application subjects and queue groups clients subscribe to |
+
+The application subjects are in the publish grant in both modes because Wills (immediate,
+delayed and owed) and the derived Sparkplug certificate publication
+(`$sparkplug.certificates.>`) are published on the service connection; without auth
+passthrough every client publication is too. Both API prefixes are needed under a domain
+because a server that runs the domain itself maps `$JS.<domain>.API.` onto `$JS.API.`
+before it judges the publisher's permissions, and one that reaches the domain over a leaf
+node judges the prefixed subject. `$JS.FC`, `$JS.EVENT`, `$KV`, `$O`, `_INBOX` and every
+other `$SYS` subject are not used. The embedded image and the chart grant the service
+identity everything, because they do not fix the passthrough mode;
+`test/conformance/nats.conf` grants it the passthrough contract (publish `>`, subscribe
+`$MQTT.>`), so the Paho job runs under it.
+
+**What keeps it true, and how far.** `TestEveryDollarSpaceIsClassified` freezes the `$`
+spaces production string literals name, and pins every literal under the narrowly granted
+`$JS.` and `$SYS.`. `TestShippedACLsStateThePermissionContract` and the chart's render
+checks hold every identity in every shipped and rendered configuration to the tables
+above, the service identity to the grant pinned for that file.
+`TestBrokerServesUnderThePermissionContract` runs a broker against a server whose service
+identity holds exactly the grant, with auth passthrough on and off and with and without a
+domain, and asserts each scenario's outcome; `TestEveryContractGrantIsExercised` removes
+each grant entry in turn and requires the attributed denial on it (the domain-qualified
+API entry is not exercised: the server here runs the domain itself). The witness
+demonstrates the asserted scenario outcomes under the specified grants and observes an
+attributed denial when each exercised entry is removed. It does not prove that every
+attempted broker operation stays within those grants. The census detects unclassified
+`$`-prefixed literal roots; the witness's trailing violation check detects additional
+violations on a best-effort basis. Unobserved asynchronous operations can escape both,
+including operations outside the grant under an already-classified root (the residual in
+`docs/CONFORMANCE.md`, "The permission contract is witnessed, not enforced").
 
 ### Shared-subscription QoS boundary
 
@@ -897,7 +969,7 @@ to which 2.15.1 added `n.scaleUp` (see the v2.15.0 → v2.15.1 audit above); `de
   `Nats-Subject` header, empty body, sent only to a subscription of the PUBLISHING
   connection that matches the reply through the account sublist
   (`processInboundClientMsg`, `subForReply` in `server/client.go`). The JSA publishes on
-  the service connection that also holds its `$MQTT.JSA.<node id>.>` reply subscription,
+  the service connection that also holds its `$MQTT.JSA.<run id>.>` reply subscription,
   which is an asynchronous callback subscription, so nats.go hands the status over as an
   ordinary message (it converts it to `ErrNoResponders` only for its request mux,
   JetStream helpers and synchronous subscriptions). `processJSAPIReplies` classifies it
@@ -3175,18 +3247,25 @@ NATS traffic on those subjects:
 |---|---|
 | `$MQTT.msgs.<subject>` | every QoS 1/2 message (the `$MQTT_msgs` stream) |
 | `$MQTT.rmsgs.<subject>` | every retained message |
-| `$MQTT.sess.<domain>.<hash>` | session records |
-| `$MQTT.JSA.<...>` | JetStream API replies (`$MQTT.JSA.<node id>.<kind>.<nuid>`) |
+| `$MQTT.sess.[<domain>.]<hash>` | session records |
+| `$MQTT.JSA.<run id>.<kind>.<nuid>` | JetStream API replies; the run id is one token, so the kind's position is fixed |
 | `$MQTT.inbox.<...>` | replies to requests the NATS client library makes on the service connection (the startup JetStream probe) |
-| `$MQTT.willq.*` | delayed-Will outbox |
-| `$MQTT.accept.*` | permanent per-CONNECT acceptance facts |
-| `$MQTT.teardown.<domain>.<hash>` | generation-retirement watermarks |
-| `$MQTT.qos2.in.<hash>.<gen>.<pi>[.rel]`, `$MQTT.out.*` | inbound QoS 2 move state and its release claim, outbound PUBREL state, and session-affine shared QoS 2 copies |
+| `$MQTT.uinfo.<nuid>` | replies to auth passthrough's identity requests, collected on the service connection |
+| `$MQTT.willq.[<domain>.]<hash>.<will id>` | delayed-Will outbox |
+| `$MQTT.accept.[<domain>.]<hash>.<epoch>.<id>` | permanent per-CONNECT acceptance facts |
+| `$MQTT.handoff.[<domain>.]<hash>.<intent>` | handoff outcomes |
+| `$MQTT.trcpt.[<domain>.]<hash>.<gen>` | teardown receipts |
+| `$MQTT.teardown.[<domain>.]<hash>` | generation-retirement watermarks |
+| `$MQTT.qos2.in.<hash>.<gen>.<pi>[.rel]`, `$MQTT.out.pubrel.<hash>.<gen>`, `$MQTT.out.q2.<hash>.<gen>.<claim>.<nonce>` | inbound QoS 2 move state and its release claim, outbound PUBREL state, and session-affine shared QoS 2 copies |
 | `$MQTT.qos2.assign.<group-durable>.<seq>` | shared-subscription QoS 2 assignment claims |
 | `$MQTT.inflight.<hash>.<gen>.<pi>` | outbound in-flight registers: the durable identity of a started QoS 1/2 delivery |
 | `$MQTT.inflight.<hash>.<gen>.<pi>.unsent` | the sibling **unsent marker**: present ⇔ nothing transmitted under this identifier yet, so the outgoing DUP flag derives from its absence ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)) |
 | `$MQTT.shared.grp.<qkey>`, `$MQTT.shared.shl.<hash>.<gen>` | the shared-group **group record** (live incarnation, holder count, retiring incarnations) and the per-generation **acquisition ledger** (acquisitions held, tenure, seal); never deleted within the recovery epoch |
-| `$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.deliver.q2.*`, `$MQTT.qsub.*` | per-client delivery subjects; a shared group's deliver subject is `$MQTT.qsub.<qkey>_<inc>`, one token, so the `.*` ACL still covers every incarnation |
+| `$MQTT.inflight.ob.<class>.<...>` | the outbound obligation authority's records, one class token each (`auth`, `closed`, `txn`, `cert`, `shard`, `root`, `led`, `duty`, `own`, `done`, `rel`, `res`, `pay`, `chunk`, `rdy`, `xch`, `act`) |
+| `$MQTT.sub.<nuid>`, `$MQTT.sub.<run id>.rmsgs.<g>`, `$MQTT.sub.<run id>.sessw`, `$MQTT.deliver.pubrel.<hash>.<gen>`, `$MQTT.deliver.q2.<hash>.<gen>`, `$MQTT.qsub.<qkey>_<inc>` | delivery subjects, all on the service connection: per-subscription, the retained observer, the session-record watch, PUBREL, affine shared QoS 2, and a shared group's (one token after `qsub.`, whatever the incarnation) |
+
+The table describes the families; it is not the permission contract, which grants or
+denies `$MQTT.>` whole (see "The permission contract"), and no test proves it complete.
 
 Anything able to read `$MQTT.msgs.>` reads every QoS 1/2 message in the account,
 so the namespace is closed on every path a client can reach:
@@ -3225,13 +3304,10 @@ so the namespace is closed on every path a client can reach:
 
 ### Recommended NATS permissions
 
-Deny both directions on the whole prefix for the identity MQTT clients
-authenticate as:
-
-```text
-publish:   { allow: [">"], deny: ["$MQTT.>"] }
-subscribe: { allow: [">"], deny: ["$MQTT.>"] }
-```
+The permissions are the permission contract's (see "The permission contract"): every
+MQTT identity denied `$MQTT.>`, `$JS.>`, `$KV.>` and `$O.>` in both directions, with no
+response permissions, and the service identity granted the namespace, the JetStream API
+and the acknowledgements.
 
 Both layers are required and neither is redundant. The broker's own checks bind
 anything speaking MQTT; the ACL is what binds someone who takes the same
@@ -3240,7 +3316,7 @@ holds real NATS credentials, so that is not a hypothetical.
 
 The service account itself needs the whole prefix, including `$MQTT.inbox.>` for the
 startup probe's reply; a service account denied it fails that probe and the broker does
-not start.
+not start. Under auth passthrough the prefix is all it subscribes to.
 
 The service account also publishes every JetStream acknowledgement, under `$JS.ACK`. A
 grant that is positional on the v1 layout (`$JS.ACK.$MQTT_msgs.>`) denies every
@@ -3250,12 +3326,14 @@ the broker starts, deliveries flow, and nothing is ever acknowledged. `$JS.ACK.>
 simple sufficient grant; a positional one must cover both layouts.
 
 This deny is safe because the broker creates its own delivery subscriptions
-(`$MQTT.sub.*`, `$MQTT.deliver.pubrel.*`, `$MQTT.qsub.*`) on the **service**
+(`$MQTT.sub.>`, `$MQTT.deliver.>`, `$MQTT.qsub.>`) on the **service**
 connection rather than on the per-client one. If they were on the client
 connection this ACL would break QoS 2 delivery and retained replay, and NATS
 evaluates deny before allow, so the three could not be carved back out. The
-conformance environment (`test/conformance/nats.conf`) ships this exact ACL, so
-the suite passing is what keeps that separation honest.
+conformance environment (`test/conformance/nats.conf`) ships this ACL and grants the
+service identity subscribe on `$MQTT.>` only, so the suite passing is what keeps that
+separation honest, and `TestBrokerServesUnderThePermissionContract` witnesses it with
+the exact grant.
 
 ## No Local is decided when the message is owned
 
@@ -15550,7 +15628,8 @@ connection.
 
 ### What a deployment must allow
 
-Auth passthrough imposes three requirements on every MQTT identity.
+Auth passthrough imposes four requirements on every MQTT identity. They are stated as
+lists in "The permission contract"; this section is why.
 
 **It must be able to publish `$SYS.REQ.USER.INFO`.** It does not need to subscribe
 to anything: the reply is collected on the SERVICE connection, under a
@@ -15594,6 +15673,11 @@ under other names (account imports, subject mappings) must deny those names too.
 broker does not refuse such topics itself: the deployment ACL is the boundary, and a
 prefix list in the broker would be a second, always incomplete statement of it.
 
+**It must have no response permissions (`allow_responses`).** nats-server consults an
+identity's response permissions after its explicit publish deny, so an identity allowed
+responses that is sent a request carrying a `$MQTT.` reply can publish into the
+namespace the deny above closes. That is the forgery the `$MQTT.>` deny exists to stop.
+
 **The NATS URLs carry no credentials, and the broker refuses any that do
 ([issue #129](https://github.com/nberlee/mqtt-nats-broker/issues/129)).**
 nats.go presents a URL's userinfo (user and password, or a token) in place of the
@@ -15618,15 +15702,15 @@ environment supplied, so neither a URL credential nor
 without the argument it rejects (the flag package's own diagnostic, which quotes it, is
 discarded): the kind of failure, and the flag's name only when the broker defines it.
 
-The service connection is exempt and deliberately full-rights: it is the thing
-that writes that namespace, and its own identity is established at `Start`, before
-the listener opens, so no MQTT client exists to race it.
+The service connection is exempt: it is the thing that writes that namespace (its
+grant is the permission contract's service row), and its own identity is established at
+`Start`, before the listener opens, so no MQTT client of this broker exists to race it.
 
 No system account needs configuring - nats-server supplies a default `$SYS`, and
 the recommended ACL in `test/conformance/nats.conf`
 (`allow: [">"], deny: ["$MQTT.>", "$JS.>", "$KV.>", "$O.>"]`, both directions)
-satisfies all three requirements; the embedded image's baked configuration denies the
-same four. With `-auth-passthrough=false` none of this protects anything: every client
+satisfies all four requirements; the embedded image's baked configuration denies the
+same four subjects. With `-auth-passthrough=false` none of this protects anything: every client
 acts as the service identity.
 
 A blanket `deny: ["$SYS.>"]` on publish prevents the bootstrap and **cannot be
