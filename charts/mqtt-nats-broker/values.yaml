@@ -3,8 +3,10 @@
 #
 # Every rendered object has a `merge` (deep-merged into the object; a list in it replaces
 # the chart's list) and a `patch` (an RFC 6902 JSON patch applied after the merge; use
-# `op: add` with a path ending in `/-` to append to a list the chart renders). Values may
-# carry `$tplYaml` / `$tplYamlSpread` templates, resolved before the merge and the patch.
+# `op: add` with a path ending in `/-` to append to a list the chart renders). Values under
+# merge, patch, broker.env and extraResources may carry `$tplYaml` / `$tplYamlSpread`
+# templates, resolved before the merge and the patch. values.schema.json is the shape of
+# these values: an unknown key or a wrongly typed value is refused.
 # This is the official NATS chart's convention, with the same helpers. See README.md.
 ############################################################
 

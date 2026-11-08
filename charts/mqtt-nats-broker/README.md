@@ -75,6 +75,14 @@ helm install broker charts/mqtt-nats-broker -f charts/mqtt-nats-broker/ci/option
 - A PodDisruptionBudget of one pod; an optional HorizontalPodAutoscaler for the external
   topology (`autoscaling.enabled`).
 
+## Values schema
+
+`values.schema.json` is the shape of these values, and Helm refuses any install, upgrade
+or render whose values do not fit it: an unknown or misspelled key, or a value of the wrong
+type, under any object the chart owns. `merge`, `patch`, `broker.env`, the maps keyed by
+Kubernetes names (`podTemplate.topologySpreadConstraints`, `container.resources`),
+`extraResources` and the `nats` subtree are free-form.
+
 ## Customizing
 
 The chart follows the official NATS chart's convention, with the same helpers. Every
@@ -84,8 +92,9 @@ rendered object has:
 - `patch`: an RFC 6902 JSON patch applied after the merge. `op: add` with a path ending
   in `/-` **appends** to a list the chart renders.
 
-Values may carry `$tplYaml` (a template whose output is parsed as YAML) and
-`$tplYamlSpread`, resolved before the merge and the patch. `extraResources` adds any
+The values under `merge`, `patch`, `broker.env` and `extraResources` may carry `$tplYaml`
+(a template whose output is parsed as YAML) and `$tplYamlSpread`, resolved before the
+merge and the patch; every other value is a literal. `extraResources` adds any
 other object. The hooks are `deployment`, `statefulSet`, `podTemplate`, `container`,
 `service`, `headlessService`, `configMap`, `podDisruptionBudget`, `autoscaling`,
 `networkPolicy` and `embedded.storage`; `broker.env` appends environment variables.

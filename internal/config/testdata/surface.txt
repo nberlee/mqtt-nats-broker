@@ -1,0 +1,43 @@
+# flag	env	kind	default
+nats	MQTTNB_NATS_URLS	string	nats://127.0.0.1:4222
+nats-embedded-config	MQTTNB_NATS_EMBEDDED_CONFIG	string	
+nats-creds	MQTTNB_NATS_CREDS	string	
+nats-user	MQTTNB_NATS_USER	string	
+nats-pass	MQTTNB_NATS_PASS	string	
+nats-name	MQTTNB_NATS_NAME	string	mqtt-nats-broker
+js-domain	MQTTNB_JS_DOMAIN	string	
+stream-replicas	MQTTNB_STREAM_REPLICAS	int	0
+host	MQTTNB_HOST	string	0.0.0.0
+port	MQTTNB_PORT	int	1883
+max-conns	MQTTNB_MAX_CONNS	int	0
+connect-timeout	MQTTNB_CONNECT_TIMEOUT	duration	5s
+drain-delay	MQTTNB_DRAIN_DELAY	duration	0s
+auth-passthrough	MQTTNB_AUTH_PASSTHROUGH	bool	true
+max-ack-pending	MQTTNB_MAX_ACK_PENDING	int	1024
+default-user	MQTTNB_DEFAULT_USER	string	
+default-pass	MQTTNB_DEFAULT_PASS	string	
+keepalive-max	MQTTNB_KEEPALIVE_MAX	int	0
+response-info	MQTTNB_RESPONSE_INFO	string	
+tls-cert	MQTTNB_TLS_CERT	string	
+tls-key	MQTTNB_TLS_KEY	string	
+plain-port	MQTTNB_PLAIN_PORT	int	0
+tls-ca	MQTTNB_TLS_CA	string	
+tls-reload-interval	MQTTNB_TLS_RELOAD_INTERVAL	duration	10s
+ws-port	MQTTNB_WS_PORT	int	0
+ws-host	MQTTNB_WS_HOST	string	
+ws-path	MQTTNB_WS_PATH	string	
+ws-handshake-timeout	MQTTNB_WS_HANDSHAKE_TIMEOUT	duration	5s
+ws-no-tls	MQTTNB_WS_NO_TLS	bool	false
+ws-allowed-origins	MQTTNB_WS_ALLOWED_ORIGINS	string	
+log-level	MQTTNB_LOG_LEVEL	string	info
+http-addr	MQTTNB_HTTP_ADDR	string	:8080
+pprof-addr	MQTTNB_PPROF_ADDR	string	
+# embedded configuration variables (read by nats-server, not by the broker)
+MQTTNB_DEFAULT_PASS
+MQTTNB_DEFAULT_USER
+MQTTNB_EMBEDDED_ROUTES
+MQTTNB_EMBEDDED_ROUTE_PASS
+MQTTNB_EMBEDDED_ROUTE_USER
+MQTTNB_EMBEDDED_SERVER_NAME
+MQTTNB_NATS_PASS
+MQTTNB_NATS_USER

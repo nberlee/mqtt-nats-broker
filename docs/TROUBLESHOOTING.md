@@ -13,7 +13,7 @@ reason names the setting:
 
 | Message | Cause |
 |---|---|
-| `invalid MQTTNB_<NAME>: ...` | a malformed duration in the environment; also fatal when the flag is given too |
+| `invalid MQTTNB_<NAME>: ...` | an environment variable that does not parse as its setting's kind (an integer, a boolean or a duration); also fatal when the flag is given too |
 | `invalid command line: <kind> (-<flag>)` | an unknown flag, or a flag value that does not parse |
 | `... URL #N (...) carries credentials, which would replace every auth-passthrough client's own; ...` | a NATS URL with a user or password in it; give the service identity with `-nats-user`/`-nats-pass` or `-nats-creds` |
 | `nats (MQTTNB_NATS_URLS) does not apply with nats-embedded-config: ...` | `-nats` set together with the embedded topology |

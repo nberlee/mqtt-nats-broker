@@ -131,59 +131,109 @@ func Default() *Config {
 	}
 }
 
-// env returns the environment variable value or the provided fallback.
-func env(key, fallback string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return v
-	}
-	return fallback
+// setting is one operator setting: its command-line flag, its environment variable, and the
+// Config field both write. The settings table is the configuration surface's one definition:
+// the flags, the environment pass, Surface and every check of the surface read it.
+type setting struct {
+	flag  string
+	env   string
+	usage string
+	field func(*Config) any // *string, *int, *bool or *time.Duration
 }
 
-func envBool(key string, fallback bool) bool {
-	if v, ok := os.LookupEnv(key); ok {
-		b, err := strconv.ParseBool(v)
-		if err == nil {
-			return b
-		}
-	}
-	return fallback
+// settings is the configuration surface, in the order docs/CONFIGURATION.md lists it. Its
+// names, kinds and built-in defaults are pinned by testdata/surface.txt.
+var settings = []setting{
+	{"nats", "MQTTNB_NATS_URLS", "comma-separated NATS server URLs", func(c *Config) any { return &c.NATSURLs }},
+	{"nats-embedded-config", "MQTTNB_NATS_EMBEDDED_CONFIG", "run an embedded nats-server from this native configuration file instead of connecting to -nats", func(c *Config) any { return &c.NATSEmbeddedConfig }},
+	{"nats-creds", "MQTTNB_NATS_CREDS", "path to NATS .creds file", func(c *Config) any { return &c.NATSCreds }},
+	{"nats-user", "MQTTNB_NATS_USER", "NATS username for the service connection", func(c *Config) any { return &c.NATSUser }},
+	{"nats-pass", "MQTTNB_NATS_PASS", "NATS password for the service connection", func(c *Config) any { return &c.NATSPass }},
+	{"nats-name", "MQTTNB_NATS_NAME", "NATS connection name", func(c *Config) any { return &c.NATSName }},
+	{"js-domain", "MQTTNB_JS_DOMAIN", "JetStream domain, a single subject token (optional; empty=the connected server's domain)", func(c *Config) any { return &c.JSDomain }},
+	{"stream-replicas", "MQTTNB_STREAM_REPLICAS", "JetStream replicas of the broker's streams (required): the JetStream cluster size, 1 for a single server; every existing broker-owned stream must have exactly this count", func(c *Config) any { return &c.StreamReps }},
+	{"host", "MQTTNB_HOST", "MQTT listen host", func(c *Config) any { return &c.MQTTHost }},
+	{"port", "MQTTNB_PORT", "MQTT listen port", func(c *Config) any { return &c.MQTTPort }},
+	{"max-conns", "MQTTNB_MAX_CONNS", "max concurrent MQTT clients (0=unlimited)", func(c *Config) any { return &c.MaxConns }},
+	{"connect-timeout", "MQTTNB_CONNECT_TIMEOUT", "how long an accepted connection may send no CONNECT before it is closed (must be > 0)", func(c *Config) any { return &c.ConnectTimeout }},
+	{"drain-delay", "MQTTNB_DRAIN_DELAY", "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)", func(c *Config) any { return &c.DrainDelay }},
+	{"auth-passthrough", "MQTTNB_AUTH_PASSTHROUGH", "dial per-client NATS connection using MQTT credentials", func(c *Config) any { return &c.AuthPassthrough }},
+	{"max-ack-pending", "MQTTNB_MAX_ACK_PENDING", "QoS 1/2 consumer push window: deliveries sent without an acknowledgement, 1-65535; applies to consumers created from then on", func(c *Config) any { return &c.MaxAckPending }},
+	{"default-user", "MQTTNB_DEFAULT_USER", "NATS user for anonymous MQTT clients", func(c *Config) any { return &c.DefaultUser }},
+	{"default-pass", "MQTTNB_DEFAULT_PASS", "NATS password for anonymous MQTT clients", func(c *Config) any { return &c.DefaultPass }},
+	{"keepalive-max", "MQTTNB_KEEPALIVE_MAX", "MQTT 5.0 Server Keep Alive cap in seconds (0=no override)", func(c *Config) any { return &c.KeepAliveMax }},
+	{"response-info", "MQTTNB_RESPONSE_INFO", "MQTT 5.0 Response Information base topic (empty=never sent)", func(c *Config) any { return &c.ResponseInfo }},
+	{"tls-cert", "MQTTNB_TLS_CERT", "TLS certificate file for the MQTT listener", func(c *Config) any { return &c.TLSCert }},
+	{"tls-key", "MQTTNB_TLS_KEY", "TLS key file for the MQTT listener", func(c *Config) any { return &c.TLSKey }},
+	{"plain-port", "MQTTNB_PLAIN_PORT", "additional plaintext MQTT listen port beside the TLS -port (0=disabled; requires -tls-cert/-tls-key)", func(c *Config) any { return &c.PlainPort }},
+	{"tls-ca", "MQTTNB_TLS_CA", "TLS client-CA file (enables mTLS)", func(c *Config) any { return &c.TLSCA }},
+	{"tls-reload-interval", "MQTTNB_TLS_RELOAD_INTERVAL", "how often the TLS files are re-read for a replacement (must be > 0)", func(c *Config) any { return &c.TLSReloadInterval }},
+	{"ws-port", "MQTTNB_WS_PORT", "MQTT over WebSocket listen port (0=disabled)", func(c *Config) any { return &c.WSPort }},
+	{"ws-host", "MQTTNB_WS_HOST", "MQTT over WebSocket listen host (empty=the -host value)", func(c *Config) any { return &c.WSHost }},
+	{"ws-path", "MQTTNB_WS_PATH", "MQTT over WebSocket request path (empty=/mqtt)", func(c *Config) any { return &c.WSPath }},
+	{"ws-handshake-timeout", "MQTTNB_WS_HANDSHAKE_TIMEOUT", "how long the WebSocket opening handshake may take (must be > 0)", func(c *Config) any { return &c.WSHandshakeTimeout }},
+	{"ws-no-tls", "MQTTNB_WS_NO_TLS", "serve plaintext WebSocket although TLS is configured (TLS terminated by an ingress; drops client-certificate verification for WebSocket clients)", func(c *Config) any { return &c.WSNoTLS }},
+	{"ws-allowed-origins", "MQTTNB_WS_ALLOWED_ORIGINS", "comma-separated browser origins allowed on the WebSocket listener, scheme://host[:port] (empty=same-origin only)", func(c *Config) any { return &c.WSAllowedOrigins }},
+	{"log-level", "MQTTNB_LOG_LEVEL", "log level: debug|info|warn|error", func(c *Config) any { return &c.LogLevel }},
+	{"http-addr", "MQTTNB_HTTP_ADDR", "health endpoint bind address, /healthz and /readyz (empty=disabled)", func(c *Config) any { return &c.HTTPAddr }},
+	{"pprof-addr", "MQTTNB_PPROF_ADDR", "serve net/http/pprof on this loopback IP:port, e.g. 127.0.0.1:6060 (empty=disabled)", func(c *Config) any { return &c.PprofAddr }},
 }
 
-func envInt(key string, fallback int) int {
-	if v, ok := os.LookupEnv(key); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return fallback
+// Setting describes one entry of the configuration surface: its flag (without the dash), its
+// environment variable, its kind (string, int, bool or duration) and its built-in default as
+// the usage text prints it.
+type Setting struct {
+	Flag, Env, Kind, Default string
 }
 
-// envIntStrict reads an integer from the environment and, like envDuration and unlike envInt,
-// refuses a present-but-malformed value rather than falling back to the default.
-func envIntStrict(key string, fallback int) (int, error) {
-	if v, ok := os.LookupEnv(key); ok {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return 0, fmt.Errorf("invalid %s: %q is not an integer", key, v)
+// Surface returns the configuration surface, in the settings table's order.
+func Surface() []Setting {
+	builtIn := flag.NewFlagSet("", flag.ContinueOnError)
+	registerFlags(builtIn, Default())
+	out := make([]Setting, 0, len(settings))
+	for _, s := range settings {
+		var kind string
+		switch s.field(Default()).(type) {
+		case *string:
+			kind = "string"
+		case *int:
+			kind = "int"
+		case *bool:
+			kind = "bool"
+		case *time.Duration:
+			kind = "duration"
 		}
-		return n, nil
+		out = append(out, Setting{Flag: s.flag, Env: s.env, Kind: kind, Default: builtIn.Lookup(s.flag).DefValue})
 	}
-	return fallback, nil
+	return out
 }
 
-// envDuration reads a Go duration (e.g. "5s") from the environment. Unlike env,
-// envInt, and envBool it does NOT silently fall back on a malformed value: a
-// present-but-unparseable value is a configuration error the operator should see
-// rather than have quietly ignored.
-func envDuration(key string, fallback time.Duration) (time.Duration, error) {
-	if v, ok := os.LookupEnv(key); ok {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return 0, fmt.Errorf("invalid %s: %w", key, err)
-		}
-		return d, nil
+// readEnv writes a present variable into its field. Every kind is read strictly: a value that
+// does not parse, the empty string included for the non-string kinds, is refused rather than
+// replaced by the default, which would be a setting the operator did not choose.
+func (s setting) readEnv(c *Config) error {
+	v, ok := os.LookupEnv(s.env)
+	if !ok {
+		return nil
 	}
-	return fallback, nil
+	var err error
+	switch p := s.field(c).(type) {
+	case *string:
+		*p = v
+	case *int:
+		if *p, err = strconv.Atoi(v); err != nil {
+			return fmt.Errorf("invalid %s: %q is not an integer", s.env, v)
+		}
+	case *bool:
+		if *p, err = strconv.ParseBool(v); err != nil {
+			return fmt.Errorf("invalid %s: %q is not a boolean", s.env, v)
+		}
+	case *time.Duration:
+		if *p, err = time.ParseDuration(v); err != nil {
+			return fmt.Errorf("invalid %s: %w", s.env, err)
+		}
+	}
+	return nil
 }
 
 // Load parses configuration from environment variables (MQTTNB_* prefix) first,
@@ -191,51 +241,13 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 func Load(args []string) (*Config, error) {
 	c := Default()
 
-	// Environment defaults (MQTTNB_ prefix).
+	// The environment is read in full before any flag, so a malformed variable is refused
+	// even when its flag is also given.
 	_, natsURLsExplicit := os.LookupEnv("MQTTNB_NATS_URLS")
-	c.NATSURLs = env("MQTTNB_NATS_URLS", c.NATSURLs)
-	c.NATSEmbeddedConfig = env("MQTTNB_NATS_EMBEDDED_CONFIG", c.NATSEmbeddedConfig)
-	c.NATSCreds = env("MQTTNB_NATS_CREDS", c.NATSCreds)
-	c.NATSUser = env("MQTTNB_NATS_USER", c.NATSUser)
-	c.NATSPass = env("MQTTNB_NATS_PASS", c.NATSPass)
-	c.NATSName = env("MQTTNB_NATS_NAME", c.NATSName)
-	c.JSDomain = env("MQTTNB_JS_DOMAIN", c.JSDomain)
-	c.StreamReps = envInt("MQTTNB_STREAM_REPLICAS", c.StreamReps)
-	c.MQTTHost = env("MQTTNB_HOST", c.MQTTHost)
-	c.MQTTPort = envInt("MQTTNB_PORT", c.MQTTPort)
-	c.PlainPort = envInt("MQTTNB_PLAIN_PORT", c.PlainPort)
-	c.MaxConns = envInt("MQTTNB_MAX_CONNS", c.MaxConns)
-	c.KeepAliveMax = envInt("MQTTNB_KEEPALIVE_MAX", c.KeepAliveMax)
-	c.ResponseInfo = env("MQTTNB_RESPONSE_INFO", c.ResponseInfo)
-	c.AuthPassthrough = envBool("MQTTNB_AUTH_PASSTHROUGH", c.AuthPassthrough)
-	c.DefaultUser = env("MQTTNB_DEFAULT_USER", c.DefaultUser)
-	c.DefaultPass = env("MQTTNB_DEFAULT_PASS", c.DefaultPass)
-	c.TLSCert = env("MQTTNB_TLS_CERT", c.TLSCert)
-	c.TLSKey = env("MQTTNB_TLS_KEY", c.TLSKey)
-	c.TLSCA = env("MQTTNB_TLS_CA", c.TLSCA)
-	c.WSHost = env("MQTTNB_WS_HOST", c.WSHost)
-	c.WSPort = envInt("MQTTNB_WS_PORT", c.WSPort)
-	c.WSPath = env("MQTTNB_WS_PATH", c.WSPath)
-	c.WSNoTLS = envBool("MQTTNB_WS_NO_TLS", c.WSNoTLS)
-	c.WSAllowedOrigins = env("MQTTNB_WS_ALLOWED_ORIGINS", c.WSAllowedOrigins)
-	c.LogLevel = env("MQTTNB_LOG_LEVEL", c.LogLevel)
-	c.HTTPAddr = env("MQTTNB_HTTP_ADDR", c.HTTPAddr)
-	c.PprofAddr = env("MQTTNB_PPROF_ADDR", c.PprofAddr)
-	var err error
-	if c.MaxAckPending, err = envIntStrict("MQTTNB_MAX_ACK_PENDING", c.MaxAckPending); err != nil {
-		return nil, err
-	}
-	if c.DrainDelay, err = envDuration("MQTTNB_DRAIN_DELAY", c.DrainDelay); err != nil {
-		return nil, err
-	}
-	if c.ConnectTimeout, err = envDuration("MQTTNB_CONNECT_TIMEOUT", c.ConnectTimeout); err != nil {
-		return nil, err
-	}
-	if c.TLSReloadInterval, err = envDuration("MQTTNB_TLS_RELOAD_INTERVAL", c.TLSReloadInterval); err != nil {
-		return nil, err
-	}
-	if c.WSHandshakeTimeout, err = envDuration("MQTTNB_WS_HANDSHAKE_TIMEOUT", c.WSHandshakeTimeout); err != nil {
-		return nil, err
+	for _, s := range settings {
+		if err := s.readEnv(c); err != nil {
+			return nil, err
+		}
 	}
 
 	fs := flag.NewFlagSet("mqtt-nats-broker", flag.ContinueOnError)
@@ -298,42 +310,22 @@ func commandLineError(fs *flag.FlagSet, err error) error {
 	return errors.New("invalid command line")
 }
 
-// registerFlags defines every flag on fs, each defaulting to and writing into c.
+// registerFlags defines every setting's flag on fs, each defaulting to and writing into c.
 func registerFlags(fs *flag.FlagSet, c *Config) {
-	fs.StringVar(&c.NATSURLs, "nats", c.NATSURLs, "comma-separated NATS server URLs")
-	fs.StringVar(&c.NATSEmbeddedConfig, "nats-embedded-config", c.NATSEmbeddedConfig, "run an embedded nats-server from this native configuration file instead of connecting to -nats")
-	fs.StringVar(&c.NATSCreds, "nats-creds", c.NATSCreds, "path to NATS .creds file")
-	fs.StringVar(&c.NATSUser, "nats-user", c.NATSUser, "NATS username for the service connection")
-	fs.StringVar(&c.NATSPass, "nats-pass", c.NATSPass, "NATS password for the service connection")
-	fs.StringVar(&c.NATSName, "nats-name", c.NATSName, "NATS connection name")
-	fs.StringVar(&c.JSDomain, "js-domain", c.JSDomain, "JetStream domain, a single subject token (optional; empty=the connected server's domain)")
-	fs.IntVar(&c.StreamReps, "stream-replicas", c.StreamReps, "JetStream replicas of the broker's streams (required): the JetStream cluster size, 1 for a single server; every existing broker-owned stream must have exactly this count")
-	fs.StringVar(&c.MQTTHost, "host", c.MQTTHost, "MQTT listen host")
-	fs.IntVar(&c.MQTTPort, "port", c.MQTTPort, "MQTT listen port")
-	fs.IntVar(&c.PlainPort, "plain-port", c.PlainPort, "additional plaintext MQTT listen port beside the TLS -port (0=disabled; requires -tls-cert/-tls-key)")
-	fs.IntVar(&c.MaxConns, "max-conns", c.MaxConns, "max concurrent MQTT clients (0=unlimited)")
-	fs.IntVar(&c.KeepAliveMax, "keepalive-max", c.KeepAliveMax, "MQTT 5.0 Server Keep Alive cap in seconds (0=no override)")
-	fs.StringVar(&c.ResponseInfo, "response-info", c.ResponseInfo, "MQTT 5.0 Response Information base topic (empty=never sent)")
-	fs.BoolVar(&c.AuthPassthrough, "auth-passthrough", c.AuthPassthrough, "dial per-client NATS connection using MQTT credentials")
-	fs.StringVar(&c.DefaultUser, "default-user", c.DefaultUser, "NATS user for anonymous MQTT clients")
-	fs.StringVar(&c.DefaultPass, "default-pass", c.DefaultPass, "NATS password for anonymous MQTT clients")
-	fs.StringVar(&c.TLSCert, "tls-cert", c.TLSCert, "TLS certificate file for the MQTT listener")
-	fs.StringVar(&c.TLSKey, "tls-key", c.TLSKey, "TLS key file for the MQTT listener")
-	fs.StringVar(&c.TLSCA, "tls-ca", c.TLSCA, "TLS client-CA file (enables mTLS)")
-	fs.DurationVar(&c.TLSReloadInterval, "tls-reload-interval", c.TLSReloadInterval, "how often the TLS files are re-read for a replacement (must be > 0)")
-	fs.StringVar(&c.WSHost, "ws-host", c.WSHost, "MQTT over WebSocket listen host (empty=the -host value)")
-	fs.IntVar(&c.WSPort, "ws-port", c.WSPort, "MQTT over WebSocket listen port (0=disabled)")
-	fs.StringVar(&c.WSPath, "ws-path", c.WSPath, "MQTT over WebSocket request path (empty=/mqtt)")
-	fs.DurationVar(&c.WSHandshakeTimeout, "ws-handshake-timeout", c.WSHandshakeTimeout, "how long the WebSocket opening handshake may take (must be > 0)")
-	fs.BoolVar(&c.WSNoTLS, "ws-no-tls", c.WSNoTLS, "serve plaintext WebSocket although TLS is configured (TLS terminated by an ingress; drops client-certificate verification for WebSocket clients)")
-	fs.StringVar(&c.WSAllowedOrigins, "ws-allowed-origins", c.WSAllowedOrigins, "comma-separated browser origins allowed on the WebSocket listener, scheme://host[:port] (empty=same-origin only)")
-	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug|info|warn|error")
-	fs.StringVar(&c.HTTPAddr, "http-addr", c.HTTPAddr, "health endpoint bind address, /healthz and /readyz (empty=disabled)")
-	fs.StringVar(&c.PprofAddr, "pprof-addr", c.PprofAddr, "serve net/http/pprof on this loopback IP:port, e.g. 127.0.0.1:6060 (empty=disabled)")
-	fs.IntVar(&c.MaxAckPending, "max-ack-pending", c.MaxAckPending, "QoS 1/2 consumer push window: deliveries sent without an acknowledgement, 1-65535; applies to consumers created from then on")
-	fs.DurationVar(&c.DrainDelay, "drain-delay", c.DrainDelay, "grace period after SIGTERM before disconnecting MQTT clients (0=immediate; set behind a load balancer / k8s)")
-	fs.DurationVar(&c.ConnectTimeout, "connect-timeout", c.ConnectTimeout, "how long an accepted connection may send no CONNECT before it is closed (must be > 0)")
-
+	for _, s := range settings {
+		switch p := s.field(c).(type) {
+		case *string:
+			fs.StringVar(p, s.flag, *p, s.usage)
+		case *int:
+			fs.IntVar(p, s.flag, *p, s.usage)
+		case *bool:
+			fs.BoolVar(p, s.flag, *p, s.usage)
+		case *time.Duration:
+			fs.DurationVar(p, s.flag, *p, s.usage)
+		default:
+			panic(fmt.Sprintf("config: setting %s has an unsupported field kind %T", s.flag, p))
+		}
+	}
 }
 
 // Validate checks the configuration for internal consistency.

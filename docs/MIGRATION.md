@@ -68,7 +68,7 @@ an `MQTTNB_` environment variable; see [Configuration](CONFIGURATION.md).
 | `js_api_timeout` (`api_timeout`) | none | |
 | `js_domain` | `-js-domain` | Baked into the broker's stream subjects: choose it before the first start. |
 | `stream_replicas` | `-stream-replicas` | Required, no default: the JetStream cluster size, `1` for a single server. |
-| `consumer_replicas` | none | nats-server ignores this key with a warning. The broker has no consumer replica setting either: its durable consumers inherit their stream's replica count, which JetStream requires on their interest-retention streams ([High availability](ARCHITECTURE.md#high-availability)). Drop `-consumer-replicas` from the launch arguments, where it now fails startup, and `MQTTNB_CONSUMER_REPLICAS` from the environment, where it is ignored; neither ever changed replication. |
+| `consumer_replicas` | none | nats-server ignores this key with a warning. The broker has no consumer replica setting either: its durable consumers inherit their stream's replica count, which JetStream requires on their interest-retention streams ([High availability](ARCHITECTURE.md#high-availability)). |
 | `consumer_memory_storage` | none | |
 | `consumer_inactive_threshold` (`consumer_auto_cleanup`) | none | The broker manages its consumers' lifetimes and refuses a stream-level inactivity limit where it would delete a consumer it still needs ([Stream prerequisites](ARCHITECTURE.md#stream-prerequisites)). |
 | `reject_qos2_publish`, `downgrade_qos2_subscribe` | none | QoS 2 is supported. A shared subscription asking for QoS 2 is granted QoS 1. |

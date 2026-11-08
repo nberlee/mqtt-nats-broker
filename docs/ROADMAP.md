@@ -1458,9 +1458,10 @@ boundary's "no compatibility" rule stands, and this policy is written into it as
   refuses the dialed server's version and header support and the meta leader's API level.
   Done 2026-11-08.
 
-- [ ] **Configuration surface.** Freeze the `MQTTNB_` variables, flags and defaults and
-  the Helm values schema, with a deprecation rule (a renamed setting keeps working, with
-  a warning, for one release).
+- [x] **Configuration surface.** One settings table defines every flag and `MQTTNB_`
+  variable, read strictly; `internal/config/testdata/surface.txt` pins names, kinds and
+  defaults, and `values.schema.json` the chart's values; no deprecation path before the
+  first release (`docs/ARCHITECTURE.md` "The configuration surface"). Done 2026-11-08.
 
 - [ ] **Permission contract.** Freeze the reserved `$MQTT.>` namespace and the ACLs
   deployments are told to set, so a hardened deployment's permissions survive upgrades.
@@ -2000,6 +2001,9 @@ The first alpha may be tagged only when:
 Nothing here blocks the alpha: the alpha release gate requires only that every item has an
 explicit disposition. It sits after the gate so that document order reaches it only once
 the alpha work in sections 0 to 7 is done.
+
+- [ ] Decide after the alpha release whether a renamed or removed setting gets a deprecation
+  period (`docs/ARCHITECTURE.md`, "The configuration surface").
 
 - [ ] **Report INPROCESS-REFUSAL to nats.go and nats-server, after the alpha release.**
   Filed 2026-10-24 by the user's decision. A connect the server refuses over an

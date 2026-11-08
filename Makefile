@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof config-surface-fixture store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -84,6 +84,9 @@ cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v
 depproof: ## Dependency canary: JetStream write-contract regressions plus every mutation
 	./test/depproof/run.sh --matrix
 
+config-surface-fixture: ## Regenerate internal/config/testdata/surface.txt, the pinned configuration surface, with a change to it (docs/ARCHITECTURE.md "The configuration surface")
+	MQTTNB_WRITE_CONFIG_SURFACE_FIXTURE=1 go test -count 1 -run '^TestWriteConfigurationSurfaceFixture$$' ./internal/config/
+
 store-format-fixture: ## Regenerate the golden store of the persisted format this build writes (internal/mqtt/testdata/storeformat/<format>); never for a released format — see docs/ARCHITECTURE.md "The persisted format"
 	MQTTNB_WRITE_STORE_FORMAT_FIXTURE=1 GOMEMLIMIT=3000MiB go test -tags mqtt_fulltests -p 1 -count 1 -run '^TestWriteStoreFormatFixture$$' ./internal/mqtt/
 
@@ -128,7 +131,7 @@ helm-check: ## Lint and render the Helm chart and the topology-3 NATS chart valu
 	for f in $(HELM_CHART)/ci/*.yaml; do $(HELM_ENV) bin/helm lint --strict $(HELM_CHART) -f $$f || exit 1; done
 	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml
 	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml -f docs/deploy/nats-chart-shared-pod/values-cluster.yaml
-	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm go test -count=1 -v -run '^(TestHelmChartStatic|TestHelmChart|TestHelmChartRefusals|TestHelmChartExtensionPoints|TestNATSChartSharedPod)$$' ./cmd/mqtt-nats-broker/
+	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm go test -count=1 -v -run '^(TestHelmChartStatic|TestHelmChart|TestHelmChartRefusals|TestHelmChartKeyedMaps|TestHelmChartExtensionPoints|TestNATSChartSharedPod)$$' ./cmd/mqtt-nats-broker/
 
 # A release tag is v + a version every publisher reads the same way, checked before any of
 # them runs (release.yml's version job):

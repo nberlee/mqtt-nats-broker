@@ -1,0 +1,477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqtt-nats-broker chart values",
+  "description": "The chart's values shape (docs/ARCHITECTURE.md, \"The configuration surface\"). Every chart-owned object is closed; merge, patch, broker.env, the Kubernetes-keyed maps, extraResources and nats are free-form. Cross-field rules are the templates'.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "topology"
+  ],
+  "properties": {
+    "nameOverride": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fullnameOverride": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "topology": {
+      "enum": [
+        "embedded",
+        "external"
+      ]
+    },
+    "replicas": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fullImageName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pullPolicy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pullSecretNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "broker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "natsURLs": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secretName": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "streamReplicas": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "logLevel": {
+          "type": "string"
+        },
+        "drainDelay": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "description": "extra environment: NAME: value or NAME: {valueFrom: ...}; may carry $tplYaml",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "object"
+            ]
+          }
+        }
+      }
+    },
+    "mqtt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "type": "integer"
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "secretName": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "caKey": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plaintext": {
+              "type": "boolean"
+            }
+          }
+        },
+        "websocket": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "embedded": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cluster": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "routeSecretName": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": "string"
+            },
+            "storageClassName": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "merge": {
+              "type": "object",
+              "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+            },
+            "patch": {
+              "type": "array",
+              "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+            }
+          }
+        }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "statefulSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "podTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "topologySpreadConstraints": {
+          "type": "object",
+          "description": "topologyKey: topologySpreadConstraint",
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "container": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "resources": {
+          "type": "object",
+          "description": "Kubernetes container resources",
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "integer",
+                  "number"
+                ]
+              }
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": {
+                "type": [
+                  "string",
+                  "integer",
+                  "number"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "type": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "headlessService": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "configMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "minReplicas": {
+          "type": "integer"
+        },
+        "maxReplicas": {
+          "type": "integer"
+        },
+        "targetCPUUtilizationPercentage": {
+          "type": "integer"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "object",
+          "description": "deep-merged into the rendered object; free-form, may carry $tplYaml"
+        },
+        "patch": {
+          "type": "array",
+          "description": "RFC 6902 JSON patch applied after the merge; free-form, may carry $tplYaml"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "extraResources": {
+      "type": "array",
+      "description": "extra user-defined resources; free-form, may carry $tplYaml"
+    },
+    "nats": {
+      "type": "object",
+      "description": "the official NATS chart's own values, untranslated; free-form",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

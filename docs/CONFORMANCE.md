@@ -6060,6 +6060,19 @@ the compatibility boundary (no released contract exists for either):
   `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
   every other broker-owned stream.
 
+### The configuration surface: what startup does not refuse
+
+The settings are read strictly and the chart's values are checked against their schema
+(`docs/ARCHITECTURE.md`, "The configuration surface"). What is not checked:
+
+- **An `MQTTNB_` variable the broker does not define** (a misspelled name, a removed
+  setting) is not read and draws no message. The prefix is shared: the embedded
+  configurations' variables are read by nats-server, an operator's own mounted
+  configuration may reference any name, and the repository's test harness uses it.
+- **The chart's free-form values** (`broker.env`, every `merge` and `patch`, the maps keyed
+  by Kubernetes names, `extraResources`, the `nats` subtree) are passed through unchecked
+  by the schema; a misspelled key there is rendered as written.
+
 ### Cross-version coexistence is excluded by procedure, not detected
 
 The broker-to-broker protocol is versioned by the persisted format's key (see "The

@@ -11,7 +11,8 @@ equivalent. Installation and the NATS prerequisites are in
 | `-nats` | `MQTTNB_NATS_URLS` | `nats://127.0.0.1:4222` | Comma-separated NATS URLs, without credentials (refused: give them with `-nats-user`/`-nats-pass` or `-nats-creds`) |
 | `-nats-embedded-config` | `MQTTNB_NATS_EMBEDDED_CONFIG` | | Run an embedded nats-server from this native configuration file instead of connecting to `-nats` ([details](ARCHITECTURE.md#embedded-nats)) |
 | `-nats-creds` | `MQTTNB_NATS_CREDS` | | NATS `.creds` file (service conn) |
-| `-nats-user` / `-nats-pass` | `MQTTNB_NATS_USER` / `_PASS` | | NATS user/password (service conn); keep URL credential-less under auth passthrough |
+| `-nats-user` | `MQTTNB_NATS_USER` | | NATS user (service conn); keep URL credential-less under auth passthrough |
+| `-nats-pass` | `MQTTNB_NATS_PASS` | | NATS password (service conn) |
 | `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-broker` | Connection name |
 | `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain; a single subject token. Baked into session subjects, so changing it later orphans existing sessions ([details](ARCHITECTURE.md#jetstream-domain)) |
 | `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | none, required | JetStream replicas of the ten broker-owned streams: the JetStream cluster size (normally 3 for HA), `1` for a single server. Every existing broker-owned stream must have exactly this count ([details](#stream-replicas)) |
@@ -22,10 +23,12 @@ equivalent. Installation and the NATS prerequisites are in
 | `-drain-delay` | `MQTTNB_DRAIN_DELAY` | `0` (immediate) | How long after SIGTERM the broker waits, with `/readyz` already answering 503, before it disconnects clients; a second signal ends the wait. Set it behind a load balancer or a Kubernetes Service ([Operations](OPERATIONS.md#shutdown)). Must be `>= 0` |
 | `-auth-passthrough` | `MQTTNB_AUTH_PASSTHROUGH` | `true` | Dial per-client NATS conn from MQTT creds; costs one NATS connection per client ([details](#what-auth-passthrough-costs)) |
 | `-max-ack-pending` | `MQTTNB_MAX_ACK_PENDING` | `1024` | QoS 1/2 push window: deliveries a subscription's consumer sends without an acknowledgement, `1`-`65535`. Applies to consumers created from then on, and to a shared group's durable on a fresh join ([details](#the-qos-12-push-window)) |
-| `-default-user` / `-default-pass` | `MQTTNB_DEFAULT_USER` / `_PASS` | | NATS creds for anonymous MQTT clients |
+| `-default-user` | `MQTTNB_DEFAULT_USER` | | NATS user for anonymous MQTT clients |
+| `-default-pass` | `MQTTNB_DEFAULT_PASS` | | NATS password for anonymous MQTT clients |
 | `-keepalive-max` | `MQTTNB_KEEPALIVE_MAX` | `0` (no override) | MQTT 5.0 Server Keep Alive cap (seconds) |
 | `-response-info` | `MQTTNB_RESPONSE_INFO` | | MQTT 5.0 Response Information base topic |
-| `-tls-cert` / `-tls-key` | `MQTTNB_TLS_CERT` / `_KEY` | | MQTT listener TLS (set `-port 8883`) |
+| `-tls-cert` | `MQTTNB_TLS_CERT` | | MQTT listener TLS certificate (set `-port 8883`) |
+| `-tls-key` | `MQTTNB_TLS_KEY` | | MQTT listener TLS key |
 | `-plain-port` | `MQTTNB_PLAIN_PORT` | `0` (off) | Additional plaintext MQTT listener beside the TLS `-port` (requires `-tls-cert`/`-tls-key`). Credentials and payloads cross it in clear, and no client certificate is checked on it |
 | `-tls-ca` | `MQTTNB_TLS_CA` | | Client-CA → enables mTLS (requires cert+key) |
 | `-tls-reload-interval` | `MQTTNB_TLS_RELOAD_INTERVAL` | `10s` | How often the TLS files are re-read for a renewal. Must be `> 0` |
@@ -41,17 +44,17 @@ equivalent. Installation and the NATS prerequisites are in
 
 ## How flags and the environment combine
 
-The environment is read first and the command line is laid over it: a flag overrides a
-successfully parsed environment value. Two exceptions follow from that order:
+The environment is read first and the command line is laid over it: a flag overrides its
+environment variable.
 
-- A malformed duration variable (`MQTTNB_CONNECT_TIMEOUT`, `MQTTNB_DRAIN_DELAY`,
-  `MQTTNB_TLS_RELOAD_INTERVAL`, `MQTTNB_WS_HANDSHAKE_TIMEOUT`) aborts startup with
-  `invalid MQTTNB_...`, even when the matching flag is also given, because it is read
-  before the flags are.
-- A malformed integer or boolean variable (`MQTTNB_PORT=abc`,
-  `MQTTNB_AUTH_PASSTHROUGH=maybe`) is ignored and the default applies, with no message.
-  Check the values you set. `MQTTNB_MAX_ACK_PENDING` is the exception: a malformed value
-  aborts startup, because the default would be a push window you did not choose.
+A variable that does not parse as its setting's kind (`MQTTNB_PORT=abc`,
+`MQTTNB_AUTH_PASSTHROUGH=maybe`, `MQTTNB_DRAIN_DELAY=10`, or an empty integer, boolean or
+duration) aborts startup with `invalid MQTTNB_<NAME>: ...`, even when the matching flag is
+also given, because the environment is read before the flags are. A string variable takes
+any value, the empty string included.
+
+An `MQTTNB_` variable the broker does not define is not read and draws no message: check
+the names you set against the table above.
 
 A flag the broker does not define, or a flag value that does not parse, is refused as
 `invalid command line: <kind> (-<flag>)`, without echoing the value.
@@ -59,6 +62,10 @@ A flag the broker does not define, or a flag value that does not parse, is refus
 After both are read the whole configuration is validated, and startup stops on the
 first inconsistency; [Troubleshooting](TROUBLESHOOTING.md#the-broker-does-not-start)
 lists the messages.
+
+The settings, their names and defaults, and the Helm chart's values schema are the
+broker's configuration surface; how it is defined, pinned and changed is in
+[Architecture](ARCHITECTURE.md#the-configuration-surface).
 
 ## The QoS 1/2 push window
 

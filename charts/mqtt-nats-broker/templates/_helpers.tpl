@@ -136,9 +136,6 @@ Refuse the combinations the broker or the topology cannot run.
 */}}
 {{- define "mqtt-nats-broker.validate" -}}
 {{- with .Values }}
-{{- if not (has .topology (list "external" "embedded")) }}
-{{- fail (printf "topology must be external or embedded, not %q" (toString .topology)) }}
-{{- end }}
 {{- if not .broker.credentials.secretName }}
 {{- fail "broker.credentials.secretName: the broker needs its NATS service identity" }}
 {{- end }}

@@ -64,7 +64,8 @@ compatibility possible is in place by the first release, though: versions on the
 persisted format (in place: see "The persisted format" below) and the broker-to-broker
 records (in place, the same version: see "The broker-to-broker protocol" below),
 a checked NATS floor, and frozen
-configuration, permission and operational interfaces (`docs/ROADMAP.md` §1, "Contracts in
+configuration (in place: see "The configuration surface" below),
+permission and operational interfaces (`docs/ROADMAP.md` §1, "Contracts in
 place by the first release"). **Beta** keeps those contracts: compatibility is guaranteed
 within them from then on, and this section is rewritten as that contract when beta is
 cut.
@@ -343,6 +344,55 @@ change inside `shim_small.go` or to the data flowing through an existing site is
 anything about a call routed through a broker-defined interface or reflection. What a
 running broker does not detect is stated in `docs/CONFORMANCE.md`, "Cross-version
 coexistence is excluded by procedure, not detected".
+
+### The configuration surface
+
+The configuration surface is every setting an operator gives the broker, and the chart's
+values. It has one definition and two pins:
+
+- **The settings.** `internal/config`'s `settings` table is the only definition of each
+  setting: its flag, its `MQTTNB_` variable and the `Config` field both write. The flags,
+  the environment pass, `config.Surface()` and every check of the surface read that table,
+  so a flag without a variable, or a variable without a flag, cannot be written. Each
+  setting's kind (string, integer, boolean, duration) is its field's type and its built-in
+  default is `config.Default()`'s.
+- **How they are read.** The environment first, in full, then the command line over it: a
+  flag overrides its variable. Every variable is read strictly: one that does not parse as
+  its kind, the empty string included for the non-string kinds, stops startup with
+  `invalid MQTTNB_<NAME>: ...`, even when its flag is also given, because the environment
+  is read before any flag. A string variable takes any value.
+- **The embedded configurations' variables.** `embedded/nats.conf` and
+  `embedded/nats-cluster.conf` reference `$MQTTNB_` variables that nats-server, not the
+  broker, reads from the environment. They are part of the surface too.
+- **The pin.** `internal/config/testdata/surface.txt` lists every setting's flag, variable,
+  kind and built-in default, and the embedded configurations' variables.
+  `TestConfigurationSurfaceIsPinned` renders it and compares bytes, and
+  `TestConfigurationDocumentNamesEverySetting` requires `docs/CONFIGURATION.md`'s flag table
+  to name exactly those settings, one per row, in the table's order. `make
+  config-surface-fixture` regenerates the file; no test writes it.
+- **The chart's values.** `charts/mqtt-nats-broker/values.schema.json` is their shape, and
+  Helm checks every install, upgrade, template and lint against it. Every chart-owned
+  object is closed, so an unknown or misspelled key is refused; the free-form parts are
+  every `merge` and `patch`, `broker.env`, the maps keyed by Kubernetes names
+  (`podTemplate.topologySpreadConstraints`, `container.resources`), `extraResources` and
+  the official NATS chart's own `nats` values. The schema owns shape and type only. A rule
+  across values stays in the templates, and so does every check that must see a value Helm
+  changes around the schema: a key set to `null` is removed before validation, and
+  `$tplYaml` is expanded after it. `TestHelmChartStatic` requires the schema and
+  `values.yaml` to name the same keys.
+
+Not in the surface: the `MQTTNB_` variables the repository's tests and Makefile targets
+use (`MQTTNB_HELM`, `MQTTNB_TEST_RUN_BROKER`, ...), the usage text's wording, the fixed
+bounds in `docs/CONFIGURATION.md`, and `GOMEMLIMIT`/`AUTOMEMLIMIT`, which are the Go
+runtime's and automemlimit's.
+
+**How it changes, until the first release.** By editing it: a rename, a removal or a
+changed default edits the table or the chart, regenerates the fixture or the schema, and
+updates the docs, in one change. There is no deprecation period, no alias, no warning and
+no refusal that names a former setting. A removed flag meets the flag package's generic
+refusal of an undefined flag, a removed variable is simply not read, and a removed chart
+value meets the schema's refusal of an unknown key. What applies from the first release is
+decided then, under "Release phases" above.
 
 ### Shared-subscription QoS boundary
 
@@ -17032,7 +17082,9 @@ supplies it. Neither image sets one, since a mounted configuration would inherit
 
 **Customization is the NATS chart's convention, with its helpers.** Every rendered object
 has a `merge` (deep-merged; a list in it replaces the chart's) and a `patch` (RFC 6902,
-applied after the merge; `/-` appends), values may carry `$tplYaml`, and
+applied after the merge; `/-` appends), the values under `merge`, `patch`, `broker.env`
+and `extraResources` may carry `$tplYaml` (`values.schema.json` types every other value as
+a literal: see "The configuration surface"), and
 `extraResources` adds arbitrary objects. `templates/_jsonpatch.tpl` and
 `templates/_tplYaml.tpl` are copied from nats-io/k8s at the commit of chart 2.15.1
 (Apache-2.0, `NOTICE`), with every `define` and `include` prefixed `mqtt-nats-broker.`:

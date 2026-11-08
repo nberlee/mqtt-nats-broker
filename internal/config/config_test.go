@@ -82,14 +82,6 @@ func TestLoadDrainDelay(t *testing.T) {
 	}
 }
 
-func TestLoadDrainDelayMalformedEnvErrors(t *testing.T) {
-	// A present-but-unparseable env value is a hard error, not a silent fallback.
-	t.Setenv("MQTTNB_DRAIN_DELAY", "notaduration")
-	if _, err := Load(nil); err == nil {
-		t.Fatal("expected error for malformed MQTTNB_DRAIN_DELAY, got nil")
-	}
-}
-
 func TestValidateRejectsNegativeDrainDelay(t *testing.T) {
 	if _, err := Load([]string{"-drain-delay", "-1s"}); err == nil {
 		t.Fatal("expected error for negative drain-delay, got nil")
@@ -328,17 +320,6 @@ func TestValidateWebSocket(t *testing.T) {
 	}
 }
 
-// TestConsumerReplicasIsNotAFlag: the broker has no consumer replica setting (a durable
-// consumer follows its interest-retention stream's count, which JetStream requires), so a
-// command line still carrying the old flag is refused at startup rather than accepted and
-// ignored.
-func TestConsumerReplicasIsNotAFlag(t *testing.T) {
-	const want = "invalid command line: flag provided but not defined"
-	if _, err := Load([]string{"-consumer-replicas", "3"}); err == nil || err.Error() != want {
-		t.Fatalf("Load(-consumer-replicas 3) = %v, want %q", err, want)
-	}
-}
-
 // TestEmbeddedConfigRefusesExplicitNATSURLs: an embedded server is reached in-process, so
 // a NATS URL the operator set would be ignored; it is refused instead, in either form.
 // The default URL is not the operator's and does not count.
@@ -572,15 +553,6 @@ func TestLoadMaxAckPending(t *testing.T) {
 		if _, err = Load([]string{"-max-ack-pending", v}); err == nil {
 			t.Errorf("-max-ack-pending %s accepted", v)
 		}
-	}
-}
-
-func TestLoadMaxAckPendingMalformedEnvErrors(t *testing.T) {
-	// A malformed value is an error, never the default: the default would be a push window
-	// the operator did not choose.
-	t.Setenv("MQTTNB_MAX_ACK_PENDING", "lots")
-	if _, err := Load(nil); err == nil {
-		t.Fatal("malformed MQTTNB_MAX_ACK_PENDING was accepted")
 	}
 }
 

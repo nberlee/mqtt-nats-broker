@@ -5,9 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"io"
 	"log/slog"
 	"net"
@@ -871,25 +868,12 @@ func checkEnvironment(t *testing.T, c map[string]any, want listeners) *config.Co
 	return cfg
 }
 
-// configEnvNames returns the MQTTNB_ string literals in internal/config/config.go: the
-// variables the binary reads, from the source rather than from a second list.
+// configEnvNames returns the variables internal/config reads: the configuration surface's.
 func configEnvNames(t *testing.T) map[string]bool {
 	t.Helper()
-	f, err := parser.ParseFile(token.NewFileSet(), "../../internal/config/config.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	names := map[string]bool{}
-	ast.Inspect(f, func(n ast.Node) bool {
-		if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-			if s, err := strconv.Unquote(lit.Value); err == nil && strings.HasPrefix(s, "MQTTNB_") {
-				names[s] = true
-			}
-		}
-		return true
-	})
-	if len(names) == 0 {
-		t.Fatal("no MQTTNB_ literals in internal/config/config.go")
+	for _, s := range config.Surface() {
+		names[s.Env] = true
 	}
 	return names
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"net"
@@ -164,6 +165,68 @@ func TestHelmChartStatic(t *testing.T) {
 		if seen == 0 {
 			t.Fatal("no template names found; the check proves nothing")
 		}
+	})
+
+	// The schema is the values' shape: every chart-owned key in values.yaml has a property,
+	// every property a key, and every chart-owned object is closed, so a misspelled or
+	// renamed key is refused. The free-form subtrees are the operator's or another chart's
+	// shape and are listed here; nothing else may be open.
+	t.Run("ValuesSchema", func(t *testing.T) {
+		var values map[string]any
+		data, err := os.ReadFile(filepath.Join(helmChartDir, "values.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal(data, &values); err != nil {
+			t.Fatal(err)
+		}
+		var schema map[string]any
+		data, err = os.ReadFile(filepath.Join(helmChartDir, "values.schema.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &schema); err != nil {
+			t.Fatal(err)
+		}
+		freeForm := map[string]bool{
+			"broker.env": true, "podTemplate.topologySpreadConstraints": true,
+			"container.resources": true, "extraResources": true, "nats": true,
+		}
+		var walk func(path string, v any, s map[string]any)
+		walk = func(path string, v any, s map[string]any) {
+			name := path[strings.LastIndex(path, ".")+1:]
+			if freeForm[path] || name == "merge" || name == "patch" {
+				if s["additionalProperties"] == false {
+					t.Errorf("%s is free-form but the schema closes it", path)
+				}
+				return
+			}
+			props, _ := s["properties"].(map[string]any)
+			vm, isMap := v.(map[string]any)
+			if props == nil {
+				if isMap {
+					t.Errorf("%s is an object in values.yaml without schema properties", path)
+				}
+				return
+			}
+			if s["additionalProperties"] != false {
+				t.Errorf("%s: a chart-owned object must be additionalProperties: false", path)
+			}
+			for k, child := range vm {
+				cs, ok := props[k].(map[string]any)
+				if !ok {
+					t.Errorf("%s.%s is in values.yaml but not in the schema", path, k)
+					continue
+				}
+				walk(strings.TrimPrefix(path+"."+k, "."), child, cs)
+			}
+			for k := range props {
+				if _, ok := vm[k]; !ok {
+					t.Errorf("%s.%s is in the schema but not in values.yaml", path, k)
+				}
+			}
+		}
+		walk("", values, schema)
 	})
 
 	t.Run("ClusterConfigCopy", func(t *testing.T) {
@@ -1357,7 +1420,18 @@ func writeValues(t *testing.T, name, body string) string {
 func TestHelmChartRefusals(t *testing.T) {
 	bin := helmBin(t)
 	for _, tc := range []struct{ name, values, want string }{
-		{"UnknownTopology", "topology: sidecar\nbroker:\n  natsURLs: nats://nats:4222\n", "topology must be external or embedded"},
+		{"UnknownTopology", "topology: sidecar\nbroker:\n  natsURLs: nats://nats:4222\n", "at '/topology': value must be one of"},
+		// The schema closes every chart-owned object and types every key (values.schema.json).
+		{"NullTopology", "topology: null\n", "missing property 'topology'"},
+		{"UnknownTopLevelKey", "topolgy: external\n", "additional properties 'topolgy' not allowed"},
+		{"MisspelledNestedKey", "broker:\n  logLevle: debug\n", "at '/broker': additional properties 'logLevle' not allowed"},
+		{"UnknownWebSocketKey", "mqtt:\n  websocket:\n    enable: true\n", "at '/mqtt/websocket': additional properties 'enable' not allowed"},
+		{"WrongType", "mqtt:\n  port: \"1883\"\n", "at '/mqtt/port': got string, want integer"},
+		// Helm removes a key set to null before the schema sees it, and expands $tplYaml after
+		// it, so these stay the templates' refusals.
+		{"NullCredentials", "topology: external\nbroker:\n  streamReplicas: 1\n  natsURLs: nats://nats:4222\n  credentials:\n    secretName: null\n", "broker.credentials.secretName"},
+		{"EmbeddedClusterNullRouteSecret", "topology: embedded\nreplicas: 3\nembedded:\n  cluster:\n    enabled: true\n    routeSecretName: null\n", "embedded.cluster.routeSecretName"},
+		{"TemplatedEnvNotAString", "broker:\n  env:\n    MQTTNB_MAX_CONNS:\n      $tplYaml: \"123\"\n", "env var MQTTNB_MAX_CONNS must be string or map"},
 		{"NoNATS", "topology: external\nbroker:\n  streamReplicas: 1\n", "broker.natsURLs"},
 		{"PlaintextWithoutTLS", "topology: external\nbroker:\n  streamReplicas: 1\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    plaintext: true\n", "mqtt.tls.plaintext"},
 		{"TLSWithoutSecret", "topology: external\nbroker:\n  streamReplicas: 1\n  natsURLs: nats://nats:4222\nmqtt:\n  tls:\n    enabled: true\n", "mqtt.tls.secretName"},
@@ -1388,6 +1462,38 @@ func TestHelmChartRefusals(t *testing.T) {
 				t.Errorf("refused with %v; want the message to name %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestHelmChartKeyedMaps: the maps keyed by Kubernetes names rather than the chart's stay
+// open under the schema, and render.
+func TestHelmChartKeyedMaps(t *testing.T) {
+	bin := helmBin(t)
+	values := "podTemplate:\n  topologySpreadConstraints:\n    kubernetes.io/hostname:\n      maxSkew: 1\n      whenUnsatisfiable: DoNotSchedule\n" +
+		"container:\n  resources:\n    limits:\n      example.com/accelerator: 1\n"
+	objs := helmTemplate(t, bin, helmChartDir, writeValues(t, "keyed", values))
+	var spread, limit bool
+	for _, o := range objs {
+		if o["kind"] != "StatefulSet" {
+			continue
+		}
+		spec := mustMap(t, o, "spec", "template", "spec")
+		tsc, _ := spec["topologySpreadConstraints"].([]any)
+		for _, c := range tsc {
+			if m, _ := c.(map[string]any); m["topologyKey"] == "kubernetes.io/hostname" {
+				spread = true
+			}
+		}
+		for _, c := range spec["containers"].([]any) {
+			if m := c.(map[string]any); m["name"] == "broker" {
+				if l, _ := m["resources"].(map[string]any)["limits"].(map[string]any); l["example.com/accelerator"] != nil {
+					limit = true
+				}
+			}
+		}
+	}
+	if !spread || !limit {
+		t.Errorf("keyed maps not rendered: topology spread %v, extended resource %v", spread, limit)
 	}
 }
 
