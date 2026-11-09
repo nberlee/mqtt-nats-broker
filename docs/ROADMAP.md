@@ -901,12 +901,10 @@ there below are recorded in it.
   lost; accepted as a latency residual in `docs/CONFORMANCE.md`, not fixed. Classified
   2026-11-02; [issue #156](https://github.com/nberlee/mqtt-nats-broker/issues/156).
 
-- [ ] Name the cause of the periodic `$MQTT_sess` JetStream API stalls a production
-  deployment logs: one request of about 3.3 s per broker per 15-minute sweep tick, and
-  past the 5 s request timeout they refuse CONNECTs. Broker access pattern or upstream
-  store is open; the evidence to collect (a cold-versus-warm read, a goroutine dump during
-  a stall) needs the deployment. Observed 2026-11-08
-  ([issue #179](https://github.com/nberlee/mqtt-nats-broker/issues/179)).
+- [x] Named and removed the cause of the periodic `$MQTT_sess` stalls: the sweeps walked the
+  sparse session records by sequence, and one wildcard read crossed every cold block of the
+  stream per tick; they now list the session subjects and load each by subject. Done
+  2026-11-08 ([issue #179](https://github.com/nberlee/mqtt-nats-broker/issues/179)).
 
 ### 0.5 Small pre-alpha fixes
 

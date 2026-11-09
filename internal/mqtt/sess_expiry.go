@@ -808,26 +808,16 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 	if h := mqttTestSessExpirySweepPassHookV.Load(); h != nil {
 		defer (*h)(as)
 	}
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
 	var swept int
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			// No (more) messages, or the stream/server is going away: done.
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT session expiry sweep ended: %v", err)
-			}
-			break
-		}
-		seq = smsg.Sequence + 1
+	if err := as.walkSessionRecords(func(smsg *StoredMsg) error {
 		ps := &mqttPersistedSession{}
 		if err := json.Unmarshal(smsg.Data, ps); err != nil {
 			s.Warnf("MQTT session expiry sweep: unable to decode session record at sequence %v, skipping: %v", smsg.Sequence, err)
-			continue
+			return nil
 		}
 		// Only sessions with a finite interval can expire.
 		if ps.ExpiryInterval == 0 || ps.ExpiryInterval == mqttSessionNeverExpire {
-			continue
+			return nil
 		}
 		idHash := getHash(ps.ID)
 		// A record this broker has said it cannot interpret is not one it may
@@ -838,7 +828,7 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 		// See mqttValidateRecordAffinePair.
 		if aerr := mqttValidateRecordAffinePair(ps, idHash); aerr != nil {
 			s.Warnf("MQTT session expiry sweep: refusing to act on the record of %q: %v", ps.ID, aerr)
-			continue
+			return nil
 		}
 		// Same rule, same reason as the affine pair: the stamp below is a full record
 		// write, and writing an unsupported shape NORMALIZES it — the record would come
@@ -846,7 +836,7 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 		if sid, found := mqttSharedConsInRecord(ps); found {
 			s.Warnf("MQTT session expiry sweep: refusing to act on the record of %q: %v",
 				ps.ID, mqttSharedConsRecordErr(ps.ID, sid))
-			continue
+			return nil
 		}
 		if ps.DisconnectedAt == 0 {
 			// The record claims a connected client. If we own the record and
@@ -859,13 +849,13 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 			// sweeps, and server names are explicit): standalone, a generated
 			// node name changes across restarts and would never match.
 			if s.JetStreamIsClustered() && ps.Origin != s.NodeName() {
-				continue
+				return nil
 			}
 			as.mu.RLock()
 			_, inMem := as.sessByHash[idHash]
 			as.mu.RUnlock()
 			if inMem {
-				continue
+				return nil
 			}
 			ps.DisconnectedAt = time.Now().Unix()
 			// A raw record write, so it carries a lineage like any other. ps was
@@ -874,7 +864,7 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 			// parents itself. See sess_fork_lineage.go.
 			ps.PWID, ps.WID = ps.WID, mqttNewRecordWID()
 			if err := as.storeSessionRecordCAS(ps, idHash, smsg.Sequence); err != nil {
-				continue
+				return nil
 			}
 		}
 		remaining := time.Until(mqttSessionExpiryDeadline(ps.DisconnectedAt, ps.ExpiryInterval))
@@ -895,6 +885,10 @@ func (as *mqttAccountSessionManager) sweepSessionExpiries(s *Server) {
 			}
 		}
 		as.mu.Unlock()
+		return nil
+	}); err != nil {
+		// The stream or the server is going away, or a read failed: done until the next tick.
+		s.Debugf("MQTT session expiry sweep ended: %v", err)
 	}
 	if swept > 0 {
 		s.Debugf("MQTT session expiry sweep re-armed %v timer(s)", swept)

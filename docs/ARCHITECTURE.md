@@ -940,11 +940,40 @@ to which 2.15.1 added `n.scaleUp` (see the v2.15.0 → v2.15.1 audit above); `de
   map with `LastSeq == 0`. The map carries per-subject **counts**, not sequences, and is the
   later sample, so the pair licenses **no inference at all** about where the returned
   occupants sit: they may lie on either side of `LastSeq`. `LastSeq` is usable for exactly
-  one thing — as a destructive cutoff — and never as an inventory of what is at or below it.
+  two things — as a destructive cutoff, and as the point a sequence walk resumes from to
+  cover what the map may have missed (the next bullet) — and never as an inventory of what
+  is at or below it.
   Both directions are handled where they are depended on
   ([issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66)): a record
   above the cutoff
   is spared, and an unusable watermark is re-sampled rather than acted on.
+- **A wildcard `next_by_subj` read that starts past a match reads every block up to the
+  next one, and a block whose subject index has expired is read whole.** In the pinned
+  `fileStore.LoadNextMsg` only a read starting at or below the first sequence jumps through
+  the stream's subject index; a later one walks the blocks from its start, and
+  `firstMatching` loads a block entirely to rebuild its per-block subject state, which
+  expires after two minutes without activity (`defaultFssExpiration`). The jump ahead
+  (`checkSkipFirstBlock`) is off for a wildcard once the stream holds 64k subjects, and
+  even below that it cannot pass the block of the earliest match. All of it runs under the
+  store's read lock and the API handler's `isolateMu` read lock, so the stream's writers
+  wait behind it. On `$MQTT_sess` the session records are a sparse class among the
+  permanent per-CONNECT facts, handoff outcomes and teardown receipts, so a sequence walk
+  of them from one long-lived early record read the whole stream once per sweep tick
+  ([issue #179](https://github.com/nberlee/mqtt-nats-broker/issues/179)). The sweeps that
+  need every session record therefore go through `walkSessionRecords`: one subject listing
+  (`STREAM.INFO` with a subjects filter, answered from the subject index without reading a
+  block), each listed subject loaded by `last_by_subj`, and a sequence walk from the
+  listing's `LastSeq + 1`. Because `State` is built before the map, every record at or
+  below `LastSeq` that still exists when the map is computed is listed, and everything
+  written after it is above it. The tail never crosses the historical prefix; it keeps the
+  exposure over the block holding `LastSeq` and whatever was written while the listed loads
+  ran. A listing that does not fit one page is not a census (pages are separate
+  computations, and a delete between them shifts the offsets past a record that never
+  left), so past `JSMaxSubjectDetails` session records the walk runs by sequence from the
+  start with the whole cost. The delayed-Will acceptance-fact scan (`scanAcceptFacts`)
+  stays a sequence walk, because its persisted floor is a sequence, and keeps the exposure:
+  it can start at sequence 1, its cutoff is checked only on the answer, and its deadline
+  cannot cancel a read in flight.
 - **An atomic batch is indivisible at APPLY, not at Raft** (`AllowAtomicPublish`).
   Raft preserves nothing about a batch: `ProposeMulti` pushes the entries
   individually, `runAsLeader` pops whatever prefix exists, and each regrouped batch
@@ -14890,14 +14919,16 @@ prerequisite and adds no compensation.
   PUBREL scan reaches - resume recovery (`recoverInflightRegistersOnce`), drain recovery
   (`recoverDrainPubRels`), `findOwedPubRelRecord`, `disposeTerminalPubRelRecords`, and
   the teardown's proof walk (`secureQ2AffPubRelProofsCharged`, run on every teardown
-  that holds a PUBREL durable); the orphan sweep (`adoptAbandonedTeardowns`,
-  `orphan_qos2_sweep.go:557`; `condemnRetiredSurvivors`, `:667`; `buildSessionRefs`,
-  `:860`; `collectInboundQoS2Candidates`, `:1229`; `collectInflightCandidates`,
-  `:1659`); `sweepSessionExpiries` (`sess_expiry.go`) and
-  `sweepOrphanedConsumersBefore` (`sess_manager.go`); `scanWillOutbox`
-  (`will_outbox.go:955`); the acceptance-fact walk `loadNextAcceptFact`
-  (`sess_accept_fact.go:344`); and `sweepSharedGroupRetirements` and
-  `sweepAcqReleaseVerdicts` (`shared_lifecycle_sweep.go:128`, `:168`). The two affine
+  that holds a PUBREL durable); the orphan sweep (`condemnRetiredSurvivors`,
+  `orphan_qos2_sweep.go:667`; `collectInboundQoS2Candidates`, `:1229`;
+  `collectInflightCandidates`, `:1659`); `walkSessionRecords` (`sess_record_walk.go`),
+  the session-record walk of `sweepSessionExpiries`, `sweepOrphanedConsumersBefore`,
+  `adoptAbandonedTeardowns`, `buildSessionRefs` and `sweepAcqReleaseVerdicts`, in its
+  tail above the subject listing's watermark and its whole-stream walk past one page (its
+  loads of the listed subjects are point reads: a failed one skips that record);
+  `scanWillOutbox` (`will_outbox.go:955`); the acceptance-fact walk `loadNextAcceptFact`
+  (`sess_accept_fact.go:344`); and `sweepSharedGroupRetirements`
+  (`shared_lifecycle_sweep.go:128`). The two affine
   claim walks (`qos2_shared_affine.go:3820`, `:4008`) are chapter P's. The custody duty
   traversal (`traverseGenerationInventory`) is NOT a suffix enumeration: it reads named
   ordinals at exact subjects through `loadLastMsgForMulti`, bounded by the ledger, and

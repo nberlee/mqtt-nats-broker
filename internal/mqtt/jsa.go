@@ -108,7 +108,8 @@ type mqttJSACore struct {
 	// stream-info subject list at JSMaxSubjectDetails and reports the true total beside it —
 	// and malformed pages, and a fixture cannot reach the page size without writing a hundred
 	// thousand records. The seam answers one page per call, envelope included, and the answer
-	// passes through the same validation as the server's.
+	// passes through the same validation as the server's. It answers every listing that goes
+	// through streamSubjectsCompletePage on this view, the session-record walk's included.
 	exchangeSubjectsObs atomic.Pointer[func(filter string, offset int) (mqttSubjectPage, error)]
 
 	// resourceSubjectsPageObs answers one page of the settlement's resource walk (issue #107 7f): the
@@ -557,7 +558,8 @@ func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 // What the pair does NOT support is any inference about where the returned subjects sit
 // relative to the sequence. The map carries per-subject COUNTS, not sequences, and it is
 // sampled after State, so its occupants may lie on either side of the watermark. LastSeq is
-// solely the earlier State watermark, and its only use is to BOUND a destructive purge;
+// solely the earlier State watermark: it BOUNDS a destructive purge, and it is where a
+// sequence walk resumes to cover what the later map may have missed (walkSessionRecords);
 // reading it as "everything returned is at or below this" is false.
 //
 // A nil map means the filter matched nothing. Callers must keep their filter
@@ -623,12 +625,15 @@ func (jsa *mqttJSA) streamSubjectsComplete(streamName, filter string) (map[strin
 }
 
 // mqttSubjectPage is one stream-info subject page as the server answered it: the subjects and the
-// paged envelope beside them.
+// paged envelope beside them, and the stream's last sequence. The server samples that sequence
+// BEFORE it computes the subjects, so it is a watermark taken ahead of the listing (see
+// walkSessionRecords, the reader that depends on it).
 type mqttSubjectPage struct {
 	Subjects map[string]uint64
 	Total    int
 	Limit    int
 	Offset   int
+	LastSeq  uint64
 }
 
 // streamSubjectsCompletePage requests the subject page at offset.
@@ -653,7 +658,7 @@ func (jsa *mqttJSA) streamSubjectsCompletePage(streamName, filter string, offset
 		return mqttSubjectPage{}, fmt.Errorf("stream info for %q unavailable", streamName)
 	}
 	return mqttSubjectPage{Subjects: slr.State.Subjects, Total: slr.Total, Limit: slr.Limit,
-		Offset: slr.Offset}, nil
+		Offset: slr.Offset, LastSeq: slr.State.LastSeq}, nil
 }
 
 // mqttSubjectPageAdvance validates the page answered for a request at offset and says where the walk

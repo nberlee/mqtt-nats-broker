@@ -1586,22 +1586,12 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cut
 		sess.mu.Unlock()
 	}
 	// Walk every session record; any referenced durable is not an orphan.
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
-	for seq := uint64(1); len(candidates) > 0; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
-				return
-			}
-			break
-		}
-		seq = smsg.Sequence + 1
+	if err := as.walkSessionRecords(func(smsg *StoredMsg) error {
 		ps := &mqttPersistedSession{}
 		if err := json.Unmarshal(smsg.Data, ps); err != nil {
 			// An undecodable record may still reference candidates: abort.
 			s.Warnf("MQTT orphaned consumer sweep: unable to decode session record at sequence %v: %v", smsg.Sequence, err)
-			return
+			return errMQTTSessRecordUninterpretable
 		}
 		// A record whose shape this broker does not write is treated exactly like an
 		// undecodable one: ABORT the whole sweep, never skip the record. This walk decides
@@ -1610,7 +1600,7 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cut
 		// complete one. See mqttSharedConsInRecord.
 		if sid, found := mqttSharedConsInRecord(ps); found {
 			s.Warnf("MQTT orphaned consumer sweep: aborting, %v", mqttSharedConsRecordErr(ps.ID, sid))
-			return
+			return errMQTTSessRecordUninterpretable
 		}
 		for _, cc := range ps.Cons {
 			delete(candidates, cc.Durable)
@@ -1620,6 +1610,16 @@ func (as *mqttAccountSessionManager) sweepOrphanedConsumersBefore(s *Server, cut
 				delete(candidates, pd.Cons.Durable)
 			}
 		}
+		if len(candidates) == 0 {
+			return errMQTTSessWalkStop
+		}
+		return nil
+	}); err != nil {
+		// An aborted walk already said why; either way the view is partial and nothing is deleted.
+		if !errors.Is(err, errMQTTSessRecordUninterpretable) {
+			s.Debugf("MQTT orphaned consumer sweep ended: %v", err)
+		}
+		return
 	}
 	for dur := range candidates {
 		// A physical name's DELETE is authorized by its OWNERSHIP record, never by the mere

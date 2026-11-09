@@ -1235,11 +1235,14 @@ SUFFIX enumerations (`loadNextMsgFromSeq` over a subject filter) the supported p
   owed-PUBREL lookup (`findOwedPubRelRecord`, `pubrel_action.go:1596`), terminal PUBREL
   disposal (`disposeTerminalPubRelRecords`, `pubrel_action.go:2310`) and the drain PUBREL
   recovery (`recoverDrainPubRels`, `unsub_drain.go:3311`);
-- the account sweeps over `$MQTT_sess`: `sweepSessionExpiries` (`sess_expiry.go`),
-  `sweepOrphanedConsumersBefore` (`sess_manager.go`), `buildSessionRefs`
-  (`orphan_qos2_sweep.go:860`), `adoptAbandonedTeardowns` (`orphan_qos2_sweep.go:557`) and
-  `sweepAcqReleaseVerdicts` (`shared_lifecycle_sweep.go:168`); the acceptance-fact scan
-  for a delayed Will (`scanAcceptFacts` via `loadNextAcceptFact`,
+- the account sweeps over `$MQTT_sess` (`sweepSessionExpiries`,
+  `sweepOrphanedConsumersBefore`, `buildSessionRefs`, `adoptAbandonedTeardowns` and
+  `sweepAcqReleaseVerdicts`), through `walkSessionRecords` (`sess_record_walk.go`): its
+  suffix enumeration above the subject listing's watermark, and the whole-stream one past
+  a listing of more than one page. Its loads of the listed subjects take "no message" as a
+  record deleted since the listing, so there a failed read skips that one record
+  ([issue #179](https://github.com/nberlee/mqtt-nats-broker/issues/179));
+  the acceptance-fact scan for a delayed Will (`scanAcceptFacts` via `loadNextAcceptFact`,
   `sess_accept_fact.go:344`);
 - `condemnRetiredSurvivors` (`orphan_qos2_sweep.go:667`, `$MQTT_teardown`),
   `collectInboundQoS2Candidates` (`orphan_qos2_sweep.go:1229`, `$MQTT_qos2in`),

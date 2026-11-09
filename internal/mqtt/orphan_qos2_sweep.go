@@ -547,28 +547,18 @@ func (as *mqttAccountSessionManager) forgetIfQ2AffClaimGone(subject string) {
 func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 	grace, q := as.orphanGrace(), as.quarantine()
 	opts := s.getOpts()
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT teardown adoption sweep ended: %v", err)
-			}
-			return
-		}
-		seq = smsg.Sequence + 1
-
+	if err := as.walkSessionRecords(func(smsg *StoredMsg) error {
 		idHash, perr := mqttSessIDHashFromSubject(smsg.Subject, as.domainTk)
 		if perr != nil {
 			// Not ours to interpret, and not ours to adopt.
-			continue
+			return nil
 		}
 		ps := &mqttPersistedSession{}
 		if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
-			continue
+			return nil
 		}
 		if ps.Teardown == nil || ps.Teardown.Nonce == _EMPTY_ {
-			continue
+			return nil
 		}
 		// Every deletion target is validated for the SAME reason the generation is, and it is
 		// easy to miss because the generation check looks like it covers the record.
@@ -579,14 +569,14 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 		// more than it is in buildSessionRefs, which applies exactly these checks.
 		if verr := mqttValidateTeardownTargets(ps, idHash); verr != nil {
 			s.Warnf("MQTT teardown adoption: refusing to adopt the teardown on %q: %v", smsg.Subject, verr)
-			continue
+			return nil
 		}
 		// The marker must have been seen, unchanged, for the whole grace. A resave
 		// moves the record's sequence and a peer's teardown changes the nonce; either
 		// restarts the wait, which is exactly what "unchanged" has to mean here.
 		fp := mqttQuarantineSeqFP(smsg.Sequence) + "|" + ps.Teardown.Nonce
 		if !q.observedOrphanFor(mqttQuarantineTeardownKey(idHash), fp, grace) {
-			continue
+			return nil
 		}
 
 		// Re-read: the snapshot is older than the record, and an adoption must act on
@@ -595,13 +585,13 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 		cur, curSeq, rerr := as.loadFenceSession(idHash)
 		if rerr != nil || cur == nil || cur.Teardown == nil ||
 			cur.Teardown.Nonce != ps.Teardown.Nonce || curSeq != smsg.Sequence {
-			continue
+			return nil
 		}
 		if err := as.finishAdoptedTeardown(cur, idHash, curSeq, opts); err != nil {
 			if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
 				// Everything this record names stays referenced until a later pass.
 				s.Warnf("MQTT teardown adoption: unable to finish the abandoned teardown of session %q: %v", idHash, err)
-				continue
+				return nil
 			}
 			// TERMINAL, and a success for this sweep: a newer record holds the subject,
 			// so the teardown this pass quarantined was not abandoned after all —
@@ -611,10 +601,13 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 			// verdict. The warning arm would skip exactly that.
 			s.Debugf("MQTT teardown adoption: the teardown of session %q was superseded; nothing was left to finish", idHash)
 			q.forget(mqttQuarantineTeardownKey(idHash))
-			continue
+			return nil
 		}
 		s.Debugf("MQTT teardown adoption: finished the abandoned teardown of session %q", idHash)
 		q.forget(mqttQuarantineTeardownKey(idHash))
+		return nil
+	}); err != nil {
+		s.Debugf("MQTT teardown adoption sweep ended: %v", err)
 	}
 }
 
@@ -831,34 +824,24 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 		}
 	}
 
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
-	for seq := uint64(1); ; {
-		smsg, lerr := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if lerr != nil {
-			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-				return nil, nil, fmt.Errorf("session record walk failed before reaching the end: %w", lerr)
-			}
-			return refs, affineIndeterminate, nil
-		}
-		seq = smsg.Sequence + 1
-
+	werr := as.walkSessionRecords(func(smsg *StoredMsg) error {
 		idHash, perr := mqttSessIDHashFromSubject(smsg.Subject, as.domainTk)
 		if perr != nil {
-			return nil, nil, fmt.Errorf("%w: session record on %q cannot be attributed: %w",
+			return fmt.Errorf("%w: session record on %q cannot be attributed: %w",
 				errMQTTSessRecordUninterpretable, smsg.Subject, perr)
 		}
 		ps := &mqttPersistedSession{}
 		if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
-			return nil, nil, fmt.Errorf("%w: session record on %q at sequence %d is undecodable: %w",
+			return fmt.Errorf("%w: session record on %q at sequence %d is undecodable: %w",
 				errMQTTSessRecordUninterpretable, smsg.Subject, smsg.Sequence, uerr)
 		}
 		// The identity half is fatal; the affine half only disables the affine claim pass.
 		if getHash(ps.ID) != idHash {
-			return nil, nil, fmt.Errorf("%w: session record on %q names a client ID that does not hash back to it",
+			return fmt.Errorf("%w: session record on %q names a client ID that does not hash back to it",
 				errMQTTSessRecordUninterpretable, smsg.Subject)
 		}
 		if _, gerr := mqttSessGenFromRecord(ps.Gen); gerr != nil {
-			return nil, nil, fmt.Errorf("%w: session record on %q: %w",
+			return fmt.Errorf("%w: session record on %q: %w",
 				errMQTTSessRecordUninterpretable, smsg.Subject, gerr)
 		}
 		if averr := mqttValidateRecordAffinePair(ps, idHash); averr != nil {
@@ -868,13 +851,23 @@ func (as *mqttAccountSessionManager) buildSessionRefs() (refs *mqttSessRefs, aff
 				affineIndeterminate = fmt.Errorf("session record on %q: %w", smsg.Subject, averr)
 			}
 			refs.inbound[mqttSessRefKey(idHash, ps.Gen)] = struct{}{}
-			continue
+			return nil
 		}
 		refs.inbound[mqttSessRefKey(idHash, ps.Gen)] = struct{}{}
 		if ps.Q2AffGen != _EMPTY_ {
 			refs.affine[mqttSessRefKey(idHash, ps.Q2AffGen)] = struct{}{}
 		}
+		return nil
+	})
+	if werr != nil {
+		// A record the visitor refused is returned as it was refused; anything else is the
+		// walk failing before it reached the end.
+		if errors.Is(werr, errMQTTSessRecordUninterpretable) {
+			return nil, nil, werr
+		}
+		return nil, nil, fmt.Errorf("session record walk failed before reaching the end: %w", werr)
 	}
+	return refs, affineIndeterminate, nil
 }
 
 // mqttValidateRecordAffinePair checks a persisted record's affine generation and

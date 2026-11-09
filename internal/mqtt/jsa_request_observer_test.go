@@ -167,7 +167,19 @@ func testSubjectHasPrefix(p string) func(string) bool {
 // released, with the right answers: a hold that dropped replies instead of parking them would
 // stall a serial caller exactly as a hold should, and only completion distinguishes the two.
 func TestJSARequestObserverDepthControls(t *testing.T) {
+	// The account manager's startup sweeps run on this same view, and the session-record
+	// walk lists $MQTT_sess through STREAM.INFO: a sweep still running inside the window
+	// would be one more held stream lookup, counted against the serial control. So the
+	// window opens only after the startup pass has finished.
+	sweepsBefore := mqttOrphanSweepRuns.Load()
 	e := testNewInflightEnv(t, "client-observer-controls")
+	deadline := time.Now().Add(10 * time.Second)
+	for mqttOrphanSweepRuns.Load() <= sweepsBefore {
+		if time.Now().After(deadline) {
+			t.Fatal("the account manager never ran its startup orphan sweep")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	jsa := &e.asm.jsa
 	o := testObserveJSA(t, jsa)
 

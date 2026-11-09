@@ -162,27 +162,17 @@ type mqttSharedVerdictObservation struct {
 // live owner is safe — L1's CAS on the exact entry converges — and a live owner that keeps
 // saving its record for other reasons is no evidence that it executes its verdicts.
 func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
 	seen := make(map[string]mqttSharedVerdictObservation)
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT shared verdict sweep ended: %v", err)
-				return
-			}
-			break
-		}
-		seq = smsg.Sequence + 1
+	if err := as.walkSessionRecords(func(smsg *StoredMsg) error {
 		ps := &mqttPersistedSession{}
 		if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
 			// Unreadable: nothing here is acted on. The record-shape refusals belong to the
 			// readers that would mutate the record; this one only executes what a readable
 			// record says.
-			continue
+			return nil
 		}
 		if len(ps.AcqReleases) == 0 {
-			continue
+			return nil
 		}
 		rendered, _ := json.Marshal(ps.AcqReleases)
 		obs := mqttSharedVerdictObservation{verdicts: string(rendered)}
@@ -191,19 +181,25 @@ func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
 		prev, had := as.sharedVerdictSeen[smsg.Subject]
 		as.mu.Unlock()
 		if !had || prev != obs {
-			continue
+			return nil
 		}
 		// STABLY OBSERVED: the same verdicts on two consecutive passes.
 		// Execute them. The record is never written here; its owner clears a verdict on its
 		// own next save, and the release CAS converges with it.
 		if !mqttValidSessGen(ps.Gen) {
-			continue
+			return nil
 		}
 		for _, r := range ps.AcqReleases {
 			if _, rerr := as.jsa.executeSharedRelease(as.sessStreamEpoch, ps.ID, ps.Gen, r); rerr != nil {
 				s.Debugf("MQTT shared verdict sweep: executing the release of %q for %q: %v", r.Acq, ps.ID, rerr)
 			}
 		}
+		return nil
+	}); err != nil {
+		// Releases already executed stay executed. This pass's observation is not published:
+		// the next pass compares against the last pass that reached the end.
+		s.Debugf("MQTT shared verdict sweep ended: %v", err)
+		return
 	}
 	as.mu.Lock()
 	as.sharedVerdictSeen = seen
