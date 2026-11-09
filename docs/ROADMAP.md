@@ -954,6 +954,19 @@ logged. An alpha blocker: it surfaces as an ERROR every few hours.
   re-read, within one allowance per closing, charged per retry on a recovery visit. Done
   2026-11-09 ([issue #178](https://github.com/nberlee/mqtt-nats-broker/issues/178)).
 
+Added 2026-11-09 at the user's request: the retained per-CONNECT records grow without bound
+under a production prober that connects once a minute with a fresh clean session. An alpha
+blocker: it reverses the 2026-10-23 "not an alpha precondition" disposition.
+
+- [ ] Reclaim the permanent records every CONNECT and every discarded generation leaves: per
+  CONNECT the acceptance fact, the handoff outcome and the transition outcomes; per generation
+  the teardown receipt, the acquisition ledger and the generation-scoped `$MQTT_inflight`
+  classes `docs/CONFORMANCE.md` lists as permanent ("The storage this design keeps on
+  `$MQTT_inflight`"), not the records already deleted there. Nothing reclaims them within
+  the recovery epoch; the reclaimer must meet the four reopening conditions the audit
+  recorded, all classes together
+  ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
+
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription
