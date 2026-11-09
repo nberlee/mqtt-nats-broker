@@ -135,7 +135,7 @@ func TestSharedAdmissionRefusesAReleasedAcquisition(t *testing.T) {
 	if _, out, err := e.sess.acquireShared(e.c, group, "foo.bar", 1024); err != nil || out != mqttSharedAcquired {
 		t.Fatalf("acquiring a second holder: %v %v", out, err)
 	}
-	if done, err := e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq); err != nil || !done {
+	if done, err := e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq, nil); err != nil || !done {
 		t.Fatalf("releasing the acquisition: done=%v err=%v", done, err)
 	}
 	pi, ok := r.admit(t, dep)
@@ -262,7 +262,7 @@ func TestSharedAdmissionRetryReReadsReadiness(t *testing.T) {
 		if id != e.sess.id || atomic.AddInt32(&calls, 1) != 1 {
 			return
 		}
-		_, _ = e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq)
+		_, _ = e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq, nil)
 	}
 	mqttTestSharedReadinessHook.Store(&hook)
 	defer mqttTestSharedReadinessHook.Store(nil)

@@ -5942,6 +5942,26 @@ under the licence described in "One tenure and one closing driver
 stays its own record, so the exclusion of delayed writes to the ledger subject is
 preserved and is never replaced by a lookup of the closure.
 
+**A competing closer's seal or release is the closing's own**
+([issue #178](https://github.com/nberlee/mqtt-nats-broker/issues/178)). One discarded
+generation has several closers writing the same target states: the inline teardown, the
+recovery visit it kicks, the periodic pass, a peer's pass and the orphan sweep's adoption.
+A standing seal reads as already sealed and an unlisted acquisition as released, so the loser
+settles by the re-read that sees the winner. On a clustered stream that re-read cannot see
+the winner while its proposal is in process: JetStream answers the loser's CAS with 10164
+until the entry is applied, and the ledger still reads as it was. So a refusal for
+contention alone — the store's 10071 or 10164, or the write boundary's stale prior — spends
+no settlement attempt; it waits the authority-contention backoff and re-reads, within ONE
+allowance per closing (the JS API timeout, five seconds) shared by the seal and every release
+episode. The allowance is this broker's patience, not a bound on the store, since a timed-out
+request abandons its reply and not its write: once it is spent, contention counts again, the
+four counted attempts end the episode, and a closing that ends unsettled leaves the record
+marked for the adoption as before. Only the closing has the allowance; the verdict executors
+on a client's path keep their counted episodes. On the receipted clean close the gate is
+released before the shared closing, so no CONNECT waits on it; the expiry route and an
+adopted teardown hold the client's gate across it, so a CONNECT for that client ID can wait
+up to the allowance longer, and only while a competitor's write is in process.
+
 **CONNECT restore and resume run every destructive act from a VERDICT, never from a
 snapshot**, because two brokers may legitimately resume one generation. After the accept
 batch lands and the authority is finalized (the tenure is minted from the acceptance fact,
@@ -14463,6 +14483,14 @@ prior re-reads, the consumer delete and retirement loop) and at most four releas
 run per visit. The inline closing on the two teardown routes stays — it also serves a
 receiptless teardown, which has no root — and the two converge on the seal and release
 CASes.
+
+**Each recovery dispatch of the closing pays for its contention retries as it takes them**
+([issue #178](https://github.com/nberlee/mqtt-nats-broker/issues/178)). The up-front price
+covers the counted attempts; a retry the closing's contention allowance absorbs (above, "A
+competing closer's seal or release is the closing's own") is charged from the visit's budget
+at the same per-attempt price before it is taken — three units for a seal, five for a sealed
+release — and a stop or an exhausted budget ends the visit with the durable ledger left for
+the next one.
 
 **What 7d does not do.** A live generation's undecided consumer is **7f** (next section).
 A discarded generation's exchanges and duties are not reclaimed by its

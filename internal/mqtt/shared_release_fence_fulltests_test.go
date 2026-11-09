@@ -119,7 +119,7 @@ func testReleaseInBackground(r *testSharedAdmitRig) <-chan error {
 	e := r.e
 	out := make(chan error, 1)
 	go func() {
-		ok, err := e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq)
+		ok, err := e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq, nil)
 		if err == nil && !ok {
 			err = errors.New("the release did not settle")
 		}
@@ -423,7 +423,7 @@ func TestSharedReleaseWithheldUntilTheDependantEnds(t *testing.T) {
 	testSharedSourceAcksStubbed(f)
 	testSaveVerdict(t, sess, f.acq)
 
-	ok, err := sess.jsa.executeSharedRelease(sess.sharedEpoch(), sess.id, sess.gen, f.acq)
+	ok, err := sess.jsa.executeSharedRelease(sess.sharedEpoch(), sess.id, sess.gen, f.acq, nil)
 	if ok || !errors.Is(err, errMQTTSharedReleaseWithheld) {
 		t.Fatalf("a release with a Publish dependant: ok=%v err=%v, want withheld", ok, err)
 	}
@@ -470,7 +470,7 @@ func TestSharedReleaseIgnoresAnAbandonedDelivery(t *testing.T) {
 	if _, x := f.exchangeOf(t, f.pi); x == nil || x.Phase != mqttExchangeDeliveryAbandoned {
 		t.Fatalf("fixture: the exchange after the deny: %+v", x)
 	}
-	ok, err := sess.jsa.executeSharedRelease(sess.sharedEpoch(), sess.id, sess.gen, f.acq)
+	ok, err := sess.jsa.executeSharedRelease(sess.sharedEpoch(), sess.id, sess.gen, f.acq, nil)
 	if !ok || err != nil {
 		t.Fatalf("a release whose only dependant is abandoned: ok=%v err=%v", ok, err)
 	}
@@ -495,7 +495,7 @@ func TestSharedReleaseWithholdsOnAnUncertainInventory(t *testing.T) {
 	hook := func(subject string) bool { return subject == xsubj }
 	mqttTestSharedInventoryUnreadableHookV.Store(&hook)
 	defer mqttTestSharedInventoryUnreadableHookV.Store(nil)
-	done, err := e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq)
+	done, err := e.sess.jsa.executeSharedRelease(e.sess.sharedEpoch(), e.sess.id, e.sess.gen, r.acq, nil)
 	if done || err == nil || errors.Is(err, errMQTTSharedReleaseWithheld) || !strings.Contains(err.Error(), "uncertain") {
 		t.Fatalf("a release over an uncertain inventory: done=%v err=%v", done, err)
 	}

@@ -136,7 +136,7 @@ func (sess *mqttSession) executeDurableVerdicts(gen string) {
 		if h := mqttTestVerdictKickExecHookV.Load(); h != nil {
 			(*h)(gen, r.Acq)
 		}
-		if ok, _ := sess.jsa.executeSharedRelease(epoch, id, gen, r); ok {
+		if ok, _ := sess.jsa.executeSharedRelease(epoch, id, gen, r, nil); ok {
 			settled = append(settled, r.Acq)
 		}
 	}

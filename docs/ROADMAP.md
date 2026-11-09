@@ -949,11 +949,10 @@ converge. An alpha blocker: the embedded StatefulSet is a supported deployment.
 Added 2026-11-08 at the user's request: a supported-path defect a production deployment
 logged. An alpha blocker: it surfaces as an ERROR every few hours.
 
-- [ ] Settle the acquisition-ledger seal against its competitor: a clean close's inline
-  discard loses the seal to the recovery visit it kicked, runs out of four back-to-back
-  attempts while the store still refuses the in-process subject (10164), logs an ERROR and
-  leaves its teardown to the sweep, where `docs/ARCHITECTURE.md` says the closing re-reads
-  and seals ([issue #178](https://github.com/nberlee/mqtt-nats-broker/issues/178)).
+- [x] A closing's seal and release settle against a competing closer: a refusal for
+  contention alone (10071, 10164, a stale prior) spends no attempt and waits before its
+  re-read, within one allowance per closing, charged per retry on a recovery visit. Done
+  2026-11-09 ([issue #178](https://github.com/nberlee/mqtt-nats-broker/issues/178)).
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 

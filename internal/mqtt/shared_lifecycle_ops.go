@@ -201,7 +201,7 @@ func (sess *mqttSession) executeOwnVerdicts(c *client) {
 	}
 	var settled []string
 	for _, r := range pending {
-		ok, err := sess.jsa.executeSharedRelease(epoch, id, gen, r)
+		ok, err := sess.jsa.executeSharedRelease(epoch, id, gen, r, nil)
 		if err != nil && c != nil {
 			c.Debugf("MQTT: releasing shared acquisition %q of session %q: %v", r.Acq, id, err)
 		}
@@ -419,7 +419,10 @@ func (sess *mqttSession) abortSharedAcquisition(id, gen, epoch string, tenure mq
 // dependant still owing delivery from the source before L1 is composed; a SEALED ledger, or a
 // generation whose discarding closure stands, needs no fence. errMQTTSharedReleaseWithheld reports
 // a dependant: nothing is released and the verdict stands.
-func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAcqRef) (bool, error) {
+//
+// cw is the closing's contention allowance (shared_closing_contention.go): a refusal for contention
+// alone spends no attempt while it lasts. A verdict executor passes nil.
+func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAcqRef, cw *mqttSharedContention) (bool, error) {
 	var lastErr error
 	fenced := false
 	for attempt := 0; attempt < mqttSharedReleaseAttempts; attempt++ {
@@ -446,6 +449,12 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 				mqttTestSharedPause("release:before-close:" + acq.Acq)
 				if res := jsa.commitSharedLifecycleBatch(b); res.Outcome != mqttSharedWriteLanded {
 					lastErr = res.Err
+					switch cw.absorb(res, mqttSharedReleaseAttemptUnits) {
+					case mqttSharedContentionAbsorbed:
+						attempt--
+					case mqttSharedContentionStopped:
+						return false, lastErr
+					}
 					continue
 				}
 			}
@@ -490,7 +499,16 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 			}
 			return true, nil
 		case mqttSharedWriteRejected:
+			// Another executor's release of this entry, or any other write to the group or the
+			// ledger, committed first: the re-read decides. Contention spends no attempt while the
+			// closing's allowance lasts, so the re-read outlasts a competitor still in process.
 			lastErr = res.Err
+			switch cw.absorb(res, mqttSharedReleaseAttemptUnits) {
+			case mqttSharedContentionAbsorbed:
+				attempt--
+			case mqttSharedContentionStopped:
+				return false, lastErr
+			}
 			continue
 		default:
 			lastErr = res.Err
@@ -626,7 +644,11 @@ func (jsa *mqttJSA) installSharedTenure(id, epoch, gen string, tenure mqttShared
 
 // sealSharedLedger is T2, the closing's fence: authorized by the teardown claim the caller
 // holds, never by tenure. It returns the sealed ledger, whose acquisitions T3 releases.
-func (jsa *mqttJSA) sealSharedLedger(id, epoch, gen string) (*mqttSharedLedger, error) {
+//
+// A competing closer's seal is this closing's seal: the re-read finds it standing and returns
+// it. cw is the closing's contention allowance, which lets that re-read outlast a competitor
+// whose write is still in process (shared_closing_contention.go).
+func (jsa *mqttJSA) sealSharedLedger(id, epoch, gen string, cw *mqttSharedContention) (*mqttSharedLedger, error) {
 	var lastErr error
 	for attempt := 0; attempt < mqttSharedAcquireAttempts; attempt++ {
 		l := jsa.loadSharedLedger(id, epoch, gen)
@@ -646,9 +668,15 @@ func (jsa *mqttJSA) sealSharedLedger(id, epoch, gen string) (*mqttSharedLedger, 
 		if res.Outcome == mqttSharedWriteLanded {
 			return b.LedgerNext, nil
 		}
-		// Refused (a tenure installation or a join landed first — the re-read seals what it
-		// preserved) or ambiguous (the re-read decides).
+		// Refused (a competing closer's seal, a tenure installation or a join landed first — the
+		// re-read returns the seal or seals what it preserved) or ambiguous (the re-read decides).
 		lastErr = res.Err
+		switch cw.absorb(res, mqttSharedSealAttemptUnits) {
+		case mqttSharedContentionAbsorbed:
+			attempt--
+		case mqttSharedContentionStopped:
+			return nil, lastErr
+		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("sealing the shared ledger of generation %q did not settle within one episode", gen)
@@ -659,13 +687,13 @@ func (jsa *mqttJSA) sealSharedLedger(id, epoch, gen string) (*mqttSharedLedger, 
 // releaseSealedAcquisitions is T3: L1 and L2 for every acquisition the sealed ledger lists.
 // An entry that cannot be released (its group record unreadable) is SKIPPED and reported;
 // the gate below withholds on it. Repeat-safe: a repeat finds the released ones unlisted.
-func (jsa *mqttJSA) releaseSealedAcquisitions(id, epoch, gen string, sealed *mqttSharedLedger) error {
+func (jsa *mqttJSA) releaseSealedAcquisitions(id, epoch, gen string, sealed *mqttSharedLedger, cw *mqttSharedContention) error {
 	if sealed == nil {
 		return nil
 	}
 	var errs []error
 	for _, a := range sealed.Acqs {
-		if _, err := jsa.executeSharedRelease(epoch, id, gen, a); err != nil {
+		if _, err := jsa.executeSharedRelease(epoch, id, gen, a, cw); err != nil {
 			errs = append(errs, fmt.Errorf("acquisition %q: %w", a.Acq, err))
 		}
 	}
@@ -697,13 +725,17 @@ func (jsa *mqttJSA) sharedClosingComplete(id, epoch, gen string) error {
 // routes. It is called between recordGenRetirement and deleteTeardownTargets, naming the
 // RETIRING generation captured before any reset. An error withholds the record's release
 // with the record still marked, so the adoption repeats it.
+//
+// ONE contention allowance covers the seal and every release, so a closing with many
+// acquisitions is not patient once per entry.
 func (jsa *mqttJSA) closeSharedGeneration(id, epoch, gen string) error {
-	sealed, err := jsa.sealSharedLedger(id, epoch, gen)
+	cw := newMqttSharedContention(nil)
+	sealed, err := jsa.sealSharedLedger(id, epoch, gen, cw)
 	if err != nil {
 		return fmt.Errorf("sealing the shared acquisitions of generation %q: %w", gen, err)
 	}
 	mqttTestSharedPause("closing:after-seal")
-	if rerr := jsa.releaseSealedAcquisitions(id, epoch, gen, sealed); rerr != nil {
+	if rerr := jsa.releaseSealedAcquisitions(id, epoch, gen, sealed, cw); rerr != nil {
 		// Reported, and the gate decides: an entry that could not be released leaves the
 		// ledger non-empty and the gate withholds.
 		if gerr := jsa.sharedClosingComplete(id, epoch, gen); gerr != nil {

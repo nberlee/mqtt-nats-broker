@@ -190,7 +190,7 @@ func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
 			return nil
 		}
 		for _, r := range ps.AcqReleases {
-			if _, rerr := as.jsa.executeSharedRelease(as.sessStreamEpoch, ps.ID, ps.Gen, r); rerr != nil {
+			if _, rerr := as.jsa.executeSharedRelease(as.sessStreamEpoch, ps.ID, ps.Gen, r, nil); rerr != nil {
 				s.Debugf("MQTT shared verdict sweep: executing the release of %q for %q: %v", r.Acq, ps.ID, rerr)
 			}
 		}

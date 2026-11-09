@@ -245,7 +245,7 @@ func Test8bLateJoinIsReleasedFromTheSealedSet(t *testing.T) {
 				// its empty observation, and its seal preserved it. The next driver resumes from it.
 				mqttTestClosingFenceHookV.Store(nil)
 				testPlantSharedAcq(t, e, gen, "g8b-late")
-				if _, err := e.asm.jsa.sealSharedLedger(e.id, e.epoch, gen); err != nil {
+				if _, err := e.asm.jsa.sealSharedLedger(e.id, e.epoch, gen, nil); err != nil {
 					t.Fatalf("sealing as the crashed driver did: %v", err)
 				}
 				if _, sealed, n := test8bLedgerState(e, gen); !sealed || n != 1 {

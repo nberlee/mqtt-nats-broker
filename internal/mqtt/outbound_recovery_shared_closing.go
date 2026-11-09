@@ -39,12 +39,13 @@ import "sync/atomic"
 const (
 	// One closure read.
 	mqttSharedClosingClosureUnits = 1
-	// sealSharedLedger: per attempt, the ledger read, the commit's prior re-read and one batch.
-	mqttSharedClosingSealUnits = mqttSharedAcquireAttempts * 3
-	// One sealed release episode (executeSharedRelease): per attempt, the ledger and group reads,
-	// the commit's two prior re-reads and one batch; then, for a last holder, the consumer delete
-	// and retireSharedIncarnation's loop of group read, prior re-read and batch.
-	mqttSharedClosingReleaseUnits = mqttSharedReleaseAttempts*5 + 1 + mqttSharedReleaseAttempts*3
+	// sealSharedLedger's counted attempts. A contention retry the closing's allowance absorbs is
+	// charged as it is taken, at the same per-attempt price (shared_closing_contention.go).
+	mqttSharedClosingSealUnits = mqttSharedAcquireAttempts * mqttSharedSealAttemptUnits
+	// One sealed release episode (executeSharedRelease): its counted attempts, absorbed retries
+	// charged as taken; then, for a last holder, the consumer delete and
+	// retireSharedIncarnation's loop of group read, prior re-read and batch.
+	mqttSharedClosingReleaseUnits = mqttSharedReleaseAttempts*mqttSharedReleaseAttemptUnits + 1 + mqttSharedReleaseAttempts*3
 	// sharedClosingComplete: one ledger read.
 	mqttSharedClosingCheckUnits = 1
 	// mqttSharedClosingVisitEpisodes caps the release episodes one visit dispatches, so a large
@@ -86,7 +87,16 @@ func (as *mqttAccountSessionManager) stepSharedClosing(s *Server, root *mqttReco
 	if !b.spend(mqttSharedClosingSealUnits) {
 		return false
 	}
-	sealed, err := as.jsa.sealSharedLedger(root.ID, root.Epoch, root.Gen)
+	// One allowance for this visit's seal and releases. Each retry it absorbs is paid from the
+	// visit's budget before it is taken, and a stop ends it; either leaves the durable ledger for
+	// the next visit.
+	cw := newMqttSharedContention(func(units int) bool {
+		if stop != nil && stop() {
+			return false
+		}
+		return b.spend(units)
+	})
+	sealed, err := as.jsa.sealSharedLedger(root.ID, root.Epoch, root.Gen, cw)
 	if err != nil {
 		s.Debugf("MQTT recovery pass: sealing the shared acquisitions of %q/%q: %v", root.ID, root.Gen, err)
 		return false
@@ -98,7 +108,7 @@ func (as *mqttAccountSessionManager) stepSharedClosing(s *Server, root *mqttReco
 			return false
 		}
 		episodes++
-		if _, rerr := as.jsa.executeSharedRelease(root.Epoch, root.ID, root.Gen, a); rerr != nil {
+		if _, rerr := as.jsa.executeSharedRelease(root.Epoch, root.ID, root.Gen, a, cw); rerr != nil {
 			s.Debugf("MQTT recovery pass: releasing shared acquisition %q of %q/%q: %v", a.Acq, root.ID, root.Gen, rerr)
 		}
 	}

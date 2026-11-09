@@ -85,7 +85,9 @@ const (
 
 	// mqttSharedAcquireAttempts bounds one acquisition's settlement loop, the
 	// mqttCloseEpisodeAttempts pattern: exhausting it fails the filter and enters abort
-	// settlement, after which no attempt of that nonce is issued again.
+	// settlement, after which no attempt of that nonce is issued again. The closing's seal
+	// counts its attempts by it too, except a contention refusal its allowance absorbs
+	// (shared_closing_contention.go).
 	mqttSharedAcquireAttempts = 4
 )
 
@@ -921,6 +923,13 @@ var mqttTestSharedGroupLoadHookV atomic.Pointer[func(qkey string) (mqttSharedGro
 // stripped: a mutation at any earlier layer is refused by the boundary and proves nothing.
 var mqttTestSharedWireHookV atomic.Pointer[func(shape mqttSharedShape, msgs []mqttBatchMsg) []mqttBatchMsg]
 
+// mqttTestSharedSendHookV REPLACES the transport of one validated batch, returning (ack,
+// transport error, true), so a test can answer a write with the store's contention refusal
+// (10164) in its acknowledgement while the competing write it models is still unapplied. The
+// acknowledgement is validated and classified as the store's own. (_, _, false) lets the real
+// send run. Nil in production.
+var mqttTestSharedSendHookV atomic.Pointer[func(shape mqttSharedShape, acq string) (*JSPubAckResponse, error, bool)]
+
 // mqttTestSharedPauseHookV pauses a schedule at a named point.
 var mqttTestSharedPauseHookV atomic.Pointer[func(point string)]
 
@@ -995,9 +1004,24 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 
 	var resp *JSPubAckResponse
 	var err error
+	// The seam stands in for the TRANSPORT only: an injected acknowledgement is validated and
+	// classified exactly as the store's own.
+	var injAck *JSPubAckResponse
+	var injErr error
+	injected := false
+	if h := mqttTestSharedSendHookV.Load(); h != nil {
+		injAck, injErr, injected = (*h)(b.Shape, b.Acq.Acq)
+		if injected && injErr == nil && injAck == nil {
+			injErr = fmt.Errorf("the test send hook answered neither an acknowledgement nor an error")
+		}
+	}
 	if two {
 		var bi any
-		bi, err = jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
+		if injected {
+			bi, err = injAck, injErr
+		} else {
+			bi, err = jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
+		}
 		if err == nil {
 			resp = bi.(*JSPubAckResponse)
 			if aerr := resp.ToError(); aerr != nil {
@@ -1007,6 +1031,12 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 					Err: fmt.Errorf("the %s batch was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
 						b.Shape, resp.BatchSize, resp.BatchId, len(msgs), batchID)}
 			}
+		}
+	} else if injected {
+		// What storeMsg does with the reply it awaited.
+		resp, err = injAck, injErr
+		if err == nil {
+			err = resp.ToError()
 		}
 	} else {
 		resp, err = jsa.storeMsg(msgs[0].subj, msgs[0].hdr, msgs[0].msg)
@@ -1039,15 +1069,15 @@ func mqttSharedPriorMatches(status mqttOutboundLoadStatus, seq uint64, priorPres
 	switch status {
 	case mqttOutboundAbsent:
 		if priorPresent {
-			return fmt.Errorf("the %s this batch was composed against is no longer there", what)
+			return fmt.Errorf("the %s this batch was composed against is no longer there: %w", what, errMQTTSharedPriorStale)
 		}
 		return nil
 	case mqttOutboundValid:
 		if !priorPresent {
-			return fmt.Errorf("the %s this batch creates already exists at sequence %d", what, seq)
+			return fmt.Errorf("the %s this batch creates already exists at sequence %d: %w", what, seq, errMQTTSharedPriorStale)
 		}
 		if seq != priorSeq {
-			return fmt.Errorf("the %s moved from sequence %d to %d since this batch was composed", what, priorSeq, seq)
+			return fmt.Errorf("the %s moved from sequence %d to %d since this batch was composed: %w", what, priorSeq, seq, errMQTTSharedPriorStale)
 		}
 		return nil
 	default:
