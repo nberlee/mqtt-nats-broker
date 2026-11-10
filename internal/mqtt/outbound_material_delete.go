@@ -210,7 +210,7 @@ func (jsa *mqttJSA) checkPurgeConfirmed(a *mqttTransitionAttempt, cur, next *mqt
 	idHash := getHash(a.ID)
 	for ord := cur.Purged + 1; ord <= next.Purged; ord++ {
 		subject := mqttChunkSubject(idHash, cur.Gen, cur.Payload, ord)
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if lerr != nil {
 			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
 				return fmt.Errorf("transition %q confirms chunk %d of payload %q removed, and "+
@@ -404,7 +404,7 @@ func (as *mqttAccountSessionManager) deleteChunkInterval(id string, m *mqttRetai
 	idHash := getHash(id)
 	for ord := from; ord <= to; ord++ {
 		subject := mqttChunkSubject(idHash, m.Gen, m.Payload, ord)
-		smsg, lerr := as.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, lerr := as.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if lerr != nil {
 			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
 				return fmt.Errorf("purging chunk %d of payload %q: %w", ord, m.Payload, lerr)
@@ -426,7 +426,7 @@ func (as *mqttAccountSessionManager) deleteChunkInterval(id string, m *mqttRetai
 			// interval was re-deleting to establish.
 			continue
 		}
-		if derr := as.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); derr != nil {
+		if derr := as.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); derr != nil {
 			return fmt.Errorf("purging chunk %d of payload %q: %w", ord, m.Payload, derr)
 		}
 	}
@@ -453,5 +453,5 @@ func (as *mqttAccountSessionManager) finishMaterialRemoval(id string, m *mqttRet
 			"read at: a cleanup that deletes whatever occupies the address can destroy a "+
 			"later materialization's record", m.Payload)
 	}
-	return as.jsa.deleteMsg(mqttInflightStreamName, mSeq, true)
+	return as.jsa.deleteMsg(mqttSessStreamName, mSeq, true)
 }

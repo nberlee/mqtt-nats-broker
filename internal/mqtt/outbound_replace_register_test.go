@@ -94,7 +94,7 @@ func (r *testReplEnv) holdOccupantAtPublish(t *testing.T) {
 // markerSeq returns the occupant's standing unsent-marker sequence, or 0 when it is absent.
 func (r *testReplEnv) markerSeq(t *testing.T) uint64 {
 	t.Helper()
-	smsg, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, r.regSubj+"."+mqttInflightMarkerSuffix)
+	smsg, err := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, r.regSubj+"."+mqttInflightMarkerSuffix)
 	if err != nil {
 		return 0
 	}
@@ -364,7 +364,7 @@ func TestReplacementRequiresARealObligation(t *testing.T) {
 		r.deleteMarker(t)
 		// Delete the obligation, leaving a readable register naming a lineage nothing backs.
 		xseq := r.exchangeSeq(t, r.occLin)
-		if err := r.asm.jsa.deleteMsg(mqttInflightStreamName, xseq, true); err != nil {
+		if err := r.asm.jsa.deleteMsg(mqttSessStreamName, xseq, true); err != nil {
 			t.Fatalf("deleting the predecessor obligation failed: %v", err)
 		}
 		if err := r.submit(t, "txn-orphanreg", r.replacingRegister(t, r.occLin, r.occ.QoS)); err == nil {
@@ -527,7 +527,7 @@ func (r *testReplEnv) occExchange(t *testing.T) *mqttOutboundExchange {
 // exchangeSeq is the sequence an exchange currently stands at, which an advance must CAS.
 func (r *testReplEnv) exchangeSeq(t *testing.T, nonce string) uint64 {
 	t.Helper()
-	smsg, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	smsg, err := r.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(r.id), testGen, nonce))
 	if err != nil {
 		t.Fatalf("the exchange %q does not load back: %v", nonce, err)

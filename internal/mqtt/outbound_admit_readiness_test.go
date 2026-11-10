@@ -170,15 +170,15 @@ func testRewriteReadinessResource(t *testing.T, f *testReadinessFixture, change 
 	}
 }
 
-// testDeleteReadinessSubject deletes a subject's last record from the inflight stream.
+// testDeleteReadinessSubject deletes a subject's last record from the in-flight space.
 func testDeleteReadinessSubject(t *testing.T, f *testReadinessFixture, subj string) {
 	t.Helper()
 	jsa := &f.e.asm.jsa
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		t.Fatalf("fixture: reading what to delete: %v", err)
 	}
-	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+	if err := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("fixture: deleting: %v", err)
 	}
 }

@@ -25,7 +25,7 @@ import (
 // legal-looking batch that the DECODER refused on read (an empty list marshalled as JSON null),
 // so a boundary test that only checked the write's own return value would have missed them too.
 //
-// It drives commitSharedLifecycleBatch directly against a real $MQTT_shared stream, because
+// It drives commitSharedLifecycleBatch directly against the real session stream's $MQTT.shared. space, because
 // the boundary compares the composer's priors with the STORE. Legal batches are built by the
 // composers (the realistic path); refusal rows hand-build the illegal member, which is the only
 // way to reach a rule the composer would never violate.

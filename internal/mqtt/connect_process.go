@@ -1635,7 +1635,7 @@ restoreSession:
 	// batch displaced the predecessor record; the later finalization closed the predecessor
 	// generation with Discard, sealed its inventory ledger and enrolled its affine target for
 	// recovery; its source and PUBREL consumers were enrolled when they were provisioned. Its
-	// SHARED acquisition ledger, on $MQTT_shared, is in neither batch: the recovery executor seals
+	// SHARED acquisition ledger, in the $MQTT.shared. space, is in neither batch: the recovery executor seals
 	// and releases it under the same closure and certifies only once it reads sealed and empty
 	// (issue #107 7e). The classification transfers the rest to the recovery executor (issue #107 7d)
 	// and what remains here is the generation's inbound QoS 2 holds and ordinary registers,
@@ -1672,8 +1672,8 @@ restoreSession:
 	//
 	// EVERY ACCEPTANCE then projects that tenure onto the generation's acquisition ledger BEFORE
 	// it serves or reconciles anything (the plan's 3.7): the record CAS that landed decides the
-	// SESSION, and the installation carries that decision onto $MQTT_shared, where no $MQTT_sess
-	// write reaches. A fresh generation installs too — the installation over absence is the ONLY
+	// SESSION, and the installation carries that decision onto the ledger, which no
+	// session-record write touches. A fresh generation installs too — the installation over absence is the ONLY
 	// creator of a ledger, so a delayed acceptance whose successor already installed learns here
 	// that it was superseded, and no join can create a ledger behind an acceptance that never
 	// installed. Then the verdicts the record carries are executed, an acquisition the record

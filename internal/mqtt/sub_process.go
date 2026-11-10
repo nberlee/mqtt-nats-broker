@@ -1008,7 +1008,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 
 		// For a shared subscription persist the membership — the acquisition references
-		// J1 reserved on $MQTT_shared — BEFORE creating the group consumer, so a restore
+		// J1 reserved in the $MQTT.shared. space — BEFORE creating the group consumer, so a restore
 		// after a crash here finds what to repair and a rollback finds what to release.
 		// Snapshot the prior state so a later failure of this filter restores it rather
 		// than leaving a phantom member. Spec5 [4.8.2].
@@ -1025,8 +1025,8 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			// references — a re-SUBSCRIBE changes the QoS or the options, never the
 			// incarnation it holds — so the ledger and the group count do not move. A key
 			// without one ACQUIRES: J0 admits the whole filter against the charge ceiling,
-			// then J1 reserves one acquisition per consumer the filter needs on
-			// $MQTT_shared under this CONNECT's tenure, BEFORE the membership save below
+			// then J1 reserves one acquisition per consumer the filter needs in
+			// the $MQTT.shared. space under this CONNECT's tenure, BEFORE the membership save below
 			// (J2) commits them to the record. The record must carry the acquisition
 			// references before anything is materialized, so a restore after a crash finds
 			// what to repair and a rollback finds what to release.

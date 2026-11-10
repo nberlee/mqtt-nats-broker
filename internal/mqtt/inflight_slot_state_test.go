@@ -791,7 +791,7 @@ func TestQuarantineRefusesEverySidOfAWildcardFilter(t *testing.T) {
 // always one call site further out.
 //
 // So the rule is a property of the DECODER, and this guard is what makes it a property
-// rather than a convention: exactly one production function may turn `$MQTT_inflight` bytes
+// rather than a convention: exactly one production function may turn `$MQTT.inflight.` bytes
 // into a record, and it validates. Any new reader inherits the refusal by construction.
 //
 // The pattern matched is an `mqttInflightRecord` handed to a DECODE call — `Unmarshal` or a

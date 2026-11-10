@@ -33,18 +33,14 @@ func TestValidateSessStream(t *testing.T) {
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
 			Name: mqttSessStreamName,
-			// FOUR subject spaces: the session records, the permanent CONNECT
+			// SIX subject spaces: the session records, the permanent CONNECT
 			// acceptance facts an accepted CONNECT commits atomically with its
 			// record, issue #107's permanent handoff outcomes, which the same batch
 			// carries because a handoff's metadata half must be decidable from a
-			// record that exists rather than from the record's absence, and the
-			// per-generation teardown receipts.
-			Subjects: []string{
-				mqttSessStreamSubjectPrefix + ">",
-				mqttAcceptSubjectPrefix + ">",
-				mqttHandoffSubjectPrefix + ">",
-				mqttTeardownReceiptSubjectPrefix + ">",
-			},
+			// record that exists rather than from the record's absence, the
+			// per-generation teardown receipts, the in-flight and outbound records,
+			// and the shared-group lifecycle records.
+			Subjects:           testSessStreamSubjects(),
 			Storage:            FileStorage,
 			Retention:          LimitsPolicy,
 			Discard:            DiscardOld,
@@ -231,7 +227,7 @@ func TestValidateWillQStream(t *testing.T) {
 	}
 }
 
-// validateMsgsStream's list differs from every register stream's, because this
+// validateMsgsStream's list differs from every register store's, because this
 // owner stores deliverable messages under interest retention and creates
 // consumers. The acceptance rows pin the deliberate asymmetries — most
 // importantly ConsumerLimits.InactiveThreshold, which is fatal on $MQTT_out
@@ -564,8 +560,6 @@ var mqttTestBrokerStreamNames = []string{
 	mqttStreamName,
 	mqttQoS2IncomingMsgsStreamName,
 	mqttQoS2AssignStreamName,
-	mqttInflightStreamName,
-	mqttSharedLifecycleStreamName,
 	mqttOutStreamName,
 	mqttRetainedMsgsStreamName,
 }
@@ -576,10 +570,10 @@ var mqttTestBrokerStreamNames = []string{
 // The order is the whole point, and getting it wrong is a live trap: the table
 // is built before any epoch exists, $MQTT_sess MINTS one into its own create
 // config, the loop adopts THAT value in $MQTT_sess's post step, and only then do
-// the other nine entries' preCreate hooks stamp it. Presetting an unrelated
+// the other seven entries' preCreate hooks stamp it. Presetting an unrelated
 // epoch on the manager and then running every preCreate — which an earlier
 // version of this helper did — leaves $MQTT_sess carrying one value and the
-// other nine carrying another, so every caller sees a bundle that disagrees
+// other seven carrying another, so every caller sees a bundle that disagrees
 // with itself even against correct code.
 //
 // So: build, run entry 0's post over its own config to adopt, then run the
@@ -605,7 +599,7 @@ func testBrokerStreamSpecsAt(replicas int) []brokerStreamSpec {
 }
 
 // TestBrokerStreamsEnforceARequestedSingleReplica: a required count of 1 is enforced on every
-// one of the ten streams like any other count. There is no count that skips the comparison
+// one of the eight streams like any other count. There is no count that skips the comparison
 // (issue #171), so a stream created at another count is refused at 1 as it is at 3.
 func TestBrokerStreamsEnforceARequestedSingleReplica(t *testing.T) {
 	t.Parallel()
@@ -658,7 +652,7 @@ func TestStartupRefusesABundleAtAnotherReplicaCount(t *testing.T) {
 
 // With provisioning table-driven, bypassing ensureBrokerStream requires
 // deleting a stream's entry — which this test refuses: the table must name
-// exactly the ten $MQTT_* streams, each with a non-nil validator and a config
+// exactly the eight $MQTT_* streams, each with a non-nil validator and a config
 // the validator itself accepts.
 func TestBrokerStreamSpecTable(t *testing.T) {
 	t.Parallel()
@@ -701,7 +695,7 @@ func TestBrokerStreamSpecTable(t *testing.T) {
 	}
 	for _, spec := range specs {
 		if got := spec.cfg.Metadata[mqttSessEpochMetaKey]; got != epoch {
-			t.Fatalf("entry %q would be created carrying %q, want the minted %q: the ten "+
+			t.Fatalf("entry %q would be created carrying %q, want the minted %q: the eight "+
 				"streams are one recreation unit and every one of them is stamped", spec.name, got, epoch)
 		}
 	}
@@ -839,7 +833,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		"AllowMsgSchedules":  {kind: dispWaived, reason: "the owner never emits schedule headers; independently enableable under DiscardOld, so this is a waiver, not domination — note a DEPLOYED schedules-enabled stream necessarily carries AllowRollup (forced at creation, checkStreamCfgLocked in server/stream.go), which the shared shape rejects on readback"},
 		"Duplicates":         {kind: dispWaived, reason: "this owner sets no Nats-Msg-Id, so a deduplication window is inert"},
 		// REJECTED for every validator, not waived: the account's recovery epoch
-		// lives in this map, and it is what makes the ten broker-owned streams one
+		// lives in this map, and it is what makes the eight broker-owned streams one
 		// recreation unit (issue #70). This row is also the mechanical guard that no
 		// validator FORGOT the stamp check — the mutator writes a malformed epoch, so
 		// a validator missing validateBundleEpochStamp fails the bijection here rather
@@ -888,7 +882,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 	case mqttSessStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges the session stream; records leave one at a time through exact-sequence deletes"}
+		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges the session stream: session records and in-flight registers leave one at a time through exact-sequence deletes (the in-flight reap since issue #38), and the shared-group records are never removed"}
 		// This owner DOES create a consumer now: every broker runs its own ephemeral
 		// session-record watch over this stream (sess_record_watch.go), so the
 		// register-commons waiver no longer describes it.
@@ -899,8 +893,10 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		// Metadata, validated by the composed callback on the same snapshot.
 		// The commons waiver said "the owner never emits batch headers". This owner
 		// now does: an accepted CONNECT commits its record and its permanent
-		// acceptance fact in ONE atomic batch, so the capability is a prerequisite of
-		// an operation rather than an inert setting.
+		// acceptance fact in ONE atomic batch, a PUBLISH-phase register commits with
+		// its unsent marker, every outbound authority transition is a batch, and a
+		// shared-group join commits the group record with the ledger — so the
+		// capability is a prerequisite of operations rather than an inert setting.
 		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
 	case mqttWillQStreamName:
 		register()
@@ -923,24 +919,6 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject; the claim reap deletes exact sequences"}
-	case mqttSharedLifecycleStreamName:
-		register()
-		// The join commits the group record and the acquisition ledger as one atomic batch,
-		// so the capability is a prerequisite, not the commons' inert setting.
-		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
-		// REQUIRED here, unlike every other register stream that either forbids or waives it:
-		// these records are never deleted, and denying delete is also what keeps this stream
-		// immune to the upstream MaxMsgsPer revival defect (docs/known-upstream-issues.md).
-		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject; a group record is CAS-rewritten and a ledger is sealed, and neither is ever deleted or purged"}
-	case mqttInflightStreamName:
-		register()
-		// Overrides the commons waiver: since issue #76 this owner DOES emit batch headers —
-		// the PUBLISH-phase register and its unsent marker are one atomic batch — so the
-		// capability is a prerequisite, exactly as it is for $MQTT_sess's accept batch.
-		d["AllowAtomicPublish"] = fieldDisposition{kind: dispRejected, errWant: "allow_atomic"}
-		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing here purges by subject SINCE issue #38: the teardown's per-incarnation filter purge was replaced by reapIncarnationRegisters, which enumerates, loads, classifies and deletes at exact sequences, so the DenyDelete rejection above is the whole of this owner's need. Same shape as $MQTT_qos2assign's waiver directly above"}
 	case mqttStreamName:
 		interest()
 		d["AllowMsgTTL"] = fieldDisposition{kind: dispRejected, errWant: "allow_msg_ttl"}

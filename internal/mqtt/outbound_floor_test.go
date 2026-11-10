@@ -91,12 +91,12 @@ func testDropEndedSlot(t *testing.T, jsa *mqttJSA, id, epoch, gen, nonce string)
 	if lerr != nil || cur == nil || smsg == nil || cur.State != mqttInflightPublishTerminal || cur.Lin != nonce {
 		t.Fatalf("the register of ended exchange %q is not its publish_terminal slot: %+v (%v)", nonce, cur, lerr)
 	}
-	if mmsg, merr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttInflightMarkerSubject(getHash(id), gen, x.PI)); merr == nil && mmsg != nil {
-		if err := jsa.deleteMsg(mqttInflightStreamName, mmsg.Sequence, true); err != nil {
+	if mmsg, merr := jsa.loadLastMsgFor(mqttSessStreamName, mqttInflightMarkerSubject(getHash(id), gen, x.PI)); merr == nil && mmsg != nil {
+		if err := jsa.deleteMsg(mqttSessStreamName, mmsg.Sequence, true); err != nil {
 			t.Fatalf("deleting %q's unsent marker: %v", nonce, err)
 		}
 	}
-	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+	if err := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("the terminal cleanup of %q's register: %v", nonce, err)
 	}
 }
@@ -430,8 +430,8 @@ func TestARegisterNamingTheLineagePinsItAndATokenRefusesTheEnding(t *testing.T) 
 	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testGen, d); cls != mqttFloorRelocate {
 		t.Fatalf("an ended obligation whose register still names it classifies %d (%v), want relocate", cls, err)
 	}
-	smsg, _ := jsa.loadLastMsgFor(mqttInflightStreamName, regSubj)
-	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+	smsg, _ := jsa.loadLastMsgFor(mqttSessStreamName, regSubj)
+	if err := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("deleting the register: %v", err)
 	}
 	if cls, err := jsa.classifyFloorPosition(e.id, e.epoch, testGen, d); cls != mqttFloorReclaim {
@@ -494,7 +494,7 @@ func TestTraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
 			led, _ := testFloorLedger(t, e)
 			testAdvanceTo(t, e, led.Hi)
 		}
-		return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		return e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 	}
 	e.asm.mu.Unlock()
 	census, err := mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testGen, nil)
@@ -512,22 +512,22 @@ func TestTraversalRestartsOnlyWhenTheFloorCrossesIt(t *testing.T) {
 	// A GENUINE HOLE inside the floor, with only an unrelated ledger write moving its sequence
 	// meanwhile (the floor unchanged): one pass, the hole uncertain.
 	ord, _, _ := jsa.findDutyInInventory(e.id, e.epoch, testGen, func(d *mqttDutyEntry) bool { return d.Ref == keep })
-	smsg, _ := jsa.loadLastMsgFor(mqttInflightStreamName, mqttDutySubject(getHash(e.id), testGen, ord))
-	if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+	smsg, _ := jsa.loadLastMsgFor(mqttSessStreamName, mqttDutySubject(getHash(e.id), testGen, ord))
+	if err := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("making the hole: %v", err)
 	}
 	reads.Store(0)
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 		if reads.Add(1) == 1 {
-			smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttGenLedgerSubject(getHash(e.id), testGen))
+			smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttGenLedgerSubject(getHash(e.id), testGen))
 			if lerr != nil {
 				t.Errorf("re-reading the ledger: %v", lerr)
 			} else if _, serr := jsa.storeMsg(mqttGenLedgerSubject(getHash(e.id), testGen), -1, smsg.Data); serr != nil {
 				t.Errorf("rewriting the ledger: %v", serr)
 			}
 		}
-		return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		return e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 	}
 	e.asm.mu.Unlock()
 	census, err = mqttTraverseGenerationInventory(jsa, e.asm, e.id, e.epoch, testGen, nil)

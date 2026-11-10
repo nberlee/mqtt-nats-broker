@@ -1352,7 +1352,7 @@ func (sess *mqttSession) sharedPendingDurablesLocked() []string {
 }
 
 // collectSharedPendingPurge drops the pending state in memory and reports what the
-// register stream still owes for it: the registers to delete and the cancellations to
+// register subjects still owe for it: the registers to delete and the cancellations to
 // tombstone. It is the derivation both purge forms share, and the rule it encodes is
 // the load-bearing part — see purgeSharedPending.
 //

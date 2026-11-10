@@ -602,7 +602,7 @@ func (sess *mqttSession) installAbandonedRetainedPubRel(c *client, pi uint16, ac
 }
 
 // emitRetainedPubRel transmits a retained exchange's PUBREL DIRECTLY, after its PUBREC advance
-// created the canonical record on $MQTT_inflight (issue #107 7c): there is no $MQTT_out delivery to
+// created the canonical record in the $MQTT.inflight. space (issue #107 7c): there is no $MQTT_out delivery to
 // carry it, so this is the delivery callback's acquire, bind, enter and write, from the register.
 // An emission that could not complete is OWNED by the continuation worker while this connection
 // lives; an ended entitlement writes nothing, and the successor's resume replays the PUBREL from
@@ -720,7 +720,7 @@ func (sess *mqttSession) disposeRetainedRel(cur *mqttInflightRecord) bool {
 	if cur == nil || cur.RelSubj == _EMPTY_ || sess.asm == nil {
 		return cur != nil && cur.RelSubj == _EMPTY_ && cur.QoS == 1
 	}
-	smsg, err := sess.jsa.loadLastMsgFor(mqttInflightStreamName, cur.RelSubj)
+	smsg, err := sess.jsa.loadLastMsgFor(mqttSessStreamName, cur.RelSubj)
 	if err != nil {
 		// The store's positive "no message", seen through the loader's wrapping.
 		ae := jsAPIError(err)
@@ -734,7 +734,7 @@ func (sess *mqttSession) disposeRetainedRel(cur *mqttInflightRecord) bool {
 	if derr != nil || rel.Identity != cur.RelID || rel.PI != cur.PI {
 		return false
 	}
-	return sess.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true) == nil
+	return sess.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true) == nil
 }
 
 // genOfRel is the generation token a retained canonical subject names.

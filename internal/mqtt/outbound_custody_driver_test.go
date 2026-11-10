@@ -1065,7 +1065,7 @@ func TestDispatcherCostBound(t *testing.T) {
 					o.probes.Add(1)
 					return nil, errors.New("test: the marker read did not resolve")
 				}
-				return e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+				return e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 			}
 			e.asm.mu.Unlock()
 			if e.sess.admitInflightPublish(e.c, o.pi, 1, o.dur, o.sseq, o.nonce, _EMPTY_, _EMPTY_, nil) {
@@ -1511,7 +1511,7 @@ func testOwedWithdrawalLandedUnresolved(t *testing.T, clientID string, deleteReg
 		t.Fatalf("fixture: the cancellation tombstone of this allocation and lineage must stand, got %+v", tomb)
 	}
 	if deleteRegister {
-		if err := f.e.asm.jsa.deleteMsg(mqttInflightStreamName, tombSeq, true); err != nil {
+		if err := f.e.asm.jsa.deleteMsg(mqttSessStreamName, tombSeq, true); err != nil {
 			t.Fatalf("fixture: deleting the tombstone: %v", err)
 		}
 	}

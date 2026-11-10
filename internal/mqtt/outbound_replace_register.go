@@ -1017,7 +1017,7 @@ func mqttBatchExchangeDispositions(a *mqttTransitionAttempt,
 // indeterminate read is NEVER an absence, and a body this broker cannot decode is present and
 // unattributed rather than missing.
 func (jsa *mqttJSA) loadOccupantMarkerLoad(regSubj string) mqttMarkerLoad {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, regSubj+"."+mqttInflightMarkerSuffix)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, regSubj+"."+mqttInflightMarkerSuffix)
 	switch {
 	case err != nil && isErrorOtherThan(err, JSNoMessageFoundErr):
 		return mqttMarkerLoad{kind: mqttInflightResponseIndeterminate}

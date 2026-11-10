@@ -38,7 +38,7 @@ import "fmt"
 //
 // An ordinary QoS 2 exchange stores its canonical PUBREL as a consumer and a sequence on
 // `$MQTT_out`. A retained one has no such consumer, so its canonical record lives at a unique
-// exchange-specific subject on `$MQTT_inflight` — a different KIND of reference, not a different
+// exchange-specific subject in the `$MQTT.inflight.` space — a different KIND of reference, not a different
 // value of the same kind. Recovery reads the exchange's canonical reference DIRECTLY; it never
 // creates an exchange from an ownerless PUBREL and never consults the current retained slot,
 // because the slot may long since have been rewritten.
@@ -136,7 +136,7 @@ const (
 	// mqttCanonicalConsumer: an ordinary exchange's release, on $MQTT_out at a sequence.
 	mqttCanonicalConsumer mqttCanonicalKind = "consumer"
 	// mqttCanonicalInflight: a retained exchange's release, at a unique exchange-specific
-	// subject on $MQTT_inflight. A DIFFERENT KIND of reference, not a different value.
+	// subject in the $MQTT.inflight. space. A DIFFERENT KIND of reference, not a different value.
 	mqttCanonicalInflight mqttCanonicalKind = "inflight"
 )
 

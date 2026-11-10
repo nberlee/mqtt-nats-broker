@@ -36,7 +36,7 @@ func testContinuityUnended(t *testing.T, e *testInflightEnv, gen, dur string, se
 	var lins []string
 	n := 0
 	for s := uint64(1); ; {
-		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, s)
+		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, s)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
 				t.Fatalf("walk registers: %v", err)

@@ -42,8 +42,9 @@ import (
 // consumer after the read.
 //
 // The boundary checks the half the resource record carries: the deciding tenure is not the one
-// that provisioned it (ProvTenure). The naming half is checked here, under a record transaction,
-// because the session record is on another stream and no batch can carry it.
+// that provisioned it (ProvTenure). The naming half is checked here, under a record transaction:
+// the session record is not a member of the boundary's batch. It shares the stream since the
+// 2026-11-09 merge, so one batch could carry it, but this protocol keeps the check here.
 
 // mqttTenureSettleBackoffMax caps the retry cadence of an incomplete visit.
 const mqttTenureSettleBackoffMax = 30 * time.Second
@@ -135,7 +136,7 @@ func (sess *mqttSession) tenureStillServes(ent mqttOutboundEntitlement) bool {
 func (sess *mqttSession) settleTenureVisit(ent mqttOutboundEntitlement, classified map[string]struct{}) bool {
 	jsa := sess.jsa
 	id, epoch := sess.id, sess.asm.sessStreamEpoch
-	subjects, err := jsa.streamSubjectsAllPages(mqttInflightStreamName, mqttResourceWalkFilter(getHash(id), ent.Gen))
+	subjects, err := jsa.streamSubjectsAllPages(mqttSessStreamName, mqttResourceWalkFilter(getHash(id), ent.Gen))
 	if err != nil {
 		if jsa.c != nil {
 			jsa.c.Debugf("MQTT: settling generation %q of %q: listing its resources: %v", ent.Gen, id, err)

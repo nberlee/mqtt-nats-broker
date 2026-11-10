@@ -110,7 +110,7 @@ func (te *testTerminalEnv) failDeletes() {
 			te.deleteFailed.Add(1)
 			return errors.New("test: the register delete could not be confirmed")
 		}
-		return te.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return te.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	te.asm.mu.Unlock()
 }
@@ -913,7 +913,7 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAPreservedRewrite(t *testing.T) {
 							t.Errorf("installing the interleaved rewrite: %v", werr)
 						}
 					}
-					return te.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+					return te.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 				}
 				te.asm.mu.Unlock()
 			}
@@ -955,7 +955,7 @@ func TestMQTTRecoverPublishTerminalSlotRefusesAnUnreadableConfirmation(t *testin
 	var gone atomic.Bool
 	te.asm.mu.Lock()
 	te.asm.testInflightDelete = func(seq uint64) error {
-		derr := te.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		derr := te.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 		gone.Store(true)
 		return derr
 	}
@@ -1341,7 +1341,7 @@ func TestMQTTAbsentRegisterResolvesTheAcknowledgementCell(t *testing.T) {
 			t.Errorf("reading the register to remove: %v", lerr)
 			return send()
 		}
-		if derr := te.asm.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); derr != nil {
+		if derr := te.asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); derr != nil {
 			t.Errorf("removing the register: %v", derr)
 		}
 		return send()

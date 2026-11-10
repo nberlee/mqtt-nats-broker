@@ -97,7 +97,7 @@ func (jsa *mqttJSA) verifyMaterial(m *mqttRetainedManifest) ([]byte, error) {
 	buf := make([]byte, 0, m.Bytes)
 	for ord := uint64(1); ord <= m.Chunks; ord++ {
 		subject := mqttChunkSubject(idHash, m.Gen, m.Payload, ord)
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if lerr != nil {
 			// A CHUNK THAT CANNOT BE READ IS A CHUNK THAT IS NOT THERE, whether the store said
 			// so or could not say. Neither licenses a replay of what is left — but the two are

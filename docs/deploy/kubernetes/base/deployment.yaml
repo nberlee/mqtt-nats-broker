@@ -9,10 +9,10 @@ metadata:
 spec:
   # Stateless: scale freely. On the FIRST start against an account whose
   # broker-owned $MQTT_* streams do not exist yet, replicas provision them
-  # concurrently. The ten streams are one recreation unit: a replica that sees a
+  # concurrently. The eight streams are one recreation unit: a replica that sees a
   # partial set rescans for up to 30 s while a peer finishes, and refuses to
   # start only if the set stays partial; the Deployment's restart then converges
-  # it. See docs/ARCHITECTURE.md, "The ten streams are one recreation unit".
+  # it. See docs/ARCHITECTURE.md, "The eight streams are one recreation unit".
   replicas: 3
   selector:
     matchLabels:

@@ -59,7 +59,7 @@ func (p *mqttPrefetchedReads) take(stream, subject string) (*JSApiMsgGetResponse
 // mqttBoundaryPrefetchSet is the subjects a transition's comparisons will read before any other
 // read decides them: every member carried at a nonzero expectation (the comparison re-reads what
 // the member overwrites) and the exchange each action member is acquired for. Deduplicated, in
-// member order, $MQTT_inflight subjects only.
+// member order, $MQTT.inflight. subjects only.
 func mqttBoundaryPrefetchSet(id string, extra []mqttTransitionMember) []string {
 	var set []string
 	seen := map[string]bool{}
@@ -85,7 +85,7 @@ func mqttBoundaryPrefetchSet(id string, extra []mqttTransitionMember) []string {
 	return set
 }
 
-// mqttIsInflightStreamSubject reports whether subject is one of $MQTT_inflight's: an issue #107 record,
+// mqttIsInflightStreamSubject reports whether subject is in the $MQTT.inflight. space: an issue #107 record,
 // a register or an unsent marker.
 func mqttIsInflightStreamSubject(subject string) bool {
 	if mqttIsOutboundRecordSubject(subject) {
@@ -108,11 +108,11 @@ func (jsa *mqttJSA) withBoundaryPrefetch(id string, extra []mqttTransitionMember
 	if len(set) < 2 {
 		return jsa
 	}
-	resps, _ := jsa.loadLastMsgForMulti(mqttInflightStreamName, set)
+	resps, _ := jsa.loadLastMsgForMulti(mqttSessStreamName, set)
 	p := &mqttPrefetchedReads{resp: make(map[string]*JSApiMsgGetResponse, len(set))}
 	for i, r := range resps {
 		if i < len(set) && r != nil {
-			p.resp[mqttPrefetchKey(mqttInflightStreamName, set[i])] = r
+			p.resp[mqttPrefetchKey(mqttSessStreamName, set[i])] = r
 		}
 	}
 	if len(p.resp) == 0 {

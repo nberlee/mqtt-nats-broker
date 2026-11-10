@@ -62,7 +62,7 @@ func (jsa *mqttJSA) reclaimRetainedPayloadStep(as *mqttAccountSessionManager, id
 	if r.State == mqttResourceCleanupComplete {
 		return jsa.resolveRetainedPayloadDuties(id, epoch, gen, inc)
 	}
-	smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(getHash(id), gen, r.Name))
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(getHash(id), gen, r.Name))
 	present := lerr == nil && smsg != nil
 	if lerr != nil && isErrorOtherThan(lerr, JSNoMessageFoundErr) {
 		return mqttReclaimWithheld, fmt.Errorf("the manifest of %q could not be read: %w", r.Name, lerr)

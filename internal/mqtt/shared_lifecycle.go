@@ -33,7 +33,7 @@ import (
 // across a record set, so it could never fence a concurrent join, and a deterministic name
 // let a late delete reach the consumer a new joiner had just created. Both are gone.
 //
-// # The two records, both on $MQTT_shared
+// # The two records, both in the $MQTT.shared. space of $MQTT_sess
 //
 //   - the GROUP RECORD, one per logical group: which PHYSICAL incarnation the group currently
 //     uses (an ordinal, never reused), how many acquisitions hold it, and which retired
@@ -42,12 +42,12 @@ import (
 //     generation holds, whether it is still open to new ones, and which TENURE of the
 //     generation may acquire.
 //
-// A JetStream atomic batch is per stream, so a join or a release commits its group member and
-// its ledger member together. The session record on $MQTT_sess cannot be in that batch; what
-// joins the two streams is the acquisition NONCE: the record CAS arbitrates every DISPOSITION
+// A join or a release commits its group member and its ledger member together, in one atomic
+// batch. The session record is not in that batch: it shares the stream, but this protocol
+// divides the authority instead, and what joins the two is the acquisition NONCE: the record CAS arbitrates every DISPOSITION
 // of an acquisition (its commit, its removal, its cancellation), the ledger CAS arbitrates the
 // acquisition and its release, and the tenure the resume installs (3.2 of the plan) projects
-// the record's ownership decision onto the ledger, where no $MQTT_sess write reaches.
+// the record's ownership decision onto the ledger, which no session-record write touches.
 //
 // # Nothing here decides from an absence
 //
@@ -60,12 +60,12 @@ import (
 // accepts").
 
 const (
-	// mqttSharedGroupClassTk and mqttSharedLedgerClassTk are the two record classes, on the
-	// dedicated $MQTT_shared stream (mqttSharedLifecycleStreamSubjectPrefix), NOT on
-	// $MQTT_inflight: a permanent record co-located with the in-flight registers keeps their
-	// storage block from collapsing, which is the neighbour condition the MaxMsgsPer revival
-	// defect needs (docs/known-upstream-issues.md). Their own stream keeps $MQTT_inflight
-	// collapsible. Only the shared-lifecycle writer below writes these two classes.
+	// mqttSharedGroupClassTk and mqttSharedLedgerClassTk are the two record classes, in their
+	// own subject space on $MQTT_sess (mqttSharedLifecycleStreamSubjectPrefix). They are
+	// permanent neighbours of the in-flight registers there, which is the neighbour condition
+	// the upstream MaxMsgsPer revival defect needs; the exposure is stated in
+	// docs/known-upstream-issues.md. Only the shared-lifecycle writer below writes these two
+	// classes.
 	mqttSharedGroupClassTk  = "grp"
 	mqttSharedLedgerClassTk = "shl"
 
@@ -142,70 +142,6 @@ func mqttSharedGroupWalkFilter() string {
 // once sealed it is the fence that refuses a stale actor of that generation for ever.
 func mqttSharedLedgerSubject(idHash, gen string) string {
 	return mqttSharedLifecycleStreamSubjectPrefix + mqttSharedLedgerClassTk + "." + idHash + "." + gen
-}
-
-// validateSharedLifecycleStream verifies $MQTT_shared can carry the group records and the
-// acquisition ledgers. The list is derived from what THIS owner does, the doctrine every
-// validator here follows: a group record is CAS-arbitrated, an acquisition ledger is sealed,
-// a join commits the pair in one atomic batch, and neither record is ever deleted.
-func validateSharedLifecycleStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
-	if si == nil {
-		return fmt.Errorf("stream info unavailable")
-	}
-	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttSharedLifecycleStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
-		return err
-	}
-	if !cfg.AllowAtomicPublish {
-		// A join commits the group record and the acquisition ledger as one atomic batch,
-		// which a stream without this rejects. Refused here, never patched: the broker-owned
-		// streams are one recreation unit (issue #70).
-		return fmt.Errorf("allow_atomic is not set: a shared-group join commits its group record and acquisition ledger in one atomic batch, which the stream would reject")
-	}
-	if cfg.Retention != LimitsPolicy {
-		return fmt.Errorf("retention is %v (want limits): nothing consumes these records, so any other retention drops them immediately", cfg.Retention)
-	}
-	if cfg.Discard != DiscardOld {
-		// A CAS rewrite must replace the subject's record, not be rejected: DiscardNew turns
-		// a replacement into a rejection and wedges every arbitration.
-		return fmt.Errorf("discard is %v (want old)", cfg.Discard)
-	}
-	if cfg.MaxMsgsPer != 1 {
-		// Each subject is a single-slot CAS register: a group per qkey, a ledger per
-		// generation. More than one per subject appends, so a read returns the newest while
-		// a stale arbitration survives underneath.
-		return fmt.Errorf("max_msgs_per_subject is %d (want 1)", cfg.MaxMsgsPer)
-	}
-	if cfg.MaxMsgs > 0 || cfg.MaxBytes > 0 || cfg.MaxAge > 0 {
-		// These records are permanent within the recovery epoch. Any global limit would evict
-		// a live group's arbitration or a generation's fence.
-		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict a live group record or a generation's ledger",
-			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
-	}
-	if len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has sources (want none): a foreign record could occupy an arbitration's CAS slot")
-	}
-	if cfg.MaxMsgSize > 0 {
-		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject a legitimate group or ledger write", cfg.MaxMsgSize)
-	}
-	if !cfg.DenyDelete {
-		// These records are never deleted within the recovery epoch: a group record is
-		// CAS-rewritten and an acquisition ledger is sealed. deny_delete enforces that AND
-		// keeps the stream immune to the MaxMsgsPer revival defect (docs/known-upstream-issues.md):
-		// with no explicit delete there is no tombstone, so no evicted-then-deleted shape
-		// exists for a raw-block recovery to revive.
-		return fmt.Errorf("deny_delete is not set: these records are never deleted, and denying it keeps the stream immune to the upstream MaxMsgsPer revival defect")
-	}
-	if cfg.SubjectDeleteMarkerTTL != 0 {
-		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages would be parsed as records", cfg.SubjectDeleteMarkerTTL)
-	}
-	// The bundle stamp: this stream carries the account's recovery epoch, which is what makes
-	// the broker-owned streams one recreation unit rather than independently recoverable
-	// stores (issue #70).
-	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
-		return err
-	}
-	return nil
 }
 
 // mqttSharedIncToken renders an incarnation ordinal for a name.
@@ -415,7 +351,7 @@ const (
 // the attempt, named by the accept batch's PubAck — and ID a nonce minted with the attempt. A
 // resume preserves the generation, so two brokers may legitimately hold one generation; the
 // record CAS decides which of them owns the SESSION, and this member carries that decision
-// onto $MQTT_shared, where no $MQTT_sess write reaches. Installation never regresses: a
+// onto the ledger, which no session-record write touches. Installation never regresses: a
 // tenure with a smaller Seq is refused over a larger one, and a sealed ledger is never
 // reopened.
 type mqttSharedTenure struct {
@@ -754,7 +690,7 @@ func (jsa *mqttJSA) loadSharedGroup(epoch, qkey string) mqttSharedGroupLoad {
 			return l
 		}
 	}
-	smsg, err := jsa.loadLastMsgFor(mqttSharedLifecycleStreamName, mqttSharedGroupSubject(qkey))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttSharedGroupSubject(qkey))
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return mqttSharedGroupLoad{status: mqttOutboundIndeterminate, err: err}
@@ -779,7 +715,7 @@ type mqttSharedLedgerLoad struct {
 
 // loadSharedLedger reads one generation's ledger.
 func (jsa *mqttJSA) loadSharedLedger(id, epoch, gen string) mqttSharedLedgerLoad {
-	smsg, err := jsa.loadLastMsgFor(mqttSharedLifecycleStreamName, mqttSharedLedgerSubject(getHash(id), gen))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttSharedLedgerSubject(getHash(id), gen))
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return mqttSharedLedgerLoad{status: mqttOutboundIndeterminate, err: err}
@@ -1216,8 +1152,8 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		}
 		// THE FENCE'S FIRST STEP PRECEDES L1 (issue #107 7e): an open ledger releases only an
 		// acquisition it already lists as closed to new dependencies; a sealed one is closed
-		// generation-wide. The rest of the fence lives on $MQTT_inflight, where this boundary
-		// cannot see it; executeSharedRelease is its one route.
+		// generation-wide. The rest of the fence is the authority's, which this boundary
+		// cannot see; executeSharedRelease is its one route.
 		if !prior.isClosed(b.Acq.Acq) {
 			return fmt.Errorf("a release of acquisition %q from an open ledger that has not closed it", b.Acq.Acq)
 		}

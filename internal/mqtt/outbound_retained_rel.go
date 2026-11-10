@@ -22,9 +22,9 @@ import (
 // A retained exchange's CANONICAL PUBREL (issue #107 7c).
 //
 // An ordinary QoS 2 exchange's release is a record on $MQTT_out delivered by the PUBREL consumer;
-// storing it there and re-phasing the slot on $MQTT_inflight can never be one write, which is why
+// storing it there and re-phasing the slot in the $MQTT.inflight. space can never be one write, which is why
 // the ordinary path has pubrel_intended and its owed materialization. A retained exchange has no
-// consumer and every other record of it is on $MQTT_inflight, so its release is a record THERE, at
+// consumer and every other record of it is in the $MQTT.inflight. space, so its release is a record THERE, at
 // an exchange-specific subject, CREATED in the same advance batch that moves the exchange to
 // PubRecObserved and the register to pubrel_ready. There is no window in which the client has
 // answered PUBREC and nothing durable says the release is owed.

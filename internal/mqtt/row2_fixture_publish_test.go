@@ -118,7 +118,7 @@ func testRequireLandedAcquisition(t *testing.T, e *testInflightEnv, tr *mqttAuth
 			return
 		}
 		asubj := mqttActionSubject(getHash(e.sess.id), name.gen, cur.Lin, cur.Acq)
-		amsg, aerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, asubj)
+		amsg, aerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, asubj)
 		if aerr != nil || amsg == nil {
 			t.Errorf("the landed acquisition has no action record on %q: %v", asubj, aerr)
 			return

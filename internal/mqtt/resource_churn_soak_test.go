@@ -511,7 +511,7 @@ func assertEndedLineagesBounded(t *testing.T, block int, as *mqttAccountSessionM
 			}
 			sess.mu.Unlock()
 			filter := mqttInflightStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"
-			regs, err := as.jsa.streamSubjectsAllPages(mqttInflightStreamName, filter)
+			regs, err := as.jsa.streamSubjectsAllPages(mqttSessStreamName, filter)
 			if err != nil {
 				t.Fatalf("block %d: listing %s's registers: %v", block, sess.id, err)
 			}

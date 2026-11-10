@@ -145,7 +145,7 @@ func (rig *testRetainedAbandonRig) awaitRetainedCopyReclaimed(t *testing.T, payl
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		_, gone := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, rig.gen, payload))
+		_, gone := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, rig.gen, payload))
 		if gone != nil {
 			return
 		}
@@ -262,7 +262,7 @@ func TestRetainedReplayTooLargeIsAbandonedQoS2(t *testing.T) {
 	for {
 		x, _, _ = rig.asm.jsa.loadOutboundExchange(rig.id, rig.epoch, rig.gen, reg.Lin)
 		cur, _, _ := rig.asm.loadInflightRecord(subject)
-		_, relGone := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, after.RelSubj)
+		_, relGone := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, after.RelSubj)
 		if x != nil && x.Phase == mqttExchangeTerminal && cur == nil && relGone != nil {
 			break
 		}
@@ -491,7 +491,7 @@ func TestRetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
 	for {
 		x, _, _ := rig.asm.jsa.loadOutboundExchange(rig.id, rig.epoch, rig.gen, reg.Lin)
 		cur, _, _ := rig.asm.loadInflightRecord(subject)
-		_, manifestGone := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
+		_, manifestGone := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
 		rig.sess.mu.Lock()
 		held := rig.sess.custody != nil && rig.sess.custody.holdsPI(pi)
 		_, entry := rig.sess.pendingPublish[pi]
@@ -609,7 +609,7 @@ func TestRetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 			if clo, _, cst := jsa.loadGenClosure(rig.id, rig.epoch, gen1); cst != mqttOutboundValid || clo == nil || !clo.Discard {
 				t.Fatalf("the fixture's Discard did not land: %+v (status %v)", clo, cst)
 			}
-			if _, gone := jsa.loadLastMsgFor(mqttInflightStreamName, mqttRetainedRelSubject(rig.idHash, gen1, lin)); gone == nil {
+			if _, gone := jsa.loadLastMsgFor(mqttSessStreamName, mqttRetainedRelSubject(rig.idHash, gen1, lin)); gone == nil {
 				t.Fatal("a canonical PUBREL was created in a discarded generation")
 			}
 		})
@@ -736,7 +736,7 @@ func TestRetainedLiveFirstSendUnservableIsWithdrawn(t *testing.T) {
 	for {
 		x, _, _ := rig.asm.jsa.loadOutboundExchange(rig.id, rig.epoch, rig.gen, big.reg.Lin)
 		cur, _, _ := rig.asm.loadInflightRecord(mqttInflightSubject(rig.idHash, rig.gen, big.pi))
-		_, gone := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, rig.gen, big.reg.Payload))
+		_, gone := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, rig.gen, big.reg.Payload))
 		rig.sess.mu.Lock()
 		held := rig.sess.custody != nil && rig.sess.custody.holdsPI(big.pi)
 		_, entry := rig.sess.pendingPublish[big.pi]
@@ -945,7 +945,7 @@ func TestRetainedPubRecDuplicateAndNegative(t *testing.T) {
 		for {
 			x, _, _ := rig.asm.jsa.loadOutboundExchange(rig.id, rig.epoch, rig.gen, reg.Lin)
 			cur, _, _ := rig.asm.loadInflightRecord(mqttInflightSubject(rig.idHash, rig.gen, pi))
-			_, gone := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
+			_, gone := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
 			if x != nil && x.Phase == mqttExchangeRejected && cur == nil && gone != nil {
 				return
 			}

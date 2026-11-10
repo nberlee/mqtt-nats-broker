@@ -364,7 +364,7 @@ func (c *testJetStreamCluster) stopNode(n *testJSClusterNode) {
 // can be told apart from a plain timeout without this.
 func (c *testJetStreamCluster) describe() string {
 	streams := []string{mqttWillQStreamName, mqttSessStreamName, mqttStreamName,
-		mqttQoS2IncomingMsgsStreamName, mqttInflightStreamName}
+		mqttQoS2IncomingMsgsStreamName, mqttSessStreamName}
 	var b strings.Builder
 	fmt.Fprintf(&b, "cluster %q:", c.name)
 	for _, n := range c.nodes {

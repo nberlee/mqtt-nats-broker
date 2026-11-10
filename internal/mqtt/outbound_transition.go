@@ -32,7 +32,7 @@ import (
 // Nats-Expected-Last-Subject-Sequence, so a failing CAS on any member rejects the whole
 // batch and nothing is stored. The binding between members is ATOMICITY, never a
 // cross-subject expectation — the same reasoning storeInflightPair and the accept batch
-// already rest on, and the reason these records share $MQTT_inflight with the registers.
+// already rest on, and the reason these records share a stream with the registers.
 //
 // The outcome member is create-only, and that is what makes an ambiguous attempt decidable.
 // An attempt whose acknowledgement is lost cannot be resolved by looking for its effect:
@@ -80,7 +80,7 @@ type mqttAuthorityLoad struct {
 // decoder so attribution never rests on the subject's hash alone.
 func (jsa *mqttJSA) loadOutboundAuthority(id, epoch string) mqttAuthorityLoad {
 	subject := mqttOutboundAuthoritySubject(getHash(id))
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return mqttAuthorityLoad{status: mqttOutboundIndeterminate}
@@ -102,7 +102,7 @@ func (jsa *mqttJSA) loadOutboundAuthority(id, epoch string) mqttAuthorityLoad {
 // destructive path needs before it may treat an obligation as ended.
 func (jsa *mqttJSA) loadGenClosure(id, epoch, gen string) (*mqttGenClosure, uint64, mqttOutboundLoadStatus) {
 	subject := mqttGenClosureSubject(getHash(id), gen)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, mqttOutboundIndeterminate
@@ -123,7 +123,7 @@ func (jsa *mqttJSA) loadGenClosure(id, epoch, gen string) (*mqttGenClosure, uint
 // that identity). A body that names another client is CORRUPT, never absent: it answers for a
 // subject it does not belong to.
 func (jsa *mqttJSA) loadGenClosureByHash(idHash, epoch, gen string) (*mqttGenClosure, uint64, mqttOutboundLoadStatus) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttGenClosureSubject(idHash, gen))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttGenClosureSubject(idHash, gen))
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, mqttOutboundIndeterminate
@@ -167,7 +167,7 @@ func (jsa *mqttJSA) requireDiscardingClosure(id, epoch, gen string) error {
 // loadTransitionOutcome reads one attempted transition's permanent verdict.
 func (jsa *mqttJSA) loadTransitionOutcome(id, epoch, txn string) (*mqttTransitionOutcome, uint64, mqttOutboundLoadStatus) {
 	subject := mqttTransitionOutcomeSubject(getHash(id), txn)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, mqttOutboundIndeterminate
@@ -703,16 +703,8 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if aerr := resp.ToError(); aerr != nil {
 			return 0, aerr
 		}
-		if resp.PubAck == nil {
-			return 0, fmt.Errorf("transition %q was acknowledged with no publish acknowledgement", a.Txn)
-		}
-		if resp.BatchId != batchID || resp.BatchSize != uint64(total) {
-			return 0, fmt.Errorf("transition %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
-				a.Txn, resp.BatchSize, resp.BatchId, total, batchID)
-		}
-		if resp.Stream != mqttInflightStreamName {
-			return 0, fmt.Errorf("transition %q was acknowledged on stream %q (want %q)",
-				a.Txn, resp.Stream, mqttInflightStreamName)
+		if cerr := mqttCheckTransitionBatchAck(resp, batchID, total, a.Txn); cerr != nil {
+			return 0, cerr
 		}
 		return resp.Sequence, nil
 	}
@@ -720,6 +712,25 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		return (*hook)(t, send)
 	}
 	return send()
+}
+
+// mqttCheckTransitionBatchAck binds a transition's success to the batch this broker sent:
+// its id, every member, and the stream the authority lives on. The caller adopts the
+// acknowledged sequence as the AUTHORITY's, which is true only of an acknowledgement naming
+// this batch, so anything else is an error the caller resolves from the outcome.
+func mqttCheckTransitionBatchAck(resp *JSPubAckResponse, batchID string, total int, txn string) error {
+	if resp.PubAck == nil {
+		return fmt.Errorf("transition %q was acknowledged with no publish acknowledgement", txn)
+	}
+	if resp.BatchId != batchID || resp.BatchSize != uint64(total) {
+		return fmt.Errorf("transition %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
+			txn, resp.BatchSize, resp.BatchId, total, batchID)
+	}
+	if resp.Stream != mqttSessStreamName {
+		return fmt.Errorf("transition %q was acknowledged on stream %q (want %q)",
+			txn, resp.Stream, mqttSessStreamName)
+	}
+	return nil
 }
 
 // mqttCheckDisposalLicence requires every disposal decision this transition introduces to be made
@@ -1893,10 +1904,11 @@ func mqttTransitionMutationDigest(t *mqttAuthorityTransition) (string, error) {
 // mqttCheckTransitionMember classifies one caller-supplied batch member and refuses
 // anything this writer is not entitled to publish.
 //
-// The batch is per stream and newAtomicBatchRequest publishes each subject separately, so a
-// member naming another stream is not part of any transaction: it is routed elsewhere or
-// nowhere, and the acknowledgement cannot establish otherwise. Confinement is therefore a
-// correctness property and not tidiness.
+// Every member must be in the outbound in-flight subject classes ($MQTT.inflight.). The
+// session records and the shared-group records share the stream since the 2026-11-09 merge,
+// so one batch COULD carry them, but this writer is not entitled to: they have writers of
+// their own that validate them, and a transition that wrote them would bypass those.
+// Confinement to the class is therefore an authorization property and not tidiness.
 //
 // Beyond confinement the member must be a record class this transition may write, for this
 // client, in a shape the register boundary would accept. Atomicity commits what it is given
@@ -1915,10 +1927,10 @@ func mqttCheckTransitionMember(a *mqttTransitionAttempt, idHash, closureGen stri
 	if _, dup := seen[e.subj]; dup {
 		return fmt.Errorf("transition %q names subject %q more than once", a.Txn, e.subj)
 	}
-	// STREAM CONFINEMENT. A batch is per stream; a foreign subject is not in the
-	// transaction at all.
+	// CLASS CONFINEMENT: only the outbound in-flight subject classes, never the session or
+	// shared-group records that share the stream.
 	if !strings.HasPrefix(e.subj, mqttInflightStreamSubjectPrefix) {
-		return fmt.Errorf("transition %q carries member %q, which is not on the outbound in-flight stream",
+		return fmt.Errorf("transition %q carries member %q, which is not an outbound in-flight subject",
 			a.Txn, e.subj)
 	}
 	if mqttIsOutboundArbitrationSubject(e.subj) {
@@ -2256,7 +2268,7 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 		}
 		gen, nonce := toks[2], toks[3]
 
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, e.subj)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, e.subj)
 		if lerr != nil {
 			return nil, fmt.Errorf("transition %q advances exchange %q, which could not be read: %w",
 				a.Txn, nonce, lerr)
@@ -3185,7 +3197,7 @@ func (jsa *mqttJSA) checkActionMembers(a *mqttTransitionAttempt, extra []mqttTra
 
 		x, ok := resulting[gen+"."+nonce]
 		if !ok {
-			smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName,
+			smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName,
 				mqttExchangeSubject(getHash(a.ID), gen, nonce))
 			if lerr != nil {
 				return fmt.Errorf("transition %q acquires an action for exchange %q, which could "+
@@ -3234,7 +3246,7 @@ func (jsa *mqttJSA) checkActionMembers(a *mqttTransitionAttempt, extra []mqttTra
 func (jsa *mqttJSA) checkPredecessorAgainstStore(a *mqttTransitionAttempt,
 	prev *mqttOutboundAuthority, prevSeq uint64) error {
 
-	smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttOutboundAuthoritySubject(getHash(a.ID)))
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttOutboundAuthoritySubject(getHash(a.ID)))
 	if lerr != nil {
 		return fmt.Errorf("transition %q names a predecessor authority that could not be read: %w",
 			a.Txn, lerr)
@@ -3348,7 +3360,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 	// client already declined.
 	terminal := func(gen, nonce string) error {
 		subj := mqttExchangeSubject(getHash(a.ID), gen, nonce)
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		if lerr != nil {
 			return fmt.Errorf("its exchange record could not be read: %w", lerr)
 		}
@@ -3412,7 +3424,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		// "one act, one fact" already refuses for dependency edges. Consult 8 named that
 		// permission and refused it: close the manifest, THEN seal the resource.
 		subj := mqttManifestSubject(getHash(a.ID), r.Gen, r.Name)
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		absent := (lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) ||
 			(lerr == nil && smsg == nil)
 		if lerr != nil && !absent {
@@ -3495,7 +3507,7 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		}
 		gen, inc := toks[2], toks[3]
 
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, e.subj)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, e.subj)
 		if lerr != nil {
 			return fmt.Errorf("transition %q mutates resource %q, which could not be read: %w",
 				a.Txn, inc, lerr)
@@ -3979,7 +3991,7 @@ func (jsa *mqttJSA) domainToken() string {
 // checkMetadataVerdict requires the proposal a transition acts on to have the permanent
 // verdict that licenses the act.
 //
-// Reading $MQTT_sess from a transition that writes $MQTT_inflight is sound because the slot
+// Reading the metadata slot from a transition that does not write it is sound because the slot
 // is CREATE-ONLY and its verdict is permanent: once read it cannot change, so there is no
 // window between this read and the authority CAS in which the answer could become wrong. The
 // converse — inferring a verdict from the authority record — is what this exists to stop.

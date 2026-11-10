@@ -478,7 +478,7 @@ func TestMQTTRejectedRecordGateHeld(t *testing.T) {
 	defer restoreCount()
 	var loads atomic.Int64
 	restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if stream == mqttSessStreamName && strings.HasSuffix(subject, e.idHash) {
+		if testSessionFamily(stream, subject) && strings.HasSuffix(subject, e.idHash) {
 			loads.Add(1)
 		}
 		return nil
@@ -564,7 +564,7 @@ func TestMQTTRejectedRecordUnreadableReadback(t *testing.T) {
 	e.rejectSave(t, e.sess)
 
 	restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if stream == mqttSessStreamName && strings.HasSuffix(subject, e.idHash) {
+		if testSessionFamily(stream, subject) && strings.HasSuffix(subject, e.idHash) {
 			return errors.New("test: the session record is unreadable")
 		}
 		return nil
@@ -722,7 +722,7 @@ func TestMQTTRejectedRecordDeferredDischargeSite(t *testing.T) {
 // enumeration missed until a review round found it, which is the argument for arming the
 // marker centrally at the store boundary rather than per site.
 //
-// A never-expiring session with real shared pending state closes while the register stream is
+// A never-expiring session with real shared pending state closes while the register store is
 // unavailable, so the purge's third rung falls back to the session record; the record has
 // already moved, so that save is CAS-rejected and nothing else on this session would ever
 // look again.
@@ -815,7 +815,7 @@ func TestMQTTRejectedRecordFiniteCloseSite(t *testing.T) {
 // originSessionSeq after the purge, so the purge's own sequence never exceeds the Will's
 // origin) nor the store-result hook (whose signature carries no body) can see it.
 func TestMQTTRejectedRecordCloseStampsDisconnect(t *testing.T) {
-	// A session with real shared pending state and a register stream that FAILS, so the
+	// A session with real shared pending state and a register store that FAILS, so the
 	// purge's third rung falls back to the session record: that is the write whose bytes
 	// must already carry the disconnect time, and the only one the purge itself makes.
 	// The gate-release handoff's save at the very end of the close would be satisfied by

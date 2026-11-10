@@ -32,15 +32,15 @@ manifests set `MQTTNB_STREAM_REPLICAS` to `3` in their Deployment; change it to 
 cluster size. The shared-pod values set it to the NATS chart's cluster size. Set it
 before the first start: existing streams keep the count they were created with.
 
-To check what a running deployment has, ask NATS about the ten broker-owned streams,
+To check what a running deployment has, ask NATS about the eight broker-owned streams,
 for example with the `nats` CLI as the broker's service user:
 
 ```sh
 nats stream info '$MQTT_sess' --json | jq .config.num_replicas
 ```
 
-All ten streams carry the same count; `$MQTT_sess`, `$MQTT_msgs`, `$MQTT_out` and
-`$MQTT_rmsgs` are four of them ([Operations](OPERATIONS.md#the-ten-streams)).
+All eight streams carry the same count; `$MQTT_sess`, `$MQTT_msgs`, `$MQTT_out` and
+`$MQTT_rmsgs` are four of them ([Operations](OPERATIONS.md#the-eight-streams)).
 
 ## Probes and shutdown
 

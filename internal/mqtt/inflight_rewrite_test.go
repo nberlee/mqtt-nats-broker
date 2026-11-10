@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-// issue #89: every retargeted CAS on $MQTT_inflight rebuilds from the record it just read.
+// issue #89: every retargeted CAS in the $MQTT.inflight. space rebuilds from the record it just read.
 //
 // The tests below are organized by what a rebuild PRESERVES — the fact a concurrent
 // writer proved between the caller's build and its re-target — because that is the
@@ -1501,6 +1501,10 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 			"the ob class token, which satisfies neither mqttValidIDHashToken nor mqttValidSessGen, so no " +
 			"register parser can place it and no void verdict can name it — there is nothing here to " +
 			"strand. Same class as the retained material's chunk and manifest deletes",
+		"releaseTeardown": "removes the SESSION RECORD at its marker sequence (the `sess.` subject space), " +
+			"never a register. It shares the stream with the registers since the in-flight space moved onto " +
+			"$MQTT_sess, so the stream name no longer tells the two apart; the subject it deletes is the " +
+			"client's record subject, which no register parser can place and no void verdict can name",
 		"disposeSettledAffineRegister": "routes through the property where an identity-fenced session is resident, " +
 			"and RETAINS a register that CARRIES a cancellation where none is. A verdict living only in a " +
 			"non-resident session's persisted VoidedRegs is invisible from there and is NOT covered: issue #92",
@@ -1538,12 +1542,13 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 				switch sel.Sel.Name {
 				case "deleteInflightRegister", "deleteInflightRegisterConfirmed":
 				case "deleteMsg":
-					// Only the register stream's deletes are in this class.
+					// Deletes on the stream that holds the registers ($MQTT_sess) are in this
+					// class; the session-record delete there is allow-listed by name above.
 					if len(call.Args) == 0 {
 						return true
 					}
 					id, ok := call.Args[0].(*ast.Ident)
-					if !ok || id.Name != "mqttInflightStreamName" {
+					if !ok || id.Name != "mqttSessStreamName" {
 						return true
 					}
 				default:

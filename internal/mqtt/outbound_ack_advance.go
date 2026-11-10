@@ -29,7 +29,7 @@ import (
 // answered. Splitting the two writes leaves a durable disagreement — a slot past PUBREC beside
 // an exchange still at PUBLISH, or the reverse — that a peer or a restart must interpret, which
 // is exactly the read-then-act shape issue #107 exists to remove. JetStream batches are per stream,
-// and both records live on `$MQTT_inflight`, so the two members commit together or not at all.
+// and both records live in the `$MQTT.inflight.` space, so the two members commit together or not at all.
 //
 // # It records evidence; it does not admit work or drain an action
 //
@@ -112,7 +112,7 @@ type mqttAdvanceExchangeAckRequest struct {
 // slot and the token keeps the cleanup waiting for its holder's drain.
 //
 // RETAINED SLOTS SKIP pubrel_intended (issue #107 7c): a retained exchange's canonical PUBREL is created
-// on $MQTT_inflight in the SAME batch as the PUBREC advance, so there is no cross-stream store for
+// in the $MQTT.inflight. space in the SAME batch as the PUBREC advance, so there is no cross-stream store for
 // an intent phase to bridge and the arrow lands on pubrel_ready directly.
 func mqttAckSlotArrow(retained bool, from mqttInflightState, to mqttExchangePhase) (mqttInflightState, bool) {
 	switch from {
@@ -327,7 +327,7 @@ func mqttAdvanceExchangeAckTransition(prev *mqttOutboundAuthority, prevSeq uint6
 	}
 
 	// The exchange advance validates the exchange and the phase move; the slot member re-phases
-	// the occupant beside it, both on $MQTT_inflight, in one batch.
+	// the occupant beside it, both in the $MQTT.inflight. space, in one batch.
 	tr, err := mqttAdvanceExchangeTransition(prev, prevSeq, r.Txn, r.Op, cur, curSeq, r.To)
 	if err != nil {
 		return nil, err

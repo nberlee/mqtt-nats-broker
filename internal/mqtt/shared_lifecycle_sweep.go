@@ -15,6 +15,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 )
 
@@ -43,7 +44,7 @@ import (
 //     owner.
 //
 // Every arm acts only on records it READ. Exhaustion of any walk authorizes nothing, and
-// neither record class on $MQTT_shared is ever deleted.
+// neither record class in the $MQTT.shared. space is ever deleted.
 
 // mqttSharedConsumerDisposition is what the consumer sweep decided about one shared consumer.
 type mqttSharedConsumerDisposition uint8
@@ -122,18 +123,40 @@ func (as *mqttAccountSessionManager) sweepSharedConsumers(s *Server, names []str
 
 // sweepSharedGroupRetirements finishes every retiring entry on every group record: a leaver
 // that crashed inside L2 left the entry as the durable marker of its unfinished reclamation.
+//
+// The group records are LISTED by subject and loaded one by one, never walked by sequence:
+// they share $MQTT_sess with the session records and every in-flight record, so a sequence
+// walk from 1 would read every block of that stream on every pass, the cold-block cost
+// walkSessionRecords stopped paying (issue #179). A listing that is not complete defers the
+// whole pass, acting on nothing it did return: the next pass sees the rest, and a retiring
+// entry is a durable marker that waits. Group records are never deleted, so a complete listing
+// misses none that existed when it began; one created concurrently waits for a later pass.
 func (as *mqttAccountSessionManager) sweepSharedGroupRetirements(s *Server) {
 	filter := mqttSharedGroupWalkFilter()
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttSharedLifecycleStreamName, filter, seq)
+	subjects, complete, err := as.jsa.streamSubjectsComplete(mqttSessStreamName, filter)
+	if err != nil {
+		s.Debugf("MQTT shared group sweep deferred: listing the group records: %v", err)
+		return
+	}
+	if !complete {
+		s.Debugf("MQTT shared group sweep deferred: the group-record listing is incomplete")
+		return
+	}
+	names := make([]string, 0, len(subjects))
+	for subj := range subjects {
+		names = append(names, subj)
+	}
+	sort.Strings(names)
+	prefix := mqttSharedLifecycleStreamSubjectPrefix + mqttSharedGroupClassTk + "."
+	for _, subj := range names {
+		smsg, err := as.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT shared group sweep ended: %v", err)
+				s.Debugf("MQTT shared group sweep: loading %q: %v", subj, err)
 			}
-			return
+			continue
 		}
-		seq = smsg.Sequence + 1
-		rest := strings.TrimPrefix(smsg.Subject, mqttSharedLifecycleStreamSubjectPrefix+mqttSharedGroupClassTk+".")
+		rest := strings.TrimPrefix(smsg.Subject, prefix)
 		g, derr := mqttDecodeSharedGroup(smsg.Data, as.sessStreamEpoch, rest)
 		if derr != nil {
 			// A record this broker cannot interpret is retained whole; nothing on it is acted

@@ -116,7 +116,7 @@ func TestPendingFenceFromTheProducerIsDroppedOnColdResume(t *testing.T) {
 				mu.Lock()
 				deleted = append(deleted, seq)
 				mu.Unlock()
-				return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+				return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 			}
 			e.asm.mu.Unlock()
 
@@ -447,7 +447,7 @@ func TestCopiedFreshAdmissionTombstoneIsNotAFence(t *testing.T) {
 			if seq == rseq {
 				dropAttempted.Store(true)
 			}
-			return f.e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+			return f.e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 		}
 		f.e.asm.mu.Unlock()
 		restored := testColdResume(t, f.e)
@@ -580,7 +580,7 @@ func TestPendingFenceDisposalPreservesASuccessor(t *testing.T) {
 				raced = true
 			})
 		}
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	e.asm.mu.Unlock()
 

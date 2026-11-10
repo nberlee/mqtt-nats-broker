@@ -22,9 +22,11 @@
 // MarkerSeq SUPPLIES NO SECOND ARM HERE, and this is the one thing about the sweep that
 // most invites a wrong fix. The PUBREL classifier is two-dimensional because a releasing
 // session has its own sess.seq to compare a marker against. This pass does not: the
-// candidate generation is a REMOTE party's, and MarkerSeq is a $MQTT_sess sequence, so
-// comparing it against a $MQTT_qos2in, $MQTT_inflight or consumer sequence crosses
-// incomparable sequence spaces. Only exact generation equality proves anything here.
+// candidate generation is a REMOTE party's, and MarkerSeq is the sequence of that party's
+// session-record marker, so comparing it against a $MQTT_qos2in or consumer sequence
+// crosses incomparable sequence spaces, and against an in-flight record's sequence (the
+// same stream now) compares two writes of unrelated records. Only exact generation
+// equality proves anything here.
 //
 // WHAT THAT COSTS, stated plainly because it is the trade this design accepts: a
 // PERMANENT, UNBOUNDED leak for a generation with no discarding closure. The watermark is a

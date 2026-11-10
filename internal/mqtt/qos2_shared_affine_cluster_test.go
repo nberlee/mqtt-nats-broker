@@ -30,7 +30,7 @@
 //
 // Packet-identifier continuity across a broker loss IS claimed and IS asserted. It was
 // a documented HA deviation when this file was written, and the outbound in-flight
-// register on `$MQTT_inflight` closed it: the identifier is durable and restored before
+// register in the `$MQTT.inflight.` space closed it: the identifier is durable and restored before
 // the redelivery, which `docs/CONFORMANCE.md` states for every outbound path. The
 // broker-loss test therefore captures the original identifier and requires the same one
 // back. It previously accepted any identifier, on the strength of the old deviation, so a
@@ -574,7 +574,7 @@ func TestQ2AffineOwnerBrokerLossKeepsAssignment(t *testing.T) {
 
 	// The owner reconnects through the SURVIVING broker and collects it — with the SAME
 	// packet identifier. Continuity is no longer a deviation on any outbound path: the
-	// identifier is durable in the in-flight register on $MQTT_inflight and restored
+	// identifier is durable in the in-flight register in the $MQTT.inflight. space and restored
 	// before the redelivery. This assertion used to permit a fresh identifier, which left
 	// the affine path's continuity unverified while the docs claimed it.
 	//

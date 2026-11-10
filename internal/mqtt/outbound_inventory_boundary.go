@@ -344,7 +344,7 @@ func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransi
 	// BOTH are refusals. An unreadable entry is not an absent one and neither licenses a
 	// rewrite — a continuation names a record it claims to be continuing, so failing to find it
 	// is never a reason to treat the member as an allocation.
-	smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, e.subj)
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, e.subj)
 	if (lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) || (lerr == nil && smsg == nil) {
 		return fmt.Errorf("transition %q continues duty %d on %q at sequence %d, but nothing "+
 			"stands there: a duty is allocated create-only and continued thereafter, and a "+
@@ -711,7 +711,7 @@ func mqttParseDutySubject(subject, wantIDHash string) (string, uint64, error) {
 // the one carrying the high-water an allocation is about to step.
 func (jsa *mqttJSA) loadGenLedger(id, epoch, gen string) (*mqttGenLedger, uint64, error) {
 	subj := mqttGenLedgerSubject(getHash(id), gen)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("reading the ledger of generation %q: %w", gen, err)

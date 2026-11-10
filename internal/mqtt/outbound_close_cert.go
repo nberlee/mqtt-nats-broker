@@ -98,7 +98,7 @@ func (jsa *mqttJSA) loadDurableCloseCert(id, epoch, gen, run, conn string) (*mqt
 			"and %q/%q/%q cannot all name one", gen, run, conn)
 	}
 	subj := mqttCloseCertSubject(getHash(id), gen, run, conn)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, fmt.Errorf("reading the closure certificate on %q: %w", subj, err)
@@ -297,7 +297,7 @@ func (sess *mqttSession) clearCertifiedActionToken(c *client, subject string, se
 	if !mqttOutboundIdentTk(pre.Lin) {
 		return mqttCertifiedClearWithheld, 0
 	}
-	amsg, aerr := sess.jsa.loadLastMsgFor(mqttInflightStreamName, mqttActionSubject(idHash, gen, pre.Lin, pre.Acq))
+	amsg, aerr := sess.jsa.loadLastMsgFor(mqttSessStreamName, mqttActionSubject(idHash, gen, pre.Lin, pre.Acq))
 	if aerr != nil || amsg == nil {
 		return mqttCertifiedClearWithheld, 0
 	}
@@ -427,7 +427,7 @@ func (sess *mqttSession) clearCertifiedTokensForResume(c *client) {
 	if idHash == _EMPTY_ || !mqttOutboundIdentTk(gen) {
 		return
 	}
-	certs, whole, err := sess.jsa.streamSubjectsComplete(mqttInflightStreamName, mqttCloseCertWalkFilter(idHash, gen))
+	certs, whole, err := sess.jsa.streamSubjectsComplete(mqttSessStreamName, mqttCloseCertWalkFilter(idHash, gen))
 	if err != nil || !whole || len(certs) == 0 {
 		return
 	}

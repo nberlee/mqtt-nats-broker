@@ -249,15 +249,15 @@ func TestDetachedCloseStagesItsVerdict(t *testing.T) {
 	e.sess.mu.Lock()
 	e.sess.c = nil // the normal close detaches before it purges
 	e.sess.mu.Unlock()
-	fail := errors.New("test: the register stream is unavailable")
+	fail := errors.New("test: the register store is unavailable")
 	e.asm.mu.Lock()
 	e.asm.testWithdrawUnsent = func(*mqttWithdrawUnsentRequest, func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 		return mqttOpOutcome{}, fail
 	}
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) { return 0, fail }
 	e.asm.mu.Unlock()
-	restore := setMQTTTestDeleteMsgHook(func(stream string, _ uint64) error {
-		if stream == mqttInflightStreamName {
+	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
+		if testInflightSpace(stream, testSubjectAtSeq(&e.asm.jsa, stream, seq)) {
 			return fail
 		}
 		return nil

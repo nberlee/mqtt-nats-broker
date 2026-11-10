@@ -63,8 +63,8 @@ const (
 	// A shared-subscription GROUP consumer is deliberately NOT a resource kind. It is the one
 	// durable a generation does not OWN — several generations hold it at once — so no
 	// per-generation resource could express it, and its former enrolment was withheld by every
-	// executor for exactly that reason. It is held by ARBITRATION on its own group record on
-	// $MQTT_shared, and a generation's ACQUISITIONS of it are released by the closing from the
+	// executor for exactly that reason. It is held by ARBITRATION on its own group record in
+	// the $MQTT.shared. space, and a generation's ACQUISITIONS of it are released by the closing from the
 	// generation's acquisition ledger (shared_lifecycle.go). A record carrying the old kind is an
 	// unsupported persisted shape and is refused, never interpreted.
 	//

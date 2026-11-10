@@ -556,7 +556,7 @@ func testXHarnessWith(t *testing.T, cid string, order testOrder, beforeResume fu
 	if err != nil || reg == nil || reg.ActionToken == _EMPTY_ {
 		t.Fatalf("fixture: A's parked section must hold the ACQUIRED action token: %+v (%v)", reg, err)
 	}
-	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); smsg == nil {
+	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj); smsg == nil {
 		t.Fatalf("fixture: the unsent marker must stand while A is parked at RESERVED")
 	}
 	w.nonce, w.lin, w.srcDur, w.srcSeq, w.tokenA = reg.Nonce, reg.Lin, reg.Dur, reg.Seq, reg.ActionToken
@@ -639,7 +639,7 @@ func testXHarnessWith(t *testing.T, cid string, order testOrder, beforeResume fu
 				"actionLive=false over a register A's persisted certificate cleared: entry %s; register %+v; "+
 				"A's certificate %+v (%v)", desc, regB, cert, cerr)
 		}
-		if smsg, _ := w.asmB.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); smsg == nil {
+		if smsg, _ := w.asmB.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj); smsg == nil {
 			t.Fatalf("fixture: the marker must still stand before A is released (A parked at RESERVED)")
 		}
 		t.Logf("A-first ordering checked: certificate %+v persisted, token cleared; entry %d %s", *cert, w.pi, desc)
@@ -722,7 +722,7 @@ func (w *testXWorld) observeA(t *testing.T) testAObservation {
 	var o testAObservation
 	o.reg, _, _ = w.asmA.jsa.loadInflightRecord(w.regSubj)
 	o.intent = w.sec.sawA(mqttMarkerSendIntent)
-	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); smsg == nil {
+	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj); smsg == nil {
 		o.markerGone = true
 	}
 	o.writerReached = w.writerReached.Load()
@@ -770,7 +770,7 @@ func (w *testXWorld) state(sess *mqttSession, asm *mqttAccountSessionManager) st
 	fmt.Fprintf(&b, "exchange %+v@%d (%v); ", x, xseq, xerr)
 	reg, _, rerr := asm.jsa.loadInflightRecord(w.regSubj)
 	fmt.Fprintf(&b, "register %+v (%v); ", reg, rerr)
-	smsg, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj)
+	smsg, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj)
 	fmt.Fprintf(&b, "marker present %v; ", smsg != nil)
 	if sess != nil {
 		sess.mu.Lock()
@@ -842,7 +842,7 @@ func (w *testXWorld) checkNoConflict(t *testing.T, asm *mqttAccountSessionManage
 	if opened, onPI := w.sec.openedB(); onPI {
 		t.Errorf("CONTRACT: B opened a section for message 1's identifier %d: %v", w.pi, opened)
 	}
-	subjects, _, err := asm.jsa.streamSubjectsPage(mqttInflightStreamName, mqttExchangeWalkFilter(w.idHash, w.gen), 0)
+	subjects, _, err := asm.jsa.streamSubjectsPage(mqttSessStreamName, mqttExchangeWalkFilter(w.idHash, w.gen), 0)
 	if err != nil {
 		t.Errorf("listing the generation's exchanges: %v", err)
 		return
@@ -1331,7 +1331,7 @@ func TestCrossTenureVerdictOverAPossiblyAttemptedRegisterCold(t *testing.T) {
 	w.markSubj = w.regSubj + "." + mqttInflightMarkerSuffix
 	checkFor(t, 10*time.Second, 20*time.Millisecond, func() error {
 		reg, _, _ := asmA.jsa.loadInflightRecord(w.regSubj)
-		m, _ := asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj)
+		m, _ := asmA.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj)
 		if reg == nil || reg.ActionToken != _EMPTY_ || m != nil {
 			return fmt.Errorf("fixture: message 1 must be transmitted on A (marker gone, token drained): %+v marker %v", reg, m != nil)
 		}
@@ -1452,7 +1452,7 @@ func testDrainWithoutIntentThenRetransmit(t *testing.T, w *testXWorld, label str
 		t.Errorf("%s: B's retransmission must confirm the retained marker's delete (INTENT) before its write (WROTE): %v",
 			label, opened)
 	}
-	if m, _ := w.asmB.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); m != nil {
+	if m, _ := w.asmB.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj); m != nil {
 		t.Errorf("%s: the marker must be gone after B's retransmission", label)
 	}
 	if got.payload != "one" || got.flags&mqttPubFlagDup == 0 {
@@ -1509,7 +1509,7 @@ func TestRecoveredTokenNoIntentDrainKeepsMarkerDebt(t *testing.T) {
 	if !ok {
 		t.Errorf("CONTRACT: the second recovery must classify message 1 transmitted with no marker; state %s", w.state(sess3, w.asmA))
 	}
-	if m, _ := w.asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); m != nil {
+	if m, _ := w.asmA.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj); m != nil {
 		t.Errorf("CONTRACT: a real transmission must not leave the unsent marker standing")
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c3, w.pi)
@@ -1555,7 +1555,7 @@ func TestIntentDeleteAfterCertificationStrandsAWithdrawnExchange(t *testing.T) {
 
 func testRun(t *testing.T, cid string, order testOrder) {
 	w := testXHarness(t, cid, order)
-	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttInflightStreamName, w.markSubj); smsg == nil {
+	if smsg, _ := w.asmA.jsa.loadLastMsgFor(mqttSessStreamName, w.markSubj); smsg == nil {
 		t.Fatalf("fixture: the marker must still stand before A is released (A parked at RESERVED)")
 	}
 	w.requireCertifiedWhileParked(t)
@@ -2119,7 +2119,7 @@ func testResidentRun(t *testing.T, cid string, abort bool) {
 	a := sess.pendingPublish[pi]
 	transmitted, markerSeq := a.transmitted, a.markerSeq
 	sess.mu.Unlock()
-	m, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markSubj)
+	m, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, markSubj)
 	if !transmitted {
 		t.Errorf("CONTRACT: the possibly-attempted classification is monotone, got transmitted=false")
 	}
@@ -2190,7 +2190,7 @@ func TestD4W6aRecoveryDropOverALiveSection(t *testing.T) {
 	if err != nil || reg == nil || reg.ActionToken == _EMPTY_ {
 		t.Fatalf("fixture: the parked section must hold the ACQUIRED action token: %+v (%v)", reg, err)
 	}
-	if smsg, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markSubj); smsg == nil {
+	if smsg, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, markSubj); smsg == nil {
 		t.Fatal("fixture: the unsent marker must stand at RESERVED")
 	}
 	nonce, lin, srcDur := reg.Nonce, reg.Lin, reg.Dur
@@ -2198,7 +2198,7 @@ func TestD4W6aRecoveryDropOverALiveSection(t *testing.T) {
 		var b strings.Builder
 		x, _, xerr := asm.jsa.loadOutboundExchange(cid, epoch, gen, lin)
 		r, _, _ := asm.jsa.loadInflightRecord(regSubj)
-		m, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markSubj)
+		m, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, markSubj)
 		fmt.Fprintf(&b, "exchange %+v (%v); register %+v; marker present %v; ", x, xerr, r, m != nil)
 		sess.mu.Lock()
 		if a := sess.pendingPublish[pi]; a != nil {
@@ -2307,7 +2307,7 @@ func TestD4W6aRecoveryDropOverALiveSection(t *testing.T) {
 		for {
 			x, _, _ := asm.jsa.loadOutboundExchange(cid, epoch, gen, lin)
 			r, _, _ := asm.jsa.loadInflightRecord(regSubj)
-			m, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markSubj)
+			m, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, markSubj)
 			sess.mu.Lock()
 			released := !sess.custody.holdsPI(pi) && !sess.custody.chargesPI(pi) && !sess.sendReservedLocked(pi)
 			sess.mu.Unlock()

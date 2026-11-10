@@ -1441,8 +1441,8 @@ func TestMQTTDrainAmbiguousCompletionThroughTheRealCallbacks(t *testing.T) {
 	// The readback is disabled from the same moment, so the removal stays
 	// unconfirmed while the assertions run.
 	var suppressing atomic.Bool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressing.Load() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressing.Load() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -1544,8 +1544,8 @@ func TestMQTTDrainUnconfirmedRemovalIsNotAckedByTheDeliveryCallback(t *testing.T
 	// The PUBACK's completion write lands nowhere and stays unresolved, so the
 	// removal is held unconfirmed while redeliveries keep arriving.
 	var suppressing atomic.Bool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressing.Load() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressing.Load() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil

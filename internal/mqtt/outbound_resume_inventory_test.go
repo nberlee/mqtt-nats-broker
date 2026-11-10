@@ -43,14 +43,14 @@ func testRestart(e *testInflightEnv) {
 	e.sess.mu.Unlock()
 }
 
-// testDeleteSubject removes the last message on subject from the in-flight stream.
+// testDeleteSubject removes the last message on subject from the in-flight space.
 func testDeleteSubject(t *testing.T, e *testInflightEnv, subject string) {
 	t.Helper()
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil || smsg == nil {
 		t.Fatalf("loading %q to delete it: %v", subject, err)
 	}
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("deleting %q: %v", subject, err)
 	}
 }
@@ -125,7 +125,7 @@ func TestResumeInventoryHoleIsUncertainty(t *testing.T) {
 			e := f.e
 			ord := testDutyOrdinalOf(t, e, f.gen, f.lin)
 			dutySubject := mqttDutySubject(e.sess.idHash, f.gen, ord)
-			original, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, dutySubject)
+			original, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, dutySubject)
 			if original == nil {
 				t.Fatal("fixture: the exchange duty must stand before it is broken")
 			}
@@ -199,7 +199,7 @@ func TestResumeInventoryResourceDutyDischargesCustodyOnly(t *testing.T) {
 	hide.Store(true)
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-		out, err := e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		out, err := e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 		if hide.Load() {
 			for i, s := range subjects {
 				if s == dutySubject && i < len(out) {
@@ -385,7 +385,7 @@ func TestResumeInventoryReadsEveryOrdinal(t *testing.T) {
 				dutyReads.Add(1)
 			}
 		}
-		return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		return e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 	}
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testInflightLoadMulti = nil; e.asm.mu.Unlock() })

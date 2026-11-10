@@ -520,7 +520,7 @@ func ackLayoutQoS1Takeover(t *testing.T, a, b *testClusterBroker, js jetstream.J
 	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		st, err := js.Stream(ctx, mqttInflightStreamName)
+		st, err := js.Stream(ctx, mqttSessStreamName)
 		if err != nil {
 			return err
 		}

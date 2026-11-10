@@ -100,7 +100,7 @@ type mqttDiscardCleanupState struct {
 func (jsa *mqttJSA) loadDiscardCleanup(id, epoch, gen string, x *mqttOutboundExchange) (mqttDiscardCleanupState, error) {
 	var st mqttDiscardCleanupState
 	idHash := getHash(id)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttRetainedRelSubject(idHash, gen, x.Nonce))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttRetainedRelSubject(idHash, gen, x.Nonce))
 	switch {
 	case err != nil && isErrorOtherThan(err, JSNoMessageFoundErr):
 		return st, fmt.Errorf("its canonical PUBREL could not be read: %w", err)
@@ -207,7 +207,7 @@ func (as *mqttAccountSessionManager) discardOneObligation(s *Server, root *mqttR
 // deleteDiscardRecord deletes one record of a discarded obligation at its exact sequence, confirmed.
 // The next visit re-reads: a deleted sequence is not proof that its subject is now empty.
 func (as *mqttAccountSessionManager) deleteDiscardRecord(seq uint64) error {
-	return as.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+	return as.jsa.deleteMsg(mqttSessStreamName, seq, true)
 }
 
 // pubRelDisposalPrerequisites reports whether a discarded generation's PUBREL consumer may be

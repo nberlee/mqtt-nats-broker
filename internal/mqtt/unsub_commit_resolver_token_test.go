@@ -149,7 +149,7 @@ func testUnsubCommitResolverTokenRealRoute(t *testing.T, filter, topic string, s
 	asm.mu.Lock()
 	asm.testInflightDelete = func(uint64) error { return errors.New("test: register delete unavailable") }
 	asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, errors.New("test: register stream unavailable")
+		return 0, errors.New("test: register store unavailable")
 	}
 	asm.mu.Unlock()
 	defer func() {

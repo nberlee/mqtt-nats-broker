@@ -191,15 +191,24 @@ func storeFormatScenario(t *testing.T, o *Options) {
 // storeFormatScenarioStreams are the streams the scenario must leave non-empty, with
 // the minimum record count each. $MQTT_willq and $MQTT_qos2assign stay empty: a
 // delayed Will needs a session-expiry clock, and the assignment stream is affine-only.
+// $MQTT_sess carries three record families, so its count alone would not show each
+// was exercised; storeFormatScenarioSubjects pins them one by one.
 var storeFormatScenarioStreams = map[string]uint64{
-	mqttSessStreamName:             1,
+	mqttSessStreamName:             4,
 	mqttTeardownStreamName:         1,
 	mqttStreamName:                 1,
 	mqttQoS2IncomingMsgsStreamName: 1,
-	mqttInflightStreamName:         1,
-	mqttSharedLifecycleStreamName:  2, // the group record and the member's acquisition ledger
 	mqttOutStreamName:              1,
 	mqttRetainedMsgsStreamName:     1,
+}
+
+// storeFormatScenarioSubjects are the $MQTT_sess subject spaces the scenario must leave
+// non-empty, with the minimum record count each: a session record, an in-flight or
+// outbound record, and the shared group record with the member's acquisition ledger.
+var storeFormatScenarioSubjects = map[string]uint64{
+	mqttSessStreamSubjectPrefix + ">":            1,
+	mqttInflightStreamSubjectPrefix + ">":        1,
+	mqttSharedLifecycleStreamSubjectPrefix + ">": 2,
 }
 
 // storeFormatRunConsumers lists every per-run ephemeral consumer on the two streams
@@ -272,6 +281,23 @@ func TestWriteStoreFormatFixture(t *testing.T) {
 		}
 		if got := st.CachedInfo().State.Msgs; got < min {
 			t.Fatalf("the scenario left %d records on %s, want at least %d", got, stream, min)
+		}
+	}
+	sess, err := js.Stream(ctx, mqttSessStreamName)
+	if err != nil {
+		t.Fatalf("looking up %s: %v", mqttSessStreamName, err)
+	}
+	for filter, min := range storeFormatScenarioSubjects {
+		info, err := sess.Info(ctx, jetstream.WithSubjectFilter(filter))
+		if err != nil {
+			t.Fatalf("listing %s on %s: %v", filter, mqttSessStreamName, err)
+		}
+		var got uint64
+		for _, n := range info.State.Subjects {
+			got += n
+		}
+		if got < min {
+			t.Fatalf("the scenario left %d records under %s on %s, want at least %d", got, filter, mqttSessStreamName, min)
 		}
 	}
 	storeFormatStopNATS(nc, ns)

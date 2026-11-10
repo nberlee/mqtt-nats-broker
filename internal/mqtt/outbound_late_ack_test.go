@@ -1308,7 +1308,7 @@ func TestInheritedReplacementCancellationEnrolsTheDrain(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(seq uint64) error {
 		deletes.Add(1)
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	e.asm.testAdmitWrite = func(s *mqttSession, ro bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 		out, err := write()
@@ -1401,7 +1401,7 @@ func TestMarkerBackedCancellationStillWithdraws(t *testing.T) {
 			t.Fatalf("fixture: the teardown must void exactly the never-sent obligation, got %+v", regs)
 		}
 		if unproven := f.e.sess.voidRegistersOnStream(f.e.c, regs, mqttLicenceOf(f.e.c)); unproven {
-			t.Fatal("the marker-backed void must be proven on the register stream")
+			t.Fatal("the marker-backed void must be proven on the register store")
 		}
 		f.requireWithdrawnAndGone(t)
 		testCustodyEventually(t, "the marker follows its register", func() bool { return !f.markerStands() })
@@ -1426,7 +1426,7 @@ func TestMarkerBackedCancellationStillWithdraws(t *testing.T) {
 			t.Fatalf("fixture: the teardown must void exactly the never-sent affine pair, got %+v", regs)
 		}
 		if unproven := a.e.sess.voidRegistersOnStream(a.e.c, regs, mqttLicenceOf(a.e.c)); unproven {
-			t.Fatal("the marker-backed affine void must be proven on the register stream")
+			t.Fatal("the marker-backed affine void must be proven on the register store")
 		}
 		if rec, smsg := a.register(t); smsg != nil {
 			t.Fatalf("the marker-backed affine register must be removed, got %+v", rec)
@@ -1812,7 +1812,7 @@ func testOpaqueMarkerSeam(t *testing.T, regSubject string, patched *atomic.Bool)
 	}
 	return func(asm *mqttAccountSessionManager) func([]string) ([]*JSApiMsgGetResponse, error) {
 		return func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-			resps, err := asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+			resps, err := asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 			if err != nil {
 				return resps, err
 			}
@@ -1954,7 +1954,7 @@ func TestOpaqueAndRereadFailureStayConservative(t *testing.T) {
 						failed.Store(true)
 						return nil, errors.New("test: the pre-apply reread failed")
 					}
-					return asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+					return asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 				}
 			})
 		if !failed.Load() {
@@ -2055,7 +2055,7 @@ func testCancelledOccupantOn(t *testing.T, e *testInflightEnv, dur string, sseq 
 	e.asm.testInflightDelete = func(seq uint64) error {
 		o.deletes.Add(1)
 		o.note("delete:" + itoa(int(seq)))
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	e.asm.testInflightMarkerLoad = func(subject string) (*StoredMsg, error) {
 		if subject == markerSubject {
@@ -2071,7 +2071,7 @@ func testCancelledOccupantOn(t *testing.T, e *testInflightEnv, dur string, sseq 
 			}
 			o.note(tag)
 		}
-		return e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		return e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	}
 	e.asm.mu.Unlock()
 	return o
@@ -2201,7 +2201,7 @@ func TestCancelledOccupantMarkerIndeterminateAbandons(t *testing.T) {
 			o.probes.Add(1)
 			return nil, errors.New("test: the marker read did not resolve")
 		}
-		return e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		return e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	}
 	e.asm.testAdmitWrite = func(s *mqttSession, ro bool, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error) {
 		if s == e.sess && ro {
@@ -3375,7 +3375,7 @@ func TestQoS2ResidualByPhase(t *testing.T) {
 		p := testResumeOnPeerBatched(t, f.testWithdrawFix, "node2-t29-pubcomp-opaque",
 			func(asm *mqttAccountSessionManager) func([]string) ([]*JSApiMsgGetResponse, error) {
 				return func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-					resps, err := asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+					resps, err := asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 					if err != nil {
 						return resps, err
 					}
@@ -3692,7 +3692,7 @@ func TestNoNewDisconnectOrQoS0Degradation(t *testing.T) {
 	var patched atomic.Bool
 	asm.mu.Lock()
 	asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-		resps, err := asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		resps, err := asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 		if err != nil {
 			return resps, err
 		}

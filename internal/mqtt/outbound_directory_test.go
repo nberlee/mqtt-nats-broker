@@ -346,15 +346,15 @@ func TestSweepCountsMissingAndMalformedEntriesAsOutstanding(t *testing.T) {
 	// start terminal, and what this test is about is what the SWEEP does with the record.
 	testPlantDuty(t, e, testDuty(e, 1, mqttDutyProvision, "inc-xa", mqttDutyTerminal))
 	// Remove 2 outright and corrupt 3, which is what a sweep must not read as done.
-	gone, gerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	gone, gerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttDutySubject(getHash(e.id), testGen, 2))
 	if gerr != nil || gone == nil {
 		t.Fatalf("reading duty 2 before removing it: %v", gerr)
 	}
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, gone.Sequence, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, gone.Sequence, true); err != nil {
 		t.Fatalf("removing duty 2: %v", err)
 	}
-	bad, berr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	bad, berr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttDutySubject(getHash(e.id), testGen, 3))
 	if berr != nil || bad == nil {
 		t.Fatalf("reading duty 3 before corrupting it: %v", berr)
@@ -619,7 +619,7 @@ func testPlantShard(t *testing.T, e *testOutboundEnv, shard, hi uint64) {
 	if err != nil {
 		t.Fatalf("marshalling the shard header: %v", err)
 	}
-	cur, cerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttShardSubject(shard))
+	cur, cerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttShardSubject(shard))
 	var expect uint64
 	if cerr == nil && cur != nil {
 		expect = cur.Sequence

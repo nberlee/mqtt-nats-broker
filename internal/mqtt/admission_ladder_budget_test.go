@@ -225,7 +225,7 @@ func TestMQTTFailedReplacementCreatesAtTheIncomingQoS(t *testing.T) {
 		if !first {
 			return write()
 		}
-		if derr := e.asm.jsa.deleteMsg(mqttInflightStreamName, occSeq, true); derr != nil {
+		if derr := e.asm.jsa.deleteMsg(mqttSessStreamName, occSeq, true); derr != nil {
 			return mqttOpOutcome{}, derr
 		}
 		mu.Lock()

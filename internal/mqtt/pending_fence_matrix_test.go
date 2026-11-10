@@ -187,7 +187,7 @@ func (f *t36Fix) recordDeletes() func() []uint64 {
 		mu.Lock()
 		seqs = append(seqs, seq)
 		mu.Unlock()
-		return f.e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return f.e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	f.e.asm.mu.Unlock()
 	return func() []uint64 {

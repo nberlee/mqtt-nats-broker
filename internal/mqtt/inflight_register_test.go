@@ -194,101 +194,76 @@ func TestMQTTInflightSourceStream(t *testing.T) {
 // Stream prerequisites
 // ---------------------------------------------------------------------------
 
-func TestMQTTValidateInflightStream(t *testing.T) {
+// TestValidateSessStreamCarriesTheInflightAndSharedSpaces pins what the merge into
+// $MQTT_sess demands of the session stream for the in-flight and shared-group records,
+// each check refused with every other prerequisite valid, so a validator that dropped
+// one of them could not pass through another's refusal.
+func TestValidateSessStreamCarriesTheInflightAndSharedSpaces(t *testing.T) {
 	t.Parallel()
 	good := func() *StreamInfo {
 		return &StreamInfo{Config: StreamConfig{
-			Name:       mqttInflightStreamName,
-			Subjects:   []string{mqttInflightStreamSubjectPrefix + ">"},
-			Storage:    FileStorage,
-			Retention:  LimitsPolicy,
-			Discard:    DiscardOld,
-			MaxMsgsPer: 1,
-			Replicas:   3,
-			Metadata:   map[string]string{mqttSessEpochMetaKey: testBundleEpoch},
-			// The PUBLISH-phase pair is one atomic batch (issue #76).
+			Name:               mqttSessStreamName,
+			Subjects:           testSessStreamSubjects(),
+			Storage:            FileStorage,
+			Retention:          LimitsPolicy,
+			Discard:            DiscardOld,
+			MaxMsgsPer:         1,
+			Replicas:           3,
 			AllowAtomicPublish: true,
+			Metadata:           map[string]string{mqttSessEpochMetaKey: mqttGenSessEpoch()},
 		}}
 	}
-	if err := validateInflightStream(good(), 3, testBundleEpoch); err != nil {
+	if err := validateSessStream(good(), _EMPTY_, 3); err != nil {
 		t.Fatalf("the shipped configuration must validate: %v", err)
 	}
-	// T23, N-2.5: the stream must allow atomic publishes, or the pair cannot be committed.
-	si := good()
-	si.Config.AllowAtomicPublish = false
-	if err := validateInflightStream(si, 3, testBundleEpoch); err == nil || !strings.Contains(err.Error(), "allow_atomic") {
-		t.Fatalf("a stream without AllowAtomicPublish must be refused naming allow_atomic, got %v", err)
+	without := func(drop string) func(*StreamConfig) {
+		return func(c *StreamConfig) {
+			kept := c.Subjects[:0:0]
+			for _, subj := range c.Subjects {
+				if subj != drop {
+					kept = append(kept, subj)
+				}
+			}
+			c.Subjects = kept
+		}
 	}
-	if err := validateInflightStream(nil, 3, testBundleEpoch); err == nil {
-		t.Fatalf("missing stream info must be rejected")
-	}
-	// Every stream must carry the required count (issue #171).
-	if err := validateInflightStream(good(), 1, testBundleEpoch); err == nil {
-		t.Fatalf("a replica mismatch must be rejected")
-	}
-	si = good()
-	si.Config.Replicas = 3
-	if err := validateInflightStream(si, 3, testBundleEpoch); err != nil {
-		t.Fatalf("matching replicas must validate: %v", err)
-	}
-
 	for _, tc := range []struct {
-		name string
-		mut  func(*StreamConfig)
+		name    string
+		mut     func(*StreamConfig)
+		errWant string
 	}{
-		{"wrong subjects", func(c *StreamConfig) { c.Subjects = []string{"foo.>"} }},
-		{"extra subjects", func(c *StreamConfig) { c.Subjects = append(c.Subjects, "foo.>") }},
-		{"memory storage", func(c *StreamConfig) { c.Storage = MemoryStorage }},
-		{"interest retention", func(c *StreamConfig) { c.Retention = InterestPolicy }},
-		{"discard new", func(c *StreamConfig) { c.Discard = DiscardNew }},
-		{"no per-subject singleton", func(c *StreamConfig) { c.MaxMsgsPer = 0 }},
-		{"per-subject limit above one", func(c *StreamConfig) { c.MaxMsgsPer = 2 }},
-		{"max msgs", func(c *StreamConfig) { c.MaxMsgs = 10 }},
-		{"max bytes", func(c *StreamConfig) { c.MaxBytes = 1 << 20 }},
-		{"max age", func(c *StreamConfig) { c.MaxAge = time.Hour }},
-		{"mirror", func(c *StreamConfig) { c.Mirror = &StreamSource{Name: "other"} }},
-		{"sources", func(c *StreamConfig) { c.Sources = []*StreamSource{{Name: "other"}} }},
-		{"max msg size", func(c *StreamConfig) { c.MaxMsgSize = 1024 }},
-		{"no ack", func(c *StreamConfig) { c.NoAck = true }},
-		{"deny delete", func(c *StreamConfig) { c.DenyDelete = true }},
-		{"sealed", func(c *StreamConfig) { c.Sealed = true }},
-		{"subject transform", func(c *StreamConfig) {
-			c.SubjectTransform = &SubjectTransformConfig{Source: ">", Destination: "x.>"}
-		}},
-		{"republish", func(c *StreamConfig) { c.RePublish = &RePublish{Source: ">", Destination: "pub.>"} }},
-		{"subject delete marker ttl", func(c *StreamConfig) { c.SubjectDeleteMarkerTTL = time.Minute }},
-		{"message counter", func(c *StreamConfig) { c.AllowMsgCounter = true }},
-		{"allow rollup", func(c *StreamConfig) { c.AllowRollup = true }},
+		// The in-flight space missing: every register, marker and authority write lands
+		// nowhere, since no stream claims the subject.
+		{"no in-flight space", without(mqttInflightStreamSubjectPrefix + ">"), "subjects"},
+		// The shared space missing: every group and ledger write lands nowhere.
+		{"no shared space", without(mqttSharedLifecycleStreamSubjectPrefix + ">"), "subjects"},
+		// A PUBLISH-phase register and its unsent marker are one atomic batch.
+		{"no atomic publish", func(c *StreamConfig) { c.AllowAtomicPublish = false }, "allow_atomic"},
+		// The exact-sequence delete every terminal in-flight path performs.
+		{"deny delete", func(c *StreamConfig) { c.DenyDelete = true }, "deny_delete"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
 			tc.mut(&si.Config)
-			if err := validateInflightStream(si, 3, testBundleEpoch); err == nil {
+			err := validateSessStream(si, _EMPTY_, 3)
+			if err == nil {
 				t.Fatalf("%s must fail validation", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.errWant) {
+				t.Fatalf("the refusal must name %q, got: %v", tc.errWant, err)
 			}
 		})
 	}
 
-	// Deliberately NOT a prerequisite: nothing ever creates a consumer here, so a
-	// stream-forced consumer inactivity limit cannot affect this owner. Listing a
-	// prerequisite the owner does not have would fail startups for no reason.
-	si = good()
-	si.Config.ConsumerLimits.InactiveThreshold = time.Minute
-	if err := validateInflightStream(si, 3, testBundleEpoch); err != nil {
-		t.Fatalf("a consumer inactivity limit is irrelevant to a stream with no consumers: %v", err)
-	}
-
-	// DenyPurge stopped being a prerequisite with issue #38, and this asserts the removal
-	// positively rather than leaving its absence to be inferred. The teardown's
+	// DenyPurge stopped being a prerequisite with issue #38, when the teardown's
 	// per-incarnation FILTER PURGE was replaced by reapIncarnationRegisters, which deletes
-	// at exact sequences — covered by the DenyDelete rejection above. Refusing DenyPurge
-	// would reject a hardened stream this broker can use, for a purge that no longer
-	// exists, so this test would fail if the rejection came back.
-	si = good()
+	// at exact sequences; and the shared-group records are never removed at all. Refusing
+	// it would reject a hardened stream this broker can use, for a purge that no longer
+	// exists, so this fails if the rejection comes back.
+	si := good()
 	si.Config.DenyPurge = true
-	if err := validateInflightStream(si, 3, testBundleEpoch); err != nil {
-		t.Fatalf("deny_purge must be accepted since issue #38 replaced the filter purge with "+
-			"exact-sequence deletes: %v", err)
+	if err := validateSessStream(si, _EMPTY_, 3); err != nil {
+		t.Fatalf("deny_purge must be accepted: nothing purges the session stream: %v", err)
 	}
 }
 
@@ -571,7 +546,7 @@ func (e *testInflightEnv) countRegisters(t *testing.T) int {
 	filter := mqttInflightWalkFilter(e.sess.idHash, e.sess.gen)
 	n := 0
 	for seq := uint64(1); ; {
-		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, seq)
+		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
 				t.Fatalf("walk registers: %v", err)
@@ -1659,7 +1634,7 @@ func TestMQTTInflightRecoveryReservesUnreadableRegister(t *testing.T) {
 	}
 
 	// Removing the unreadable record restores allocation on the next resume.
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, ack.regSeq, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, ack.regSeq, true); err != nil {
 		t.Fatalf("remove the unreadable register: %v", err)
 	}
 	e.sess.mu.Lock()
@@ -2096,7 +2071,7 @@ func TestMQTTInflightDrainCompletesWhenRegisterAlreadyGone(t *testing.T) {
 	}}
 	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
 	e.sess.mu.Unlock()
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, regSeq, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, regSeq, true); err != nil {
 		t.Fatalf("pre-delete the register: %v", err)
 	}
 
@@ -2136,7 +2111,7 @@ func TestDrainFinalizeRereadsAmbiguityUnderTheFence(t *testing.T) {
 	e.sess.drains = map[string]*mqttDrain{sid: {cc: cc, qos: 2, seqs: map[uint64]*drainSeq{sseq: st}}}
 	e.sess.drainByDur = map[string]*mqttDrain{dur: e.sess.drains[sid]}
 	e.sess.mu.Unlock()
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, regSeq, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, regSeq, true); err != nil {
 		t.Fatalf("pre-delete the register: %v", err)
 	}
 	// The apply lands DURING the release: the finalize has already read the flag as clear.
@@ -2305,7 +2280,7 @@ func TestMQTTInflightCancelledRegisterTombstoneFreesIdentifier(t *testing.T) {
 // recovery frees the identifier through it.
 //
 // The ladder is delete -> tombstone -> persisted nonce, and the first two share a storage
-// domain ($MQTT_inflight), so they usually fail together — which is exactly when the session
+// domain (the $MQTT.inflight. space), so they usually fail together — which is exactly when the session
 // record must carry the verdict. Without it, a crash leaves a register whose consumer is
 // gone, which recovery deliberately does not read as complete: its identifier and its
 // Receive Maximum slot would be reserved for the life of the session.
@@ -2334,14 +2309,14 @@ func TestMQTTInflightTeardownLadderPersistsVerdict(t *testing.T) {
 		t.Fatalf("the teardown must report the register of its transmitted delivery, got %+v", regs)
 	}
 
-	// The whole register stream is unavailable: neither the delete nor the tombstone lands.
+	// The whole register store is unavailable: neither the delete nor the tombstone lands.
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, fmt.Errorf("test: register stream unavailable")
+		return 0, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, fmt.Errorf("test: register stream unavailable")
+		return nil, nil, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.mu.Unlock()
 
@@ -2433,7 +2408,7 @@ func TestMQTTInflightTeardownLadderTombstoneBoundsVerdicts(t *testing.T) {
 	}
 }
 
-// A consumer teardown makes its cancellations durable ON THE REGISTER STREAM before the
+// A consumer teardown makes its cancellations durable ON THE REGISTER STORE before the
 // consumer goes, and holds the identifier until the store settles.
 //
 // These callers (a QoS downgrade's deferred consumer delete, a forced shared leave, a shared
@@ -2492,7 +2467,7 @@ func TestMQTTInflightConsumerPurgeSecuresCancellations(t *testing.T) {
 			t.Errorf("the cancellation must be securable")
 		}
 
-		// The tombstone is on the register stream, so a restart needs nothing else.
+		// The tombstone is on the register store, so a restart needs nothing else.
 		rec, smsg := e.loadRegister(t, pi)
 		if rec == nil || smsg == nil {
 			t.Errorf("no cancellation tombstone was written for pi %d", pi)
@@ -2882,10 +2857,10 @@ func TestMQTTInflightCleanupHelpersTolerateNoClient(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, fmt.Errorf("test: register stream unavailable")
+		return 0, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, fmt.Errorf("test: register stream unavailable")
+		return nil, nil, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.mu.Unlock()
 	restore := setMQTTTestSessSaveHook(func(*mqttSession) error {
@@ -3326,7 +3301,7 @@ func TestMQTTInflightLateCancellationVerdictIsPersisted(t *testing.T) {
 		if failDeletes {
 			return fmt.Errorf("test: delete unavailable")
 		}
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
 		// Indeterminate, so the mark's reconcile cannot conclude the record is gone.
@@ -3416,7 +3391,7 @@ func TestMQTTInflightStalledStoreHoldsReservation(t *testing.T) {
 // A settled-but-unproven cancellation keeps its identifier until the verdict's save lands.
 //
 // The settle point (the store's confirmation) can find every durable rung failing — the
-// register stream down for the delete AND the tombstone, the session record down for the
+// register store down for the delete AND the tombstone, the session record down for the
 // verdict. Releasing the identifier there hands it to a new delivery while nothing durable
 // anywhere calls the old register void; a crash then resurrects it as an ordinary delivery
 // holding a Receive Maximum slot forever. The release belongs to the save that proves the
@@ -3449,10 +3424,10 @@ func TestMQTTInflightUnprovenSettleKeepsReservation(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, fmt.Errorf("test: register stream unavailable")
+		return 0, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, fmt.Errorf("test: register stream unavailable")
+		return nil, nil, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.mu.Unlock()
 	restoreSave := setMQTTTestSessSaveHook(func(*mqttSession) error {
@@ -3784,7 +3759,7 @@ func TestMQTTInflightSlotOnlyConsumedCloseRetiresLiveMemory(t *testing.T) {
 	e.asm.testInflightStore = func(subject string, expectSeq uint64, r *mqttInflightRecord) (uint64, error) {
 		if r.Claim == ownClaim && mqttDurIsSlotOnlyClass(r.Dur) && !raced {
 			raced = true
-			if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, expectSeq, true); err != nil {
+			if err := e.asm.jsa.deleteMsg(mqttSessStreamName, expectSeq, true); err != nil {
 				t.Errorf("the close's delete must land first: %v", err)
 			}
 		}
@@ -4120,10 +4095,10 @@ func TestMQTTInflightSharedPurgeLadderKeepsConsumer(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, fmt.Errorf("test: register stream unavailable")
+		return 0, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, fmt.Errorf("test: register stream unavailable")
+		return nil, nil, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.mu.Unlock()
 
@@ -4253,10 +4228,10 @@ func TestMQTTInflightSharedRejoinUnaffectedByOldVerdict(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return fmt.Errorf("test: delete unavailable") }
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, fmt.Errorf("test: register stream unavailable")
+		return 0, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, fmt.Errorf("test: register stream unavailable")
+		return nil, nil, fmt.Errorf("test: register store unavailable")
 	}
 	e.asm.mu.Unlock()
 	e.sess.deleteInflightRegisters(e.c, recordTx{}, regs, mqttTestLicence(e.sess, nil))
@@ -4869,12 +4844,14 @@ func TestMQTTInflightRecoveryReadsInBatches(t *testing.T) {
 	e.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
 		enumerations++
 		filters = append(filters, filter)
-		subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+		subjects, _, err := e.asm.jsa.streamSubjects(mqttSessStreamName, filter)
 		return subjects, err
 	}
 	e.asm.mu.Unlock()
+	// Counted for THIS client only: the hook is process-wide, and a sweep another test's broker
+	// runs over the whole in-flight space at the same time is not this recovery's walk.
 	restore := setMQTTTestLoadNextMsgHook(func(stream, subject string, seq uint64) error {
-		if stream == mqttInflightStreamName {
+		if testInflightSpace(stream, subject) && strings.Contains(subject, e.sess.idHash) {
 			nextWalks++
 		}
 		return nil
@@ -5336,7 +5313,7 @@ func TestMQTTInflightCancelledRegisterDeleteIsConfirmed(t *testing.T) {
 			return fmt.Errorf("test: transient delete failure")
 		}
 		// Delete for real, so the absence assertion below means something.
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	e.asm.mu.Unlock()
 
@@ -5433,7 +5410,7 @@ func TestMQTTInflightTeardownReapsRegisters(t *testing.T) {
 	}
 	// Count against the RETIRED generation: the live one is fresh and empty.
 	filter := mqttInflightWalkFilter(e.sess.idHash, retiring)
-	if _, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, 1); err == nil {
+	if _, err := e.asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, 1); err == nil {
 		t.Fatalf("the retired incarnation's registers must be reaped")
 	} else if isErrorOtherThan(err, JSNoMessageFoundErr) {
 		t.Fatalf("walk the retired registers: %v", err)
@@ -5544,7 +5521,7 @@ func TestMQTTInflightOrphanReconcile(t *testing.T) {
 		mu.Lock()
 		requested = append(requested, s)
 		mu.Unlock()
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, s, false)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, s, false)
 	}
 	e.asm.mu.Unlock()
 	requestedSeeded := func() bool {

@@ -289,7 +289,7 @@ type mqttSession struct {
 	sharedCharged map[string]int
 	// sharedTenure is WHICH CONNECT of this generation may acquire shared group durables: the
 	// stream sequence of this acceptance's own create-only fact, and the authority tenure the
-	// acceptance was finalized under — one tenure, named on both streams (issue #107 8b). Fixed for
+	// acceptance was finalized under — one tenure, named in both records (issue #107 8b). Fixed for
 	// the connection; every join and fence it composes names exactly this, and every acceptance
 	// installs it on the generation's acquisition ledger before it reconciles or serves. See
 	// mqttSharedTenure and mintAcceptanceTenure.
@@ -796,7 +796,7 @@ type mqttPersistedSession struct {
 	// builder filters group-owned configs out of Cons as redundant.
 	//
 	// It is NOT a holder registry. Whether a group consumer may be deleted is decided by the
-	// group record's CAS on $MQTT_shared (shared_lifecycle.go), never by walking these maps
+	// group record's CAS in the $MQTT.shared. space (shared_lifecycle.go), never by walking these maps
 	// across the record set; a membership's absence authorizes no release — a release is
 	// authorized by a verdict in AcqReleases. Spec5 [4.8.2].
 	SharedSubs map[string]mqttSharedMembership `json:"shared_subs,omitempty"`
@@ -898,7 +898,7 @@ type mqttPersistedSession struct {
 	// resume that state: every reader that can INTERPRET the record finishes the
 	// teardown (the deletions are generation-scoped; repeating them is safe for names nothing
 	// can re-occupy, bounded per walk for the inbound QoS 2 hold walk — issue #66 — and bounded
-	// by its own enumeration watermark for the `$MQTT_inflight` reap — issue #38) and releases
+	// by its own enumeration watermark for the in-flight reap — issue #38) and releases
 	// the record before starting fresh. A reader that refuses the record's schema does not
 	// resume it either, but it does not finish it: the expiry path and the orphan
 	// sweep pick a reserved-namespace record up only while its GENERATION is valid,

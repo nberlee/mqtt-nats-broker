@@ -208,9 +208,9 @@ func mqttValidateDirShard(s *mqttDirShard, wantShard uint64) error {
 //
 // # Why this rides the closing batch and not a write of its own
 //
-// Every issue #107 class lives on $MQTT_inflight, and a JetStream atomic batch is per stream, so the
-// closure, the enrolment, the sealed ledger, the header and the root commit together or not at
-// all. A second write after the closure would leave a crash window in which a sealed, enrolled,
+// Every issue #107 class lives in the $MQTT.inflight. space of one stream, and the closing is one
+// atomic batch, so the closure, the enrolment, the sealed ledger, the header and the root commit
+// together or not at all. A second write after the closure would leave a crash window in which a sealed, enrolled,
 // CLOSED generation has no root — which the release gate refuses for ever, and which could only
 // be repaired by discovering unrooted closed generations, the very enumeration the paged
 // directory exists to avoid.
@@ -390,7 +390,7 @@ func (jsa *mqttJSA) persistShard(h *mqttDirShard, expect uint64) (uint64, error)
 
 // loadDirShardAt reads one shard header with the sequence it stands at.
 func (jsa *mqttJSA) loadDirShardAt(shard uint64) (*mqttDirShard, uint64, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttShardSubject(shard))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttShardSubject(shard))
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("reading directory shard %d: %w", shard, err)
@@ -720,7 +720,7 @@ func (jsa *mqttJSA) sweepOneBatchCharged(r *mqttRecoveryRoot,
 		}
 		out.Examined++
 		subj := mqttDutySubject(idHash, r.Gen, ord)
-		smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		switch {
 		case lerr != nil && isErrorOtherThan(lerr, JSNoMessageFoundErr):
 			// AN UNRESOLVED READ IS NOT AN ANSWER. The sweep cannot say whether this ordinal is
@@ -790,7 +790,7 @@ func (jsa *mqttJSA) persistSweep(r *mqttRecoveryRoot, expect uint64) (uint64, er
 
 // loadRecoveryRoot reads one root with its sequence, returning nil when none stands.
 func (jsa *mqttJSA) loadRecoveryRoot(shard, ord uint64) (*mqttRecoveryRoot, uint64, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttRootSubject(shard, ord))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttRootSubject(shard, ord))
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("reading recovery root %d/%d: %w", shard, ord, err)

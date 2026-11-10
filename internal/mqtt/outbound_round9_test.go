@@ -139,7 +139,7 @@ func TestAcquisitionIsDecidedByTheExchange(t *testing.T) {
 	if err := acquire("txn-pub", mqttActionPublish, 1, nonce); err != nil {
 		t.Fatalf("acquiring the publish was refused: %v", err)
 	}
-	amsg, aerr := jsa.loadLastMsgFor(mqttInflightStreamName,
+	amsg, aerr := jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttActionSubject(getHash(e.id), auth.Gen, nonce, 1))
 	if aerr != nil {
 		t.Fatalf("the acquired action does not load back: %v", aerr)
@@ -818,7 +818,7 @@ func TestAnActionIsLegalAgainstWhatItsBatchLeaves(t *testing.T) {
 	if after.Phase != mqttExchangePublish {
 		t.Fatalf("the refused batch advanced the exchange to phase %d", after.Phase)
 	}
-	if _, err := jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttActionSubject(getHash(e.id), auth.Gen, nonce, 1)); err == nil {
 		t.Fatalf("the refused batch installed its action")
 	}
@@ -1063,11 +1063,11 @@ func TestNewWorkIsCarriedOnlyByTheKindThatAdmitsIt(t *testing.T) {
 	}
 
 	// Nothing landed, and the authority did not move.
-	if _, err := jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(e.id), auth.Gen, fresh)); err == nil {
 		t.Fatalf("the refused closure installed its exchange")
 	}
-	if _, err := jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttActionSubject(getHash(e.id), auth.Gen, standing, 1)); err == nil {
 		t.Fatalf("the refused closure installed its action")
 	}
@@ -1342,7 +1342,7 @@ func TestARegisterSaysWhatItsSubjectNames(t *testing.T) {
 	}
 	// NOTHING DURABLE HAPPENED, at either identifier.
 	for _, subj := range []string{moved, mqttInflightSubject(getHash(e.id), testGen, 7)} {
-		if _, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
+		if _, err := jsa.loadLastMsgFor(mqttSessStreamName, subj); err == nil {
 			t.Fatalf("the refused admission installed a register on %q", subj)
 		}
 	}
@@ -1420,7 +1420,7 @@ func TestAnObligationHoldsOneAllocation(t *testing.T) {
 		}
 	}
 	for _, subj := range []string{ninth, mqttInflightSubject(getHash(e.id), testGen, 7)} {
-		if _, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
+		if _, err := jsa.loadLastMsgFor(mqttSessStreamName, subj); err == nil {
 			t.Fatalf("the refused admission installed a register on %q", subj)
 		}
 	}
@@ -1488,7 +1488,7 @@ func TestOneAcquisitionPerObligationInABatch(t *testing.T) {
 		t.Fatalf("a batch acquired two emitting actions for one obligation")
 	}
 	for _, acq := range []uint64{1, 2} {
-		if _, err := jsa.loadLastMsgFor(mqttInflightStreamName,
+		if _, err := jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttActionSubject(getHash(e.id), auth.Gen, nonce, acq)); err == nil {
 			t.Fatalf("the refused batch installed its action at acquisition %d", acq)
 		}
@@ -1869,7 +1869,7 @@ func TestATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 		t.Fatalf("the first admission was refused: %v", err)
 	}
 	ledSubj := mqttGenLedgerSubject(getHash(e.id), testGen)
-	good, err := jsa.loadLastMsgFor(mqttInflightStreamName, ledSubj)
+	good, err := jsa.loadLastMsgFor(mqttSessStreamName, ledSubj)
 	if err != nil {
 		t.Fatalf("reading the ledger: %v", err)
 	}
@@ -2018,7 +2018,7 @@ func TestAnAllocationIsAdmittedWithItsObligation(t *testing.T) {
 		t.Fatalf("an identifier was allocated with no obligation behind it, or refused for another "+
 			"reason: %v", err)
 	}
-	if _, err := jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err == nil {
+	if _, err := jsa.loadLastMsgFor(mqttSessStreamName, regSubj); err == nil {
 		t.Fatalf("the refused allocation installed its register")
 	}
 

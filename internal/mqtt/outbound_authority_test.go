@@ -32,7 +32,7 @@ const (
 // TestSubjectsAreUnreachableByTheRegisterMachinery is the tripwire the class token
 // exists for.
 //
-// The issue #107 record classes share $MQTT_inflight with the outbound registers, because
+// The issue #107 record classes share a stream with the outbound registers, because
 // JetStream's atomic batches are per stream and the authority has to commit with the
 // exchange mutation it authorizes. Sharing the stream means sharing the subject space with
 // a reap that deletes what its enumeration returns, so the separation is asserted here
@@ -1079,7 +1079,7 @@ func TestMembersAreConfinedToTheirOwnStreamAndClient(t *testing.T) {
 	idHash := getHash(testID)
 
 	for name, subj := range map[string]string{
-		"another stream entirely":   mqttSessStreamSubjectPrefix + idHash,
+		"a session record subject":  mqttSessStreamSubjectPrefix + idHash,
 		"the retained-message tree": mqttRetainedMsgsStreamSubject,
 		"a wildcard":                mqttInflightStreamSubjectPrefix + idHash + "." + testGen + ".*",
 		"another client's register": mqttInflightSubject("zzzz9999", testGen, 3),

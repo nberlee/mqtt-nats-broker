@@ -684,17 +684,28 @@ func (jsa *mqttJSA) storeInflightPair(subject string, regExpect, markerExpect ui
 	if aerr := resp.ToError(); aerr != nil {
 		return 0, aerr
 	}
-	if resp.PubAck == nil {
-		return 0, fmt.Errorf("the in-flight pair on %q was acknowledged with no publish acknowledgement", subject)
-	}
-	if resp.BatchId != batchID || resp.BatchSize != mqttInflightPairBatchSize {
-		return 0, fmt.Errorf("the in-flight pair on %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
-			subject, resp.BatchSize, resp.BatchId, mqttInflightPairBatchSize, batchID)
-	}
-	if resp.Stream != mqttInflightStreamName {
-		return 0, fmt.Errorf("the in-flight pair on %q was acknowledged on stream %q (want %q)", subject, resp.Stream, mqttInflightStreamName)
+	if cerr := mqttCheckInflightPairBatchAck(resp, batchID, subject); cerr != nil {
+		return 0, cerr
 	}
 	return resp.Sequence, nil
+}
+
+// mqttCheckInflightPairBatchAck binds a pair write's success to the batch this broker sent:
+// its id, both members, and the stream the register lives on. The caller adopts the
+// acknowledged sequence as the REGISTER's, which is true only of an acknowledgement naming
+// this batch.
+func mqttCheckInflightPairBatchAck(resp *JSPubAckResponse, batchID, subject string) error {
+	if resp.PubAck == nil {
+		return fmt.Errorf("the in-flight pair on %q was acknowledged with no publish acknowledgement", subject)
+	}
+	if resp.BatchId != batchID || resp.BatchSize != mqttInflightPairBatchSize {
+		return fmt.Errorf("the in-flight pair on %q was acknowledged as %d message(s) under batch %q, but this broker sent %d under %q",
+			subject, resp.BatchSize, resp.BatchId, mqttInflightPairBatchSize, batchID)
+	}
+	if resp.Stream != mqttSessStreamName {
+		return fmt.Errorf("the in-flight pair on %q was acknowledged on stream %q (want %q)", subject, resp.Stream, mqttSessStreamName)
+	}
+	return nil
 }
 
 // storeInflightPair honours the instance-scoped test seams. testInflightStorePair replaces
@@ -787,7 +798,7 @@ func (as *mqttAccountSessionManager) loadInflightMarker(caller, regSubject strin
 		body, _ := mqttBuildInflightMarker(ghost.nonce)
 		smsg = &StoredMsg{Subject: subject, Sequence: mqttTestGhostMarkerSeq, Data: body}
 	default:
-		smsg, err = as.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, err = as.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	}
 	switch {
 	case err != nil && isErrorOtherThan(err, JSNoMessageFoundErr):
@@ -868,7 +879,7 @@ func (as *mqttAccountSessionManager) deleteInflightMarker(caller, regSubject str
 				return err
 			}
 		}
-		return as.jsa.deleteMsg(mqttInflightStreamName, seq, false)
+		return as.jsa.deleteMsg(mqttSessStreamName, seq, false)
 	}
 	// CONFIRMED: retried, and the outcome the caller classifies is the outcome of the WHOLE
 	// operation. An attempt that got no authoritative answer may have landed, and no later
@@ -887,7 +898,7 @@ func (as *mqttAccountSessionManager) deleteInflightMarker(caller, regSubject str
 			err = (*hook)(caller, subject, seq)
 		}
 		if err == nil {
-			err = as.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+			err = as.jsa.deleteMsg(mqttSessStreamName, seq, true)
 		}
 		if err == nil {
 			return nil

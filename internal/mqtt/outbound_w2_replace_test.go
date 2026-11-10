@@ -199,7 +199,7 @@ func TestRegisterOnlyReplacementChargesOnce(t *testing.T) {
 	if err != nil || x1.Nonce != x0.Nonce || x1.Phase != mqttExchangePublish || x1seq != x0seq {
 		t.Fatalf("E1 changed under a register-only replacement: %+v at %d (was %+v at %d) err=%v", x1, x1seq, x0, x0seq, err)
 	}
-	if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(sess.idHash, f.gen, heir.Nonce)); xm != nil ||
+	if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(sess.idHash, f.gen, heir.Nonce)); xm != nil ||
 		!IsNatsErr(xerr, JSNoMessageFoundErr) {
 		t.Fatalf("an exchange was created for the heir's transmission nonce %q: %+v (%v)", heir.Nonce, xm, xerr)
 	}
@@ -278,7 +278,7 @@ func TestFailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
 		}
 		// The occupant's register goes, so the replacement - which CASes at the occupant's
 		// observed sequence and is re-derived by the boundary from the occupant it reads - fails.
-		if derr := e.asm.jsa.deleteMsg(mqttInflightStreamName, occSeq, true); derr != nil {
+		if derr := e.asm.jsa.deleteMsg(mqttSessStreamName, occSeq, true); derr != nil {
 			return mqttOpOutcome{}, derr
 		}
 		mu.Lock()
@@ -346,7 +346,7 @@ func TestFailedRegisterOnlyAttemptRetriesOnAFreshLineage(t *testing.T) {
 	if admitted {
 		t.Fatal("a create was admitted on an identifier the unended E1 still holds")
 	}
-	if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
+	if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
 		!IsNatsErr(xerr, JSNoMessageFoundErr) {
 		t.Fatalf("an exchange was created for %q beside the standing E1: %+v (%v)", nonce, xm, xerr)
 	}
@@ -455,7 +455,7 @@ func TestRegisterOnlyLostResponseChargesOnce(t *testing.T) {
 			if !testCustodyHasExchange(sess, f.lin) {
 				t.Fatal("the continued obligation E1 lost its charge")
 			}
-			if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
+			if xm, xerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
 				!IsNatsErr(xerr, JSNoMessageFoundErr) {
 				t.Fatalf("an exchange was created for the heir's transmission nonce %q: %+v (%v)", nonce, xm, xerr)
 			}
@@ -574,7 +574,7 @@ func TestAReplacementRespectsAThirdStandingExchange(t *testing.T) {
 		xC.Phase != mqttExchangePublish || xseq != xC0seq {
 		t.Fatalf("the third exchange moved under a refused replacement: %+v at %d (was %d) err=%v", xC, xseq, xC0seq, lerr)
 	}
-	if xm, xerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
+	if xm, xerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(sess.idHash, f.gen, nonce)); xm != nil ||
 		!IsNatsErr(xerr, JSNoMessageFoundErr) {
 		t.Fatalf("the refused replacement created an exchange for %q: %+v (%v)", nonce, xm, xerr)
 	}

@@ -1173,11 +1173,11 @@ func jsPathRefusalCosts(t *testing.T) {
 	resSubj := func(f *fixture) string { return mqttResourceSubject(f.e.sess.idHash, f.gen, f.srcInc) }
 	del := func(subj func(*fixture) string) func(*testing.T, *fixture) {
 		return func(t *testing.T, f *fixture) {
-			smsg, err := f.e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj(f))
+			smsg, err := f.e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj(f))
 			if err != nil {
 				t.Fatalf("fixture: %v", err)
 			}
-			if err := f.e.asm.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+			if err := f.e.asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 				t.Fatalf("fixture: %v", err)
 			}
 		}

@@ -111,7 +111,7 @@ func TestMQTTDrainClusterResumesOnAnotherBroker(t *testing.T) {
 
 	// B redelivers the claim and completes the exchange UNDER THE ORIGINAL IDENTIFIER.
 	// Continuity is no longer a deviation on any outbound path: the in-flight register on
-	// $MQTT_inflight is restored before source interest is, and drain recovery reserves the
+	// the $MQTT.inflight. space is restored before source interest is, and drain recovery reserves the
 	// identifier the drain already recorded. This assertion previously discarded piA on the
 	// strength of the old deviation, so a continuity regression here would have passed.
 	qos, piB := testMQTTReadPublishV5(t, rb, topic, []byte("payload"))

@@ -69,7 +69,7 @@ func (sess *mqttSession) clearWindowHook(window string) {
 // resource named here is generation-scoped. Generation scoping protects the next
 // incarnation; a resume preserves the generation, so it never protected a peer still
 // serving the retiring one. What protects that peer's inbound QoS 2 state is the bound
-// each hold removal carries (issue #66); $MQTT_inflight now carries the same kind of bound,
+// each hold removal carries (issue #66); the in-flight reap now carries the same kind of bound,
 // its reap's own enumeration watermark (issue #38). What neither bound does is arbitrate a
 // peer that is genuinely still serving the retiring incarnation — that needs an ownership
 // predicate, which is issue #40's. See sess_teardown.go.
@@ -254,7 +254,7 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	// These verdicts are per-incarnation and they only ever reach durable state through
 	// the session record (VoidedRegs on the way out, mqttNonceSet on the way back in),
 	// and a discard DELETES that record — so no later reader can obtain a retired
-	// generation's verdicts, whatever survives on $MQTT_inflight. That is the reason, and
+	// generation's verdicts, whatever survives in the $MQTT.inflight. space. That is the reason, and
 	// it deliberately does NOT rest on the teardown having removed every register: since
 	// issue #38 the reap spares anything above its enumeration watermark and refuses outright
 	// on an unreadable one, and clear()'s no-record branch has no marker to re-drive it,
@@ -505,7 +505,7 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 // destroyReleasing is destroy with one addition: onRetirementDurable, when non-nil, is
 // invoked exactly once, as soon as the retirement is DURABLY OWNED — the teardown claim and its
 // receipt on $MQTT_sess, the retirement watermark naming this generation on $MQTT_teardown,
-// and the discarding closure with its recovery root on $MQTT_inflight — and before the shared
+// and the discarding closure with its recovery root in the $MQTT.inflight. space — and before the shared
 // closing, the deletions and the record release. The clean close releases the client-ID gate
 // there, so a clean-start successor does not wait for the reclamation that follows: a CONNECT
 // that reads the marked record then finds every fact it needs to displace it
@@ -584,7 +584,7 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	// that obligation. See unsub_drain.go.
 	durs = append(durs, sess.drainDurablesLocked()...)
 	// The shared group durables are NOT a teardown target. Every acquisition this generation
-	// holds is listed by its acquisition ledger on $MQTT_shared, and the closing releases
+	// holds is listed by its acquisition ledger in the $MQTT.shared. space, and the closing releases
 	// them from that ledger — sealing it first, so no late join can add to it — before the
 	// record is deleted (closeSharedGeneration). No name derived from this session's own
 	// membership decides another member's consumer. Spec5 [4.8.2].
@@ -630,7 +630,7 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 				mqttAffineRetireDescriptor(q2AffDur, q2AffGen, pubRelDur)
 			// Carried into the close's first-attempt fast path: the authority just read and the
 			// sequence to CAS against. The claim below writes only the marker and the receipt on
-			// $MQTT_sess, never the authority on $MQTT_inflight, so this sequence is still current
+			// $MQTT_sess, never the authority in the $MQTT.inflight. space, so this sequence is still current
 			// when the close commits.
 			closePrev, closePrevSeq = al.rec, al.seq
 		}
@@ -741,7 +741,7 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	// delete cannot be atomic. Generation-scoped naming is what keeps these deletes off
 	// the NEXT incarnation's resources; it does not establish that no peer is still
 	// serving this one. For the inbound QoS 2 holds that is covered by the bound each
-	// removal carries (issue #66); for $MQTT_inflight it is the bound issue #38 added, its reap's
+	// removal carries (issue #66); for the in-flight reap it is the bound issue #38 added, its reap's
 	// own enumeration watermark. Neither bound arbitrates a genuinely live owner of the
 	// same record — that is issue #40's predicate. The hook here is how a test parks a broker
 	// in exactly that window.

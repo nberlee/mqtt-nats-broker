@@ -2752,8 +2752,8 @@ func TestQ2AffineAmbiguousProvisioningSurvivesRestartUntilTeardown(t *testing.T)
 	// The provisioning save LANDS and its response is lost; the readback that would
 	// classify it is unavailable, so the session is still unresolved at the restart.
 	suppressRead := &atomic.Bool{}
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressRead.Load() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressRead.Load() {
 			return fmt.Errorf("test: readback unavailable")
 		}
 		return nil
@@ -3876,7 +3876,7 @@ func TestQ2AffOwnClaimRefusesSourceAckWhenTheStoreKeptNothing(t *testing.T) {
 // $MQTT_qos2assign's claims behind with their sequence counter reset underneath them.
 //
 // Recreating it ALONE is what startup USED TO instruct, and that reachability is what
-// made this issue #70's flagship row. issue #70's enforcement (2026-09-01) withdrew it: the ten
+// made this issue #70's flagship row. issue #70's enforcement (2026-09-01) withdrew it: the broker-owned
 // streams are one recreation unit and a proper subset is refused before anything is
 // provisioned, so the state below is now reachable only through an UNSUPPORTED operation
 // — administrative deletion or a partial restore. The behaviour this test pins is

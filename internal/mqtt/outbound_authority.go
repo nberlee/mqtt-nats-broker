@@ -36,9 +36,9 @@ import (
 // the tenure currently admitted to create outbound obligations, and every transition that
 // creates an obligation, acquires an action, transfers ownership or closes admission
 // contends on it — committing in the SAME atomic batch as the exchange mutation it
-// authorizes. Because JetStream's atomic batches are per stream, that co-location is why
-// these records live on $MQTT_inflight beside the registers they govern rather than on
-// $MQTT_sess beside the session record.
+// authorizes. JetStream's atomic batches are per stream, so the authority shares a stream
+// with the exchanges it governs; the session record shares it too ($MQTT_sess), but no
+// transition here commits with it.
 //
 // Three facts are kept apart, because collapsing any two of them is what every prior
 // attempt did:
@@ -340,7 +340,7 @@ const (
 	// (issue #107 7e): the second step of a shared acquisition's release, written after the ledger
 	// closed the acquisition, so every shared admission that read readiness before the close —
 	// and CASes the authority sequence it read — loses its CAS. It carries no member and changes
-	// no state or ownership; its licence (the verdict) lives on $MQTT_shared, out of this
+	// no state or ownership; its licence (the verdict) lives on the shared ledger, out of this
 	// boundary's sight, and its whole cost to a concurrent operation is one CAS re-read.
 	mqttTransitionFenceSharedRelease mqttTransitionKind = "fence-shared-release"
 	// mqttTransitionFencePendingDisposal advances a SERVING authority's revision and nothing else,

@@ -30,10 +30,10 @@ The embedded listener keeps its state in five streams in each account it serves:
 `$MQTT_sess`, `$MQTT_msgs`, `$MQTT_rmsgs`, `$MQTT_qos2in` and `$MQTT_out`. A server
 creates them the first time it initializes MQTT for that account, which happens on
 the first MQTT CONNECT that authenticates into it after the server starts. Every one
-of those names is also one of the ten streams this broker keeps in the account, and
-the ten are one unit: the broker starts on an account holding none of them (it
-creates them) or all ten, and refuses anything in between (see
-[The ten streams are one recreation unit](ARCHITECTURE.md#the-ten-streams-are-one-recreation-unit)).
+of those names is also one of the eight streams this broker keeps in the account, and
+the eight are one unit: the broker starts on an account holding none of them (it
+creates them) or all eight, and refuses anything in between (see
+[The eight streams are one recreation unit](ARCHITECTURE.md#the-eight-streams-are-one-recreation-unit)).
 `-js-domain` does not separate them: stream names carry no domain.
 
 Started on an account the embedded listener has used, the broker stops at once with:
@@ -139,7 +139,7 @@ this is a cutover with downtime. Steps in order; each states what it depends on.
    ```
 
 6. **Start the brokers** and wait for `/readyz` on each. The first to start creates
-   the ten streams; the others adopt them.
+   the eight streams; the others adopt them.
 7. **Move clients**: point DNS or the load balancer at the broker. How fast clients
    follow depends on their reconnect back-off, cached resolutions and long-lived
    connections as much as on a DNS TTL.
@@ -152,7 +152,7 @@ this is a cutover with downtime. Steps in order; each states what it depends on.
 | Before step 3 | Nothing has changed. | Put the old endpoint back. |
 | During step 3 or 4 | Some or all servers run without `mqtt {}`. The five streams still exist; how much of their state still serves clients is not promised. | Either continue, or restore `mqtt {}` on every server and accept what the embedded listener resumes. |
 | During step 5 | Some of the five are deleted; the old state is partly gone. | Delete the rest, with every server still without `mqtt {}`, and continue. |
-| During step 6 | A broker stopped or failed while creating its ten streams; any subset may exist. | Stop every broker, restart controllers included, list the `$MQTT_*` streams, and if the set is incomplete delete all of them and start again. This is the broker's own whole-bundle reset ([The ten streams are one recreation unit](ARCHITECTURE.md#the-ten-streams-are-one-recreation-unit)). |
+| During step 6 | A broker stopped or failed while creating its eight streams; any subset may exist. | Stop every broker, restart controllers included, list the `$MQTT_*` streams, and if the set is incomplete delete all of them and start again. This is the broker's own whole-bundle reset ([The eight streams are one recreation unit](ARCHITECTURE.md#the-eight-streams-are-one-recreation-unit)). |
 | After step 6 | The broker holds new state. | Going back is a rollback, below. |
 
 ## Cutover into a fresh account
@@ -166,7 +166,7 @@ no recipe for bridging the two accounts.
 ## Verify
 
 - `/readyz` answers 200 on every broker.
-- The account holds ten `$MQTT_*` streams (`nats stream ls`).
+- The account holds eight `$MQTT_*` streams (`nats stream ls`).
 - An MQTT client round-trips a QoS 1 message, sets a retained message and reads it
   back, and on reconnecting with a persistent session gets Session Present 1.
 - The client ACL holds, checked without harming anything: an MQTT 5 client that
@@ -182,7 +182,7 @@ A rollback restores service through the embedded listener with **empty MQTT
 state**:
 
 1. Stop every broker, and whatever would restart them.
-2. Delete all ten broker streams. This discards everything the broker accepted
+2. Delete all eight broker streams. This discards everything the broker accepted
    since the cutover, delayed Wills included. Never start the embedded listener on
    any of them, a partial set included: nats-server uses existing streams of its
    five names as it finds them, and would read records it did not write.

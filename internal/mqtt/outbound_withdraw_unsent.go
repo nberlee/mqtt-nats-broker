@@ -574,7 +574,7 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 		return false, fmt.Errorf("tombstoning %q: %w", subject, errMQTTNoDestroyLicence)
 	}
 	// The instance-scoped register-store seam, honoured exactly as storeInflightCAS honours it:
-	// a rig that fault-injects the register stream reaches this write too.
+	// a rig that fault-injects the register subjects reaches this write too.
 	as.mu.RLock()
 	hook := as.testInflightStore
 	as.mu.RUnlock()

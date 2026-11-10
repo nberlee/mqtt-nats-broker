@@ -65,7 +65,7 @@ func TestResumeReadsFromTheFloor(t *testing.T) {
 				below.Add(1)
 			}
 		}
-		return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		return e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 	}
 	e.asm.mu.Unlock()
 	t.Cleanup(func() { e.asm.mu.Lock(); e.asm.testInflightLoadMulti = nil; e.asm.mu.Unlock() })

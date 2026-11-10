@@ -135,7 +135,7 @@ func mqttDecodeAffineReadiness(data []byte, wantID, wantEpoch, wantGen string) (
 // as missing would refuse a legal seal — or, at the boundary, admit nothing at all.
 func (jsa *mqttJSA) loadAffineReadiness(id, epoch, gen string) (*mqttAffineReadiness, error) {
 	subj := mqttReadinessSubject(getHash(id), gen)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, fmt.Errorf("reading the affine readiness of generation %q: %w", gen, err)

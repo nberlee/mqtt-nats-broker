@@ -419,7 +419,7 @@ func (as *mqttAccountSessionManager) retireRecoveryRoot(s *Server, root *mqttRec
 		s.Debugf("MQTT recovery pass: certifying %q/%q was not confirmed: %v", root.ID, root.Gen, err)
 		return
 	}
-	if derr := as.jsa.deleteMsg(mqttInflightStreamName, rootSeq, true); derr != nil {
+	if derr := as.jsa.deleteMsg(mqttSessStreamName, rootSeq, true); derr != nil {
 		// The certificate stands, so the generation is certified even though its root remains.
 		// The next pass finds the root, re-derives retirement, validates the certificate it
 		// already wrote, and deletes the root again. A conflict or an ambiguity never escalates

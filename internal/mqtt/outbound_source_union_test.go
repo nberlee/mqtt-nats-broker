@@ -105,7 +105,7 @@ func TestARetainedSourceMayNotFabricateADelivery(t *testing.T) {
 //
 // An ordinary exchange's release lives on $MQTT_out at a sequence; a retained one has no such
 // consumer, so its canonical record lives at a unique exchange-specific subject on
-// $MQTT_inflight. Those are different KINDS of reference, and the identity beside the in-flight
+// the $MQTT.inflight. space. Those are different KINDS of reference, and the identity beside the in-flight
 // subject is what makes the difference safe: a subject locates an ADDRESS, and this project has
 // been bitten before by treating an address as an identity.
 func TestACanonicalReferenceIsAKindNotAValue(t *testing.T) {

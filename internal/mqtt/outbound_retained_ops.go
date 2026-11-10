@@ -20,8 +20,8 @@ import (
 
 // The retained materialization operations (issue #107 7c).
 //
-// A retained QoS 1/2 delivery becomes durable in four acts, each one authority batch on
-// $MQTT_inflight, each fenced by the producing connection's CAPTURED entitlement (compared with the
+// A retained QoS 1/2 delivery becomes durable in four acts, each one authority batch in
+// the $MQTT.inflight. space, each fenced by the producing connection's CAPTURED entitlement (compared with the
 // standing authority, never adopted from it):
 //
 //  1. RESERVE: the payload resource, its provision and cleanup duties, and the PROVISIONING

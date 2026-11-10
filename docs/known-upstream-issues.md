@@ -41,7 +41,7 @@ was not repeated.
 
 | ID | One line | Upstream | Blocks | Status |
 |---|---|---|---|---|
-| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register on `$MQTT_inflight` at crash or raw-block recovery; since [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register in the `$MQTT.inflight.` space of `$MQTT_sess` at crash or raw-block recovery; since [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) affine cleanup | Filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
@@ -60,9 +60,9 @@ present in the blocks including the tombstoned one, so limit enforcement leaves
 the older evicted copies in place; the tombstone loop then removes the survivor
 and an intermediate evicted copy is left revived.
 
-**Why it matters here.** `$MQTT_inflight` uses a `MaxMsgsPer:1` subject as a
-single-slot in-flight register. A QoS 1 register is rewritten via
-`Nats-Expected-Last-Subject-Sequence` CAS (each landing limit-evicts the prior
+**Why it matters here.** The `$MQTT.inflight.` space of `$MQTT_sess` uses a
+`MaxMsgsPer:1` subject as a single-slot in-flight register. A QoS 1 register is rewritten
+via `Nats-Expected-Last-Subject-Sequence` CAS (each landing limit-evicts the prior
 copy) and deleted at its exact sequence on ack. On a crash or stale-index
 recovery an evicted intermediate copy revives and recovery restores it as a
 phantom pending message, which exhausts the `MaxAckPending` window.
@@ -76,7 +76,8 @@ a clean shutdown, and no index or rebuild cause is inferred from it.
 **Exposure.** Present independently of
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107): a clean tree fails
 `TestMQTTMaxAckPending` when a single inert permanent record is added to
-`$MQTT_inflight`, so any account whose inflight stream is non-empty at a crash
+`$MQTT_inflight` (then a stream of its own), so any account whose in-flight records share
+a non-empty stream at a crash
 restart is exposed. Since
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) that stream
 is non-empty for every account from its
@@ -84,11 +85,19 @@ first accepted CONNECT, so the population is any account with an admitted regist
 no longer only multi-session accounts. Not claimed for every restart, and not claimed
 universal (below).
 
-**[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) widens
-the potential exposure.** The shared-group transfer's records are on the dedicated
-`$MQTT_shared` stream (`DenyDelete`, so no tombstone and no revival shape), but the
+**[issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) and the stream
+merge widen the potential exposure.** The shared-group transfer's records had a
+dedicated `$MQTT_shared` stream whose `DenyDelete` left no tombstone and so no revival
+shape; since 2026-11-09 they are in the `$MQTT.shared.` space of `$MQTT_sess`, a stream
+that deletes, and that immunity is given up
+([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)). A group record
+or ledger is CAS-rewritten under `MaxMsgsPer:1` but never deleted, so the witnessed
+rewritten-then-explicitly-deleted shape does not apply to it; what changes is that it is
+now a permanent neighbour of records that are, and its presence can keep a block holding
+an eligible deleted register from collapsing. No group-record revival is claimed: none
+has been witnessed. The
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover keeps
-permanent records ON `$MQTT_inflight`: every accepted CONNECT CASes the per-client
+permanent records in the `$MQTT.inflight.` space too: every accepted CONNECT CASes the per-client
 authority and leaves at least two permanent transition outcomes, and every admitted
 QoS 1/2 register is written in one batch with its permanent exchange, outcome and
 dependency records, then CAS-rewritten by its acknowledgement advance and
@@ -99,7 +108,7 @@ only once an obligation was admitted and the defect's own conditions hold. The
 neighbours remove whole-stream emptiness as an escape but establish no shared-block
 placement, so the widening is of the POTENTIAL exposure, not a claim that every
 restart revives. The disposition and the per-defect exposure are in
-`docs/CONFORMANCE.md`, "The storage this design keeps on `$MQTT_inflight`".
+`docs/CONFORMANCE.md`, "The storage this design keeps in `$MQTT.inflight.`".
 
 **Upstream.** Known as PR
 [#8506](https://github.com/nats-io/nats-server/pull/8506) ("Filestore MaxMsgsPer
@@ -113,13 +122,14 @@ evicted.
 **Not a client-side fix.** Re-deleting every occupied sequence does not make the
 absence durable: `removeMsgFromBlock` returns early for a sequence below the
 block's first sequence or already in the deleted map, before the explicit-delete
-tombstone is written (`server/filestore.go` near L6097 on v2.15.0). Only the
-shared-group lifecycle records moved off `$MQTT_inflight` (to `$MQTT_shared`). The
+tombstone is written (`server/filestore.go` near L6097 on v2.15.0). The
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) authority
-classes cannot move: an atomic batch is per stream, and the authority
-commits with the register it authorizes. So the single-session exposure returns by
-design and is accepted as a disposition, and the register path on `$MQTT_inflight`
-remains subject to this defect until upstream corrects it.
+classes cannot be separated from the registers: an atomic batch is per stream, and the
+authority commits with the register it authorizes. The shared-group records once had a
+stream of their own for this reason, and share `$MQTT_sess` since the merge, so that the
+reclamation of issue #133 can fence them in the same batch. So the single-session
+exposure returns by design and is accepted as a disposition, and the register path in the
+`$MQTT.inflight.` space remains subject to this defect until upstream corrects it.
 
 **Witness.** Minimal broker-free reproduction kept with the lane scratch
 (`minimal-witness-maxmsgsper-revival.go`): a `MaxMsgsPer:1` stream, one
@@ -130,7 +140,8 @@ That witness's clean-shutdown control is clean. Confirmed on `v2.15.0` and
 
 **A second witness reproduces it after a CLEAN shutdown (2026-09-24).** Through the
 broker's own harness on `v2.15.0` (`revival-witness_test.go.txt`, kept outside the
-tree): a `MaxMsgsPer:1` register on `$MQTT_inflight` beside a neighbour record,
+tree): a `MaxMsgsPer:1` register on `$MQTT_inflight` (then its own stream) beside a
+neighbour record,
 rewritten once by a plain CAS and separately by an atomic batch, its survivor
 exact-deleted, then an ordinary server `Shutdown()` and a restart on the same store
 directory: the subject reads the limit-evicted FIRST version again, in both modes. It
@@ -149,9 +160,8 @@ restart in both the plain-CAS and atomic-batch modes.
 **Unblock.** An upstream correction plus a reviewed pin bump closes this defect and
 the register path is no longer exposed. Neither
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) unit waits on it:
-the shared-group transfer's own records are on `$MQTT_shared` and add no revival shape,
-and the cutover's widened potential exposure (above) is a disclosed disposition, not a
-repair this repository owes.
+the cutover's and the merge's widened potential exposure (above) is a disclosed
+disposition, not a repair this repository owes.
 
 ## issue #110: a failed read reads as an empty suffix
 
@@ -161,7 +171,7 @@ Every error from `LoadMsg`, `LoadNextMsg` and `LoadLastMsg` in the message-GET
 handler becomes `NewJSNoMessageFoundError()`, so an enumeration reads a read
 failure as its own end. The supported suffix enumerations it reaches (with
 `scanPubRelRecordsCharged` among them) are listed by file and line in
-`docs/CONFORMANCE.md`, "The storage this design keeps on `$MQTT_inflight`", beside
+`docs/CONFORMANCE.md`, "The storage this design keeps in `$MQTT.inflight.`", beside
 the [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) and
 [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) exposure.
 Receiver is `msgBlock`: `firstMatching` returns early only

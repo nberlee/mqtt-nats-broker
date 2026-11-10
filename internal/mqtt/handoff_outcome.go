@@ -21,11 +21,13 @@ import (
 
 // The handoff metadata outcome (issue #107).
 //
-// $MQTT_sess and $MQTT_inflight cannot commit together — a JetStream atomic batch is per
-// stream — so an ownership handoff is three durable steps: PREPARE on $MQTT_inflight, which
-// reserves the transition and temporarily freezes new admission without closing anything;
-// COMMIT METADATA here on $MQTT_sess; then FINALIZE on $MQTT_inflight, which installs the
-// new serving tenure or closes the predecessor's generation. CONNACK follows the final
+// An ownership handoff is three durable steps: PREPARE on the authority in the $MQTT.inflight.
+// space, which reserves the transition and temporarily freezes new admission without closing
+// anything; COMMIT METADATA here, in the session record's batch; then FINALIZE on the
+// authority, which installs the new serving tenure or closes the predecessor's generation.
+// The authority and the session record were on different streams when this was designed, and
+// a JetStream atomic batch is per stream; they now share $MQTT_sess, but the protocol keeps
+// the three steps and the receipt that decides the middle one. CONNACK follows the final
 // ownership result and nothing earlier.
 //
 // This file owns the middle step's permanent evidence. A recovery that finds a preparation

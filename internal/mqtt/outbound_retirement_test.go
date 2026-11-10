@@ -301,7 +301,7 @@ func TestCleanupSurvivesClosure(t *testing.T) {
 		t.Fatalf("the permanent closure did not survive the disposal (status %v)", st)
 	}
 
-	smsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	smsg, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttResourceSubject(getHash(e.id), testGen, "inc-1"))
 	got, derr := mqttDecodeOutboundResource(smsg.Data, e.id, e.epoch, testGen, "inc-1")
 	if derr != nil {
@@ -409,7 +409,7 @@ func TestCleanupOfAnOldGenerationWhileANewOneServes(t *testing.T) {
 			"%v — this is exactly when deferred cleanup must work", err)
 	}
 
-	fmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	fmsg, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttResourceSubject(getHash(e.id), testGen, "inc-1"))
 	got, derr := mqttDecodeOutboundResource(fmsg.Data, e.id, e.epoch, testGen, "inc-1")
 	if derr != nil {
@@ -967,7 +967,7 @@ func TestFormerRoleRecordIsRefusedAndStands(t *testing.T) {
 
 	// AND EVERY PLANTED RECORD STILL STANDS, edge and all: the refusals removed nothing.
 	for i, p := range all {
-		msg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		msg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttResourceSubject(idHash, testGen, p.inc))
 		if lerr != nil {
 			t.Fatalf("the %q record no longer reads after its refusals: %v", formerRoles[i], lerr)

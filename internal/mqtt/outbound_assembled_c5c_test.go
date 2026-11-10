@@ -160,7 +160,7 @@ func TestUnitCAckFirstCrash(t *testing.T) {
 								e.sess.mu.Unlock()
 								observed.Add(1)
 							}
-							subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+							subjects, _, err := e.asm.jsa.streamSubjects(mqttSessStreamName, filter)
 							return subjects, err
 						}
 						e.asm.mu.Unlock()

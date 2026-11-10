@@ -416,7 +416,7 @@ func TestMarkerMembersAreShapedAndCreateOnly(t *testing.T) {
 	// a marker rewrite the store itself would accept.
 	regSubj := mqttInflightSubject(getHash(e.id), testGen, 7)
 	subj := regSubj + "." + mqttInflightMarkerSuffix
-	rmsg, rlerr := jsa.loadLastMsgFor(mqttInflightStreamName, regSubj)
+	rmsg, rlerr := jsa.loadLastMsgFor(mqttSessStreamName, regSubj)
 	if rlerr != nil {
 		t.Fatalf("the committed register does not load back: %v", rlerr)
 	}
@@ -428,13 +428,13 @@ func TestMarkerMembersAreShapedAndCreateOnly(t *testing.T) {
 		t.Fatalf("ending the standing obligation was refused: %v", err)
 	}
 	// The ending re-phased the register in its own batch: delete it at the sequence it stands at.
-	if rmsg, rlerr = jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); rlerr != nil {
+	if rmsg, rlerr = jsa.loadLastMsgFor(mqttSessStreamName, regSubj); rlerr != nil {
 		t.Fatalf("the ended register does not load back: %v", rlerr)
 	}
-	if derr := jsa.deleteMsg(mqttInflightStreamName, rmsg.Sequence, true); derr != nil {
+	if derr := jsa.deleteMsg(mqttSessStreamName, rmsg.Sequence, true); derr != nil {
 		t.Fatalf("deleting the register failed: %v", derr)
 	}
-	mmsg, mlerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	mmsg, mlerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if mlerr != nil {
 		t.Fatalf("the standing marker does not load back: %v", mlerr)
 	}
@@ -451,7 +451,7 @@ func TestMarkerMembersAreShapedAndCreateOnly(t *testing.T) {
 		t.Fatalf("a standing unsent marker was rewritten at its own sequence: a transmitted " +
 			"allocation would be described as unsent again")
 	}
-	after, alerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	after, alerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if alerr != nil || after.Sequence != mmsg.Sequence {
 		t.Fatalf("the refused rewrite moved the standing marker")
 	}

@@ -166,7 +166,7 @@ func TestMaterialIsRemovedOnlyUnderBothFacts(t *testing.T) {
 	}
 	for ord := uint64(1); ord <= 2; ord++ {
 		subj := mqttChunkSubject(getHash(e.id), testGen, testPayload, ord)
-		if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); lerr == nil && smsg != nil {
+		if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj); lerr == nil && smsg != nil {
 			t.Fatalf("chunk %d is still standing after its removal", ord)
 		}
 	}
@@ -179,7 +179,7 @@ func TestMaterialIsRemovedOnlyUnderBothFacts(t *testing.T) {
 	if more, perr := e.asm.purgeMaterialStep(e.id, e.epoch, "txn-purge-2", m, seq); perr != nil || more {
 		t.Fatalf("finishing the removal: more=%v err=%v", more, perr)
 	}
-	if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttManifestSubject(getHash(e.id), testGen, testPayload)); lerr == nil && smsg != nil {
 		t.Fatalf("the manifest is still standing after its material is gone")
 	}
@@ -209,7 +209,7 @@ func TestAPurgeIsAnnouncedBeforeItRemoves(t *testing.T) {
 	// this failure, material gone from a payload whose manifest still claims it is whole.
 	for ord := uint64(1); ord <= 2; ord++ {
 		subj := mqttChunkSubject(getHash(e.id), testGen, testPayload, ord)
-		if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); lerr != nil || smsg == nil {
+		if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj); lerr != nil || smsg == nil {
 			t.Fatalf("chunk %d was removed by a step whose announcement never landed", ord)
 		}
 	}
@@ -325,7 +325,7 @@ func TestTheManifestGoesLastAndByItsOwnSequence(t *testing.T) {
 	if _, err := e.asm.purgeMaterialStep(e.id, e.epoch, "txn-finish", stale, staleSeq); err != nil {
 		t.Fatalf("finishing the removal: %v", err)
 	}
-	if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttManifestSubject(getHash(e.id), testGen, testPayload)); lerr == nil && smsg != nil {
 		t.Fatalf("the manifest is still standing after its material is gone")
 	}
@@ -348,7 +348,7 @@ func TestTheManifestGoesLastAndByItsOwnSequence(t *testing.T) {
 	// materialization's own removal already emptied, so the assertion below is the only thing
 	// this call can disturb.
 	_ = e.asm.finishMaterialRemoval(e.id, stale, staleSeq)
-	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttManifestSubject(getHash(e.id), testGen, testPayload))
 	if lerr != nil || smsg == nil {
 		t.Fatalf("a stale removal took the replacement's manifest")
@@ -599,7 +599,7 @@ func TestAPausedCleanupDoesNotTakeAReplacementsChunks(t *testing.T) {
 
 	// WORKER A RESUMES against the state it was holding, and must take nothing.
 	_ = e.asm.deleteChunkInterval(e.id, paused, 1, 1)
-	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttChunkSubject(getHash(e.id), testGen, testPayload, 1))
 	if lerr != nil || smsg == nil {
 		t.Fatalf("a paused cleanup deleted a replacement materialization's chunk")

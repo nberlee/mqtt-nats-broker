@@ -811,10 +811,10 @@ type mqttAccountSessionManager struct {
 	// retirementProvenFor.
 	retirementMemo map[string]string
 	// inflightSweepCursor / inflightSweepSeeded are the same scheduling state for the
-	// $MQTT_inflight walk. Separate from the inbound pair because the two streams have
-	// independent sequence spaces and independent budgets; sharing one cursor would
-	// make each pass's coverage of one stream depend on the other's size. Guarded by
-	// mu. See orphan_qos2_sweep.go.
+	// walk of the in-flight space on $MQTT_sess. Separate from the inbound pair because
+	// that pair walks $MQTT_qos2in, an independent sequence space with its own budget;
+	// sharing one cursor would make each pass's coverage of one stream depend on the
+	// other's size. Guarded by mu. See orphan_qos2_sweep.go.
 	inflightSweepCursor uint64
 	inflightSweepSeeded bool
 
@@ -1269,7 +1269,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	// Provision the ten broker-owned $MQTT_* streams through the one
+	// Provision the eight broker-owned $MQTT_* streams through the one
 	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
 	// authoritative re-read, then per-owner validation over that re-read — a
 	// nonconforming stream is a startup failure with recreate guidance, never
@@ -1277,7 +1277,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// stream cannot be provisioned outside the helper without deleting its entry,
 	// which the table-coverage test refuses. Per-stream specials (the recovery
 	// epoch's generation, gate hooks and adoption, and the per-stream stamp that
-	// couples the ten) live in the entries, not around this loop.
+	// couples the eight) live in the entries, not around this loop.
 	maxAckPending := int(opts.MQTT.MaxAckPending)
 	if maxAckPending == 0 {
 		maxAckPending = mqttDefaultMaxAckPending
@@ -1292,13 +1292,17 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// Two lookup-only preflights, before anything is created, because the loop's own
 	// shape creates an absent stream before it validates one.
 	//
-	// First: an account still holding the retired $MQTT_origin register is refused
-	// outright. Second: an account holding a PROPER SUBSET of the ten broker-owned
-	// streams is refused rather than silently completed — those ten are one
-	// recreation unit, and recreating a subset leaves records referencing identities
-	// the other streams have since reissued (issue #70). Both take
-	// brokerStreamLookupAPI, so neither can create what it is deciding about.
+	// First: an account still holding a retired stream — the $MQTT_origin register,
+	// or $MQTT_inflight or $MQTT_shared, whose subject spaces now live on
+	// $MQTT_sess — is refused outright. Second: an account holding a PROPER SUBSET of
+	// the eight broker-owned streams is refused rather than silently completed —
+	// those eight are one recreation unit, and recreating a subset leaves records
+	// referencing identities the other streams have since reissued (issue #70). All
+	// take brokerStreamLookupAPI, so none can create what it is deciding about.
 	if err := mqttRefuseRetiredOriginStream(jsa); err != nil {
+		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
+	}
+	if err := mqttRefuseRetiredMetadataStreams(jsa); err != nil {
 		return nil, fmt.Errorf("MQTT stream prerequisites for account %q: %w", accName, err)
 	}
 	if err := mqttPreflightBrokerStreamBundle(jsa, specs, s.bundleSettleBudget, s.quitCh, abandon); err != nil {
@@ -2266,7 +2270,7 @@ RESTORE:
 	// Session Present false. See sess_teardown.go.
 	// The generation is validated BEFORE anything derives a name from it — the adopted
 	// teardown below deletes by generation-scoped name, and it WALKS by generation-scoped
-	// filter (the inbound QoS 2 holds; $MQTT_inflight's own filter purge is gone since
+	// filter (the inbound QoS 2 holds; the in-flight space's own filter purge is gone since
 	// issue #38, replaced by a bounded reap whose enumeration uses the same kind of filter).
 	// A malformed stored value would widen those walks across other incarnations, and
 	// what each pass then destroys is bounded per issue #66 and issue #38 rather than blind — but
@@ -2382,7 +2386,7 @@ RESTORE:
 	// A retired generation takes the SAME route rather than a second discard shape of
 	// its own: build the transient session, clear() it (which re-marks the record,
 	// finds the retirement already recorded, repeats the deletions — the inbound QoS 2 hold
-	// walk bounded per walk, issue #66; the `$MQTT_inflight` reap beside it bounded by its own
+	// walk bounded per walk, issue #66; the in-flight reap beside it bounded by its own
 	// enumeration watermark, issue #38 — and releases the record) and hand back the reset
 	// object as a fresh session, with
 	// Session Present false — which is the truthful answer in both cases.

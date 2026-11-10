@@ -134,7 +134,7 @@ type mqttPersistedDrainSeq struct {
 	Attempt uint64 `json:"attempt,omitempty"`
 	// No register sequence is persisted. The drain's register is the one PI names: the
 	// release addresses it by that subject and removes only an identity-matched occupant
-	// (finalizeDrainDelivery), so an absolute $MQTT_inflight sequence here would decide
+	// (finalizeDrainDelivery), so an absolute in-flight record sequence here would decide
 	// nothing and would name an unrelated register once that stream is recreated.
 
 	// OwnerNonce is the EXCHANGE identity this drained delivery owns, persisted with the
@@ -1724,7 +1724,7 @@ func (sess *mqttSession) finalizeDrainDelivery(c *client, jsDur string, sseq uin
 	//
 	// A remembered register sequence used to address this delete directly, and that was the
 	// defect: the store path's replacement branch rewrites a register for the same
-	// (Dur, Seq) at a NEW sequence, and after $MQTT_inflight is recreated the recorded
+	// (Dur, Seq) at a NEW sequence, and after the stream is recreated the recorded
 	// sequence names an unrelated register belonging to another session. Deleting there
 	// destroyed it — which issue #70's table had already recorded, assigning the
 	// consequence to "that mechanism's owner", i.e. here.

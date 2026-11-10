@@ -97,7 +97,7 @@ func (r *testAdmitLosesToClosureRig) requireNothingAdmitted(t *testing.T) {
 	if _, smsg := e.loadMarker(t, r.pi); smsg != nil {
 		t.Fatalf("an unsent marker stands for identifier %d after its admission lost to the closure", r.pi)
 	}
-	if xm, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(getHash(e.sess.id), r.gen, r.nonce)); xm != nil ||
+	if xm, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(getHash(e.sess.id), r.gen, r.nonce)); xm != nil ||
 		!IsNatsErr(err, JSNoMessageFoundErr) {
 		t.Fatalf("an exchange stands for %q after its admission lost to the closure: %+v (%v)", r.nonce, xm, err)
 	}

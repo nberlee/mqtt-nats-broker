@@ -439,7 +439,7 @@ func (as *mqttAccountSessionManager) recoveryRootReachable(id, epoch, gen string
 // starts a pass over it. UNREADABLE is a refusal, because a header this broker cannot interpret
 // may be the one whose high-water covers the root a teardown is asking about.
 func (jsa *mqttJSA) loadDirShard(shard uint64) (*mqttDirShard, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttShardSubject(shard))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttShardSubject(shard))
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, fmt.Errorf("reading directory shard %d: %w", shard, err)
@@ -459,7 +459,7 @@ func (jsa *mqttJSA) loadDirShard(shard uint64) (*mqttDirShard, error) {
 // loadGenCompletionCert reads one generation's completion certificate, nil when none stands.
 func (jsa *mqttJSA) loadGenCompletionCert(id, epoch, gen string) (*mqttGenCompletionCertificate, error) {
 	subj := mqttGenCertSubject(getHash(id), gen)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, fmt.Errorf("reading the completion certificate of generation %q: %w", gen, err)

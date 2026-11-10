@@ -180,8 +180,8 @@ func (sess *mqttSession) classifyQoS2ReleaseInTx(asm *mqttAccountSessionManager,
 	switch status {
 	case mqttRetirementAbsent:
 		// No retirement was ever recorded for this client. issue #70 makes a lone
-		// recreation of $MQTT_teardown a refused state — an account holding nine of
-		// the ten streams fails the account-wide preflight before anything is
+		// recreation of $MQTT_teardown a refused state — an account holding seven of
+		// the eight streams fails the account-wide preflight before anything is
 		// provisioned — so absence here is absence rather than a lost fence.
 		return mqttQoS2RetireProceed, nil
 	case mqttRetirementValid:

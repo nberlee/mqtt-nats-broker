@@ -88,8 +88,8 @@ type mqttPending struct {
 	// non-zero value.
 	qos byte
 
-	// regSeq is the stream sequence of this delivery's durable in-flight register on
-	// $MQTT_inflight, and regNonce the register's immutable identity. Every delete targets
+	// regSeq is the stream sequence of this delivery's durable in-flight register in
+	// the $MQTT.inflight. space, and regNonce the register's immutable identity. Every delete targets
 	// regSeq exactly, because the register's subject is reused by later exchanges on the
 	// same identifier (R4). Zero until a register lands: a retained allocation carries only
 	// its nonce until its admission is promoted. A slot-backed exchange recovered from a

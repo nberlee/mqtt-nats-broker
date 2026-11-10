@@ -846,7 +846,7 @@ func TestMQTTTerminalCleanupHoldsAnUnconfirmedRelease(t *testing.T) {
 			jsa := &e.asm.jsa
 			e.asm.mu.Lock()
 			e.asm.testInflightDelete = func(seq uint64) error {
-				err := jsa.deleteMsg(mqttInflightStreamName, seq, true)
+				err := jsa.deleteMsg(mqttSessStreamName, seq, true)
 				if tc.failAfterDel {
 					armed.Store(true) // every read from here on is the confirmation
 				}

@@ -69,7 +69,7 @@ func mqttNewSessGen() string { return nuid.Next() }
 // assigned it, so every durable record that carries one carries the epoch beside it.
 // Resetting the bundle mints a new epoch, which is exactly how records naming
 // sequences of the old store are recognised as uncomparable rather than misread. Every
-// broker-owned stream carries it, not just $MQTT_sess: the ten are one recreation
+// broker-owned stream carries it, not just $MQTT_sess: the eight are one recreation
 // unit (issue #70), and recreating any one of them alone is refused at startup.
 //
 // It is an identity token: equality means "same incarnation, sequences comparable",
@@ -226,7 +226,7 @@ func mqttQoS2HoldWalkFilter(idHash, gen string) string {
 	return mqttQoS2IncomingMsgsStreamSubjectPrefix + idHash + mqttSessGenTk(gen, ".") + ".*"
 }
 
-// mqttInflightSubject returns the $MQTT_inflight subject carrying the durable
+// mqttInflightSubject returns the $MQTT.inflight. subject carrying the durable
 // IN-FLIGHT REGISTER for one outbound packet identifier of one session incarnation
 // ("$MQTT.inflight.<idHash>.<gen>.<PI>").
 //

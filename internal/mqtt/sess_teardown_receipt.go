@@ -32,7 +32,7 @@ import (
 // reason (outbound_transition.go): ending a generation is not authority to abandon
 // what it owes. The receipt is that authority, made durable.
 //
-// It is the FOURTH top-level subject space on $MQTT_sess, beside the session record,
+// It is one of the top-level subject spaces on $MQTT_sess, beside the session record,
 // the acceptance fact and the handoff outcome, for the same reason the fact is
 // top-level: every session walk filters "sess.<domainTk>>" and decodes what it finds
 // as a record, so the receipt must not live under that prefix. Living on the same

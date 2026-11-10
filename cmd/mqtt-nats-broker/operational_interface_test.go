@@ -63,7 +63,7 @@ func TestStartupOutcomeClassifiesCancellation(t *testing.T) {
 	}
 }
 
-// startPartialBundleServer runs a JetStream server whose account holds one of the ten
+// startPartialBundleServer runs a JetStream server whose account holds one of the eight
 // broker-owned streams, so a broker's stream preflight waits on the partial bundle (30 s)
 // after it has connected and before it serves.
 func startPartialBundleServer(t *testing.T) *server.Server {

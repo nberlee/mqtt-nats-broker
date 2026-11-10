@@ -43,7 +43,7 @@ func authRev(t *testing.T, f *t36Fix) (rev, seq uint64) {
 // nor the disposal advance can be what refuses a later write.
 func rawDelete(t *testing.T, f *t36Fix, seq uint64) {
 	t.Helper()
-	if err := f.e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true); err != nil {
+	if err := f.e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true); err != nil {
 		t.Fatalf("raw delete of sequence %d: %v", seq, err)
 	}
 }

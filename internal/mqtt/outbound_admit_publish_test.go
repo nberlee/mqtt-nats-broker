@@ -144,13 +144,13 @@ func TestPublishAdmissionIsOneTransaction(t *testing.T) {
 
 	// All four landed: register, marker, exchange, and both dependency counts.
 	regSubj := mqttInflightSubject(getHash(e.id), testGen, 7)
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err != nil {
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); err != nil {
 		t.Fatalf("the register does not load back: %v", err)
 	}
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj+"."+mqttInflightMarkerSuffix); err != nil {
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj+"."+mqttInflightMarkerSuffix); err != nil {
 		t.Fatalf("the unsent marker does not load back: %v", err)
 	}
-	xmsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	xmsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(e.id), testGen, adm.Exchange.Nonce))
 	if err != nil {
 		t.Fatalf("the exchange does not load back: %v", err)
@@ -159,7 +159,7 @@ func TestPublishAdmissionIsOneTransaction(t *testing.T) {
 		t.Fatalf("the exchange does not decode: %v", derr)
 	}
 	for _, inc := range []string{"inc-src", "inc-rel"} {
-		rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttResourceSubject(getHash(e.id), testGen, inc))
 		if rerr != nil {
 			t.Fatalf("resource %q does not load back: %v", inc, rerr)
@@ -219,12 +219,12 @@ func TestPublishAdmissionLosesWhole(t *testing.T) {
 		"marker":   regSubj + "." + mqttInflightMarkerSuffix,
 		"exchange": mqttExchangeSubject(getHash(e.id), testGen, stale.Exchange.Nonce),
 	} {
-		if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
+		if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj); err == nil {
 			t.Fatalf("the refused admission still installed its %s: that is an obligation no "+
 				"authority admitted", name)
 		}
 	}
-	rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttResourceSubject(getHash(e.id), testGen, "inc-src"))
 	got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testGen, "inc-src")
 	if len(got.Deps) != 0 {
@@ -299,7 +299,7 @@ func TestPublishAdmissionNeverReplacesARegister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planting the prior register failed: %v", err)
 	}
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj+"."+mqttInflightMarkerSuffix); err == nil {
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj+"."+mqttInflightMarkerSuffix); err == nil {
 		t.Fatalf("the fixture planted a marker it was supposed to leave absent")
 	}
 
@@ -334,7 +334,7 @@ func TestPublishAdmissionNeverReplacesARegister(t *testing.T) {
 	if _, err := e.asm.jsa.commitAuthorityTransition(hand); err == nil {
 		t.Fatalf("a hand-composed member replaced a live register at its own sequence")
 	}
-	rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj)
+	rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj)
 	if rerr != nil || rmsg.Sequence != priorSeq {
 		t.Fatalf("the refused replacement moved the standing register")
 	}
@@ -350,7 +350,7 @@ func TestPublishAdmissionNeverReplacesARegister(t *testing.T) {
 		t.Fatalf("an admission onto a free identifier was refused: %v", err)
 	}
 	freeSubj := mqttInflightSubject(getHash(e.id), testGen, 8)
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, freeSubj+"."+mqttInflightMarkerSuffix); err != nil {
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, freeSubj+"."+mqttInflightMarkerSuffix); err != nil {
 		t.Fatalf("the admission did not install its unsent marker: %v", err)
 	}
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -391,7 +391,7 @@ func TestCreateAdmissionRefusesAnotherLineage(t *testing.T) {
 	})
 	other := mqttNewInflightNonce()
 	absent := func(subj string) bool {
-		m, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		m, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		return m == nil && IsNatsErr(err, JSNoMessageFoundErr)
 	}
 	otherSubj := mqttExchangeSubject(getHash(e.id), al.rec.Gen, other)

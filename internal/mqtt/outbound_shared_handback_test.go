@@ -510,7 +510,7 @@ func TestAcquireActionRefusesAnInconsistentSharedPair(t *testing.T) {
 	if err == nil || !errors.Is(err, errMQTTSharedAcqPair) || act != nil {
 		t.Fatalf("a contradictory pair acquired output: act=%v err=%v", act, err)
 	}
-	subs, whole, serr := e.asm.jsa.streamSubjectsComplete(mqttInflightStreamName,
+	subs, whole, serr := e.asm.jsa.streamSubjectsComplete(mqttSessStreamName,
 		mqttActionWalkFilter(getHash(e.id), auth.Gen, nonce))
 	if serr != nil || !whole || len(subs) != 0 {
 		t.Fatalf("an action record exists after the refusal: %v whole=%v err=%v", subs, whole, serr)

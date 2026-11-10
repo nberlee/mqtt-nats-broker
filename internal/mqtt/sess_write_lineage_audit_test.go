@@ -1,5 +1,5 @@
 // Tests for the session write-lineage audit: what a parentless create concedes, what
-// the retained obligations still hold, and the refusal of the register stream that is
+// the retained obligations still hold, and the refusal of the register store that is
 // no longer defined.
 //
 // The pairing across this file is deliberate and is the discrimination the whole change
@@ -381,7 +381,7 @@ func TestMQTTCreateRefusesAnUnreadableRetirementWatermark(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: the register stream is refused, not tolerated
+// Test 6: the register store is refused, not tolerated
 // ---------------------------------------------------------------------------
 
 // TestMQTTStartupRefusesALeftoverOriginStream covers all three preflight outcomes.
@@ -508,10 +508,15 @@ func TestMQTTStartupRefusalIsWiredIntoManagerInit(t *testing.T) {
 func TestMQTTProvisionedStreamsExcludeTheRetiredRegister(t *testing.T) {
 	t.Parallel()
 	specs := testBrokerStreamSpecs()
-	if len(specs) != 10 {
-		t.Fatalf("the broker provisions ten streams, got %d", len(specs))
+	if len(specs) != 8 {
+		t.Fatalf("the broker provisions eight streams, got %d", len(specs))
 	}
 	for _, spec := range specs {
+		for _, retired := range []string{mqttRetiredInflightStreamName, mqttRetiredSharedStreamName} {
+			if spec.name == retired {
+				t.Fatalf("%s is refused at startup and must never be provisioned", retired)
+			}
+		}
 		if spec.name == mqttOriginStreamName {
 			t.Fatalf("%s is refused at startup and must never be provisioned", mqttOriginStreamName)
 		}

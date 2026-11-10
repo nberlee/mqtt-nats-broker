@@ -293,11 +293,11 @@ func TestRetainedStaleResolverDoesNotActOverAQuarantine(t *testing.T) {
 	rig.sess.mu.Lock()
 	delete(rig.sess.pendingPubRel, rig.pi)
 	rig.sess.mu.Unlock()
-	raw, err := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, cur.RelSubj)
+	raw, err := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, cur.RelSubj)
 	if err != nil || raw == nil {
 		t.Fatalf("loading the canonical: %v", err)
 	}
-	if err := rig.asm.jsa.deleteMsg(mqttInflightStreamName, raw.Sequence, true); err != nil {
+	if err := rig.asm.jsa.deleteMsg(mqttSessStreamName, raw.Sequence, true); err != nil {
 		t.Fatalf("removing the canonical: %v", err)
 	}
 	rig.c, rig.r = testMQTTConnectV5(t, rig.ci, rig.o.MQTT.Host, rig.o.MQTT.Port)
@@ -368,11 +368,11 @@ func TestRetainedCloseRefusesAContradictedAbandonment(t *testing.T) {
 		// quarantines on the canonical, which the close must refuse by the same check.
 		{"late-pubrec-canonical-absent", func(t *testing.T, rig *testRetainedAbandonRig, subject string, cur *mqttInflightRecord) {
 			rel := testRetainedLatePubRec(t, rig, subject)
-			raw, err := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, rel)
+			raw, err := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, rel)
 			if err != nil || raw == nil {
 				t.Fatalf("loading the canonical: %v", err)
 			}
-			if err := rig.asm.jsa.deleteMsg(mqttInflightStreamName, raw.Sequence, true); err != nil {
+			if err := rig.asm.jsa.deleteMsg(mqttSessStreamName, raw.Sequence, true); err != nil {
 				t.Fatalf("removing the canonical: %v", err)
 			}
 		}},
@@ -437,10 +437,10 @@ func TestRetainedCloseRefusesAContradictedAbandonment(t *testing.T) {
 	}
 }
 
-// testRewriteRecordField rewrites one JSON field of the record at subject on $MQTT_inflight.
+// testRewriteRecordField rewrites one JSON field of the record at subject in the $MQTT.inflight. space.
 func testRewriteRecordField(t *testing.T, as *mqttAccountSessionManager, subject, field string, value any) {
 	t.Helper()
-	raw, err := as.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	raw, err := as.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil || raw == nil {
 		t.Fatalf("loading %q: %v", subject, err)
 	}
@@ -521,7 +521,7 @@ func TestRetainedAckAdvanceRefusesAContradictedPair(t *testing.T) {
 	if x.Abandoned.Reason == other {
 		other = mqttAbandonReasonPacketTooLarge
 	}
-	raw, _ := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(rig.idHash, rig.gen, cur.Lin))
+	raw, _ := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(rig.idHash, rig.gen, cur.Lin))
 	var m map[string]any
 	if err := json.Unmarshal(raw.Data, &m); err != nil {
 		t.Fatalf("decoding the exchange: %v", err)
@@ -546,7 +546,7 @@ func TestRetainedAckAdvanceRefusesAContradictedPair(t *testing.T) {
 	if after == nil || after.State != mqttInflightDeliveryAbandoned {
 		t.Fatalf("the contradicted pair was advanced: register %+v", after)
 	}
-	if _, err := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttRetainedRelSubject(rig.idHash, rig.gen, cur.Nonce)); err == nil {
 		t.Fatal("a canonical PUBREL was created over a contradicted pair")
 	}

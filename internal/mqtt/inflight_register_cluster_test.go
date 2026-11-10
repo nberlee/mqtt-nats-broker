@@ -10,7 +10,7 @@
 // never saw the delivery start, with the durable state reached
 // over a replicated stream rather than a single-node one. Broker B here has none of
 // A's memory — no cpending, no pendingPublish — so the identifier it re-offers can
-// only have come from `$MQTT_inflight`.
+// only have come from the `$MQTT.inflight.` space.
 
 package mqtt
 
@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// TestMQTTInflightReplicatedStream is always run: it asserts the register stream
+// TestMQTTInflightReplicatedStream is always run: it asserts the register store
 // really is Replicas=3, current on every node, and carries the configuration the
 // protocol needs. Without this the failover tests below could pass against a
 // single-replica stream and prove nothing about HA.
@@ -28,19 +28,19 @@ func TestMQTTInflightReplicatedStream(t *testing.T) {
 	b := c.startBroker(t, 0)
 	defer b.cleanup()
 
-	c.waitStreamCurrent(t, testGlobalAccount, mqttInflightStreamName)
+	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
 
 	asm := b.s.mqtt.sessmgr.sessions[globalAccountName]
-	si, err := asm.jsa.lookupStream(mqttInflightStreamName)
+	si, err := asm.jsa.lookupStream(mqttSessStreamName)
 	if err != nil {
-		t.Fatalf("lookup %s: %v", mqttInflightStreamName, err)
+		t.Fatalf("lookup %s: %v", mqttSessStreamName, err)
 	}
 	if si.Config.Replicas != 3 {
 		t.Fatalf("%s has %d replica(s), want 3: the failover tests would prove nothing",
-			mqttInflightStreamName, si.Config.Replicas)
+			mqttSessStreamName, si.Config.Replicas)
 	}
-	if err := validateInflightStream(si, 3, asm.sessStreamEpoch); err != nil {
-		t.Fatalf("%s does not carry the required configuration: %v", mqttInflightStreamName, err)
+	if err := validateSessStream(si, asm.domainTk, 3); err != nil {
+		t.Fatalf("%s does not carry the required configuration: %v", mqttSessStreamName, err)
 	}
 }
 

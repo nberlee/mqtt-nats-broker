@@ -909,7 +909,7 @@ func TestValidateTeardownStream(t *testing.T) {
 	}
 }
 
-// The ten broker-owned streams are ONE recreation unit, asserted from both
+// The eight broker-owned streams are ONE recreation unit, asserted from both
 // directions: a bundle missing ANY single member is refused, and a complete
 // bundle whose members disagree on the recovery epoch is refused too.
 //
@@ -918,7 +918,7 @@ func TestValidateTeardownStream(t *testing.T) {
 // the OPPOSITE of what the contract now says: recreating $MQTT_teardown alone
 // used to be ADMITTED, silently losing every open fence. That admission is the
 // residual issue #70 withdraws, so the assertion is inverted rather than deleted —
-// and it is inverted for all ten positions, not just that one.
+// and it is inverted for all eight positions, not just that one.
 func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 	for _, missing := range mqttTestBrokerStreamNames {
 		t.Run("without "+missing, func(t *testing.T) {
@@ -928,7 +928,7 @@ func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 				t.Fatalf("first bring-up: %v", err)
 			}
 			// Every member carries the adopted epoch: that stamp is what makes the
-			// ten one unit, and a fixture whose premise is unchecked proves nothing.
+			// eight one unit, and a fixture whose premise is unchecked proves nothing.
 			for _, name := range mqttTestBrokerStreamNames {
 				si, lerr := asm1.jsa.lookupStream(name)
 				if lerr != nil || si == nil {
@@ -951,26 +951,26 @@ func TestBrokerStreamBundleRefusesAPartialAccount(t *testing.T) {
 			s2.bundleSettleBudget = 0
 			_, err = s2.getOrCreateMQTTAccountSessionManager(c2)
 			if err == nil {
-				t.Fatalf("an account holding nine of the ten broker-owned streams must fail "+
+				t.Fatalf("an account holding seven of the eight broker-owned streams must fail "+
 					"initialization; %s was deleted and the rest were silently reprovisioned", missing)
 			}
 			// The PREFLIGHT's reason specifically. Without this the test passes on any
 			// refusal at all — including a later epoch mismatch — which would make it
 			// blind to the preflight being removed entirely.
-			for _, want := range []string{"of the 10 broker-owned streams", "ONE recreation unit"} {
+			for _, want := range []string{"of the 8 broker-owned streams", "ONE recreation unit"} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the refusal must name %q, got: %v", want, err)
 				}
 			}
 			// The two LISTS, not just the name somewhere in the message: the
-			// refusal also enumerates all ten as the streams to delete, so a
+			// refusal also enumerates all eight as the streams to delete, so a
 			// bare Contains passes even when both vectors are empty.
 			gotPresent, gotAbsent := testBundleRefusalLists(t, err)
 			if len(gotAbsent) != 1 || gotAbsent[0] != missing {
 				t.Errorf("the refusal's absent list is %v, want exactly [%s]", gotAbsent, missing)
 			}
 			if len(gotPresent) != len(mqttTestBrokerStreamNames)-1 {
-				t.Errorf("the refusal's present list is %v, want the other nine streams", gotPresent)
+				t.Errorf("the refusal's present list is %v, want the other seven streams", gotPresent)
 			}
 			// And it must not have recreated what it refused: a preflight that creates
 			// is the defect this whole mechanism exists to prevent. Checked through
@@ -1016,7 +1016,7 @@ func TestBrokerStreamBundleRefusesAForeignEpochMember(t *testing.T) {
 					t.Errorf("the refusal must name %q, got: %v", want, err)
 				}
 			}
-			if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
+			if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
 				t.Fatalf("the refusal came from the count rule, so the epoch comparison was never reached: %v", err)
 			}
 		})

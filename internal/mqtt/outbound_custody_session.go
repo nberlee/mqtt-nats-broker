@@ -746,7 +746,7 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 		case as != nil:
 			resps, berr = as.loadInflightRecordsMulti(subjects)
 		default:
-			resps, berr = jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+			resps, berr = jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 		}
 		if berr != nil {
 			return out, false, fmt.Errorf("reading the duties of %q/%q: %w", id, gen, berr)

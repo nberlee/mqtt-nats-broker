@@ -35,7 +35,7 @@ func (e *testInflightEnv) regSubject(pi uint16) string {
 // loadMarker reads the unsent marker beside pi from the stream: nil, nil when absent.
 func (e *testInflightEnv) loadMarker(t *testing.T, pi uint16) (*mqttInflightMarker, *StoredMsg) {
 	t.Helper()
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, e.regSubject(pi)+"."+mqttInflightMarkerSuffix)
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, e.regSubject(pi)+"."+mqttInflightMarkerSuffix)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			t.Fatalf("load the marker for pi %d: %v", pi, err)
@@ -322,7 +322,7 @@ func TestMQTTInflightBatchIsAtomic(t *testing.T) {
 
 	// The marker's own create-only CAS: a marker with no register (a stale leftover) makes
 	// the create of a fresh pair reject as a whole, which is what the store retry reaps.
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, regSeq2, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, regSeq2, true); err != nil {
 		t.Fatalf("delete the register: %v", err)
 	}
 	if _, err := e.asm.jsa.storeInflightPair(subject, 0, 0, rec(n3)); err == nil {
@@ -616,7 +616,7 @@ func TestMQTTInflightMarkerAbsenceIsNotInterpretedAgainstAStaleSnapshot(t *testi
 				// traversal's duty batches (issue #107 7b) and the marker batches read the stream as
 				// it stands, or the walk's own read would be counted against another batch.
 				if isMarkerBatch(subjects) || !slices.Contains(subjects, subject) {
-					return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+					return e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 				}
 				registerReads++
 				out := make([]*JSApiMsgGetResponse, 0, len(subjects))
@@ -675,7 +675,7 @@ func TestMQTTInflightRecoveryWalkRaceFailsClosed(t *testing.T) {
 			if calls == 1 {
 				return map[string]uint64{}, nil
 			}
-			subjects, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+			subjects, _, err := e.asm.jsa.streamSubjects(mqttSessStreamName, filter)
 			return subjects, err
 		}
 		e.asm.mu.Unlock()
@@ -740,7 +740,7 @@ func TestMQTTInflightMarkerBatchReadFailureReservesTheIdentifierSpace(t *testing
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
 		if !isMarkerBatch(subjects) {
-			return e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+			return e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 		}
 		out := make([]*JSApiMsgGetResponse, len(subjects))
 		for i := range out {
@@ -812,7 +812,7 @@ func TestMQTTInflightTerminalCleanupRemovesRegisterThenMarker(t *testing.T) {
 		var mu sync.Mutex
 		var order []string
 		restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
-			if stream == mqttInflightStreamName {
+			if testInflightSpace(stream, testSubjectAtSeq(&e.asm.jsa, stream, seq)) {
 				// Named by subject: the admitted unsent register is withdrawn first, so its
 				// delete acts on the tombstone's sequence rather than the admitted one.
 				what := fmt.Sprintf("other@%d", seq)
@@ -1283,7 +1283,7 @@ func TestMQTTInflightClearReapRemovesBothClasses(t *testing.T) {
 	var mu sync.Mutex
 	var order []uint64
 	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
-		if stream == mqttInflightStreamName {
+		if testInflightSpace(stream, testSubjectAtSeq(&e.asm.jsa, stream, seq)) {
 			mu.Lock()
 			order = append(order, seq)
 			mu.Unlock()
@@ -1499,7 +1499,7 @@ func TestMQTTInflightMarkerOpaqueReservation(t *testing.T) {
 	delete(e.sess.cpending[dur], sseq)
 	e.sess.piSpaceIncomplete = true
 	e.sess.mu.Unlock()
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, mmsg.Sequence, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, mmsg.Sequence, true); err != nil {
 		t.Fatalf("delete the marker: %v", err)
 	}
 	if _, err := e.sess.recoverInflightRegisters(e.c); err != nil {
@@ -1555,7 +1555,7 @@ func TestMQTTInflightSameDeliveryOccupantIsReplacedAsAPair(t *testing.T) {
 		{"row 16: an absent marker means a transmitted occupant; the register alone is rewritten and no marker is minted",
 			func(t *testing.T, e *testInflightEnv, pi uint16) {
 				_, mmsg := e.loadMarker(t, pi)
-				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, mmsg.Sequence, true); err != nil {
+				if err := e.asm.jsa.deleteMsg(mqttSessStreamName, mmsg.Sequence, true); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -1904,7 +1904,7 @@ func failRegisterDeletes(t *testing.T, e *testInflightEnv, subject string, failu
 	t.Helper()
 	var attempts int32
 	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
-		if stream != mqttInflightStreamName || !e.inflightSeqNames(seq, subject) {
+		if stream != mqttSessStreamName || !e.inflightSeqNames(seq, subject) {
 			return nil
 		}
 		if int(atomic.AddInt32(&attempts, 1)) <= failures {
@@ -1915,9 +1915,9 @@ func failRegisterDeletes(t *testing.T, e *testInflightEnv, subject string, failu
 	return restore, &attempts
 }
 
-// inflightSeqNames reports whether the in-flight stream's message at seq is on subject.
+// inflightSeqNames reports whether the in-flight space's message at seq is on subject.
 func (e *testInflightEnv) inflightSeqNames(seq uint64, subject string) bool {
-	smsg, err := e.asm.jsa.loadMsg(mqttInflightStreamName, seq)
+	smsg, err := e.asm.jsa.loadMsg(mqttSessStreamName, seq)
 	return err == nil && smsg != nil && smsg.Subject == subject
 }
 

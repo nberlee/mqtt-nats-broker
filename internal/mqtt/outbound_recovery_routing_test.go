@@ -167,7 +167,7 @@ func TestUnitCRecoveryRouting(t *testing.T) {
 				}
 				ref := *mqttSlotRefFromRecord(f.subject, seq, r)
 				if tc.bad == "missing" {
-					if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true); err != nil {
+					if err := e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -353,7 +353,7 @@ func TestUnitCRecoveryCensusDoesNotOwnOrdinaryWalk(t *testing.T) {
 				f := testWithdrawAdmitMore(t, e, testRealPubRelSrcSeq, 1)
 				_, seq := f.register(t)
 				missingPI = f.pi
-				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true); err != nil {
+				if err := e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true); err != nil {
 					t.Fatal(err)
 				}
 			}

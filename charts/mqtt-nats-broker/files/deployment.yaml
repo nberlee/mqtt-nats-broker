@@ -8,7 +8,7 @@ spec:
   # Stateless: scale freely. On the first start against an account whose broker-owned
   # $MQTT_* streams do not exist yet, replicas provision them concurrently; a replica that
   # sees a partial set rescans for up to 30 s, and the restart converges the rest
-  # (docs/ARCHITECTURE.md, "The ten streams are one recreation unit").
+  # (docs/ARCHITECTURE.md, "The eight streams are one recreation unit").
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicas }}
   {{- end }}

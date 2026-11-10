@@ -48,7 +48,7 @@ func testInflightWaitNoRegisters(t *testing.T, asm *mqttAccountSessionManager, i
 	t.Helper()
 	filter := mqttInflightWalkFilter(idHash, gen)
 	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
-		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, 1)
+		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, 1)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
 				return fmt.Errorf("walk the registers: %w", err)
@@ -327,7 +327,7 @@ func TestMQTTInflightStaleRegisterLeavesNoPhantomSlot(t *testing.T) {
 	sess.mu.Lock()
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
-	if _, err := asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName,
+	if _, err := asm.jsa.loadNextMsgFromSeq(mqttSessStreamName,
 		mqttInflightWalkFilter(idHash, gen), 1); err != nil {
 		t.Fatalf("the suppressed delete should have left a stale register behind: %v", err)
 	}
@@ -1011,10 +1011,10 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 	asm.mu.Lock()
 	asm.testInflightDelete = func(uint64) error { return errors.New("test: register delete unavailable") }
 	asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, errors.New("test: register stream unavailable")
+		return 0, errors.New("test: register store unavailable")
 	}
 	asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, errors.New("test: register stream unavailable")
+		return nil, nil, errors.New("test: register store unavailable")
 	}
 	asm.mu.Unlock()
 	// The record store fails for as long as the session is UNBOUND, which is what makes the
@@ -1100,7 +1100,7 @@ func TestMQTTInflightReconnectAcceptSaveCreditsInheritedVerdict(t *testing.T) {
 		t.Fatalf("no close-path write may have landed, got %d", landed)
 	}
 
-	// The register stream recovers so the resume can run; the record store stays refused
+	// The register store recovers so the resume can run; the record store stays refused
 	// until the reconnect BINDS, so the accept save is the first landed write.
 	asm.mu.Lock()
 	asm.testInflightDelete, asm.testInflightStore, asm.testInflightLoad = nil, nil, nil
@@ -1461,7 +1461,7 @@ func TestMQTTInflightUnsentMarkerRedeliversWithoutDup(t *testing.T) {
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
 	markerSubj := mqttInflightSubject(idHash, gen, firstPI) + "." + mqttInflightMarkerSuffix
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err != nil || smsg == nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, markerSubj); err != nil || smsg == nil {
 		t.Fatalf("the unsent marker must survive an aborted send: msg=%v err=%v", smsg, err)
 	}
 	// Close the subscriber BEFORE restoring the hook: once the connection is gone the
@@ -1696,7 +1696,7 @@ func TestMQTTInflightCrashAfterIntentRedeliversWithDup(t *testing.T) {
 	idHash, gen := sess.idHash, sess.gen
 	sess.mu.Unlock()
 	markerSubj := mqttInflightSubject(idHash, gen, firstPI) + "." + mqttInflightMarkerSuffix
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err == nil && smsg != nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, markerSubj); err == nil && smsg != nil {
 		t.Fatalf("the intent delete must have landed before the write window: marker still at %d", smsg.Sequence)
 	}
 	// The window hook fires INSIDE the section; the outcome it produces is applied by
@@ -2118,7 +2118,7 @@ func TestMQTTInflightExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 		t.Fatalf("the unresolved entry keeps its captured marker and is not transmitted, got %+v", ack)
 	}
 	asm := testMQTTGetAccountSessionManager(t, s, "x6-sub")
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, ack.slot.name.subject); err != nil || smsg == nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, ack.slot.name.subject); err != nil || smsg == nil {
 		t.Fatalf("the register must survive an elapsed expiry while the intent is unresolved: msg=%v err=%v", smsg, err)
 	}
 
@@ -2215,7 +2215,7 @@ func TestQ2AffExpiryDoesNotReleaseAnUnresolvedIntent(t *testing.T) {
 		t.Fatalf("the unresolved entry keeps its captured marker and is not transmitted, got %+v", ack)
 	}
 	asm := testMQTTGetAccountSessionManager(t, b.s, "x6affA")
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, ack.slot.name.subject); err != nil || smsg == nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, ack.slot.name.subject); err != nil || smsg == nil {
 		t.Fatalf("the register must survive an elapsed expiry while the intent is unresolved: msg=%v err=%v", smsg, err)
 	}
 
@@ -2291,7 +2291,7 @@ func TestMQTTInflightStalePubRelScanDoesNotLoseTheClientsPubRel(t *testing.T) {
 	var enumerated atomic.Bool
 	asm.mu.Lock()
 	asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
-		subjects, _, err := asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+		subjects, _, err := asm.jsa.streamSubjects(mqttSessStreamName, filter)
 		enumerated.Store(true)
 		return subjects, err
 	}

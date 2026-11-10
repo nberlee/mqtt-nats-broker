@@ -124,7 +124,7 @@ func TestStandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
 	}
 }
 
-// TestStandaloneTeardownCrashWindowsAreExecutableSpecs documents the cross-stream crash
+// TestStandaloneTeardownCrashWindowsAreExecutableSpecs documents the two-transaction crash
 // windows Codex enumerated (consult 7, section 4). They are executable specifications rather
 // than run assertions because reaching them needs a broker parked between two separate
 // transactions — the authority close and the record delete — which a single-broker harness
@@ -148,5 +148,5 @@ func TestStandaloneTeardownPermitsReserveOverClosed(t *testing.T) {
 func TestStandaloneTeardownCrashWindowsAreExecutableSpecs(t *testing.T) {
 	t.Skip("executable specification: the crash-window recoveries are implemented (adopter close, " +
 		"idempotent re-close, bounded resolve) and asserted indirectly; a parked-broker harness for " +
-		"the cross-stream window is owed with the Gap-2 CONNECT-side recovery work")
+		"the two-transaction window is owed with the Gap-2 CONNECT-side recovery work")
 }

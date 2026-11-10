@@ -113,7 +113,7 @@ func TestRetainedMaterializeAndAdmit(t *testing.T) {
 		stored.Dur != _EMPTY_ || stored.Seq != 0 {
 		t.Fatalf("the retained register is %+v (%v)", stored, lerr)
 	}
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttInflightSubject(idHash, auth.Gen, 11)+"."+mqttInflightMarkerSuffix); err != nil {
 		t.Fatalf("the unsent marker does not load back: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestRetainedCloseArbitratesWithAdmission(t *testing.T) {
 
 // TestRetainedPubRecCreatesItsCanonical: a successful PUBREC moves the exchange to
 // PubRecObserved and the retained register straight to pubrel_ready, creating its canonical PUBREL
-// on $MQTT_inflight in the same batch; a direct advance without the record is refused.
+// in the $MQTT.inflight. space in the same batch; a direct advance without the record is refused.
 func TestRetainedPubRecCreatesItsCanonical(t *testing.T) {
 	e, done := testNewEnv(t, "f105-ret-pubrec")
 	defer done()
@@ -306,7 +306,7 @@ func TestRetainedPubRecCreatesItsCanonical(t *testing.T) {
 	if after.State != mqttInflightPubRelReady || after.RelID != relID {
 		t.Fatalf("the retained register after PUBREC is %+v", after)
 	}
-	rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, after.RelSubj)
+	rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, after.RelSubj)
 	if rerr != nil {
 		t.Fatalf("the canonical PUBREL does not load back: %v", rerr)
 	}

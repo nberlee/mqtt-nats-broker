@@ -573,7 +573,7 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 		// skipped store leaves the slot in publish for recovery.
 		var presp *JSPubAckResponse
 		// THE INTENT, BEFORE THE STORE. Batches are per stream, so the record on
-		// `$MQTT_out` and the slot on `$MQTT_inflight` can never be written atomically;
+		// `$MQTT_out` and the slot in the `$MQTT.inflight.` space can never be written atomically;
 		// what CAN be made safe is the ORDER. A crash after this CAS leaves a slot that
 		// says "past PUBREC, canonical record owed", which no peer may reap; a crash
 		// after the store with the slot still in `publish` is the window this closes.
@@ -592,8 +592,8 @@ func (c *client) mqttProcessPublishReceived(pi uint16, isPubRec bool, reason byt
 			sess.scheduleIntentResolution(c, pi, removed)
 		default:
 			if removed != nil && removed.kind == mqttPendingRetained {
-				// A RETAINED exchange's canonical PUBREL was created by the advance itself, on
-				// $MQTT_inflight (issue #107 7c): nothing is stored on $MQTT_out, and the PUBREL goes
+				// A RETAINED exchange's canonical PUBREL was created by the advance itself, in
+				// the $MQTT.inflight. space (issue #107 7c): nothing is stored on $MQTT_out, and the PUBREL goes
 				// out directly once this handler releases the locks.
 				retainedPubRel = true
 				break

@@ -26,9 +26,9 @@ import (
 // delivery is retransmitted, and on an interest-retained stream that source lives only as long as
 // some holder keeps the consumer. An open ledger's release therefore runs, in order:
 //
-//  1. CLOSE the acquisition on the ledger ($MQTT_shared), so a shared admission's readiness refuses
+//  1. CLOSE the acquisition on the ledger (the $MQTT.shared. space), so a shared admission's readiness refuses
 //     it from now on;
-//  2. FENCE the authority ($MQTT_inflight): a CONFIRMED advance of its sequence past the one read
+//  2. FENCE the authority (the $MQTT.inflight. space): a CONFIRMED advance of its sequence past the one read
 //     after the close, which every admission that read readiness before the close names in its CAS
 //     and so loses;
 //  3. ENUMERATE the generation's inventory, read after the fence, so every admission that landed
@@ -36,8 +36,9 @@ import (
 //     delivery from the source (phase Publish), or while any subject is uncertain;
 //  4. only then L1.
 //
-// Atomic batches are per stream, so steps 1 and 2 cannot be one write, and the order is the
-// fence: an admission that reads the authority after step 2 reads the ledger after step 1.
+// Steps 1 and 2 are two writes, and the order is the fence: an admission that reads the
+// authority after step 2 reads the ledger after step 1. Both records share $MQTT_sess, so
+// one batch could carry them; this protocol does not, and the order is what it rests on.
 //
 // Two shortcuts, each an authorization rather than an observation. A SEALED ledger releases at
 // once: a seal is written only by a closing under a won teardown claim or the committed discarding

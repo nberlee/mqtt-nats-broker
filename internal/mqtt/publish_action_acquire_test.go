@@ -303,7 +303,7 @@ func TestMQTTPublishActionRecordsTheCounterItLandedOnAnOrdinarySlot(t *testing.T
 	if tok.out == nil || tok.out.action == nil || tok.out.action.Acq != cur.Acq || tok.out.acq != cur.Acq {
 		t.Fatalf("the acquisition the frame will consume does not name the landed counter: %+v", tok.out)
 	}
-	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttActionSubject(getHash(e.sess.id), tok.slot.name.gen, cur.Lin, cur.Acq)); lerr != nil {
 		t.Fatalf("no action record at the landed counter: %v", lerr)
 	}

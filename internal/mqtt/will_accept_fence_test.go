@@ -1417,7 +1417,7 @@ func TestWillLicensingIsRefusedPastTheBudget(t *testing.T) {
 // nothing.
 //
 // This USED TO be reachable through an operation the documentation supported, because
-// $MQTT_willq sat outside the coupled recreation unit. issue #70 made all ten streams one
+// $MQTT_willq sat outside the coupled recreation unit. issue #70 made all eight streams one
 // recreation unit, so it is now reachable only through administrative deletion or a
 // partial restore — unsupported, not impossible. The behaviour is still pinned: a test
 // is not weakened because the route to its state got narrower.
@@ -1726,6 +1726,12 @@ func TestWillCutoffChaseIsBoundedAndStillDecides(t *testing.T) {
 		t.Fatalf("an owed Will must be DECIDED when the chase limit runs out, not deferred: "+
 			"got state=%q decision=%q cutoff=%v", cur.State, cur.Decision, cur.DecisionCutoff)
 	}
+	// The decision records the LAST verified cutoff, not the first sample: since the
+	// in-flight space shares $MQTT_sess, a claimant on a busy account usually exhausts
+	// its chases, and the persisted cutoff must still be what the scan verified through.
+	if want := cutoffs[len(cutoffs)-1]; cur.DecisionCutoff == nil || *cur.DecisionCutoff != want {
+		t.Fatalf("the decision must record the final verified cutoff %d, got %v", want, cur.DecisionCutoff)
+	}
 	testWaitFor(t, 4*time.Second, 10*time.Millisecond, func() error {
 		if n := pubs.Load(); n != 1 {
 			return fmt.Errorf("the owed Will must be published, got %d publications", n)
@@ -1998,7 +2004,7 @@ func TestWillScanProgressPersistsDespiteAStaleForeignFloor(t *testing.T) {
 	// A floor from an incarnation that no longer exists, numerically far above anything
 	// the current stream will reach: what a surviving $MQTT_willq record carries when
 	// $MQTT_sess has been replaced under it. No SUPPORTED operation produces that any
-	// more (issue #70 made the ten streams one recreation unit); an administrative
+	// more (issue #70 made the eight streams one recreation unit); an administrative
 	// deletion or a partial restore still can.
 	//
 	// Seeded PUBLISHING with an expired lease, because that is the only shape that can

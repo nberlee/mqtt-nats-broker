@@ -20,7 +20,7 @@ import (
 )
 
 // testResetBundle performs the documented recovery: STOP every broker serving the
-// account, then delete all ten streams.
+// account, then delete all eight streams.
 //
 // The stop is the point, not a formality. Deleting the bundle under a live manager is
 // not the contract's procedure and proves nothing about it — worse, an initialized
@@ -63,7 +63,7 @@ func jsRawStreamConfig(t *testing.T, nc *nats.Conn, name string) *StreamConfig {
 // testBundleThenReplace brings a manager up so the account holds a real bundle
 // under the epoch that manager adopted, then replaces the named members,
 // STAMPING each replacement with that same epoch and this build's persisted format. For a defect that is not
-// about the epoch: the preflight admits ten-present and the per-stream
+// about the epoch: the preflight admits eight-present and the per-stream
 // validator is what refuses, which is the production shape.
 func testBundleThenReplace(t *testing.T, s *Server, c *client, nc *nats.Conn, cfgs map[string]*StreamConfig) string {
 	t.Helper()
@@ -97,7 +97,7 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getOrCreate: %v", err)
 	}
-	// All TEN, not the four this test used to name: every validator now also
+	// All EIGHT, not the four this test used to name: every validator now also
 	// compares the bundle epoch stamp, so every one of them has a new way to
 	// reject a stream the broker itself created. The epoch passed is the one this
 	// manager ADOPTED — using the unit-test constant here would assert against a
@@ -115,7 +115,6 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 		}},
 		{mqttQoS2IncomingMsgsStreamName, func(si *StreamInfo) error { return validateQoS2InStream(si, 1, e) }},
 		{mqttQoS2AssignStreamName, func(si *StreamInfo) error { return validateQoS2AssignStream(si, 1, e) }},
-		{mqttInflightStreamName, func(si *StreamInfo) error { return validateInflightStream(si, 1, e) }},
 		{mqttOutStreamName, func(si *StreamInfo) error {
 			return validateOutStream(si, 1, mqttDefaultMaxAckPending, e)
 		}},
@@ -129,8 +128,8 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 			t.Fatalf("the %s stream the broker created does not satisfy its own validator: %v", tc.stream, verr)
 		}
 	}
-	// And the stamps AGREE across the whole bundle, which is what makes the ten
-	// one recreation unit. Asserted here rather than inferred from the ten
+	// And the stamps AGREE across the whole bundle, which is what makes the eight
+	// one recreation unit. Asserted here rather than inferred from the eight
 	// validator calls above: each of those compares against the same e, so they
 	// would all pass even if the manager had adopted an epoch no stream carried.
 	if !mqttValidSessEpoch(e) {
@@ -142,7 +141,7 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 			t.Fatalf("lookup %s: si=%v err=%v", name, si, err)
 		}
 		if got := si.Config.Metadata[mqttSessEpochMetaKey]; got != e {
-			t.Fatalf("%s carries recovery epoch %q, want the adopted %q: the ten streams must be one bundle",
+			t.Fatalf("%s carries recovery epoch %q, want the adopted %q: the eight streams must be one bundle",
 				name, got, e)
 		}
 	}
@@ -155,7 +154,7 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 //
 // The fixture shape is forced, not preferred. This test used to hand-create ONE
 // stream and let the broker provision the rest; startup now REFUSES a proper
-// subset of the ten before any validator runs, so that shape would exercise the
+// subset of the eight before any validator runs, so that shape would exercise the
 // count rule instead of the validator. Bringing the whole bundle up and then
 // replacing one member — carrying the same epoch, so only the poisoned FIELD
 // differs — is what reaches the validator, and it is the shape a production account is
@@ -240,7 +239,7 @@ func TestNewValidatorMisconfigurationFailsStartup(t *testing.T) {
 }
 
 // The documented recovery is the WHOLE BUNDLE, proven rather than asserted: from
-// a refused account, stopping the broker and deleting all ten streams lets the
+// a refused account, stopping the broker and deleting all eight streams lets the
 // next initialization provision a fresh bundle and succeed.
 //
 // This replaces the per-stream "recovery" subtests that used to delete ONE
@@ -261,7 +260,7 @@ func TestBrokerStreamBundleResetRecovers(t *testing.T) {
 	if _, err := s.getOrCreateMQTTAccountSessionManager(s.createInternalAccountClient()); err == nil {
 		t.Fatal("expected the nonconforming stream to refuse startup")
 	}
-	// The reset: every one of the ten, with nothing serving the account. The
+	// The reset: every one of the eight, with nothing serving the account. The
 	// stopped broker is not restarted — "stop all brokers, then restart" means a new
 	// process, so the recovery is proven on a fresh one.
 	testResetBundle(t, nc, s)
@@ -377,7 +376,7 @@ func TestBrokerRefusesTTLlessMessageStreams(t *testing.T) {
 			}
 			// A complete bundle is present, so a refusal mentioning the count rule
 			// would mean this fixture stopped testing what it names.
-			if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
+			if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
 				t.Fatalf("the refusal came from the bundle preflight, not the TTL validator: %v", err)
 			}
 		})
@@ -418,7 +417,7 @@ func TestBrokerStreamBundleStartRefusesThenRestartConverges(t *testing.T) {
 		t.Fatal("Start must FAIL against a partial bundle: the recovery guidance rests on a " +
 			"failed initialization being fatal rather than completing the bundle")
 	}
-	for _, want := range []string{"of the 10 broker-owned streams", "ONE recreation unit"} {
+	for _, want := range []string{"of the 8 broker-owned streams", "ONE recreation unit"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Start's error must carry the bundle refusal (%q), got: %v", want, err)
 		}

@@ -323,11 +323,11 @@ func TestAnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
 	// client's AUTHORITY RECORD REMOVED — rather than a hand-built duty, which would prove only
 	// that a struct literal reaches a branch.
 	authSubj := mqttOutboundAuthoritySubject(getHash(e.id))
-	asmsg, aerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, authSubj)
+	asmsg, aerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, authSubj)
 	if aerr != nil || asmsg == nil {
 		t.Fatalf("reading the authority to remove it: %v", aerr)
 	}
-	if derr := e.asm.jsa.deleteMsg(mqttInflightStreamName, asmsg.Sequence, true); derr != nil {
+	if derr := e.asm.jsa.deleteMsg(mqttSessStreamName, asmsg.Sequence, true); derr != nil {
 		t.Fatalf("removing the authority: %v", derr)
 	}
 
@@ -414,11 +414,11 @@ func TestAnAbsentAuthorityWithholdsTheReadinessWorkToo(t *testing.T) {
 	}
 
 	authSubj := mqttOutboundAuthoritySubject(getHash(e.id))
-	asmsg, aerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, authSubj)
+	asmsg, aerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, authSubj)
 	if aerr != nil || asmsg == nil {
 		t.Fatalf("reading the authority to remove it: %v", aerr)
 	}
-	if derr := e.asm.jsa.deleteMsg(mqttInflightStreamName, asmsg.Sequence, true); derr != nil {
+	if derr := e.asm.jsa.deleteMsg(mqttSessStreamName, asmsg.Sequence, true); derr != nil {
 		t.Fatalf("removing the authority: %v", derr)
 	}
 

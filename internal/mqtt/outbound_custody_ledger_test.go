@@ -216,7 +216,7 @@ func testCustodyCountExchanges(t *testing.T, e *testInflightEnv, gen string) int
 	filter := mqttExchangeSubject(e.sess.idHash, gen, "*")
 	n := 0
 	for seq := uint64(1); ; {
-		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, seq)
+		smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
 		if err != nil {
 			if isErrorOtherThan(err, JSNoMessageFoundErr) {
 				t.Fatalf("walk exchanges: %v", err)

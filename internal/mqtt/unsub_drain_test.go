@@ -124,7 +124,7 @@ func TestMQTTDrainDiscardsFreshMessages(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, got)
 
 	// Nothing else arrives: the fresh message was discarded, not queued.
-	testMQTTExpectNothing(t, conn.r)
+	testDrainExpectNothingButLateRedeliveries(t, conn.r, testDrainRedelivery{pi: pi, topic: "fresh/topic", payload: "payload"})
 
 	checkFor(t, 5*time.Second, 25*time.Millisecond, func() error {
 		if n := testDrainCount(sess); n != 0 {
@@ -246,7 +246,7 @@ func TestMQTTDrainAdoptedByResubscribe(t *testing.T) {
 	testMQTTPublish(t, pc, pr, 1, false, false, "adopt/topic", 3, []byte("again"))
 	next := testMQTTCheckPubMsgNoAck(t, conn.c, conn.r, "adopt/topic", mqttPubQos1, []byte("again"))
 	testMQTTSendPIPacket(mqttPacketPubAck, t, conn.c, next)
-	testMQTTExpectNothing(t, conn.r)
+	testDrainExpectNothingButLateRedeliveries(t, conn.r, testDrainRedelivery{pi: pi, topic: "adopt/topic", payload: "payload"})
 }
 
 // TestMQTTDrainDiscardsWithheldDeliveries is test 14 (I5): only a delivery that
@@ -431,7 +431,7 @@ func TestMQTTDrainRefusedUnderStreamConsumerLimit(t *testing.T) {
 	if oerr != nil || own == nil || own.State != mqttNameOwnRetired {
 		t.Fatalf("the retired consumer's name is not RETIRED: %+v (%v)", own, oerr)
 	}
-	testMQTTExpectNothing(t, conn.r)
+	testDrainExpectNothingButLateRedeliveries(t, conn.r, testDrainRedelivery{pi: pi, topic: "limited/topic", payload: "payload"})
 }
 
 // TestMQTTDrainNotAdoptedByQoS0Resubscribe pins the other half of adoption: a
@@ -577,10 +577,13 @@ func TestMQTTDrainDurablesDeletedOnCleanStart(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	conn, sess, _ := testDrainSetup(t, s, o, "cleanstart", "cleanstart/topic", 1)
+	conn, sess, pi := testDrainSetup(t, s, o, "cleanstart", "cleanstart/topic", 1)
 
-	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "cleanstart/topic"}})
-	testMQTTFlush(t, conn.c, nil, conn.r)
+	// The started delivery stays unacknowledged in the drain, so its redelivery may arrive
+	// during any wait from here to the close (see TestMQTTDrainRestoredClaimRedeliveredAfterRestart).
+	redelivery := testDrainRedelivery{pi: pi, topic: "cleanstart/topic", payload: "payload"}
+	testDrainUnsubAmidRedeliveries(t, conn, 1, "cleanstart/topic", redelivery)
+	testDrainPingAmidRedeliveries(t, conn, redelivery)
 
 	sess.mu.Lock()
 	var drainDur string
@@ -595,7 +598,7 @@ func TestMQTTDrainDurablesDeletedOnCleanStart(t *testing.T) {
 		t.Fatalf("the drained durable should exist before the discard (err=%v)", err)
 	}
 
-	testMQTTDisconnect(t, conn.c, nil)
+	testDrainDisconnectAmidRedeliveries(t, conn, redelivery)
 	conn.c.Close()
 
 	// A clean-start CONNECT discards the session, which must take the drain with it.
@@ -680,12 +683,15 @@ func TestMQTTDrainDiscardsOfflineBacklog(t *testing.T) {
 
 	conn, sess, pi := testDrainSetup(t, s, o, "backlog", "backlog/topic", 1)
 
-	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "backlog/topic"}})
-	testMQTTFlush(t, conn.c, nil, conn.r)
+	// The started delivery stays unacknowledged in the drain, so its redelivery may arrive
+	// during any wait from here to the close (see TestMQTTDrainRestoredClaimRedeliveredAfterRestart).
+	redelivery := testDrainRedelivery{pi: pi, topic: "backlog/topic", payload: "payload"}
+	testDrainUnsubAmidRedeliveries(t, conn, 1, "backlog/topic", redelivery)
+	testDrainPingAmidRedeliveries(t, conn, redelivery)
 	if n := testDrainCount(sess); n != 1 {
 		t.Fatalf("expected one draining consumer, got %v", n)
 	}
-	testMQTTDisconnect(t, conn.c, nil)
+	testDrainDisconnectAmidRedeliveries(t, conn, redelivery)
 	conn.c.Close()
 
 	pc, pr := testMQTTConnect(t, &mqttConnInfo{clientID: "backlogpub2", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
@@ -705,7 +711,7 @@ func TestMQTTDrainDiscardsOfflineBacklog(t *testing.T) {
 		t.Errorf("redelivered identifier = %v, want the original %v", got, pi)
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, got)
-	testMQTTExpectNothing(t, r2)
+	testDrainExpectNothingButLateRedeliveries(t, r2, testDrainRedelivery{pi: got, topic: "backlog/topic", payload: "payload"})
 }
 
 // TestMQTTDrainLevelUpCoversBothConsumers is test 27. A "foo/#" subscription is
@@ -832,13 +838,16 @@ func TestMQTTDrainSurvivesConsumerInactivityThreshold(t *testing.T) {
 			ci.Config.InactiveThreshold)
 	}
 
-	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "inact/topic"}})
-	testMQTTFlush(t, conn.c, nil, conn.r)
+	// The started delivery stays unacknowledged in the drain, so its redelivery may arrive
+	// during any wait from here to the close (see TestMQTTDrainRestoredClaimRedeliveredAfterRestart).
+	redelivery := testDrainRedelivery{pi: pi, topic: "inact/topic", payload: "payload"}
+	testDrainUnsubAmidRedeliveries(t, conn, 1, "inact/topic", redelivery)
+	testDrainPingAmidRedeliveries(t, conn, redelivery)
 	if n := testDrainCount(sess); n != 1 {
 		t.Fatalf("expected one draining consumer, got %v", n)
 	}
 
-	testMQTTDisconnect(t, conn.c, nil)
+	testDrainDisconnectAmidRedeliveries(t, conn, redelivery)
 	conn.c.Close()
 
 	// Offline for a while. The durable was never armed with a timer, so nothing reaps it.
@@ -1088,6 +1097,196 @@ func TestMQTTDrainCompletionSaveFailureLosesNothing(t *testing.T) {
 // After a restart the in-memory tracking maps are empty, so the delivery path
 // cannot tell a started delivery from a new one — only the record can, which is
 // why the claim, not the memory, is the authority.
+// testDrainRedelivery names the one packet a drain may legitimately send while a test waits
+// for something else: the started QoS 1 delivery again, with DUP.
+type testDrainRedelivery struct {
+	pi      uint16
+	topic   string
+	payload string
+}
+
+// testDrainCheckRedelivery parses the PUBLISH whose fixed header r has just read (b, pl) and
+// requires it to be the started delivery's DUP redelivery, validated whole. It is left
+// unacknowledged, so the drain keeps the claim the test goes on to restore.
+func testDrainCheckRedelivery(t testing.TB, r *mqttReader, b byte, pl int, d testDrainRedelivery) {
+	t.Helper()
+	if b&mqttPacketMask != mqttPacketPub {
+		t.Fatalf("only a DUP redelivery of the started delivery may arrive here, got packet %x", b&mqttPacketMask)
+	}
+	flags := b & mqttPacketFlagMask
+	start := r.pos
+	topic, err := r.readString("topic name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pi, err := r.readUint16("packet identifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed := r.pos - start; consumed > pl || start+pl > len(r.buf) {
+		t.Fatalf("a PUBLISH of %d bytes does not hold its own topic and identifier", pl)
+	}
+	payload := string(r.buf[r.pos : start+pl])
+	r.pos = start + pl
+	// The flags exactly: QoS 1 with DUP. The started delivery was published non-retained and
+	// checked with exact flags (testDrainSetup), so RETAIN on its retransmission is a defect.
+	if flags != mqttPubQos1|mqttPubFlagDup || pi != d.pi ||
+		topic != d.topic || payload != d.payload {
+		t.Fatalf("only a DUP redelivery of the started delivery (pi %d, %q, %q) may arrive here, got flags=%x pi=%d %q %q",
+			d.pi, d.topic, d.payload, flags, pi, topic, payload)
+	}
+}
+
+// testDrainNextAmidRedeliveries reads packets until one that is not a PUBLISH arrives and
+// returns it, requiring every PUBLISH before it to be the started delivery's DUP
+// redelivery. ok is false when no complete packet arrived within the deadline, which the
+// caller treats as a failure: these waits expect a reply, never a close.
+func testDrainNextAmidRedeliveries(t testing.TB, r *mqttReader, d testDrainRedelivery,
+	deadline time.Time) (b byte, pl int, ok bool) {
+	t.Helper()
+	for {
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return 0, 0, false
+		}
+		b, pl, ok = testMQTTReadPacketReady(r, wait)
+		if !ok || b&mqttPacketMask != mqttPacketPub {
+			return b, pl, ok
+		}
+		testDrainCheckRedelivery(t, r, b, pl, d)
+	}
+}
+
+// testDrainCollect returns everything the connection delivers until the deadline, after what
+// the reader already holds: its partial packet when it is mid-packet, else its unread bytes.
+// With untilClose the peer must close before the deadline, which the CALLER arms before it
+// sends DISCONNECT (the peer may close at once, and a deadline armed after that fails); without
+// it the deadline is armed here, its ending the read is the expected outcome, and a close ends
+// it early. Either way nothing is interpreted
+// here: testDrainParseRedeliveries judges the bytes whole, so a malformed or truncated packet
+// can never pass for silence or for the close.
+func testDrainCollect(t testing.TB, r *mqttReader, deadline time.Time, untilClose bool) []byte {
+	t.Helper()
+	var received []byte
+	if len(r.pbuf) > 0 {
+		received = append(received, r.pbuf...)
+	} else {
+		received = append(received, r.buf[r.pos:]...)
+	}
+	r.pbuf, r.buf, r.pos, r.pstart = nil, nil, 0, 0
+	if !untilClose {
+		if err := r.reader.SetReadDeadline(deadline); err != nil {
+			t.Fatalf("arming the read deadline: %v", err)
+		}
+	}
+	defer func() { _ = r.reader.SetReadDeadline(time.Time{}) }()
+	var chunk [4096]byte
+	for {
+		n, err := r.reader.Read(chunk[:])
+		received = append(received, chunk[:n]...)
+		if err == nil {
+			continue
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			if untilClose {
+				t.Fatal("the broker did not close the connection within the deadline after DISCONNECT")
+			}
+		}
+		return received // the deadline, or EOF or a reset: the connection is closed
+	}
+}
+
+// testDrainParseRedeliveries requires received to be nothing but complete DUP redeliveries of
+// the started delivery.
+func testDrainParseRedeliveries(t testing.TB, received []byte, d testDrainRedelivery) {
+	t.Helper()
+	r := &mqttReader{}
+	r.reset(received)
+	for r.hasMore() {
+		b, err := r.readByte("packet type")
+		if err != nil {
+			t.Fatalf("reading what arrived: %v", err)
+		}
+		pl, complete, err := r.readPacketLen(b&mqttPacketMask, mqttProtoLevel5, MAX_PAYLOAD_SIZE)
+		if err != nil || !complete {
+			t.Fatalf("a malformed or truncated packet (%x) arrived: complete=%v err=%v",
+				b&mqttPacketMask, complete, err)
+		}
+		testDrainCheckRedelivery(t, r, b, pl, d)
+	}
+}
+
+// testDrainExpectNothingButLateRedeliveries is testMQTTExpectNothing after the started
+// delivery was acknowledged. A redelivery JetStream re-offered (AckWait) before the broker
+// processed that PUBACK can still reach the client after it, and that is a retransmission, not
+// a fresh message; anything else arriving in the window fails, a fresh or withheld message,
+// a malformed packet and a partial one included.
+func testDrainExpectNothingButLateRedeliveries(t testing.TB, r *mqttReader, d testDrainRedelivery) {
+	t.Helper()
+	testDrainParseRedeliveries(t, testDrainCollect(t, r, time.Now().Add(300*time.Millisecond), false), d)
+}
+
+// testDrainUnsubAmidRedeliveries sends UNSUBSCRIBE and requires its UNSUBACK.
+func testDrainUnsubAmidRedeliveries(t testing.TB, conn *mqttTestConn, pi uint16, filter string, d testDrainRedelivery) {
+	t.Helper()
+	w := newMQTTWriter(0)
+	w.WriteByte(mqttPacketUnsub | mqttUnsubscribeFlags)
+	w.WriteVarInt(2 + 2 + len(filter))
+	w.WriteUint16(pi)
+	w.WriteBytes([]byte(filter))
+	if _, err := testMQTTWrite(conn.c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing UNSUBSCRIBE protocol: %v", err)
+	}
+	b, _, ok := testDrainNextAmidRedeliveries(t, conn.r, d, time.Now().Add(10*time.Second))
+	if !ok || b&mqttPacketMask != mqttPacketUnsubAck {
+		t.Fatalf("expected UNSUBACK, got packet %x (ok=%v)", b&mqttPacketMask, ok)
+	}
+	if rpi, err := conn.r.readUint16("packet identifier"); err != nil || rpi != pi {
+		t.Fatalf("UNSUBACK packet identifier: want %d, got %d (%v)", pi, rpi, err)
+	}
+}
+
+// testDrainPingAmidRedeliveries sends PINGREQ and requires its PINGRESP.
+func testDrainPingAmidRedeliveries(t testing.TB, conn *mqttTestConn, d testDrainRedelivery) {
+	t.Helper()
+	if _, err := conn.c.Write([]byte{mqttPacketPing, 0}); err != nil {
+		t.Fatalf("writing the packet: %v", err)
+	}
+	b, pl, ok := testDrainNextAmidRedeliveries(t, conn.r, d, time.Now().Add(10*time.Second))
+	if !ok || b&mqttPacketMask != mqttPacketPingResp {
+		t.Fatalf("expected PINGRESP, got packet %x (ok=%v)", b&mqttPacketMask, ok)
+	}
+	if pl != 0 {
+		t.Fatalf("PINGRESP must have a remaining length of 0, got %d", pl)
+	}
+}
+
+// testDrainDisconnectAmidRedeliveries sends DISCONNECT and requires the broker to close the
+// connection within one absolute deadline. Everything received before the close is collected
+// first and only then parsed, so a malformed or truncated packet is a failure rather than
+// being taken for the close, and the bytes must be nothing but complete DUP redeliveries of
+// the started delivery.
+func testDrainDisconnectAmidRedeliveries(t testing.TB, conn *mqttTestConn, d testDrainRedelivery) {
+	t.Helper()
+	testDrainDisconnectAmidRedeliveriesWithin(t, conn, d, 10*time.Second)
+}
+
+// testDrainDisconnectAmidRedeliveriesWithin is testDrainDisconnectAmidRedeliveries with the
+// close deadline given, so a test of the wait itself need not spend the full ten seconds.
+func testDrainDisconnectAmidRedeliveriesWithin(t testing.TB, conn *mqttTestConn, d testDrainRedelivery, within time.Duration) {
+	t.Helper()
+	// The deadline is armed BEFORE the DISCONNECT goes out: the broker may close the
+	// connection as soon as it reads it, and the deadline bounds the whole wait from here.
+	deadline := time.Now().Add(within)
+	if err := conn.c.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("arming the close deadline: %v", err)
+	}
+	if _, err := conn.c.Write([]byte{mqttPacketDisconnect, 0}); err != nil {
+		t.Fatalf("writing the packet: %v", err)
+	}
+	testDrainParseRedeliveries(t, testDrainCollect(t, conn.r, deadline, true), d)
+}
+
 func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
@@ -1100,12 +1299,18 @@ func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 		t.Fatalf("packet identifier %d is what a fresh allocator would produce; the continuity comparison after the restart would prove nothing", piOrig)
 	}
 
-	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "restart1/topic"}})
-	testMQTTFlush(t, conn.c, nil, conn.r)
+	// The unacknowledged delivery stays outstanding in the drain, so with AckWait at 250 ms
+	// its redelivery can arrive at any point from here to the close: before UNSUBACK, before
+	// PINGRESP, after DISCONNECT. That is the drain doing its job, not noise to discard, so
+	// each wait below accepts exactly a DUP redelivery of the started delivery (original
+	// identifier, topic and payload) and refuses anything else.
+	redelivery := testDrainRedelivery{pi: piOrig, topic: "restart1/topic", payload: "payload"}
+	testDrainUnsubAmidRedeliveries(t, conn, 1, "restart1/topic", redelivery)
+	testDrainPingAmidRedeliveries(t, conn, redelivery)
 	if n := testDrainCount(sess); n != 1 {
 		t.Fatalf("expected one draining consumer, got %v", n)
 	}
-	testMQTTDisconnect(t, conn.c, nil)
+	testDrainDisconnectAmidRedeliveries(t, conn, redelivery)
 	conn.c.Close()
 
 	dir := strings.TrimSuffix(s.JetStreamConfig().StoreDir, JetStreamStoreDir)
@@ -1143,7 +1348,7 @@ func TestMQTTDrainRestoredClaimRedeliveredAfterRestart(t *testing.T) {
 		}
 		return nil
 	})
-	testMQTTExpectNothing(t, r2)
+	testDrainExpectNothingButLateRedeliveries(t, r2, testDrainRedelivery{pi: pi2, topic: "restart1/topic", payload: "payload"})
 }
 
 // TestMQTTDrainDurablesDeletedOnSessionExpiry is the other half of test 21:
@@ -1162,10 +1367,13 @@ func TestMQTTDrainDurablesDeletedOnSessionExpiry(t *testing.T) {
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 
-	conn, sess, _ := testDrainSetup(t, s, o, "expiredrain", "expiredrain/topic", 1)
+	conn, sess, pi := testDrainSetup(t, s, o, "expiredrain", "expiredrain/topic", 1)
 
-	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "expiredrain/topic"}})
-	testMQTTFlush(t, conn.c, nil, conn.r)
+	// The started delivery stays unacknowledged in the drain, so its redelivery may arrive
+	// during any wait from here to the close (see TestMQTTDrainRestoredClaimRedeliveredAfterRestart).
+	redelivery := testDrainRedelivery{pi: pi, topic: "expiredrain/topic", payload: "payload"}
+	testDrainUnsubAmidRedeliveries(t, conn, 1, "expiredrain/topic", redelivery)
+	testDrainPingAmidRedeliveries(t, conn, redelivery)
 
 	sess.mu.Lock()
 	var drainDur string
@@ -1183,7 +1391,7 @@ func TestMQTTDrainDurablesDeletedOnSessionExpiry(t *testing.T) {
 	sess.mu.Lock()
 	sess.expiryInterval = 1
 	sess.mu.Unlock()
-	testMQTTDisconnect(t, conn.c, nil)
+	testDrainDisconnectAmidRedeliveries(t, conn, redelivery)
 	conn.c.Close()
 
 	asm := testMQTTGetGlobalASM(t, s)
@@ -1348,8 +1556,8 @@ func TestMQTTSubscribeAmbiguousSaveIsNotRolledBack(t *testing.T) {
 	// resolveUncertainNow), so without this the session would settle before the
 	// retained state could be observed.
 	var suppressRead atomicOnceBool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressRead.get() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressRead.get() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -1435,8 +1643,8 @@ func TestMQTTSharedSubscribeAmbiguousSaveAbandonsThePacket(t *testing.T) {
 
 	// The shared filter's EARLY membership write lands but its response is lost.
 	var suppressRead atomicOnceBool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressRead.get() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressRead.get() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -1512,8 +1720,8 @@ func TestMQTTForcedSharedLeaveAmbiguousSaveKeepsTheRemoval(t *testing.T) {
 	// CONNECT would instead make an earlier save ambiguous, and this branch would
 	// never be exercised.
 	var suppressRead atomicOnceBool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressRead.get() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressRead.get() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil

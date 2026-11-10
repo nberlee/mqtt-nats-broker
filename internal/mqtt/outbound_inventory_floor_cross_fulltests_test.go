@@ -27,7 +27,7 @@ func TestTraversalRestartsWhenFloorCrossesAFailedExchange(t *testing.T) {
 	var advFrom, advTo int // the fixture's own floor advance, excluded from the traversal's count
 	e.asm.mu.Lock()
 	e.asm.testInflightLoadMulti = func(subjects []string) ([]*JSApiMsgGetResponse, error) {
-		resps, err := e.asm.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+		resps, err := e.asm.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 		if calls.Add(1) == 1 {
 			advFrom = o.mark()
 			led, _ := testFloorLedger(t, e)

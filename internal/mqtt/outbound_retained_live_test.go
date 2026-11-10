@@ -109,7 +109,7 @@ func TestRetainedQoS1PubAckReclaimsTheCopy(t *testing.T) {
 	for {
 		x, _, _ := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, r.gen, reg.Lin)
 		res, _, _ := r.asm.jsa.loadOutboundResource(r.id, r.epoch, r.gen, m.Inc)
-		_, gone := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(r.idHash, r.gen, reg.Payload))
+		_, gone := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(r.idHash, r.gen, reg.Payload))
 		cur, _, _ := r.asm.loadInflightRecord(subject)
 		r.sess.mu.Lock()
 		_, held := r.sess.pendingPublish[pi]
@@ -281,14 +281,14 @@ func TestRetainedReclaimStoreFailureKeepsItsOwner(t *testing.T) {
 	if merr != nil {
 		t.Fatalf("no copy: %v", merr)
 	}
-	chunk, cerr := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttChunkSubject(r.idHash, r.gen, reg.Payload, 1))
+	chunk, cerr := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttChunkSubject(r.idHash, r.gen, reg.Payload, 1))
 	if cerr != nil || chunk == nil {
 		t.Fatalf("no chunk: %v", cerr)
 	}
 	// One more refusal than the withheld bound: a key dropped at the bound is never finished.
 	var refused atomic.Int32
 	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
-		if stream == mqttInflightStreamName && seq == chunk.Sequence && refused.Add(1) <= mqttRetainedStepAttempts+1 {
+		if stream == mqttSessStreamName && seq == chunk.Sequence && refused.Add(1) <= mqttRetainedStepAttempts+1 {
 			return errors.New("the chunk delete was refused")
 		}
 		return nil
@@ -438,7 +438,7 @@ func TestRetainedRecoveryRereadFailureRefusesTheResume(t *testing.T) {
 				}
 				passes.Add(1)
 				if tc.moves {
-					raw, err := as.jsa.loadLastMsgFor(mqttInflightStreamName, xsubj)
+					raw, err := as.jsa.loadLastMsgFor(mqttSessStreamName, xsubj)
 					if err == nil && raw != nil {
 						if _, serr := as.jsa.storeMsg(xsubj, -1, raw.Data); serr != nil {
 							t.Errorf("moving exchange %q: %v", xsubj, serr)
@@ -546,7 +546,7 @@ func TestRetainedPreClassificationFailureRefusesTheResume(t *testing.T) {
 						return nil, errors.New("the register batch could not be loaded")
 					}
 				}
-				return as.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+				return as.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 			}
 			if tc.noCensus {
 				// The inventory itself is unreadable: nothing rules a retained exchange out.
@@ -663,7 +663,7 @@ func TestRetainedQuarantineMatrix(t *testing.T) {
 	type corrupt func(t *testing.T, r *testRetainedRig, pi uint16, reg *mqttInflightRecord)
 	rewrite := func(t *testing.T, r *testRetainedRig, subject, field string, value any) {
 		t.Helper()
-		raw, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		raw, err := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if err != nil || raw == nil {
 			t.Fatalf("loading %q: %v", subject, err)
 		}
@@ -679,11 +679,11 @@ func TestRetainedQuarantineMatrix(t *testing.T) {
 	}
 	remove := func(t *testing.T, r *testRetainedRig, subject string) {
 		t.Helper()
-		raw, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		raw, err := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if err != nil || raw == nil {
 			t.Fatalf("loading %q: %v", subject, err)
 		}
-		if err := r.asm.jsa.deleteMsg(mqttInflightStreamName, raw.Sequence, true); err != nil {
+		if err := r.asm.jsa.deleteMsg(mqttSessStreamName, raw.Sequence, true); err != nil {
 			t.Fatalf("deleting %q: %v", subject, err)
 		}
 	}
@@ -828,7 +828,7 @@ func TestRetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
 	c.Close()
 	jsa := &rig.asm.jsa
 	rewrite := func(subj, field string, value any) {
-		raw, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		raw, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		if err != nil || raw == nil {
 			t.Errorf("loading %q: %v", subj, err)
 			return
@@ -851,9 +851,9 @@ func TestRetainedConcurrentPubCompIsNotQuarantined(t *testing.T) {
 		// THE PREVIOUS BROKER'S PUBCOMP, between the exchange read and the canonical read.
 		rewrite(mqttExchangeSubject(rig.idHash, rig.gen, reg.Lin), "phase", int(mqttExchangeTerminal))
 		rewrite(subject, "state", string(mqttInflightPubRelTerminal))
-		raw, err := jsa.loadLastMsgFor(mqttInflightStreamName, reg.RelSubj)
+		raw, err := jsa.loadLastMsgFor(mqttSessStreamName, reg.RelSubj)
 		if err == nil && raw != nil {
-			if derr := jsa.deleteMsg(mqttInflightStreamName, raw.Sequence, true); derr != nil {
+			if derr := jsa.deleteMsg(mqttSessStreamName, raw.Sequence, true); derr != nil {
 				t.Errorf("deleting the canonical PUBREL: %v", derr)
 			}
 		}
@@ -911,7 +911,7 @@ func TestRetainedSameObjectRefusedShapeDemotesTheResident(t *testing.T) {
 	if resident == nil || resident.kind != mqttPendingRetained {
 		t.Fatalf("no resident retained PUBREL entry: %+v", resident)
 	}
-	raw, err := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	raw, err := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil || raw == nil {
 		t.Fatalf("loading the register: %v", err)
 	}
@@ -1024,7 +1024,7 @@ func TestRetainedReclaimWakeDuringAWithheldStepIsKept(t *testing.T) {
 }
 
 // TestRetainedQoS2HandshakeThroughTheCanonical: a retained QoS 2 delivery's PUBREC creates its
-// canonical PUBREL on $MQTT_inflight in the advance and the PUBREL is emitted directly — no
+// canonical PUBREL in the $MQTT.inflight. space in the advance and the PUBREL is emitted directly — no
 // $MQTT_out record exists for it; PUBCOMP then terminalizes the exchange and the cleanup removes
 // the canonical, the register and the copy.
 func TestRetainedQoS2HandshakeThroughTheCanonical(t *testing.T) {
@@ -1050,8 +1050,8 @@ func TestRetainedQoS2HandshakeThroughTheCanonical(t *testing.T) {
 	if after == nil || after.State != mqttInflightPubRelReady || after.RelSubj == _EMPTY_ {
 		t.Fatalf("the retained register after PUBREC is %+v", after)
 	}
-	if _, err := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, after.RelSubj); err != nil {
-		t.Fatalf("the canonical PUBREL is not on $MQTT_inflight: %v", err)
+	if _, err := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, after.RelSubj); err != nil {
+		t.Fatalf("the canonical PUBREL is not in the $MQTT.inflight. space: %v", err)
 	}
 	if _, err := r.asm.jsa.loadLastMsgFor(mqttOutStreamName, r.sess.pubRelSubject); err == nil {
 		t.Fatalf("a retained PUBREC stored a PUBREL on $MQTT_out")
@@ -1062,7 +1062,7 @@ func TestRetainedQoS2HandshakeThroughTheCanonical(t *testing.T) {
 	for {
 		x, _, _ := r.asm.jsa.loadOutboundExchange(r.id, r.epoch, r.gen, reg.Lin)
 		cur, _, _ := r.asm.loadInflightRecord(subject)
-		_, relGone := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, after.RelSubj)
+		_, relGone := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, after.RelSubj)
 		res, _, _ := r.asm.jsa.loadOutboundResource(r.id, r.epoch, r.gen, m.Inc)
 		if x != nil && x.Phase == mqttExchangeTerminal && cur == nil && relGone != nil &&
 			res != nil && res.State == mqttResourceCleanupComplete {
@@ -1340,7 +1340,7 @@ func TestRetainedDiscardReclaimsTheCopy(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		res, _, _ := r.asm.jsa.loadOutboundResource(r.id, r.epoch, gen, m.Inc)
-		_, gone := r.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(r.idHash, gen, reg.Payload))
+		_, gone := r.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(r.idHash, gen, reg.Payload))
 		if res != nil && res.State == mqttResourceCleanupComplete && gone != nil {
 			break
 		}
@@ -1506,7 +1506,7 @@ func TestRetainedCrashMidChunksIsReclaimedAtTheNextConnect(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		res, _, _ := jsa.loadOutboundResource(rig.id, rig.epoch, gen, m.Inc)
-		_, gone := jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, gen, payload))
+		_, gone := jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, gen, payload))
 		if res != nil && res.State == mqttResourceCleanupComplete && gone != nil {
 			break
 		}
@@ -1677,7 +1677,7 @@ func TestRetainedFailedWithdrawalStaysOwned(t *testing.T) {
 					}
 					return errors.New("the register delete was refused")
 				}
-				return as.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+				return as.jsa.deleteMsg(mqttSessStreamName, seq, true)
 			}
 			r.asm.mu.Unlock()
 			defer func() {
@@ -1947,7 +1947,7 @@ func TestRetainedWorkersDoNotWaitOnAHeldReplay(t *testing.T) {
 	// The finished copy is reclaimed while the replay is still held.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		_, gone := jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
+		_, gone := jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
 		if gone != nil {
 			break
 		}

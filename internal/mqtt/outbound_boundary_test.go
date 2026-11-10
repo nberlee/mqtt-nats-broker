@@ -338,7 +338,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 // testBoundaryLoadResource reads one resource as it durably stands, with its sequence.
 func testBoundaryLoadResource(t *testing.T, e *testOutboundEnv, inc string) (*mqttOutboundResource, uint64) {
 	t.Helper()
-	msg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	msg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttResourceSubject(getHash(e.id), testGen, inc))
 	if err != nil {
 		t.Fatalf("loading resource %q: %v", inc, err)

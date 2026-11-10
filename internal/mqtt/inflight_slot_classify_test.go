@@ -399,7 +399,7 @@ func TestSlotClassifierDrivesTheLiveLadder(t *testing.T) {
 			if _, err := e.asm.jsa.storeMsg(subject, -1, []byte("not a register")); err != nil {
 				t.Fatalf("planting the unreadable occupant failed: %v", err)
 			}
-			smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+			smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 			if lerr != nil || smsg == nil {
 				t.Fatalf("the planted occupant does not load back: %v", lerr)
 			}
@@ -410,7 +410,7 @@ func TestSlotClassifierDrivesTheLiveLadder(t *testing.T) {
 		}
 		// UNTOUCHED. An unreadable record cannot be attributed to any delivery, so it cannot
 		// be proven stale — erasing it is how a corrupted record becomes a reused identifier.
-		smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if err != nil || smsg == nil || smsg.Sequence != planted {
 			t.Fatalf("the refusal moved the unreadable occupant")
 		}
@@ -431,7 +431,7 @@ func TestSlotClassifierDrivesTheLiveLadder(t *testing.T) {
 		if ok {
 			t.Fatalf("the store transmitted under an identifier a mismatched record occupies")
 		}
-		smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if err != nil || smsg == nil || smsg.Sequence != planted {
 			t.Fatalf("the refusal moved the mismatched occupant")
 		}
@@ -454,7 +454,7 @@ func TestSlotClassifierDrivesTheLiveLadder(t *testing.T) {
 		}
 		// NEVER REAPED: on another broker this record is that delivery's only durable
 		// identity, and destroying it strands the identifier the client is holding.
-		smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if err != nil || smsg == nil || smsg.Sequence != planted {
 			t.Fatalf("a live occupant for another delivery was reaped")
 		}

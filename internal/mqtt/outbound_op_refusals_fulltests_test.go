@@ -92,11 +92,11 @@ func TestOpRefusalCosts(t *testing.T) {
 	}
 	first := mqttResourceSubject(idHash, auth.Gen, x.Holds[0].Inc)
 	second := mqttResourceSubject(idHash, auth.Gen, x.Holds[1].Inc)
-	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, first)
+	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, first)
 	if lerr != nil {
 		t.Fatalf("fixture: reading the first held resource: %v", lerr)
 	}
-	if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
+	if err := e.asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
 		t.Fatalf("fixture: deleting the first held resource: %v", err)
 	}
 	m2 := o.mark()

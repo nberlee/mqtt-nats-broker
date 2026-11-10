@@ -241,6 +241,13 @@ const (
 	// See mqttRefuseRetiredOriginStream and docs/ARCHITECTURE.md "Compatibility boundary".
 	mqttOriginStreamName = "$MQTT_origin"
 
+	// The two streams whose subject spaces moved onto $MQTT_sess. The broker no
+	// longer defines them, so an account still holding either is refused at
+	// startup; the names survive for that preflight only.
+	// See mqttRefuseRetiredMetadataStreams.
+	mqttRetiredInflightStreamName = "$MQTT_inflight"
+	mqttRetiredSharedStreamName   = "$MQTT_shared"
+
 	// Reserved $MQTT_sess metadata key holding the generated stream-incarnation
 	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
 	// is an identity token (equality only), so a session sequence is comparable to
@@ -251,7 +258,7 @@ const (
 
 	// Reserved stream metadata key naming the persisted format every broker-owned
 	// stream was written in, and the one format this build writes and reads. The
-	// format is everything the broker writes into the ten streams and every rule a
+	// format is everything the broker writes into the eight streams and every rule a
 	// reader applies to it (docs/ARCHITECTURE.md, "The persisted format"). It is a
 	// separate fact from the recovery epoch: a reset changes the incarnation and
 	// keeps the format, and a migration would change the format and keep the
@@ -283,29 +290,26 @@ const (
 	mqttQoS2AssignStreamName          = "$MQTT_qos2assign"
 	mqttQoS2AssignStreamSubjectPrefix = mqttPrefix + "qos2.assign."
 
-	// Stream name and subject prefix for OUTBOUND in-flight registers: one tiny
-	// record per started QoS 1/2 PUBLISH, naming the packet identifier it was sent
-	// under together with the source durable and stream sequence it came from
-	// (MaxMsgsPer:1, keyed by the identifier). This is what makes an outbound
-	// identifier survive a broker restart or a failover instead of only a
-	// same-process reconnect. Kept on its own stream: $MQTT_out is interest-retained
-	// and would keep nothing, and a per-message write to the session record would
-	// serialize every delivery on the record CAS. See inflight_register.go.
-	mqttInflightStreamName          = "$MQTT_inflight"
+	// Subject space for OUTBOUND in-flight registers and the issue #107 outbound
+	// records, on the session stream ($MQTT_sess): one tiny record per started QoS
+	// 1/2 PUBLISH, naming the packet identifier it was sent under together with the
+	// source durable and stream sequence it came from (MaxMsgsPer:1, keyed by the
+	// identifier). This is what makes an outbound identifier survive a broker
+	// restart or a failover instead of only a same-process reconnect. It is a
+	// subject space of its own, not part of the session record: $MQTT_out is
+	// interest-retained and would keep nothing, and a per-message write to the
+	// session record would serialize every delivery on the record CAS. Every CAS
+	// is per subject, so sharing the stream puts no write behind another subject's
+	// expectation. See inflight_register.go.
 	mqttInflightStreamSubjectPrefix = mqttPrefix + "inflight."
 
-	// The shared-group lifecycle records (issue #107 transfer): the per-group group
-	// record and the per-generation acquisition ledger. Kept on their OWN stream
-	// rather than on $MQTT_inflight, even though both are MaxMsgsPer:1 CAS slots
-	// like the in-flight registers. The registers are rewritten and then deleted
-	// on ack, and an evicted register revives on a raw-block recovery whenever a
-	// neighbour keeps its storage block non-empty (the upstream defect recorded in
-	// docs/known-upstream-issues.md, MAXMSGSPER-REVIVAL). A permanent lifecycle
-	// record co-located on $MQTT_inflight would be exactly such a neighbour, so a
-	// plain session that leaves no live register would still not let its block
-	// collapse. These records are not in-flight registers and do not belong there;
-	// their own stream keeps $MQTT_inflight collapsible. See shared_lifecycle.go.
-	mqttSharedLifecycleStreamName          = "$MQTT_shared"
+	// Subject space for the shared-group lifecycle records (issue #107 transfer) on
+	// the session stream: the per-group group record and the per-generation
+	// acquisition ledger, both MaxMsgsPer:1 CAS slots. They once had a stream of
+	// their own whose DenyDelete made them immune to the upstream revival defect
+	// (docs/known-upstream-issues.md, MAXMSGSPER-REVIVAL); the session stream
+	// deletes, so that immunity is given up and the exposure is stated there. See
+	// shared_lifecycle.go.
 	mqttSharedLifecycleStreamSubjectPrefix = mqttPrefix + "shared."
 
 	// Generation-scoped names for a session's affine QoS 2 delivery path on

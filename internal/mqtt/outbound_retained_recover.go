@@ -511,7 +511,7 @@ func (sess *mqttSession) retainedQuarantinedLocked(nonce string) bool {
 // register's exchange and identifier. err reports a read the store did not answer; otherwise
 // agrees, or the quarantine reason that it does not.
 func (jsa *mqttJSA) retainedCanonicalAgrees(id, epoch, gen string, rec *mqttInflightRecord) (agrees bool, reason string, err error) {
-	smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, rec.RelSubj)
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, rec.RelSubj)
 	if !mqttStoreAnswered(lerr) {
 		return false, _EMPTY_, lerr
 	}

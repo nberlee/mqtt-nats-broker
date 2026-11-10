@@ -69,12 +69,13 @@ func TestMQTTSessionDeleteAlreadyDeletedReplicated(t *testing.T) {
 		if si.Config.Replicas != 3 {
 			return fmt.Errorf("Config.Replicas=%d, want 3", si.Config.Replicas)
 		}
-		// The stream carries the permanent acceptance fact too, and the fact sorts
-		// BELOW its own record — which is why the precondition is stated as "the
-		// record is the stream HEAD", not "the only message". What the fixture needs
-		// is that deleting the record leaves the stale sequence past the last one.
-		if si.State.LastSeq != seq {
-			return fmt.Errorf("LastSeq=%d, want the session record at %d", si.State.LastSeq, seq)
+		// The stream carries the permanent acceptance fact below the record, and the
+		// in-flight records (the CONNECT's authority transitions) beside it. What the
+		// fixture needs is that, once everything at or below the record is removed,
+		// the stale sequence sits BELOW FirstSeq; the check after the deletes asserts
+		// exactly that.
+		if si.State.LastSeq < seq {
+			return fmt.Errorf("LastSeq=%d, want the session record at %d stored", si.State.LastSeq, seq)
 		}
 		return nil
 	})
@@ -82,12 +83,12 @@ func TestMQTTSessionDeleteAlreadyDeletedReplicated(t *testing.T) {
 	// Remove the record out from under the broker, then wait until the stale
 	// sequence really is below the head on the replicated view.
 	//
-	// The permanent acceptance facts sit BELOW the record on this same stream, so
-	// deleting the record alone would leave the head where it is and the stale
-	// sequence still above it — the 10043 "removed nothing" path, not the one under
-	// test. They are removed here as a fixture manipulation; no broker operation ever
-	// deletes a fact, which is exactly what TestSessionTeardownLeavesAcceptFactsIntact
-	// pins.
+	// The permanent acceptance facts and the earlier in-flight records sit BELOW the
+	// record on this same stream, so deleting the record alone would leave the head
+	// where it is and the stale sequence still above it — the 10043 "removed nothing"
+	// path, not the one under test. They are removed here as a fixture manipulation; no
+	// broker operation ever deletes a fact, which is exactly what
+	// TestSessionTeardownLeavesAcceptFactsIntact pins.
 	for i := uint64(1); i < seq; i++ {
 		if derr := js.DeleteMsg(mqttSessStreamName, i); derr != nil {
 			t.Logf("fixture: no message at %d to remove (%v)", i, derr)

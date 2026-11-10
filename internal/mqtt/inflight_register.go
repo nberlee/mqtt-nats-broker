@@ -18,7 +18,7 @@
 // source interest exists, so the redelivery that follows finds cpending already
 // populated and goes out under the identifier the client is holding.
 //
-// # Why a stream of its own
+// # Why a subject space of its own
 //
 // $MQTT_out cannot carry it: that stream is interest-retained, so a store with no
 // consumer succeeds and keeps nothing, and a register has no consumer by design (it
@@ -392,7 +392,7 @@ type mqttInflightRecord struct {
 	Payload string `json:"payload,omitempty"`
 	Digest  string `json:"digest,omitempty"`
 	// RelSubj and RelID are a retained QoS 2 exchange's CANONICAL PUBREL: the in-flight arm of
-	// the canonical reference, an exchange-specific record on $MQTT_inflight written in the same
+	// the canonical reference, an exchange-specific record in the $MQTT.inflight. space written in the same
 	// batch as the PUBREC advance. The identity is carried beside the subject because a subject
 	// locates an address and only the identity says the record there is this exchange's. They
 	// take the place PubRelDurable/PubRelStreamSeq hold for an ordinary exchange, and the two
@@ -676,7 +676,7 @@ func (jsa *mqttJSA) storeInflightCAS(subject string, expectSeq uint64, r *mqttIn
 //	                   authorizes reusing an identifier, which is the one decision
 //	                   that can put a duplicate identifier on the wire.
 func (jsa *mqttJSA) loadInflightRecord(subject string) (*mqttInflightRecord, *StoredMsg, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, nil, err
@@ -767,7 +767,7 @@ func (as *mqttAccountSessionManager) enumerateInflightSubjects(filter string) (m
 	if hook != nil {
 		return hook(filter)
 	}
-	subjects, _, err := as.jsa.streamSubjects(mqttInflightStreamName, filter)
+	subjects, _, err := as.jsa.streamSubjects(mqttSessStreamName, filter)
 	return subjects, err
 }
 
@@ -786,7 +786,7 @@ func (as *mqttAccountSessionManager) enumerateInflightSubjectsBounded(filter str
 	if hook != nil {
 		return hook(filter)
 	}
-	return as.jsa.streamSubjects(mqttInflightStreamName, filter)
+	return as.jsa.streamSubjects(mqttSessStreamName, filter)
 }
 
 // loadInflightRecordsMulti is the batched register read, honoring an instance-scoped
@@ -799,7 +799,7 @@ func (as *mqttAccountSessionManager) loadInflightRecordsMulti(subjects []string)
 	if hook != nil {
 		return hook(subjects)
 	}
-	return as.jsa.loadLastMsgForMulti(mqttInflightStreamName, subjects)
+	return as.jsa.loadLastMsgForMulti(mqttSessStreamName, subjects)
 }
 
 // mqttSlotMutate is applied to a LOADED slot record to produce the record to CAS back. It
@@ -1267,7 +1267,7 @@ func (as *mqttAccountSessionManager) deleteInflightRegister(seq uint64) {
 		_ = hook(seq)
 		return
 	}
-	_ = as.jsa.deleteMsg(mqttInflightStreamName, seq, false)
+	_ = as.jsa.deleteMsg(mqttSessStreamName, seq, false)
 }
 
 // mqttDrainRegObservation is one claimed drain entry a scan found AMBIGUOUS: the entry it is
@@ -1416,7 +1416,7 @@ const (
 // exact sequence. What R4 does not say, and what issue #38 found, is that WHICH sequence to
 // read is itself a question with a right answer. A caller holding a sequence it recorded
 // EARLIER is holding a guess: the store path's replacement branch rewrites a register for
-// the same (Dur, Seq) at a new sequence, and after $MQTT_inflight is recreated the
+// the same (Dur, Seq) at a new sequence, and after the stream is recreated the
 // recorded sequence names an unrelated register entirely. Deleting there destroys another
 // session's register — the defect issue #38 owns, which issue #70's table had already assigned to
 // "that mechanism's owner".
@@ -2053,7 +2053,7 @@ func (as *mqttAccountSessionManager) deleteInflightRegisterConfirmed(seq uint64,
 		if hook != nil {
 			err = hook(seq)
 		} else {
-			err = as.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+			err = as.jsa.deleteMsg(mqttSessStreamName, seq, true)
 		}
 		if err == nil {
 			return nil
@@ -4443,7 +4443,7 @@ func (sess *mqttSession) deleteInflightRegistersClassified(c *client, tok record
 	return casRejected
 }
 
-// voidRegistersOnStream is deleteInflightRegisters' ladder over the REGISTER STREAM
+// voidRegistersOnStream is deleteInflightRegisters' ladder over the REGISTER SUBJECTS
 // alone — the confirmed delete and the tombstone — reporting whether any register got
 // neither, so its nonce is staged in memory and the SESSION RECORD still owes the
 // verdict.
@@ -5052,7 +5052,7 @@ func (sess *mqttSession) purgeConsumerPendingModeLocked(durable string, mode mqt
 }
 
 // secureRegCancellations makes each withdrawn allocation's cancellation durable ON THE
-// REGISTER STREAM, and must be called before the consumer that owns them is destroyed.
+// REGISTER SUBJECTS, and must be called before the consumer that owns them is destroyed.
 //
 // The session record carries the same fact, but not always in time: these callers run
 // after their packet's save (a deferred consumer delete, a forced leave, a shared release),
@@ -5108,7 +5108,7 @@ func (sess *mqttSession) secureRegCancellationsClassified(c *client, tok recordT
 }
 
 // tombstoneCancellationsOnStream is secureRegCancellations' tombstone pass over the
-// REGISTER STREAM alone, reporting whether any cancellation failed to get one, so its
+// REGISTER SUBJECTS alone, reporting whether any cancellation failed to get one, so its
 // nonce stays staged in memory and the SESSION RECORD still owes the verdict.
 //
 // Split from the wrapper for the same reason voidRegistersOnStream is: the deferred
@@ -9051,7 +9051,7 @@ func mqttSendSettleIsAnswer(k mqttSendSettleKind) bool {
 // Subject parsing
 // ---------------------------------------------------------------------------
 
-// mqttInflightName is a parsed $MQTT_inflight subject.
+// mqttInflightName is a parsed $MQTT.inflight. subject.
 type mqttInflightName struct {
 	idHash  string
 	gen     string
@@ -9059,7 +9059,7 @@ type mqttInflightName struct {
 	subject string
 }
 
-// mqttParseInflightSubject parses a subject on $MQTT_inflight strictly, in the exact
+// mqttParseInflightSubject parses a subject in the $MQTT.inflight. space strictly, in the exact
 // shape this broker writes and no other.
 //
 // Strictness for the reason mqttParseQoS2InSubject is strict: a subject that cannot
@@ -10176,7 +10176,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		// There is no legacy population to serve: pre-alpha, no releases anywhere, so an
 		// unsupported persisted shape is REFUSED rather than migrated or tolerated. A
 		// developer stream carrying older records resets, which is the documented boundary
-		// (the ten broker-owned streams are one recreation unit, issue #70).
+		// (the eight broker-owned streams are one recreation unit, issue #70).
 		if !mqttInflightStateKnown(rec.State) {
 			// A state this broker genuinely does not write. Opaque: the identifier is
 			// reserved, nothing acts on the record, and the identifier space is
@@ -11883,7 +11883,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	// no new identifier can be issued safely. The session completes what it already has
 	// and accepts nothing new; QoS 0 is unaffected. It is loud rather than silent, and
 	// an operator removing the corrupt record lifts it on the next resume. Recreating
-	// $MQTT_inflight is NOT an alternative: the ten broker-owned streams are one
+	// the stream is NOT an alternative: the eight broker-owned streams are one
 	// recreation unit, so the only other route is a whole-bundle reset (issue #70, and
 	// the compatibility boundary in docs/ARCHITECTURE.md).
 	//
@@ -12182,98 +12182,4 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 			len(drop)+len(dropByNonce), len(dropByNonce), skipped)
 	}
 	return staged, nil
-}
-
-// ---------------------------------------------------------------------------
-// Stream prerequisites
-// ---------------------------------------------------------------------------
-
-// validateInflightStream verifies $MQTT_inflight can carry the registers.
-//
-// The list is derived from what THIS owner does, which is the doctrine every
-// validator here follows and the reason no two of these lists are the same: a
-// create-only CAS per identifier, a per-subject singleton, deletes at an exact
-// sequence, and a bounded forward walk. Since issue #38 there is NO filter purge: the
-// teardown's per-incarnation purge was replaced by reapIncarnationRegisters, which
-// enumerates, loads, classifies and deletes at exact sequences — which is why
-// DenyPurge is a waiver here and not a rejection. It
-// therefore requires the CAS and acknowledgement semantics, and — unlike
-// $MQTT_teardown, which never removes anything — it requires DELETION to be
-// permitted. Purging is not required and stopped being required with issue #38: the
-// reap is the only remover left, and it deletes at exact sequences.
-//
-// It deliberately does NOT check ConsumerLimits.InactiveThreshold: nothing ever
-// creates a consumer on this stream, so a stream-forced consumer limit cannot affect
-// it. A validator that listed prerequisites its owner does not have would fail
-// startups for no reason.
-func validateInflightStream(si *StreamInfo, wantReplicas int, bundleEpoch string) error {
-	if si == nil {
-		return fmt.Errorf("stream info unavailable")
-	}
-	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttInflightStreamSubjectPrefix + ">"}, wantReplicas); err != nil {
-		return err
-	}
-	if !cfg.AllowAtomicPublish {
-		// The PUBLISH-phase register and its unsent marker are committed as one atomic
-		// batch, which the stream would reject outright without this. A stream that
-		// merely LOOKED right would fail every first QoS 1/2 delivery. An existing stream
-		// lacking it is refused here, never patched: the ten broker-owned streams are one
-		// recreation unit (issue #70).
-		return fmt.Errorf("allow_atomic is not set: a PUBLISH-phase in-flight register and its unsent marker are committed in one atomic batch, which the stream would reject")
-	}
-	if cfg.Retention != LimitsPolicy {
-		// Nothing consumes a register — they are read by direct lookup and by a
-		// bounded walk — so interest or work-queue retention would drop every one of
-		// them at the moment it was written.
-		return fmt.Errorf("retention is %v (want limits): nothing consumes a register, so any other retention drops it immediately", cfg.Retention)
-	}
-	if cfg.Discard != DiscardOld {
-		// DiscardNew turns a replacement into a rejection. Registers are written
-		// create-only today, but a full subject must be replaceable for the store
-		// path's reconcile-then-retry to converge rather than fail identically forever.
-		return fmt.Errorf("discard is %v (want old)", cfg.Discard)
-	}
-	if cfg.MaxMsgsPer != 1 {
-		// With more than one record per subject a write APPENDS: loadLastMsgFor
-		// returns the newest while an older register survives underneath, and
-		// deleting the exact sequence then re-exposes a stale identifier claim.
-		return fmt.Errorf("max_msgs_per_subject is %d (want 1)", cfg.MaxMsgsPer)
-	}
-	if cfg.MaxMsgs > 0 || cfg.MaxBytes > 0 || cfg.MaxAge > 0 {
-		// Age eviction cannot honour "delete only once the exchange is complete", and
-		// a count or size cap would silently drop the identity of a delivery the
-		// client is still holding. Cleanup here is explicit reconciliation.
-		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict the identity of a live in-flight delivery",
-			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
-	}
-	if len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has sources (want none): a foreign record could occupy an identifier's CAS slot")
-	}
-	if cfg.MaxMsgSize > 0 {
-		// A register is small and fixed-shape, but a cap is not this owner's
-		// semantics: it would reject the write that must precede a send, stalling the
-		// delivery rather than degrading anything.
-		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject the register write that must precede a send", cfg.MaxMsgSize)
-	}
-	if cfg.DenyDelete {
-		return fmt.Errorf("deny_delete is set: it blocks the exact-sequence delete every terminal path performs")
-	}
-	// DenyPurge is deliberately NOT a prerequisite, and it stopped being one with issue #38.
-	// The teardown's per-incarnation FILTER PURGE was replaced by reapIncarnationRegisters,
-	// which enumerates, loads, classifies and deletes at exact sequences — so DenyDelete
-	// above is the whole of what this owner needs. Refusing DenyPurge would reject a
-	// hardened stream this broker can now use, on the strength of a purge that no longer
-	// exists: the audit that removed the purge is the same one that must remove its
-	// prerequisite (feedback_delete_redundant_mechanisms).
-	if cfg.SubjectDeleteMarkerTTL != 0 {
-		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): marker messages on register subjects would be parsed as records", cfg.SubjectDeleteMarkerTTL)
-	}
-	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the ten broker-owned streams one recreation unit rather than ten
-	// independently recoverable stores (issue #70).
-	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
-		return err
-	}
-	return nil
 }

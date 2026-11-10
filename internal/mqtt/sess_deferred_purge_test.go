@@ -74,10 +74,10 @@ func (e *testDeferredEnv) failRegisterStream(t *testing.T) {
 	e.asm.mu.Lock()
 	e.asm.testInflightDelete = func(uint64) error { return errors.New("test: register delete unavailable") }
 	e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-		return 0, errors.New("test: register stream unavailable")
+		return 0, errors.New("test: register store unavailable")
 	}
 	e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-		return nil, nil, errors.New("test: register stream unavailable")
+		return nil, nil, errors.New("test: register store unavailable")
 	}
 	e.asm.mu.Unlock()
 }
@@ -503,7 +503,7 @@ func TestMQTTDeferredCloseDefiniteFailureConvergesAtGateRelease(t *testing.T) {
 // re-check.
 //
 // The settle is the production entry point (confirmInflightRegister's cancelled ladder), not a
-// hand-built state, and the register stream is failed only from inside the window so the
+// hand-built state, and the register store is failed only from inside the window so the
 // purge's own rung behaves normally.
 func (e *testDeferredEnv) armLateSettle(t *testing.T) (settle func(), nonce func() string) {
 	t.Helper()
@@ -520,16 +520,16 @@ func (e *testDeferredEnv) armLateSettle(t *testing.T) (settle func(), nonce func
 	}
 
 	return func() {
-		// From here the register stream is unreachable, so this settle has only the nonce
+		// From here the register store is unreachable, so this settle has only the nonce
 		// verdict left: the delete fails, and the tombstone can neither be written nor be
 		// read back as already present.
 		e.asm.mu.Lock()
 		e.asm.testInflightDelete = func(uint64) error { return errors.New("test: register delete unavailable") }
 		e.asm.testInflightStore = func(string, uint64, *mqttInflightRecord) (uint64, error) {
-			return 0, errors.New("test: register stream unavailable")
+			return 0, errors.New("test: register store unavailable")
 		}
 		e.asm.testInflightLoad = func(string) (*mqttInflightRecord, *StoredMsg, error) {
-			return nil, nil, errors.New("test: register stream unavailable")
+			return nil, nil, errors.New("test: register store unavailable")
 		}
 		e.asm.mu.Unlock()
 		// A landed CAS whose confirmation runs now: the entry was cancelled under it, so it
@@ -1382,7 +1382,7 @@ func TestMQTTContendedSaveCreditsMarshalledVerdicts(t *testing.T) {
 	t.Run("an unresolved attempt hands the revision to the readback", func(t *testing.T) {
 		e, d, pi := setup(t, "unresolved")
 		restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-			if stream == mqttSessStreamName {
+			if testSessionFamily(stream, subject) {
 				return errors.New("test: the session record is unreadable")
 			}
 			return nil

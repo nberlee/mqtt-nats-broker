@@ -513,7 +513,7 @@ func TestSettlementWalkIsComplete(t *testing.T) {
 		c := testClaimedSourceConsumer(t, e, "settle.t18.c")
 		ent := testResumeUnderNewTenure(t, e)
 		filter := mqttResourceWalkFilter(getHash(e.sess.id), ent.Gen)
-		all, _, err := e.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+		all, _, err := e.asm.jsa.streamSubjects(mqttSessStreamName, filter)
 		if err != nil || len(all) != 3 {
 			t.Fatalf("fixture: three resources expected, got %v (%v)", all, err)
 		}
@@ -566,7 +566,7 @@ func TestSettlementWalkIsComplete(t *testing.T) {
 				return nil, 0, errors.New("injected: the listing failed")
 			}
 			e.asm.jsa.resourceSubjectsPageObs.Store(nil)
-			return e.asm.jsa.streamSubjectsPage(mqttInflightStreamName, f, offset)
+			return e.asm.jsa.streamSubjectsPage(mqttSessStreamName, f, offset)
 		}
 		e.asm.jsa.resourceSubjectsPageObs.Store(&obs)
 		if c := testSettleClasses(t, e, ent)[cl.name]; c != mqttSettleSupersededUndecide {

@@ -13,7 +13,7 @@
 // stream sequence. Absent headers mean "no correlation": a PUBREC whose entry names no
 // source durable stores its PUBREL uncorrelated. Safe, because a delivery with no source
 // durable is not one a drain can be waiting on. A retained QoS 2 exchange never stores one:
-// its PUBREL is the canonical record its PUBREC advance creates on $MQTT_inflight (issue
+// its PUBREL is the canonical record its PUBREC advance creates in the $MQTT.inflight. space (issue
 // #107 7c).
 //
 // The deterministic Nats-Msg-Id exists for a different hazard. A superseded broker
@@ -56,7 +56,7 @@ const (
 	mqttPubRelAffCopyHeader  = "Nmqtt-Q2AffCopy"
 
 	// mqttPubRelOwnerHeader names the OUTBOUND QoS 2 EXCHANGE this record belongs to:
-	// the exchange nonce its durable owner slot on $MQTT_inflight carries.
+	// the exchange nonce its durable owner slot in the $MQTT.inflight. space carries.
 	//
 	// MANDATORY on every stored PUBREL, and that is what turns the record from a CLAIM on
 	// the packet identifier into EVIDENCE about one exchange. Absent or malformed is an

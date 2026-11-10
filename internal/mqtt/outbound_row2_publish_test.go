@@ -160,7 +160,7 @@ func TestRow2PublishAcquisitionEndsWithTheConnectionsEntitlement(t *testing.T) {
 	if cur == nil || cur.ActionToken != _EMPTY_ || before == nil || cur.Acq != before.Acq {
 		t.Fatalf("the refused acquisition moved the register: before %+v after %+v", before, cur)
 	}
-	if _, err := s.e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := s.e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttActionSubject(getHash(s.e.sess.id), s.tok.slot.name.gen, cur.Lin, cur.Acq+1)); err == nil {
 		t.Fatal("the refused acquisition wrote an action record")
 	}
@@ -180,7 +180,7 @@ func TestRow2PublishAcquisitionEndsWithTheConnectionsEntitlement(t *testing.T) {
 func TestRow2SlotOnlyDeliveriesWriteNoActionRecord(t *testing.T) {
 	noActions := func(t *testing.T, sess *mqttSession, gen, lin string) {
 		t.Helper()
-		subs, whole, err := sess.jsa.streamSubjectsComplete(mqttInflightStreamName,
+		subs, whole, err := sess.jsa.streamSubjectsComplete(mqttSessStreamName,
 			mqttActionWalkFilter(getHash(sess.id), gen, lin))
 		if err != nil || !whole {
 			t.Fatalf("enumerating the action subjects: whole=%v err=%v", whole, err)
@@ -275,7 +275,7 @@ func TestRow2SharedQoS1PublishIsAnAcquiredAction(t *testing.T) {
 	if xerr != nil || x == nil || x.SharedAcq == nil || mqttSharedDurableOf(*x.SharedAcq) != reg.Dur {
 		t.Fatalf("the shared delivery's exchange does not name its acquisition: %+v (%v)", x, xerr)
 	}
-	subs, whole, serr := sess.jsa.streamSubjectsComplete(mqttInflightStreamName,
+	subs, whole, serr := sess.jsa.streamSubjectsComplete(mqttSessStreamName,
 		mqttActionWalkFilter(getHash(sess.id), gen, reg.Lin))
 	if serr != nil || !whole || len(subs) == 0 {
 		t.Fatalf("the shared PUBLISH wrote no action record: %v whole=%v err=%v", subs, whole, serr)

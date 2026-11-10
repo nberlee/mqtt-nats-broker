@@ -233,7 +233,7 @@ func TestConsult77OutputEvidence(t *testing.T) {
 			t.Fatal("missing nonzero drained acquisition")
 		}
 		actionSubject := mqttActionSubject(e.sess.idHash, e.sess.gen, r.Lin, r.Acq)
-		action, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, actionSubject)
+		action, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, actionSubject)
 		if err != nil || action == nil {
 			t.Fatal("missing positive action control")
 		}
@@ -241,7 +241,7 @@ func TestConsult77OutputEvidence(t *testing.T) {
 		if _, err := e.sess.abandonCurrentOutputVeto(ev); !errors.Is(err, errMQTTAbandonCurrentOutput) {
 			t.Fatal("the real action did not prove current output")
 		}
-		if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, action.Sequence, true); err != nil {
+		if err := e.asm.jsa.deleteMsg(mqttSessStreamName, action.Sequence, true); err != nil {
 			t.Fatal(err)
 		}
 		e.sess.mu.Lock()

@@ -1,4 +1,4 @@
-// The durable QoS 2 owner slot: the design in which one PI-scoped `$MQTT_inflight` record
+// The durable QoS 2 owner slot: the design in which one PI-scoped `$MQTT.inflight.` record
 // owns one outbound QoS 2 exchange for its WHOLE life, not only its PUBLISH phase.
 //
 // This file is the state machine's shared substrate: the state set, the one legal-shape
@@ -221,7 +221,7 @@ func mqttDecodeInflightRecord(data []byte) (*mqttInflightRecord, error) {
 // at most once. `noun` names the record class in the refusal ("register", "marker").
 //
 // Shared by the register decoder and the unsent-marker decoder (inflight_marker.go): the
-// two persisted classes on $MQTT_inflight are different records with different schemas,
+// two persisted classes in the $MQTT.inflight. space are different records with different schemas,
 // and the closed-schema property must hold for both by the SAME walk rather than by a
 // second one that can drift.
 //
@@ -401,7 +401,7 @@ func mqttValidateInflightShape(r *mqttInflightRecord) error {
 	}
 	// THE RETAINED ARM (issue #107 7c) has its own exclusions; the ordinary arm may not borrow its
 	// canonical members. The canonical reference follows the source arm: a retained exchange's
-	// release lives at an exchange-specific $MQTT_inflight subject, an ordinary one's on a
+	// release lives at an exchange-specific $MQTT.inflight. subject, an ordinary one's on a
 	// consumer at a sequence — different KINDS, so a record naming the other kind is refused.
 	if r.retainedSource() {
 		if err := mqttValidateRetainedRegisterShape(r); err != nil {
@@ -1059,7 +1059,7 @@ func mqttSlotIdentityOf(subject string, rec *mqttInflightRecord) mqttSlotIdentit
 // mqttInflightSlotRef is the identity an irreversible slot operation must carry.
 //
 // It exists because the two generic helpers could not fence themselves: a remembered
-// stream sequence names a MESSAGE, not an exchange, and `$MQTT_inflight` subjects are
+// stream sequence names a MESSAGE, not an exchange, and `$MQTT.inflight.` subjects are
 // reused by later exchanges on the same identifier. Carrying a sequence and a nonce
 // proved "this record is ours" but not "this record is still in a state my operation may
 // touch" — so every caller carries the whole reference plus the permitted transition, and

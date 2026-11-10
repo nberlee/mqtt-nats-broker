@@ -620,7 +620,7 @@ func (jsa *mqttJSA) checkManifestMembers(a *mqttTransitionAttempt, prev *mqttOut
 func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mqttOutboundAuthority, extra []mqttTransitionMember,
 	next *mqttRetainedManifest, subj string, expect uint64, gen, pay string, chunksHere uint64) error {
 
-	smsg, lerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	absent := (lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) || (lerr == nil && smsg == nil)
 	if lerr != nil && !absent {
 		return fmt.Errorf("transition %q could not read the manifest of payload %q: %w", a.Txn, pay, lerr)

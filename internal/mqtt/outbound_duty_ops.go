@@ -28,7 +28,7 @@ const mqttDutyOutcomeResolved = "resolved"
 // loadDutyEntryAt reads one duty entry with the sequence it stands at.
 func (jsa *mqttJSA) loadDutyEntryAt(id, epoch, gen string, ord uint64) (*mqttDutyEntry, uint64, error) {
 	subj := mqttDutySubject(getHash(id), gen, ord)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("reading duty %d of generation %q: %w", ord, gen, err)

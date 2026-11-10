@@ -765,7 +765,7 @@ func testForcedLeaveConsumerExists(t *testing.T, s *Server, durable string) bool
 //
 // The two failed attempts, recorded so the next person does not repeat them:
 //
-//  1. Injecting into a transmitted entry's cleanup reached only the REGISTER stream, so the
+//  1. Injecting into a transmitted entry's cleanup reached only the REGISTER store, so the
 //     session-record hook never fired and the fixture never entered the window it named.
 //  2. Arming the rejection marker BEFORE the leave does not survive it: a landed save advances
 //     sess.seq, which RETIRES the marker by design — so at phase 3 there was correctly no

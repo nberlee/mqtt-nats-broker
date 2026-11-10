@@ -5,7 +5,7 @@
 // subject currently holds, and only when the occupant's identity matches.
 //
 // The defect the contract replaces, from issue #70's own table: the drain used to persist an
-// absolute $MQTT_inflight sequence in the session record, and its release deleted that
+// absolute in-flight record sequence in the session record, and its release deleted that
 // sequence directly "with no subject or record identity check at all". After that stream is
 // recreated the sequence names an unrelated register — another session's — and the delete
 // destroyed it. The drain now persists no register sequence at all (issue #71), so there is

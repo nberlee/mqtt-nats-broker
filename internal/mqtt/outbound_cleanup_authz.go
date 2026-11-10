@@ -64,7 +64,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationResources(id, epoch, gen
 	// DEPENDENCIES. The server answers a subject list in pages of at most 100,000, so a walk
 	// missing the page that holds the one resource still naming a dependent would return no block
 	// at all — an absence read as a fact, which is the whole shape this lane exists to remove.
-	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
+	subjects, whole, err := as.jsa.streamSubjectsComplete(mqttSessStreamName,
 		mqttResourceWalkFilter(idHash, gen))
 	if err != nil {
 		if isErrorOtherThan(err, JSStreamNotFoundErr) {
@@ -82,7 +82,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationResources(id, epoch, gen
 			unreadable++
 			continue
 		}
-		smsg, lerr := as.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		smsg, lerr := as.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 		if lerr != nil {
 			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
 				return nil, 0, fmt.Errorf("loading the backing resource on %q: %w", subject, lerr)

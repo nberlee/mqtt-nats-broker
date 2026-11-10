@@ -126,14 +126,14 @@ func TestBoundaryPrefetchAnswersEachSubjectOnce(t *testing.T) {
 	seqA2 := testPrefetchStore(t, jsa, a, []byte(`"v2"`))
 	gets := testPrefetchGets(t, jsa)
 
-	first, err := view.loadLastMsgFor(mqttInflightStreamName, a)
+	first, err := view.loadLastMsgFor(mqttSessStreamName, a)
 	if err != nil || first == nil || first.Sequence != seqA {
 		t.Fatalf("the first read was not the prefetched record: %v %v", first, err)
 	}
 	if n := gets()[a]; n != 0 {
 		t.Fatalf("the first read of a prefetched subject sent %d request(s)", n)
 	}
-	second, err := view.loadLastMsgFor(mqttInflightStreamName, a)
+	second, err := view.loadLastMsgFor(mqttSessStreamName, a)
 	if err != nil || second == nil || second.Sequence != seqA2 {
 		t.Fatalf("the second read did not reach the store: got %v (want sequence %d) %v", second, seqA2, err)
 	}
@@ -153,14 +153,14 @@ func TestBoundaryPrefetchAnswersAsTheStoreWould(t *testing.T) {
 	bad := mqttInflightSubject(e.sess.idHash, g1, 6)
 	badSeq := testPrefetchStore(t, jsa, bad, []byte("not a register"))
 
-	dMsg, dErr := jsa.loadLastMsgFor(mqttInflightStreamName, absent)
+	dMsg, dErr := jsa.loadLastMsgFor(mqttSessStreamName, absent)
 	dRec, dSmsg, dRErr := jsa.loadInflightRecord(bad)
 
 	view := jsa.withBoundaryPrefetch(e.sess.id, []mqttTransitionMember{{subj: absent, expect: 3}, {subj: bad, expect: badSeq}})
 	if view == jsa {
 		t.Fatalf("no view installed")
 	}
-	vMsg, vErr := view.loadLastMsgFor(mqttInflightStreamName, absent)
+	vMsg, vErr := view.loadLastMsgFor(mqttSessStreamName, absent)
 	if (vMsg == nil) != (dMsg == nil) || fmt.Sprint(vErr) != fmt.Sprint(dErr) || vErr == nil {
 		t.Fatalf("absent subject: view (%v, %v), store (%v, %v)", vMsg, vErr, dMsg, dErr)
 	}
@@ -198,10 +198,10 @@ func TestBoundaryPrefetchKeepsAPartialBatch(t *testing.T) {
 	dropping.Store(false)
 	view.deadline = time.Time{}
 	gets := testPrefetchGets(t, jsa)
-	if m, err := view.loadLastMsgFor(mqttInflightStreamName, got); err != nil || m == nil || m.Sequence != gotSeq {
+	if m, err := view.loadLastMsgFor(mqttSessStreamName, got); err != nil || m == nil || m.Sequence != gotSeq {
 		t.Fatalf("the received reply was not kept: %v %v", m, err)
 	}
-	if m, err := view.loadLastMsgFor(mqttInflightStreamName, lost); err != nil || m == nil || m.Sequence != lostSeq {
+	if m, err := view.loadLastMsgFor(mqttSessStreamName, lost); err != nil || m == nil || m.Sequence != lostSeq {
 		t.Fatalf("the missing subject was not read from the store: %v %v", m, err)
 	}
 	if g := gets(); g[got] != 0 || g[lost] != 1 {
@@ -238,7 +238,7 @@ func TestBoundaryPrefetchStillMeetsTheReadFaultSeam(t *testing.T) {
 	}
 	mqttTestLoadLastMsgHookV.Store(&h)
 	t.Cleanup(func() { mqttTestLoadLastMsgHookV.Store(nil) })
-	if _, err := view.loadLastMsgFor(mqttInflightStreamName, a); !errors.Is(err, injected) {
+	if _, err := view.loadLastMsgFor(mqttSessStreamName, a); !errors.Is(err, injected) {
 		t.Fatalf("the fault seam did not reach a prefetched subject: %v", err)
 	}
 }
@@ -341,7 +341,7 @@ func TestBoundaryPrefetchRacingWriteIsRefusedBySubmission(t *testing.T) {
 			if _, err := mqttParseInflightSubject(m.subj); err != nil || m.expect == 0 {
 				continue
 			}
-			cur, err := sess.jsa.loadLastMsgFor(mqttInflightStreamName, m.subj)
+			cur, err := sess.jsa.loadLastMsgFor(mqttSessStreamName, m.subj)
 			if err != nil || cur == nil {
 				rec.fail("reading %q to race it: %v", m.subj, err)
 				return

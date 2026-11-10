@@ -310,8 +310,8 @@ func TestUncertainReattemptWindow(t *testing.T) {
 		// re-read that would classify it cannot be taken: nothing is established, in
 		// either direction.
 		var loads atomic.Int32
-		restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-			if stream != mqttSessStreamName {
+		restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+			if !testSessionFamily(stream, subject) {
 				return nil
 			}
 			if loads.Add(1) >= 2 {

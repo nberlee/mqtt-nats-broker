@@ -320,7 +320,7 @@ func TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep(t *tes
 	_, pi := testMQTTReadPublishV5(t, r, "foo", []byte("unacked"))
 	regSubj := mqttInflightSubject(hash, predGen, pi)
 	checkFor(t, 5*time.Second, 20*time.Millisecond, func() error {
-		if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err != nil || smsg == nil {
+		if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); err != nil || smsg == nil {
 			return fmt.Errorf("the predecessor's register on %q does not stand: %v", regSubj, err)
 		}
 		return nil
@@ -349,7 +349,7 @@ func TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep(t *tes
 		t.Fatalf("planting the unreadable register: %v", err)
 	}
 	corruptSeq := ack.Sequence
-	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); lerr != nil || smsg == nil ||
+	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); lerr != nil || smsg == nil ||
 		smsg.Sequence != corruptSeq || string(smsg.Data) != string(corrupt) {
 		t.Fatalf("fixture: the planted body is not what stands on %q: %+v, %v", regSubj, smsg, lerr)
 	}
@@ -380,14 +380,14 @@ func TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep(t *tes
 		t.Fatal("fixture: a watermark names the predecessor generation, so the closure is not the licence under test")
 	}
 	// The reap refused rather than deleted: the unreadable register still stands at its sequence.
-	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); lerr != nil || smsg == nil || smsg.Sequence != corruptSeq {
+	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); lerr != nil || smsg == nil || smsg.Sequence != corruptSeq {
 		t.Fatalf("the unreadable register on %q did not survive the cleanup: %+v, %v", regSubj, smsg, lerr)
 	}
 
 	// Only now may the sweep qualify it: the background sweep runs at the default grace.
 	testOrphanSetGraces(t, asm, 0, 0)
 	testOrphanSettle(asm, s)
-	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); lerr == nil && smsg != nil {
+	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); lerr == nil && smsg != nil {
 		t.Fatalf("the orphan sweep retained the unreadable register on %q at sequence %d", regSubj, smsg.Sequence)
 	}
 }

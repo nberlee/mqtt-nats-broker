@@ -187,7 +187,7 @@ func TestDiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 				if rerr != nil || rmsg == nil {
 					t.Fatalf("reading the ended register: %v", rerr)
 				}
-				if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, rmsg.Sequence, true); err != nil {
+				if err := e.asm.jsa.deleteMsg(mqttSessStreamName, rmsg.Sequence, true); err != nil {
 					t.Fatalf("removing the register: %v", err)
 				}
 				b, _ := json.Marshal(&mqttRetainedRel{ID: e.id, Epoch: e.epoch, Gen: testGen,
@@ -200,7 +200,7 @@ func TestDiscardCensusDeletesWhatAnEndedObligationLeft(t *testing.T) {
 			gen := testDiscardClose(t, e)
 			testDiscardResolveDutyRaw(t, e, gen, nonce)
 			standing := func(subj string) bool {
-				_, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+				_, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 				return err == nil
 			}
 			testDiscardSweepUntilCertified(t, e, gen, func() error {
@@ -486,7 +486,7 @@ func TestDiscardReapSparesRetainedRegisters(t *testing.T) {
 	idHash := getHash(e.id)
 	retSubj := mqttInflightSubject(idHash, auth.Gen, 11)
 	standing := func(subj string) bool {
-		_, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		_, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		return err == nil
 	}
 	if err := e.asm.reapIncarnationRegisters(nil, idHash, auth.Gen, true); err != nil {
@@ -533,7 +533,7 @@ func TestRecoveryEntryUnitCoversTheCostliestEntry(t *testing.T) {
 	}
 	root := &mqttRecoveryRoot{ID: e.id, Epoch: e.epoch, Gen: gen}
 	e.asm.executeRecoveryDuty(e.asm.server(), root, mqttSweptDuty{Ord: ord, Entry: d, Census: true}, b, nil, true)
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err == nil {
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); err == nil {
 		t.Fatalf("one unit did not cover the census entry's delete (budget left %d)", b.left)
 	}
 }

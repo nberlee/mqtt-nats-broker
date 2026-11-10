@@ -117,7 +117,7 @@ func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 
 	// Streams other than $MQTT_out, named literally: a different class entirely.
 	// Every broker-owned stream constant EXCEPT $MQTT_out. A delete named against one of
-	// these is statically a different class. The list is exhaustive over the nine so an
+	// these is statically a different class. The list is exhaustive over the eight so an
 	// omission cannot silently become a fail-closed false positive.
 	otherStreams := map[string]bool{
 		"mqttStreamName":                 true,
@@ -128,7 +128,6 @@ func TestQ2AffineConsumerDeletesAreInventoried(t *testing.T) {
 		"mqttOriginStreamName":           true,
 		"mqttQoS2IncomingMsgsStreamName": true,
 		"mqttQoS2AssignStreamName":       true,
-		"mqttInflightStreamName":         true,
 	}
 
 	fset := token.NewFileSet()

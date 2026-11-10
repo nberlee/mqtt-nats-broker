@@ -476,8 +476,8 @@ func TestDrainAmbiguousSaveKeepsTheAttemptedState(t *testing.T) {
 	// before it is resolved: this path now resolves an ambiguous write immediately
 	// (see resolveUncertainNow), and a landed-response-lost write would otherwise
 	// settle before the assertion runs.
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -748,8 +748,8 @@ func TestDrainAmbiguousCompletionIsSettledForward(t *testing.T) {
 	// unavailable too, so the unresolved window stays open long enough to assert
 	// what is barred inside it. Without the second half the path now resolves
 	// immediately (see resolveUncertainNow) and the window cannot be observed.
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -966,8 +966,8 @@ func TestDrainAmbiguousLandedCompletionDischargesTheAck(t *testing.T) {
 	// The write LANDS; only the response is lost, and the readback is held off so
 	// the unconfirmed window is observable.
 	var suppressing atomicOnceBool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressing.get() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressing.get() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -1036,8 +1036,8 @@ func TestDrainAmbiguousIntentIsSettledForward(t *testing.T) {
 	}
 
 	var suppressing atomicOnceBool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressing.get() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressing.get() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil
@@ -1157,8 +1157,8 @@ func TestSubscribeAmbiguousIsSettledForward(t *testing.T) {
 	// The packet's write neither lands nor resolves, so the retained state is
 	// observable while the session is unresolved.
 	var suppressing atomicOnceBool
-	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, _ string) error {
-		if stream == mqttSessStreamName && suppressing.get() {
+	restoreRead := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+		if testSessionFamily(stream, subject) && suppressing.get() {
 			return errors.New("test: readback unavailable")
 		}
 		return nil

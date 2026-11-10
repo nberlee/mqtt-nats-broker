@@ -140,14 +140,17 @@ func testCountFactLoads(t testing.TB, asm *mqttAccountSessionManager) *atomic.In
 }
 
 // testSessStreamSubjects is the exact subject set $MQTT_sess must carry: the
-// session records, and the permanent CONNECT acceptance facts an accepted CONNECT
-// commits atomically with its record.
+// session records, the permanent CONNECT acceptance facts an accepted CONNECT
+// commits atomically with its record, the handoff outcomes, the teardown receipts,
+// the in-flight and outbound records, and the shared-group lifecycle records.
 func testSessStreamSubjects() []string {
 	return []string{
 		mqttSessStreamSubjectPrefix + ">",
 		mqttAcceptSubjectPrefix + ">",
 		mqttHandoffSubjectPrefix + ">",
 		mqttTeardownReceiptSubjectPrefix + ">",
+		mqttInflightStreamSubjectPrefix + ">",
+		mqttSharedLifecycleStreamSubjectPrefix + ">",
 	}
 }
 
@@ -299,8 +302,8 @@ func TestSessionTeardownLeavesAcceptFactsIntact(t *testing.T) {
 // T10: the stream's shape is a prerequisite, not a preference
 // ---------------------------------------------------------------------------
 
-// TestValidateSessStreamRequiresBatchesAndBothSubjects is T10.
-func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
+// TestValidateSessStreamRequiresBatchesAndEverySubjectSpace is T10.
+func TestValidateSessStreamRequiresBatchesAndEverySubjectSpace(t *testing.T) {
 	t.Parallel()
 	const domainTk = _EMPTY_
 	base := func() *StreamInfo {
@@ -335,7 +338,7 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 		{"only the handoff subject", func(c *StreamConfig) {
 			c.Subjects = []string{mqttHandoffSubjectPrefix + domainTk + ">"}
 		}, "subjects"},
-		{"a fourth subject", func(c *StreamConfig) {
+		{"a seventh subject", func(c *StreamConfig) {
 			c.Subjects = append(c.Subjects, "$MQTT.other.>")
 		}, "subjects"},
 		// The duplicate list is the RIGHT LENGTH, because the size check runs first: a
@@ -348,6 +351,8 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 				mqttSessStreamSubjectPrefix + domainTk + ">",
 				mqttAcceptSubjectPrefix + domainTk + ">",
 				mqttHandoffSubjectPrefix + domainTk + ">",
+				mqttInflightStreamSubjectPrefix + ">",
+				mqttSharedLifecycleStreamSubjectPrefix + ">",
 			}
 		}, "repeat"},
 	} {
@@ -368,7 +373,9 @@ func TestValidateSessStreamRequiresBatchesAndBothSubjects(t *testing.T) {
 	// not promise to return the configured order.
 	si := base()
 	si.Config.Subjects = []string{
+		mqttSharedLifecycleStreamSubjectPrefix + ">",
 		mqttHandoffSubjectPrefix + domainTk + ">",
+		mqttInflightStreamSubjectPrefix + ">",
 		mqttAcceptSubjectPrefix + domainTk + ">",
 		mqttSessStreamSubjectPrefix + domainTk + ">",
 		mqttTeardownReceiptSubjectPrefix + domainTk + ">",

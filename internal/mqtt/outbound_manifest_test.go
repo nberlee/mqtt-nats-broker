@@ -95,7 +95,7 @@ func testChunkMember(t *testing.T, e *testOutboundEnv, ord uint64, expect uint64
 func testLoadManifest(t *testing.T, e *testOutboundEnv) (*mqttRetainedManifest, uint64) {
 	t.Helper()
 	subj := mqttManifestSubject(getHash(e.id), testGen, testPayload)
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil || smsg == nil {
 		t.Fatalf("reading the manifest: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestAChunkLandsOnlyThroughItsManifestFence(t *testing.T) {
 	// acceptable on a chunk at all: a rewrite at the correct sequence is a well-formed CAS the
 	// store would happily commit, replacing bytes an obligation may already be replaying.
 	chunkSubj := mqttChunkSubject(getHash(e.id), testGen, testPayload, 1)
-	planted, cerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, chunkSubj)
+	planted, cerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, chunkSubj)
 	if cerr != nil || planted == nil {
 		t.Fatalf("reading the chunk back: %v", cerr)
 	}

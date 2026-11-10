@@ -38,7 +38,7 @@ import (
 // may still execute afterwards, on its original connection; what it may not do is be
 // redirected through a rebound one.
 //
-// Both records live on $MQTT_inflight, and both are installed by the SAME atomic batch that
+// Both records live in the $MQTT.inflight. space, and both are installed by the SAME atomic batch that
 // contends on the outbound authority. That is the admission boundary: an exchange that
 // existed without an authority transition admitting it would be an obligation nothing
 // authorized, which is precisely the state issue #107 exists to make unreachable.

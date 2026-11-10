@@ -26,14 +26,15 @@ import (
 //
 // The permanent transition outcome, the generation closure, the enrolment's resource and duty
 // members, the SEALED ledger, the directory shard header taking the next ordinal, the recovery
-// root at that ordinal, and the authority record last, carrying the commit flag. All of it is on
-// $MQTT_inflight and a JetStream atomic batch is per stream, so it commits together or not at all.
+// root at that ordinal, and the authority record last, carrying the commit flag. All of it is in
+// the $MQTT.inflight. space of one stream and goes in one atomic batch, so it commits together or
+// not at all.
 //
 // # Which durables are enrolled, and the selector is the DISPOSITION
 //
 // The shared group durables are NOT enrolled. A group consumer is held by several generations
 // at once, so no per-generation resource could express it; a generation's ACQUISITIONS of it
-// are released by the closing from the generation's own acquisition ledger on $MQTT_shared
+// are released by the closing from the generation's own acquisition ledger in the $MQTT.shared. space
 // (shared_lifecycle_ops.go, closeSharedGeneration), before its record goes.
 //
 // The AFFINE consumer is enrolled ONLY when the closure DISCARDS. A closure that preserves the
@@ -450,8 +451,8 @@ var errMQTTClosingUnlicensed = errors.New("the retiring generation's shared clos
 var mqttTestClosingFenceHookV atomic.Pointer[func(gen string)]
 
 // closeRetiringGeneration is the ONE closing driver of a teardown (issue #107 8b), on the owner's
-// path and on the adoption: the generation closure on $MQTT_inflight is the ADMISSION fence and
-// the ledger seal on $MQTT_shared is the JOIN fence, and the seal is followed by T3, whose
+// path and on the adoption: the generation closure in the $MQTT.inflight. space is the ADMISSION fence and
+// the ledger seal in the $MQTT.shared. space is the JOIN fence, and the seal is followed by T3, whose
 // releases skip the release fence (7e). So T3 may only run where nothing can depend on an
 // acquisition it releases — and a dependant needs an admission, which needs the authority
 // SERVING at this generation. The caller has already driven its receipted close, if it had a

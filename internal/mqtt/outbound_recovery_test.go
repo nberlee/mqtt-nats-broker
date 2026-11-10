@@ -134,7 +134,7 @@ func TestAbandonedForeignReservationIsRecoverable(t *testing.T) {
 	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); err != nil {
 		t.Fatalf("closing the abandoned reservation was refused: %v", err)
 	}
-	if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttOutboundAuthoritySubject(getHash(e.id))); err != nil {
 		t.Fatalf("the authority record disappeared: %v", err)
 	}

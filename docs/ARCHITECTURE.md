@@ -155,18 +155,18 @@ a stream belongs to and is compared for equality wherever a sequence is used as 
 identity. The format says which *encoding* wrote it. A reset changes the incarnation and
 keeps the format; a migration would change the format and keep the incarnation. Two facts,
 two keys, on the same carrier: both are set on the create configuration, by the
-`$MQTT_sess` literal and the other nine's stamp from one constructor
+`$MQTT_sess` literal and the other seven's stamp from one constructor
 (`mqttBundleMetadata`), and both are read from the authoritative re-read. Nothing ever
 writes stream metadata after the create, so a stream without the stamp is refused, never
 stamped.
 
 **What the format is.** Format 1 is, as a whole:
 
-- the ten stream names and the configurations the provisioning table creates (subjects,
+- the eight stream names and the configurations the provisioning table creates (subjects,
   retention, flags, metadata keys);
 - every subject layout written into them;
 - **every record class written on those subjects**, the outbound authority's classes on
-  `$MQTT_inflight`, the handoff outcomes, the teardown receipts and the name ownerships
+  `$MQTT.inflight.`, the handoff outcomes, the teardown receipts and the name ownerships
   included: its encoding (a JSON body, `Nmqtt-*` headers, a raw body), its required-member
   rules (several decoders refuse unknown members), its enum values, and the identities it
   derives and references;
@@ -206,9 +206,9 @@ snapshot: a stamp edited after a manager initialized is seen at the next initial
   members makes a new field there a breaking change, and so does a compare-and-set rewrite
   that drops it.
 - **Adding a required bundle member is breaking.** The preflight looks up only its own
-  table's names, so an earlier broker finding its ten members beside an eleventh would
+  table's names, so an earlier broker finding its eight members beside a ninth would
   admit; the format bump on the existing members is what makes it refuse. A later broker
-  meeting the earlier ten refuses through the count rule anyway.
+  meeting the earlier eight refuses through the count rule anyway.
 - A **breaking** change bumps the format and ships, per the release phases above, either a
   migration or a refusal with guidance — never "retain and ignore", reading a store whose
   meaning changed and skipping what the reader does not understand.
@@ -243,7 +243,7 @@ on the account, and everything one broker writes, publishes or names that a peer
 acts on is the **broker-to-broker protocol**:
 
 - **the store**, exactly as "The persisted format" defines it: every coordination record
-  on the ten streams (session records and acceptance facts, the Will outbox, teardown
+  on the eight streams (session records and acceptance facts, the Will outbox, teardown
   watermarks and receipts, the QoS 2 move and release claims, assignment claims, in-flight
   registers and unsent markers, the shared group records and acquisition ledgers, the
   outbound authority's records), consumer names and metadata, and the deliver subjects
@@ -551,7 +551,7 @@ turning that gate off is unsupported: operators must reset it rather than expect
 to reinterpret the membership as QoS 1 or unwind it through incomplete cleanup machinery.
 Detection, migration, rollback, backup/restore and downgrade compatibility for experimental
 state are not promised. An incompatible build requires an all-brokers-stopped reset of all
-ten broker-owned streams, with the data loss described under “The ten streams are one
+eight broker-owned streams, with the data loss described under “The eight streams are one
 recreation unit.”
 
 The architecture sections about affine claims, copies, consumers and correlated PUBRELs
@@ -571,12 +571,12 @@ is therefore an **all-brokers-stopped**
 operation, which is the same conclusion the paragraph above reaches for a nonconforming
 stream shape.
 
-**And it is never a SINGLE stream.** The ten broker-owned streams are one recreation
+**And it is never a SINGLE stream.** The eight broker-owned streams are one recreation
 unit: startup refuses an account holding a proper subset, and refuses a complete bundle
 whose members carry different recovery epochs, so the supported operation is a reset of
-all ten together
+all eight together
 ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70); see "The
-ten streams are one recreation unit"). Recreating one
+eight streams are one recreation unit"). Recreating one
 stream is not a smaller version of that procedure — it is the procedure the enforcement
 exists to refuse, and an operator who worked around the refusal by copying the surviving
 epoch onto a replacement would reinstate exactly the stale-identity hazard the epoch is
@@ -904,7 +904,7 @@ to which 2.15.1 added `n.scaleUp` (see the v2.15.0 → v2.15.1 audit above); `de
   every claim write to `$MQTT_qos2assign` is funnelled through one CAS helper that always
   emits its expectation
   ([issue #37](https://github.com/nberlee/mqtt-nats-broker/issues/37)), so neither needs
-  lineage; `$MQTT_inflight` reached the same verdict on lineage
+  lineage; `$MQTT.inflight.` reached the same verdict on lineage
   ([issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38)), and the reachable
   defect it found is remedied by identity conditioning plus bounded destruction rather
   than lineage. A rejection is reported structurally (`JSStreamWrongLastSequenceErrF`
@@ -1202,7 +1202,7 @@ Every broker-owned `$MQTT_*` stream is provisioned through one convergence shape
 **unconditional authoritative re-read**, then a per-stream validator over that
 re-read — so a create-race loser (and equally the winner, whose create response is
 not authoritative for what now exists) validates the stream that is actually
-there, never the config it asked for. The ten streams are entries in one ordered
+there, never the config it asked for. The eight streams are entries in one ordered
 provisioning table iterated by a single loop, so none can be provisioned outside
 the shape. A stream that fails its validator **fails account-manager
 initialization** with recreate guidance; nothing is repaired or updated in place,
@@ -1233,16 +1233,14 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker**, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's | **exactly four subjects** — `$MQTT.sess.<domainTk>>`, `$MQTT.accept.<domainTk>>`, `$MQTT.handoff.<domainTk>>` and `$MQTT.trcpt.<domainTk>>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch carries `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the fact and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently); no `Sources`; no `SubjectDeleteMarkerTTL`; a **well-formed account recovery epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) — this stream MINTS it, so the requirement here is well-formedness rather than equality, and every other broker-owned stream must then carry that exact value; **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
-| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's four-subject set and its atomic-publish requirement, neither of which applies |
+| `$MQTT_sess` | THREE record families, each in its own subject space. **Session records**: per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry); no purge; **one ephemeral `AckNone` session-record watch consumer per broker**, filtered to the session-record space, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); and, on `$MQTT.accept.>`, **create-only CAS writes of permanent per-CONNECT acceptance facts** committed in ONE atomic batch with the record, plus bounded filtered walks of them. Every record carries `WID`/`PWID`, the write's own identity and its parent's. **In-flight and outbound records** (`$MQTT.inflight.>`, once their own stream `$MQTT_inflight`): create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; and the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) outbound authority (see "The records" under "The outbound obligation authority"): the per-client authority CAS, every authority transition as ONE atomic batch over the authority, its create-only permanent outcome and its members (exchange, action, resource, ledger and duty, retained manifest, chunks and `rel`, closure and recovery root), the name-ownership CAS keyed by physical consumer name (absent → LIVE → RETIRED, never reused), create-only closure and completion certificates, and exact-sequence deletes of `rel`, retained material, recovery roots, a discarded obligation's records, and the exchanges and duty entries of positions a live generation's inventory floor retired ([issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114)). **Authority, outcomes, closures, actions, resources, ledgers, name ownerships and certificates are never deleted within the recovery epoch, nor are exchanges and duty entries except behind that floor**, so the stream is non-empty for an account from its first accepted CONNECT; no consumers. **Shared-group lifecycle records** (`$MQTT.shared.>`, once their own stream `$MQTT_shared`): group-record CAS (`$MQTT.shared.grp.<qkey>`) and acquisition-ledger CAS (`$MQTT.shared.shl.<hash>.<gen>`), a join committing the pair in one atomic batch, and a group-record LISTING with point reads for the retiring-entry sweep; **no message delete, no purge, no consumers** — a group record is CAS-rewritten and a ledger is sealed, neither is ever deleted within the recovery epoch. Every CAS is per subject, so no write of one family waits behind another's expectation; what the families share is the one stream leader | **exactly six subjects** — `$MQTT.sess.<domainTk>>`, `$MQTT.accept.<domainTk>>`, `$MQTT.handoff.<domainTk>>`, `$MQTT.trcpt.<domainTk>>`, `$MQTT.inflight.>` and `$MQTT.shared.>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (the accept batch, the PUBLISH-phase register and its unsent marker ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), every [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) authority transition and a shared join carry `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the fact and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently; and every terminal in-flight path deletes at an exact sequence). The shared-group records' former **`DenyDelete` requirement is given up**: it made their own stream immune to the upstream `MaxMsgsPer` revival defect, and on this stream they are permanent neighbours of records that are rewritten and deleted (`docs/known-upstream-issues.md`); no `Sources`; no `SubjectDeleteMarkerTTL`; a **well-formed account recovery epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) — this stream MINTS it, so the requirement here is well-formedness rather than equality, and every other broker-owned stream must then carry that exact value; **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `DenyPurge` (nothing purges: session records and in-flight registers leave at exact sequences, since [issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38) for the in-flight reap, and the shared-group records are never removed); `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the eight ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would now import that stream's six-subject set and its atomic-publish requirement, neither of which applies |
 | `$MQTT_teardown` | per-client retirement watermark CAS and reads, one filtered walk by the orphan sweep — **nothing else, ever** | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; no `Sources`; plus the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — the same prerequisite every broker-owned stream now carries, and this stream's own reason for it is the sharpest: an `mseq` is a session-stream sequence, so watermarks are comparable only within the incarnation they were written under | **`DenyDelete`/`DenyPurge`** and `SubjectDeleteMarkerTTL` (no operation deletes or purges — a fence is permanent by design, so no delete marker can ever be created); `MaxConsumers`/`ConsumerLimits` (no consumers). Both denial waivers are load-bearing here, since reaping a fence would unfence a generation whose resources are already deleted |
-| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required** (every broker accepts MQTT 5.0, so any stored PUBLISH may carry a `Nats-TTL` for Message Expiry); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards, and by [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) admission, which refuses a depended-on source consumer unless the stream limit reads verified-zero and the consumer's effective threshold is zero, a snapshot at admission and not a fence; waived at startup because a limit can be imposed later; see below); `Duplicates` (best-effort narrowing only) |
-| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, with `IdleHeartbeat`, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position, and a mid-run reset its `DeliverByStartSequence` resume at W+1 (see "Per-run ephemeral consumer identity" and "The retained index is ordered by stream sequence") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL` (markers were evaluated and declined by [issue #63](https://github.com/nberlee/mqtt-nats-broker/issues/63): they require `AllowRollup`, which the shared shape refuses; a marker SOURCED in from an upstream is recognised and applied as a deletion); `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
-| `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL`; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
-| `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_inflight` | create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; and the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) outbound authority (see "The records" under "The outbound obligation authority"): the per-client authority CAS, every authority transition as ONE atomic batch over the authority, its create-only permanent outcome and its members (exchange, action, resource, ledger and duty, retained manifest, chunks and `rel`, closure and recovery root), the name-ownership CAS keyed by physical consumer name (absent → LIVE → RETIRED, never reused), create-only closure and completion certificates, and exact-sequence deletes of `rel`, retained material, recovery roots and a discarded obligation's records. **Authority, outcomes, closures, exchanges, actions, resources, ledgers, duties, name ownerships and certificates are never deleted within the recovery epoch**, so the stream is non-empty for an account from its first accepted CONNECT; no consumers | as `$MQTT_qos2in` but **`DenyPurge` waived since [issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38)** (`DenyDelete` fatal; the per-incarnation FILTER PURGE was replaced by `reapIncarnationRegisters`, which deletes at exact sequences, so nothing here purges by subject) and **`AllowAtomicPublish` REQUIRED since [issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)** (the PUBLISH-phase register and its unsent marker commit as one atomic batch carrying `Nats-Batch-*` headers, which a stream without it rejects — refused at startup, never patched; every [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) authority transition is such a batch too, so without it no CONNECT reaches a serving authority); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_shared` | group-record CAS (`$MQTT.shared.grp.<qkey>`) and acquisition-ledger CAS (`$MQTT.shared.shl.<hash>.<gen>`), a join committing the pair in one atomic batch, and a bounded group-record walk for the retiring-entry sweep; **no message delete, no purge, no consumers** — a group record is CAS-rewritten and a ledger is sealed, neither is ever deleted within the recovery epoch | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `Sources`; no `MaxMsgSize` cap; **`AllowAtomicPublish` REQUIRED** (the join's group-record + ledger pair carries `Nats-Batch-*` headers); **`DenyDelete` REQUIRED** — these records are never deleted, and denying it also keeps this stream immune to the upstream `MaxMsgsPer` revival defect (`docs/known-upstream-issues.md`): with no explicit delete there is no tombstone, so no evicted-then-deleted shape exists for a raw-block recovery to revive. **Kept OFF `$MQTT_inflight`** so that these records add no neighbours of their own to the in-flight registers. That removes only THEIR contribution: since the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover `$MQTT_inflight` carries permanent authority records from an account's first accepted CONNECT, so whole-stream emptiness is no longer an escape there (see "Storage this mechanism accepts"); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
-| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer, and the PUBREL consumer an admitted QoS 2 obligation depends on, whose interest-retained records are its completion evidence; admission and PUBREL re-materialisation re-check the stream limit at runtime, and admission the consumer's effective threshold too); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the ten ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
+| `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required** (every broker accepts MQTT 5.0, so any stored PUBLISH may carry a `Nats-TTL` for Message Expiry); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the eight ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards, and by [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) admission, which refuses a depended-on source consumer unless the stream limit reads verified-zero and the consumer's effective threshold is zero, a snapshot at admission and not a fence; waived at startup because a limit can be imposed later; see below); `Duplicates` (best-effort narrowing only) |
+| `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, with `IdleHeartbeat`, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position, and a mid-run reset its `DeliverByStartSequence` resume at W+1 (see "Per-run ephemeral consumer identity" and "The retained index is ordered by stream sequence") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL` (markers were evaluated and declined by [issue #63](https://github.com/nberlee/mqtt-nats-broker/issues/63): they require `AllowRollup`, which the shared shape refuses; a marker SOURCED in from an upstream is recognised and applied as a deletion); `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the eight ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
+| `$MQTT_qos2in` | hold/claim CAS at `<idHash>.<gen>.<PI>` (+ `.rel` sibling), exact-sequence deletes, confirmed exact-subject hold purge (discard + orphan sweep), bounded walk | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; `DenyDelete` fatal; **`DenyPurge` fatal** (blocks the confirmed exact-subject hold purge); no `Sources`; no `SubjectDeleteMarkerTTL`; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the eight ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `MaxConsumers`/`ConsumerLimits` (no consumers); `AllowMsgTTL`; `Duplicates` |
+| `$MQTT_qos2assign` | create-only claim CAS, transition CAS, exact-sequence reap; no purge, no consumers | as `$MQTT_qos2in` but `DenyPurge` waived; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the eight ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge` (nothing purges by subject); `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL` |
+| `$MQTT_out` | append-only stores (one a create-only CAS), per-session PUBREL + affine durables, interest-based drop, and **delete of an exact sequence** (a materialization attempt withdrawing a copy no claim of its incarnation can authorize); **no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap; no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (two durables per session); **`ConsumerLimits.InactiveThreshold` fatal** (it would reap a disconnected session's affine consumer, and the PUBREL consumer an admitted QoS 2 obligation depends on, whose interest-retained records are its completion evidence; admission and PUBREL re-materialisation re-check the stream limit at runtime, and admission the consumer's effective threshold too); `ConsumerLimits.MaxAckPending` fatal when non-zero and below the effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the eight ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | **`DenyDelete` fatal** (a disowned copy could not be withdrawn and would NAK-loop behind the fail-closed delivery gate for the session's life); `DenyPurge` (nothing purges by subject); `Discard` (inert); `AllowMsgTTL`; `Duplicates` (best-effort narrowing only) |
 
 Three asymmetries in that table are deliberate, and each is pinned by an
 acceptance test so an over-strict "fix" fails:
@@ -1274,14 +1272,55 @@ acceptance test so an over-strict "fix" fails:
   fatal exactly where a foreign record could occupy a protocol CAS slot, and
   cross-account retained sourcing is a supported topology.
 
-### The ten streams are one recreation unit
+**One stream, three record families: what the merge preserves and what it costs.**
+`$MQTT_sess` carries the session records, the in-flight and outbound records and the
+shared-group records since 2026-11-09
+([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)). Every subject
+filter on it sits under exactly one family's prefix, every write is a per-subject CAS, and
+nothing uses a stream-level expectation, so no protocol step and no classification changed.
+What changed is the cost of reading the stream as a whole, stated rather than claimed away:
+
+- **One stream leader.** All metadata writes of an account go through one Raft group, so an
+  election stalls the three families together and their aggregate write rate is one
+  stream's.
+- **The delayed-Will cutoff.** The acceptance-fact cutoff is the stream's last sequence
+  (`sessLastSeq`), which every in-flight or shared write now advances, so a decision
+  usually runs all `mqttWillCutoffChases` delta walks. Exhausting them still decides on the
+  verified cutoff, so the outcome is unchanged; the walks' server-side cost over a denser
+  stream is not bounded by the chase count, and they run under the scan deadline, so heavy
+  metadata traffic can defer a decision (`docs/CONFORMANCE.md`).
+- **The session-record walk** (`walkSessionRecords`). Its tail spans every write from the
+  listing's watermark through all point reads and visitors, which run JetStream operations
+  of their own, to the tail's completion. It has no captured upper bound and its blocks are
+  not guaranteed warm; the multi-page fallback walks the whole, denser history.
+- **The orphan sweep's in-flight walk.** Its budget is charged per returned record, so one
+  filtered read can traverse unrelated session and shared blocks before it returns.
+- **The shared-group retirement sweep** no longer walks by sequence: it lists the group
+  records by subject and loads each one, and an incomplete listing defers the pass.
+
+**Measured on 2026-11-09**, one machine, embedded JetStream, against the tree before the
+merge (numbers drift; the mechanisms above are the claim):
+
+- `TestMQTTMergedStreamLoad` (opt-in, `MQTTNB_MERGED_LOAD=1`) runs QoS 1 traffic, fresh-ID
+  CONNECT churn, delayed Wills coming due and the sweep tick at once. Across two interleaved
+  runs per tree, CONNECT latency p50 rose from about 93 ms to 117 ms, a sweep pass p50 from
+  about 1.1 s to 1.3 s, and a Will's lateness past its due time from about 108 ms to 131 ms
+  (maximum 220 ms, far inside a claimant lease: no deferral was observed). The stream moved
+  1 to 6 sequences during one session-record walk before the merge and 39 to 217 after it.
+- `make bench-jspaths`: standalone rows within noise; on R3 the publish rows cost 17 to
+  23 % more wall time per operation and startup 28 % more, with the request census
+  unchanged.
+  `make bench-outbound`: R3 QoS 1 burst throughput 21 % lower, standalone unchanged. One run
+  per tree.
+
+### The eight streams are one recreation unit
 
 **Every broker-owned `$MQTT_*` stream is recreated, reset, backed up and restored
 as ONE unit. There is no supported procedure that recreates a proper subset**, and
 startup enforces that rather than merely advising it ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)).
 
 The hazard the rule removes is not an empty stream, it is a stale reference that
-matches new unrelated state. Records on each of the ten persist identities the
+matches new unrelated state. Records on each of the eight persist identities the
 others issue — sequences, consumer durable names, subjects — so recreating one
 strands every surviving reference to it: an assignment claim naming a `$MQTT_msgs`
 sequence a recreated `$MQTT_msgs` has since reissued to a different message, a
@@ -1302,8 +1341,8 @@ provisioned. Each lookup's `(info, error)` PAIR is dispositioned together — pr
 undecided into absence is the fail-open that matters: a transient lookup outage
 would turn an eight-present account into a zero-present one and the loop would
 silently reprovision the missing stream. Then, judged on ONE scan's vector:
-**zero present admits** (initial creation, or a completed reset), **ten present
-admits**, and **one through nine is not admitted**.
+**zero present admits** (initial creation, or a completed reset), **eight present
+admits**, and **one through seven is not admitted**.
 
 **A partial vector is rescanned before it is refused.** The commonest way to observe
 one is a peer's provisioning in flight: brokers that start together (every pod of a
@@ -1314,9 +1353,9 @@ So the preflight rescans, read-only, every 250 ms for up to 30 s
 scan judged on its own vector, presence is never accumulated across scans (a vector
 whose union is complete but which no single scan saw complete is refused), a lookup
 error on a rescan is undecided exactly as on the first, nothing is created while it
-waits, and a ten-present rescan goes through the same validation as any start. No
+waits, and an eight-present rescan goes through the same validation as any start. No
 rescan starts once the budget is spent; the budget bounds waiting on a partial bundle,
-not admission, so a scan that by itself observed all ten admits whenever its last lookup
+not admission, so a scan that by itself observed all eight admits whenever its last lookup
 returns. A partial vector that persists for the whole budget **REFUSES**, naming what is present
 and what is absent, and so does a scan that sees zero after a partial one, at once:
 presence only grows under creation, so streams that vanished were deleted while the
@@ -1325,7 +1364,7 @@ broker started. Stopping the server ends the wait.
 **An EPOCH stamp, per stream, checked by every validator.** `$MQTT_sess` mints a recovery
 epoch into its own stream metadata at creation (the linearization point, so whichever
 replica wins the create sets the authoritative value), and every broker adopts it from
-`ensureBrokerStream`'s authoritative re-read. The other nine are stamped with the adopted
+`ensureBrokerStream`'s authoritative re-read. The other seven are stamped with the adopted
 value before their own create, and every validator compares it through
 `validateBundleEpochStamp`. A malformed or empty *expected* epoch is itself a refusal,
 never a wildcard. `$MQTT_teardown` carries no private epoch check beside it: two
@@ -1341,7 +1380,7 @@ being exact about what each one can and cannot see.
   a partial restore, or a replacement created without the account's stamp.
 
 Neither catches an operator who deletes a member, recreates it by hand, AND
-copies the surviving epoch onto the replacement: the count sees ten and the
+copies the surviving epoch onto the replacement: the count sees eight and the
 epoch sees agreement. That is the forgery case, outside what this enforcement
 claims (see "What the enforcement does not buy"), and doing it reinstates exactly
 the stale-identity hazard the epoch exists to detect.
@@ -1351,7 +1390,7 @@ create routes and judged before the epoch and the shape. It is a separate fact, 
 recreation-unit mechanism: it says which encoding wrote a member, not which incarnation it
 belongs to (see "The persisted format").
 
-**What the preflight does NOT promise, because it is ten independent lookups
+**What the preflight does NOT promise, because it is eight independent lookups
 rather than an atomic snapshot.** Under create-only concurrency — every other actor
 a broker running this same ordered provisioning — an admission cannot wrongfully
 succeed: an all-absent observation may race a peer's creation but then adopts that
@@ -1363,7 +1402,7 @@ rescans lengthen the window in which such a deletion can be observed from one sc
 up to the settle budget; they do not change what it takes to reach it.
 
 **The recovery, for every nonconforming state and for a CONFIRMED partial one:** stop
-ALL brokers for the account, delete all ten streams, and restart, which provisions a
+ALL brokers for the account, delete all eight streams, and restart, which provisions a
 fresh bundle under a fresh epoch. Recovery is therefore a complete account-level state
 reset with **no partial recovery**. A partial refusal does not by itself confirm the
 state: a peer slower than the budget refuses the same way, so its message puts that
@@ -1373,17 +1412,28 @@ session, retained message and in-flight QoS state. An operator
 running a supported administrative variation — a `Sources` topology on
 `$MQTT_rmsgs` — reapplies it as part of the reset; nothing here reconstructs it.
 
+**The streams the bundle no longer defines are refused, not adopted.** `$MQTT_inflight`
+and `$MQTT_shared` were streams of their own until 2026-11-09; their subject spaces are
+now on `$MQTT_sess`, which lets the reclamation of
+[issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133) fence those records
+in the same atomic batch. An account still holding either is an unsupported persisted
+shape, so a lookup-only preflight beside the retired-origin check
+(`mqttRefuseRetiredMetadataStreams`) refuses startup before anything is created, naming
+them, and the recovery is the same reset with them deleted too. Without it the old layout
+would still be refused, but only by the session stream's subject-set validator or by the
+server's subject-overlap check on create, neither of which names the stream to delete.
+
 nats-server's own MQTT listener keeps its state in `$MQTT_sess`, `$MQTT_msgs`,
-`$MQTT_rmsgs`, `$MQTT_qos2in` and `$MQTT_out`: five of the ten names, in the same
+`$MQTT_rmsgs`, `$MQTT_qos2in` and `$MQTT_out`: five of the eight names, in the same
 account. An account that listener has served therefore holds five members, none carrying
 this broker's persisted-format stamp, and the preflight refuses them by that stamp before
 the count rule judges the vector (see "The persisted format"); the migration procedure
 deletes them before the broker starts (`docs/MIGRATION.md`, witnessed by
 `TestEmbeddedListenerCutover`).
 
-A tenth stream, `$MQTT_origin`, is not a member: it is retired state, refused by its
-own lookup-only preflight with delete guidance, for the same reason the bundle
-preflight is a preflight at all.
+Three other streams, `$MQTT_origin`, `$MQTT_inflight` and `$MQTT_shared`, are not members:
+they are retired state, refused by lookup-only preflights with delete guidance, for the
+same reason the bundle preflight is a preflight at all.
 
 Resetting the bundle costs things that are not recoverable, and they are worth
 stating separately because an operator may reach for the reset casually: the
@@ -1408,7 +1458,7 @@ code. Startup validation and the preflight are both snapshots, so a live operato
 deleting a stream behind initialized managers still reaches those paths, and the
 all-brokers-stopped precondition stays load-bearing. Accepted-data loss when
 resetting a bundle holding accepted data is unchanged. Completeness is demonstrable
-at this HEAD and GUARDED rather than proven: the ten-entry provisioning table is
+at this HEAD and GUARDED rather than proven: the eight-entry provisioning table is
 hand-maintained, and what guards it is that the preflight derives its names from
 that table, that `TestBrokerStreamSpecTable` pins the table, and that
 `TestStreamValidatorFieldCoverage` requires every validator to reject a foreign
@@ -1440,7 +1490,7 @@ broker-owned streams persist identities other streams issue (sequences, consumer
 names, subjects), so recreating one of them strands every surviving reference to it.
 [issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70) closed that hazard by
 **WITHDRAWING the single-stream procedure rather than by generalising the coupling**: all
-ten broker-owned streams are one recreation unit, enforced as described above, and every
+eight broker-owned streams are one recreation unit, enforced as described above, and every
 validator's recovery text names the bundle. The enumerable thing is the STREAMS, one
 provisioning table with one loop over it, not the identities. The population is enumerated
 rather than sampled.
@@ -1750,7 +1800,7 @@ Two refinements keep the guarantee tight:
 
   **It is a `$MQTT_sess` SEQUENCE, so it is meaningless outside the incarnation that
   issued it**, and it therefore travels with `ScanEpoch`. The pair is validated together:
-  a bare sequence is uncomparable and a bare epoch says nothing. All ten streams are one
+  a bare sequence is uncomparable and a bare epoch says nothing. All eight streams are one
   recreation unit
   ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)),
   so no supported operation replaces `$MQTT_sess` while `$MQTT_willq` survives; the
@@ -1889,7 +1939,7 @@ Will. Refusal is read-only, so a refused record is **reclaimed by nothing**: no
 sweep, fence or reaper will ever remove it. It is logged once per subject (Warn,
 then Debug — the claim scan meets it every 5s) with the only remedy there is,
 deleting that message from `$MQTT_willq` — recreating the stream is NOT an
-alternative, since the ten broker-owned streams are one recreation unit and the only
+alternative, since the eight broker-owned streams are one recreation unit and the only
 other route is a whole-bundle reset. A refused record
 does not make a cancellation pass unresolved — no fire path will act on it either —
 so a reconnect still completes cleanly, and it never contends for a live Will's
@@ -1919,17 +1969,17 @@ interpret.
 
 Operational constraints for the coupled streams:
 
-- **Back up, restore, delete and recreate ALL TEN broker-owned streams as one unit,
+- **Back up, restore, delete and recreate ALL EIGHT broker-owned streams as one unit,
   from one point in time.** There is no supported single-stream or partial procedure:
-  startup refuses an account holding one to nine of the ten, and refuses a complete
-  bundle whose members carry different recovery epochs (see "The ten streams are one
+  startup refuses an account holding one to seven of the eight, and refuses a complete
+  bundle whose members carry different recovery epochs (see "The eight streams are one
   recreation unit"). A reset discards every client's permanent acceptance history with
   `$MQTT_sess`, every open generation-retirement fence with `$MQTT_teardown`, and every
   pending delayed Will with `$MQTT_willq`. Note what that means for the Will: losing the
   acceptance facts does NOT make a pending Will fire, because the reset takes the Will
   too. The fire outcome needs `$MQTT_sess` lost while `$MQTT_willq` survives, which is a
   partial operation this enforcement refuses.
-  A common epoch detects a bundle assembled across incarnations; it does NOT prove ten
+  A common epoch detects a bundle assembled across incarnations; it does NOT prove eight
   independently restored snapshots came from one coherent instant, so restore skew
   within one incarnation is undetectable and the "one point in time" is the operator's
   to guarantee.
@@ -1941,9 +1991,9 @@ Operational constraints for the coupled streams:
   the enforcement too: the preflight is a snapshot, so an operator deleting streams
   behind a running broker can still reach the stale-identity paths.
 - **A first start interrupted part-way leaves a partial bundle, and the recovery is the
-  same reset**: stop every broker, delete whichever of the ten exist, restart. A
+  same reset**: stop every broker, delete whichever of the eight exist, restart. A
   concurrent first start is NOT that state: a broker whose scan overlaps a peer's
-  provisioning rescans and admits once the peer has completed all ten (see "The ten
+  provisioning rescans and admits once the peer has completed all eight (see "The eight
   streams are one recreation unit"). Only a peer slower than the 30 s settle budget, or
   one that died part-way, leaves it refusing.
 - **The reset recreates streams with broker defaults.** A supported administrative
@@ -1958,7 +2008,7 @@ Operational constraints for the coupled streams:
   only such record: the same batch also creates the acceptance's create-only handoff
   receipt on `$MQTT.handoff.>`, and the ownership drive leaves at least two permanent
   [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
-  transition outcomes on `$MQTT_inflight`. Nothing reaps a fact: a fact has a reader
+  transition outcomes in `$MQTT.inflight.`. Nothing reaps a fact: a fact has a reader
   besides the Will scan (`mintAcceptanceTenure` reads the acceptance's OWN fact back),
   and a delayed Will held in memory by the retention queue can be enqueued later with an
   origin below facts a reaper would already have taken. Retiring a fact therefore needs
@@ -1967,13 +2017,13 @@ Operational constraints for the coupled streams:
   [the reclamation
   audit](https://github.com/nberlee/mqtt-nats-broker/issues/133) records why all
   three classes are retained. Monitor `$MQTT_sess`
-  and `$MQTT_inflight` message count and storage. Administrative pruning of facts or
+  and `$MQTT.inflight.` message count and storage. Administrative pruning of facts or
   receipts silently removes evidence and can let a superseded Will fire;
   `docs/CONFORMANCE.md` states the whole accepted exposure under "Per-CONNECT permanent
   records accumulate for the recovery epoch, and a reconnect loop can exhaust
   storage".
 - **The full `$MQTT_sess` configuration is validated at startup** (see "Stream
-  prerequisites"), including the exact four-subject set and `AllowAtomicPublish`. A
+  prerequisites"), including the exact six-subject set and `AllowAtomicPublish`. A
   stream that merely looked right — one subject space, or batches disabled — would
   fail every CONNECT at the accept batch rather than degrade quietly.
 
@@ -3800,8 +3850,8 @@ by a group delivery callback that was already dispatched when the reap happened,
 identical across those attempts, and a stream sequence is not an identity — a
 `$MQTT_qos2assign` whose sequence space restarts reissues them, which no supported
 operation now produces on its own
-([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70) made the ten
-streams one recreation unit, and
+([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70) made the
+broker-owned streams one recreation unit, and
 a supported reset takes the referenced state with the claims), but administrative
 deletion and partial restore still do. So the record carries a `Nonce`, minted
 once at the election and never rewritten, and it does three things:
@@ -4496,7 +4546,7 @@ Four defects follow, each resting on a premise of its own:
 - **[issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)**: durable records
   persist identities other streams issue, so recreating a proper subset of the
   broker-owned streams loses accepted messages, delivers an OLD payload for a new message,
-  or NAK-loops orphaned copies forever. The ten broker-owned streams are therefore one
+  or NAK-loops orphaned copies forever. The eight broker-owned streams are therefore one
   recreation unit (see the Compatibility boundary).
 
 Two consequences on this path are
@@ -5682,7 +5732,7 @@ this broker still *owns* the membership. Neither says when a durable may be
 session records, and a group consumer is deleted only through it. This section is the
 mechanism; the release paths are below.
 
-**Two record classes on `$MQTT_shared`, one verdict list in the session record.**
+**Two record classes in `$MQTT.shared.`, one verdict list in the session record.**
 
 | fact | instrument |
 |---|---|
@@ -5690,9 +5740,11 @@ mechanism; the release paths are below.
 | which acquisitions THIS session generation holds, and whether the generation is closed to new ones | one **acquisition ledger** per session generation, `$MQTT.shared.shl.<idHash>.<gen>`, sealed by the closing, permanent |
 | which acquisitions this session has durably decided to RELEASE and not yet confirmed released | `AcqReleases` in the session record, written by the record transaction that removes the membership or cancels an uncommitted join |
 
-A JetStream atomic batch is per stream, so a join or a leave commits its group member and
-its ledger member together and the session record can never be in that batch. The answer
-to that is a division of authority: **the record CAS on `$MQTT_sess` arbitrates every
+A join or a leave commits its group member and its ledger member together in one atomic
+batch, and the session record is not in that batch. The two once lived on different
+streams, and a JetStream atomic batch is per stream; they share `$MQTT_sess` since
+2026-11-09, but the protocol keeps the separation. The answer to that is a division of
+authority: **the record CAS on `$MQTT_sess` arbitrates every
 DISPOSITION** — the commit of an acquisition to a session, its removal, its cancellation —
 while **the ledger CAS arbitrates every ACQUISITION and its release**, and the two are joined
 by identity (the acquisition nonce) rather than by atomicity. Both classes live under the
@@ -5729,7 +5781,7 @@ count can only move together with the entry that IS the thing counted.
 **The tenure is which CONNECT of this generation may acquire, and it is ordered.** A resume
 preserves the generation, so two brokers may legitimately hold one generation at once; the
 record CAS decides which of them owns the SESSION, and no `$MQTT_sess` write reaches
-`$MQTT_shared`. The tenure carries that decision onto the ledger, and it is the acceptance's
+`$MQTT.shared.`. The tenure carries that decision onto the ledger, and it is the acceptance's
 ONE tenure ([issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
 8b): `id` is the outbound authority tenure the acceptance was finalized
 under, and `seq` is the `$MQTT_sess` stream sequence of the acceptance's own create-only
@@ -5765,7 +5817,7 @@ equality: their authority is a committed verdict or the seal, they remove exactl
 named entry and preserve the standing tenure, and concurrent executors converge through
 the CAS. The SEAL is authorized by the teardown claim, not by tenure, and no join, fence
 or installation undoes it. Cost, stated: one acceptance-fact read on `$MQTT_sess` and
-one `$MQTT_shared` transition on the critical path of EVERY CONNECT, whether or not the
+one `$MQTT.shared.` transition on the critical path of EVERY CONNECT, whether or not the
 session has shared subscriptions, and one permanent ledger subject per generation of
 every client within the recovery epoch.
 
@@ -5835,7 +5887,7 @@ session's in-memory membership for the key, which the record mirrors:
 any reservation — the charge ceiling `tmaxack + Σ maxAckPending` over every consumer the
 filter needs and the session is not already charged for, so one remaining charge refuses a
 `foo.>` filter before either of its acquisitions, and the ledger bound. **J1** acquires on
-`$MQTT_shared`, once per consumer the filter needs, composed under this CONNECT's tenure:
+`$MQTT.shared.`, once per consumer the filter needs, composed under this CONNECT's tenure:
 one batch that appends the acquisition to the ledger (create-only over absence, CAS at the
 read sequence otherwise, requiring `open(G, T)`) and moves the group (`holders+1` on the live
 incarnation, or `live = {next, 1}, next+1` when nobody holds one, finishing `retiring`
@@ -5860,7 +5912,7 @@ every one an attempt was composed against and unlisted ⇒ every issued attempt 
 excluded, re-attempt the IDENTICAL batch (the only branch that re-appends, reached only
 while no disposition of the acquisition has begun); sequence unchanged, or absent after a
 first-ever attempt ⇒ the batch may still be in flight, re-attempt at the same expectation
-so at most one lands; another tenure ⇒ this CONNECT is superseded on `$MQTT_shared`,
+so at most one lands; another tenure ⇒ this CONNECT is superseded in `$MQTT.shared.`,
 the filter fails, no fence and no retry (a stale tenure never acquires again); `sealed` ⇒
 the generation is closing, the filter fails. Bounded at `mqttSharedAcquireAttempts`.
 **Exhausting it fails the filter and enters abort settlement, after which no attempt of
@@ -6002,7 +6054,7 @@ STABLY OBSERVED, the same verdicts on two consecutive passes whatever the record
 sequence did meanwhile (7e: a connected session's unrelated saves move it on every pass).
 The sweep never writes the record; the owner clears the verdict on its next save. All
 passes act only on records they read, exhaustion of a walk authorizes nothing, and neither
-`$MQTT_shared` class is ever deleted.
+`$MQTT.shared.` class is ever deleted.
 
 **One writer, seven batch shapes, every rule at the write boundary.**
 `commitSharedLifecycleBatch` frames every batch through `newAtomicBatchRequest` and
@@ -6030,7 +6082,7 @@ decodes as the permissive value.
 created in the epoch; one ledger per session generation that ever acquires, closes or is
 resumed — every teardown writes an empty seal for a generation that never acquired, and
 every resume installs its tenure — proportional to generations, the closure record's own
-cardinality; and one `$MQTT_shared` transition on the critical path of every CONNECT,
+cardinality; and one `$MQTT.shared.` transition on the critical path of every CONNECT,
 fresh or resumed. Neither class is deleted within the recovery epoch, for the reason given
 under the seal.
 
@@ -6926,7 +6978,7 @@ allocated** identifier, which a client is entitled to read as a new message.
 
 An **in-flight register** supplies the missing durable fact
 (`internal/mqtt/inflight_register.go`): one small record per started PUBLISH-phase
-delivery on `$MQTT_inflight`, at `$MQTT.inflight.<idHash>.<gen>.<PI>`, naming the
+delivery in `$MQTT.inflight.`, at `$MQTT.inflight.<idHash>.<gen>.<PI>`, naming the
 source durable and stream sequence it came from.
 
 The register records that an identifier is ALLOCATED; whether a PUBLISH was ever put
@@ -7160,9 +7212,9 @@ one delete is CONFIRMED before the reap, and a delete that cannot be confirmed r
 marker at all: both halves are left to the sweep rather than acted on without proof.
 Recovery's drop loop is deliberately different — it keeps a fire-and-forget delete for an
 unverdicted nonce and reaps opportunistically, so its marker is removed only where the
-sibling reads authoritatively absent. `$MQTT_inflight` therefore requires
+sibling reads authoritatively absent. `$MQTT_sess` therefore requires
 `AllowAtomicPublish` (the pair
-is one batch), refused at startup if absent — the ten broker-owned streams are one
+is one batch), refused at startup if absent — the eight broker-owned streams are one
 recreation unit
 ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)), never
 migrated. Keyed by the identifier, so the
@@ -7172,7 +7224,8 @@ reason, as the inbound hold walk. The record carries an immutable nonce, because
 subject is reused by later exchanges on the same identifier and a stream sequence is
 therefore not an identity.
 
-It is a stream of its own for two reasons that are not preferences: `$MQTT_out` is
+It is a subject space of its own (`$MQTT.inflight.` on `$MQTT_sess`, a stream of its own
+until 2026-11-09) for two reasons that are not preferences: `$MQTT_out` is
 interest-retained, so a store with no consumer succeeds and keeps nothing, and a
 register has no consumer by design; and a per-delivery write to the session record
 would put every outbound QoS 1/2 message behind the record CAS and the record fence.
@@ -7200,7 +7253,7 @@ ordinary `publish` slot that no peer, and no restart, had anything positive to r
 session receiving anything at all.
 
 `pubrel_intended` exists because **JetStream batches are per stream**, so the PUBREL record
-on `$MQTT_out` and the slot on `$MQTT_inflight` can never be written atomically. What can
+on `$MQTT_out` and the slot in `$MQTT.inflight.` can never be written atomically. What can
 be made safe is the ORDER: the phase is written first, so a crash between them leaves a
 slot that says "past PUBREC, canonical record owed" instead of a `publish` slot a peer may
 legitimately reap. It is a **monotone phase, never a holder-exclusive action** — a
@@ -8290,7 +8343,7 @@ The invariants, in the order they matter:
   walk a ladder whose rungs are ordered by strength: (1) the confirmed delete, (2) the
   cancellation tombstone at the register's exact sequence, (3) the nonce verdict
   persisted with the session record. A proven rung ends the story and forgets the
-  verdict; the first two rungs share a storage domain (`$MQTT_inflight`) and usually
+  verdict; the first two rungs share a storage domain (`$MQTT.inflight.`) and usually
   fail together, which is exactly when the third matters. The one exception is a
   **retired** QoS 2 source: `Retired` proves that the source crossed PUBREC, not that the
   slot reached an explicit past-PUBREC phase or that PUBCOMP arrived. Consumer teardown
@@ -8664,7 +8717,7 @@ The invariants, in the order they matter:
   was never sent, so it is never registered. A retained QoS 1/2 send is registered like
   any other exchange, so its identifier survives a restart ("Retained delivery through
   the manifest (issue #107 7c)").
-- **A retargeted CAS rebuilds from the record it just read.** A writer of `$MQTT_inflight`
+- **A retargeted CAS rebuilds from the record it just read.** A writer of `$MQTT.inflight.`
   whose CAS is rejected must not re-read the subject only to learn the SEQUENCE and
   re-target with the original body: that silently erases whatever a concurrent writer
   proved in between (a pre-retirement snapshot re-proposed over a `Retired` mark puts a
@@ -8976,7 +9029,7 @@ session does read one as durable authority and rewrite it to take ownership. Its
 enumeration filter names a generation `clear()` has already re-minted, so it cannot reach
 the next incarnation. That is the extent of the claim. A resume preserves the generation,
 so a peer may still be serving this incarnation; whether removing a register costs
-anything there is `$MQTT_inflight`'s own consequence question, answered by the bounded
+anything there is `$MQTT.inflight.`'s own consequence question, answered by the bounded
 reap below ([issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38)).
 
 `reapIncarnationRegisters` enumerates, loads, classifies and deletes only at or below the
@@ -9397,7 +9450,7 @@ late removal had to be made safe against that peer, the bound came from the remo
 than the name: on `$MQTT_qos2in` every hold purge carries the highest sequence its remover
 could prove it was entitled to destroy
 ([issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66)). On
-`$MQTT_inflight` the answer is the same in kind
+`$MQTT.inflight.` the answer is the same in kind
 ([issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38)): the
 teardown's register pass carries the watermark its own enumeration returned, and conditions
 each delete on the identity it loaded at the sequence it loaded.
@@ -9428,7 +9481,7 @@ subject, so a repeat can name a subject re-occupied since: what makes it safe is
 each call carries, per walk, which naming alone never gave — see
 **[issue #66](https://github.com/nberlee/mqtt-nats-broker/issues/66)** for what that
 bounds and what it deliberately does not. It is **not** claimed for the deletion set as a
-whole on naming alone; the `$MQTT_inflight` register pass is bounded too, an
+whole on naming alone; the `$MQTT.inflight.` register pass is bounded too, an
 enumerate-load-classify pass carrying its own watermark
 (**[issue #38](https://github.com/nberlee/mqtt-nats-broker/issues/38)**).
 That also makes a crashed teardown self-healing instead of leaking until the orphan
@@ -9445,7 +9498,7 @@ it was, and only one of the two is recoverable:
   on a record it cannot validate, `mqttValidateTeardownTargets` rejects it through
   `mqttValidateSessionRecord`, and the orphaned-consumer sweep counts the consumers the
   record names as *referenced*, so they are not reaped either. The record, its
-  consumers and its marker persist until an operator resets the ten-stream `$MQTT_*`
+  consumers and its marker persist until an operator resets the eight-stream `$MQTT_*`
   bundle.
   That is the pre-existing consequence of the generation refusal — there is no
   generation to scope a safe deletion by — and it is why both refusals prescribe
@@ -9957,8 +10010,9 @@ non-destructive in themselves.**
   `mseq` supplies no second dimension there, and the reason is structural rather than
   conservative: the candidate generation belongs to a REMOTE party, so this pass has no
   `sess.seq` of its own to compare a marker against, and comparing `mseq` with a
-  `$MQTT_qos2in`, `$MQTT_inflight` or consumer sequence crosses incomparable sequence
-  spaces. See "Orphan reconciliation".
+  `$MQTT_qos2in` or consumer sequence crosses incomparable sequence spaces, and with an
+  in-flight record's sequence (the same stream now) compares writes of unrelated records.
+  See "Orphan reconciliation".
 
 Nothing ever reaps a watermark. Storage is bounded by the client-ID population, and
 permanence is what keeps the residual from being widened by a GC choice. Because
@@ -9966,7 +10020,7 @@ permanence is what keeps the residual from being widened by a GC choice. Because
 incarnation that issued those sequences — which is now a property of the whole
 bundle rather than of this pair: every broker-owned stream carries the account's
 recovery epoch and a mismatch is **refused at startup**, and no stream may be
-recreated without the other nine. See "The ten streams are one recreation unit".
+recreated without the other seven. See "The eight streams are one recreation unit".
 
 The deliberate exception to the fence is a crash *between* the won claim and the
 watermark write. It is non-destructive by construction, since the write precedes every
@@ -10069,8 +10123,9 @@ existing readers of the watermark treat retirement as generation-wide and irreve
 
 ### The records
 
-All live on `$MQTT_inflight`, because a JetStream atomic batch is **per stream** and the
-authority must commit together with the exchange mutation it authorizes. They are kept out
+All live in the `$MQTT.inflight.` space of `$MQTT_sess`, because a JetStream atomic batch
+is **per stream** and the authority must commit together with the exchange mutation it
+authorizes. They are kept out
 of
 the register machinery's reach by a leading `ob` class token, which can satisfy neither
 the
@@ -10759,9 +10814,9 @@ it composes the batch:
   tell a proposal that COMMITTED from one that was ABORTED, because that fact lives on
   `$MQTT_sess`. Without it a caller reserves, aborts its own metadata slot, and finalizes
   anyway — installing SERVING over a permanent ABORTED verdict — or cancels a proposal whose
-  metadata half had committed. Reading across streams is safe here because the slot is
-  create-only and its verdict permanent, so it cannot change between the read and the CAS.
-  UNRESOLVED and FOREIGN both refuse.
+  metadata half had committed. Reading the slot outside the transition's own batch is safe
+  here because the slot is create-only and its verdict permanent, so it cannot change
+  between the read and the CAS. UNRESOLVED and FOREIGN both refuse.
 
 The metadata half is checked the same way, and at the same place: `commitMetadataAttempt`
 validates the WHOLE frozen attempt before it reads anything or composes the batch, because
@@ -12075,7 +12130,7 @@ writer).
 several generations at once, so no per-generation resource can express it; what keeps it —
 and with it the interest-retained source message a member still owes its client — alive is
 that this generation's acquisition stays listed in its ledger (`shl.<idHash>.<gen>` on
-`$MQTT_shared`). So the exchange carries `SharedAcq`, the exact `{Group, Inc, Acq}` it
+`$MQTT.shared.`). So the exchange carries `SharedAcq`, the exact `{Group, Inc, Acq}` it
 depends on, written once by the admission and carried unchanged through every successor.
 It is never re-derived later: a register can be destroyed without ending its exchange, and
 a durable name identifies the incarnation, not which of this generation's acquisitions of
@@ -12128,10 +12183,11 @@ and the recovery executor's closing below — reaches L1 only through `executeSh
    (`mqttSharedAcqReadyForDependency`). The write boundary refuses a release from an open
    ledger whose prior does not list the nonce closed, and a release drops it from `closed`
    with the entry.
-2. **FENCE THE AUTHORITY**, after a read showing the close durable. Atomic batches are per
-   stream, so the close on `$MQTT_shared` and the admission's CAS on `$MQTT_inflight` cannot
-   be one write; the ORDER is the fence. The authority is read at sequence S; if it is
-   SERVING at the released generation a `fence-shared-release` transition (revision +1,
+2. **FENCE THE AUTHORITY**, after a read showing the close durable. The close on the ledger
+   and the admission's CAS on the authority are two writes; the ORDER is the fence. They now
+   share `$MQTT_sess`, so one batch could carry both, but this protocol does not. The
+   authority is read at sequence S; if it is SERVING at the released generation a
+   `fence-shared-release` transition (revision +1,
    nothing else, no member, SERVING predecessor) is committed against S. **Fenced means a
    CONFIRMED advance**: the batch landed, or a re-read shows a stored sequence past S — a
    committed write after the close, which every admission CASing S or earlier loses
@@ -13048,9 +13104,8 @@ closure, the enrolment's resource and duty members, the SEALED ledger, the direc
 header
 taking the next ordinal, the root at that ordinal, and the authority record last. Every
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107)
-class lives on `$MQTT_inflight` and a JetStream atomic batch is per stream, so all of it
-commits
-together or not at all.
+class lives in the `$MQTT.inflight.` space of one stream and the closing is one atomic
+batch, so all of it commits together or not at all.
 
 A second write after the closure would leave a crash window in which a sealed, enrolled,
 CLOSED
@@ -13616,7 +13671,7 @@ closure and refuses — and refuses equally when that read fails, because what l
 allocation is the ABSENCE of a closure and a failed read establishes no absence.
 
 **A shared group durable is not a resource of the authority at all.** A group durable is
-held by acquisitions counted in its GROUP record on `$MQTT_shared`, its name carries a
+held by acquisitions counted in its GROUP record in `$MQTT.shared.`, its name carries a
 physical incarnation no successor reuses, and its deletion is authorized by the release of
 the group's last acquisition ("A group durable is held by arbitration, not counted by a
 scan"). The teardown seals the generation's acquisition ledger, releases what it lists and
@@ -13948,7 +14003,7 @@ full API timeout, starving this session's retained replay worker and holding the
 identifier for the session's life. A successful PUBREC is ONE advance: the exchange to
 PubRecObserved, the register `publish -> pubrel_ready` carrying `rel_subj`/`rel_id`, the
 create-only CANONICAL PUBREL (`ob.rel.<idHash>.<gen>.<nonce>`, class `rel`) on
-`$MQTT_inflight`, and the manifest at its read sequence, unchanged and READY — so a copy
+`$MQTT.inflight.`, and the manifest at its read sequence, unchanged and READY — so a copy
 cleanup has closed forbids a late `rel`. The PUBREL is acquired on the register and
 written directly; nothing is stored on `$MQTT_out`. A duplicate PUBREC acquires a new
 PUBREL action and re-emits it; a PUBREL that could not be acquired is the continuation
@@ -14599,7 +14654,7 @@ positively, that the connection could never emit again; the certificate makes th
 durable and lets it end the token.
 
 **The record.** `$MQTT.inflight.ob.cert.<idHash>.<gen>.<run>.<conn>` on
-`$MQTT_inflight`, body `{id, epoch, gen, run, conn}`: which connection of which broker
+`$MQTT.inflight.`, body `{id, epoch, gen, run, conn}`: which connection of which broker
 run, serving which client generation, can emit nothing more. The connection token is
 MINTED per connection, with the server-local number only as a prefix: one process may
 construct several servers, each numbering its connections from one, and two sockets
@@ -14703,9 +14758,9 @@ decision about a consumer a displaced tenure provisioned: the write boundary adm
 when the resource's provisioning tenure differs from the deciding one, beside the existing
 rule that the deciding entitlement is the one serving. `repair-replaced` is the resume
 repair's decision about the durable it replaced. Neither may decide a PUBREL consumer. What
-the boundary does NOT prove is the naming half — the session record is on another stream
-and no batch carries it — so that half is the settlement's, read under a record
-transaction.
+the boundary does NOT prove is the naming half — the session record is not a member of the
+boundary's batch, though it shares the stream since 2026-11-09 — so that half is the
+settlement's, read under a record transaction.
 
 **The settlement.** At the end of every accepted RESUME, after the resume reconcile, a
 background job of the resident session walks the generation's resource records — a paged
@@ -14870,7 +14925,7 @@ section and in the mechanism sections above. These are its boundaries:
   enforced in the transactional validator, so no batch escapes it. That nothing is
   DELETED before the announcement lands is enforced only by `purgeMaterialStep`, because
   a JetStream delete is its own call and the validator never sees one. A raw
-  `deleteMsg` on `$MQTT_inflight` outside the named removal functions —
+  `deleteMsg` in `$MQTT.inflight.` outside the named removal functions —
   `deleteChunkInterval`, `finishMaterialRemoval`, `disposeRetainedRel` and the register
   reapers — fails the untagged delete-route check; that check is structural, not a fence.
 
@@ -14879,7 +14934,7 @@ section and in the mechanism sections above. These are its boundaries:
 Nothing deletes an authority, a transition outcome, a generation closure, a name
 ownership, a closure or completion certificate, a resource, an action, a ledger, a directory
 shard or a readiness record during the account's recovery epoch. The only deletes on
-`$MQTT_inflight` are of registers, unsent markers, `rel` records, retained material, recovery
+`$MQTT.inflight.` are of registers, unsent markers, `rel` records, retained material, recovery
 roots, a discarded obligation's records, and — since
 [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114) — the
 exchange records and duty
@@ -14899,7 +14954,7 @@ What that means per event:
 
 - **Permanent
   [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) records
-  are on `$MQTT_inflight` already by an account's first
+  are in `$MQTT.inflight.` already by an account's first
   accepted CONNECT**, with no obligation admitted. The accept drive runs at least two
   authority transitions (reserve then finalize-creation, or prepare then
   finalize-handoff), each of which CASes the per-client authority and writes its own
@@ -14954,9 +15009,11 @@ prerequisite and adds no compensation.
   `adoptAbandonedTeardowns`, `buildSessionRefs` and `sweepAcqReleaseVerdicts`, in its
   tail above the subject listing's watermark and its whole-stream walk past one page (its
   loads of the listed subjects are point reads: a failed one skips that record);
-  `scanWillOutbox` (`will_outbox.go:955`); the acceptance-fact walk `loadNextAcceptFact`
-  (`sess_accept_fact.go:344`); and `sweepSharedGroupRetirements`
-  (`shared_lifecycle_sweep.go:128`). The two affine
+  `scanWillOutbox` (`will_outbox.go:955`); and the acceptance-fact walk
+  `loadNextAcceptFact` (`sess_accept_fact.go:344`). `sweepSharedGroupRetirements` left
+  this list on 2026-11-09: it lists the group records (`streamSubjectsComplete`), defers
+  the whole pass on an incomplete listing, and loads each record by subject, so a failed
+  point read skips that group until the next pass. The two affine
   claim walks (`qos2_shared_affine.go:3820`, `:4008`) are chapter P's. The custody duty
   traversal (`traverseGenerationInventory`) is NOT a suffix enumeration: it reads named
   ordinals at exact subjects through `loadLastMsgForMulti`, bounded by the ledger, and
@@ -15130,7 +15187,7 @@ consumers, clustered returns early without a total, offline placeholders carry n
 The arm **discovers from its licence**. A PUBREL consumer is deletable by it only when its
 name's `own.out` ownership record is RETIRED, so the deletable set is exactly the set of
 RETIRED `own.out` records, and those already lie on the in-flight walk's path: it reads
-every `$MQTT_inflight` record under its sequence cursor and record budget. It decodes an
+every `$MQTT.inflight.` record under its sequence cursor and record budget. It decodes an
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) `own.out` record
 against the manager's epoch, requires it to be filed under exactly its own name's subject
 and to name a PUBREL durable (the parser requires the prefix), and hands a RETIRED one on.
@@ -15148,7 +15205,7 @@ observations: its licence is the name's RETIRED ownership, which a later generat
 retirement cannot mask.
 
 **What it costs, stated rather than implied:** a rotation is sized by the whole
-`$MQTT_inflight` record population — permanent outcomes and closures, every ownership
+`$MQTT.inflight.` record population — permanent outcomes and closures, every ownership
 record, registers and markers — and every RETIRED `$MQTT_out` name costs one consumer
 lookup per rotation for the life of the epoch, almost always answered NotFound. Both grow
 with history rather than with the live consumer population. The complete session-record
@@ -15188,7 +15245,7 @@ alone. An incomplete walk, an undecodable record, a client ID that does not hash
 its subject token, or an unvalidatable generation aborts the whole destructive pass.
 
 Under a live generation reference the pass reaps claims that are already durably TERMINAL,
-and collects the retired affine `$MQTT_inflight` register class with the copy and claim
+and collects the retired affine `$MQTT.inflight.` register class with the copy and claim
 each names; it skips every NONTERMINAL claim of a live generation, leaving it to an owner
 resume that may never come
 ([issue #68](https://github.com/nberlee/mqtt-nats-broker/issues/68)). That skip is a proof
@@ -17248,7 +17305,7 @@ assets), and memory for recovery (see "The Helm chart" for what was observed). N
 needs to cover the JetStream wait or recovery, since `/healthz` answers from the start.
 Brokers that leave the wait together
 create the stream bundle concurrently, which the bundle preflight's rescans absorb (see
-"The ten streams are one recreation unit").
+"The eight streams are one recreation unit").
 
 **The default configuration** (`embedded/nats.conf`, baked into the embedded image):
 loopback client listener, JetStream in `/data`, one account with JetStream and two
@@ -17352,7 +17409,8 @@ an even or sub-three peer count.
 sizing: an embedded broker's recovery holds its stored streams and consumers in memory.
 One observation, not a measured minimum: a three-peer R3 cluster recovering about 530
 consumers was OOMKilled at a 384Mi limit and was not at 512Mi — while its
-`$MQTT_inflight` stream held 1.16M records (533 MiB), most of them retired records an
+`$MQTT_inflight` stream (as it then was) held 1.16M records (533 MiB), most of them
+retired records an
 operator purge later removed. The derived Go soft limit (90 % of the limit) is a GC
 target, so a pod's peak memory tracks the limit it is given rather than what it needs.
 

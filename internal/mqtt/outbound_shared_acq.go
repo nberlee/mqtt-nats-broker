@@ -24,8 +24,8 @@ import (
 // A shared exchange depends on its exact acquisition (issue #107 cutover, unit 7a; consult 82).
 //
 // A shared-subscription GROUP consumer is not a resource any generation owns: several
-// generations hold it at once, through ACQUISITIONS listed in each generation's ledger on
-// $MQTT_shared (shared_lifecycle.go). What keeps the consumer — and with it the interest-retained
+// generations hold it at once, through ACQUISITIONS listed in each generation's ledger in
+// the $MQTT.shared. space (shared_lifecycle.go). What keeps the consumer — and with it the interest-retained
 // source message a member still owes its client — alive is that this generation's acquisition
 // stays listed. So the obligation's dependency is that acquisition, by its exact identity
 // {Group, Inc, Acq}, recorded ON THE EXCHANGE by the admission batch and never re-derived later:

@@ -228,7 +228,7 @@ func TestMQTTFailedInheritingReplacementDoesNotCarryItsLineage(t *testing.T) {
 			replacementSeen = true
 			// ROUTE WITNESS: the replacement really did select the inherited lineage.
 			inheritedProposed = r.Lin == predecessorLin
-			if derr := e.asm.jsa.deleteMsg(mqttInflightStreamName, occSeq, true); derr != nil {
+			if derr := e.asm.jsa.deleteMsg(mqttSessStreamName, occSeq, true); derr != nil {
 				return 0, derr
 			}
 			return 0, fmt.Errorf("the replacement CAS lost its race")
@@ -485,7 +485,7 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 	onStream := func() int {
 		n := 0
 		for seq := uint64(1); ; {
-			smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttInflightStreamName,
+			smsg, err := e.asm.jsa.loadNextMsgFromSeq(mqttSessStreamName,
 				mqttInflightStreamSubjectPrefix+">", seq)
 			if err != nil {
 				return n
@@ -539,7 +539,7 @@ func TestMQTTRegisterWithoutLineageIsRefused(t *testing.T) {
 				}
 				if after := onStream(); after != before {
 					t.Fatalf("a refused register reached storage: %d message(s) landed on %s",
-						after-before, mqttInflightStreamName)
+						after-before, mqttSessStreamName)
 				}
 				rec, smsg, lerr := e.asm.jsa.loadInflightRecord(subject)
 				if lerr != nil {
@@ -640,7 +640,7 @@ var mqttLineageWriteSinks = map[string][]string{
 	// THE REACH OF THIS GUARD, stated rather than implied: it is SYNTACTIC and NAME-BASED. It
 	// catches a bypass that uses the register body builder or the atomic-batch request, which
 	// is every route this package actually has. It does NOT prove that no other code path
-	// anywhere can reach $MQTT_inflight -- a raw storeMsg on a hand-built subject with a
+	// anywhere can reach the $MQTT.inflight. space -- a raw storeMsg on a hand-built subject with a
 	// hand-marshalled body would not appear here, because deciding which storeMsg calls carry
 	// a register would need subject analysis this scanner cannot do. That limit is the reason
 	// the guard is described as bounded.
@@ -682,7 +682,7 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 
 	// issue #107's metadata commit. Reaches the batch primitive on $MQTT_sess — the session
 	// record, the acceptance fact and the handoff receipt — and writes NO register body at
-	// all: it does not touch $MQTT_inflight. One call site, in commitMetadataAttempt.
+	// all: it does not touch the $MQTT.inflight. space. One call site, in commitMetadataAttempt.
 	{fn: "commitMetadataAttempt", sink: "newAtomicBatchRequest"}: 1,
 
 	// issue #107's shared-group lifecycle writer. Reaches the batch primitive for a two-member
@@ -738,7 +738,7 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 
 	// NOT a register write either: the teardown claim batch writes the session MARKER (a
 	// record write, lineage decided by claimTeardown) and its create-only teardown receipt
-	// on $MQTT_sess, and touches no $MQTT_inflight register. Listed for the same reason
+	// on $MQTT_sess, and touches no in-flight register. Listed for the same reason
 	// commitMetadataAttempt is — the name-based bypass guard cannot tell one atomic batch from
 	// another, so naming it keeps that limitation visible (issue #107 Gap 1). One call site, in
 	// storeTeardownClaimBatch.

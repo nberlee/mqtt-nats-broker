@@ -481,7 +481,7 @@ func TestForegroundAuthorityPriorityOverRetainedWorkers(t *testing.T) {
 		sch.verify(true)
 		deadline := time.Now().Add(10 * time.Second)
 		for {
-			_, gone := rig.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
+			_, gone := rig.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(rig.idHash, rig.gen, reg.Payload))
 			if gone != nil {
 				return
 			}

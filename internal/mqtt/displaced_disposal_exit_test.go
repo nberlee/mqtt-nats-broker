@@ -145,7 +145,7 @@ func TestDisplacedDisposalEndsOnlyOnBothFacts(t *testing.T) {
 		if al.status != mqttOutboundValid || al.seq == 0 {
 			t.Fatalf("fixture: no authority to remove: %+v", al)
 		}
-		if err := e.asm.jsa.deleteMsg(mqttInflightStreamName, al.seq, true); err != nil {
+		if err := e.asm.jsa.deleteMsg(mqttSessStreamName, al.seq, true); err != nil {
 			t.Fatal(err)
 		}
 		if w.endIfDisplacedAndSourceSettled() || !disposalIndexed(e.sess, w) {

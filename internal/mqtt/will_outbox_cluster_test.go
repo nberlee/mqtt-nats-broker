@@ -339,7 +339,7 @@ func testAcceptFactsFor(t *testing.T, asm *mqttAccountSessionManager, cidHash st
 }
 
 // TestMQTTWillOutboxReplicatedAcceptFacts is T17's always-run half: $MQTT_sess is
-// created R3 and current on every node, it carries ALL FOUR subject spaces, and a real
+// created R3 and current on every node, it carries ALL SIX subject spaces, and a real
 // CONNECT through the broker leaves a permanent acceptance fact that is replicated
 // and reads back valid.
 //
@@ -369,14 +369,16 @@ func TestMQTTWillOutboxReplicatedAcceptFacts(t *testing.T) {
 		// missing space and an unexpected space are both failures here, which is what a
 		// stream whose validator refuses an unsupported shape actually needs.
 		want := map[string]struct{}{
-			mqttSessStreamSubjectPrefix + ">":      {},
-			mqttAcceptSubjectPrefix + ">":          {},
-			mqttHandoffSubjectPrefix + ">":         {},
-			mqttTeardownReceiptSubjectPrefix + ">": {},
+			mqttSessStreamSubjectPrefix + ">":            {},
+			mqttAcceptSubjectPrefix + ">":                {},
+			mqttHandoffSubjectPrefix + ">":               {},
+			mqttTeardownReceiptSubjectPrefix + ">":       {},
+			mqttInflightStreamSubjectPrefix + ">":        {},
+			mqttSharedLifecycleStreamSubjectPrefix + ">": {},
 		}
 		if len(si.Config.Subjects) != len(want) {
-			return fmt.Errorf("Config.Subjects=%v, want the record, accept-fact and handoff-outcome spaces",
-				si.Config.Subjects)
+			return fmt.Errorf("Config.Subjects=%v, want the record, accept-fact, handoff-outcome, "+
+				"teardown-receipt, in-flight and shared-group spaces", si.Config.Subjects)
 		}
 		for _, subj := range si.Config.Subjects {
 			if _, ok := want[subj]; !ok {

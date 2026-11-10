@@ -101,7 +101,7 @@ func TestRow2AnAcquisitionIsBothCarriersOverAFreeOccupant(t *testing.T) {
 		if cur == nil || cur.ActionToken != tokenA || cur.Acq != 1 {
 			t.Fatalf("a refused batch moved A's lease: %+v", cur)
 		}
-		if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttActionSubject(getHash(e.id), auth.Gen, nonce, 2)); err == nil {
 			t.Fatalf("a refused batch installed its action record")
 		}
@@ -298,7 +298,7 @@ func TestRow2StoreContentionRefusesTheWholeLosingBatch(t *testing.T) {
 	if cur == nil || cur.ActionToken != reqA.Token || cur.Acq != 1 {
 		t.Fatalf("the register is not A's acquisition: %+v", cur)
 	}
-	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttActionSubject(getHash(e.id), auth.Gen, nonce, 1))
+	smsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttActionSubject(getHash(e.id), auth.Gen, nonce, 1))
 	if lerr != nil || smsg == nil {
 		t.Fatalf("A's action record is missing: %v", lerr)
 	}

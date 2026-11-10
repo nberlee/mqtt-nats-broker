@@ -192,7 +192,7 @@ func TestAdvanceAdmitsNothing(t *testing.T) {
 	// the kind's own confinement. A member the store would reject anyway proves nothing
 	// about the rule.
 	regSubj := mqttInflightSubject(getHash(e.id), testGen, 7)
-	regMsg, rerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj)
+	regMsg, rerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj)
 	if rerr != nil {
 		t.Fatalf("the admission's register is not in the store: %v", rerr)
 	}
@@ -226,7 +226,7 @@ func TestAdvanceAdmitsNothing(t *testing.T) {
 	if _, cerr := e.asm.jsa.commitAuthorityTransition(&creating); cerr == nil {
 		t.Fatalf("an advance-exchange transition installed an exchange create-only")
 	}
-	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(e.id), testGen, freshNonce)); lerr == nil {
 		t.Fatalf("the smuggled exchange landed in the store")
 	}
@@ -859,7 +859,7 @@ func TestNoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 	// be: the record is never rewritten at all, so a nonzero expectation is the whole
 	// defect.
 	actSubj := mqttActionSubject(getHash(e.id), testGen, adm.Exchange.Nonce, 1)
-	amsg, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, actSubj)
+	amsg, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, actSubj)
 	if lerr != nil {
 		t.Fatalf("the acquired action is not in the store: %v", lerr)
 	}
@@ -893,7 +893,7 @@ func TestNoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 			t.Fatalf("a %s transition rewrote an acquired action's connection binding", name)
 		}
 	}
-	back, derr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, actSubj)
+	back, derr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, actSubj)
 	if derr != nil {
 		t.Fatalf("the action disappeared: %v", derr)
 	}

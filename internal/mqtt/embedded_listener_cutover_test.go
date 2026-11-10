@@ -69,7 +69,7 @@ func TestEmbeddedListenerCutover(t *testing.T) {
 			t.Fatalf("the refusal does not name the listener's %s as unstamped: %v", name, err)
 		}
 	}
-	if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
+	if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
 		t.Fatalf("the refusal came from the count rule, not the format check: %v", err)
 	}
 	testStopBringUpServer(t, b)
@@ -85,7 +85,7 @@ func TestEmbeddedListenerCutover(t *testing.T) {
 		t.Fatalf("after the restart without mqtt {} the account holds %v, want the listener's five", got)
 	}
 
-	// 4. Delete the five and start the broker: it provisions its own ten, and the
+	// 4. Delete the five and start the broker: it provisions its own eight, and the
 	//    client that had a session on the embedded listener has none here.
 	js, err := nc.JetStream()
 	if err != nil {

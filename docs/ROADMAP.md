@@ -958,13 +958,23 @@ Added 2026-11-09 at the user's request: the retained per-CONNECT records grow wi
 under a production prober that connects once a minute with a fresh clean session. An alpha
 blocker: it reverses the 2026-10-23 "not an alpha precondition" disposition.
 
+- [x] Merged `$MQTT_inflight` and `$MQTT_shared` into `$MQTT_sess`, eight streams, so the
+  reclaimer's fences can be members of one atomic batch: existing protocol steps and
+  classifications preserved, with the widened scan-cost and deadline-bounded liveness
+  exposure stated; an account still holding either retired stream is refused. Done
+  2026-11-09 ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
+
 - [ ] Reclaim the permanent records every CONNECT and every discarded generation leaves: per
   CONNECT the acceptance fact, the handoff outcome and the transition outcomes; per generation
-  the teardown receipt, the acquisition ledger and the generation-scoped `$MQTT_inflight`
-  classes `docs/CONFORMANCE.md` lists as permanent ("The storage this design keeps on
-  `$MQTT_inflight`"), not the records already deleted there. Nothing reclaims them within
+  the teardown receipt, the acquisition ledger and the generation-scoped `$MQTT.inflight.`
+  classes `docs/CONFORMANCE.md` lists as permanent ("The storage this design keeps in
+  `$MQTT.inflight.`"), not the records already deleted there; and the per-client watermark
+  and authority, which fresh-ID churn leaves unbounded too. Nothing reclaims them within
   the recovery epoch; the reclaimer must meet the four reopening conditions the audit
-  recorded, all classes together
+  recorded, all classes together. The design direction is a lifecycle registry, an attempt
+  journal in place of the permanent outcomes, per-anchor acceptance summaries, and the
+  receipts, facts and watermark eliminated rather than reclaimed, with name ownership and
+  group records retained
   ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
@@ -990,7 +1000,7 @@ supported and experimental contracts are deliberately asymmetric:
   upgrade, rollback, backup/restore and downgrade guarantees;
 
 - turning the gate off with experimental state present is **unsupported**; operators must
-  perform the documented all-brokers-stopped reset of all ten `$MQTT_*` streams first;
+  perform the documented all-brokers-stopped reset of all eight `$MQTT_*` streams first;
 
 - detection, migration, reinterpretation and cleanup of incompatible experimental state
 are
@@ -999,7 +1009,7 @@ are
 - there is no automatic conversion from a persisted shared QoS 2 membership to QoS 1, and
   no migration or legacy reader is owed for experimental state.
 
-This cost is acceptable only for an explicit experiment: the ten streams are one recovery
+This cost is acceptable only for an explicit experiment: the eight streams are one recovery
 unit, so resetting experimental state also resets ordinary sessions, accepted messages,
 retained messages and pending Wills in that account.
 
@@ -2019,7 +2029,7 @@ The first alpha may be tagged only when:
 
 - [ ] TLS rollover, WebSocket, authentication, authorization, migration, backup,
   restore, upgrade, rollback, and shutdown procedures are documented and tested.
-  **Backup and restore are per-BUNDLE**: all ten broker-owned `$MQTT_*` streams are
+  **Backup and restore are per-BUNDLE**: all eight broker-owned `$MQTT_*` streams are
   one recreation unit, taken and restored together from one point in time, since
   startup refuses a proper subset and refuses members carrying different recovery
   epochs ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)).

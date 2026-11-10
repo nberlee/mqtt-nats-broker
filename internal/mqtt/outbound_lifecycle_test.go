@@ -130,7 +130,7 @@ func TestObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		t.Fatalf("the acquired action did not survive the closure: %d found", len(obs.actions))
 	}
 	for _, inc := range []string{"inc-src", "inc-rel"} {
-		rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		rmsg, rerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttResourceSubject(getHash(e.id), testGen, inc))
 		if rerr != nil {
 			t.Fatalf("resource %q did not survive the closure: %v", inc, rerr)
@@ -250,7 +250,7 @@ func TestObligationSurvivesRetirementAndCompletes(t *testing.T) {
 
 	authNow = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	for _, inc := range []string{"inc-src", "inc-rel"} {
-		rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttResourceSubject(getHash(e.id), testGen, inc))
 		cleared, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testGen, inc)
 		// The release took this obligation's hold: nothing depends on the resource.
@@ -270,7 +270,7 @@ func TestObligationSurvivesRetirementAndCompletes(t *testing.T) {
 		if authNow.rec.State != mqttAuthorityClosed {
 			t.Fatalf("disposing %q reopened the authority to state %d", inc, authNow.rec.State)
 		}
-		fmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+		fmsg, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 			mqttResourceSubject(getHash(e.id), testGen, inc))
 		fin, _ := mqttDecodeOutboundResource(fmsg.Data, e.id, e.epoch, testGen, inc)
 		if !mqttResourceDeletable(fin) {
@@ -322,11 +322,11 @@ func TestClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
 		"marker":   regSubj + "." + mqttInflightMarkerSuffix,
 		"exchange": mqttExchangeSubject(getHash(e.id), testGen, adm.Exchange.Nonce),
 	} {
-		if _, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); err == nil {
+		if _, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj); err == nil {
 			t.Fatalf("the refused post-closure admission installed its %s", name)
 		}
 	}
-	rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	rmsg, _ := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttResourceSubject(getHash(e.id), testGen, "inc-src"))
 	got, _ := mqttDecodeOutboundResource(rmsg.Data, e.id, e.epoch, testGen, "inc-src")
 	if len(got.Deps) != 0 {
@@ -340,7 +340,7 @@ func TestClosureBeforeAdmissionRefusesTheObligation(t *testing.T) {
 // sequence a caller held from earlier would overwrite whatever happened in between.
 func testLoadExchange(t *testing.T, e *testOutboundEnv, gen, nonce string) (*mqttOutboundExchange, uint64) {
 	t.Helper()
-	msg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	msg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(e.id), gen, nonce))
 	if err != nil {
 		t.Fatalf("loading exchange %q: %v", nonce, err)

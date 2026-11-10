@@ -391,7 +391,7 @@ func (g *testReleaseRig) source(t *testing.T) *mqttOutboundResource {
 	g.sess.mu.Lock()
 	gen := g.sess.gen
 	g.sess.mu.Unlock()
-	subjs, _, err := g.asm.jsa.streamSubjectsComplete(mqttInflightStreamName, mqttResourceSubject(g.sess.idHash, gen, "*"))
+	subjs, _, err := g.asm.jsa.streamSubjectsComplete(mqttSessStreamName, mqttResourceSubject(g.sess.idHash, gen, "*"))
 	if err != nil {
 		t.Fatalf("listing the resources: %v", err)
 	}

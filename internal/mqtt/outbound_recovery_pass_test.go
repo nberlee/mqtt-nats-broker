@@ -481,7 +481,7 @@ func TestACertificateMustStateItsCoverage(t *testing.T) {
 		t.Helper()
 		subj := mqttGenCertSubject(getHash(e.id), testGen)
 		var expect uint64
-		if cur, cerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj); cerr == nil && cur != nil {
+		if cur, cerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj); cerr == nil && cur != nil {
 			expect = cur.Sequence
 		}
 		msg, hdr := mqttFrameBatchWrite(expect, []byte(body), _EMPTY_, 0, false)

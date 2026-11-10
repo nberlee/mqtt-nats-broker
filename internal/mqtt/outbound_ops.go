@@ -86,7 +86,7 @@ import (
 
 // loadOutboundExchange reads one exchange as it durably stands.
 func (jsa *mqttJSA) loadOutboundExchange(id, epoch, gen, nonce string) (*mqttOutboundExchange, uint64, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(getHash(id), gen, nonce))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(getHash(id), gen, nonce))
 	if err != nil {
 		return nil, 0, fmt.Errorf("exchange %q of generation %q could not be read: %w", nonce, gen, err)
 	}
@@ -99,7 +99,7 @@ func (jsa *mqttJSA) loadOutboundExchange(id, epoch, gen, nonce string) (*mqttOut
 
 // loadOutboundResource reads one backing resource as it durably stands.
 func (jsa *mqttJSA) loadOutboundResource(id, epoch, gen, inc string) (*mqttOutboundResource, uint64, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttResourceSubject(getHash(id), gen, inc))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttResourceSubject(getHash(id), gen, inc))
 	if err != nil {
 		return nil, 0, fmt.Errorf("resource %q of generation %q could not be read: %w", inc, gen, err)
 	}

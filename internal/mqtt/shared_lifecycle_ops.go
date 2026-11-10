@@ -283,7 +283,7 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 				return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedLedgerSealed
 			}
 			if l.rec.Tenure != tenure {
-				// Superseded on $MQTT_shared: a newer CONNECT of this generation owns
+				// Superseded in the $MQTT.shared. space: a newer CONNECT of this generation owns
 				// acquisition. Whether `acq` is listed or not it is the successor's to
 				// reconcile. No fence, no retry — a stale tenure never acquires again.
 				return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedTenureSuperseded

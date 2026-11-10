@@ -91,7 +91,7 @@ func testNewEnv(t *testing.T, clientID string) (*testOutboundEnv, func()) {
 // test binary otherwise.
 func testClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, clientID string, onFatal func()) {
 	t.Helper()
-	if err := asm.jsa.purgeStream(mqttInflightStreamName, mqttOutboundAuthoritySubject(getHash(clientID)), 0, false); err != nil {
+	if err := asm.jsa.purgeStream(mqttSessStreamName, mqttOutboundAuthoritySubject(getHash(clientID)), 0, false); err != nil {
 		if onFatal != nil {
 			onFatal()
 		}
@@ -753,7 +753,7 @@ func TestClosedAuthorityCanClaimAFreshGeneration(t *testing.T) {
 // TestSweepSkipsArbitrationRecords pins that the orphan sweep neither sweeps nor
 // mis-logs issue #107's permanent records, and does not spend its bounded budget on them.
 //
-// They share $MQTT_inflight with the registers because a batch is per stream, so the sweep
+// They share a stream with the registers because a batch is per stream, so the sweep
 // walks straight over them. Before this they were retained as "unattributable registers":
 // true in the sense that nothing could attribute them to a register, false as a description,
 // and each one consumed a record from a pass whose whole point is to be bounded.
@@ -1040,7 +1040,7 @@ func TestExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	}
 
 	// Both halves landed.
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(e.id), testGen, xchNonce))
 	if err != nil {
 		t.Fatalf("the admitted exchange does not load back: %v", err)
@@ -1073,7 +1073,7 @@ func TestExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, str)); err == nil {
 		t.Fatalf("an exchange was admitted against a superseded authority")
 	}
-	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	if _, lerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttExchangeSubject(getHash(e.id), testGen, staleNonce)); lerr == nil {
 		t.Fatalf("the refused admission still installed its exchange: the obligation exists " +
 			"and no authority transition admitted it")
@@ -1094,7 +1094,7 @@ func TestExchangeAdmissionIsAtomicWithItsAuthority(t *testing.T) {
 	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, atr)); err != nil {
 		t.Fatalf("the action acquisition was refused: %v", err)
 	}
-	amsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName,
+	amsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName,
 		mqttActionSubject(getHash(e.id), testGen, xchNonce, 1))
 	if err != nil {
 		t.Fatalf("the acquired action does not load back: %v", err)

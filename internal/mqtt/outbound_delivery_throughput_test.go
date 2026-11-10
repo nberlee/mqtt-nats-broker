@@ -438,7 +438,7 @@ func outboundDeliveryBenchShape(start time.Time, at []time.Time) ([]float64, []t
 }
 
 // outboundDeliveryCensus counts the requests the account's store client sends, by class: verb
-// and, for a message GET on the in-flight stream, the record class it reads.
+// and, for a message GET on the in-flight space, the record class it reads.
 type outboundDeliveryCensus struct {
 	jsa *mqttJSA
 	mu  sync.Mutex

@@ -539,7 +539,7 @@ func (as *mqttAccountSessionManager) forgetIfQ2AffClaimGone(subject string) {
 // (the inbound hold walk included: a second run that meets the first adopter's
 // `discarded` marker purges to the fence THAT marker recorded, so a later exchange is
 // spared rather than destroyed — issue #66 arm A2, which also states what a subject the first
-// run never reached does instead. The `$MQTT_inflight` purge in the same teardown stays
+// run never reached does instead. The in-flight purge in the same teardown stays
 // bounded since issue #38 by the enumeration watermark of the pass that removes it)
 // reconciliation: both delete the same retired, generation-scoped names, one wins
 // the record delete, and the loser's classifying re-read reports released or
@@ -1592,7 +1592,7 @@ func mqttQ2AffSettleableRegister(rec *mqttInflightRecord, name *mqttInflightName
 // or a static run of them longer than the allowance would have its tail skipped on every
 // rotation.
 func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mqttInflightCandidate, []*mqttInflightMarkerCandidate, []*mqttPubRelCandidate, error) {
-	si, err := as.jsa.lookupStream(mqttInflightStreamName)
+	si, err := as.jsa.lookupStream(mqttSessStreamName)
 	if err != nil {
 		if isErrorOtherThan(err, JSStreamNotFoundErr) {
 			return nil, nil, nil, err
@@ -1632,7 +1632,7 @@ func (as *mqttAccountSessionManager) collectInflightCandidates(s *Server) ([]*mq
 			break
 		}
 		for seq := span[0]; seq <= span[1]; {
-			smsg, err := as.jsa.loadNextMsgFromSeq(mqttInflightStreamName, filter, seq)
+			smsg, err := as.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
 			if err != nil {
 				if isErrorOtherThan(err, JSNoMessageFoundErr) {
 					return nil, nil, nil, err
@@ -1808,7 +1808,7 @@ func mqttRegisterKindName(k mqttRegisterKind) string {
 	return "unobserved"
 }
 
-// inflightSweepStart returns this pass's starting sequence in $MQTT_inflight, seeded
+// inflightSweepStart returns this pass's starting sequence for the walk of the in-flight space, seeded
 // and advanced exactly as the inbound cursor is (qos2SweepStart), and scheduling
 // state only: every candidate is authoritatively revalidated before deletion.
 func (as *mqttAccountSessionManager) inflightSweepStart(firstSeq, lastSeq uint64) uint64 {

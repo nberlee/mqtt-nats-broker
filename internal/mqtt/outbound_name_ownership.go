@@ -283,7 +283,7 @@ func (jsa *mqttJSA) loadNameOwnership(id, epoch string, stream mqttOwnedStream, 
 // it); a corrupt or INDETERMINATE read is an error, never absence.
 func (jsa *mqttJSA) loadNameOwnershipPhysical(epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, uint64, error) {
 	subj := mqttNameOwnershipSubject(stream, name)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q could not be read: %w", name, stream, err)

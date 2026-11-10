@@ -143,7 +143,7 @@ func testRow2Ref(t *testing.T, e *testInflightEnv, subject string) (mqttInflight
 // testRow2Action loads the action record for (gen, lin, acq), or nil when there is none.
 func testRow2Action(t *testing.T, e *testInflightEnv, gen, lin string, acq uint64) *mqttOutboundAction {
 	t.Helper()
-	msg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttActionSubject(getHash(e.sess.id), gen, lin, acq))
+	msg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttActionSubject(getHash(e.sess.id), gen, lin, acq))
 	if err != nil || msg == nil {
 		return nil
 	}

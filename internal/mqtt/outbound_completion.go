@@ -205,7 +205,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 		out.exchanges = append(out.exchanges, x)
 
 		// Its actions, by the same rules.
-		asubs, awhole, aerr := as.jsa.streamSubjectsComplete(mqttInflightStreamName,
+		asubs, awhole, aerr := as.jsa.streamSubjectsComplete(mqttSessStreamName,
 			mqttActionWalkFilter(idHash, gen, toks[3]))
 		if aerr != nil {
 			if isErrorOtherThan(aerr, JSStreamNotFoundErr) {
@@ -228,7 +228,7 @@ func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, g
 				out.unreadableOther++
 				continue
 			}
-			amsg, alerr := as.jsa.loadLastMsgFor(mqttInflightStreamName, asubject)
+			amsg, alerr := as.jsa.loadLastMsgFor(mqttSessStreamName, asubject)
 			if alerr != nil {
 				if isErrorOtherThan(alerr, JSNoMessageFoundErr) {
 					return nil, fmt.Errorf("loading the outbound action on %q: %w", asubject, alerr)

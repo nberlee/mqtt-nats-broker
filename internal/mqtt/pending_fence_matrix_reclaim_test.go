@@ -140,7 +140,7 @@ func newT36Reclaim(t *testing.T, clientID string) *t36Reclaim {
 			r.issued++
 		}
 		r.mu.Unlock()
-		return e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+		return e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	}
 	e.asm.testInflightDelete = func(seq uint64) error {
 		r.mu.Lock()
@@ -158,7 +158,7 @@ func newT36Reclaim(t *testing.T, clientID string) *t36Reclaim {
 		if fail {
 			err = errors.New("test: the fence's delete failed")
 		} else {
-			err = e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+			err = e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 		}
 		if after != nil {
 			after(seq, err)
@@ -327,7 +327,7 @@ func t36Row18FiniteFailureFenceRetry(t *testing.T) {
 		if f {
 			return errors.New("test: the first disposal of the fence fails finitely")
 		}
-		return e.asm.jsa.deleteMsg(mqttInflightStreamName, seq, true)
+		return e.asm.jsa.deleteMsg(mqttSessStreamName, seq, true)
 	}
 	e.asm.mu.Unlock()
 

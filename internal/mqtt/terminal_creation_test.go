@@ -89,7 +89,7 @@ func TestUnitCTerminalCreationSurvivesRecoveryExit(t *testing.T) {
 			}
 			te.asm.testInflightEnumerate = func(filter string) (map[string]uint64, error) {
 				if filter != mqttInflightMarkerWalkFilter(te.sess.idHash, te.sess.gen) {
-					subjects, _, err := te.asm.jsa.streamSubjects(mqttInflightStreamName, filter)
+					subjects, _, err := te.asm.jsa.streamSubjects(mqttSessStreamName, filter)
 					return subjects, err
 				}
 				markerFailed = true

@@ -109,7 +109,7 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 	}
 	regSubj := mqttInflightSubject(idHash, gen, pi)
 	markerSubj := regSubj + "." + mqttInflightMarkerSuffix
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err != nil || smsg == nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, markerSubj); err != nil || smsg == nil {
 		restoreSend()
 		t.Fatalf("fixture: the unsent marker must survive an aborted send: msg=%v err=%v", smsg, err)
 	}
@@ -168,11 +168,11 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 		t.Fatalf("fixture: issue #102's reap must have released the entry (tracked=%v mapped=%v)",
 			stillTracked, stillMapped)
 	}
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); err != nil || smsg == nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); err != nil || smsg == nil {
 		sub.Close()
 		t.Fatalf("fixture: the durable register must survive that release: msg=%v err=%v", smsg, err)
 	}
-	if smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); err != nil || smsg == nil {
+	if smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, markerSubj); err != nil || smsg == nil {
 		sub.Close()
 		t.Fatalf("fixture: the marker must survive too, or the pair is not proven-unsent: msg=%v err=%v", smsg, err)
 	}
@@ -209,10 +209,10 @@ func TestMQTTInflightStrandedReservationOverADeletedConsumerIsReleased(t *testin
 	if charge != 0 {
 		t.Fatalf("the released exchange still charges Receive Maximum, got %d", charge)
 	}
-	if smsg, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, regSubj); smsg != nil {
+	if smsg, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); smsg != nil {
 		t.Fatal("the durable register survived the release")
 	}
-	if smsg, _ := asm.jsa.loadLastMsgFor(mqttInflightStreamName, markerSubj); smsg != nil {
+	if smsg, _ := asm.jsa.loadLastMsgFor(mqttSessStreamName, markerSubj); smsg != nil {
 		t.Fatal("the unsent marker survived the release")
 	}
 

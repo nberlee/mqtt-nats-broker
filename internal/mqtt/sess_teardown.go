@@ -37,7 +37,7 @@
 // generation, releases the record, and only then starts a fresh session with a fresh
 // generation and Session Present false. (Repeating them is safe for names nothing can
 // re-occupy; for the inbound QoS 2 hold walk it is bounded per walk, and for the
-// `$MQTT_inflight` reap it is bounded by that pass's own enumeration watermark — issue #38
+// in-flight reap it is bounded by that pass's own enumeration watermark — issue #38
 // replaced the unbounded purge that used to sit there. issue #66 and issue #38 state those two; do
 // not restate them here.) That also makes a crashed teardown
 // self-healing, which today leaks until the orphan sweep. A record the restore
@@ -83,7 +83,7 @@ type mqttSessTeardown struct {
 // here, and do not paraphrase the entitlement criterion — three review rounds were spent on
 // restatements of it that were a shade too strong.
 //
-// It extends to `$MQTT_inflight` too, since issue #38: the blind filter purge there was
+// It extends to `$MQTT.inflight.` too, since issue #38: the blind filter purge there was
 // replaced by an enumerate-load-classify-delete pass whose entitlement is its own
 // enumeration watermark, so a subject re-occupied since the enumeration is SPARED rather
 // than destroyed.
@@ -438,7 +438,7 @@ const (
 // a private version of the check before the stamp became the bundle's.
 //
 // Both partial-recreation directions this comment used to describe are now REFUSED
-// before any validator runs: the ten streams are one recreation unit, and an account
+// before any validator runs: the eight streams are one recreation unit, and an account
 // holding a proper subset fails the account-wide preflight
 // (mqttPreflightBrokerStreamBundle). In particular "$MQTT_teardown recreated alone
 // admits with no historical fences" was a stated residual and is no longer reachable
@@ -896,7 +896,7 @@ func (sess *mqttSession) secureQ2AffPubRelProofsCharged(t *mqttTeardownTarget, c
 // Tolerating "already gone" is not by itself what makes this repeatable. For the
 // inbound QoS 2 hold walk, which purges by subject and so can name a subject re-occupied
 // since the first run, what makes a second run safe is the bound each call carries (issue #66).
-// The `$MQTT_inflight` reap below carries the same kind of bound, since issue #38: its
+// The in-flight reap below carries the same kind of bound, since issue #38: its
 // entitlement is the watermark its own enumeration returned, and it deletes only records
 // at or below that, at exact sequences, after checking each occupant's identity.
 //
@@ -1002,7 +1002,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 		}
 	}
 
-	// Destroy this incarnation's OUTBOUND in-flight registers ($MQTT_inflight,
+	// Destroy this incarnation's OUTBOUND in-flight registers (the $MQTT.inflight. space,
 	// subject "$MQTT.inflight.<idHash>.<gen>.<PI>"). The session is being discarded,
 	// so every identifier it was holding is void: Spec5 [4.1] makes an unacknowledged
 	// outbound QoS 1/2 delivery session state, and a discard destroys it rather than
@@ -1162,7 +1162,7 @@ func (sess *mqttSession) releaseTeardown(tok recordTx, t *mqttTeardownTarget, no
 // classifying re-read reports released or superseded.
 //
 // The inbound QoS 2 hold walk carries a bound of its own, per walk, which is what makes a
-// repeat of it safe where naming alone would not have. The `$MQTT_inflight` reap beside it
+// repeat of it safe where naming alone would not have. The in-flight reap beside it
 // carries the same kind of bound since issue #38. "Idempotent" is still not claimed for either:
 // a repeat is SAFE, which is a weaker and sufficient statement. issue #66 states the first and
 // issue #38 the second; neither is restated here.

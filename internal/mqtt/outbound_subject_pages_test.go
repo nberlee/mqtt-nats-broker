@@ -178,7 +178,7 @@ func testPagesAdmit(t *testing.T, e *testOutboundEnv, txn string, pi uint16) (st
 // testPagesExchangePresent reports whether an exchange subject holds a record.
 func testPagesExchangePresent(t *testing.T, e *testOutboundEnv, gen, nonce string) bool {
 	t.Helper()
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, mqttExchangeSubject(getHash(e.id), gen, nonce))
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttExchangeSubject(getHash(e.id), gen, nonce))
 	if err != nil {
 		if ae := jsAPIError(err); ae != nil && IsNatsErr(ae, JSNoMessageFoundErr) {
 			return false
@@ -213,7 +213,7 @@ func TestExchangeWalkReadsEveryPage(t *testing.T) {
 	}
 	walkRefused := func(t *testing.T, s *testPageScript, what string, wantErr string, offsets ...int) {
 		t.Helper()
-		subs, complete, err := jsa.streamSubjectsComplete(mqttInflightStreamName, filter)
+		subs, complete, err := jsa.streamSubjectsComplete(mqttSessStreamName, filter)
 		switch {
 		case wantErr != _EMPTY_:
 			if err == nil || !strings.Contains(err.Error(), wantErr) {
@@ -332,7 +332,7 @@ func TestExchangeWalkReadsEveryPage(t *testing.T) {
 			pages[pg.off] = mqttSubjectPage{Subjects: m, Total: pg.total, Limit: limit, Offset: pg.off}
 		}
 		s := script(pages, nil)
-		got, complete, err := jsa.streamSubjectsComplete(mqttInflightStreamName, filter)
+		got, complete, err := jsa.streamSubjectsComplete(mqttSessStreamName, filter)
 		if err != nil || !complete {
 			t.Fatalf("(f): a shifted answer was refused: complete=%t err=%v", complete, err)
 		}
@@ -355,7 +355,7 @@ func TestExchangeWalkReadsEveryPage(t *testing.T) {
 	t.Run("g the all-zero empty first answer", func(t *testing.T) {
 		pages := map[int]mqttSubjectPage{0: {}}
 		s := script(pages, nil)
-		got, complete, err := jsa.streamSubjectsComplete(mqttInflightStreamName, filter)
+		got, complete, err := jsa.streamSubjectsComplete(mqttSessStreamName, filter)
 		if err != nil || !complete || len(got) != 0 {
 			t.Fatalf("(g): the empty answer gave %d subjects complete=%t err=%v, want complete and empty", len(got), complete, err)
 		}
@@ -488,7 +488,7 @@ func TestExchangeWalkPastTheServerPageSize(t *testing.T) {
 	t.Logf("seeded %d terminal exchanges in %v", seeded, time.Since(start))
 
 	// THE PAGE BOUNDARY, read back: the server's page size, and the seeds on page 1 versus later.
-	first, err := e.asm.jsa.streamSubjectsCompletePage(mqttInflightStreamName, filter, 0)
+	first, err := e.asm.jsa.streamSubjectsCompletePage(mqttSessStreamName, filter, 0)
 	if err != nil {
 		t.Fatalf("reading the first page: %v", err)
 	}
@@ -528,14 +528,14 @@ func TestExchangeWalkPastTheServerPageSize(t *testing.T) {
 	// planted record sits past the server's page boundary, where a subject walk would have had to
 	// reach it.
 	testPlantAdmittedDuty(t, &e.asm.jsa, e.id, e.epoch, gen, late)
-	first, err = e.asm.jsa.streamSubjectsCompletePage(mqttInflightStreamName, filter, 0)
+	first, err = e.asm.jsa.streamSubjectsCompletePage(mqttSessStreamName, filter, 0)
 	if err != nil {
 		t.Fatalf("re-reading the first page: %v", err)
 	}
 	if _, onFirst := first.Subjects[mqttExchangeSubject(idHash, gen, late)]; onFirst || first.Total != seeded+2 {
 		t.Fatalf("the outstanding exchange must be on a later page (on page 1=%t, total=%d)", onFirst, first.Total)
 	}
-	later, err := e.asm.jsa.streamSubjectsCompletePage(mqttInflightStreamName, filter, first.Limit)
+	later, err := e.asm.jsa.streamSubjectsCompletePage(mqttSessStreamName, filter, first.Limit)
 	if err != nil {
 		t.Fatalf("reading the later page: %v", err)
 	}

@@ -478,19 +478,24 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 		mqttAcceptSubjectPrefix + domainTk + ">",
 		mqttHandoffSubjectPrefix + domainTk + ">",
 		mqttTeardownReceiptSubjectPrefix + domainTk + ">",
+		mqttInflightStreamSubjectPrefix + ">",
+		mqttSharedLifecycleStreamSubjectPrefix + ">",
 	}, wantReplicas); err != nil {
 		return err
 	}
-	// The permanent CONNECT acceptance facts, and issue #107's permanent handoff outcomes,
-	// live on this stream so that an accepted CONNECT commits its record and both
-	// facts in one atomic batch. Without
-	// the capability the server rejects the batch headers outright, which would
-	// fail every CONNECT — and, worse, a stream that merely LOOKED right would
-	// leave the split-acceptance interval the fact exists to remove. It is a
-	// prerequisite of an operation this owner performs, so it belongs here rather
-	// than in the shared shape: no other broker-owned stream is written in a batch.
+	// Four operations this owner performs are atomic batches: an accepted CONNECT
+	// commits its record, its permanent acceptance fact and issue #107's handoff
+	// outcome together; a PUBLISH-phase in-flight register commits with its unsent
+	// marker (inflight_marker.go); every issue #107 authority transition commits
+	// its outcome with the authority; and a shared-group join commits the group
+	// record with the acquisition ledger (shared_lifecycle.go). Without the
+	// capability the server rejects the batch headers outright, which would fail
+	// every CONNECT — and, worse, a stream that merely LOOKED right would leave the
+	// split-acceptance interval the fact exists to remove. It is a prerequisite of
+	// operations this owner performs, so it belongs here rather than in the shared
+	// shape: no other broker-owned stream is written in a batch.
 	if !cfg.AllowAtomicPublish {
-		return fmt.Errorf("allow_atomic is not set: an accepted CONNECT commits the session record and its permanent acceptance fact in one atomic batch, which the stream would reject")
+		return fmt.Errorf("allow_atomic is not set: an accepted CONNECT, a PUBLISH-phase in-flight register, every outbound authority transition and a shared-group join are each committed in one atomic batch, which the stream would reject")
 	}
 	if cfg.Retention != LimitsPolicy {
 		return fmt.Errorf("retention is %v (want limits): nothing consumes a session record, so any other retention drops it immediately", cfg.Retention)
@@ -512,8 +517,11 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 		return fmt.Errorf("max_msg_size is %d (want unlimited): a record grows with subscriptions, drains and verdicts, and a cap would reject a save the protocol cannot skip", cfg.MaxMsgSize)
 	}
 	if cfg.DenyDelete {
-		return fmt.Errorf("deny_delete is set: it blocks the teardown release, permanently locking the client ID out")
+		return fmt.Errorf("deny_delete is set: it blocks the teardown release, permanently locking the client ID out, and the exact-sequence delete every terminal in-flight path performs")
 	}
+	// DenyPurge is deliberately NOT a prerequisite: nothing purges this stream. The
+	// in-flight reap deletes at exact sequences (issue #38), and the shared-group
+	// records are never removed.
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): a marker after the teardown delete would be read back as an unreadable record", cfg.SubjectDeleteMarkerTTL)
 	}

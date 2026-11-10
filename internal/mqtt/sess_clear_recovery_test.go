@@ -213,8 +213,8 @@ func TestMQTTExpiryKeepsHistoricalOutcomeOnANonSentinelFailure(t *testing.T) {
 	// Scoped to the session stream, so unrelated deletes (the in-flight registers) still
 	// work, and NOT a not-found error, which the release would read as already gone.
 	failed := false
-	restore := setMQTTTestDeleteMsgHook(func(stream string, _ uint64) error {
-		if stream != mqttSessStreamName {
+	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
+		if !testSessionFamily(stream, testSubjectAtSeq(&e.asm.jsa, stream, seq)) {
 			return nil
 		}
 		failed = true
@@ -265,8 +265,8 @@ func TestMQTTExpiryKeepsHistoricalOutcomeWhenAPostClaimFailureLeavesItUnresolved
 	e, _ := testExpiringEnv(t, "client-expiry-postclaim-uncertain", "expiry.postclaim.uncertain")
 
 	failed := false
-	restore := setMQTTTestDeleteMsgHook(func(stream string, _ uint64) error {
-		if stream != mqttSessStreamName {
+	restore := setMQTTTestDeleteMsgHook(func(stream string, seq uint64) error {
+		if !testSessionFamily(stream, testSubjectAtSeq(&e.asm.jsa, stream, seq)) {
 			return nil
 		}
 		if !failed {
@@ -564,7 +564,7 @@ func TestMQTTExpiryHoldsTheRecordFenceAcrossTheLoad(t *testing.T) {
 	// the SUBJECT is tested first, and only this session's own record load touches the flags.
 	recordSubject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.sess.idHash
 	restore := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if stream != mqttSessStreamName || subject != recordSubject || !watching || probed {
+		if !testSessionFamily(stream, subject) || subject != recordSubject || !watching || probed {
 			return nil
 		}
 		probed = true
@@ -648,7 +648,7 @@ func TestMQTTExpiryDecidesSupersededUnderTheSameTransaction(t *testing.T) {
 	txAtLoad := uint64(0)
 	loadSeen := false
 	restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if stream != mqttSessStreamName ||
+		if !testSessionFamily(stream, subject) ||
 			subject != mqttSessStreamSubjectPrefix+e.asm.domainTk+e.sess.idHash {
 			return nil
 		}

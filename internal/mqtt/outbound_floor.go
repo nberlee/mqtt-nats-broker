@@ -494,7 +494,7 @@ func (jsa *mqttJSA) checkFloorAdvance(a *mqttTransitionAttempt, extra []mqttTran
 	// EVERY RETIRED POSITION, re-decided against the store.
 	for ord := cur.Lo; ord < next.Lo; ord++ {
 		subj := mqttDutySubject(idHash, gen, ord)
-		smsg, rerr := jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+		smsg, rerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
 		if rerr != nil || smsg == nil {
 			return fmt.Errorf("transition %q retires position %d of generation %q, which could not be "+
 				"read: a position inside the inventory exists, and retiring one this broker cannot see "+
@@ -553,7 +553,7 @@ func (jsa *mqttJSA) checkFloorAdvance(a *mqttTransitionAttempt, extra []mqttTran
 			a.Txn, gen, next.Del, cur.Lo)
 	}
 	for ord := cur.Del; ord < next.Del; ord++ {
-		smsg, rerr := jsa.loadLastMsgFor(mqttInflightStreamName, mqttDutySubject(idHash, gen, ord))
+		smsg, rerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttDutySubject(idHash, gen, ord))
 		if rerr == nil && smsg != nil {
 			return fmt.Errorf("transition %q records position %d of generation %q deleted while its entry "+
 				"still stands", a.Txn, ord, gen)
@@ -613,7 +613,7 @@ func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint
 	end := min(led.Lo, led.Del+min(limit, mqttFloorBatchPositions))
 	for ord := led.Del; ord < end; ord++ {
 		dsubj := mqttDutySubject(idHash, gen, ord)
-		smsg, rerr := jsa.loadLastMsgFor(mqttInflightStreamName, dsubj)
+		smsg, rerr := jsa.loadLastMsgFor(mqttSessStreamName, dsubj)
 		if rerr != nil {
 			if isErrorOtherThan(rerr, JSNoMessageFoundErr) {
 				return true, fmt.Errorf("reading retired position %d of generation %q: %w", ord, gen, rerr)
@@ -631,8 +631,8 @@ func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint
 				return true, err
 			}
 		}
-		if err := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); err != nil {
-			if again, aerr := jsa.loadLastMsgFor(mqttInflightStreamName, dsubj); aerr == nil && again != nil {
+		if err := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
+			if again, aerr := jsa.loadLastMsgFor(mqttSessStreamName, dsubj); aerr == nil && again != nil {
 				return true, fmt.Errorf("deleting retired position %d of generation %q: %w", ord, gen, err)
 			} else if aerr != nil && isErrorOtherThan(aerr, JSNoMessageFoundErr) {
 				return true, fmt.Errorf("deleting retired position %d of generation %q was unresolved: %w",
@@ -656,15 +656,15 @@ func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint
 // deleteReclaimedExchange removes one reclaimed exchange record by the exact sequence it stands at.
 func (jsa *mqttJSA) deleteReclaimedExchange(id, epoch, gen, nonce string) error {
 	xsubj := mqttExchangeSubject(getHash(id), gen, nonce)
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, xsubj)
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, xsubj)
 	if err != nil {
 		if isErrorOtherThan(err, JSNoMessageFoundErr) {
 			return fmt.Errorf("reading reclaimed exchange %q of generation %q: %w", nonce, gen, err)
 		}
 		return nil
 	}
-	if derr := jsa.deleteMsg(mqttInflightStreamName, smsg.Sequence, true); derr != nil {
-		again, aerr := jsa.loadLastMsgFor(mqttInflightStreamName, xsubj)
+	if derr := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); derr != nil {
+		again, aerr := jsa.loadLastMsgFor(mqttSessStreamName, xsubj)
 		if aerr == nil && again != nil {
 			return fmt.Errorf("deleting reclaimed exchange %q of generation %q: %w", nonce, gen, derr)
 		}

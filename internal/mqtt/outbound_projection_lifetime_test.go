@@ -256,7 +256,7 @@ func testBreakDuty(t *testing.T, f *testWithdrawFix) (subject string, restore fu
 	t.Helper()
 	ord := testDutyOrdinalOf(t, f.e, f.gen, f.lin)
 	subject = mqttDutySubject(f.e.sess.idHash, f.gen, ord)
-	original, err := f.e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subject)
+	original, err := f.e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subject)
 	if err != nil || original == nil {
 		t.Fatalf("loading the duty: %v", err)
 	}

@@ -476,10 +476,15 @@ func TestMQTTv5PipelineFailurePreventedDoesNotHandOff(t *testing.T) {
 func TestMQTTv5PipelineFailureDisconnectIsTheLastFrame(t *testing.T) {
 	f := newHandoffFix(t, false, "holast", nil)
 	var unlocked, staged atomic.Int32
+	// The DISCONNECT's bytes are readable as soon as the write returns, before the writer
+	// reaches this hook, so the test waits for the hook to FINISH before it reads what the
+	// hook observed (the sibling linger test accommodates the same post-write window).
+	hookDone := make(chan struct{})
 	h := func(c *client) {
 		if !f.mine(c) || !f.failing.Load() || staged.Add(1) != 1 {
 			return
 		}
+		defer close(hookDone)
 		// THE ORACLE: the write lock is held across the write and the seal.
 		if c.wmu.TryLock() {
 			c.wmu.Unlock()
@@ -503,6 +508,10 @@ func TestMQTTv5PipelineFailureDisconnectIsTheLastFrame(t *testing.T) {
 	f.store.release()
 	if _, err := f.readDisconnect(); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-hookDone:
+	case <-time.After(10 * time.Second):
 	}
 	if staged.Load() == 0 {
 		t.Fatal("fixture: the failure's DISCONNECT was not a sealing write")

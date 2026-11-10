@@ -1507,11 +1507,13 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	var mu sync.Mutex
 	var armed, rewritten bool
 	var storeSeqs []uint64
+	var repairBases []uint64
 	restoreSave := setMQTTTestSessSaveHook(func(sess *mqttSession) error {
 		if sess.id != cid || !testReconcileIsRepairSave(sess, sid, oldDur) {
 			return nil
 		}
 		mu.Lock()
+		repairBases = append(repairBases, sess.seq)
 		if !armed {
 			armed = true
 			mqttTestSessStoreSuppressV.Store(true)
@@ -1566,19 +1568,25 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	mu.Lock()
 	sawRewrite := rewritten
 	seqs := append([]uint64(nil), storeSeqs...)
+	bases := append([]uint64(nil), repairBases...)
 	mu.Unlock()
 	if !sawRewrite {
 		t.Fatal("the 10164 injection never fired; the test proved nothing")
 	}
 	// Exactly two record writes landed for this session across the CONNECT: the
-	// accept save and the ONE retried repair save — the suppressed attempt
-	// stored nothing, so consecutive sequences prove the retry reused the same
-	// base.
+	// accept save and the ONE retried repair save. The suppressed attempt stored
+	// nothing: the repair was composed ONCE, conditioned on the accept save's own
+	// sequence, and its retry re-sent that frozen write, which landed, so the record
+	// subject's last sequence was still the accept save's when it did. The stream
+	// sequences are no longer consecutive, since the in-flight records share
+	// $MQTT_sess and the CONNECT's authority transitions interleave, so the proof is
+	// the landed write's expectation rather than adjacency.
 	if len(seqs) != 2 {
 		t.Fatalf("observed %d landed record writes (%v), want the accept save and exactly one repair save", len(seqs), seqs)
 	}
-	if seqs[1] != seqs[0]+1 {
-		t.Fatalf("the repair save landed at %d after the accept save at %d; something else wrote in between", seqs[1], seqs[0])
+	if len(bases) != 1 || bases[0] != seqs[0] {
+		t.Fatalf("the landed repair save was conditioned on %v, want the accept save's sequence %d: "+
+			"something else wrote the record in between", bases, seqs[0])
 	}
 	// The retried write's sequence was adopted, and the record it stored names
 	// the replacement.
@@ -1660,13 +1668,24 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	// applied only at the grant point, which a refused resume never reaches, so
 	// there is nothing else to write and nothing to put back.
 	//
-	// Counted in $MQTT_sess sequences. The CONNECT's accept save IS the outbound-ownership
-	// metadata commit (issue #107 cutover), so it consumes mqttAcceptOwnershipBatchSize of them: the
-	// permanent acceptance fact, the COMMITTED ownership receipt, and the session record, one
-	// atomic batch.
-	if recSeqAfter != recSeqBefore+mqttAcceptOwnershipBatchSize {
-		t.Fatalf("record advanced %d -> %d; want the accept save only (%d sequences)",
-			recSeqBefore, recSeqAfter, mqttAcceptOwnershipBatchSize)
+	// The CONNECT's accept save IS the outbound-ownership metadata commit (issue #107
+	// cutover): the permanent acceptance fact, the COMMITTED ownership receipt, and the
+	// session record, one atomic batch on consecutive sequences. So the record standing
+	// now is the accept save exactly when it sits mqttAcceptOwnershipBatchSize-1 above
+	// this CONNECT's acceptance fact. Raw stream distance no longer counts record
+	// writes: the in-flight records share $MQTT_sess and the CONNECT's authority
+	// transitions land beside the batch.
+	_, factSeqs := testFactsFor(t, asm, cid)
+	if len(factSeqs) == 0 {
+		t.Fatal("the refused CONNECT left no acceptance fact")
+	}
+	newest := factSeqs[0]
+	for _, f := range factSeqs {
+		newest = max(newest, f)
+	}
+	if newest <= recSeqBefore || recSeqAfter != newest+mqttAcceptOwnershipBatchSize-1 {
+		t.Fatalf("record advanced %d -> %d with the newest acceptance fact at %d; want the accept save only",
+			recSeqBefore, recSeqAfter, newest)
 	}
 	if ps.ExpiryInterval != mqttSessionNeverExpire || ps.Clean {
 		t.Fatalf("the restored record carries ExpiryInterval=%d Clean=%v, want the session's own persistent lifetime",
@@ -4152,7 +4171,7 @@ func TestMQTTReconcileCloseParksTeardownWhenResolverHoldsGate(t *testing.T) {
 	// retry, and signal once it is provably inside the gate.
 	inReadback := make(chan struct{}, 1)
 	restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-		if stream != mqttSessStreamName || !strings.Contains(subject, hash) {
+		if !testSessionFamily(stream, subject) || !strings.Contains(subject, hash) {
 			return nil
 		}
 		select {
@@ -4315,7 +4334,7 @@ func TestMQTTReconcileRepairClaimSurvivesContention(t *testing.T) {
 		}
 		if attempts.Add(1) == 1 {
 			subj := mqttOutboundAuthoritySubject(getHash(cid))
-			smsg, err := asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+			smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 			if err != nil || smsg == nil {
 				t.Errorf("reading the authority to contend on: %v", err)
 				return send()

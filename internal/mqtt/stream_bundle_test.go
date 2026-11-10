@@ -1,7 +1,7 @@
 // Shared fixtures for the broker-owned stream BUNDLE, and the unit tests for the
 // preflight that enforces it.
 //
-// Untagged on purpose: the ten streams are one recreation unit (issue #70), so
+// Untagged on purpose: the eight streams are one recreation unit (issue #70), so
 // every fixture that hand-builds broker-owned streams now needs these helpers,
 // and several of those fixtures live outside the mqtt_fulltests build.
 
@@ -53,7 +53,7 @@ func jsRawDeleteStream(t *testing.T, nc *nats.Conn, name string) {
 // ---------------------------------------------------------------------------
 // Bundle fixtures
 //
-// The ten broker-owned streams are ONE recreation unit and startup REFUSES a
+// The eight broker-owned streams are ONE recreation unit and startup REFUSES a
 // proper subset before any validator runs (mqttPreflightBrokerStreamBundle), so
 // a fixture that hand-creates one nonconforming stream no longer reaches the
 // validator it means to exercise — it is refused by the count rule instead.
@@ -68,7 +68,7 @@ func jsRawDeleteStream(t *testing.T, nc *nats.Conn, name string) {
 // test, and one needs several members replaced at once.
 // ---------------------------------------------------------------------------
 
-// testBundleConfigs returns the ten configurations the broker itself would
+// testBundleConfigs returns the eight configurations the broker itself would
 // create, in provisioning order, already stamped with one epoch. Built from the
 // production table so a stream added there appears here without being restated.
 func testBundleConfigs(t *testing.T, domainTk string, replicas int) []*StreamConfig {
@@ -88,7 +88,7 @@ func testBundleConfigs(t *testing.T, domainTk string, replicas int) []*StreamCon
 	return cfgs
 }
 
-// testCreateBundle creates all ten streams BY HAND under one epoch, applying
+// testCreateBundle creates all eight streams BY HAND under one epoch, applying
 // per-stream overrides. It is the only helper that can express a bundle the
 // broker would never create itself — TTL-less members, a poisoned member, or a
 // member carrying a foreign epoch — and it returns the epoch they share.
@@ -190,7 +190,7 @@ func testPresentInfo(name string) *StreamInfo {
 // "absent: [...]" segments.
 //
 // Parsing them rather than substring-matching the whole message is the point: the
-// refusal also lists all ten names as the streams to delete, so "the error
+// refusal also lists all eight names as the streams to delete, so "the error
 // mentions $MQTT_out" is true whatever the vector says. A mutation that emptied
 // both lists survived an assertion written that way.
 func testBundleRefusalLists(t *testing.T, err error) (present, absent []string) {
@@ -228,7 +228,7 @@ func TestBrokerStreamBundlePreflightCountRule(t *testing.T) {
 		}
 	})
 
-	t.Run("ten present admits", func(t *testing.T) {
+	t.Run("eight present admits", func(t *testing.T) {
 		st := &testBundleLookupStub{info: map[string]*StreamInfo{}}
 		for _, n := range names {
 			st.info[n] = testPresentInfo(n)
@@ -360,7 +360,7 @@ func TestBrokerStreamBundlePreflightUndecidedFailsClosed(t *testing.T) {
 				if !strings.Contains(err.Error(), n) {
 					t.Fatalf("the refusal must name the undecided stream %s: %v", n, err)
 				}
-				if strings.Contains(err.Error(), "of the 10 broker-owned streams") {
+				if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
 					t.Fatalf("%s was counted as ABSENT rather than undecided: %v", n, err)
 				}
 			})
@@ -391,7 +391,7 @@ func TestBrokerStreamBundlePreflightPresentWinsOverError(t *testing.T) {
 				st.err[n] = tc.err
 			}
 			if err := mqttPreflightBrokerStreamBundle(st, specs, 0, nil, nil); err != nil {
-				t.Fatalf("ten present-with-%s must admit: %v", tc.label, err)
+				t.Fatalf("eight present-with-%s must admit: %v", tc.label, err)
 			}
 		})
 	}
@@ -458,10 +458,10 @@ func TestValidateBundleEpochStamp(t *testing.T) {
 
 // The interleaving a concurrent first start produces, made deterministic: a peer
 // provisions the whole bundle in the middle of B's scan, right after B has seen
-// $MQTT_sess absent, so B's first scan returns nine-of-ten, a vector no one created.
+// $MQTT_sess absent, so B's first scan returns seven-of-eight, a vector no one created.
 //
 // B must not admit on that vector, must not repair it, and must not need a restart: it
-// rescans, read-only, and admits on a LATER scan that by itself returned all ten, then
+// rescans, read-only, and admits on a LATER scan that by itself returned all eight, then
 // adopts the peer's bundle and recovery epoch. Brokers started together reach this
 // schedule in practice (every pod of a clustered embedded deployment leaves its
 // JetStream wait at the same moment); the concurrent fixture elsewhere excludes it by
@@ -486,7 +486,7 @@ func TestBrokerStreamBundlePreflightRescansAnOverlappingProvisioning(t *testing.
 		fired = fired || fire
 		mu.Unlock()
 		if fire {
-			// The peer: provisions all ten, attributed here and not to B.
+			// The peer: provisions all eight, attributed here and not to B.
 			for _, cfg := range testBundleConfigs(t, _EMPTY_, 1) {
 				jsRawCreateStream(t, nc, cfg)
 			}
@@ -519,13 +519,13 @@ func TestBrokerStreamBundlePreflightRescansAnOverlappingProvisioning(t *testing.
 	}
 	for _, n := range names {
 		if n != mqttSessStreamName && !first[n] {
-			t.Fatalf("scan 0 returned %s absent, want the nine the peer had created present", n)
+			t.Fatalf("scan 0 returned %s absent, want the seven the peer had created present", n)
 		}
 	}
 	// 2 and 3. That scan did not admit: a fresh scan ran, looking up every member again,
-	// and the admitting (last) scan returned all ten present by itself.
+	// and the admitting (last) scan returned all eight present by itself.
 	if len(scans) < 2 {
-		t.Fatalf("%d scan(s) ran, want the nine-of-ten scan followed by at least one fresh scan", len(scans))
+		t.Fatalf("%d scan(s) ran, want the seven-of-eight scan followed by at least one fresh scan", len(scans))
 	}
 	last := scans[len(scans)-1]
 	if len(last) != len(names) {
@@ -611,7 +611,7 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 			testVector(names, func(i int) bool { return i != 0 }), all,
 		}}
 		if err := mqttPreflightBrokerStreamBundle(st, specs, budget, nil, nil); err != nil {
-			t.Fatalf("a rescan saw all ten and must admit: %v", err)
+			t.Fatalf("a rescan saw all eight and must admit: %v", err)
 		}
 		if st.scan < 1 {
 			t.Fatal("admitted without a second scan")

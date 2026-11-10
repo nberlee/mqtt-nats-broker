@@ -19,7 +19,7 @@ import "testing"
 //
 // testReadyForPubRelDelivery's world keeps the register in an in-memory map, which was enough
 // while PUBCOMP moved only the slot. An ORDINARY exchange's completion is now one authority batch
-// over the slot AND its exchange on $MQTT_inflight, and a map slot can never pair with a real
+// over the slot AND its exchange in the $MQTT.inflight. space, and a map slot can never pair with a real
 // exchange — so a test that asserts ordinary PUBCOMP, cleanup or admission behaviour seeds here
 // instead, through production: an authority-admitted delivery and the real PUBREC handler, which
 // records the intent on the slot and the exchange together, stores the canonical PUBREL, and

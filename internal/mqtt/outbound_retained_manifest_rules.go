@@ -313,7 +313,7 @@ func (jsa *mqttJSA) retainedMaterialNoLongerNeeded(a *mqttTransitionAttempt, r *
 // loadRetainedManifest reads one copy's manifest and the sequence it stands at. Absence is an
 // error: every caller is acting on a copy it was told exists.
 func (jsa *mqttJSA) loadRetainedManifest(id, epoch, gen, payload string) (*mqttRetainedManifest, uint64, error) {
-	smsg, err := jsa.loadLastMsgFor(mqttInflightStreamName, mqttManifestSubject(getHash(id), gen, payload))
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, mqttManifestSubject(getHash(id), gen, payload))
 	if err != nil {
 		if !mqttStoreAnswered(err) {
 			err = fmt.Errorf("%w: %w", errMQTTStoreUnreadable, err)

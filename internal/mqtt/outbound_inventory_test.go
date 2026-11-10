@@ -162,7 +162,7 @@ func testDutyMember(t *testing.T, e *testOutboundEnv, expect uint64, d *mqttDuty
 func testPlantDuty(t *testing.T, e *testOutboundEnv, d *mqttDutyEntry) {
 	t.Helper()
 	subj := mqttDutySubject(getHash(e.id), testGen, d.Ord)
-	cur, cerr := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	cur, cerr := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if cerr != nil || cur == nil {
 		t.Fatalf("reading duty %d before planting over it: %v", d.Ord, cerr)
 	}
@@ -222,7 +222,7 @@ func testCompleteCleanupAt(t *testing.T, e *testOutboundEnv, gen, inc string, or
 func testLoadDutyIfAny(t *testing.T, e *testOutboundEnv, ord uint64) (*mqttDutyEntry, uint64) {
 	t.Helper()
 	subj := mqttDutySubject(getHash(e.id), testGen, ord)
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil || smsg == nil {
 		return nil, 0
 	}
@@ -237,7 +237,7 @@ func testLoadDutyIfAny(t *testing.T, e *testOutboundEnv, ord uint64) (*mqttDutyE
 func testLoadDuty(t *testing.T, e *testOutboundEnv, ord uint64) (*mqttDutyEntry, uint64) {
 	t.Helper()
 	subj := mqttDutySubject(getHash(e.id), testGen, ord)
-	smsg, err := e.asm.jsa.loadLastMsgFor(mqttInflightStreamName, subj)
+	smsg, err := e.asm.jsa.loadLastMsgFor(mqttSessStreamName, subj)
 	if err != nil || smsg == nil {
 		t.Fatalf("reading duty %d: %v", ord, err)
 	}
