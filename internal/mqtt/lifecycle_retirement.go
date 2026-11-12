@@ -272,37 +272,7 @@ func (as *mqttAccountSessionManager) sweepLifecycles(s *Server) {
 				as.jsa.c.Debugf("MQTT: %v", err)
 			}
 		}
-		for _, o := range a.Life.Outstanding {
-			gen, gerr := mqttGenToken(a.Life.L, o.Ord)
-			if gerr != nil {
-				continue
-			}
-			if o.Phase == mqttOutstandingOpen && o.Teardown.Pending {
-				// A RELEASE THAT DID NOT LAND (plan 5.2): the record was deleted and the
-				// authority-only half failed or never ran. The record's absence and the positive
-				// entry are the whole licence; a record that still stands is its adopter's.
-				if !as.teardownRecordAbsent(id) {
-					continue
-				}
-				if err := as.releaseTeardownEntry(id, gen, o.Teardown.Nonce, admit); err != nil {
-					if as.jsa.c != nil {
-						as.jsa.c.Debugf("MQTT: recording the release of generation %q of %q: %v", gen, id, err)
-					}
-					continue
-				}
-			}
-			if as.testHoldGenerationRetirement.Load() {
-				continue
-			}
-			if err := as.jsa.retireGeneration(id, epoch, gen, admit); err != nil &&
-				!errors.Is(err, errMQTTGenerationNotRetirable) && as.jsa.c != nil {
-				as.jsa.c.Debugf("MQTT: retiring generation %q of %q: %v", gen, id, err)
-			}
-		}
-		if err := as.jsa.retireLifecycle(id, epoch, admit); err != nil &&
-			!errors.Is(err, errMQTTLifecycleNotRetirable) && as.jsa.c != nil {
-			as.jsa.c.Debugf("MQTT: retiring the lifecycle of %q: %v", id, err)
-		}
+		as.driveLifecycleRetirement(id, epoch, a, admit, true)
 		return nil
 	})
 	if walkErr != nil && as.jsa.c != nil {
@@ -321,4 +291,108 @@ func (as *mqttAccountSessionManager) sweepLifecycles(s *Server) {
 			}
 		}
 	}
+}
+
+// driveLifecycleRetirement takes client id's lifecycle as far toward retirement as its finished
+// work allows, from the authority a as read: a teardown release whose record is gone but whose
+// authority half never landed is recorded, every outstanding generation whose work is done is
+// retired, and the lifecycle itself once nothing is left. admit is asked before every authority
+// attempt. The lifecycle sweep runs it for every authority; a landed release kicks it for its
+// client (kickLifecycleRetirement), so a burst of reconnects does not wait for the sweep.
+//
+// wholeLifecycle is the sweep's alone: fencing a whole lifecycle refuses every CONNECT of the
+// client until the registry entry completes, which is right for a client long gone and wrong
+// right after an ordinary disconnect, when the prompt drive runs and the client may reconnect at
+// once. The prompt drive reclaims generations only.
+func (as *mqttAccountSessionManager) driveLifecycleRetirement(id, epoch string, a *mqttOutboundAuthority, admit func() bool, wholeLifecycle bool) {
+	for _, o := range a.Life.Outstanding {
+		gen, gerr := mqttGenToken(a.Life.L, o.Ord)
+		if gerr != nil {
+			continue
+		}
+		if o.Phase == mqttOutstandingOpen && o.Teardown.Pending {
+			// A RELEASE THAT DID NOT LAND (plan 5.2): the record was deleted and the
+			// authority-only half failed or never ran. The record's absence and the positive
+			// entry are the whole licence; a record that still stands is its adopter's.
+			if !as.teardownRecordAbsent(id) {
+				continue
+			}
+			if err := as.releaseTeardownEntry(id, gen, o.Teardown.Nonce, admit); err != nil {
+				if as.jsa.c != nil {
+					as.jsa.c.Debugf("MQTT: recording the release of generation %q of %q: %v", gen, id, err)
+				}
+				continue
+			}
+		}
+		if as.testHoldGenerationRetirement.Load() {
+			continue
+		}
+		if err := as.jsa.retireGeneration(id, epoch, gen, admit); err != nil &&
+			!errors.Is(err, errMQTTGenerationNotRetirable) && as.jsa.c != nil {
+			as.jsa.c.Debugf("MQTT: retiring generation %q of %q: %v", gen, id, err)
+		}
+	}
+	if !wholeLifecycle {
+		return
+	}
+	if err := as.jsa.retireLifecycle(id, epoch, admit); err != nil &&
+		!errors.Is(err, errMQTTLifecycleNotRetirable) && as.jsa.c != nil {
+		as.jsa.c.Debugf("MQTT: retiring the lifecycle of %q: %v", id, err)
+	}
+}
+
+// kickLifecycleRetirement asks for one drive of client id's lifecycle retirement, off the
+// caller's path. It is single-flight per client: a kick arriving while a drive runs asks for
+// one more. A release that lands while its generation's recovery visit has already found it
+// pending (and the reopen and displacement acceptances, which discharge pending releases in
+// their own batch) would otherwise leave every such generation outstanding until the sweep, and
+// a client reconnecting faster than that fills its generation slots and is refused.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) kickLifecycleRetirement(id string) {
+	if as == nil || id == _EMPTY_ {
+		return
+	}
+	as.mu.Lock()
+	if as.lifecycleKicks == nil {
+		as.lifecycleKicks = make(map[string]bool)
+	}
+	if _, running := as.lifecycleKicks[id]; running {
+		as.lifecycleKicks[id] = true
+		as.mu.Unlock()
+		return
+	}
+	as.lifecycleKicks[id] = false
+	as.mu.Unlock()
+	go as.runLifecycleKick(id)
+}
+
+// runLifecycleKick runs client id's lifecycle drive until no kick is owed. A registered actor
+// for each drive, it waits for the client's announced foreground work to clear before every
+// authority attempt, so the CONNECT whose acceptance kicked it finishes first.
+func (as *mqttAccountSessionManager) runLifecycleKick(id string) {
+	for {
+		as.runLifecycleKickOnce(id)
+		as.mu.Lock()
+		if again := as.lifecycleKicks[id]; !again {
+			delete(as.lifecycleKicks, id)
+			as.mu.Unlock()
+			return
+		}
+		as.lifecycleKicks[id] = false
+		as.mu.Unlock()
+	}
+}
+
+func (as *mqttAccountSessionManager) runLifecycleKickOnce(id string) {
+	deregister := as.registerForegroundActor(id)
+	defer deregister()
+	quit := as.jsa.quitCh
+	admit := func() bool { return as.admitForegroundOrWait(id, quit) }
+	epoch := as.sessStreamEpoch
+	al := as.jsa.loadOutboundAuthority(id, epoch)
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Life == nil {
+		return
+	}
+	as.driveLifecycleRetirement(id, epoch, al.rec, admit, false)
 }

@@ -253,6 +253,18 @@ var mqttTestDrainRetirementUnlockedHookV atomic.Pointer[func(durable string)]
 // Atomic for the same reason as the save hook above.
 var mqttTestDrainRestorePreInstallHookV atomic.Pointer[func(durable string)]
 
+// mqttTestTeardownClaimPointV runs at two points of a teardown claim, with the client id:
+// "before-announce", after the first composition and before the claim announces itself, and
+// "before-send", before every attempt's send. The windows a background authority write
+// admitted before, or around, the announcement invalidates. Nil in production.
+var mqttTestTeardownClaimPointV atomic.Pointer[func(id, point string)]
+
+func mqttTeardownClaimPoint(id, point string) {
+	if h := mqttTestTeardownClaimPointV.Load(); h != nil {
+		(*h)(id, point)
+	}
+}
+
 // Test hook: when set, it is invoked after a teardown claim is CONFIRMED and
 // before the first deletion — the exact window a nonce re-check cannot close,
 // where a paused broker can let a peer finish the whole teardown and create a

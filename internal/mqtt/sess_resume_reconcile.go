@@ -179,7 +179,7 @@ type mqttReconcileEntry struct {
 
 // mqttRepairSaveAttempts bounds the re-read/retry of a repair save rejected by
 // clustered contention (10164), which is a rejection but NOT evidence that the
-// record moved — the same posture as mqttTeardownClaimAttempts. Exhausting it
+// record moved. Exhausting it
 // with the base sequence still unchanged is a local-definite failure: the phase
 // undoes its work and the client reconnects.
 const mqttRepairSaveAttempts = 3

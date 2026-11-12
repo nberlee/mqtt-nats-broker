@@ -312,3 +312,84 @@ func TestAnOwedWillAnchorHoldsItsLifecycle(t *testing.T) {
 		return nil
 	})
 }
+
+// A client reconnecting faster than the lifecycle sweep runs never fills its generation slots
+// (issue #133): a generation whose recovery visit certified it while its teardown release was
+// still pending (or whose release a reopen discharged) is retired by the drive the landed release
+// kicks, not left outstanding until the sweep. Forty clean-session connections in a row, more
+// than the 32 slots, each reconnecting as soon as its predecessor is certified, are all accepted
+// with no sweep running. Mutation: the release and reopen kicks removed (the 33rd outstanding
+// generation refuses the CONNECT).
+func TestAReconnectBurstDoesNotFillTheGenerationSlots(t *testing.T) {
+	o := testMQTTDefaultOptionsV5()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	asm := testMQTTGetGlobalASM(t, s)
+	const id = "reconnect-burst"
+	for i := 0; i < mqttMaxGenerationSlots+8; i++ {
+		c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: id, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
+		if _, rc, _ := testMQTTReadConnAckV5(t, r); rc != mqttConnAckRCConnectionAccepted {
+			t.Fatalf("clean-session connection %d was answered %#x", i, rc)
+		}
+		gen := testSessionGenOf(t, s, id)
+		testMQTTSubV5(t, c, r, 1, []mqttV5SubFilter{{topic: "burst/topic", opts: 2}})
+		testMQTTDisconnect(t, c, nil)
+		c.Close()
+		// Its recovery certifies it (HEAD's work); retiring it, which purges the certificate,
+		// is what this pins.
+		checkFor(t, 10*time.Second, 10*time.Millisecond, func() error {
+			if st, _ := asm.genStanding(id, gen); st == mqttGenRetired {
+				return nil
+			}
+			if cert, err := asm.jsa.loadGenCompletionCert(id, asm.sessStreamEpoch, gen); err != nil || cert == nil {
+				st, ent := asm.genStanding(id, gen)
+				return fmt.Errorf("generation %q of connection %d is neither certified nor retired (%v) standing=%v entry=%+v", gen, i, err, st, ent)
+			}
+			return nil
+		})
+	}
+}
+
+// The prompt lifecycle drive reclaims generations only (issue #133): after an ordinary clean
+// disconnect it retires the generation, but never fences the whole lifecycle, which would refuse
+// a reconnect arriving before the registry entry completes. The lifecycle stays active and the
+// client reconnects at once. Mutation: the kick driving the whole lifecycle (it fences and the
+// registry reads retiring, or the reconnect is refused).
+func TestAPromptRetirementNeverFencesTheLifecycle(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	asm := testMQTTGetGlobalASM(t, s)
+	const id = "prompt-no-fence"
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	al := asm.jsa.loadOutboundAuthority(id, asm.sessStreamEpoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("fixture: the authority reads %v", al.status)
+	}
+	l := al.rec.Life.L
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+	// The kicked drive retires the closed generation with no sweep running.
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		al := asm.jsa.loadOutboundAuthority(id, asm.sessStreamEpoch)
+		if al.status != mqttOutboundValid || len(al.rec.Life.Outstanding) != 0 {
+			return fmt.Errorf("the closed generation is not retired yet (%v)", al.status)
+		}
+		return nil
+	})
+	// AND THE LIFECYCLE IS NEVER FENCED by it.
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		al := asm.jsa.loadOutboundAuthority(id, asm.sessStreamEpoch)
+		if al.status != mqttOutboundValid || al.rec.Life.Phase == mqttLifecycleRetiring {
+			t.Fatalf("the prompt drive fenced the lifecycle (%v)", al.status)
+		}
+		reg := asm.jsa.loadLifecycleRegistryShard(asm.sessStreamEpoch, mqttLifecycleRegistryShardFor(getHash(id)))
+		if reg.status != mqttOutboundValid || reg.rec.classify(getHash(id), l) != mqttLifecycleActive {
+			t.Fatalf("the prompt drive moved lifecycle %d out of the registry's active set", l)
+		}
+	}
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
+}

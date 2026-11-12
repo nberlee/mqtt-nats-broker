@@ -508,6 +508,7 @@ var fgCensusBackgroundRoots = map[string]string{
 	"discardOwedDelayedWills":   "shutdown's last delayed-Will pass",
 	"sweepAcqReleaseVerdicts":   "the shared-verdict sweep, on the account ticker",
 	"runVerdictKick":            "a session's prompt verdict execution, off the connection's path",
+	"runLifecycleKick":          "a client's prompt lifecycle drive after a landed release or a reopen",
 }
 
 // fgCensusWalkResolutions narrow one call edge of the by-name walk to the receiver type the call
@@ -616,6 +617,9 @@ var fgCensusBackgroundAdmissions = map[string]fgCensusAdmissionSite{
 	"shared_verdict_kick.go:(mqttSession).executeDurableVerdicts": {
 		admission:    "admit := func() bool { return as.admitForegroundOrWait(id, quit) }",
 		registration: []string{"deregister := as.registerForegroundActor(id)", "defer deregister()"}},
+	"lifecycle_retirement.go:(mqttAccountSessionManager).runLifecycleKickOnce": {
+		admission:    "admit := func() bool { return as.admitForegroundOrWait(id, quit) }",
+		registration: []string{"deregister := as.registerForegroundActor(id)", "defer deregister()"}},
 	"will_anchor_ops.go:(mqttAccountSessionManager).runBackgroundAnchorTransition": {
 		admission:    "admit := func() bool { _, _, idle := as.admitForegroundOrIdle(clientID) return idle == nil }",
 		registration: []string{"deregister := as.registerForegroundActor(clientID)", "defer deregister()"}},
@@ -673,6 +677,7 @@ var fgCensusAdmitParams = map[string]int{
 	"executeSharedRelease":       4,
 	"releaseSealedAcquisitions":  4,
 	"fenceSharedRelease":         3,
+	"driveLifecycleRetirement":   3,
 }
 
 // fgCensusAdmitForwarders are the functions that hand on an admission they were handed.
@@ -681,6 +686,7 @@ var fgCensusAdmitForwarders = map[string]bool{
 	"publishAffineReadiness":     true,
 	"deleteRetiredPositionsStep": true,
 	"releaseSealedAcquisitions":  true,
+	"driveLifecycleRetirement":   true,
 }
 
 // fgCensusUnadmittedCalls are the calls of a dual-use helper that pass no admission, "caller ->

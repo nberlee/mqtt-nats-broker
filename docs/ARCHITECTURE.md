@@ -10197,6 +10197,23 @@ nothing is left; then it reads all 64 registry shards and completes every entry 
 left retiring. Each authority write it makes is admitted only while the client has no
 announced foreground work (`admitForegroundOrIdle`); a refused one waits for the next pass.
 
+**The lifecycle drive is also kicked** (`kickLifecycleRetirement`), because the sweep runs
+every 15 minutes and a generation can finish its work with no other prompt driver: its
+recovery visit certifies it and deletes its root while its teardown release is still
+pending, finds it not yet retirable, and does not come back; and a reopen or displacement
+acceptance discharges earlier generations' pending releases in its own batch. A client
+reconnecting faster than the sweep runs (a test suite, a flapping device) would fill its
+32 generation slots that way and have every further CONNECT refused. So a landed teardown
+release and a landed reopen or displacement each kick one drive of that client's lifecycle,
+the sweep's per-client body (`driveLifecycleRetirement`) without the abandonment and
+without the lifecycle's own retirement, which stays the sweep's: fencing a whole lifecycle
+refuses the client's CONNECTs until its registry entry completes, right for a client long
+gone and wrong right after an ordinary disconnect. The drive is single-flight per client,
+a registered actor that waits for the client's announced foreground work to clear before
+every authority attempt (`admitForegroundOrWait`), so the CONNECT that kicked it finishes
+first. An acceptance that would still exceed the slots is
+refused at composition, with its reason.
+
 ### The shared acquisition ledger is lazy
 
 A generation's shared ledger `shl.<idHash>.<g>` exists only once the generation acquired
@@ -14094,7 +14111,8 @@ whose retirement it performs. A foreground operation (the SUBSCRIBE's name claim
 PUBREC, PUBACK and PUBCOMP advances, the ordinary and shared delivery admission
 ladder, [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114), and the
 CONNECT's acceptance and its bind, which a generation's retirement would otherwise outrun
-on every attempt, [issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)) ANNOUNCES
+on every attempt, and the connection's own teardown claim,
+[issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)) ANNOUNCES
 itself before its first relevant read and stays announced across every attempt; every
 background authority-transition ATTEMPT is admitted on its own and is granted only while
 nothing is announced (`outbound_foreground_priority.go`).
@@ -14119,7 +14137,7 @@ periodic, for the visit, the lifecycle sweep and the shared-verdict sweep for ea
 they visit, the verdict kick for its pass (it waits for an announcement to clear rather than
 being refused, since the PUBACK that ends a dependant both announces and kicks it), and each
 background Will-anchor transition (the removal loop, the outbox scan's discharge, shutdown's
-last removal) for the transition (issue #133).
+last removal) for the transition, and the kicked lifecycle drive for its pass (issue #133).
 An announcement snapshots the registered actors as
 its ALLOWANCE and returns a handle carrying it. An attempt admitted just before an
 announcement may still commit, each actor is single-flight and holds at most one admitted
@@ -14145,11 +14163,12 @@ Budgets are DERIVED from the allowance. Every announced loop on
 `mqttForegroundAcquireAttempts` (6) or `mqttSubscribeClaimAttempts` (8) runs
 `handle.budget(base) = max(base, allowance + base - mqttBackgroundAuthorityWriters)`:
 never fewer attempts than the base, and always the margin over the allowance that the base
-had over the five session workers (1 for the acquisition loops and the CONNECT's acceptance
-and bind, 3 for the claims). The acceptance and the bind charge by cause: a recomposition
-after the authority moved is contention and draws only on that budget and the ownership
-deadline; a re-send of an unchanged batch charges the CONNECT's re-attempt allowance, and
-a moved session record returns to the CONNECT's own restore cycles. A loop
+had over the five session workers (1 for the acquisition loops, the CONNECT's acceptance
+and bind and the teardown claim, 3 for the claims). The acceptance and the bind charge by
+cause: a recomposition after the authority moved is contention and draws only on that
+budget and the ownership deadline; a re-send of an unchanged batch charges the CONNECT's
+re-attempt allowance, and a moved session record returns to the CONNECT's own restore
+cycles. A loop
 that receives its budget from its caller takes the handle as a parameter;
 `bounded_reattempt_census_test.go` refuses a raw base budget anywhere in a function body
 and a handle that was neither announced in the function nor handed in by such a caller.

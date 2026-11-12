@@ -151,6 +151,7 @@ func (sess *mqttSession) acceptOwnership(tok recordTx, clientID, sessEpoch strin
 		}
 		detail, serr := sess.saveAcceptShape(jsa, tok, clientID, sessEpoch, ca.T)
 		if serr == nil {
+			sess.kickRetirementAfterAcceptance(ca.T)
 			return ca.Gen, r.Tenure, r.Nonce, ref, nil
 		}
 		landed, retry, rerr := sess.resolveAcceptance(jsa, detail, r.Nonce, retryOK, stepAllow)
@@ -158,6 +159,7 @@ func (sess *mqttSession) acceptOwnership(tok recordTx, clientID, sessEpoch strin
 		case rerr != nil:
 			return _EMPTY_, _EMPTY_, _EMPTY_, nil, rerr
 		case landed:
+			sess.kickRetirementAfterAcceptance(ca.T)
 			return ca.Gen, r.Tenure, r.Nonce, ref, nil
 		case !retry:
 			return _EMPTY_, _EMPTY_, _EMPTY_, nil, serr
@@ -324,4 +326,18 @@ func (jsa *mqttJSA) observeAcceptanceCommit(phase mqttAcceptStorePhase, batchID 
 		obs.RecptDigest = mqttRecordDigest(body)
 	}
 	return (*h)(obs)
+}
+
+// kickRetirementAfterAcceptance kicks the client's lifecycle drive after a reopen or a
+// displacement landed: both discharge the pending releases of earlier generations in their own
+// batch, and a generation whose recovery visit already found its release pending has no other
+// prompt driver.
+func (sess *mqttSession) kickRetirementAfterAcceptance(t *mqttAuthorityTransition) {
+	if sess.asm == nil || t == nil || t.Attempt == nil {
+		return
+	}
+	switch t.Attempt.Kind {
+	case mqttTransitionAcceptReopen, mqttTransitionAcceptDisplace:
+		sess.asm.kickLifecycleRetirement(sess.id)
+	}
 }

@@ -174,6 +174,9 @@ type mqttAccountSessionManager struct {
 	// with anchorRemovalsRunning admitting one retry loop.
 	anchorRemovals        map[mqttAnchorRemoval]struct{}
 	anchorRemovalsRunning bool
+	// lifecycleKicks are the clients whose lifecycle drive runs now (kickLifecycleRetirement),
+	// each true when one more drive is owed. Guarded by mu.
+	lifecycleKicks map[string]bool
 	// willAheadCursor is where the next early-cancellation phase resumes in this
 	// account's not-yet-due pending Wills. The phase is budgeted, so without a cursor
 	// a large enough backlog would re-examine the same first records every pass and

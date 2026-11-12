@@ -58,6 +58,10 @@ type reattemptRow struct {
 }
 
 var reattemptCensus = map[string]reattemptRow{
+	"sess_teardown.go:(mqttSession).claimTeardown": {store: 0, fg: 2, fors: []string{"attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++"}, budgets: nil,
+		class:     "FG-AUTHORITY: the connection's own teardown claim, announced; a recomposition follows authority-only movement (contention), the frozen batch is re-sent while the authority stands",
+		exhausted: "the admitted background writers cannot exhaust it; persistent contention from elsewhere returns the claim indeterminate, which its caller handles as any unresolved claim",
+		done:      "CONVERTED (issue #133): it was a fixed three attempts with one recomposition"},
 	"accept_drive.go:(mqttSession).acceptOwnership": {store: 0, fg: 2, fors: []string{"attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++"}, budgets: nil,
 		class:     "FG-AUTHORITY: the CONNECT's acceptance batch, announced; a recomposition follows only an authority-only stale CAS (contention), charged to the derived budget and the ownership deadline",
 		exhausted: "the admitted background writers cannot exhaust it; persistent contention from elsewhere refuses the CONNECT (0x83) and the client reconnects; a re-send of an unchanged batch charges stepAllow, a moved record returns to the CONNECT's restore cycles",

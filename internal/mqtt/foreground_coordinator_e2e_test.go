@@ -271,6 +271,9 @@ func testPriorGenerationRecoveryYields(t *testing.T, id string, periodic bool) {
 	}
 	old := testMQTTResidentSession(t, s, id)
 	as := old.asm
+	// The test waits for the previous generation's completion certificate, which the
+	// generation's retirement (issue #133) would purge once it certifies.
+	as.testHoldGenerationRetirement.Store(true)
 	old.mu.Lock()
 	oldGen := old.gen
 	old.mu.Unlock()

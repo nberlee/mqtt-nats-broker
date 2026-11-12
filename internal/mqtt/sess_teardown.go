@@ -161,11 +161,6 @@ func (r mqttTeardownRelease) String() string {
 // CONNECT at all) finishes — never a silent leak.
 const mqttTeardownReleaseAttempts = 3
 
-// mqttTeardownClaimAttempts bounds the retry of a claim rejected by transient
-// clustered contention (10164), which is a rejection but NOT evidence that the
-// subject moved.
-const mqttTeardownClaimAttempts = 3
-
 // mqttTeardownClaim is how a claim attempt ended.
 type mqttTeardownClaim int
 
@@ -270,9 +265,35 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 			fmt.Errorf("unable to compose the teardown claim of session %q: %w", ps.ID, cerr)
 	}
 
+	// THE CLAIM IS FOREGROUND AUTHORITY WORK (issue #133): it is the connection's own close, and
+	// the background writers of the client's authority (a generation's retirement, the lifecycle
+	// drive, anchor removals) would otherwise outrun its recomposition. Announced, it loses at
+	// most the attempts admitted before it, which its derived budget outlasts.
+	mqttTeardownClaimPoint(ps.ID, "before-announce")
+	fg := sess.announceForegroundAuthority()
+	defer fg.release()
+	// THE FIRST ATTEMPT IS COMPOSED AGAINST A READ TAKEN UNDER THE ANNOUNCEMENT. The authority
+	// above was read before it (prepareClear), so a background write admitted in between would
+	// spend an attempt the allowance sampled here does not count: re-read, and recompose against
+	// what stands, with the same supersession rules as a recomposition below.
+	if fresh := sess.jsa.loadOutboundAuthority(ps.ID, sess.asm.sessStreamEpoch); fresh.seq != t.PrevSeq {
+		switch {
+		case fresh.status != mqttOutboundValid || fresh.rec == nil:
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to claim the teardown of session %q: its authority reads %v", ps.ID, fresh.status)
+		case fresh.rec.State != mqttAuthorityServing || fresh.rec.Gen != ret.Gen ||
+			fresh.rec.Tenure != ret.Tenure || fresh.rec.OwnerTxn != ret.OwnerTxn:
+			return 0, nonce, mqttTeardownClaimSuperseded, nil
+		}
+		req.Prev, req.PrevSeq, req.Txn = fresh.rec, fresh.seq, mqttNewInflightNonce()
+		if t, cerr = sess.jsa.composeTeardownClaim(req); cerr != nil {
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to recompose the teardown claim of session %q: %w", ps.ID, cerr)
+		}
+	}
 	var lastErr error
-	recomposed := false
-	for attempt := 0; attempt < mqttTeardownClaimAttempts; attempt++ {
+	for attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++ {
+		mqttTeardownClaimPoint(ps.ID, "before-send")
 		authSeq, err := sess.jsa.commitAuthorityTransition(t)
 		if err == nil {
 			// The marker commits the batch directly after the authority.
@@ -314,16 +335,13 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 		case fresh.seq == t.PrevSeq:
 			// Contention, or our own batch still in process: the same frozen batch.
 			continue
-		case recomposed:
-			return 0, nonce, mqttTeardownClaimIndeterminate,
-				fmt.Errorf("the authority of session %q moved again under a recomposed teardown claim", ps.ID)
 		case fresh.rec.State != mqttAuthorityServing || fresh.rec.Gen != ret.Gen ||
 			fresh.rec.Tenure != ret.Tenure || fresh.rec.OwnerTxn != ret.OwnerTxn:
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		}
-		// Authority-only movement: the frozen batch can never land. Recompose once against the
-		// fresh authority, under a new transition, revalidating the generation and the caps.
-		recomposed = true
+		// Authority-only movement: the frozen batch can never land. Recompose against the fresh
+		// authority, under a new transition, revalidating the generation and the caps; each such
+		// movement is a pre-admitted background write, which the budget outlasts.
 		req.Prev, req.PrevSeq, req.Txn = fresh.rec, fresh.seq, mqttNewInflightNonce()
 		if t, cerr = sess.jsa.composeTeardownClaim(req); cerr != nil {
 			return 0, nonce, mqttTeardownClaimIndeterminate,
@@ -332,7 +350,7 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 	}
 	return 0, nonce, mqttTeardownClaimIndeterminate,
 		fmt.Errorf("unable to claim the teardown of session %q at sequence %v after %d attempts: %w",
-			ps.ID, seq, mqttTeardownClaimAttempts, lastErr)
+			ps.ID, seq, fg.budget(mqttForegroundAcquireAttempts), lastErr)
 }
 
 // secureQ2AffPubRelProofs records the PUBREC proof carried by every stored PUBREL of the
@@ -697,6 +715,10 @@ func (sess *mqttSession) releaseTeardown(tok recordTx, t *mqttTeardownTarget, no
 			if sess.asm != nil {
 				if rerr := sess.asm.releaseTeardownEntry(t.id, t.gen, nonce, nil); rerr != nil {
 					sess.jsa.c.Warnf("MQTT: the release of session %q generation %q is not yet recorded: %v", t.id, t.gen, rerr)
+				} else {
+					// The generation's recovery visit may already have found this release
+					// pending: the drive retires it now rather than at the next sweep.
+					sess.asm.kickLifecycleRetirement(t.id)
 				}
 			}
 			return mqttTeardownReleased, nil, 0, nil

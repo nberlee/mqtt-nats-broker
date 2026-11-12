@@ -410,6 +410,11 @@ func (jsa *mqttJSA) composeAcceptance(r mqttAcceptRequest, al mqttAuthorityLoad,
 		t.Attempt.Kind = mqttTransitionAcceptDisplace
 		nl.Outstanding = out
 		nl.Pending = &mqttPendingAcceptance{Kind: mqttPendingFresh, AcceptOrd: accept.Ord, Nonce: r.Nonce, At: r.At}
+		// The new current generation takes a slot beside every outstanding one: refused here,
+		// with its reason, rather than at the write boundary.
+		if err := mqttCheckGenerationSlots(len(nl.Outstanding), true); err != nil {
+			return nil, err
+		}
 
 	case prev.State == mqttAuthorityClosed:
 		// A REOPEN: the record is gone and the lifecycle has not retired. The record is created
@@ -427,6 +432,9 @@ func (jsa *mqttJSA) composeAcceptance(r mqttAcceptRequest, al mqttAuthorityLoad,
 		nl.Outstanding = mqttReleaseAllPending(pl.Outstanding)
 		nl.Phase = mqttLifecycleServing
 		nl.Pending = &mqttPendingAcceptance{Kind: mqttPendingFresh, AcceptOrd: accept.Ord, Nonce: r.Nonce, At: r.At}
+		if err := mqttCheckGenerationSlots(len(nl.Outstanding), true); err != nil {
+			return nil, err
+		}
 
 	case prev.State == mqttAuthorityServing && !r.RecordExists:
 		// Every serving generation's record was written by the acceptance that installed it, and

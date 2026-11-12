@@ -161,3 +161,56 @@ func TestTheLifecycleSweepYieldsToAnnouncedForegroundWork(t *testing.T) {
 		t.Fatal("the sweep did not record the release once the announcement was released")
 	}
 }
+
+// A teardown claim outlasts a background write admitted before its announcement and the full
+// allowance after it (consult 15, holistic review of the prompt drive): its first attempt is
+// composed against a read taken under the announcement, so the pre-announcement write costs no
+// attempt, and the k pre-admitted writes after it are outlasted by the derived budget. Mutation:
+// the claim composed only against the read taken before the announcement (the claim exhausts its
+// budget and the clean disconnect's teardown is left undone).
+func TestATeardownClaimOutlastsAWriteBeforeItsAnnouncement(t *testing.T) {
+	const k = 6
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+	asm := testMQTTGetGlobalASM(t, s)
+	const id = "claim-pre-announce"
+	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: id, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+	for i := 0; i < k; i++ {
+		deregister := asm.registerForegroundActor(id)
+		defer deregister()
+	}
+	var before, sends atomic.Int32
+	h := func(cid, point string) {
+		if cid != id {
+			return
+		}
+		switch point {
+		case "before-announce":
+			if before.Add(1) == 1 {
+				testInvalidateAuthorityOf(t, asm, id)
+			}
+		case "before-send":
+			// Sends 2 to k+1: the pre-announcement write is the only one that can spend the
+			// first attempt, and the k after it are the allowance's.
+			if n := sends.Add(1); n >= 2 && n <= k+1 {
+				testInvalidateAuthorityOf(t, asm, id)
+			}
+		}
+	}
+	mqttTestTeardownClaimPointV.Store(&h)
+	defer mqttTestTeardownClaimPointV.Store(nil)
+	testMQTTDisconnect(t, c, nil)
+	c.Close()
+	checkFor(t, 10*time.Second, 25*time.Millisecond, func() error {
+		al := asm.jsa.loadOutboundAuthority(id, asm.sessStreamEpoch)
+		if al.status != mqttOutboundValid || al.rec.State == mqttAuthorityServing {
+			return fmt.Errorf("the clean disconnect's teardown has not claimed (%v)", al.status)
+		}
+		return nil
+	})
+	if before.Load() == 0 || sends.Load() == 0 {
+		t.Fatalf("fixture: %d pre-announcement and %d send point(s), want both reached", before.Load(), sends.Load())
+	}
+}
