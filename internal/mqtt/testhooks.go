@@ -493,3 +493,14 @@ var mqttTestSlowConnectThresholdV atomic.Pointer[time.Duration]
 // mqttTestConnectReportHookV is called by every CONNECT's timeline reporter at its return, with
 // the rendered line and whether it was logged. nil in production.
 var mqttTestConnectReportHookV atomic.Pointer[func(clientID, line string, slow bool)]
+
+// mqttTestStaleProofPointV runs inside the sequence proof of a stale attempt, after its first
+// authority read and before its outcome read, with the client id: the window in which a landed
+// attempt's generation can be fenced, bounded and purged. Nil in production.
+var mqttTestStaleProofPointV atomic.Pointer[func(id string)]
+
+func mqttStaleProofPoint(id string) {
+	if h := mqttTestStaleProofPointV.Load(); h != nil {
+		(*h)(id)
+	}
+}

@@ -1199,6 +1199,11 @@ func mqttTransitionDigest(a *mqttTransitionAttempt, authExpect uint64, authBody 
 type mqttTransitionHandle struct {
 	attempt mqttTransitionAttempt
 	digest  string
+	// authSeq is the authority sequence the attempt's batch expects its authority member at, or
+	// zero for an attempt with no predecessor authority (authority-free, a creation) or whose
+	// expectation is unknown: zero disables the sequence proof, never satisfies it. It is the
+	// frozen batch's own PrevSeq, never a sequence read later.
+	authSeq uint64
 }
 
 // mqttNewTransitionHandle freezes a transition into the handle that can classify it later.
@@ -1217,5 +1222,5 @@ func mqttNewTransitionHandle(t *mqttAuthorityTransition) (*mqttTransitionHandle,
 	if derr != nil {
 		return nil, derr
 	}
-	return &mqttTransitionHandle{attempt: *t.Attempt, digest: digest}, nil
+	return &mqttTransitionHandle{attempt: *t.Attempt, digest: digest, authSeq: t.PrevSeq}, nil
 }

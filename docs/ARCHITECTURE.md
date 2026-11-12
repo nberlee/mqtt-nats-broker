@@ -10096,11 +10096,31 @@ transition; an authority that moved under the abort while its outcome subject is
 empty is contention, re-read and retried through the fence each time, four attempts in all
 (`mqttAuthorityFenceAttempts`); a taken outcome subject is the answer and ends it.
 
+**A stale attempt needs no abort.** An attempt's batch carries the authority at the
+sequence its transition was composed against, and stream sequences only grow, so once the
+authority stands past that sequence the batch can never be applied. The resolver reads the
+authority first, the outcome second and the authority again last
+(`provedNeverLandedBySequence`): an outcome absent after an authority read past the expected
+sequence, in a scope that both authority reads show positively live (the standing
+lifecycle's, its generation current or outstanding and open), is never-landed, proved
+without a write. Read in the other order, a batch landing between the two reads would
+itself move the authority; and "not retired" would not do for the last read, since a fenced
+or bounded scope may have purged the outcome without having retired yet. A scope that is
+not positively live leaves the attempt to the abort and its classification, as before.
+The proof matters because the abort is fenced
+beside the authority: every abort rewrites it, so settling a stale attempt by abort would
+defeat any attempt composed against it meanwhile, and two contending loops of one session
+(the admission or acquisition batches of two subscriptions) could keep each other's
+attempts stale for as long as their timing stayed in step. An attempt with no expected
+authority sequence (authority-free, a creation, or an unknown expectation, all recorded as
+zero) is still settled by the abort ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
+
 Every abort attempt, each retry included, is admitted by its holder's own admission,
 asked before the attempt; a foreground holder passes none, because it must not wait on its
 own announcement, and a refusal (`errMQTTAbortNotAdmitted`) leaves the attempt unresolved
-for the holder's retry. Each unresolved failed attempt may require an abort authority
-write. Background abort attempts yield to announced foreground work, so settlement and
+for the holder's retry. An unresolved failed attempt needs no abort when the sequence proof
+completes; any other (its authority still standing as expected, an outcome or authority
+read that cannot be answered, a zero expectation) may require an abort authority write. Background abort attempts yield to announced foreground work, so settlement and
 release of associated local resources may be delayed under sustained foreground load.
 Pending handles retain a retry owner. Admission does not revoke already-admitted requests
 or exclude remote writers.
@@ -10109,7 +10129,8 @@ or exclude remote writers.
 `mqttTransitionRetired` for an outcome that is absent in a positively retired scope: a
 generation scope whose generation reads retired, or a lifecycle scope whose lifecycle the
 registry reads RETIRED. Within a live scope no outcome is ever deleted, so absence there
-stays Unresolved exactly as before. RETIRED says the scope's work is terminal and no
+is Unresolved unless the sequence proof above concludes never-landed. RETIRED says the
+scope's work is terminal and no
 publication for it can land; it says nothing about whether this attempt committed, so no
 holder reads it as landed, superseded or never-landed. Each holder drops the handle from
 the set holding it, reports it decided where it returns a decision, and takes neither

@@ -279,8 +279,9 @@ func (sess *mqttSession) pubRelClaimEntitled(ent mqttOutboundEntitlement, nameGe
 // LIVE for this generation, and the adoption arm takes it, still under the entitlement rule.
 //
 // EXHAUSTION SETTLES EVERY SUBMITTED ATTEMPT BY PERMANENT ARBITRATION (as retireSourceStep does):
-// a landed or superseded verdict is adopted after one more ownership read; an unresolved one is
-// aborted, so it can never land; one whose abort fails stays open and refuses the claim. An open
+// a landed or superseded verdict is adopted after one more ownership read; one proved never
+// landed (the authority moved past its batch, issue #133) is settled as it stands; an unresolved
+// one is aborted, so it can never land; one whose abort fails stays open and refuses the claim. An open
 // attempt that lands later leaves exactly what a crash between a claim and its create leaves: a
 // LIVE name and resource with their provision and cleanup duties in this generation's inventory,
 // which the next claim adopts and the generation's closing retires. Unlike a source name nothing
@@ -305,24 +306,25 @@ func (sess *mqttSession) claimPubRelName(ent mqttOutboundEntitlement, nameGen, n
 		}
 		lastErr = err
 	}
-	landed, aborted, open := false, 0, 0
+	landed, neverLanded, open := false, 0, 0
 	for _, h := range handles {
 		switch sess.jsa.resolveTransitionHandle(h) {
 		case mqttTransitionLanded, mqttTransitionSuperseded:
 			landed = true
 		case mqttTransitionNeverLanded:
+			neverLanded++
 		case mqttTransitionRetired:
 			// The generation retired: the name claim is obsolete, settled with no landing.
 		default:
 			if aerr := sess.jsa.abortTransition(&h.attempt, nil); aerr != nil {
 				open++
 			} else {
-				aborted++
+				neverLanded++
 			}
 		}
 	}
 	if h := mqttTestPubRelClaimSettledHook.Get(); h != nil {
-		h(len(handles), landed, aborted, open)
+		h(len(handles), landed, neverLanded, open)
 	}
 	if landed {
 		if _, _, err := sess.claimPubRelNameOnce(ent, nameGen, name); err == nil {
@@ -388,8 +390,10 @@ func (sess *mqttSession) claimPubRelNameOnce(ent mqttOutboundEntitlement, nameGe
 var (
 	// mqttTestPubRelClaimAdoptedHook observes an attempt adopting a standing LIVE name.
 	mqttTestPubRelClaimAdoptedHook = new(mqttKnob[func()])
-	// mqttTestPubRelClaimSettledHook observes exhaustion's settlement of the submitted attempts.
-	mqttTestPubRelClaimSettledHook = new(mqttKnob[func(submitted int, landed bool, aborted, open int)])
+	// mqttTestPubRelClaimSettledHook observes exhaustion's settlement of the submitted attempts:
+	// how many are settled never-landed (proved by the authority sequence, or aborted) and how
+	// many stay open.
+	mqttTestPubRelClaimSettledHook = new(mqttKnob[func(submitted int, landed bool, neverLanded, open int)])
 )
 
 // claimSourceConsumerName claims a fresh source consumer name's LIVE ownership, its resource

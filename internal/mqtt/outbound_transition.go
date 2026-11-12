@@ -185,7 +185,57 @@ func (jsa *mqttJSA) resolveTransitionHandle(h *mqttTransitionHandle) mqttTransit
 	if h == nil {
 		return mqttTransitionUnresolved
 	}
+	if v, ok := jsa.provedNeverLandedBySequence(h); ok {
+		return v
+	}
 	return jsa.classifyAgainstOutcome(&h.attempt, h.digest)
+}
+
+// provedNeverLandedBySequence settles an attempt whose authority moved past the sequence its batch
+// expects, without an abort (issue #133). The batch carries the authority at expected sequence
+// authSeq, and JetStream's sequences only grow, so once the authority stands past it the batch
+// can never be applied; and the attempt's outcome rides in that same atomic batch, so an outcome
+// read absent AFTER that authority read means it never was. The authority is read FIRST: read
+// after the outcome, a batch landing between the two reads would move it itself.
+//
+// Without this proof every stale attempt is settled by an abort, which since the abort is fenced
+// beside the authority (abortTransition) rewrites the authority and so defeats any concurrent
+// attempt composed against it: two contending loops of one session, each aborting the attempt
+// the other's abort made stale, can keep each other from landing for as long as their timing
+// stays in step. It proves only where the abort would be admitted, so it replaces exactly the
+// aborts that would have landed. ok is false when nothing is proved here; the caller classifies
+// as before.
+func (jsa *mqttJSA) provedNeverLandedBySequence(h *mqttTransitionHandle) (mqttTransitionVerdict, bool) {
+	a := &h.attempt
+	if h.authSeq == 0 || mqttAttemptAuthorityFree(a.Kind, a.Rev) || mqttValidateTransitionAttempt(a) != nil {
+		return mqttTransitionUnresolved, false
+	}
+	al := jsa.loadOutboundAuthority(a.ID, a.Epoch)
+	if al.status != mqttOutboundValid || al.seq <= h.authSeq {
+		return mqttTransitionUnresolved, false
+	}
+	// ONLY WHERE AN ABORT WOULD BE ADMITTED: the scope is the standing lifecycle's and passes the
+	// same generation boundary the abort's own fence applies. A fenced, bounded or retiring scope
+	// is settled exactly as before, by the abort's refusal and then its retirement.
+	live := func(al mqttAuthorityLoad) bool {
+		l, _, _ := mqttParseOutcomeScope(a.Scope)
+		return al.status == mqttOutboundValid && al.rec.Life != nil && al.rec.Life.L == l &&
+			mqttCheckGenerationBoundary(&mqttAuthorityTransition{Attempt: a, Prev: al.rec, PrevSeq: al.seq, Auth: al.rec}) == nil
+	}
+	if !live(al) {
+		return mqttTransitionUnresolved, false
+	}
+	mqttStaleProofPoint(a.ID)
+	if _, _, ostatus := jsa.loadTransitionOutcome(a.ID, a.Epoch, a.Scope, a.Txn); ostatus != mqttOutboundAbsent {
+		return mqttTransitionUnresolved, false
+	}
+	// THE SCOPE IS POSITIVELY LIVE AFTER THE ABSENCE WAS READ (consult 17): a scope still open then
+	// was never fenced (phases only advance), so nothing purged an outcome the batch wrote. "Not
+	// retired" would not do: a fenced or bounded scope may have purged it and not yet retired.
+	if !live(jsa.loadOutboundAuthority(a.ID, a.Epoch)) {
+		return mqttTransitionUnresolved, false
+	}
+	return mqttTransitionNeverLanded, true
 }
 
 // classifyAgainstOutcome is the ONE partition both resolvers use, so they can never disagree

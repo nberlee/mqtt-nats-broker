@@ -476,8 +476,9 @@ acceptance's same-subject re-sends (10164) for the CONNECT's create-retry allowa
 authority that moved after fork repair read its consumers sends the CONNECT back through
 its bounded restore cycles; and a creation's registry-shard CAS contends with other
 clients' lifecycle completions on the same shard, which no client's announcement covers.
-The cost on the other side: under sustained foreground load a background abort, a
-generation's reclamation, an anchor's discharge and an abandonment wait, and what waits on
+The cost on the other side: under sustained foreground load a background abort (avoided
+when the authority sequence proves the attempt never landed; written whenever that proof
+cannot complete), a generation's reclamation, an anchor's discharge and an abandonment wait, and what waits on
 them (the settlement of local resources, the storage, the lifecycle's retirement) is
 delayed.
 

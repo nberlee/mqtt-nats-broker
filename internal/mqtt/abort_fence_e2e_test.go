@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -508,6 +509,115 @@ func TestAFencedRecordWriteIsAdmittedPerAttempt(t *testing.T) {
 	}
 	if after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); after.seq != before.seq {
 		t.Fatalf("a refused fenced write moved the authority from %d to %d", before.seq, after.seq)
+	}
+}
+
+// A stale attempt is proved never landed by the authority sequence, with no write (consult 17):
+// its batch expected the authority at a sequence the authority has since moved past, so its CAS
+// can never apply; its outcome is absent and its scope live, so nothing landed. Resolving it moves
+// nothing, which is what keeps two contending loops of one session from invalidating each
+// other's attempts with their aborts. An attempt whose authority still stands as it expected
+// may still land, and is not concluded from absence. Mutations: the proof removed (the stale
+// attempt reads unresolved and needs an abort); the sequence condition dropped (the standing
+// attempt reads never-landed while it can still land).
+func TestAStaleAttemptIsProvedNeverLandedWithoutAWrite(t *testing.T) {
+	e, done := testNewEnv(t, "stale-proof")
+	defer done()
+	base, baseSeq := e.bootstrap(t, "txn-1")
+
+	standing := testAdmitNothing(e, base, baseSeq, "txn-standing")
+	hs, err := mqttNewTransitionHandle(standing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := e.asm.jsa.resolveTransitionHandle(hs); v == mqttTransitionNeverLanded {
+		t.Fatal("an attempt whose authority still stands as its batch expects was concluded never-landed")
+	}
+
+	stale := testAdmitNothing(e, base, baseSeq, "txn-stale")
+	h, err := mqttNewTransitionHandle(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testInvalidateAuthorityOf(t, e.asm, e.id)
+	before := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionNeverLanded {
+		t.Fatalf("a stale attempt the authority moved past resolved %v, want never-landed", v)
+	}
+	if after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); after.seq != before.seq {
+		t.Fatalf("resolving the stale attempt moved the authority from %d to %d", before.seq, after.seq)
+	}
+	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, stale.Attempt.Scope, stale.Attempt.Txn); st != mqttOutboundAbsent {
+		t.Fatalf("resolving the stale attempt wrote an outcome (status %v)", st)
+	}
+}
+
+// A LANDED attempt whose generation is fenced, bounded and purged inside the sequence proof's
+// window (after its first authority read, before its outcome read) is not concluded never-landed
+// from the absence the purge left (consult 17): the scope is re-checked positively live after
+// the outcome read, and a bounded one is not. Mutation: the final check accepting any scope not
+// yet retired (the purged attempt reads never-landed).
+func TestALandedAttemptPurgedMidProofIsNotNeverLanded(t *testing.T) {
+	e, done := testNewEnv(t, "stale-proof-purged")
+	defer done()
+	base, baseSeq := e.bootstrap(t, "txn-1")
+	gen := base.Gen
+	landed := testAdmitNothing(e, base, baseSeq, "txn-landed")
+	if _, err := e.asm.jsa.commitAuthorityTransition(landed); err != nil {
+		t.Fatalf("landing the attempt: %v", err)
+	}
+	h, err := mqttNewTransitionHandle(landed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testDiscardClose(t, e)
+	checkFor(t, 30*time.Second, 50*time.Millisecond, func() error {
+		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
+		if !testDiscardCertified(e, gen) {
+			return fmt.Errorf("generation %q is not certified", gen)
+		}
+		return nil
+	})
+	_, ord, _ := mqttParseGenToken(gen)
+	idHash := getHash(e.id)
+	var fired atomic.Bool
+	point := func(id string) {
+		if id != e.id || !fired.CompareAndSwap(false, true) {
+			return
+		}
+		// The retirement, fenced and bounded, and its purge, inside the proof's window.
+		for i := 0; i < 2; i++ {
+			al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+			bound := uint64(0)
+			if o := al.rec.Life.Outstanding[mqttOutstandingIndex(al.rec.Life, ord)]; o.Phase == mqttOutstandingFenced {
+				_, last, serr := e.asm.jsa.streamSubjects(mqttSessStreamName, mqttOutboundAuthoritySubject(idHash))
+				if serr != nil {
+					t.Error(serr)
+					return
+				}
+				bound = last
+			}
+			tr, cerr := mqttComposeRetireGenerationStep(al.rec, al.seq, mqttNewInflightNonce(), ord, bound)
+			if cerr != nil || tr == nil {
+				t.Errorf("composing the retirement step: %v", cerr)
+				return
+			}
+			if _, cerr := e.asm.jsa.commitAuthorityTransition(tr); cerr != nil {
+				t.Errorf("the retirement step was refused: %v", cerr)
+				return
+			}
+		}
+		if perr := e.asm.jsa.purgeStream(mqttSessStreamName, mqttTransitionOutcomeSubject(idHash, landed.Attempt.Scope, landed.Attempt.Txn), 0, false); perr != nil {
+			t.Errorf("purging the outcome: %v", perr)
+		}
+	}
+	mqttTestStaleProofPointV.Store(&point)
+	defer mqttTestStaleProofPointV.Store(nil)
+	if v := e.asm.jsa.resolveTransitionHandle(h); v == mqttTransitionNeverLanded {
+		t.Fatal("a landed attempt whose outcome was purged inside the proof's window was concluded never-landed")
+	}
+	if !fired.Load() {
+		t.Fatal("fixture: the proof's window was never reached")
 	}
 }
 

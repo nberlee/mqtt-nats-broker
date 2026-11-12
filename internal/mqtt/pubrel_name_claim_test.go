@@ -179,12 +179,12 @@ func TestPubRelClaimExhaustionSettlesItsAttempts(t *testing.T) {
 	rig := newTestPubRelClaimRig(t, "pubrel-exhausted")
 	testCountContentionWaits(t, rig.sess)
 	type settlement struct {
-		submitted, aborted, open int
-		landed                   bool
+		submitted, neverLanded, open int
+		landed                       bool
 	}
 	got := make(chan settlement, 1)
-	mqttTestPubRelClaimSettledHook.Set(func(submitted int, landed bool, aborted, open int) {
-		got <- settlement{submitted, aborted, open, landed}
+	mqttTestPubRelClaimSettledHook.Set(func(submitted int, landed bool, neverLanded, open int) {
+		got <- settlement{submitted, neverLanded, open, landed}
 	})
 	t.Cleanup(func() { mqttTestPubRelClaimSettledHook.Set(nil) })
 	rig.presend(t, func(int32) {
@@ -197,12 +197,13 @@ func TestPubRelClaimExhaustionSettlesItsAttempts(t *testing.T) {
 	}
 	select {
 	case st := <-got:
-		if st.landed || st.open != 0 || st.submitted == 0 || st.aborted != st.submitted {
-			t.Fatalf("the exhausted claim settled with landed=%v, %d of %d submitted attempt(s) aborted "+
-				"and %d open: every unresolved attempt must be aborted so it can never land",
-				st.landed, st.aborted, st.submitted, st.open)
+		if st.landed || st.open != 0 || st.submitted == 0 || st.neverLanded != st.submitted {
+			t.Fatalf("the exhausted claim settled with landed=%v, %d of %d submitted attempt(s) settled "+
+				"never-landed and %d open: every unresolved attempt must be settled so it can never land "+
+				"(proved by the authority sequence, or aborted)",
+				st.landed, st.neverLanded, st.submitted, st.open)
 		}
-		t.Logf("settled %d submitted attempt(s), %d aborted", st.submitted, st.aborted)
+		t.Logf("settled %d submitted attempt(s), %d never-landed", st.submitted, st.neverLanded)
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the exhausted claim never settled its attempts")
 	}
