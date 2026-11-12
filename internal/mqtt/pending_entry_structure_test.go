@@ -952,6 +952,7 @@ var pendingStructureFieldWrites = map[string]int{
 	"retainAndReconcileTerminal|terminalReconcile|RESIDENT":         3,
 	"retrackPublishLocked|transmitted|RESIDENT":                     1,
 	"retrackPublishLocked|transmittedOn|RESIDENT":                   1,
+	"retrackPublishLocked|sendNonce|RESIDENT":                       1, // a reinstalled entry drops a token its section's ended hold no longer names, under sess.mu
 	"trackPublish|jsAckSubject|RESIDENT":                            1,
 	"trackPublish|jsDur|RESIDENT":                                   1,
 	"trackPublish|sseq|RESIDENT":                                    1,

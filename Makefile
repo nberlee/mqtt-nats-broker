@@ -24,6 +24,11 @@ KUBECTL_VERSION := v1.37.0
 KUBECTL_SHA256_amd64 := 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
 KUBECTL_SHA256_arm64 := 922df28df248cc00a9e025f947704f1d1482de64ece54cfe57e61f19eaf1eef3
 HELM_ENV := HELM_CACHE_HOME=$(CURDIR)/bin/helm-home/cache HELM_CONFIG_HOME=$(CURDIR)/bin/helm-home/config HELM_DATA_HOME=$(CURDIR)/bin/helm-home/data
+# The chart's NATS dependency is fetched from a GitHub release download, which answers a
+# transient 5xx now and then (a 504 failed two CI runs on 2026-11-09). Three attempts, 15 s
+# apart; a persistent failure still fails the target.
+HELM_DEP_BUILD = for i in 1 2 3; do $(HELM_ENV) bin/helm dependency build $(HELM_CHART) \
+	&& break; [ $$i -lt 3 ] || exit 1; echo "helm dependency build failed, retrying in 15 s" >&2; sleep 15; done
 HELM_CHART := charts/mqtt-nats-broker
 
 build: ## Build the binary for the host platform
@@ -130,7 +135,7 @@ kubernetes-render: ## Render docs/deploy/kubernetes (base and TLS overlay) with 
 helm-check: ## Lint and render the Helm chart and the topology-3 NATS chart values with the pinned helm, and check the output against the binary
 	GOBIN=$(CURDIR)/bin go install helm.sh/helm/v4/cmd/helm@$(HELM_VERSION)
 	$(HELM_ENV) bin/helm repo add --force-update nats https://nats-io.github.io/k8s/helm/charts/
-	$(HELM_ENV) bin/helm dependency build $(HELM_CHART)
+	$(HELM_DEP_BUILD)
 	for f in $(HELM_CHART)/ci/*.yaml; do $(HELM_ENV) bin/helm lint --strict $(HELM_CHART) -f $$f || exit 1; done
 	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml
 	$(HELM_ENV) bin/helm lint --strict $(HELM_CHART)/charts/nats-*.tgz -f docs/deploy/nats-chart-shared-pod/values.yaml -f docs/deploy/nats-chart-shared-pod/values-cluster.yaml
@@ -170,7 +175,7 @@ helm-package: ## Package the Helm chart for the release tag TAG into bin/helm-pa
 	v=$$(printf '%s\n' '$(TAG)' | $(MAKE) -s release-version) || exit 1; \
 	GOBIN=$(CURDIR)/bin go install helm.sh/helm/v4/cmd/helm@$(HELM_VERSION) && \
 	$(HELM_ENV) bin/helm repo add --force-update nats https://nats-io.github.io/k8s/helm/charts/ && \
-	$(HELM_ENV) bin/helm dependency build $(HELM_CHART) && \
+	{ $(HELM_DEP_BUILD); } && \
 	rm -rf bin/helm-package && \
 	$(HELM_ENV) bin/helm package $(HELM_CHART) --version "$$v" --app-version "$$v" -d bin/helm-package && \
 	$(HELM_ENV) MQTTNB_HELM=$(CURDIR)/bin/helm MQTTNB_HELM_PACKAGE=$(CURDIR)/bin/helm-package/mqtt-nats-broker-$$v.tgz \

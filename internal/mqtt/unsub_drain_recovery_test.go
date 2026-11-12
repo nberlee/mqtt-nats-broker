@@ -1284,6 +1284,29 @@ func TestResolveUncertainNowDetachesAForeignSession(t *testing.T) {
 	testMarkUncertainLocked(sess, baseSeq, planted)
 	sess.mu.Unlock()
 
+	// The foreign write below is also an observation the record watch acts on: its eviction
+	// worker is a SECOND legitimate disposer of the same record, and when it decides first it
+	// detaches and evicts the session itself, leaving the resolver's disposal nothing to do. This
+	// test pins the resolver's disposal, so the watch is held for this client until the verdict
+	// has been asserted (as the cross-tenure witness holds it), and released before the
+	// server's shutdown.
+	evictHold := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseEvict := func() { releaseOnce.Do(func() { close(evictHold) }) }
+	asm.mu.Lock()
+	asm.testEvictPauseBeforeLoad = func(h string) {
+		if h == sess.idHash {
+			<-evictHold
+		}
+	}
+	asm.mu.Unlock()
+	t.Cleanup(func() {
+		releaseEvict()
+		asm.mu.Lock()
+		asm.testEvictPauseBeforeLoad = nil
+		asm.mu.Unlock()
+	})
+
 	// Somebody else advances the record with different content.
 	subject := mqttSessStreamSubjectPrefix + sess.domainTk + sess.idHash
 	if _, err := sess.jsa.storeMsg(subject, 0, []byte(`{"owner":"someone-else"}`)); err != nil {

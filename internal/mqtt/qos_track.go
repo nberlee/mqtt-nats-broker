@@ -835,6 +835,15 @@ func (sess *mqttSession) retrackPublishLocked(c *client, pi uint16, ack *mqttPen
 	if c != nil && c.cid != 0 {
 		ack.transmittedOn = c.cid
 	}
+	// THE SECTION IT WAS SENT IN MAY HAVE ENDED while it was removed: the PUBREC can take the
+	// entry before its section's end, and that end clears the section token only on the entry it
+	// finds under the identifier. A token no live hold names is a section nobody will end, and
+	// reinstalled it would refuse every later offer of this delivery as one already being written
+	// (trackPublish, beginSendLocked) for the life of the session. It stays only while the hold
+	// still names it, so the section's own end clears it as usual.
+	if ack.sendNonce != _EMPTY_ && !sess.sendSectionOpenLocked(pi, ack.sendNonce) {
+		ack.sendNonce = _EMPTY_
+	}
 	// ANY: this is the exact entry the caller removed, put back. Its kind and evidence are the
 	// ones its constructor gave it, and the writer's gate asks the question the reinstallation
 	// depends on — does custody still hold its lineage; if not, the exchange ended meanwhile and

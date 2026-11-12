@@ -8696,6 +8696,16 @@ func (sess *mqttSession) sendTransmissionOpenLocked(pi uint16) bool {
 	return h != nil && h.token != _EMPTY_
 }
 
+// sendSectionOpenLocked reports whether the send section token opened for pi is still the one
+// its hold names: a token no hold names belongs to a section that has ended, and nothing will
+// clear it from an entry it is reinstalled on.
+//
+// Session lock held on entry.
+func (sess *mqttSession) sendSectionOpenLocked(pi uint16, token string) bool {
+	h := sess.sendsInFlight[pi]
+	return token != _EMPTY_ && h != nil && h.token == token
+}
+
 // sweepDeadSendHoldsLocked drops holds that reserve nothing: no write out, and no
 // acknowledgement owed by the connection that is ours now.
 //

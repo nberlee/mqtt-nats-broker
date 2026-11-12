@@ -1040,6 +1040,64 @@ func TestMQTTDrainDefiniteIntentFailureUnwedgesIdentifier(t *testing.T) {
 	})
 }
 
+// A PUBREC whose intent write definitely fails is rolled back onto the very entry it removed,
+// and the PUBLISH section that sent that entry may have ENDED in between: its end clears the
+// section token only on the entry it finds under the identifier, so the removed one would come
+// back naming a section nobody will end. Held here at exactly that schedule (the PUBREC paused
+// after its handoff until the section's hold is gone), the rolled-back entry must still be
+// redelivered to the reconnected same-process session. Mutation: retrackPublishLocked keeping
+// a section token no live hold names (every redelivery is then declined as already being
+// written, and this read times out).
+func TestARolledBackPubRecRedeliversAfterItsSectionEnded(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.MQTT.AckWait = time.Second
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	conn, sess, pi := testDrainSetup(t, s, o, "section-ended", "section/ended", 2)
+	testMQTTUnsub(t, 1, conn.c, conn.r, []*mqttFilter{{filter: "section/ended"}})
+	testMQTTFlush(t, conn.c, nil, conn.r)
+
+	var waited atomic.Bool
+	h := func(p uint16) {
+		if p != pi {
+			return
+		}
+		checkFor(t, 5*time.Second, 5*time.Millisecond, func() error {
+			sess.mu.Lock()
+			defer sess.mu.Unlock()
+			if sess.sendsInFlight[pi] != nil {
+				return fmt.Errorf("the PUBLISH section of %d has not ended", pi)
+			}
+			return nil
+		})
+		waited.Store(true)
+	}
+	mqttTestPubRecHandoffV.Store(&h)
+	defer mqttTestPubRecHandoffV.Store(nil)
+	restore := setMQTTTestSessSaveHook(func(*mqttSession) error { return errDrainTestSaveFailed })
+	testMQTTSendPIPacket(mqttPacketPubRec, t, conn.c, pi)
+	testDrainWaitConnClosed(t, conn.r)
+	restore()
+	mqttTestPubRecHandoffV.Store(nil)
+	conn.c.Close()
+	if !waited.Load() {
+		t.Fatal("the PUBREC never reached its handoff, so the schedule was not exercised")
+	}
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: "section-ended", cleanSess: false}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, true)
+	flags, pi2, topic, payload := testMQTTReadPubPacket(t, r2)
+	if topic != "section/ended" || string(payload) != "payload" || flags&mqttPubFlagDup == 0 {
+		t.Fatalf("the rolled-back delivery must be redelivered with DUP, got %q %q flags %x", topic, payload, flags)
+	}
+	testMQTTSendPIPacket(mqttPacketPubRec, t, c2, pi2)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, r2, pi2)
+	testMQTTSendPIPacket(mqttPacketPubComp, t, c2, pi2)
+	testMQTTFlush(t, c2, nil, r2)
+}
+
 // testDrainWaitConnClosed blocks until the broker closes the connection, which is
 // how a storage failure surfaces to the client.
 func testDrainWaitConnClosed(t *testing.T, r *mqttReader) {

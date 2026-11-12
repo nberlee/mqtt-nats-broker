@@ -901,7 +901,9 @@ func TestMQTTInflightSendHoldsAreReadThroughOneAPI(t *testing.T) {
 		// answers "is this identifier reserved", which stays sendReservedLocked's.
 		// The TRANSMISSION question (unit C3): is a PUBLISH write still out? Not a reservation
 		// reader — a terminal identifier hold reserves without transmitting.
-		"mqttSession.sendTransmissionOpenLocked":       {},
+		"mqttSession.sendTransmissionOpenLocked": {},
+		// The SECTION question: is the token an entry carries still its open section's?
+		"mqttSession.sendSectionOpenLocked":            {},
 		"mqttSession.holdTerminalCleanupLocked":        {},
 		"mqttSession.releaseTerminalCleanupHoldLocked": {}, // the terminal hold's owner (the unlocked wrapper only locks)
 		// The IDENTIFIER EXCLUSION a removal site hands off (issue #100, C-IV's consolidation):

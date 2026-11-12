@@ -9132,9 +9132,13 @@ mechanisms are reached through a reconnect's resend instead.
 is the cid of the connection a write of the entry possibly reached, set in
 `endPublishSend` when `wrote` is true, and in `retrackPublishLocked` from the PUBREC that
 a rollback answers (the client proved receipt there, and the PUBREC can remove the entry
-before its section's end stamps it). It is a different fact from `transmitted`, the DUP
-fact: an intent confirmed without a write sets `transmitted` and leaves the connection
-without the PUBLISH, so its next offer there is written (DUP=1), and recovery's
+before its section's end stamps it). For the same reason the rollback keeps the entry's
+section token only while the send hold still names it: a section that ended while the entry
+was removed cleared nothing on it, and a reinstalled dead token would refuse every later
+offer of the delivery as one already being written. It is a different fact from
+`transmitted`, the DUP fact: an intent confirmed without a write sets `transmitted` and
+leaves the connection without the PUBLISH, so its next offer there is written (DUP=1), and
+recovery's
 `transmitted` names a write by an earlier process. Recovery and promotions build entries
 before any write in this process, so a takeover or restart resends by construction. The
 refusal is in `beginSendLocked`, the one opener every offer of a JetStream-backed entry

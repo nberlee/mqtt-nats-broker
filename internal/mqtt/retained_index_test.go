@@ -716,10 +716,16 @@ func TestRetainedAmbiguousResetDeleteRetriesOnCadence(t *testing.T) {
 
 // L6: a create that landed with its response lost is reconciled by the next attempt,
 // and leaves exactly one consumer under the name.
+//
+// "Reconciled" includes the reconciling create having RETURNED: a reset installs its new
+// generation and clears resetting before its create (deliveries may precede the create's
+// response and are committed, L7), so between that and the create the old consumer is
+// deleted and the new one not yet made.
 func TestRetainedResetCreateResponseLostReconciles(t *testing.T) {
 	t.Parallel()
 	srv := runJetStreamServerHA(t)
 	var lose atomic.Int32
+	var createdOK atomic.Int32
 	lose.Store(1)
 	s, _, _ := retainedBrokerWith(t, srv.ClientURL(), "l6", func(sm *mqttSessionManager) {
 		sm.testRetainedObserverHeartbeat = 300 * time.Millisecond
@@ -727,14 +733,17 @@ func TestRetainedResetCreateResponseLostReconciles(t *testing.T) {
 			if err == nil && lose.Add(-1) >= 0 {
 				return fmt.Errorf("mqtt test: create response lost")
 			}
+			if err == nil {
+				createdOK.Add(1)
+			}
 			return err
 		}
 	})
 	asm := retainedASM(t, s)
 	forceObserverReset(asm)
 	retainedCheckFor(t, 10*time.Second, 10*time.Millisecond, func() error {
-		if st := observerState(asm); st.resets < 2 || st.resetting {
-			return fmt.Errorf("not reconciled yet: %+v", st)
+		if st := observerState(asm); st.resets < 2 || st.resetting || createdOK.Load() < 1 {
+			return fmt.Errorf("not reconciled yet: %+v, %d create(s) returned", st, createdOK.Load())
 		}
 		return nil
 	})
