@@ -296,7 +296,7 @@ func mqttPurgeCountTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, 
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: m.Gen, Op: op,
 			// A DISPOSAL, deliberately: cleanup must run under a CLOSED authority, which is
 			// exactly when old material is reclaimed. The kinds that WRITE material are
 			// refused here for the mirror-image reason.
@@ -307,7 +307,7 @@ func mqttPurgeCountTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn, 
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttManifestSubject(getHash(prev.ID), m.Gen, m.Payload),

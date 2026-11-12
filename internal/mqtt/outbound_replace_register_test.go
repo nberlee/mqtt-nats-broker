@@ -508,7 +508,7 @@ func TestReplacementExpectationNamesTheInspectedMarker(t *testing.T) {
 func (r *testReplEnv) attempt(txn string) *mqttTransitionAttempt {
 	al := r.asm.jsa.loadOutboundAuthority(r.id, r.epoch)
 	return &mqttTransitionAttempt{
-		ID: r.id, Epoch: r.epoch, Txn: txn, Op: "op-" + txn,
+		ID: r.id, Epoch: r.epoch, Txn: txn, Scope: al.rec.Gen, Op: "op-" + txn,
 		Kind: mqttTransitionAdmitExchange, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 		Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 	}
@@ -868,7 +868,7 @@ func TestBoundaryRefusesALoneSupersession(t *testing.T) {
 	}
 	tr := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: r.id, Epoch: r.epoch, Txn: "txn-lone", Op: "op-lone",
+			ID: r.id, Epoch: r.epoch, Txn: "txn-lone", Scope: testGen, Op: "op-lone",
 			Kind: mqttTransitionAdmitExchange, PrevTxn: r.auth.OwnerTxn, Rev: r.auth.Rev + 1,
 			Gen: testGen, Tenure: r.auth.Tenure, OwnerTxn: r.auth.OwnerTxn,
 		},
@@ -876,6 +876,7 @@ func TestBoundaryRefusesALoneSupersession(t *testing.T) {
 		Auth: &mqttOutboundAuthority{
 			ID: r.id, Epoch: r.epoch, Gen: testGen, Tenure: r.auth.Tenure,
 			State: mqttAuthorityServing, Rev: r.auth.Rev + 1, Txn: "txn-lone", OwnerTxn: r.auth.OwnerTxn,
+			Life: mqttLifeOf(r.auth),
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttExchangeSubject(getHash(r.id), testGen, r.occLin),

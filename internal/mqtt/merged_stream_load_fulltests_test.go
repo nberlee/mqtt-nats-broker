@@ -257,14 +257,14 @@ func TestMQTTMergedStreamLoad(t *testing.T) {
 			asm.sweepOutboundRecovery(s, func() bool { return false })
 			sweepPass.add(time.Since(start))
 
-			before, err := asm.sessLastSeq()
+			before, err := testSampleSessLastSeq(asm)
 			if err != nil {
 				continue
 			}
 			if werr := asm.walkSessionRecords(func(*StoredMsg) error { return nil }); werr != nil {
 				continue
 			}
-			after, err := asm.sessLastSeq()
+			after, err := testSampleSessLastSeq(asm)
 			if err == nil && after >= before {
 				// Recorded as a count, through the same series: one "ms" is one sequence.
 				walkSpan.add(time.Duration(after-before) * time.Millisecond)
@@ -307,4 +307,16 @@ func TestMQTTMergedStreamLoad(t *testing.T) {
 		t.Fatalf("an activity made no observation: published=%d connects=%d sweeps=%d wills=%d walks=%d",
 			published.Load(), connectLat.count(), sweepPass.count(), willLate.count(), walkSpan.count())
 	}
+}
+
+// testSampleSessLastSeq samples the session stream's last sequence.
+func testSampleSessLastSeq(asm *mqttAccountSessionManager) (uint64, error) {
+	si, err := asm.jsa.lookupStream(mqttSessStreamName)
+	if err != nil {
+		return 0, err
+	}
+	if si == nil {
+		return 0, fmt.Errorf("stream %q not found", mqttSessStreamName)
+	}
+	return si.State.LastSeq, nil
 }

@@ -7,23 +7,22 @@
 // for the server's apply-layer contract -- a committed batch prefix with no commit
 // entry stores nothing -- lives in test/depproof, inside an isolated nats-server
 // checkout. What this test adds is that the BROKER's accepted CONNECT really goes
-// through that contract: one batch, all three members, and at the moment the commit is
-// acknowledged the acceptance fact, the COMMITTED ownership receipt and the session
-// record are all on the stream with the attempt's own bytes.
+// through that contract: one batch, every member, and at the moment the commit is
+// acknowledged the authority carrying the acceptance and the session record are both on
+// the stream with the attempt's own bytes.
 //
 // The observation is a MOMENT, not an invariant. The session record's subject is a
 // MaxMsgsPer:1 register, so a later legitimate save -- a repair save, a lifetime grant,
-// a SUBSCRIBE -- replaces what the batch committed, and "a fact always has its original
-// record" is simply false over time. What is true, and what mqttAcceptFactLanded's
-// stated meaning needs, is that the record committed WITH the fact. That is a claim
-// about the store boundary, so it is asserted at the store boundary: the seam fires
-// inside commitMetadataAttempt, before the caller adopts the sequence and before anything
-// else can write the subject. The accept transaction the CONNECT holds is what keeps
+// a SUBSCRIBE -- replaces what the batch committed, and "an acceptance always has its
+// original record" is simply false over time. What is true is that the record committed
+// WITH the acceptance. That is a claim about the store boundary, so it is asserted at the
+// store boundary: the seam fires inside the acceptance's batch commit, before the caller
+// adopts the sequence and before anything else can write the subject. The accept transaction the CONNECT holds is what keeps
 // the window closed to a local successor.
 //
 // The paired mutation is m-accept-split-write (test/depproof/run.sh --broker): the one
-// batch becomes independent conditional writes, and the fact is acknowledged on its own
-// while the receipt and the record are suppressed through the counterfactual phase below,
+// batch becomes independent conditional writes, and the authority is acknowledged on
+// its own while the record is suppressed through the counterfactual phase below,
 // while the caller is still handed an acknowledgement it cannot tell from a real commit.
 // That must make the assertion here fail with a torn batch.
 
@@ -38,15 +37,15 @@ import (
 )
 
 // acceptBatchTornMarker names the ONE failure this sentinel is evidence about: the
-// acceptance fact durable without the session record its batch was supposed to carry.
+// acceptance's authority durable without the session record its batch was supposed to carry.
 // The harness scores the mutation row on this marker rather than on any failure, so a
 // kill that came from a broken cluster or a refused CONNECT is not counted.
 const acceptBatchTornMarker = "ACCEPT-BATCH-TORN"
 
-// mqttAcceptStoreSplitRecordPending is the counterfactual phase: the acceptance fact
-// has been INDEPENDENTLY acknowledged and the session record has not been written yet.
+// mqttAcceptStoreSplitRecordPending is the counterfactual phase: the acceptance's
+// authority has been INDEPENDENTLY acknowledged and the session record has not been written yet.
 //
-// Production never fires it, and cannot: commitMetadataAttempt issues one atomic batch, so
+// Production never fires it, and cannot: the acceptance issues one atomic batch, so
 // no such moment exists between its members. It is declared here, next to the
 // assertion it exists to break, because the mutation needs an interception point
 // rather than a notification -- an observer returning an error at this phase is what
@@ -55,7 +54,7 @@ const acceptBatchTornMarker = "ACCEPT-BATCH-TORN"
 const mqttAcceptStoreSplitRecordPending mqttAcceptStorePhase = 200
 
 // TestMQTTAcceptBatchReplicatedIndivisible: a FIRST-EVER session's accepted CONNECT
-// commits its acceptance fact and its session record together, over a real R3
+// commits its acceptance and its session record together, over a real R3
 // $MQTT_sess, and the acknowledgement it returns names the record.
 //
 // test/depproof/run.sh selects it by its exact name (accept_test) for the
@@ -108,28 +107,19 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 
 			// The acknowledgement has to be about the batch that was issued, or
 			// everything below is a readback of some other attempt's write.
-			if obs.BatchID != want.BatchID || obs.FactDigest != want.FactDigest ||
-				obs.RecDigest != want.RecDigest {
+			if obs.BatchID != want.BatchID || obs.RecDigest != want.RecDigest {
 				t.Errorf("the acknowledged batch %q is not the batch that was issued (%q)",
 					obs.BatchID, want.BatchID)
 				return nil
 			}
 
-			// The fact, by CONTENT: its subject is unique to this attempt, so its own
-			// bytes being there is the batch having committed.
-			if _, rb := asm.jsa.readAcceptFactSeq(obs.FactSubj, obs.FactDigest); rb != mqttAcceptFactLanded {
-				t.Errorf("%s: the acceptance fact on %q does not read back as this attempt's "+
-					"(readback %d) although its batch was acknowledged at sequence %d",
-					acceptBatchTornMarker, obs.FactSubj, rb, obs.Seq)
-			}
-
-			// And the session record, at the sequence the acknowledgement named --
+			// The session record, at the sequence the acknowledgement named --
 			// which is the claim the caller acts on when it adopts resp.Sequence.
 			smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, obs.RecSubj)
 			switch {
 			case lerr != nil || smsg == nil:
 				t.Errorf("%s: the acceptance batch was acknowledged at sequence %d, but no session "+
-					"record is on %q: the fact committed without it (%v)",
+					"record is on %q: the acceptance committed without it (%v)",
 					acceptBatchTornMarker, obs.Seq, obs.RecSubj, lerr)
 			case smsg.Sequence != obs.Seq:
 				t.Errorf("%s: the acceptance batch was acknowledged at sequence %d, but the session "+
@@ -140,25 +130,22 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 					"body this attempt sent", acceptBatchTornMarker, obs.Seq, obs.RecSubj)
 			}
 
-			// And the COMMITTED ownership receipt, the batch's THIRD member: it commits
-			// with the fact and the record or not at all. That third member is what makes
-			// the accepted CONNECT's metadata batch indivisible rather than a fact and a
-			// record that happened to land beside a receipt -- the property issue #107's cutover
-			// rests on, because a receipt without its record would be a permanent claim to
-			// an ownership the record never took.
+			// And the authority, the member that carries the acceptance: it commits with
+			// the record or not at all. An authority without its record would be an
+			// acceptance of a session the record never took.
 			switch obs.RecptSubj {
 			case "":
-				t.Errorf("%s: the acknowledged accept batch carried no ownership receipt "+
-					"member: the accept path is not the metadata-commit path", acceptBatchTornMarker)
+				t.Errorf("%s: the acknowledged accept batch carried no authority "+
+					"member: the accept path is not the acceptance-commit path", acceptBatchTornMarker)
 			default:
 				rmsg, rerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, obs.RecptSubj)
 				switch {
 				case rerr != nil || rmsg == nil:
 					t.Errorf("%s: the accept batch was acknowledged at sequence %d, but no "+
-						"COMMITTED receipt is on %q: the record committed without it (%v)",
+						"authority is on %q: the record committed without it (%v)",
 						acceptBatchTornMarker, obs.Seq, obs.RecptSubj, rerr)
 				case mqttRecordDigest(rmsg.Data) != obs.RecptDigest:
-					t.Errorf("%s: the receipt on %q is not the body this attempt sent",
+					t.Errorf("%s: the authority on %q is not the body this attempt sent",
 						acceptBatchTornMarker, obs.RecptSubj)
 				}
 			}

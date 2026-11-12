@@ -518,8 +518,10 @@ func (w *mqttDisposal) settleHandles() bool {
 	sess.mu.Unlock()
 	var unresolved []*mqttTransitionHandle
 	for _, h := range handles {
-		switch sess.settleCustodyHandle(h) { // resolve -> abort -> resolve
-		case mqttTransitionNeverLanded, mqttTransitionLanded, mqttTransitionSuperseded:
+		switch sess.settleCustodyHandle(h, nil) { // resolve -> abort -> resolve
+		case mqttTransitionNeverLanded, mqttTransitionLanded, mqttTransitionSuperseded, mqttTransitionRetired:
+			// Settled. A RETIRED attempt leaves the set too: its scope's work is terminal, and the
+			// owner finishes under its own source and generation rules.
 		default:
 			unresolved = append(unresolved, h)
 		}

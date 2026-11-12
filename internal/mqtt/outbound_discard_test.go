@@ -26,13 +26,13 @@ import (
 // issue #107 7d: the two acts a discarded generation's retirement takes under its closure, at the write
 // boundary (plan-7d T5, T14, T16).
 
-// testDiscardPlantClosure plants generation gen's closure, discarding or not. Direct, because what
+// testDiscardPlantClosure plants generation gen's closure (every closure discards). Direct, because what
 // is under test is the boundary's READ of the licence; the transitions that write one are tested
 // where they live.
-func testDiscardPlantClosure(t *testing.T, jsa *mqttJSA, id, epoch, gen string, discard bool) {
+func testDiscardPlantClosure(t *testing.T, jsa *mqttJSA, id, epoch, gen string) {
 	t.Helper()
 	body, err := json.Marshal(&mqttGenClosure{
-		ID: id, Epoch: epoch, Gen: gen, Txn: "txn-planted-closure", Discard: discard,
+		ID: id, Epoch: epoch, Gen: gen, Txn: "txn-planted-closure",
 		RootShard: mqttDirShardFor(getHash(id)), RootOrd: 1,
 	})
 	if err != nil {
@@ -86,7 +86,7 @@ func TestDiscardEndsAnObligationOfADiscardedGeneration(t *testing.T) {
 					t.Fatalf("advancing to %d: %v", to, err)
 				}
 			}
-			testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+			testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 			if _, err := e.asm.jsa.opDiscardExchange(e.id, e.epoch, "txn-discard", testGen, x.Nonce); err != nil {
 				t.Fatalf("the discard was refused: %v", err)
 			}
@@ -121,29 +121,21 @@ func TestDiscardBoundaryRefusals(t *testing.T) {
 		defer done()
 		x := testDiscardHeldQoS2(t, e)
 		_, err := e.asm.jsa.commitAuthorityTransition(compose(t, e, x, true))
-		testDiscardRefused(t, err, "only a committed discarding closure licenses")
-	})
-	t.Run("a preserving closure", func(t *testing.T) {
-		e, done := testNewEnv(t, "f105-discard-b-preserve")
-		defer done()
-		x := testDiscardHeldQoS2(t, e)
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, false)
-		_, err := e.asm.jsa.commitAuthorityTransition(compose(t, e, x, true))
-		testDiscardRefused(t, err, "preserving its obligations")
+		testDiscardRefused(t, err, "only a committed closure licenses")
 	})
 	t.Run("another generation's closure", func(t *testing.T) {
 		e, done := testNewEnv(t, "f105-discard-b-other")
 		defer done()
 		x := testDiscardHeldQoS2(t, e)
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen2, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen2)
 		_, err := e.asm.jsa.commitAuthorityTransition(compose(t, e, x, true))
-		testDiscardRefused(t, err, "only a committed discarding closure licenses")
+		testDiscardRefused(t, err, "only a committed closure licenses")
 	})
 	t.Run("without its hold releases", func(t *testing.T) {
 		e, done := testNewEnv(t, "f105-discard-b-norelease")
 		defer done()
 		x := testDiscardHeldQoS2(t, e)
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		_, err := e.asm.jsa.commitAuthorityTransition(compose(t, e, x, false))
 		testDiscardRefused(t, err, "without releasing its hold")
 	})
@@ -156,7 +148,7 @@ func TestDiscardBoundaryRefusals(t *testing.T) {
 		if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, x.Nonce, mqttExchangeRejected); err != nil {
 			t.Fatalf("ending the obligation: %v", err)
 		}
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		cur, curSeq := testLoadExchange(t, e, testGen, x.Nonce)
 		pending := *cur
 		pending.Phase = mqttExchangePublish
@@ -172,7 +164,7 @@ func TestDiscardBoundaryRefusals(t *testing.T) {
 		e, done := testNewEnv(t, "f105-discard-b-kind")
 		defer done()
 		x := testDiscardHeldQoS2(t, e)
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		tr := compose(t, e, x, true)
 		tr.Attempt.Kind = mqttTransitionAdvanceExchange
 		_, err := e.asm.jsa.commitAuthorityTransition(tr)
@@ -185,7 +177,7 @@ func TestDiscardBoundaryRefusals(t *testing.T) {
 		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		nonce, subj, reg, regSeq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
 		x, _ := testLoadExchange(t, e, testGen, nonce)
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		tr := compose(t, e, x, true)
 		b, _ := json.Marshal(reg)
 		tr.Extra = append(tr.Extra, mqttTransitionMember{subj: subj, expect: regSeq, body: b})
@@ -202,7 +194,7 @@ func TestDiscardPreservesAnEnding(t *testing.T) {
 	if _, err := testAdvanceLive(t, &e.asm.jsa, e.id, e.epoch, testGen, x.Nonce, mqttExchangeRejected); err != nil {
 		t.Fatalf("ending the obligation: %v", err)
 	}
-	testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+	testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 	_, before := testLoadExchange(t, e, testGen, x.Nonce)
 	_, err := e.asm.jsa.opDiscardExchange(e.id, e.epoch, "txn-discard", testGen, x.Nonce)
 	if !errors.Is(err, errMQTTExchangeAlreadyReleased) {
@@ -224,7 +216,7 @@ func TestDiscardPreservesTheAbandonmentFact(t *testing.T) {
 		x := f.exchange(t)
 		testRequireHolds(t, &f.e.asm.jsa, x, true)
 		jsa, id, epoch := &f.e.asm.jsa, f.e.sess.id, f.e.asm.sessStreamEpoch
-		testDiscardPlantClosure(t, jsa, id, epoch, f.gen, true)
+		testDiscardPlantClosure(t, jsa, id, epoch, f.gen)
 		if _, err := jsa.opDiscardExchange(id, epoch, "txn-discard", f.gen, f.lin); err != nil {
 			t.Fatalf("QoS %d: discarding the abandoned obligation was refused: %v", qos, err)
 		}
@@ -257,7 +249,7 @@ func TestGenerationDiscardedDisposal(t *testing.T) {
 
 	t.Run("licensed by a discarding closure, with no tenure", func(t *testing.T) {
 		e := setup(t, "ok")
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		if _, err := e.asm.jsa.opDisposeDiscarded(e.id, e.epoch, "txn-disp", testGen, "inc-src"); err != nil {
 			t.Fatalf("the discard's disposal was refused: %v", err)
 		}
@@ -277,23 +269,17 @@ func TestGenerationDiscardedDisposal(t *testing.T) {
 	t.Run("without a closure", func(t *testing.T) {
 		e := setup(t, "none")
 		err := direct(t, e, &mqttResourceDisposal{Txn: "txn-x", Reason: mqttDisposalGenerationDiscarded, Gen: testGen})
-		testDiscardRefused(t, err, "only a committed discarding closure licenses")
-	})
-	t.Run("under a preserving closure", func(t *testing.T) {
-		e := setup(t, "preserve")
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, false)
-		err := direct(t, e, &mqttResourceDisposal{Txn: "txn-x", Reason: mqttDisposalGenerationDiscarded, Gen: testGen})
-		testDiscardRefused(t, err, "preserving its obligations")
+		testDiscardRefused(t, err, "only a committed closure licenses")
 	})
 	t.Run("naming another generation", func(t *testing.T) {
 		e := setup(t, "othergen")
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen2, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen2)
 		err := direct(t, e, &mqttResourceDisposal{Txn: "txn-x", Reason: mqttDisposalGenerationDiscarded, Gen: testGen2})
 		testDiscardRefused(t, err, "a discard decides only its own generation's consumers")
 	})
 	t.Run("carrying a tenure", func(t *testing.T) {
 		e := setup(t, "tenure")
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		err := direct(t, e, &mqttResourceDisposal{Txn: "txn-x", Reason: mqttDisposalGenerationDiscarded,
 			Gen: testGen, Tenure: al.rec.Tenure})
@@ -301,7 +287,7 @@ func TestGenerationDiscardedDisposal(t *testing.T) {
 	})
 	t.Run("another reason without a tenure", func(t *testing.T) {
 		e := setup(t, "notenure")
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		d := &mqttResourceDisposal{Txn: "txn-x", Reason: mqttDisposalUnsubscribed, Gen: testGen}
 		// The licence refuses it at the boundary (no serving entitlement has an empty tenure), and
 		// the closed schema refuses it on its own, which is the reason-specific rule under test.
@@ -353,7 +339,7 @@ func TestAckAndDiscardRaceOnOneExchange(t *testing.T) {
 		e.bootstrap(t, "txn-1")
 		testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
 		nonce, _, reg, regSeq := testAdmitQoS(t, e, "txn-adm", 7, 1, "inc-src")
-		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen, true)
+		testDiscardPlantClosure(t, &e.asm.jsa, e.id, e.epoch, testGen)
 		return e, nonce, reg, regSeq
 	}
 	ack := func(e *testOutboundEnv, nonce string, reg *mqttInflightRecord, regSeq uint64) error {

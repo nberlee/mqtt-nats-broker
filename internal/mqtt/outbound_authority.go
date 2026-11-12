@@ -45,9 +45,8 @@ import (
 //
 //   - ADMISSION is the authority's positive state. A missing authority record does not
 //     establish an open generation, and a missing anything never establishes a fact here.
-//   - CLOSURE is a permanent per-generation record. It is AUTHORITATIVE, and the
-//     $MQTT_teardown generation-retirement watermark becomes a recoverable index
-//     projected from it — never independent closure evidence. "Retired" means no new
+//   - CLOSURE is a per-generation record, AUTHORITATIVE for its generation until that
+//     generation retires (issue #133). "Retired" means no new
 //     admission; it does NOT mean every old operation finished or every backing resource
 //     is disposable.
 //   - An OUTCOME is the permanent, immutable verdict of one attempted transition. It
@@ -92,9 +91,8 @@ func mqttIsOutboundRecordSubject(subject string) bool {
 	return strings.HasPrefix(subject, mqttOutboundRecordSubjectPrefix())
 }
 
-// mqttIsOutboundArbitrationSubject reports whether a subject is one of the three records the
-// TRANSITION WRITER ITSELF owns: the authority, a permanent generation closure, a permanent
-// transition outcome.
+// mqttIsOutboundArbitrationSubject reports whether a subject is one of the records the
+// TRANSITION WRITER ITSELF owns: the authority, a generation closure, a transition outcome.
 //
 // The distinction from the obligation classes matters and is not cosmetic. These three are
 // how a transition is arbitrated and recorded, so a caller-supplied member naming one would
@@ -165,8 +163,12 @@ func mqttGenClosureSubject(idHash, gen string) string {
 // that cannot decide publishes ABORTED to the same subject, so exactly one of the two can
 // ever exist and the loser's whole batch is refused. Two slots, or one overwritable slot,
 // would let an abort stand beside a later commit and decide nothing.
-func mqttTransitionOutcomeSubject(idHash, txn string) string {
-	return mqttOutboundRecordSubjectPrefix() + mqttOutcomeClassTk + "." + idHash + "." + txn
+//
+// SCOPED, ob.txn.<idHash>.<scope>.<txn>: a generation-scoped outcome is one of that
+// generation's records and is reclaimed with them by its purge filter; a lifecycle-scoped one
+// (L.<L>) outlives every generation of its lifecycle (mqttKindOutcomeScope).
+func mqttTransitionOutcomeSubject(idHash, scope, txn string) string {
+	return mqttOutboundRecordSubjectPrefix() + mqttOutcomeClassTk + "." + idHash + "." + scope + "." + txn
 }
 
 // mqttOutboundIdentTk reports whether s is a nonempty single subject token. Used for the
@@ -189,54 +191,11 @@ func mqttOutboundIdentTk(s string) bool {
 type mqttTransitionKind string
 
 const (
-	// There is deliberately NO kind that installs a SERVING authority outright.
-	//
-	// Two once existed — admit-tenure at revision 1 and readmit-tenure over a closure — and
-	// both were the bootstrap gap itself: an authority entitled to serve a client with no
-	// reservation behind it and no committed metadata half, which is the entitlement issue #107
-	// exists to make impossible. Every route to SERVING is now reserve-creation, a metadata
-	// commit, and finalize-creation, whose verdict check reads the permanent receipt.
-	mqttTransitionPrepareIntent mqttTransitionKind = "prepare-intent"
-	mqttTransitionFinalize      mqttTransitionKind = "finalize"
-	mqttTransitionCloseAdmit    mqttTransitionKind = "close-admission"
-	// mqttTransitionCloseTeardown is the AUTHORIZED DISCARDING closure of a standalone
-	// teardown: a session that ends with no displacing successor closes its OWN authority
-	// and abandons its outbound obligations, which a close-admission may never do.
-	//
-	// It is close-admission with the one difference that it MAY discard, and the difference
-	// is authorized rather than asserted: the operation loads and validates a durable
-	// teardown receipt naming the exact retiring ownership before it composes the batch, and
-	// carries that receipt's retirement onto the transition so the boundary binds the affine
-	// enrolment to the target the receipt selected, exactly as a finalization binds to its
-	// intent's. Ending a generation is still not authority to abandon what it owes; the
-	// receipt is that authority (issue #107, row 8, Gap 1).
-	mqttTransitionCloseTeardown mqttTransitionKind = "close-teardown"
+	// There is deliberately NO kind that installs a SERVING authority outright: every route to
+	// SERVING is an acceptance shape, which commits the ownership and the session record as one
+	// batch (accept_shapes.go, issue #133).
 	mqttTransitionAdmitExchange mqttTransitionKind = "admit-exchange"
 	mqttTransitionAcquireAction mqttTransitionKind = "acquire-action"
-	// mqttTransitionCancelIntent returns a PREPARING authority to serving under its
-	// ORIGINAL ownership, on proof that the metadata half was positively aborted.
-	//
-	// Without it a preparation whose metadata half lost is a dead end: admission and
-	// preparation both require SERVING, finalization requires the proposed ownership, and
-	// closing admission would destroy a session that was never displaced. A broker would
-	// have to either delete the authority or wait forever, and the first is the shape this
-	// item exists to remove.
-	mqttTransitionCancelIntent mqttTransitionKind = "cancel-intent"
-	// mqttTransitionReserveCreation claims a client with a proposal that serves nothing.
-	//
-	// It installs a RESERVING authority, which grants no serving permission: the shape
-	// virgin creation lacked. Two predecessors are legal and they are ONE fact, not two
-	// kinds — an ABSENT one at revision 1, create-only by virtue of that, and a CLOSED one
-	// proposing a fresh generation.
-	//
-	// The second is what makes a claim after a closure executable at all, and it is the ONLY
-	// route there: a kind installing SERVING over a closure would reintroduce the bootstrap
-	// gap on the second attempt — after an abandoned first creation, which is precisely when
-	// it is reached.
-	mqttTransitionReserveCreation mqttTransitionKind = "reserve-creation"
-	// mqttTransitionFinalizeCreation turns a reservation into a serving authority, after
-	// its metadata half has committed. It may install only what the reservation proposed.
-	mqttTransitionFinalizeCreation mqttTransitionKind = "finalize-creation"
 	// mqttTransitionDisposeResource authorizes or completes the cleanup of a backing
 	// resource, and is the ONE obligation transition that does not require serving
 	// authority.
@@ -352,18 +311,64 @@ const (
 	mqttTransitionFencePendingDisposal mqttTransitionKind = "fence-pending-disposal"
 )
 
+// mqttOutcomeScopeClass is what an outcome's scope names: one generation, or the lifecycle.
+type mqttOutcomeScopeClass uint8
+
+const (
+	mqttOutcomeScopeGeneration mqttOutcomeScopeClass = iota + 1
+	mqttOutcomeScopeLifecycle
+)
+
+// mqttKindOutcomeScope is THE scope of each kind. A transition whose business is one
+// generation's records is scoped to THAT generation, the one its members belong to and not the
+// one the authority serves: old-generation cleanup under a successor is the old generation's.
+// A transition that changes lifecycle-level state (an acceptance, the bind and abandonment, the
+// teardown claim and release, the Will anchors) is scoped to the lifecycle, so its outcome
+// survives the generation it closed or installed.
+func mqttKindOutcomeScope(k mqttTransitionKind) mqttOutcomeScopeClass {
+	switch k {
+	case mqttTransitionTeardownClaim, mqttTransitionTeardownRelease, mqttTransitionRetireGeneration, mqttTransitionRetireLifecycle,
+		mqttTransitionAcceptCreate, mqttTransitionAcceptHandoff, mqttTransitionAcceptReopen,
+		mqttTransitionAcceptDisplace, mqttTransitionBind, mqttTransitionAcceptAbandon,
+		mqttTransitionWillAnchor:
+		return mqttOutcomeScopeLifecycle
+	}
+	return mqttOutcomeScopeGeneration
+}
+
+// mqttCheckOutcomeScope reports whether scope is a well-formed scope of kind k's class.
+func mqttCheckOutcomeScope(k mqttTransitionKind, scope string) error {
+	_, gen, ok := mqttParseOutcomeScope(scope)
+	switch {
+	case !ok:
+		return fmt.Errorf("a %s attempt carries a malformed outcome scope %q", k, scope)
+	case mqttKindOutcomeScope(k) == mqttOutcomeScopeGeneration && gen == _EMPTY_:
+		return fmt.Errorf("a %s attempt is generation-scoped and carries the lifecycle scope %q", k, scope)
+	case mqttKindOutcomeScope(k) == mqttOutcomeScopeLifecycle && gen != _EMPTY_:
+		return fmt.Errorf("a %s attempt is lifecycle-scoped and carries the generation scope %q", k, scope)
+	}
+	return nil
+}
+
+// mqttKindResolvesIntent reports whether a kind names the acceptance it answers: the acceptance
+// shapes, the bind, and the abandonment of a resume.
+func mqttKindResolvesIntent(k mqttTransitionKind) bool {
+	return mqttIsAcceptShape(k) || k == mqttTransitionBind || k == mqttTransitionAcceptAbandon
+}
+
 // mqttValidTransitionKind reports whether k is one this broker writes.
 func mqttValidTransitionKind(k mqttTransitionKind) bool {
 	switch k {
-	case mqttTransitionPrepareIntent, mqttTransitionFinalize,
-		mqttTransitionCloseAdmit, mqttTransitionCloseTeardown,
+	case mqttTransitionTeardownClaim, mqttTransitionTeardownRelease, mqttTransitionRetireGeneration, mqttTransitionRetireLifecycle,
 		mqttTransitionAdmitExchange, mqttTransitionAcquireAction,
-		mqttTransitionCancelIntent, mqttTransitionDisposeResource, mqttTransitionProvisionResource,
-		mqttTransitionReserveCreation, mqttTransitionFinalizeCreation,
+		mqttTransitionDisposeResource, mqttTransitionProvisionResource,
 		mqttTransitionAdvanceExchange, mqttTransitionMaterializePayload,
 		mqttTransitionWithdrawUnsent, mqttTransitionAbandonDelivery, mqttTransitionTombstoneRegister,
 		mqttTransitionRebindCanonical, mqttTransitionDiscardExchange, mqttTransitionFenceSharedRelease,
-		mqttTransitionFencePendingDisposal, mqttTransitionAdvanceFloor, mqttTransitionReleaseHolds:
+		mqttTransitionFencePendingDisposal, mqttTransitionAdvanceFloor, mqttTransitionReleaseHolds,
+		mqttTransitionAcceptCreate, mqttTransitionAcceptHandoff, mqttTransitionAcceptReopen, mqttTransitionAcceptDisplace, mqttTransitionBind,
+		mqttTransitionAcceptAbandon,
+		mqttTransitionWillAnchor:
 		return true
 	}
 	return false
@@ -387,6 +392,10 @@ type mqttTransitionAttempt struct {
 
 	// Txn is this ATTEMPT's identity, fresh per attempt, and names the outcome subject.
 	Txn string
+	// Scope is the outcome's scope (mqttKindOutcomeScope): the generation the members belong to,
+	// or the lifecycle token. Part of the outcome subject, so the abort and the resolution that
+	// hold only the attempt name the same subject the commit did.
+	Scope string
 	// Op is the LOGICAL operation, stable across the transport attempts of one transition.
 	// A fresh batch id per transport attempt is a transport concern; this is what an
 	// ambiguity resolution is about.
@@ -431,6 +440,9 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 	if !mqttValidTransitionKind(a.Kind) {
 		return fmt.Errorf("transition attempt carries an unsupported kind %q", a.Kind)
 	}
+	if serr := mqttCheckOutcomeScope(a.Kind, a.Scope); serr != nil {
+		return serr
+	}
 	if a.PrevTxn != _EMPTY_ && !mqttOutboundIdentTk(a.PrevTxn) {
 		return fmt.Errorf("transition attempt names a malformed predecessor transition %q", a.PrevTxn)
 	}
@@ -457,11 +469,11 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 		return fmt.Errorf("transition attempt at revision %d names predecessor %q: only a first admission has none",
 			a.Rev, a.PrevTxn)
 	}
-	// The intent is required by exactly the two kinds that resolve one, and refused by the
-	// rest: an attempt that carried one where it means nothing would have a field no reader
-	// checks, which is how a stale value survives to be believed later.
-	needsIntent := a.Kind == mqttTransitionFinalize || a.Kind == mqttTransitionCancelIntent ||
-		a.Kind == mqttTransitionFinalizeCreation
+	// The intent is required by exactly the kinds that resolve one (the acceptances, the bind and
+	// the abandonment of a resume), and refused by the rest: an attempt that carried one where it
+	// means nothing would have a field no reader checks, which is how a stale value survives to be
+	// believed later.
+	needsIntent := mqttKindResolvesIntent(a.Kind)
 	if needsIntent && !mqttOutboundIdentTk(a.Intent) {
 		return fmt.Errorf("a %s attempt names no handoff intent", a.Kind)
 	}
@@ -478,9 +490,8 @@ func mqttValidateTransitionAttempt(a *mqttTransitionAttempt) error {
 // mqttAuthorityState is the lifecycle of one client's outbound authority.
 //
 // The states are deliberately few, and none of them is "unknown": an authority that cannot
-// be read is refused by its reader rather than classified here, for the reason the
-// retirement watermark refuses a corrupt read — a record you cannot interpret may name a
-// tenure newer than yours.
+// be read is refused by its reader rather than classified here: a record you cannot
+// interpret may name a tenure newer than yours.
 //
 // The constants start at 1. A missing or null `state` member decodes to the zero value,
 // and a zero naming a real state would make an unsupported persisted shape read as
@@ -493,32 +504,10 @@ const (
 	// mqttAuthorityServing is the ordinary state: Tenure names the tenure admitted to
 	// create outbound obligations for Gen.
 	mqttAuthorityServing mqttAuthorityState = 1
-	// mqttAuthorityPreparing names a handoff intent that has reserved the transition and
-	// TEMPORARILY frozen new admission. It is not closure: obligations already admitted
-	// continue, and their completion is still permitted.
-	mqttAuthorityPreparing mqttAuthorityState = 2
 	// mqttAuthorityClosed records that Gen is permanently closed to new admission. The
 	// permanent closure record is the authority for that; this state is the same fact in
 	// the place contention happens.
 	mqttAuthorityClosed mqttAuthorityState = 3
-	// mqttAuthorityReserving is a FIRST CREATION that has reserved its arbitration and is
-	// not yet serving.
-	//
-	// It exists because virgin creation had no representation at all: a first admission
-	// installs SERVING with no predecessor, while a prepared handoff requires a full
-	// one — predecessor generation, tenure, ownership transition, session write identity
-	// and a nonzero session sequence — so there was no way to express "this client has no
-	// prior ownership and I am claiming it" without either serving before the metadata
-	// committed or MANUFACTURING a predecessor from session metadata. The second is
-	// forbidden: missing metadata is not evidence that a creation is first, and inventing
-	// a predecessor would let a reader believe ownership was displaced that never existed.
-	//
-	// A reservation grants NO serving permission. It is create-only, so exactly one
-	// claimant can hold it, and it is finalized into a serving authority only after the
-	// metadata half commits. An abandoned reservation is CLOSED rather than deleted — its
-	// generation never served and never will — and a later attempt reserves a fresh
-	// generation beside it, through reserve-creation again.
-	mqttAuthorityReserving mqttAuthorityState = 4
 )
 
 // mqttOutboundAuthority is the per-client arbitration record.
@@ -552,41 +541,9 @@ type mqttOutboundAuthority struct {
 	// preparation silently retarget the predecessor a finalization must match.
 	OwnerTxn string `json:"owner_txn"`
 
-	// Intent is the handoff intent this authority has reserved, present exactly in the
-	// preparing state and absent otherwise.
-	Intent *mqttHandoffIntent `json:"intent,omitempty"`
-
-	// Creation is the first-creation proposal, present exactly in the reserving state and
-	// absent otherwise.
-	Creation *mqttCreationIntent `json:"creation,omitempty"`
-}
-
-// mqttHandoffIntent is the immutable description of a proposed ownership move.
-//
-// It names its PREDECESSOR explicitly, and that is what makes a delayed acceptance lose:
-// finalization requires both this intent's id and the ownership predecessor it named, so a
-// CAS retry may refresh the storage revision it contends against but can never retarget a
-// successor that has since been admitted. Another acceptance requires another CONNECT
-// transaction, not the revival of this one.
-type mqttHandoffIntent struct {
-	ID string `json:"id"`
-
-	// The named predecessor, in full. PrevSessSeq is the session record's sequence at the
-	// time the predecessor was observed; it is part of the predecessor's identity and is
-	// NOT a tenure identity in its own right, since every confirmed save advances it.
-	PrevGen      string `json:"prev_gen"`
-	PrevTenure   string `json:"prev_tenure"`
-	PrevOwnerTxn string `json:"prev_owner_txn"`
-	PrevSessWID  string `json:"prev_sess_wid"`
-	PrevSessSeq  uint64 `json:"prev_sess_seq"`
-
-	// What the intent proposes.
-	Tenure   string `json:"tenure"`
-	Gen      string `json:"gen"`
-	CleanReq bool   `json:"clean_req"`
-
-	// Retire, when present, is the retirement this handoff also requests.
-	Retire *mqttRetirementRequest `json:"retire,omitempty"`
+	// Life is the lifecycle this authority belongs to and what reclamation needs it to say
+	// (lifecycle_authority.go).
+	Life *mqttLifecycleState `json:"life,omitempty"`
 }
 
 // mqttRetirementRequest names the exact predecessor a handoff asks to retire.
@@ -604,22 +561,11 @@ type mqttRetirementRequest struct {
 	// components D2 requires rather than the three that identify ownership alone. A
 	// retirement that named fewer could be satisfied by a predecessor whose metadata half
 	// had since been replaced.
-	//
-	// ONE EXCEPTION, stated (issue #107 8b, consult 122): a receipt the adopted teardown's receiptless
-	// continuation authors (claimTeardownReceipt) carries SessWID = the retired record's write
-	// identity (the marker's parent) but SessSeq = the PRE-BATCH MARKER's sequence, because the
-	// retired record's own sequence is not recoverable from the marker. There the two are not
-	// one record's identity; the marker CAS the receipt is committed with, and its nonce and
-	// MarkerWID, are what bind it. A teardown receipt's SessSeq is compared against nothing.
 	SessWID string `json:"sess_wid"`
 	SessSeq uint64 `json:"sess_seq"`
 	// Reason is one of the supported retirement reasons; a free string would let a
 	// contradictory request describe itself into legitimacy.
 	Reason mqttRetirementReason `json:"reason"`
-	// Discard records that explicit session discard was requested, as Clean Start does.
-	// It is a request, re-evaluated against the current authority by the CONNECT
-	// transaction; it is never itself authority to discard.
-	Discard bool `json:"discard"`
 	// The predecessor's AFFINE target, carried so the closure that ends its generation can
 	// enrol it AFTER the accepted batch has displaced the record that named it (issue #107).
 	//
@@ -638,75 +584,37 @@ type mqttRetirementRequest struct {
 	PubRelDurable string `json:"pubrel_durable,omitempty"`
 }
 
-// mqttCreationIntent is the immutable proposal of a FIRST creation.
-//
-// A separate type from mqttHandoffIntent on purpose. That type requires a full predecessor,
-// and that requirement is load-bearing — it is what stops a delayed acceptance retargeting a
-// successor — so weakening it to accommodate creation would remove the guarantee everywhere
-// to serve one case. A creation names no predecessor because there is none, and says so by
-// being a different shape rather than by leaving fields empty.
-type mqttCreationIntent struct {
-	ID     string `json:"id"`
-	Gen    string `json:"gen"`
-	Tenure string `json:"tenure"`
-}
-
-// mqttValidateCreationIntent refuses a creation proposal this broker cannot act on.
-func mqttValidateCreationIntent(i *mqttCreationIntent) error {
-	if i == nil {
-		return fmt.Errorf("creation intent is absent")
-	}
-	if !mqttOutboundIdentTk(i.ID) {
-		return fmt.Errorf("creation intent carries a malformed id %q", i.ID)
-	}
-	if !mqttValidSessGen(i.Gen) {
-		return fmt.Errorf("creation intent proposes a malformed generation %q", i.Gen)
-	}
-	if !mqttOutboundIdentTk(i.Tenure) {
-		return fmt.Errorf("creation intent proposes a malformed tenure %q", i.Tenure)
-	}
-	return nil
-}
-
-// mqttRetirementReason is the closed set of reasons a handoff may request retirement.
-//
-// Closed because the reason is not decoration: it decides which CONNECT mode and which
-// discard disposition are legal, and a free string would let a request assert one thing in
-// its reason and another in its flags.
+// mqttRetirementReason is the closed set of reasons a generation is retired. Every retirement
+// DISCARDS the generation it names (issue #133: a noncurrent generation is a discarded one); the
+// reason says only what ended it.
 type mqttRetirementReason string
 
 const (
-	// mqttRetireCleanStart is an explicit client-requested discard. It is the only reason
-	// that may carry Discard, and it necessarily replaces the generation.
+	// mqttRetireCleanStart is an explicit client-requested discard, which replaces the
+	// generation in the acceptance that displaces it.
 	mqttRetireCleanStart mqttRetirementReason = "clean-start"
-	// mqttRetireExpiry is the session-expiry pass retiring an elapsed session. It never
-	// carries Discard: expiry ends the session's entitlement, and what happens to its
-	// outstanding obligations is decided by the retirement protocol, not asserted here.
-	mqttRetireExpiry mqttRetirementReason = "expiry"
-	// mqttRetireTakeover is a successor acceptance displacing a predecessor that keeps its
-	// session. It preserves the generation, so it never carries Discard either.
-	mqttRetireTakeover mqttRetirementReason = "takeover"
 	// mqttRetireSessionEnd is the OWNING broker discarding its own session record because
 	// the session's retention ended: a clean-session close, a zero session-expiry
 	// disconnect, or an elapsed expiry that removes the record. Unlike Clean Start it is
-	// not driven by a displacing CONNECT and carries no handoff — it is a standalone
-	// teardown — and unlike a plain expiry/takeover it DOES discard, which is the fact the
-	// durable teardown receipt authorizes and the discarding closure records. It exists
-	// because Clean Start was the only reason that could discard, and a session that ends
-	// with no successor still has to close its own authority (issue #107, row 8, Gap 1).
+	// not driven by a displacing CONNECT and carries no handoff: it is a standalone
+	// teardown, authorized at the teardown claim's write boundary.
 	mqttRetireSessionEnd mqttRetirementReason = "session-end"
 )
 
 // mqttValidRetirementReason reports whether r is one this broker writes.
 func mqttValidRetirementReason(r mqttRetirementReason) bool {
 	switch r {
-	case mqttRetireCleanStart, mqttRetireExpiry, mqttRetireTakeover, mqttRetireSessionEnd:
+	case mqttRetireCleanStart, mqttRetireSessionEnd, mqttRetireAbandoned:
 		return true
 	}
 	return false
 }
 
 // mqttGenClosure is the permanent record that one generation is closed to new admission.
+//
+// EVERY CLOSURE DISCARDS (issue #133). A generation becomes noncurrent only by being discarded:
+// a preserving close keeps it current, so there is no closure that ends admission while keeping
+// the obligations, and no member saying which of the two a closure is.
 type mqttGenClosure struct {
 	ID    string `json:"id"`
 	Epoch string `json:"epoch"`
@@ -714,11 +622,6 @@ type mqttGenClosure struct {
 	// Txn names the transition that closed it, so the closure and the outcome that
 	// produced it can be reconciled without either being inferred from the other.
 	Txn string `json:"txn"`
-	// Discard records whether the closure carried an authorized session discard, which is
-	// what distinguishes "this generation ended" from "this generation's obligations were
-	// authorized to be abandoned". They are different facts and only one of them licenses
-	// disposal.
-	Discard bool `json:"discard"`
 	// RootShard and RootOrd are the ADDRESS of the recovery root this closure's own batch
 	// allocated. Both are MANDATORY, and they are read rather than searched for: the release
 	// gate loads the root at this address instead of enumerating a shard by wildcard, which
@@ -754,6 +657,7 @@ type mqttTransitionOutcome struct {
 	ID      string             `json:"id"`
 	Epoch   string             `json:"epoch"`
 	Txn     string             `json:"txn"`
+	Scope   string             `json:"scope"`
 	Op      string             `json:"op"`
 	Kind    mqttTransitionKind `json:"kind"`
 	Verdict mqttOutcomeVerdict `json:"verdict"`
@@ -793,7 +697,7 @@ type mqttTransitionOutcome struct {
 
 var mqttAuthorityMembers = map[string]struct{}{
 	"id": {}, "epoch": {}, "gen": {}, "tenure": {}, "state": {}, "rev": {},
-	"txn": {}, "owner_txn": {}, "intent": {}, "creation": {},
+	"txn": {}, "owner_txn": {}, "life": {},
 }
 
 var mqttAuthorityRequired = map[string]struct{}{
@@ -801,37 +705,8 @@ var mqttAuthorityRequired = map[string]struct{}{
 	"txn": {}, "owner_txn": {},
 }
 
-var mqttIntentMembers = map[string]struct{}{
-	"id": {}, "prev_gen": {}, "prev_tenure": {}, "prev_owner_txn": {}, "prev_sess_wid": {},
-	"prev_sess_seq": {}, "tenure": {}, "gen": {}, "clean_req": {}, "retire": {},
-}
-
-var mqttIntentRequired = map[string]struct{}{
-	"id": {}, "prev_gen": {}, "prev_tenure": {}, "prev_owner_txn": {}, "prev_sess_wid": {},
-	"prev_sess_seq": {}, "tenure": {}, "gen": {}, "clean_req": {},
-}
-
-// A RETIREMENT REQUEST NAMES ALL FIVE COMPONENTS OF ITS PREDECESSOR, session identity
-// included. The set was left at three ownership members when sess_wid and sess_seq were
-// added, which made every preparing authority carrying a retirement request WRITABLE and
-// UNREADABLE: the record landed, and its own decoder then refused it as corrupt. Nothing
-// caught it because no test loaded such an authority back — the closed schema is only a
-// schema if the set and the struct are changed together.
-var mqttRetireMembers = map[string]struct{}{
-	"gen": {}, "tenure": {}, "owner_txn": {}, "sess_wid": {}, "sess_seq": {},
-	"reason": {}, "discard": {},
-	"affine_durable": {}, "affine_gen": {}, "pubrel_durable": {},
-}
-
-// mqttRetireRequired is what a retirement request must SAY, which is not the same set as what it
-// may carry. The durable targets are optional: a retirement that transfers nothing names none.
-var mqttRetireRequired = map[string]struct{}{
-	"gen": {}, "tenure": {}, "owner_txn": {}, "sess_wid": {}, "sess_seq": {},
-	"reason": {}, "discard": {},
-}
-
 var mqttClosureMembers = map[string]struct{}{
-	"id": {}, "epoch": {}, "gen": {}, "txn": {}, "discard": {},
+	"id": {}, "epoch": {}, "gen": {}, "txn": {},
 	"root_shard": {}, "root_ord": {},
 }
 
@@ -839,27 +714,27 @@ var mqttClosureMembers = map[string]struct{}{
 // ownership members — even spelled as explicit zeroes — is contradictory rather than merely
 // over-specified, so the two sets are separate and the verdict is read first.
 var mqttOutcomeCommonMembers = map[string]struct{}{
-	"id": {}, "epoch": {}, "txn": {}, "op": {}, "kind": {}, "verdict": {}, "prev_txn": {}, "intent": {},
+	"id": {}, "epoch": {}, "txn": {}, "scope": {}, "op": {}, "kind": {}, "verdict": {}, "prev_txn": {}, "intent": {},
 }
 
 var mqttOutcomeCommittedMembers = map[string]struct{}{
-	"id": {}, "epoch": {}, "txn": {}, "op": {}, "kind": {}, "verdict": {}, "prev_txn": {}, "intent": {},
+	"id": {}, "epoch": {}, "txn": {}, "scope": {}, "op": {}, "kind": {}, "verdict": {}, "prev_txn": {}, "intent": {},
 	"rev": {}, "gen": {}, "tenure": {}, "owner_txn": {}, "digest": {},
 }
 
 var mqttOutcomeCommonRequired = map[string]struct{}{
-	"id": {}, "epoch": {}, "txn": {}, "op": {}, "kind": {}, "verdict": {},
+	"id": {}, "epoch": {}, "txn": {}, "scope": {}, "op": {}, "kind": {}, "verdict": {},
 }
 
 var mqttOutcomeCommittedRequired = map[string]struct{}{
-	"id": {}, "epoch": {}, "txn": {}, "op": {}, "kind": {}, "verdict": {},
+	"id": {}, "epoch": {}, "txn": {}, "scope": {}, "op": {}, "kind": {}, "verdict": {},
 	"rev": {}, "gen": {}, "tenure": {}, "owner_txn": {}, "digest": {},
 }
 
 // mqttOutcomeCommittedFreeRequired is the committed receipt of a kind that may run authority-free:
 // an authority-free attempt produced no revision, so it carries none (mqttAttemptAuthorityFree).
 var mqttOutcomeCommittedFreeRequired = map[string]struct{}{
-	"id": {}, "epoch": {}, "txn": {}, "op": {}, "kind": {}, "verdict": {},
+	"id": {}, "epoch": {}, "txn": {}, "scope": {}, "op": {}, "kind": {}, "verdict": {},
 	"gen": {}, "tenure": {}, "owner_txn": {}, "digest": {},
 }
 
@@ -889,8 +764,7 @@ func mqttJSONOptionalMembersNotNull(data []byte, optional map[string]struct{}, n
 
 // The optional members of each class, which is what the rule above is applied to.
 var (
-	mqttAuthorityOptional = map[string]struct{}{"intent": {}, "creation": {}}
-	mqttIntentOptional    = map[string]struct{}{"retire": {}}
+	mqttAuthorityOptional = map[string]struct{}{"life": {}}
 	mqttOutcomeOptional   = map[string]struct{}{
 		"prev_txn": {}, "intent": {}, "rev": {}, "gen": {}, "tenure": {}, "owner_txn": {}, "digest": {},
 	}
@@ -912,42 +786,8 @@ func mqttDecodeOutboundAuthority(data []byte, wantID, wantEpoch string) (*mqttOu
 	if err := mqttJSONOptionalMembersNotNull(data, mqttAuthorityOptional, "an outbound authority"); err != nil {
 		return nil, err
 	}
-	raw := struct {
-		State  mqttAuthorityState `json:"state"`
-		Intent json.RawMessage    `json:"intent"`
-	}{}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := mqttCheckLifecycleSection(data); err != nil {
 		return nil, err
-	}
-	if raw.State == mqttAuthorityPreparing {
-		if len(raw.Intent) == 0 {
-			return nil, mqttShapeErr("a preparing outbound authority carries no handoff intent")
-		}
-		if err := mqttJSONMembersAreExactAndUnique(raw.Intent, mqttIntentMembers, "a handoff intent"); err != nil {
-			return nil, err
-		}
-		if err := mqttJSONMembersArePresent(raw.Intent, mqttIntentRequired, "a handoff intent"); err != nil {
-			return nil, err
-		}
-		if err := mqttJSONOptionalMembersNotNull(raw.Intent, mqttIntentOptional, "a handoff intent"); err != nil {
-			return nil, err
-		}
-		rr := struct {
-			Retire json.RawMessage `json:"retire"`
-		}{}
-		if err := json.Unmarshal(raw.Intent, &rr); err != nil {
-			return nil, err
-		}
-		if len(rr.Retire) != 0 {
-			if err := mqttJSONMembersAreExactAndUnique(rr.Retire, mqttRetireMembers, "a retirement request"); err != nil {
-				return nil, err
-			}
-			if err := mqttJSONMembersArePresent(rr.Retire, mqttRetireRequired, "a retirement request"); err != nil {
-				return nil, err
-			}
-		}
-	} else if len(raw.Intent) != 0 {
-		return nil, mqttShapeErr("a non-preparing outbound authority carries a handoff intent")
 	}
 	a := &mqttOutboundAuthority{}
 	if err := json.Unmarshal(data, a); err != nil {
@@ -1060,43 +900,13 @@ func mqttValidateOutboundAuthority(a *mqttOutboundAuthority, wantID, wantEpoch s
 	if a.Rev == 0 {
 		return fmt.Errorf("outbound authority carries no revision")
 	}
-	// The two intent shapes are present in exactly one state each, and nowhere else. A
-	// record carrying both, or carrying one in a state that does not use it, has two places
-	// to say what it is doing.
-	if a.Creation != nil && a.State != mqttAuthorityReserving {
-		return fmt.Errorf("outbound authority in state %d carries a creation intent", a.State)
+	if a.Life != nil {
+		if err := mqttValidateLifecycleState(a.Life, a.Gen, a.State == mqttAuthorityServing); err != nil {
+			return fmt.Errorf("outbound authority: %w", err)
+		}
 	}
 	switch a.State {
 	case mqttAuthorityServing, mqttAuthorityClosed:
-		if a.Intent != nil {
-			return fmt.Errorf("outbound authority in state %d carries a handoff intent", a.State)
-		}
-	case mqttAuthorityReserving:
-		if a.Intent != nil {
-			return fmt.Errorf("a reserving outbound authority carries a handoff intent")
-		}
-		if err := mqttValidateCreationIntent(a.Creation); err != nil {
-			return fmt.Errorf("reserving outbound authority: %w", err)
-		}
-		// THE RESERVATION DESCRIBES WHAT IT PROPOSES, not something else. A reservation
-		// whose body named a different generation or tenure from its own proposal would
-		// make the finalization's binding meaningless.
-		if a.Gen != a.Creation.Gen || a.Tenure != a.Creation.Tenure {
-			return fmt.Errorf("a reserving authority carries %q/%q but proposes %q/%q",
-				a.Gen, a.Tenure, a.Creation.Gen, a.Creation.Tenure)
-		}
-	case mqttAuthorityPreparing:
-		if err := mqttValidateHandoffIntentFor(getHash(a.ID), a.Intent); err != nil {
-			return fmt.Errorf("preparing outbound authority: %w", err)
-		}
-		// THE INTENT MUST NAME THIS AUTHORITY'S OWN OWNERSHIP as its predecessor. An
-		// intent naming some other predecessor is not a weaker intent: finalizing it would
-		// displace ownership nobody checked, which is the retarget this structure exists
-		// to prevent.
-		if a.Intent.PrevGen != a.Gen || a.Intent.PrevTenure != a.Tenure || a.Intent.PrevOwnerTxn != a.OwnerTxn {
-			return fmt.Errorf("handoff intent names predecessor %q/%q/%q but its authority carries %q/%q/%q",
-				a.Intent.PrevGen, a.Intent.PrevTenure, a.Intent.PrevOwnerTxn, a.Gen, a.Tenure, a.OwnerTxn)
-		}
 	default:
 		return fmt.Errorf("outbound authority carries an unsupported state %d", a.State)
 	}
@@ -1163,102 +973,6 @@ func mqttAffineRetireDescriptor(affDur, affGen, pubRelDur string) (string, strin
 	return affDur, affGen, pubRelDur
 }
 
-// mqttValidateHandoffIntentFor is mqttValidateHandoffIntent plus the AFFINE DESCRIPTOR, for the
-// callers that are about to PERSIST the intent and therefore know whose it is.
-//
-// The plain form is also used as a VIEW — mqttProposalFromHandoff reads an intent as a proposal —
-// and a view has no client identity to derive names from and is not the gate that must refuse an
-// unfinishable shape. The persistence boundaries are: the authority record's own validation, and
-// opPrepareHandoffFenced before the record is written.
-func mqttValidateHandoffIntentFor(idHash string, i *mqttHandoffIntent) error {
-	if err := mqttValidateHandoffIntent(i); err != nil {
-		return err
-	}
-	if i == nil || i.Retire == nil {
-		return nil
-	}
-	r := i.Retire
-	if derr := mqttValidateAffineDescriptor(idHash, r.Gen, r.AffineGen, r.AffineDurable,
-		r.PubRelDurable); derr != nil {
-		return fmt.Errorf("retirement request of generation %q: %w", r.Gen, derr)
-	}
-	return nil
-}
-
-// mqttValidateHandoffIntent refuses an intent that cannot name what it proposes to
-// displace, or whose retirement names a different predecessor from the intent itself.
-func mqttValidateHandoffIntent(i *mqttHandoffIntent) error {
-	if i == nil {
-		return fmt.Errorf("handoff intent is absent")
-	}
-	if !mqttOutboundIdentTk(i.ID) {
-		return fmt.Errorf("handoff intent carries a malformed id %q", i.ID)
-	}
-	if !mqttValidSessGen(i.PrevGen) {
-		return fmt.Errorf("handoff intent names a malformed predecessor generation %q", i.PrevGen)
-	}
-	if !mqttOutboundIdentTk(i.PrevTenure) {
-		return fmt.Errorf("handoff intent names a malformed predecessor tenure %q", i.PrevTenure)
-	}
-	if !mqttOutboundIdentTk(i.PrevOwnerTxn) {
-		return fmt.Errorf("handoff intent names a malformed predecessor ownership transition %q", i.PrevOwnerTxn)
-	}
-	if i.PrevSessWID == _EMPTY_ {
-		return fmt.Errorf("handoff intent names no predecessor session write identity")
-	}
-	// A predecessor that exists has a sequence. Zero is the shape of a record never
-	// written, so an intent claiming to displace one cannot carry it.
-	if i.PrevSessSeq == 0 {
-		return fmt.Errorf("handoff intent names a predecessor session record at sequence zero")
-	}
-	if !mqttValidSessGen(i.Gen) {
-		return fmt.Errorf("handoff intent proposes a malformed generation %q", i.Gen)
-	}
-	if !mqttOutboundIdentTk(i.Tenure) {
-		return fmt.Errorf("handoff intent proposes a malformed tenure %q", i.Tenure)
-	}
-	// A clean start DISCARDS the session, so it necessarily proposes a fresh generation; a
-	// resume necessarily preserves it. Either pairing reversed is a body whose two halves
-	// disagree about what it is asking for.
-	if i.CleanReq == (i.Gen == i.PrevGen) {
-		return fmt.Errorf("handoff intent requests clean=%t while proposing generation %q against predecessor %q",
-			i.CleanReq, i.Gen, i.PrevGen)
-	}
-	// A CLEAN START DISCARDS THE SESSION, so it must actually retire the predecessor it is
-	// displacing. Without this a clean start could replace the generation while leaving the
-	// old one admitted, which is the state whose obligations nothing would ever resolve.
-	if i.CleanReq && i.Retire == nil {
-		return fmt.Errorf("handoff intent clean-starts %q but requests no retirement of it", i.PrevGen)
-	}
-	if i.Retire != nil {
-		r := i.Retire
-		// THE FULL PREDECESSOR, all five components. Ownership alone would be satisfied by
-		// a predecessor whose session-record half had since been replaced.
-		if r.Gen != i.PrevGen || r.Tenure != i.PrevTenure || r.OwnerTxn != i.PrevOwnerTxn ||
-			r.SessWID != i.PrevSessWID || r.SessSeq != i.PrevSessSeq {
-			return fmt.Errorf("retirement request names %q/%q/%q/%q/%d but its intent's predecessor is %q/%q/%q/%q/%d",
-				r.Gen, r.Tenure, r.OwnerTxn, r.SessWID, r.SessSeq,
-				i.PrevGen, i.PrevTenure, i.PrevOwnerTxn, i.PrevSessWID, i.PrevSessSeq)
-		}
-		if !mqttValidRetirementReason(r.Reason) {
-			return fmt.Errorf("retirement request carries an unsupported reason %q", r.Reason)
-		}
-		// The reason, the CONNECT mode and the discard disposition are three statements
-		// about one request, and a body where they disagree describes no supported
-		// operation. A clean start is exactly the discarding case.
-		if (r.Reason == mqttRetireCleanStart) != i.CleanReq {
-			return fmt.Errorf("retirement request reasons %q against a clean=%t intent", r.Reason, i.CleanReq)
-		}
-		if r.Discard != (r.Reason == mqttRetireCleanStart) {
-			return fmt.Errorf("retirement request reasons %q with discard=%t", r.Reason, r.Discard)
-		}
-		// The AFFINE DESCRIPTOR is checked by mqttValidateHandoffIntentFor, which the two
-		// PERSISTENCE boundaries call — it needs the client identity the names derive from, and
-		// this function is also used as a view where there is none.
-	}
-	return nil
-}
-
 // mqttValidateGenClosure refuses a closure body this broker does not support. A closure
 // that cannot be read is an inconsistency, and its readers refuse the decisions that depend
 // on it rather than treating the generation as open.
@@ -1322,14 +1036,15 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 	if !mqttValidTransitionKind(o.Kind) {
 		return fmt.Errorf("transition outcome carries an unsupported kind %q", o.Kind)
 	}
+	if serr := mqttCheckOutcomeScope(o.Kind, o.Scope); serr != nil {
+		return serr
+	}
 	if o.PrevTxn != _EMPTY_ && !mqttOutboundIdentTk(o.PrevTxn) {
 		return fmt.Errorf("transition outcome names a malformed predecessor transition %q", o.PrevTxn)
 	}
-	// The same three kinds that must NAME the proposal they answer must record it, so the
-	// receipt says which one it was for. Keep this set and the attempt's in step: a kind
-	// required to name an intent whose receipt may not carry it would be unresolvable.
-	resolvesHandoff := o.Kind == mqttTransitionFinalize || o.Kind == mqttTransitionCancelIntent ||
-		o.Kind == mqttTransitionFinalizeCreation
+	// The kinds that must NAME the acceptance they answer must record it, so the outcome says
+	// which one it was for: the attempt's set (mqttKindResolvesIntent), one definition.
+	resolvesHandoff := mqttKindResolvesIntent(o.Kind)
 	if resolvesHandoff && !mqttOutboundIdentTk(o.Intent) {
 		return fmt.Errorf("a %s outcome names no handoff intent", o.Kind)
 	}
@@ -1387,6 +1102,9 @@ func mqttOutcomeMatchesAttempt(o *mqttTransitionOutcome, a *mqttTransitionAttemp
 	if o.Kind != a.Kind {
 		return fmt.Errorf("outcome names kind %q, the attempt %q", o.Kind, a.Kind)
 	}
+	if o.Scope != a.Scope {
+		return fmt.Errorf("outcome names scope %q, the attempt %q", o.Scope, a.Scope)
+	}
 	if o.PrevTxn != a.PrevTxn {
 		return fmt.Errorf("outcome names predecessor %q, the attempt %q", o.PrevTxn, a.PrevTxn)
 	}
@@ -1429,7 +1147,7 @@ func mqttTransitionDigest(a *mqttTransitionAttempt, authExpect uint64, authBody 
 			h.Write([]byte(p))
 		}
 	}
-	writeField(a.ID, a.Epoch, a.Txn, a.Op, string(a.Kind), a.PrevTxn, a.Gen, a.Tenure, a.OwnerTxn, a.Intent)
+	writeField(a.ID, a.Epoch, a.Txn, a.Scope, a.Op, string(a.Kind), a.PrevTxn, a.Gen, a.Tenure, a.OwnerTxn, a.Intent)
 	writeField(strconv.FormatUint(a.Rev, 10), strconv.FormatUint(authExpect, 10))
 	writeField(string(authBody))
 
@@ -1500,56 +1218,4 @@ func mqttNewTransitionHandle(t *mqttAuthorityTransition) (*mqttTransitionHandle,
 		return nil, derr
 	}
 	return &mqttTransitionHandle{attempt: *t.Attempt, digest: digest}, nil
-}
-
-// mqttSameHandoffIntent and mqttSameCreationIntent report whether two pending proposals are
-// the same one.
-//
-// Compared by VALUE rather than by pointer: a transition rebuilds the authority body, so the
-// proposal it carries is a different object even when it is the same proposal, and a pointer
-// comparison would report every faithful copy as a rewrite.
-func mqttSameHandoffIntent(a, b *mqttHandoffIntent) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	if a.Retire == nil || b.Retire == nil {
-		if a.Retire != nil || b.Retire != nil {
-			return false
-		}
-		return *a == *b || sameIntentBody(a, b)
-	}
-	return sameIntentBody(a, b) && sameRetirement(a.Retire, b.Retire)
-}
-
-// sameRetirement compares two retirement requests member by member.
-//
-// Written out rather than compared with ==, because the request now carries a SLICE of durable
-// names and Go refuses to compare a struct containing one. Spelling it out is also what keeps this
-// honest: a member added later and forgotten here would silently make two different retirements
-// compare equal, and a preserved-intent check that cannot see a difference is not a check.
-func sameRetirement(a, b *mqttRetirementRequest) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	if a.Gen != b.Gen || a.Tenure != b.Tenure || a.OwnerTxn != b.OwnerTxn ||
-		a.SessWID != b.SessWID || a.SessSeq != b.SessSeq || a.Reason != b.Reason ||
-		a.Discard != b.Discard || a.AffineDurable != b.AffineDurable ||
-		a.AffineGen != b.AffineGen || a.PubRelDurable != b.PubRelDurable {
-		return false
-	}
-	return true
-}
-
-func sameIntentBody(a, b *mqttHandoffIntent) bool {
-	return a.ID == b.ID && a.PrevGen == b.PrevGen && a.PrevTenure == b.PrevTenure &&
-		a.PrevOwnerTxn == b.PrevOwnerTxn && a.PrevSessWID == b.PrevSessWID &&
-		a.PrevSessSeq == b.PrevSessSeq && a.Tenure == b.Tenure && a.Gen == b.Gen &&
-		a.CleanReq == b.CleanReq
-}
-
-func mqttSameCreationIntent(a, b *mqttCreationIntent) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
 }

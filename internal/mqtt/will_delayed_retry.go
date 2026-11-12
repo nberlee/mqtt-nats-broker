@@ -2,7 +2,11 @@
 
 package mqtt
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
 // A DELAYED Will whose enqueue was refused before it had any effect, held until its
 // authorized account returns.
@@ -21,7 +25,7 @@ import "sync"
 // vehicle that recomputed it would reintroduce the very defect anchoring the
 // deadline was for. The authorized account is the identity the record is written
 // under and the fence deliverWillRecord applies at fire time. The origin sequence
-// and epoch are what mqttAcceptFactQualifies compares against. And the WillID and
+// and epoch are the record's provenance. And the WillID and
 // client-ID hash are carried IMMUTABLY so every re-attempt is the same create-only
 // CAS on the same subject; see enqueueDelayedWill, whose ambiguity resolution
 // depends on that identity being stable.
@@ -51,6 +55,10 @@ const (
 type mqttDelayedWillIdentity struct {
 	WillID  string
 	CIDHash string
+	// PossiblyLanded: an earlier attempt sent a create for this WillID that was never
+	// confirmed, so a record may stand (plan 5.3). Sticky: nothing clears it. A
+	// re-attempt is then an enqueue RESOLUTION, which never takes the fail-safe.
+	PossiblyLanded bool
 }
 
 // mqttWillEnqueueOutcome classifies which EXIT of enqueueDelayedWill was taken.
@@ -70,8 +78,7 @@ const (
 	mqttWillEnqueueConfirmed mqttWillEnqueueOutcome = iota
 	// mqttWillEnqueueUnavailable: refused BEFORE any enqueue effect, because the
 	// service account is not established or is not the one this Will was authorized
-	// against. The ONLY retainable outcome, and it is retainable precisely because
-	// nothing happened.
+	// against. Retained DEFINITELY UNSENT, precisely because nothing happened.
 	mqttWillEnqueueUnavailable
 	// mqttWillEnqueuePublishedInstead: the record was refused by its own writer
 	// validation and the fail-safe published it. The Will Delay is sacrificed rather
@@ -85,19 +92,68 @@ const (
 	// have gone out. Terminal: the caller must neither retry nor publish again.
 	mqttWillEnqueueUnconfirmedPublished
 	// mqttWillEnqueueUnconfirmedAbandoned: the attempts were exhausted and the
-	// fail-safe also failed. Terminal, with possible loss -- possible rather than
-	// certain, because a create may have landed before the re-reads failed, in which
-	// case the durable record still fires.
+	// fail-safe also failed (or, for a resolution, was never taken). Retained
+	// POSSIBLY LANDED: a create may have landed before the re-reads failed, in which
+	// case the durable record still fires, and a resolution finds it.
 	mqttWillEnqueueUnconfirmedAbandoned
+	// mqttWillEnqueueEnded: a resolution of a possibly-landed Will found no record and
+	// the Will's anchor discharged (or its lifecycle retired): the record landed and
+	// reached its terminal path, or the Will was otherwise settled. Nothing is left to do.
+	mqttWillEnqueueEnded
+
+	mqttWillEnqueueOutcomes //nolint:unused // the count of outcomes: TestEveryEnqueueOutcomeHasAnAnchorAction proves every one has an anchor action and a retention class
 )
 
-// retainable reports whether this outcome may be re-attempted later. Exactly one
-// outcome may, and it is the one with no enqueue effect.
-func (o mqttWillEnqueueOutcome) retainable() bool { return o == mqttWillEnqueueUnavailable }
+// mqttWillRetention is what an enqueue outcome leaves for the delayed queue (plan 5.3).
+type mqttWillRetention uint8
+
+const (
+	// mqttWillRetainNone: terminal; nothing is retained.
+	mqttWillRetainNone mqttWillRetention = iota
+	// mqttWillRetainUnsent: refused before any effect; definitely unsent, and a
+	// re-attempt is the ordinary enqueue.
+	mqttWillRetainUnsent
+	// mqttWillRetainPossiblyLanded: a create was sent and never confirmed, and the
+	// fail-safe did not publish; a record may stand, and it may be the only copy.
+	mqttWillRetainPossiblyLanded
+)
+
+// mqttWillAnchorAction is what an enqueue outcome does to the Will's anchor.
+type mqttWillAnchorAction uint8
+
+const (
+	// mqttWillAnchorKeep: the anchor stays OWED: the outbox terminal path, or the retained
+	// continuation, completes it.
+	mqttWillAnchorKeep mqttWillAnchorAction = iota
+	// mqttWillAnchorDischarge: the Will was published without its delay or can never be
+	// written, so the anchor protects nothing.
+	mqttWillAnchorDischarge
+)
+
+// mqttAnchorActionFor is THE map from an enqueue outcome to its anchor action and its
+// retention (plan 5.3's table), stated once so the producers and the delayed queue cannot
+// disagree about an outcome.
+func mqttAnchorActionFor(o mqttWillEnqueueOutcome) (mqttWillAnchorAction, mqttWillRetention) {
+	switch o {
+	case mqttWillEnqueueConfirmed, mqttWillEnqueueEnded:
+		return mqttWillAnchorKeep, mqttWillRetainNone
+	case mqttWillEnqueueUnavailable:
+		return mqttWillAnchorKeep, mqttWillRetainUnsent
+	case mqttWillEnqueueUnconfirmedAbandoned:
+		// Discharging here would cancel what may be the only durable copy.
+		return mqttWillAnchorKeep, mqttWillRetainPossiblyLanded
+	case mqttWillEnqueuePublishedInstead, mqttWillEnqueueTerminalFailed, mqttWillEnqueueUnconfirmedPublished:
+		return mqttWillAnchorDischarge, mqttWillRetainNone
+	default:
+		panic(fmt.Sprintf("mqtt: delayed-Will enqueue outcome %d has no anchor action", o))
+	}
+}
 
 // mqttOwedDelayedWill is one delayed-Will enqueue awaiting the return of the account
-// it was authorized against. Every field is captured, immutable, and re-used verbatim
-// on each attempt -- nothing here is re-derived, and no mutable session is held.
+// it was authorized against, or the resolution of a create that may have landed. Every
+// input is captured, immutable, and re-used verbatim on each attempt -- nothing here is
+// re-derived, and no mutable session is held. Only the identity's sticky PossiblyLanded
+// flag and the retry pacing change, and only under the pass.
 type mqttOwedDelayedWill struct {
 	as       *mqttAccountSessionManager
 	identity mqttDelayedWillIdentity
@@ -115,6 +171,36 @@ type mqttOwedDelayedWill struct {
 	originSessSeq   uint64
 	originSessEpoch string
 	size            int
+	// retryAt and backoff pace a POSSIBLY-LANDED entry's resolutions (plan 5.3): its own
+	// retry driver re-attempts it at retryAt, doubling backoff up to a bound. Touched only
+	// by the pass that holds dischargeMu.
+	retryAt time.Time
+	backoff time.Duration
+}
+
+// The possibly-landed retry driver's backoff bounds.
+const (
+	mqttPossiblyLandedRetryMin = 500 * time.Millisecond
+	mqttPossiblyLandedRetryMax = 30 * time.Second
+)
+
+// settleDelayedWillEnqueue applies a producer's enqueue outcome (mqttAnchorActionFor): the
+// anchor action, then the retention of whatever is left to re-attempt. It reports whether the
+// outcome is settled with nothing for the caller to report: a retained Will, or a terminal
+// outcome. A retention that was refused has already been reported here.
+func (s *Server) settleDelayedWillEnqueue(o *mqttOwedDelayedWill, anchor *mqttWillAnchorRef, outcome mqttWillEnqueueOutcome, eerr error) bool {
+	o.as.settleWillAnchorAfterEnqueue(o.clientID, anchor, outcome)
+	_, retention := mqttAnchorActionFor(outcome)
+	switch retention {
+	case mqttWillRetainNone:
+		return false
+	case mqttWillRetainPossiblyLanded:
+		o.identity.PossiblyLanded = true
+	}
+	if !s.retainDelayedWillEnqueue(o) {
+		s.Errorf("MQTT: the delayed Will of client %q on %q could not be retained (%v)", o.clientID, o.will.topic, eerr)
+	}
+	return true
 }
 
 type mqttDelayedWillQueue struct {
@@ -130,6 +216,9 @@ type mqttDelayedWillQueue struct {
 	// bytes charges exactly what the queue holds. An entry is uncharged only when it
 	// leaves, and it leaves only when its outcome is terminal.
 	bytes int
+	// retryTimer is the possibly-landed retry driver: one timer, armed after each pass at
+	// the earliest retryAt of the possibly-landed entries it left. Guarded by mu.
+	retryTimer *time.Timer
 	// kickPending coalesces waiters to one, cleared as soon as the waiting pass takes
 	// dischargeMu so a kick arriving DURING a pass schedules a fresh waiter.
 	kickPending bool
@@ -139,11 +228,14 @@ type mqttDelayedWillQueue struct {
 }
 
 // retainDelayedWillEnqueue holds a delayed-Will enqueue refused before it had any
-// effect, to be re-attempted when its authorized account returns.
+// effect, to be re-attempted when its authorized account returns, or one whose create
+// may have landed, to be resolved by its retry driver.
 //
 // Returns false when it could NOT be retained -- shutdown has begun, or the capacity
 // bound is reached -- and a false return is a loss the caller must report. Silence is
-// the one thing this must not do.
+// the one thing this must not do. A definitely unsent Will that is not retained is lost,
+// so its anchor is discharged; a possibly-landed one keeps its anchor OWED, because a
+// landed record still reaches its terminal path.
 //
 // The recheck-and-kick at the end is load-bearing, exactly as it is for the immediate
 // queue: the reconnect that would discharge this obligation can complete BETWEEN the
@@ -156,6 +248,7 @@ func (s *Server) retainDelayedWillEnqueue(o *mqttOwedDelayedWill) bool {
 	// The same admission gate every Will worker uses. A closed gate means shutdown
 	// Phase 2 has begun and nothing new may be taken on.
 	if !s.admitWillWorker() {
+		s.releaseUnretainedDelayedWill(o, false)
 		return false
 	}
 	o.size = len(o.will.message) + len(o.props) + len(o.will.topic)
@@ -168,6 +261,7 @@ func (s *Server) retainDelayedWillEnqueue(o *mqttOwedDelayedWill) bool {
 		s.willWorkerWG.Done()
 		s.Errorf("MQTT: dropping the delayed Will on %q: %d bytes of delayed Wills are already held awaiting the return of their authorized account (%d dropped so far)",
 			o.will.topic, held, dropped)
+		s.releaseUnretainedDelayedWill(o, false)
 		return false
 	}
 	q.owed = append(q.owed, o)
@@ -186,6 +280,24 @@ func (s *Server) retainDelayedWillEnqueue(o *mqttOwedDelayedWill) bool {
 		s.kickOwedDelayedWills()
 	}
 	return true
+}
+
+// releaseUnretainedDelayedWill is the anchor action for a retained Will the queue lets go
+// of without an outcome (plan 5.3): a definitely unsent one is lost, so its anchor is
+// discharged; a possibly-landed one keeps its anchor OWED. sync runs the discharge on the
+// caller, for shutdown's one last attempt.
+func (s *Server) releaseUnretainedDelayedWill(o *mqttOwedDelayedWill, sync bool) {
+	ref := mqttWillAnchorRefOf(o.identity.WillID)
+	if o.identity.PossiblyLanded || ref == nil {
+		return
+	}
+	if !sync {
+		o.as.dropWillAnchor(o.clientID, ref)
+		return
+	}
+	if err := o.as.runBackgroundAnchorTransition(o.clientID, *ref, mqttAnchorRemove, 0); err != nil {
+		s.Warnf("MQTT: the Will anchor %d of client %q could not be removed at shutdown: %v", ref.Ord, o.clientID, err)
+	}
 }
 
 // kickOwedDelayedWills asks for a pass WITHOUT blocking the caller, so a reconnect
@@ -240,23 +352,42 @@ func (s *Server) dischargeOwedDelayedWills() {
 		q.mu.Lock()
 		if i >= len(q.owed) {
 			q.mu.Unlock()
+			s.armPossiblyLandedRetry()
 			return
 		}
 		o := q.owed[i]
 		q.mu.Unlock()
 
+		if o.identity.PossiblyLanded && time.Now().Before(o.retryAt) {
+			continue // its retry driver re-attempts it
+		}
 		// Re-attempted with the queue UNLOCKED but the entry still in it and still
 		// charged, so a concurrent retention cannot be admitted against space this
 		// entry occupies -- and so one obligation can never be submitted twice.
 		// Nothing else removes entries; dischargeMu admits one pass.
 		outcome, err := o.as.enqueueDelayedWill(s, o.clientID, o.sessGen, o.will, o.props, o.user,
 			o.fireAt, o.originSessSeq, o.originSessEpoch, o.account, &o.identity)
-		if outcome.retainable() {
-			continue // still away; the eventual return finds it
+		action, retention := mqttAnchorActionFor(outcome)
+		if retention != mqttWillRetainNone {
+			// Still away, or (newly or still) possibly landed. The flag is sticky: a
+			// later Unavailable never downgrades it.
+			if retention == mqttWillRetainPossiblyLanded {
+				o.identity.PossiblyLanded = true
+			}
+			if o.identity.PossiblyLanded {
+				o.backoff = min(max(2*o.backoff, mqttPossiblyLandedRetryMin), mqttPossiblyLandedRetryMax)
+				o.retryAt = time.Now().Add(o.backoff)
+			}
+			continue
+		}
+		if action == mqttWillAnchorDischarge {
+			o.as.dropWillAnchor(o.clientID, mqttWillAnchorRefOf(o.identity.WillID))
 		}
 		switch outcome {
 		case mqttWillEnqueueConfirmed:
 			s.Noticef("MQTT: the retained delayed Will on %q for account %q is durably enqueued", o.will.topic, o.account)
+		case mqttWillEnqueueEnded:
+			s.Noticef("MQTT: the possibly-landed delayed Will on %q for account %q was settled by its record", o.will.topic, o.account)
 		case mqttWillEnqueuePublishedInstead, mqttWillEnqueueUnconfirmedPublished:
 			s.Warnf("MQTT: the retained delayed Will on %q was published without its delay: %v", o.will.topic, err)
 		default:
@@ -277,6 +408,32 @@ func (s *Server) dischargeOwedDelayedWills() {
 	}
 }
 
+// armPossiblyLandedRetry arms the possibly-landed retry driver at the earliest retryAt the
+// queue holds, while the service account is established; its return kicks a pass anyway.
+// Called by a pass, which holds dischargeMu, so retryAt is stable here.
+func (s *Server) armPossiblyLandedRetry() {
+	q := &s.owedDelayedWills
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.retryTimer != nil {
+		q.retryTimer.Stop()
+		q.retryTimer = nil
+	}
+	var at time.Time
+	for _, o := range q.owed {
+		if o.identity.PossiblyLanded && (at.IsZero() || o.retryAt.Before(at)) {
+			at = o.retryAt
+		}
+	}
+	if at.IsZero() {
+		return
+	}
+	if _, ok := s.serviceAccountForWill(); !ok {
+		return
+	}
+	q.retryTimer = time.AfterFunc(max(time.Until(at), 0), s.kickOwedDelayedWills)
+}
+
 // discardOwedDelayedWills reports and releases everything still held. Shutdown's
 // last word on this queue, run after the Will workers have drained so nothing can be
 // added behind it.
@@ -285,9 +442,19 @@ func (s *Server) discardOwedDelayedWills() {
 	q.mu.Lock()
 	pending := q.owed
 	q.owed, q.bytes = nil, 0
+	if q.retryTimer != nil {
+		q.retryTimer.Stop()
+		q.retryTimer = nil
+	}
 	q.mu.Unlock()
 	for _, o := range pending {
-		s.Errorf("MQTT: shutting down while still holding the delayed Will on %q for account %q; it is not published",
-			o.will.topic, o.account)
+		if o.identity.PossiblyLanded {
+			s.Errorf("MQTT: shutting down while still resolving the possibly-landed delayed Will on %q for account %q; a landed record still fires",
+				o.will.topic, o.account)
+		} else {
+			s.Errorf("MQTT: shutting down while still holding the delayed Will on %q for account %q; it is not published",
+				o.will.topic, o.account)
+		}
+		s.releaseUnretainedDelayedWill(o, true)
 	}
 }

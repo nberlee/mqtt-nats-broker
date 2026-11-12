@@ -30,11 +30,18 @@ func mqttTestRetireBound(t *testing.T, asm *mqttAccountSessionManager, sess *mqt
 func testInstallFixtureTenure(t *testing.T, sess *mqttSession) mqttSharedTenure {
 	t.Helper()
 	sess.mu.Lock()
-	tenure, ref, ent := sess.sharedTenure, sess.acceptFact, sess.boundEnt.Tenure
+	tenure, ent := sess.sharedTenure, sess.boundEnt.Tenure
 	sess.mu.Unlock()
+	// A SESSION WITH NO AUTHORITY gets the rig's, in a lifecycle of its own (issue #133): every
+	// ledger step is fenced by the authority of the generation it names.
+	if al := sess.jsa.loadOutboundAuthority(sess.id, sess.sharedEpoch()); al.status == mqttOutboundAbsent && sess.asm != nil {
+		testInstallRigAuthority(t, sess.asm, sess)
+	}
 	if tenure.isZero() {
-		if ref.Subj != "" && ent != "" {
-			if err := sess.mintAcceptanceTenure(sess.jsa, ent); err != nil {
+		al := sess.jsa.loadOutboundAuthority(sess.id, sess.sharedEpoch())
+		if ent != "" && al.status == mqttOutboundValid && al.rec != nil && al.rec.Life != nil &&
+			al.rec.Life.Accept.Tenure == ent {
+			if err := sess.mintAcceptanceTenure(sess.jsa, ent, al.rec.Life.Accept.Nonce); err != nil {
 				t.Fatalf("minting the fixture's tenure: %v", err)
 			}
 		} else {
@@ -46,6 +53,8 @@ func testInstallFixtureTenure(t *testing.T, sess *mqttSession) mqttSharedTenure 
 	sess.mu.Lock()
 	id, gen, epoch, tenure := sess.id, sess.gen, sess.sharedEpoch(), sess.sharedTenure
 	sess.mu.Unlock()
+	// The tenure is the lifecycle's current acceptance, as the CONNECT that minted it made it.
+	testAcceptSharedTenure(t, sess.jsa, id, epoch, tenure)
 	if _, err := sess.jsa.installSharedTenure(id, epoch, gen, tenure); err != nil {
 		t.Fatalf("installing the fixture's tenure on generation %q: %v", gen, err)
 	}

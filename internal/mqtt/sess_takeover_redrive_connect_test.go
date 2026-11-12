@@ -19,8 +19,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/nats-io/nuid"
 )
 
 // issue #31 (Slice B): the re-drive's BINDING transitions, which need a live CONNECT.
@@ -324,9 +322,21 @@ func testClosePredecessorAuthority(t *testing.T, asm *mqttAccountSessionManager,
 		t.Fatalf("staging a CLOSED authority needs a SERVING predecessor for %q, got status=%v", cid, load.status)
 	}
 	a := load.rec
-	if _, err := asm.jsa.opCloseGeneration(cid, epoch, mqttNewInflightNonce(), a.Gen, a.Tenure, a.OwnerTxn); err != nil {
+	if _, err := testCloseGenerationOp(asm, cid, epoch, a.Gen, a.Tenure, a.OwnerTxn); err != nil {
 		t.Fatalf("closing the predecessor authority for %q: %v", cid, err)
 	}
+}
+
+// testStandingRecordSeq is the sequence of the client's session record as it stands now.
+func testStandingRecordSeq(t *testing.T, asm *mqttAccountSessionManager, cid string) uint64 {
+	t.Helper()
+	smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
+	if err != nil || smsg == nil {
+		// Errorf: the callers run inside hooks, off the test goroutine.
+		t.Errorf("reading the standing record of %q: %v", cid, err)
+		return 0
+	}
+	return smsg.Sequence
 }
 
 // testReDriveResident reports the session currently mapped for a client ID, and whether
@@ -767,27 +777,22 @@ func TestAcceptSaveRejectionKindsTakeDifferentBranches(t *testing.T) {
 			t.Fatalf("the metadata commit issued %d time(s), want %d (%d contention rejections + 1 "+
 				"success)", len(got), rejections+1, rejections)
 		}
-		// Proposal identity across retries (Codex consult 10): each resend re-sends the SAME
-		// frozen attempt, so the acceptance fact, the session record and the COMMITTED receipt
-		// are byte-identical every time and only the transport batch id is fresh. A retry that
-		// re-composed instead (a fresh saveAcceptWithOwnership) would mint a new acceptID, so the
-		// fact digest would change and the permanent slot of the old proposal would be orphaned.
+		// Acceptance identity across retries (Codex consult 10): each resend re-sends the SAME
+		// frozen batch, so the session record and the authority are byte-identical every time
+		// and only the transport batch id is fresh. A retry that re-composed instead would mint
+		// a new acceptance, and the one the lost response may have committed would be orphaned.
 		batchIDs := map[string]bool{}
 		for i, obs := range got {
 			if obs.BatchID == _EMPTY_ || batchIDs[obs.BatchID] {
 				t.Fatalf("resend %d did not mint a fresh transport batch id (batch %q)", i, obs.BatchID)
 			}
 			batchIDs[obs.BatchID] = true
-			if obs.FactDigest != got[0].FactDigest {
-				t.Fatalf("resend %d changed the acceptance fact: the frozen attempt was re-composed, "+
-					"not re-sent", i)
-			}
 			if obs.RecDigest != got[0].RecDigest {
 				t.Fatalf("resend %d changed the session record bytes: the frozen attempt was "+
 					"re-composed, not re-sent", i)
 			}
 			if obs.RecptDigest != got[0].RecptDigest {
-				t.Fatalf("resend %d changed the COMMITTED receipt: the frozen attempt was re-composed, "+
+				t.Fatalf("resend %d changed the authority: the frozen attempt was re-composed, "+
 					"not re-sent", i)
 			}
 		}
@@ -1463,7 +1468,8 @@ func TestReDriveReReadsAfterASupersededDeferredDiscard(t *testing.T) {
 		// the record is gone, so the re-drive's authoritative read finds an absent subject over a
 		// CLOSED generation and makes a genuine first create.
 		testClosePredecessorAuthority(t, asm, cid)
-		if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
+		// The close MARKED the record (issue #133), so what goes is the record standing now.
+		if derr := asm.jsa.deleteMsg(mqttSessStreamName, testStandingRecordSeq(t, asm, cid), true); derr != nil {
 			t.Errorf("deleting the record the discharge is about to claim: %v", derr)
 			return
 		}
@@ -1603,26 +1609,26 @@ func TestSessSupersededByAnotherMarkerAdoptsIt(t *testing.T) {
 		markerWID, markerPWID string
 	)
 	tr := testTraceReDriveStaged(t, func(sess *mqttSession) {
-		sess.mu.Lock()
-		ps := sess.buildPersistedSessionLocked()
-		seq, idHash, held := sess.seq, sess.idHash, sess.wid
-		sess.mu.Unlock()
-		ps.WID, ps.PWID = mqttNewRecordWID(), held
-		ps.Origin = "other-frontend"
-		ps.Teardown = &mqttSessTeardown{
-			Origin:    "other-frontend",
-			Nonce:     nuid.Next(),
-			StartedAt: time.Now().Unix(),
-		}
-		if _, err := mqttStoreSessionRecordCAS(&asm.jsa, asm.domainTk, &ps, idHash, seq); err != nil {
-			t.Errorf("landing the teardown marker: %v", err)
+		// The rival's claim batch (issue #133): the marker on the record this session holds,
+		// parented to it, with the generation made noncurrent in the same act.
+		prev, prevSeq, err := asm.jsa.requireAuthority(cid, asm.sessStreamEpoch)
+		if err != nil || prev == nil {
+			t.Errorf("no authority for the rival to claim under: %v", err)
 			return
 		}
-		// The issue #107 shape of a rival's claimed teardown: the marker stands on the record AND the
-		// authority the rival was discarding is CLOSED. Closing it here is what lets the re-drive
-		// adopt the standing teardown and create fresh over a CLOSED generation, rather than meet
-		// a serving authority whose record now carries somebody else's marker.
-		testClosePredecessorAuthority(t, asm, cid)
+		if err := testCommitTeardownClaimWith(asm, cid, prev, prevSeq, func(m *mqttPersistedSession) {
+			m.Origin, m.Teardown.Origin = "other-frontend", "other-frontend"
+		}); err != nil {
+			t.Errorf("landing the rival's teardown claim: %v", err)
+			return
+		}
+		smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
+		if lerr != nil {
+			t.Errorf("reading the rival's marker: %v", lerr)
+			return
+		}
+		var ps mqttPersistedSession
+		_ = json.Unmarshal(smsg.Data, &ps)
 		mmu.Lock()
 		markerWID, markerPWID = ps.WID, ps.PWID
 		mmu.Unlock()
@@ -1718,7 +1724,8 @@ func TestSessSupersededByAnAbsentSubjectCreatesFresh(t *testing.T) {
 		// CLOSED and the record is gone. Closing the authority is what makes the re-drive create
 		// fresh over a CLOSED generation rather than meet a serving one with no record.
 		testClosePredecessorAuthority(t, asm, cid)
-		if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
+		// The close MARKED the record (issue #133), so what goes is the record standing now.
+		if derr := asm.jsa.deleteMsg(mqttSessStreamName, testStandingRecordSeq(t, asm, cid), true); derr != nil {
 			t.Errorf("removing the record the discard is about to claim: %v", derr)
 			return
 		}
@@ -1961,7 +1968,8 @@ func TestSupersededDiscardIsTerminalForTheConnectionCallers(t *testing.T) {
 			}
 			// issue #107 shape of a rival's completed release: CLOSED authority and an absent record.
 			testClosePredecessorAuthority(t, asm, cid)
-			if derr := asm.jsa.deleteMsg(mqttSessStreamName, seq, true); derr != nil {
+			// The close MARKED the record (issue #133), so what goes is the record standing now.
+			if derr := asm.jsa.deleteMsg(mqttSessStreamName, testStandingRecordSeq(t, asm, cid), true); derr != nil {
 				t.Errorf("removing the record the discharge is about to claim: %v", derr)
 				return
 			}

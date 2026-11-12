@@ -647,12 +647,11 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 	defer gate.releaseAll()
 	setWillPublishHook(asm, gate.hook)
 
-	// A due pending record with a valid origin (nonzero seq + current epoch) so the
-	// fence proceeds; no watermark exists for this hash, so it falls back to the
-	// (absent) session record and fires.
+	// A due pending record with a valid origin (nonzero seq + current epoch) and its
+	// anchor standing with no later acceptance, so the claimant licenses it and fires.
 	const clientID = "scr-cid"
 	cidHash := getHash(clientID)
-	wid := "scr-w"
+	wid := testAnchoredWillID(t, asm, clientID)
 	subject := mqttWillQSubject(asm.domainTk, cidHash, wid)
 	seedWillRecord(t, asm, &mqttWillOutbox{
 		WillID: wid, ClientIDHash: cidHash, ClientID: clientID, Gen: mqttNewSessGen(), Topic: "will/scr", Msg: []byte("x"), QoS: 0,
@@ -727,8 +726,8 @@ func TestMQTTWillOutboxTerminalCASStaleSequenceReconcile(t *testing.T) {
 // The record's own sequence is deliberately irrelevant now, and that is the change:
 // a newer record proves only that something wrote one (an expiry sweep's
 // disconnect stamp, a teardown, a reconnect that happened AFTER the delay elapsed),
-// none of which is an acceptance entitled to suppress. Only a dated acceptance fact
-// is.
+// none of which is an acceptance entitled to suppress. Only an acceptance recorded on
+// the Will's anchor is.
 func TestMQTTWillOutboxNoAcceptanceMeansTheWillFires(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
@@ -743,7 +742,7 @@ func TestMQTTWillOutboxNoAcceptanceMeansTheWillFires(t *testing.T) {
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/ndrf", opts: 0}})
 
 	seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "ndrf-w", ClientIDHash: getHash("ndrf-pub"), ClientID: "ndrf-pub", Gen: mqttNewSessGen(), Topic: "will/ndrf", Msg: []byte("fire"), QoS: 0,
+		WillID: testAnchoredWillID(t, asm, "ndrf-pub"), ClientIDHash: getHash("ndrf-pub"), ClientID: "ndrf-pub", Gen: mqttNewSessGen(), Topic: "will/ndrf", Msg: []byte("fire"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
@@ -752,9 +751,9 @@ func TestMQTTWillOutboxNoAcceptanceMeansTheWillFires(t *testing.T) {
 }
 
 // TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss: the claimant must cancel a Will
-// purely from persisted state when a permanent acceptance fact of that exact client
-// is dated before the Will fell due. No live origin broker is needed, and no
-// reconnect-time action either: the durable fact alone drives the suppression, which
+// purely from persisted state when its anchor records an acceptance of that exact
+// client dated before the Will fell due. No live origin broker is needed, and no
+// reconnect-time action either: the durable anchor alone drives the suppression, which
 // is what makes it survive the loss of the broker that enqueued the Will.
 func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 	t.Parallel()
@@ -769,15 +768,14 @@ func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/lesol", opts: 0}})
 
-	// The Will's origin sits at the stream floor, and the acceptance lands above it
-	// and BEFORE the Will falls due — the production ordering.
-	origin := testSessStreamFloor(t, asm)
+	// A later acceptance lands BEFORE the Will falls due.
+	wid := testAnchoredWillID(t, asm, "lesol-pub")
 	fireAt := time.Now().Add(-time.Millisecond).UnixNano()
-	testPlantAcceptFact(t, asm, "lesol-pub", fireAt-int64(time.Minute))
+	testPlantAnchorAcceptance(t, asm, "lesol-pub", fireAt-int64(time.Minute))
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "lesol-w", ClientIDHash: getHash("lesol-pub"), ClientID: "lesol-pub", Gen: mqttNewSessGen(), Topic: "will/lesol", Msg: []byte("suppressed"), QoS: 0,
+		WillID: wid, ClientIDHash: getHash("lesol-pub"), ClientID: "lesol-pub", Gen: mqttNewSessGen(), Topic: "will/lesol", Msg: []byte("suppressed"), QoS: 0,
 		FireAt: fireAt, State: mqttWillPending,
-		OriginSessionSeq: origin, OriginSessEpoch: asm.sessStreamEpoch,
+		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	// The claimant cancels the superseded Will; it is never delivered.
@@ -797,11 +795,11 @@ func TestMQTTWillOutboxLateEnqueueSurvivesOriginLoss(t *testing.T) {
 	testMQTTExpectNothing(t, rs)
 }
 
-// TestMQTTWillOutboxFactReadIndeterminateDefers: when the acceptance evidence cannot
+// TestMQTTWillOutboxAnchorReadIndeterminateDefers: when the acceptance evidence cannot
 // be read, the claimant must DEFER — neither fire nor cancel — so a later pass
 // resolves it once the read succeeds. This proves an indeterminate read never risks
 // publishing a suppressed Will nor loses a legitimate one.
-func TestMQTTWillOutboxFactReadIndeterminateDefers(t *testing.T) {
+func TestMQTTWillOutboxAnchorReadIndeterminateDefers(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
@@ -809,12 +807,12 @@ func TestMQTTWillOutboxFactReadIndeterminateDefers(t *testing.T) {
 
 	asm := testMQTTGetGlobalASM(t, s)
 
-	// Fail every acceptance-fact read: the claimant defers on each pass.
+	// Fail every read of the Will's anchor: the claimant defers on each pass.
 	var loads int32
 	asm.mu.Lock()
-	asm.testFactLoad = func(string, uint64) (*StoredMsg, error) {
+	asm.testAnchorEvidenceLoad = func(string) mqttAuthorityLoad {
 		atomic.AddInt32(&loads, 1)
-		return nil, fmt.Errorf("injected acceptance-fact read error")
+		return mqttAuthorityLoad{status: mqttOutboundIndeterminate}
 	}
 	asm.mu.Unlock()
 
@@ -823,11 +821,10 @@ func TestMQTTWillOutboxFactReadIndeterminateDefers(t *testing.T) {
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/fild", opts: 0}})
 
-	origin := testSessStreamFloor(t, asm)
 	subject, _ := seedWillRecord(t, asm, &mqttWillOutbox{
-		WillID: "fild-w", ClientIDHash: getHash("fild-pub"), ClientID: "fild-pub", Gen: mqttNewSessGen(), Topic: "will/fild", Msg: []byte("later"), QoS: 0,
+		WillID: testAnchoredWillID(t, asm, "fild-pub"), ClientIDHash: getHash("fild-pub"), ClientID: "fild-pub", Gen: mqttNewSessGen(), Topic: "will/fild", Msg: []byte("later"), QoS: 0,
 		FireAt: time.Now().Add(-time.Millisecond).UnixNano(), State: mqttWillPending,
-		OriginSessionSeq: origin, OriginSessEpoch: asm.sessStreamEpoch,
+		OriginSessionSeq: 1, OriginSessEpoch: asm.sessStreamEpoch,
 	})
 
 	// While reads fail, the record is left for a later pass and nothing is delivered.
@@ -842,13 +839,13 @@ func TestMQTTWillOutboxFactReadIndeterminateDefers(t *testing.T) {
 	}
 	testMQTTExpectNothing(t, rs)
 	if atomic.LoadInt32(&loads) == 0 {
-		t.Fatal("expected the claimant to attempt an acceptance-fact read")
+		t.Fatal("expected the claimant to attempt a read of the Will's anchor")
 	}
 
-	// Clear the seam: the real walk finds no qualifying acceptance => publish, so the
+	// Clear the seam: the real anchor records no later acceptance => publish, so the
 	// deferred Will now fires (never lost).
 	asm.mu.Lock()
-	asm.testFactLoad = nil
+	asm.testAnchorEvidenceLoad = nil
 	asm.mu.Unlock()
 	testMQTTReadPublishV5(t, rs, "will/fild", []byte("later"))
 }
@@ -866,19 +863,14 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 
 	asm := testMQTTGetGlobalASM(t, s)
 
-	// Make the early cancel WANT to cancel — a qualifying acceptance of this exact
-	// client, dated before the Will falls due — so the test proves the STATE GUARD,
-	// not the absence of evidence, is what protects the publishing record.
-	testSessStreamFloor(t, asm)
-	testPlantAcceptFact(t, asm, "eadpub", time.Now().Add(-time.Hour).UnixNano())
-
 	cs, rs := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "eadsub", cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer cs.Close()
 	testMQTTReadConnAckV5(t, rs)
 	testMQTTSubV5(t, cs, rs, 1, []mqttV5SubFilter{{topic: "will/ead", opts: 0}})
 
-	// Enqueue seam: perform the real create, then advance the record straight to
-	// publishing (as a claimant would), then return an error simulating a lost ack.
+	// Enqueue seam: perform the real create, then advance the record straight to a
+	// LICENSED publishing claim (as a claimant that decided before the later acceptance
+	// would), then return an error simulating a lost ack.
 	// enqueueDelayedWill must re-read, see publishing (not pending), and return
 	// WITHOUT writing cancelled over the in-flight claim.
 	var advanced int32
@@ -889,7 +881,7 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 		}
 		if atomic.AddInt32(&advanced, 1) == 1 {
 			pub := *rec
-			pub.State = mqttWillPublishing
+			testLicenseWill(&pub, mqttWillPublishing, mqttWillDecisionPublish, 1)
 			pub.ClaimOwner = s.NodeName()
 			pub.ClaimUntil = time.Now().Add(mqttWillClaimLease.Get()).UnixNano()
 			if _, aerr := asm.jsa.storeWillOutboxCAS(subject, seq, &pub); aerr != nil {
@@ -906,10 +898,14 @@ func TestMQTTWillOutboxEnqueueAckDelayedNoCancelWhilePublishing(t *testing.T) {
 	cw, rw := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: "eadpub", cleanStart: true, will: will,
 		willProps: mqttV5WillDelayProps(1), props: mqttV5ConnPropsSessionExpiry(60)}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTReadConnAckV5(t, rw)
+	// Make the early cancel WANT to cancel — a later acceptance of this exact client,
+	// dated before the Will falls due, on its anchor — so the test proves the STATE
+	// GUARD, not the absence of evidence, is what protects the publishing record.
+	testPlantAnchorAcceptance(t, asm, "eadpub", time.Now().UnixNano())
 	cw.Close()
 
 	// The record was left publishing (not cancelled): once its lease lapses the
-	// claim loop reclaims it (recovery bypasses the fence) and a real worker delivers
+	// claim loop reclaims it (recovery reuses the persisted decision) and a real worker delivers
 	// the Will. If the enqueue-side had cancelled it, nothing would ever be delivered.
 	testMQTTReadPublishV5(t, rs, "will/ead", []byte("inflight"))
 }
@@ -1740,14 +1736,15 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 
 	const clientID = "aec-pub"
 	cidHash := getHash(clientID)
-	subject := mqttWillQSubject(asm.domainTk, cidHash, "aec-wid")
+	wid := testAnchoredWillID(t, asm, clientID)
+	subject := mqttWillQSubject(asm.domainTk, cidHash, wid)
 	// A valid epoch from a DIFFERENT incarnation than the account's, so the
 	// watermark path below decides cancel.
 	originEpoch := mqttSessEpochNUIDPrefix + nuid.Next()
 
 	// Seed a pending record far in the future and keep its sequence.
 	pending := &mqttWillOutbox{
-		WillID: "aec-wid", ClientIDHash: cidHash, ClientID: clientID, Gen: mqttNewSessGen(), Topic: "will/aec", Msg: []byte("x"), QoS: 0,
+		WillID: wid, ClientIDHash: cidHash, ClientID: clientID, Gen: mqttNewSessGen(), Topic: "will/aec", Msg: []byte("x"), QoS: 0,
 		FireAt: time.Now().Add(time.Hour).UnixNano(), State: mqttWillPending,
 		OriginSessionSeq: 1, OriginSessEpoch: originEpoch,
 	}
@@ -1771,11 +1768,9 @@ func TestMQTTWillOutboxTimerReleasedOnAmbiguousEarlyCancel(t *testing.T) {
 		t.Fatalf("advance record to publishing: %v", err)
 	}
 
-	// Give the early cancel something to decide on: an acceptance of this exact
-	// client, dated before the Will falls due. The Will's origin is from a DIFFERENT
-	// incarnation, so the sequence comparison does not apply and a current-incarnation
-	// acceptance supersedes it outright.
-	testPlantAcceptFact(t, asm, clientID, pending.FireAt-int64(time.Minute))
+	// Give the early cancel something to decide on: a later acceptance of this exact
+	// client on the Will's anchor, dated before the Will falls due.
+	testPlantAnchorAcceptance(t, asm, clientID, pending.FireAt-int64(time.Minute))
 
 	// Early-cancel with the stale sequence: the CAS loses, and the re-read sees
 	// publishing. The record is no longer this broker's to fire, so the timer

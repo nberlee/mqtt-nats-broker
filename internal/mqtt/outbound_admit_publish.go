@@ -311,7 +311,7 @@ func mqttAdmitPublishesTransition(a *mqttPublishAdmission, entries []mqttPublish
 
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: a.Auth.ID, Epoch: a.Auth.Epoch, Txn: a.Txn, Op: a.Op,
+			ID: a.Auth.ID, Epoch: a.Auth.Epoch, Txn: a.Txn, Scope: a.Auth.Gen, Op: a.Op,
 			Kind: mqttTransitionAdmitExchange, PrevTxn: a.Auth.OwnerTxn, Rev: a.Auth.Rev + 1,
 			Gen: a.Auth.Gen, Tenure: a.Auth.Tenure, OwnerTxn: a.Auth.OwnerTxn,
 		},
@@ -319,6 +319,7 @@ func mqttAdmitPublishesTransition(a *mqttPublishAdmission, entries []mqttPublish
 		Auth: &mqttOutboundAuthority{
 			ID: a.Auth.ID, Epoch: a.Auth.Epoch, Gen: a.Auth.Gen, Tenure: a.Auth.Tenure,
 			State: mqttAuthorityServing, Rev: a.Auth.Rev + 1, Txn: a.Txn, OwnerTxn: a.Auth.OwnerTxn,
+			Life: a.Auth.Life,
 		},
 		Extra: members,
 	}, nil

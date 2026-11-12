@@ -161,7 +161,7 @@ func (jsa *mqttJSA) loadAffineReadiness(id, epoch, gen string) (*mqttAffineReadi
 //
 // An AMBIGUOUS publication is settled by that same read-back rather than by assuming absence: the
 // subject is create-only, so whatever stands there is the answer.
-func (jsa *mqttJSA) publishAffineReadiness(r *mqttAffineReadiness) error {
+func (jsa *mqttJSA) publishAffineReadiness(r *mqttAffineReadiness, admit func() bool) error {
 	if err := mqttValidateAffineReadiness(r, r.ID, r.Epoch, r.Gen); err != nil {
 		return fmt.Errorf("refusing to publish an unsupported affine readiness: %w", err)
 	}
@@ -169,8 +169,8 @@ func (jsa *mqttJSA) publishAffineReadiness(r *mqttAffineReadiness) error {
 	if err != nil {
 		return err
 	}
-	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
-	if _, serr := jsa.storeMsg(mqttReadinessSubject(getHash(r.ID), r.Gen), hdr, msg); serr != nil {
+	if serr := jsa.createFencedGenRecord(r.ID, r.Epoch, r.Gen, mqttReadinessSubject(getHash(r.ID), r.Gen),
+		body, mqttGenRecordWhileLive, admit); serr != nil {
 		stood, lerr := jsa.loadAffineReadiness(r.ID, r.Epoch, r.Gen)
 		if lerr != nil {
 			return fmt.Errorf("publishing the affine readiness of generation %q was unresolved "+

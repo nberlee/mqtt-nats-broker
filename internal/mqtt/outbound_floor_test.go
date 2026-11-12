@@ -373,7 +373,7 @@ func testCommitFloorMembers(t *testing.T, e *testOutboundEnv, members []mqttTran
 	txn := mqttNewInflightNonce()
 	_, cerr := jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: auth.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionAdvanceFloor, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -381,7 +381,7 @@ func testCommitFloorMembers(t *testing.T, e *testOutboundEnv, members []mqttTran
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: mqttLifeOf(auth),
 		},
 		Extra: members,
 	})
@@ -568,7 +568,7 @@ func TestALandingProofIsACommittedAttempt(t *testing.T) {
 	if herr != nil {
 		t.Fatalf("freezing the handle: %v", herr)
 	}
-	if err := jsa.abortTransition(&h.attempt); err != nil {
+	if err := jsa.abortTransition(&h.attempt, nil); err != nil {
 		t.Fatalf("aborting: %v", err)
 	}
 	if p := testProof(jsa, []mqttCustodyAttempt{{handle: h, lin: abortedLin}}, abortedLin); p != mqttLandingUnproven {

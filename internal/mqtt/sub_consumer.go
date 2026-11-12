@@ -311,8 +311,10 @@ func (sess *mqttSession) claimPubRelName(ent mqttOutboundEntitlement, nameGen, n
 		case mqttTransitionLanded, mqttTransitionSuperseded:
 			landed = true
 		case mqttTransitionNeverLanded:
+		case mqttTransitionRetired:
+			// The generation retired: the name claim is obsolete, settled with no landing.
 		default:
-			if aerr := sess.jsa.abortTransition(&h.attempt); aerr != nil {
+			if aerr := sess.jsa.abortTransition(&h.attempt, nil); aerr != nil {
 				open++
 			} else {
 				aborted++

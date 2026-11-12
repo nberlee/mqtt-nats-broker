@@ -94,20 +94,7 @@ func TestObligationSurvivesRetirementAndCompletes(t *testing.T) {
 	// (4) RETIREMENT WINS. The generation is closed while the obligation is outstanding and
 	// its action is still executing. This is the moment that used to destroy the completion
 	// route.
-	closing := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: pre.rec.Rev + 1,
-			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: pre.rec, PrevSeq: pre.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
-			State: mqttAuthorityClosed, Rev: pre.rec.Rev + 1, Txn: "txn-close",
-			OwnerTxn: auth.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
-	}
+	closing := testClosure(e, pre.rec, pre.seq, "txn-close")
 	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if err != nil {
 		t.Fatalf("the closure was refused: %v", err)

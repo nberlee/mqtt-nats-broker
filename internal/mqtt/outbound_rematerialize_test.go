@@ -17,6 +17,7 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -325,4 +326,39 @@ func TestCandidateBeforeRebindCrashStillRematerializes(t *testing.T) {
 		t.Fatalf("recoverInflightRegisters: %v", err)
 	}
 	testAwaitRebind(t, e, subject, canon)
+}
+
+// T-candidate-cleanup (issue #133): the rebind of a published candidate whose generation retires
+// before the rebind resolves reads RETIRED: the rebind is obsolete, so the candidate is disposed
+// and the slot is left as it was, never retried. Mutation: RETIRED read as unresolved (the
+// candidate is kept and the rebind retried).
+func TestARetiredRebindDisposesOfItsCandidate(t *testing.T) {
+	t.Parallel()
+	e, _, subject, _, canon := testPubRelReadyWorld(t, "remat-retired")
+	if err := e.asm.jsa.deleteMsg(mqttOutStreamName, canon, true); err != nil {
+		t.Fatalf("delete the canonical PUBREL: %v", err)
+	}
+	e.sess.mu.Lock()
+	gen := e.sess.gen
+	e.sess.mu.Unlock()
+	testArmTransitionSeam(t, &e.asm.jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if tr.Attempt.Kind != mqttTransitionRebindCanonical {
+			return send()
+		}
+		// The generation retires under the in-flight rebind, which never lands.
+		testRetireGeneration(t, e.asm, e.sess.id, gen)
+		_, ord, _ := mqttParseGenToken(gen)
+		testRewriteAuthority(t, e, func(a *mqttOutboundAuthority) {
+			if i := mqttOutstandingIndex(a.Life, ord); i >= 0 {
+				a.Life.Outstanding = append(a.Life.Outstanding[:i], a.Life.Outstanding[i+1:]...)
+			}
+		})
+		return 0, errors.New("test: the rebind's acknowledgement was lost")
+	})
+	if got := e.sess.rematerializeOnce(e.c, testRemat(t, e, subject, mqttLicenceOf(e.c))); got != mqttRematerializeDone {
+		t.Fatalf("a rebind whose generation retired returned %d, want done", got)
+	}
+	if n := testPubRelRecords(t, e); n != 0 {
+		t.Fatalf("the retired rebind's candidate must be disposed, got %d records", n)
+	}
 }

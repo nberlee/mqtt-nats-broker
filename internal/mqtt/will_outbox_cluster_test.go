@@ -72,7 +72,7 @@ func TestMQTTWillOutboxReplicatedStream(t *testing.T) {
 	if !svcOK {
 		t.Fatal("the service account must be established before an outbox record can be written")
 	}
-	willID := nuid.Next()
+	willID := testWillToken(t, 1)
 	clientID := "smoke-" + nuid.Next()
 	cidHash := getHash(clientID)
 	subject := mqttWillQSubject(asm.domainTk, cidHash, willID)
@@ -315,119 +315,30 @@ func testMQTTExpectNothingFor(t testing.TB, r *mqttReader, d time.Duration) {
 	}
 }
 
-// testAcceptFactsFor returns every permanent acceptance fact currently stored for a
-// client hash in this broker's incarnation, oldest first.
-func testAcceptFactsFor(t *testing.T, asm *mqttAccountSessionManager, cidHash string) []*mqttAcceptFact {
+// testAcceptanceOf returns the acceptance a client's authority records as current, or nil
+// when its authority carries none.
+func testAcceptanceOf(t *testing.T, asm *mqttAccountSessionManager, clientID string) *mqttAcceptance {
 	t.Helper()
-	filter := mqttAcceptClientEpochFilter(asm.domainTk, cidHash, asm.sessStreamEpoch)
-	var out []*mqttAcceptFact
-	for seq := uint64(1); ; {
-		smsg, err := asm.jsa.loadNextMsgFromSeq(mqttSessStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				t.Fatalf("walk acceptance facts: %v", err)
-			}
-			return out
-		}
-		seq = smsg.Sequence + 1
-		f, derr := mqttDecodeAcceptFact(asm.domainTk, asm.sessStreamEpoch, smsg)
-		if derr != nil {
-			t.Fatalf("decode acceptance fact on %q: %v", smsg.Subject, derr)
-		}
-		out = append(out, f)
-	}
-}
-
-// TestMQTTWillOutboxReplicatedAcceptFacts is T17's always-run half: $MQTT_sess is
-// created R3 and current on every node, it carries ALL SIX subject spaces, and a real
-// CONNECT through the broker leaves a permanent acceptance fact that is replicated
-// and reads back valid.
-//
-// SMOKE COVERAGE ONLY. It runs against a real cluster, but no mutation is paired
-// with it, so it is not evidence for any cluster-shaped claim — see CLAUDE.md. What
-// it does establish is that the atomic batch actually works against a replicated
-// stream, which no single-node test can.
-func TestMQTTWillOutboxReplicatedAcceptFacts(t *testing.T) {
-	c := testNewJetStreamCluster(t, 3)
-	b := c.startBroker(t, 0)
-
-	js, err := b.nc.JetStream()
-	if err != nil {
-		t.Fatalf("jetstream context: %v", err)
-	}
-	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
-		si, err := js.StreamInfo(mqttSessStreamName)
-		if err != nil {
-			return fmt.Errorf("session stream info: %w", err)
-		}
-		if si.Config.Replicas != 3 {
-			return fmt.Errorf("Config.Replicas=%d, want 3", si.Config.Replicas)
-		}
-		// THE EXACT SET, by name. A count was the earlier assertion and it went stale the
-		// moment the handoff outcomes gained their own space — worse, a count would have
-		// been satisfied by any three spaces, including a wrong one. Naming them means a
-		// missing space and an unexpected space are both failures here, which is what a
-		// stream whose validator refuses an unsupported shape actually needs.
-		want := map[string]struct{}{
-			mqttSessStreamSubjectPrefix + ">":            {},
-			mqttAcceptSubjectPrefix + ">":                {},
-			mqttHandoffSubjectPrefix + ">":               {},
-			mqttTeardownReceiptSubjectPrefix + ">":       {},
-			mqttInflightStreamSubjectPrefix + ">":        {},
-			mqttSharedLifecycleStreamSubjectPrefix + ">": {},
-		}
-		if len(si.Config.Subjects) != len(want) {
-			return fmt.Errorf("Config.Subjects=%v, want the record, accept-fact, handoff-outcome, "+
-				"teardown-receipt, in-flight and shared-group spaces", si.Config.Subjects)
-		}
-		for _, subj := range si.Config.Subjects {
-			if _, ok := want[subj]; !ok {
-				return fmt.Errorf("Config.Subjects=%v carries %q, which is no space this broker provisions",
-					si.Config.Subjects, subj)
-			}
-			delete(want, subj)
-		}
-		if len(want) != 0 {
-			return fmt.Errorf("Config.Subjects=%v is missing %v", si.Config.Subjects, want)
-		}
-		if si.Cluster == nil || si.Cluster.Leader == "" || len(si.Cluster.Replicas) != 2 {
-			return fmt.Errorf("session stream not R3-clustered: %+v", si.Cluster)
-		}
-		// AllowAtomicPublish is asserted through the broker's OWN validator rather
-		// than this client's StreamConfig, which does not carry the field: the
-		// account manager refuses to initialize without it, so a broker that got
-		// this far already proved it. Left as a note rather than a silent omission.
+	al := asm.jsa.loadOutboundAuthority(clientID, asm.sessStreamEpoch)
+	switch {
+	case al.status == mqttOutboundAbsent:
 		return nil
-	})
-	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
-
-	asm := testMQTTGetGlobalASM(t, b.s)
-	const cid = "factrepl"
-	cc, cr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, cleanStart: true,
-		props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
-	defer cc.Close()
-	testMQTTReadConnAckV5(t, cr)
-
-	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
-	facts := testAcceptFactsFor(t, asm, getHash(cid))
-	if len(facts) != 1 {
-		t.Fatalf("one accepted CONNECT must leave exactly one acceptance fact, got %d", len(facts))
+	case al.status != mqttOutboundValid || al.rec == nil:
+		t.Fatalf("read the authority of %q: %v", clientID, al.status)
+	case al.rec.Life == nil:
+		return nil
 	}
-	if facts[0].ClientID != cid {
-		t.Fatalf("the fact must carry the EXACT client id: got %q want %q", facts[0].ClientID, cid)
-	}
-	if facts[0].At == 0 {
-		t.Fatal("the fact must be dated: an undated acceptance suppresses unconditionally")
-	}
+	acc := al.rec.Life.Accept
+	return &acc
 }
 
-// TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover is T17's gated half: a
-// committed acceptance fact stays authoritative across the loss of its stream-leader
-// node, and a CONNECT after the election commits a new one.
+// TestMQTTWillOutboxReplicatedAcceptanceLeaderFailover is T17's gated half: a
+// committed acceptance stays recorded in its authority across the loss of the
+// stream-leader node, and a CONNECT after the election commits its own.
 //
 // Same limitation: smoke coverage, no paired mutation, not evidence for a
 // cluster-shaped claim.
-func TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover(t *testing.T) {
+func TestMQTTWillOutboxReplicatedAcceptanceLeaderFailover(t *testing.T) {
 	if os.Getenv("MQTTNB_CLUSTER_FAILOVER_TESTS") != "1" {
 		t.Skip("set MQTTNB_CLUSTER_FAILOVER_TESTS=1 to run cluster failover tests")
 	}
@@ -447,8 +358,9 @@ func TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover(t *testing.T) {
 	defer cc.Close()
 	testMQTTReadConnAckV5(t, cr)
 	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
-	if n := len(testAcceptFactsFor(t, asm, getHash(before))); n != 1 {
-		t.Fatalf("pre-failover CONNECT must leave one acceptance fact, got %d", n)
+	committed := testAcceptanceOf(t, asm, before)
+	if committed == nil {
+		t.Fatal("the pre-failover CONNECT left no acceptance in its authority")
 	}
 
 	// Stop ONLY the session stream leader (2/3 quorum preserved).
@@ -460,12 +372,11 @@ func TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover(t *testing.T) {
 	t.Logf("new $MQTT_sess stream-leader node %q", newLeader.name)
 	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
 
-	// The pre-failover fact is permanent: nothing rewrites its subject and nothing
-	// reaps it, so an election cannot cost it.
+	// The acceptance committed before the election is still the authority's: an
+	// acknowledged batch survives the loss of the node that acknowledged it.
 	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
-		facts := testAcceptFactsFor(t, asm, getHash(before))
-		if len(facts) != 1 || facts[0].ClientID != before {
-			return fmt.Errorf("acceptance fact lost across failover: %+v\n%s", facts, c.describe())
+		if got := testAcceptanceOf(t, asm, before); got == nil || *got != *committed {
+			return fmt.Errorf("the acceptance %+v reads %+v across failover\n%s", committed, got, c.describe())
 		}
 		return nil
 	})
@@ -483,7 +394,7 @@ func TestMQTTWillOutboxReplicatedAcceptFactsLeaderFailover(t *testing.T) {
 		props: mqttV5ConnPropsSessionExpiry(60)}, b.opts.MQTT.Host, b.opts.MQTT.Port)
 	defer cc2.Close()
 	testMQTTReadConnAckV5(t, cr2)
-	if n := len(testAcceptFactsFor(t, asm, getHash(after))); n != 1 {
-		t.Fatalf("a post-election CONNECT must commit its acceptance fact, got %d facts", n)
+	if testAcceptanceOf(t, asm, after) == nil {
+		t.Fatal("a post-election CONNECT committed no acceptance")
 	}
 }

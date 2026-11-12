@@ -280,8 +280,7 @@ func TestConsult78Generation(t *testing.T) {
 	if err := sess.clear(false); err != nil {
 		t.Fatal(err)
 	}
-	watermark, _, status := e.asm.jsa.loadGenRetirementRecord(e.asm.domainTk, sess.idHash)
-	if status != mqttRetirementValid || watermark.Gen != f.gen || sess.gen == f.gen {
+	if !testGenNoncurrent(e.asm, sess.id, f.gen) || sess.gen == f.gen {
 		t.Fatal("clear did not durably retire the old generation")
 	}
 	// RETIRED THROUGH ITS RESOURCE since issue #107 7d: the teardown transfers the source consumer to
@@ -322,17 +321,19 @@ func TestConsult78Generation(t *testing.T) {
 		}
 		return nil
 	})
-	// Retirement leaves CLOSED authority. The bootstrap helper only creates at
-	// sequence zero, so model the next accept against the existing authority head.
-	testRewriteAuthority(t, e, func(a *mqttOutboundAuthority) {
-		if a.State != mqttAuthorityClosed || a.Gen != f.gen {
-			t.Fatal("retirement did not close the old generation's authority")
-		}
-		*a = mqttOutboundAuthority{
-			ID: a.ID, Epoch: a.Epoch, Gen: sess.gen, Tenure: mqttNewInflightNonce(),
-			State: mqttAuthorityServing, Rev: a.Rev, Txn: a.Txn, OwnerTxn: a.Txn,
-		}
-	})
+	// Retirement leaves CLOSED authority; the next accept is a real one over it (issue #133: the
+	// lifecycle installs its next generation), and the reused session object takes that generation.
+	if al := e.asm.jsa.loadOutboundAuthority(e.sess.id, e.asm.sessStreamEpoch); al.status != mqttOutboundValid ||
+		al.rec.State != mqttAuthorityClosed || al.rec.Gen != f.gen {
+		t.Fatal("retirement did not close the old generation's authority")
+	}
+	bt, _, _ := testAcceptAndBindAs(t, &e.asm.jsa, e.asm.domainTk, e.sess.id, e.asm.sessStreamEpoch,
+		mqttNewInflightNonce(), _EMPTY_, mqttNewInflightNonce(), true, mqttClosingTargets{}, false)
+	recSeq := testStandingRecordSeq(t, e.asm, e.sess.id)
+	sess.mu.Lock()
+	sess.deriveGenerationLocked(bt.Auth.Gen)
+	sess.seq = recSeq // the acceptance wrote the record the next save CASes
+	sess.mu.Unlock()
 	// A new accept on the reused object has a fresh set-once entitlement.
 	e.c.mu.Lock()
 	e.c.mqtt.outEnt = mqttOutboundEntitlement{}

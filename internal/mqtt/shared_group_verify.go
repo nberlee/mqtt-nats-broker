@@ -124,8 +124,8 @@ var mqttServerOwnedConsumerMetaKeys = []string{
 // nothing but the server's own keys.
 //
 // This broker sets no consumer metadata. That is an assertion, not an absence of interest:
-// consumer metadata is a CARRIER — it is how $MQTT_teardown's epoch coupling is expressed
-// at the stream level — so "nobody writes it here" is a fact worth re-checking rather than
+// consumer metadata is a CARRIER, the place a coupling to another stream would be expressed
+// at the consumer level, so "nobody writes it here" is a fact worth re-checking rather than
 // assuming. A group durable carrying a key this broker did not write was provisioned by
 // something else, and the whole-struct comparison is what makes that observable.
 func sharedGroupMetadataIsServerOnly(md map[string]string) error {

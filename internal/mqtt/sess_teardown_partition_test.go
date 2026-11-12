@@ -32,15 +32,19 @@ import (
 func TestAVacuousGenerationOwnsItsOwnCleanup(t *testing.T) {
 	e, cleanup := testNewEnv(t, "client-f105-part-vacuous")
 	defer cleanup()
+	// The generation is the authority's current one (issue #133): vacuous needs positive standing
+	// that its records can still stand, never an absence nothing explains.
+	auth, _ := e.bootstrap(t, "txn-1")
+	gen := auth.Gen
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
+	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), gen)
 
 	target := &mqttTeardownTarget{
-		id: e.id, idHash: getHash(e.id), gen: testGen,
+		id: e.id, idHash: getHash(e.id), gen: gen,
 		q2AffDur: durable, q2AffGen: affGen, pubRelDur: pubRelDur,
 	}
-	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testGen, target)
+	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, gen, target)
 	if err != nil {
 		t.Fatalf("classifying a generation that admitted nothing: %v", err)
 	}
@@ -49,41 +53,6 @@ func TestAVacuousGenerationOwnsItsOwnCleanup(t *testing.T) {
 	}
 	if own.Affine != nil {
 		t.Fatalf("a vacuous generation reported an enrolled affine target: %+v", own.Affine)
-	}
-}
-
-// TestAPreservingClosureKeepsItsAffineConsumer: an inventory exists, its closure does not
-// discard, so the affine consumer was never transferred and stays the teardown's to delete.
-func TestAPreservingClosureKeepsItsAffineConsumer(t *testing.T) {
-	e, cleanup := testNewEnv(t, "client-f105-part-preserving")
-	defer cleanup()
-	const affGen = "0123456789abcdefghijkq"
-	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
-	auth, _ := e.bootstrap(t, "txn-boot")
-
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
-		auth.OwnerTxn); err != nil {
-		t.Fatalf("closing without a discard: %v", err)
-	}
-	target := &mqttTeardownTarget{
-		id: e.id, idHash: getHash(e.id), gen: testGen,
-		q2AffDur: durable, q2AffGen: affGen, pubRelDur: pubRelDur,
-	}
-	own, err := e.asm.classifyTeardownGeneration(e.id, e.epoch, testGen, target)
-	if err != nil {
-		t.Fatalf("classifying a preserving closure: %v", err)
-	}
-	if own.Class != mqttTeardownOwnerPreserving {
-		t.Fatalf("a non-discarding closure classified as %v", own.Class)
-	}
-	if own.Affine != nil {
-		t.Fatalf("a preserving closure reported an enrolled affine target: %+v", own.Affine)
-	}
-	// AND THE TEARDOWN DELETES IT, because ownership is per target and this one was not
-	// transferred. The flag the caller derives from this class is what says so.
-	if own.Class == mqttTeardownOwnerDiscarding {
-		t.Fatal("the preserving class would defer a deletion nobody will perform")
 	}
 }
 

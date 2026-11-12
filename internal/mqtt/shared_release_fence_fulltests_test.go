@@ -199,38 +199,6 @@ func TestSharedReadinessRefusesAClosedAcquisition(t *testing.T) {
 	}
 }
 
-// T3: the fence kind's rule: a SERVING predecessor reinstalled exactly but for its revision,
-// carrying no member and no closure.
-func TestSharedReleaseFenceKindRule(t *testing.T) {
-	prev := &mqttOutboundAuthority{ID: "fence-t3", Epoch: "ep", Gen: mqttNewSessGen(), Tenure: "ten",
-		State: mqttAuthorityServing, Rev: 4, Txn: "t4", OwnerTxn: "own"}
-	ok := mqttFenceSharedReleaseTransition(prev, 9, "txn-fence")
-	if err := mqttCheckTransitionKindRules(ok); err != nil {
-		t.Fatalf("the composed fence is refused: %v", err)
-	}
-	rows := map[string]func(tr *mqttAuthorityTransition){
-		"a member": func(tr *mqttAuthorityTransition) {
-			tr.Extra = []mqttTransitionMember{{subj: "x", body: []byte("{}")}}
-		},
-		"a changed generation": func(tr *mqttAuthorityTransition) { tr.Auth.Gen = mqttNewSessGen() },
-		"a changed state":      func(tr *mqttAuthorityTransition) { tr.Auth.State = mqttAuthorityClosed },
-		"a closure":            func(tr *mqttAuthorityTransition) { tr.Closure = &mqttGenClosure{} },
-		"a non-serving predecessor": func(tr *mqttAuthorityTransition) {
-			p := *tr.Prev
-			p.State = mqttAuthorityPreparing
-			tr.Prev = &p
-			tr.Auth.State = mqttAuthorityPreparing
-		},
-	}
-	for name, mut := range rows {
-		tr := mqttFenceSharedReleaseTransition(prev, 9, "txn-fence")
-		mut(tr)
-		if err := mqttCheckTransitionKindRules(tr); err == nil {
-			t.Errorf("a fence with %s was accepted", name)
-		}
-	}
-}
-
 // testBumpAuthority advances the authority's revision with a raw CAS write, standing for any
 // committed authority write a concurrent operation makes.
 func testBumpAuthority(t *testing.T, e *testInflightEnv) {
@@ -276,7 +244,7 @@ func TestSharedReleaseFenceNeedsAConfirmedAdvance(t *testing.T) {
 	attempts.Store(0)
 	setHook(func(int) (error, bool) { return nil, false })
 	before := seq()
-	if err := e.sess.jsa.fenceSharedRelease(id, epoch, gen); err != nil {
+	if err := e.sess.jsa.fenceSharedRelease(id, epoch, gen, nil); err != nil {
 		t.Fatalf("a landed fence: %v", err)
 	}
 	if attempts.Load() != 1 || seq() <= before {
@@ -287,7 +255,7 @@ func TestSharedReleaseFenceNeedsAConfirmedAdvance(t *testing.T) {
 	attempts.Store(0)
 	setHook(func(int) (error, bool) { return injected, true })
 	before = seq()
-	if err := e.sess.jsa.fenceSharedRelease(id, epoch, gen); err == nil {
+	if err := e.sess.jsa.fenceSharedRelease(id, epoch, gen, nil); err == nil {
 		t.Fatal("a fence whose every attempt was rejected over an unchanged authority reported FENCED")
 	}
 	if attempts.Load() != mqttSharedReleaseAttempts || seq() != before {
@@ -301,7 +269,7 @@ func TestSharedReleaseFenceNeedsAConfirmedAdvance(t *testing.T) {
 		testBumpAuthority(t, e)
 		return injected, true
 	})
-	if err := e.sess.jsa.fenceSharedRelease(id, epoch, gen); err != nil {
+	if err := e.sess.jsa.fenceSharedRelease(id, epoch, gen, nil); err != nil {
 		t.Fatalf("a rejection behind a committed advance must be fenced: %v", err)
 	}
 	if attempts.Load() != 1 {
@@ -827,7 +795,9 @@ func testPlantSharedAcq(t *testing.T, e *testOutboundEnv, gen, group string) mqt
 	if l.status == mqttOutboundValid {
 		tenure = l.rec.Tenure
 	} else {
-		// Only an installation creates a ledger (issue #107 8b): install the planted tenure first.
+		// Only an installation creates a ledger (issue #107 8b): install the planted tenure first,
+		// under the acceptance that would have minted it (shared_ledger_fence.go).
+		testAcceptSharedTenure(t, jsa, e.id, e.epoch, tenure)
 		if _, err := jsa.installSharedTenure(e.id, e.epoch, gen, tenure); err != nil {
 			t.Fatalf("installing the planted tenure: %v", err)
 		}
@@ -1130,4 +1100,36 @@ func TestSharedVerdictSweepIgnoresUnrelatedRecordChurn(t *testing.T) {
 		}
 	}
 	t.Fatal("the verdict sweep never executed a durable verdict on a record whose sequence kept moving")
+}
+
+// T3: the fence kind's rule: a SERVING predecessor reinstalled exactly but for its revision,
+// carrying no member and no closure.
+func TestSharedReleaseFenceKindRule(t *testing.T) {
+	prev := &mqttOutboundAuthority{ID: "fence-t3", Epoch: "ep", Gen: mqttNewSessGen(), Tenure: "ten",
+		State: mqttAuthorityServing, Rev: 4, Txn: "t4", OwnerTxn: "own"}
+	ok := mqttFenceSharedReleaseTransition(prev, 9, "txn-fence")
+	if err := mqttCheckTransitionKindRules(ok); err != nil {
+		t.Fatalf("the composed fence is refused: %v", err)
+	}
+	rows := map[string]func(tr *mqttAuthorityTransition){
+		"a member": func(tr *mqttAuthorityTransition) {
+			tr.Extra = []mqttTransitionMember{{subj: "x", body: []byte("{}")}}
+		},
+		"a changed generation": func(tr *mqttAuthorityTransition) { tr.Auth.Gen = mqttNewSessGen() },
+		"a changed state":      func(tr *mqttAuthorityTransition) { tr.Auth.State = mqttAuthorityClosed },
+		"a closure":            func(tr *mqttAuthorityTransition) { tr.Closure = &mqttGenClosure{} },
+		"a non-serving predecessor": func(tr *mqttAuthorityTransition) {
+			p := *tr.Prev
+			p.State = mqttAuthorityClosed
+			tr.Prev = &p
+			tr.Auth.State = mqttAuthorityClosed
+		},
+	}
+	for name, mut := range rows {
+		tr := mqttFenceSharedReleaseTransition(prev, 9, "txn-fence")
+		mut(tr)
+		if err := mqttCheckTransitionKindRules(tr); err == nil {
+			t.Errorf("a fence with %s was accepted", name)
+		}
+	}
 }

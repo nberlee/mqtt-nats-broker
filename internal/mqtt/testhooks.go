@@ -288,6 +288,20 @@ var mqttTestCleanCloseWillHookV atomic.Pointer[func(sess *mqttSession)]
 // displaced (mqttMarkedRecordDisplaceable held) or adopted (finishAdoptedTeardown inline).
 var mqttTestMarkedRecordArmHookV atomic.Pointer[func(clientID string, arm mqttMarkedRecordArm)]
 
+// mqttTestMarkedRecordDeclineDisplaceV, when set and returning true for a client, makes a CONNECT
+// that meets that client's marked record adopt it inline instead of displacing it, as when one of
+// the displacement facts cannot be read. Nil in production.
+var mqttTestMarkedRecordDeclineDisplaceV atomic.Pointer[func(clientID string) bool]
+
+// mqttTestBesideAuthorityPresendV, when set, runs in createBesideAuthority after the authority was
+// read and before the batch is sent, naming the created subject: where a test moves the authority
+// to make that write lose its CAS. nil in production.
+var mqttTestBesideAuthorityPresendV atomic.Pointer[func(subj string)]
+
+// mqttTestBeforeBindHookV, when set, runs on a CONNECT after its acceptance committed and before
+// its bind, naming the client: the window an abandonment can win in. Nil in production.
+var mqttTestBeforeBindHookV atomic.Pointer[func(clientID string)]
+
 // Test hook: when set, it is invoked at the start of deleteTeardownTargets, before the first
 // deletion and the inbound QoS 2 hold walk, on every teardown route that reaches it.
 var mqttTestTeardownDeletesHookV atomic.Pointer[func(t *mqttTeardownTarget)]

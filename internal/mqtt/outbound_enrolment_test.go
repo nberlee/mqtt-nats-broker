@@ -29,31 +29,21 @@ import (
 // A rule proven only through the composer is a rule the boundary never had to make.
 
 // testClosingBatch submits a closing transition with the given extra members, under a
-// closure the caller shapes.
+// closure the caller shapes: the teardown claim over the env's record (the one act that closes a
+// generation), with its composed closing members replaced by the caller's.
 func testClosingBatch(t *testing.T, e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn string, closure *mqttGenClosure, members ...mqttTransitionMember) error {
 	t.Helper()
-	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		Closure: closure,
-		Extra:   members,
-	})
+	tr := testClosure(e, prev, prevSeq, txn)
+	tr.Closure, tr.Extra = closure, members
+	_, err := e.asm.jsa.commitAuthorityTransition(tr)
 	return err
 }
 
 // testClosureRecord builds a closure naming a root address.
-func testClosureRecord(e *testOutboundEnv, txn string, discard bool, shard, ord uint64) *mqttGenClosure {
+func testClosureRecord(e *testOutboundEnv, txn string, shard, ord uint64) *mqttGenClosure {
 	return &mqttGenClosure{
-		ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: txn, Discard: discard,
+		ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: txn,
 		RootShard: shard, RootOrd: ord,
 	}
 }
@@ -74,7 +64,7 @@ func TestClosureAllocatesAReachableRoot(t *testing.T) {
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch, auth.Gen, auth.Tenure,
 		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}
@@ -136,7 +126,7 @@ func TestEveryClosureSealsAndRoots(t *testing.T) {
 		}
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		err := testClosingBatch(t, e, al.rec, al.seq, "txn-close",
-			testClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1))
+			testClosureRecord(e, "txn-close", mqttDirShardFor(getHash(e.id)), 1))
 		if err == nil {
 			t.Fatal("a closure that seals nothing was accepted")
 		}
@@ -152,7 +142,7 @@ func TestEveryClosureSealsAndRoots(t *testing.T) {
 		defer cleanup()
 		auth, seq := e.bootstrap(t, "txn-boot")
 		err := testClosingBatch(t, e, auth, seq, "txn-close",
-			testClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1))
+			testClosureRecord(e, "txn-close", mqttDirShardFor(getHash(e.id)), 1))
 		if err == nil {
 			t.Fatal("a closure over a generation with no ledger sealed nothing and was accepted")
 		}
@@ -166,7 +156,7 @@ func TestEveryClosureSealsAndRoots(t *testing.T) {
 		defer cleanup()
 		auth, seq := e.bootstrap(t, "txn-boot")
 		err := testClosingBatch(t, e, auth, seq, "txn-close",
-			testClosureRecord(e, "txn-close", false, mqttDirShardFor(getHash(e.id)), 1),
+			testClosureRecord(e, "txn-close", mqttDirShardFor(getHash(e.id)), 1),
 			testLedgerMember(t, e, 0, &mqttGenLedger{
 				Lo: 1, Del: 1,
 				ID: e.id, Epoch: e.epoch, Gen: testGen,
@@ -236,7 +226,7 @@ func TestRootBoundEqualsTheSealTheBatchInstalls(t *testing.T) {
 	// The batch seals at 1 and the root is bounded at 0 — the pre-inventory bound, which is the
 	// mutation this test exists to kill. Nothing else differs, so only the bound rule can refuse.
 	err := testClosingBatch(t, e, al.rec, al.seq, "txn-close",
-		testClosureRecord(e, "txn-close", false, shard, 1),
+		testClosureRecord(e, "txn-close", shard, 1),
 		testLedgerMember(t, e, ledSeq, &mqttGenLedger{
 			Lo: 1, Del: 1,
 			ID: e.id, Epoch: e.epoch, Gen: testGen,
@@ -273,7 +263,7 @@ func TestHeaderAllocationPreservesTraversalState(t *testing.T) {
 		t.Fatalf("planting the shard header: %v", err)
 	}
 
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch, auth.Gen, auth.Tenure,
 		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}
@@ -309,7 +299,7 @@ func TestAnArbitraryBatchCannotForgeAnEnrolment(t *testing.T) {
 			Shard: shard, Ord: 1, ID: e.id, Epoch: e.epoch, Gen: testGen,
 			SweepStart: 1, Resume: 1, Bound: 0,
 		}
-		closure := testClosureRecord(e, "txn-close", false, shard, 1)
+		closure := testClosureRecord(e, "txn-close", shard, 1)
 		mutate(e, hdr, root, closure)
 		err := testClosingBatch(t, e, auth, seq, "txn-close", closure,
 			testLedgerMember(t, e, 0, &mqttGenLedger{
@@ -404,7 +394,7 @@ func testEnrolClosing(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransit
 	}
 	cur, curSeq, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, gen)
 	hdr, hdrSeq, _ := e.asm.jsa.loadDirShardAt(mqttDirShardFor(getHash(e.id)))
-	enr, err := mqttComposeClosingEnrolment(e.id, e.epoch, gen, tr.Closure.Discard,
+	enr, err := mqttComposeClosingEnrolment(e.id, e.epoch, gen,
 		mqttClosingTargets{}, cur, curSeq, hdr, hdrSeq)
 	if err != nil {
 		t.Fatalf("composing the closing enrolment for generation %q: %v", gen, err)
@@ -456,7 +446,7 @@ func TestALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 
 			_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 				Attempt: &mqttTransitionAttempt{
-					ID: e.id, Epoch: e.epoch, Txn: "txn-seal-noclose", Op: "op-seal-noclose",
+					ID: e.id, Epoch: e.epoch, Txn: "txn-seal-noclose", Scope: auth.Gen, Op: "op-seal-noclose",
 					Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 					Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 				},
@@ -465,6 +455,7 @@ func TestALedgerIsSealedOnlyInAClosingBatch(t *testing.T) {
 					ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 					State: auth.State, Rev: auth.Rev + 1, Txn: "txn-seal-noclose",
 					OwnerTxn: auth.OwnerTxn,
+					Life:     mqttLifeOf(auth),
 				},
 				Extra: []mqttTransitionMember{
 					testLedgerMember(t, e, expect, &mqttGenLedger{
@@ -524,7 +515,7 @@ func TestAnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 			}
 			_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 				Attempt: &mqttTransitionAttempt{
-					ID: e.id, Epoch: e.epoch, Txn: "txn-aff-" + tc.name,
+					ID: e.id, Epoch: e.epoch, Txn: "txn-aff-" + tc.name, Scope: auth.Gen,
 					Op: "op-aff-" + tc.name, Kind: mqttTransitionProvisionResource,
 					PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 					Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
@@ -534,6 +525,7 @@ func TestAnAffineResourceIsBornOnlyInAClosingBatch(t *testing.T) {
 					ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 					State: auth.State, Rev: auth.Rev + 1, Txn: "txn-aff-" + tc.name,
 					OwnerTxn: auth.OwnerTxn,
+					Life:     mqttLifeOf(auth),
 				},
 				Extra: []mqttTransitionMember{
 					{
@@ -588,11 +580,11 @@ func TestAnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), testGen)
 
 	retire := &mqttRetirementRequest{
-		Gen: testGen, Discard: true,
+		Gen:           testGen,
 		AffineDurable: mineDur, AffineGen: mine, PubRelDurable: pubRelDur,
 	}
 	attempt := &mqttTransitionAttempt{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-fin", Op: "op-fin", Kind: mqttTransitionFinalize,
+		ID: e.id, Epoch: e.epoch, Txn: "txn-fin", Op: "op-fin", Kind: mqttTransitionAcceptHandoff,
 	}
 	member := func(t *testing.T, r *mqttOutboundResource) mqttTransitionMember {
 		t.Helper()
@@ -615,11 +607,12 @@ func TestAnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 	}
 	tr := func(members ...mqttTransitionMember) *mqttAuthorityTransition {
 		return &mqttAuthorityTransition{
+			Attempt: attempt,
 			Prev: &mqttOutboundAuthority{
 				ID: e.id, Epoch: e.epoch, Gen: testGen,
-				Intent: &mqttHandoffIntent{Gen: testGen2, Retire: retire},
 			},
-			Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Discard: true},
+			Retire:  retire,
+			Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen},
 			Extra:   members,
 		}
 	}
@@ -654,7 +647,7 @@ func TestAnAffineEnrolmentIsBoundToTheStandingRetirement(t *testing.T) {
 
 	// AND NO STANDING RETIREMENT AT ALL is refused rather than treated as permission.
 	noIntent := tr(member(t, base(mine, mineDur)))
-	noIntent.Prev.Intent = nil
+	noIntent.Retire = nil
 	if err := mqttCheckClosingEnrolment(attempt, noIntent); err == nil {
 		t.Fatal("an affine consumer was enrolled with no standing retirement to have selected it")
 	}
@@ -696,16 +689,14 @@ func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	}
 
 	// (2) THE RETIREMENT REQUEST that selects the target, which is the earliest record carrying it.
-	intent := &mqttHandoffIntent{
-		ID: "intent-bad", PrevGen: testGen, PrevTenure: "ten", PrevOwnerTxn: "own",
-		PrevSessWID: "wid", PrevSessSeq: 1, Gen: testGen2, Tenure: "ten2", CleanReq: true,
+	intent := &testRetireHolder{
 		Retire: &mqttRetirementRequest{
 			Gen: testGen, Tenure: "ten", OwnerTxn: "own", SessWID: "wid", SessSeq: 1,
-			Reason: mqttRetireCleanStart, Discard: true,
+			Reason:    mqttRetireCleanStart,
 			AffineGen: bad, AffineDurable: badDur, PubRelDurable: pubRelDur,
 		},
 	}
-	if err := mqttValidateHandoffIntentFor(getHash(e.id), intent); err == nil {
+	if err := testValidateHolderRetire(getHash(e.id), intent); err == nil {
 		t.Fatal("a retirement request named a malformed affine generation, so it could persist a " +
 			"target no readiness assertion could ever name")
 	} else if !strings.Contains(err.Error(), "malformed affine generation") {
@@ -734,7 +725,7 @@ func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 		bad.PubRelDurable = tc.pubRel
 		badIntent := *intent
 		badIntent.Retire = &bad
-		if err := mqttValidateHandoffIntentFor(getHash(e.id), &badIntent); err == nil {
+		if err := testValidateHolderRetire(getHash(e.id), badIntent); err == nil {
 			t.Fatalf("a retirement named a %s PUBREL consumer, so finalization would refuse a "+
 				"descriptor that can no longer be changed", tc.name)
 		}
@@ -746,7 +737,7 @@ func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	wrongDur.AffineDurable = "$MQTT_Q2AFF_not_derived"
 	wrongIntent := *intent
 	wrongIntent.Retire = &wrongDur
-	if err := mqttValidateHandoffIntentFor(getHash(e.id), &wrongIntent); err == nil {
+	if err := testValidateHolderRetire(getHash(e.id), wrongIntent); err == nil {
 		t.Fatal("a retirement named an affine durable no generation of this client owns")
 	}
 
@@ -756,7 +747,7 @@ func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	half.AffineGen = testGen2
 	halfIntent := *intent
 	halfIntent.Retire = &half
-	if err := mqttValidateHandoffIntentFor(getHash(e.id), &halfIntent); err == nil {
+	if err := testValidateHolderRetire(getHash(e.id), halfIntent); err == nil {
 		t.Fatal("a retirement named an affine generation with no durable")
 	}
 
@@ -769,7 +760,7 @@ func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	_, _, good.PubRelDurable = mqttPubRelNames(getHash(e.id), good.Gen)
 	okIntent := *intent
 	okIntent.Retire = &good
-	if err := mqttValidateHandoffIntentFor(getHash(e.id), &okIntent); err != nil {
+	if err := testValidateHolderRetire(getHash(e.id), okIntent); err != nil {
 		t.Fatalf("a well-formed affine descriptor was refused: %v", err)
 	}
 	okRes := *badRes
@@ -778,4 +769,21 @@ func TestAMalformedAffineGenerationIsRefusedAtEveryRecord(t *testing.T) {
 	if err := mqttValidateOutboundResource(&okRes, e.id, e.epoch, testGen, "inc-aff"); err != nil {
 		t.Fatalf("a well-formed affine resource was refused: %v", err)
 	}
+}
+
+// testRetireHolder carries a retirement request the way a Clean Start's acceptance does (issue
+// #133): the closing targets are validated as one descriptor before anything is composed.
+type testRetireHolder struct{ Retire *mqttRetirementRequest }
+
+func testValidateHolderRetire(idHash string, h interface{}) error {
+	var r *mqttRetirementRequest
+	switch v := h.(type) {
+	case *testRetireHolder:
+		r = v.Retire
+	case testRetireHolder:
+		r = v.Retire
+	}
+	return mqttValidateRetireTargets(idHash, r.Gen, mqttClosingTargets{
+		AffineDurable: r.AffineDurable, AffineGen: r.AffineGen, PubRelDurable: r.PubRelDurable,
+	})
 }

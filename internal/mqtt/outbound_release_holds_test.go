@@ -104,7 +104,7 @@ func testReleaseBatch(t *testing.T, e *testOutboundEnv, nonce string, incs []str
 	jsa := &e.asm.jsa
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
 	tr := &mqttAuthorityTransition{Attempt: &mqttTransitionAttempt{
-		ID: e.id, Epoch: e.epoch, Txn: mqttNewInflightNonce(), Op: "op-release", Kind: mqttTransitionReleaseHolds,
+		ID: e.id, Epoch: e.epoch, Txn: mqttNewInflightNonce(), Scope: al.rec.Gen, Op: "op-release", Kind: mqttTransitionReleaseHolds,
 		Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 	}}
 	for _, inc := range incs {

@@ -137,7 +137,7 @@ func TestCompletionOutcomeResolvesLanded(t *testing.T) {
 		t.Fatalf("an attempt with no receipt resolves %v, want UNRESOLVED", v)
 	}
 	// ABORTED: the settlement a caller with an ambiguous send writes.
-	if aerr := jsa.abortTransition(unsent.Attempt); aerr != nil {
+	if aerr := jsa.abortTransition(unsent.Attempt, nil); aerr != nil {
 		t.Fatalf("aborting the unsent attempt: %v", aerr)
 	}
 	if v := jsa.resolveTransitionHandle(h); v != mqttTransitionNeverLanded {

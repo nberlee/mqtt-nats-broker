@@ -1459,7 +1459,10 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 	// can name the nonce but cannot REACH the verdict set, which lives on a session:
 	// the orphan sweep with none resident, which is issue #92.
 	allowed := map[string]string{
-		"reapRegisterWithVerdict":          "the property's own implementation",
+		"reapRegisterWithVerdict": "the property's own implementation",
+		"createOrRestoreSessionWithin": "deletes the obsolete SESSION RECORD of a generation the authority no longer serves " +
+			"(the revived-record shape, issue #133), never a register: it names no exchange nonce, and the " +
+			"generation's registers are its retirement's",
 		"deleteInflightRegister":           "the fire-and-forget transport primitive the property calls",
 		"deleteInflightRegisterConfirmed":  "the confirmed transport primitive the property calls",
 		"deleteInflightRegistersPipelined": "the pipelined transport primitive over sequences already collected",

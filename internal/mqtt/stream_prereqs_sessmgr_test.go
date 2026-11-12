@@ -109,7 +109,6 @@ func TestNewValidatorsAcceptBrokerCreatedStreams(t *testing.T) {
 	}{
 		{mqttSessStreamName, func(si *StreamInfo) error { return validateSessStream(si, asm.domainTk, 1) }},
 		{mqttWillQStreamName, func(si *StreamInfo) error { return validateWillQStream(si, asm.domainTk, 1, e) }},
-		{mqttTeardownStreamName, func(si *StreamInfo) error { return validateTeardownStream(si, asm.domainTk, 1, e) }},
 		{mqttStreamName, func(si *StreamInfo) error {
 			return validateMsgsStream(si, 1, mqttDefaultMaxAckPending, e)
 		}},
@@ -376,7 +375,7 @@ func TestBrokerRefusesTTLlessMessageStreams(t *testing.T) {
 			}
 			// A complete bundle is present, so a refusal mentioning the count rule
 			// would mean this fixture stopped testing what it names.
-			if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
+			if strings.Contains(err.Error(), "of the 7 broker-owned streams") {
 				t.Fatalf("the refusal came from the bundle preflight, not the TTL validator: %v", err)
 			}
 		})
@@ -417,7 +416,7 @@ func TestBrokerStreamBundleStartRefusesThenRestartConverges(t *testing.T) {
 		t.Fatal("Start must FAIL against a partial bundle: the recovery guidance rests on a " +
 			"failed initialization being fatal rather than completing the bundle")
 	}
-	for _, want := range []string{"of the 8 broker-owned streams", "ONE recreation unit"} {
+	for _, want := range []string{"of the 7 broker-owned streams", "ONE recreation unit"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Start's error must carry the bundle refusal (%q), got: %v", want, err)
 		}

@@ -168,12 +168,12 @@ type mqttAccountSessionManager struct {
 	// distinct refused subjects, and never cleared because a refused record is
 	// permanent until an operator removes it. See refuseWillOutboxRecord.
 	refusedWillRecords map[string]struct{}
-	// refusedAcceptFacts is the same set for CONNECT acceptance facts this broker
-	// cannot interpret. Same reasons and the same bound, and one more of its own:
-	// an acceptance fact is never rewritten (its subject is unique) and never
-	// deleted (facts are permanent), so nothing but an operator ever clears one.
-	// Guarded by mu. See refuseAcceptFact.
-	refusedAcceptFacts map[string]struct{}
+	// anchorRemovals are the Will anchors this broker owes a removal (issue #133, plan 5.3):
+	// each is retried until it lands or the anchor reads absent, and only an orderly shutdown
+	// drops one, leaving its anchor to pin its lifecycle (the stated residual). Guarded by mu,
+	// with anchorRemovalsRunning admitting one retry loop.
+	anchorRemovals        map[mqttAnchorRemoval]struct{}
+	anchorRemovalsRunning bool
 	// willAheadCursor is where the next early-cancellation phase resumes in this
 	// account's not-yet-due pending Wills. The phase is budgeted, so without a cursor
 	// a large enough backlog would re-examine the same first records every pass and
@@ -261,19 +261,16 @@ type mqttAccountSessionManager struct {
 	// indeterminate read. Nil in production. See loadFenceSession.
 	testSessionLoad func(cidHash string) (*mqttPersistedSession, uint64, error)
 
-	// testFactLoad, when non-nil, replaces the acceptance-fact walk's point read for
-	// THIS account manager only (instance-scoped). Set/read under mu. It is both a
-	// gate and a COUNTER, and the counting is the load-bearing half: a claimant that
-	// reused a persisted decision and one that rescanned and found nothing produce
-	// the same publication, so the only discriminating assertion is that no fact was
-	// loaded at all. Nil in production. See loadNextAcceptFact.
-	testFactLoad func(filter string, seq uint64) (*StoredMsg, error)
+	// testAnchorEvidenceLoad, when non-nil, replaces the authority read a delayed Will's
+	// claimant decides from, for THIS account manager only (instance-scoped). Set/read
+	// under mu. Used to make the evidence unreadable, and to count that it was read at all.
+	// Nil in production. See decideFromAnchor.
+	testAnchorEvidenceLoad func(clientID string) mqttAuthorityLoad
 
-	// testSessLastSeq, when non-nil, replaces the $MQTT_sess last-sequence sample
-	// that becomes a decision's cutoff, for THIS account manager only
-	// (instance-scoped). Set/read under mu. Used to stage a claimant scanning under
-	// an older cutoff than a peer's. Nil in production. See sessLastSeq.
-	testSessLastSeq func() (uint64, error)
+	// testAnchorTransitionErr, when non-nil, fails a Will-anchor transition before it reads
+	// anything, for THIS account manager only. Set/read under mu. Nil in production. See
+	// runAnchorTransition.
+	testAnchorTransitionErr func(clientID string, op mqttAnchorOp) error
 
 	// testBeforeTeardownLock, when non-nil, is invoked by mqttHandleClosedClient for
 	// THIS account manager only (instance-scoped) after the closing connection has
@@ -622,6 +619,12 @@ type mqttAccountSessionManager struct {
 	// (completeExchangeDrain) exactly as testAckAdvance wraps the acknowledgement advance.
 	// Nil in production.
 	testDrainComplete func(req *mqttCompleteExchangeDrainRequest, write func() (mqttOpOutcome, error)) (mqttOpOutcome, error)
+	// testHoldGenerationRetirement, when true, stops the recovery visit before it retires the
+	// generation whose root it just retired, and the lifecycle sweep before it retires any
+	// generation: a test that inspects what certification left (the certificate, the sealed
+	// shared ledger) holds the reclamation that would purge it. false in production.
+	testHoldGenerationRetirement atomic.Bool
+
 	// testWithdrawUnsent wraps the withdraw-unsent write (withdrawUnsent) exactly as
 	// testAckAdvance wraps the acknowledgement advance: a hook can refuse it, report a landed
 	// batch as lost, or land a racing write before calling write(). Nil in production.
@@ -664,22 +667,10 @@ type mqttAccountSessionManager struct {
 	// the map's (member), so a test can prove a detached worker keeps its cleanup retries after
 	// losing map membership. Nil in production.
 	testPubCompAttempt func(rec *mqttPubCompOwed, member bool)
-	// testOwnershipMetadataEntry observes an accepting CONNECT's executor ENTERING its fenced
-	// metadata commit, so a test can prove the commit was never attempted for a proposal that is
-	// not this acceptance's. Nil in production.
-	testOwnershipMetadataEntry func()
-	// testAbandonOwn intercepts the owed-abandonment worker (issue #107 8a) before it acts: it
-	// returns false to suppress the attempt, so a test can prove the next acceptance settles a
-	// proposal the worker never reached. Nil in production.
-	testAbandonOwn func(id string, target mqttOwnershipProposal) bool
-	// testOwnershipStepEntry observes an accepting CONNECT's executor ENTERING a step, and may
-	// fail it: an error returned here ends the step exactly as a process stopping there would —
-	// nothing of the step lands and no in-place cleanup runs. Nil in production.
-	testOwnershipStepEntry func(action mqttConnectOwnershipAction) error
-	// testOwnershipBeforeMetadata runs after a reservation or preparation LANDED and before its
-	// metadata half is committed; an error returned here ends the step as a process stopping
-	// there would, leaving the proposal standing with an empty receipt slot. Nil in production.
-	testOwnershipBeforeMetadata func(action mqttConnectOwnershipAction) error
+	// testAcceptEntry observes an accepting CONNECT ENTERING one acceptance composition, and may
+	// fail it: an error returned here ends the attempt exactly as a process stopping there would,
+	// before anything is sent. Nil in production.
+	testAcceptEntry func() error
 	// testOwnershipBudgetTotal, when positive, replaces mqttConnectOwnershipBudget for the
 	// CONNECTs of this account, so a test reaches an expiry in milliseconds. Zero in production.
 	testOwnershipBudgetTotal time.Duration
@@ -1269,7 +1260,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		as.cleanupRetainedMessageCache(s, closeCh)
 	})
 
-	// Provision the eight broker-owned $MQTT_* streams through the one
+	// Provision the seven broker-owned $MQTT_* streams through the one
 	// convergence shape (ensureBrokerStream): create-or-lose, an UNCONDITIONAL
 	// authoritative re-read, then per-owner validation over that re-read — a
 	// nonconforming stream is a startup failure with recreate guidance, never
@@ -1295,7 +1286,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// First: an account still holding a retired stream — the $MQTT_origin register,
 	// or $MQTT_inflight or $MQTT_shared, whose subject spaces now live on
 	// $MQTT_sess — is refused outright. Second: an account holding a PROPER SUBSET of
-	// the eight broker-owned streams is refused rather than silently completed —
+	// the seven broker-owned streams is refused rather than silently completed —
 	// those eight are one recreation unit, and recreating a subset leaves records
 	// referencing identities the other streams have since reissued (issue #70). All
 	// take brokerStreamLookupAPI, so none can create what it is deciding about.
@@ -1392,6 +1383,10 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 				as.sweepSharedGroupRetirements(s)
 				as.sweepAcqReleaseVerdicts(s)
 				as.sweepOrphanedQoS2State(s)
+				// The lifecycle pass (lifecycle_retirement.go): acceptances whose CONNECT never
+				// bound, finished generations and lifecycles retired. After the orphan sweep, so
+				// a fresh abandonment's marked record is adopted by a later pass.
+				as.sweepLifecycles(s)
 				// The outbound recovery pass rides the same cadence (issue #107, row 6). It is
 				// deliberately NOT run at startup beside the three above: those reconcile state
 				// this broker may have left behind, while this one walks a durable directory
@@ -2198,19 +2193,8 @@ RESTORE:
 		// is the UNSETTLED vocabulary, not a takeover claim (issue #86). See
 		// sess_fork_lineage.go and docs/CONFORMANCE.md.
 		//
-		// The watermark is still READ here, and its unreadable arm is a refusal in its
-		// own right rather than the discarded half of an inheritance: admitting a
-		// session over a watermark this broker cannot read leaves its OWN later teardown
-		// unable to record a retirement (recordGenRetirement refuses to replace a corrupt
-		// standing watermark), so the record would stay MARKED for every future finisher
-		// — new state admitted into a store whose teardown path is already known to be
-		// unusable.
-		if _, _, st := jsa.loadGenRetirement(as.domainTk, hash); st == mqttRetirementCorrupt {
-			return nil, false, fmt.Errorf("creating session %q: the delayed-teardown "+
-				"watermark for this client is unreadable, so a teardown of this session "+
-				"could never record its retirement; stop this account's brokers and "+
-				"recreate the broker-owned JetStream state (the $MQTT_* streams)", clientID)
-		}
+		// A Corrupt authority or registry shard refuses at the acceptance, which reads both
+		// before it composes anything (accept_shapes.go).
 		sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), 0, _EMPTY_, _EMPTY_, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk
@@ -2299,14 +2283,16 @@ RESTORE:
 	}
 
 	if ps.Teardown != nil {
-		// A RETIREMENT ALREADY DURABLY OWNED is displaced, not finished: the teardown that wrote
-		// this marker committed its receipt, its watermark and its discarding closure, so the
-		// rest of the generation belongs to that teardown's continuation, its recovery executor
-		// and the orphan sweep, and this CONNECT only writes over the marker. The create below is
+		// A RETIREMENT ALREADY DURABLY OWNED is displaced, not finished: the claim that wrote this
+		// marker committed its generation's Outstanding entry and discarding closure, so the rest of the generation belongs to its recovery executor and the sweep,
+		// and this CONNECT only writes over the marker, discharging its release. The create below is
 		// parentless, on a fresh generation, at the marker's sequence, so the accept batch's
 		// record CAS is what arbitrates it; Session Present is false. See
 		// sess_teardown_displace.go.
 		ok, why := mqttMarkedRecordDisplaceable(as.markedRecordFacts(ps, hash, smsg.Sequence))
+		if h := mqttTestMarkedRecordDeclineDisplaceV.Load(); ok && h != nil && (*h)(clientID) {
+			ok, why = false, "declined by a test seam"
+		}
 		if ok {
 			if h := mqttTestMarkedRecordArmHookV.Load(); h != nil {
 				(*h)(clientID, mqttMarkedRecordDisplaced)
@@ -2314,6 +2300,7 @@ RESTORE:
 			sess := mqttSessionCreate(jsa, clientID, hash, mqttNewSessGen(), smsg.Sequence, _EMPTY_, _EMPTY_, opts)
 			sess.asm = as
 			sess.domainTk = as.domainTk
+			sess.displacedMarker = ps.Teardown.Nonce
 			return sess, false, nil
 		}
 		jsa.c.Debugf("MQTT: finishing the claimed teardown of session %q inline: %s", clientID, why)
@@ -2338,60 +2325,44 @@ RESTORE:
 		sess.domainTk = as.domainTk
 		// Parentless, as every create now is: this session's first write no longer
 		// descends from the record the ADOPTED teardown claimed. The marker's own PWID
-		// still names that record, and finishAdoptedTeardown passes it to
-		// recordGenRetirement as the PRECONDITION that the record being retired has an
-		// identity at all — the watermark no longer stores it. See the create arm above.
+		// still names that record. See the create arm above.
 		return sess, false, nil
 	}
 
-	// THE RETIREMENT FENCE. An unmarked record whose generation is durably RETIRED is
-	// the hollow survivor of the claim-won deletion window: some teardown won its
-	// claim, recorded the retirement and deleted this generation's consumers, durables,
-	// QoS 2 holds and in-flight registers, and an unconditional foreign write then
-	// evicted the marker off this subject (the same-base boundary, docs/CONFORMANCE.md:
-	// a CAS cannot exclude a write that carries no expectation). Resuming it would answer Session Present 1 for state
-	// that no longer exists, so it is discarded instead. This is the only prompt reader
-	// for a winner that crashed after the watermark: without it every reconnect
-	// re-resumes the same hollow record until the sweep runs.
-	//
-	// One exact-subject read per record-restoring CONNECT (a fresh create and a
-	// marked-record adoption never reach here). A watermark that cannot be read — or
-	// that is malformed in any field — REFUSES the CONNECT rather than being ignored:
-	// the same fail-closed rule the record load itself follows, and the same rule the
-	// writer and the sweep apply. See sess_teardown.go.
-	rt, _, rstatus := jsa.loadGenRetirement(as.domainTk, hash)
-	switch rstatus {
-	case mqttRetirementCorrupt:
-		return nil, false, fmt.Errorf("restoring session %q: its durable retirement watermark is malformed, "+
-			"so whether this generation was torn down cannot be decided: stop this account's brokers and "+
-			"recreate the broker-owned JetStream state (the $MQTT_* streams)", clientID)
-	case mqttRetirementIndeterminate:
-		return nil, false, fmt.Errorf("restoring session %q: unable to read its durable retirement watermark", clientID)
-	}
-	genRetired := rstatus == mqttRetirementValid && rt.Gen == ps.Gen
-	if genRetired {
-		// The discard below is destructive — clear() deletes every durable this record
-		// names — and `genRetired` is a NEW route into it, so it does not inherit the
-		// overdue arm's pre-existing validation level. A record naming another session's
-		// consumer is refused here rather than discarded, exactly as readers 1 and 3
-		// refuse to condemn one. See mqttValidateTeardownTargets.
-		if verr := mqttValidateTeardownTargets(ps, hash); verr != nil {
-			return nil, false, fmt.Errorf("restoring session %q: its generation is durably retired, but the "+
-				"record names resources that are not this session's: %w", clientID, verr)
+	// THE RETIREMENT FENCE. An unmarked record is resumable only while its generation is the
+	// authority's CURRENT one (gen_standing.go). A teardown marks the record in the batch that
+	// makes its generation noncurrent, so no broker writer leaves an unmarked record of a
+	// noncurrent generation; the store does, when a limit-evicted record revives after a restart
+	// (docs/known-upstream-issues.md, MAXMSGSPER-REVIVAL). Such a record is OBSOLETE: the
+	// authority says no broker serves its generation, whose cleanup belongs to that generation's
+	// Outstanding entry and retirement. It is not resumed (Session Present would describe state
+	// that may be gone) and it is not torn down again (that would author a second discard of one
+	// generation): its record alone is deleted at its exact sequence and the restore reads again
+	// (plan section 7, "refuse resume"). An authority that cannot be read refuses the CONNECT,
+	// by the same fail-closed rule the record load itself follows.
+	switch standing, _ := as.genStanding(clientID, ps.Gen); standing {
+	case mqttGenCurrent:
+	case mqttGenOutstanding, mqttGenRetired:
+		jsa.c.Warnf("MQTT: the record of session %q at sequence %d names generation %q, which its authority no "+
+			"longer serves; the obsolete record is deleted and the session starts fresh", clientID, smsg.Sequence, ps.Gen)
+		if derr := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); derr != nil &&
+			isErrorOtherThan(derr, JSSequenceNotFoundErrF) &&
+			!isJSErrCausedBy(derr, JSStreamMsgDeleteFailedF, ErrStoreMsgNotFound) {
+			return nil, false, fmt.Errorf("restoring session %q: deleting its obsolete record: %w", clientID, derr)
 		}
+		if aerr := rd.admitCycle(); aerr != nil {
+			return nil, false, fmt.Errorf("restoring session %q: %w", clientID, aerr)
+		}
+		goto RESTORE
+	default:
+		return nil, false, fmt.Errorf("restoring session %q: where its generation %q stands cannot be read", clientID, ps.Gen)
 	}
 
 	// An overdue session must not be resumed, even if this reconnect beats the
-	// startup sweep to it: discard its state and start fresh. Spec5 [3.1.2.11.2].
-	// A retired generation takes the SAME route rather than a second discard shape of
-	// its own: build the transient session, clear() it (which re-marks the record,
-	// finds the retirement already recorded, repeats the deletions — the inbound QoS 2 hold
-	// walk bounded per walk, issue #66; the in-flight reap beside it bounded by its own
-	// enumeration watermark, issue #38 — and releases the record) and hand back the reset
-	// object as a fresh session, with
-	// Session Present false — which is the truthful answer in both cases.
+	// startup sweep to it: discard its state and start fresh, with Session Present false.
+	// Spec5 [3.1.2.11.2].
 	overdue := mqttSessionOverdue(ps.DisconnectedAt, ps.ExpiryInterval, time.Now())
-	if overdue || genRetired {
+	if overdue {
 		sess := mqttSessionCreate(jsa, clientID, hash, ps.Gen, smsg.Sequence, ps.WID, ps.PWID, opts)
 		sess.asm = as
 		sess.domainTk = as.domainTk

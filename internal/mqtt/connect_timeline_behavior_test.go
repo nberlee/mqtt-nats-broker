@@ -76,7 +76,7 @@ func testConnectSpans(line string) ([]string, map[string]time.Duration) {
 
 // The steps of an accepted CONNECT that resumes nothing, and the cleanup after it.
 var testFreshConnectSpans = []string{"admit", "authorize", "account", "gate", "session", "ownership",
-	"tenure", "bind", "resume", "finish", "after-connack", "cleanup:accept-tx", "cleanup:will",
+	"tenure", "bind", "resume", "finish", "accept-bind", "after-connack", "cleanup:accept-tx", "cleanup:will",
 	"cleanup:gate-release", "cleanup:conn-tail", "cleanup:certify", "cleanup:abandon"}
 
 func TestSlowConnectNamesTheOwnershipStep(t *testing.T) {
@@ -90,7 +90,7 @@ func TestSlowConnectNamesTheOwnershipStep(t *testing.T) {
 
 	var paused bool
 	asm.mu.Lock()
-	asm.testOwnershipStepEntry = func(mqttConnectOwnershipAction) error {
+	asm.testAcceptEntry = func() error {
 		if !paused {
 			paused = true
 			time.Sleep(pause)
@@ -187,7 +187,7 @@ func TestSlowRefusedConnectNamesTheFailedStepAndItsCleanup(t *testing.T) {
 
 	refused := errors.New("test: the ownership step is refused")
 	asm.mu.Lock()
-	asm.testOwnershipStepEntry = func(mqttConnectOwnershipAction) error { return refused }
+	asm.testAcceptEntry = func() error { return refused }
 	asm.testCertified = func(c *client, _ *mqttCloseCert) {
 		if c.mqtt.cid == id {
 			time.Sleep(pause)

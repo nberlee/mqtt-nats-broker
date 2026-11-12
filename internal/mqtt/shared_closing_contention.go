@@ -89,7 +89,26 @@ type mqttSharedContention struct {
 	// pace, when set, is consulted before each absorbed retry with its price; false ends the
 	// episode unsettled. The recovery visit charges its budget and honours its stop here.
 	pace func(units int) bool
+	// admit, when set, is asked before EVERY ledger write the closing sends, first attempts and
+	// retries alike: each one rewrites the client's authority (shared_ledger_fence.go), so a
+	// background closing yields to announced foreground work per attempt (issue #133).
+	admit func() bool
 }
+
+// errMQTTSharedNotAdmitted: a background closing's ledger write was refused admission because
+// foreground work of the client is announced. Nothing was sent; the next visit continues.
+var errMQTTSharedNotAdmitted = errors.New("the shared closing's write was not admitted: foreground work is announced")
+
+// mqttSharedAdmissionOnly is a background verdict executor's allowance: it absorbs no
+// contention (its deadline is past, so every refusal is counted, as a nil allowance's is) and
+// admits every ledger write it sends, the release fence included, through admit.
+func mqttSharedAdmissionOnly(admit func() bool) *mqttSharedContention {
+	return &mqttSharedContention{admit: admit}
+}
+
+// admits asks the closing's admission before one ledger write. A nil allowance, or one with no
+// admission, is a client's own path and admits.
+func (c *mqttSharedContention) admits() bool { return c == nil || c.admit == nil || c.admit() }
 
 func newMqttSharedContention(pace func(units int) bool) *mqttSharedContention {
 	allowance := mqttSharedContentionAllowance

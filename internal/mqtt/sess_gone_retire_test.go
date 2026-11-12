@@ -1,6 +1,8 @@
 package mqtt
 
 import (
+	"encoding/json"
+	"errors"
 	"runtime"
 	"sync/atomic"
 	"testing"
@@ -21,33 +23,47 @@ import (
 //
 // None of these tests is parallel: several install process-global hooks.
 
-// plantGoneLicence writes a valid retirement watermark for this client whose marker
-// sequence exceeds the session's acknowledged record sequence — the licence itself.
-//
-// markerAbove says whether the marker should REACH past our sequence. False builds the
-// no-licence case, where a watermark exists but proves nothing about a record this
-// session is already acknowledged beyond.
-func (e *testRejectionEnv) plantGoneLicence(t *testing.T, gen string, markerAbove bool) {
+// plantGoneLicence makes this session's generation NONCURRENT in its authority, the state a
+// peer's teardown leaves (issue #133): closed, with the generation outstanding and its release
+// done. laterGen instead has a LATER generation of the lifecycle installed and then torn down
+// as well, so the authority's last generation is not ours: the licence is our generation's
+// standing, never the authority's last generation.
+func (e *testRejectionEnv) plantGoneLicence(t *testing.T, laterGen bool) {
 	t.Helper()
 	e.sess.mu.Lock()
-	idHash, id, ourSeq := e.sess.idHash, e.sess.id, e.sess.seq
+	id, gen := e.sess.id, e.sess.gen
 	e.sess.mu.Unlock()
-	if ourSeq == 0 {
-		t.Fatal("the session has no acknowledged record sequence, so no licence case can be built")
+	al := e.asm.jsa.loadOutboundAuthority(id, e.asm.sessStreamEpoch)
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Life == nil ||
+		al.rec.State != mqttAuthorityServing || al.rec.Gen != gen {
+		t.Fatalf("fixture: the authority must serve the session's generation, reads %v", al.status)
 	}
-	markerSeq := ourSeq + 1
-	if !markerAbove {
-		markerSeq = ourSeq
+	next := *al.rec
+	life := *al.rec.Life
+	ended := func(ord uint64) mqttOutstandingGen {
+		return mqttOutstandingGen{Ord: ord, Phase: mqttOutstandingOpen,
+			Teardown: mqttOutstandingTeardown{Kind: mqttTeardownMarker, Nonce: nuid.Next(), MarkerWID: nuid.Next()}}
 	}
-	subject := mqttTeardownSubject(e.asm.domainTk, idHash)
-	_, seq, status := e.asm.jsa.loadGenRetirement(e.asm.domainTk, idHash)
-	var expect uint64
-	if status != mqttRetirementAbsent {
-		expect = seq
+	_, ord, _ := mqttParseGenToken(gen)
+	life.Outstanding = append(append([]mqttOutstandingGen(nil), life.Outstanding...), ended(ord))
+	if laterGen {
+		later, err := mqttGenToken(life.L, life.NextGenOrd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		life.Outstanding = append(life.Outstanding, ended(life.NextGenOrd))
+		next.Gen = later
+		life.NextGenOrd++
 	}
-	r := &mqttGenRetirement{ID: id, Gen: gen, MarkerSeq: markerSeq, Nonce: nuid.Next(), Origin: "node2"}
-	if _, err := e.asm.jsa.storeGenRetirementCAS(subject, expect, r); err != nil {
-		t.Fatalf("planting the retirement watermark: %v", err)
+	life.Phase, life.GenAcqs, life.Pending = mqttLifecycleClosed, false, nil
+	next.State, next.Life, next.Rev, next.Txn = mqttAuthorityClosed, &life, next.Rev+1, mqttNewInflightNonce()
+	body, err := json.Marshal(&next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, hdr := mqttFrameBatchWrite(al.seq, body, _EMPTY_, 0, false)
+	if _, err := e.asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(id)), hdr, msg); err != nil {
+		t.Fatalf("planting the noncurrent generation: %v", err)
 	}
 }
 
@@ -92,12 +108,9 @@ func TestSilentBoundGoneWithHigherRetirementIsRetired(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonebound")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
-	e.sess.mu.Lock()
-	gen := e.sess.gen
-	e.sess.mu.Unlock()
 
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	// The FIRST pass arms the marker and consumes it in the same pass; a second is run
 	// because a refusal before the detach leaves the marker armed for a retry, and the
@@ -121,14 +134,11 @@ func TestSilentBoundGoneWithHigherRetirementIsRetired(t *testing.T) {
 	}
 }
 
-// TestSilentBoundGoneAfterLaterGenerationRetirement is the case that makes the
-// licence a SEQUENCE test rather than a generation test.
+// TestSilentBoundGoneAfterLaterGenerationRetirement: the authority's last generation is a LATER
+// one, also torn down, so it does not name ours. Ours is still outstanding in the lifecycle,
+// which is the whole licence.
 //
-// The watermark's single slot has been replaced by a LATER generation's retirement, so it
-// cannot name ours. Its marker sequence still proves a teardown claimed this client's
-// record subject after the record we are acknowledged for, which is the whole licence.
-//
-// Mutation: requiring watermark generation EQUALITY here must fail this test.
+// Mutation: licensing on the authority's last generation instead of ours must fail this test.
 func TestSilentBoundGoneAfterLaterGenerationRetirement(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonelater")
 	e.dropPersistObservations(t, e.idHash)
@@ -136,14 +146,14 @@ func TestSilentBoundGoneAfterLaterGenerationRetirement(t *testing.T) {
 
 	e.deleteRecordRemotely(t)
 	// A DIFFERENT generation occupies the slot.
-	e.plantGoneLicence(t, mqttNewSessGen(), true)
+	e.plantGoneLicence(t, true)
 
 	e.asm.reconcileResidentRecordState(e.s)
 	if e.resident(e.sess) {
 		e.asm.reconcileResidentRecordState(e.s)
 	}
 	if e.resident(e.sess) {
-		t.Fatal("a marker sequence beyond our own record is the licence: a different generation in the slot must not defeat it")
+		t.Fatal("our generation reading noncurrent is the licence: a later generation's teardown must not defeat it")
 	}
 }
 
@@ -153,7 +163,7 @@ func TestSilentBoundGoneAfterLaterGenerationRetirement(t *testing.T) {
 // Three sub-cases, each a way the licence can be missing. In every one the incumbent must
 // be left bound with its session intact — refusal, never disposal under a live owner.
 func TestSilentBoundGoneWithoutLicenceRemainsBound(t *testing.T) {
-	t.Run("no watermark at all", func(t *testing.T) {
+	t.Run("the generation is still current", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "f036gonenowm")
 		e.dropPersistObservations(t, e.idHash)
 		e.bind(t)
@@ -161,50 +171,28 @@ func TestSilentBoundGoneWithoutLicenceRemainsBound(t *testing.T) {
 
 		e.asm.reconcileResidentRecordState(e.s)
 		e.asm.reconcileResidentRecordState(e.s)
-		e.assertStillBound(t, "an absent watermark is not a licence: absence of a record proves nothing on its own")
+		e.assertStillBound(t, "a current generation is not a licence: absence of a record proves nothing on its own")
 	})
 
-	t.Run("marker does not reach past our record", func(t *testing.T) {
-		e := testNewRejectionEnv(t, "f036gonelow")
-		e.dropPersistObservations(t, e.idHash)
-		e.bind(t)
-		e.sess.mu.Lock()
-		gen := e.sess.gen
-		e.sess.mu.Unlock()
-		e.deleteRecordRemotely(t)
-		// Valid, and naming our own generation — but its marker landed at or below the
-		// record we are acknowledged for, so it describes a retirement this session
-		// already outlived.
-		e.plantGoneLicence(t, gen, false)
-
-		e.asm.reconcileResidentRecordState(e.s)
-		e.asm.reconcileResidentRecordState(e.s)
-		e.assertStillBound(t, "a marker at or below our own sequence is not a licence")
-	})
-
-	t.Run("unreadable watermark", func(t *testing.T) {
+	t.Run("unreadable authority", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "f036gonecorrupt")
 		e.dropPersistObservations(t, e.idHash)
 		e.bind(t)
 		e.deleteRecordRemotely(t)
-		// Scoped to THIS client and delegating every other hash to the real read: the
-		// hook is process-global and paused parallel tests resume between sequential
-		// ones, so an unscoped hook makes concurrently running tests read a corrupt
-		// watermark for their own sessions.
-		ourHash := e.sess.idHash
-		asm := e.asm
-		restore := setMQTTTestRetirementLoadHook(
-			func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
-				if idHash != ourHash {
-					return asm.jsa.loadGenRetirementRecord(asm.domainTk, idHash)
-				}
-				return nil, 5, mqttRetirementCorrupt
-			})
+		e.plantGoneLicence(t, false)
+		// Scoped to THIS client's authority subject: the hook is process-global.
+		authSubj := mqttOutboundAuthoritySubject(e.sess.idHash)
+		restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
+			if subject == authSubj {
+				return errors.New("injected: the authority read is indeterminate")
+			}
+			return nil
+		})
 		defer restore()
 
 		e.asm.reconcileResidentRecordState(e.s)
 		e.asm.reconcileResidentRecordState(e.s)
-		e.assertStillBound(t, "a watermark this broker cannot interpret is never a licence")
+		e.assertStillBound(t, "an authority this broker cannot read is never a licence")
 	})
 }
 
@@ -240,11 +228,8 @@ func TestGoneRetirementRevalidatesInsideRecordFence(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonefence")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
-	e.sess.mu.Lock()
-	gen := e.sess.gen
-	e.sess.mu.Unlock()
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	fired := 0
 	restore := setMQTTTestGoneRetireIdentityHook(func(sess *mqttSession) {
@@ -276,25 +261,21 @@ func TestGoneRetirementRevalidatesInsideRecordFence(t *testing.T) {
 // TestGoneRetirementRefusesOnARecordThatCameBack is the BETWEEN-READ case, and it is
 // what makes the in-fence durable re-reads provable rather than decorative.
 //
-// The off-gate prefilter read the record as absent and the watermark as licensing. Both
-// observations were taken with no gate and no fence held, so either can be stale by the
-// time the proof runs: a peer's CONNECT can restore this client's record in that window.
-// The proof re-reads both INSIDE the fence, and the record read goes LAST so it is the
-// final fallible observation.
+// The off-gate prefilter read the record as absent and the generation as noncurrent, with no
+// gate and no fence held, so the absence can be stale by the time the proof runs: a peer's
+// CONNECT can restore this client's record in that window. The proof re-reads INSIDE the
+// fence, and the record read goes LAST so it is the final fallible observation. (The
+// generation's noncurrency is monotone, so its re-read cannot be made stale by any writer.)
 //
-// Mutations: removing the in-fence record-absence re-read, or the in-fence watermark
-// re-validation, must fail this test. Neither is killable without this seam, because the
-// prefilter's own reads already satisfy every other fixture.
+// Mutation: removing the in-fence record-absence re-read must fail this test. It is not
+// killable without this seam, because the prefilter's own reads satisfy every other fixture.
 func TestGoneRetirementRefusesOnARecordThatCameBack(t *testing.T) {
 	t.Run("the record is restored inside the fence", func(t *testing.T) {
 		e := testNewRejectionEnv(t, "f036goneback")
 		e.dropPersistObservations(t, e.idHash)
 		e.bind(t)
-		e.sess.mu.Lock()
-		gen := e.sess.gen
-		e.sess.mu.Unlock()
 		body := e.deleteRecordRemotely(t)
-		e.plantGoneLicence(t, gen, true)
+		e.plantGoneLicence(t, false)
 
 		fired := 0
 		restore := setMQTTTestGoneRetireProofEntryHook(func(sess *mqttSession) {
@@ -321,42 +302,6 @@ func TestGoneRetirementRefusesOnARecordThatCameBack(t *testing.T) {
 			t.Fatal("the retirement proceeded even though a session record was present again inside the fence")
 		}
 	})
-
-	t.Run("the watermark is replaced inside the fence", func(t *testing.T) {
-		e := testNewRejectionEnv(t, "f036gonewmback")
-		e.dropPersistObservations(t, e.idHash)
-		e.bind(t)
-		e.sess.mu.Lock()
-		gen := e.sess.gen
-		e.sess.mu.Unlock()
-		e.deleteRecordRemotely(t)
-		e.plantGoneLicence(t, gen, true)
-
-		fired := 0
-		restore := setMQTTTestGoneRetireProofEntryHook(func(sess *mqttSession) {
-			if sess != e.sess || fired > 0 {
-				return // another test's session: this hook is process-global
-			}
-			fired++
-			// The slot is replaced by a retirement whose marker no longer reaches past
-			// our record, so the licence the prefilter read no longer exists.
-			e.plantGoneLicence(t, mqttNewSessGen(), false)
-		})
-		defer restore()
-
-		e.asm.reconcileResidentRecordState(e.s)
-		restore()
-
-		if fired == 0 {
-			t.Fatal("the proof-entry seam never ran")
-		}
-		e.sess.mu.Lock()
-		bound := e.sess.c != nil
-		e.sess.mu.Unlock()
-		if !bound {
-			t.Fatal("the retirement proceeded on a licence that was withdrawn inside the fence")
-		}
-	})
 }
 
 // TestGoneRetirementAbnormalExitUnwindsTheProof is the abnormal-exit case, and the
@@ -377,11 +322,8 @@ func TestGoneRetirementAbnormalExitUnwindsTheProof(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonegoexit")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
-	e.sess.mu.Lock()
-	gen := e.sess.gen
-	e.sess.mu.Unlock()
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	var died atomic.Bool
 	restore := setMQTTTestGoneRetireProofEntryHook(func(sess *mqttSession) {
@@ -453,11 +395,8 @@ func TestGoneRetirementAbnormalExitAfterTheDetach(t *testing.T) {
 	e.dropPersistObservations(t, e.idHash)
 	b := e.bindSocket(t, mqttProtoLevel5)
 	b.armWill()
-	e.sess.mu.Lock()
-	gen := e.sess.gen
-	e.sess.mu.Unlock()
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	var died atomic.Bool
 	restore := setMQTTTestWillPhaseProbe(func(sess *mqttSession, _ *mqttAccountSessionManager) {
@@ -527,16 +466,15 @@ func TestGoneRetirementAbnormalExitPreservesADelayedWill(t *testing.T) {
 		props:   &mqttProperties{willDelay: 3600},
 	}
 	b.bc.mqtt.willDisposition = mqttWillArmed
+	// The anchor a delay-capable CONNECT's acceptance allocates for this Will.
+	b.bc.mqtt.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
 	// The connection's own expiry, which is what mqttHandleWill caps the delay against.
 	// It must outlive the connection for the Will to be DELAYED rather than immediate.
 	b.bc.mqtt.sessionExpiry = 600
 	b.bc.mu.Unlock()
 
-	e.sess.mu.Lock()
-	gen := e.sess.gen
-	e.sess.mu.Unlock()
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	// The abnormal exit lands INSIDE the Will phase, before the Will is consumed.
 	var died atomic.Bool
@@ -618,6 +556,8 @@ func TestGoneRetirementRefusesABoundSessionWithAParkedAction(t *testing.T) {
 		props:   &mqttProperties{willDelay: 3600},
 	}
 	b.bc.mqtt.willDisposition = mqttWillArmed
+	// The anchor a delay-capable CONNECT's acceptance allocates for this Will.
+	b.bc.mqtt.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
 	b.bc.mqtt.sessionExpiry = 600
 	b.bc.mu.Unlock()
 
@@ -626,11 +566,10 @@ func TestGoneRetirementRefusesABoundSessionWithAParkedAction(t *testing.T) {
 	parked := &mqttDeferredDisconnect{disconnectedAt: time.Now().Unix(), expiryInterval: 0}
 	e.sess.mu.Lock()
 	e.sess.deferredDisconnect = parked
-	gen := e.sess.gen
 	e.sess.mu.Unlock()
 
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	willWatch := e.watchDelivery(t, "will/topic")
 	e.asm.reconcileResidentRecordState(e.s)
@@ -709,11 +648,8 @@ func TestGoneRetirementRefusesOnASplitIndex(t *testing.T) {
 			e := testNewRejectionEnv(t, "f036gonesplit")
 			e.dropPersistObservations(t, e.idHash)
 			e.bind(t)
-			e.sess.mu.Lock()
-			gen := e.sess.gen
-			e.sess.mu.Unlock()
 			e.deleteRecordRemotely(t)
-			e.plantGoneLicence(t, gen, true)
+			e.plantGoneLicence(t, false)
 
 			fired := 0
 			restore := setMQTTTestGoneRetireIdentityHook(func(sess *mqttSession) {
@@ -758,11 +694,8 @@ func TestGoneRetirementReopensAdmissionOnRefusal(t *testing.T) {
 	e := testNewRejectionEnv(t, "f036gonereopen")
 	e.dropPersistObservations(t, e.idHash)
 	e.bind(t)
-	e.sess.mu.Lock()
-	gen := e.sess.gen
-	e.sess.mu.Unlock()
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	restore := setMQTTTestGoneRetireIdentityHook(func(sess *mqttSession) {
 		if sess != e.sess {
@@ -813,7 +746,6 @@ func TestGoneRetirementDischargesWillExactlyOnce(t *testing.T) {
 	b.armWill()
 
 	e.sess.mu.Lock()
-	gen := e.sess.gen
 	// A parked action and a live Will cannot coexist on a successful retirement, and the
 	// check below is what makes that an invariant rather than a comment.
 	parked := e.sess.deferredDisconnect
@@ -823,7 +755,7 @@ func TestGoneRetirementDischargesWillExactlyOnce(t *testing.T) {
 	}
 
 	e.deleteRecordRemotely(t)
-	e.plantGoneLicence(t, gen, true)
+	e.plantGoneLicence(t, false)
 
 	willWatch := e.watchDelivery(t, "will/topic")
 	e.asm.reconcileResidentRecordState(e.s)

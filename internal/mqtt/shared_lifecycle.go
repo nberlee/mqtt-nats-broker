@@ -745,8 +745,9 @@ const (
 	// seal: the ledger loses exactly one entry and the group one holder; the last holder moves
 	// the incarnation into retiring.
 	mqttSharedShapeRelease
-	// mqttSharedShapeInstall: ledger alone. A resume's tenure installation, under the
-	// non-regression rule; over absence it is also the abort's INIT FENCE.
+	// mqttSharedShapeInstall: ledger alone (and the authority it is fenced by). A resume's tenure
+	// installation over a standing ledger, under the non-regression rule; over absence it is the
+	// generation's first acquisition creating the ledger, which records GenAcqs (issue #133).
 	mqttSharedShapeInstall
 	// mqttSharedShapeSeal: ledger alone. The closing's fence, authorized by the teardown claim
 	// and never by tenure; preserves acquisitions and tenure.
@@ -909,13 +910,27 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 		}
 	}
 
+	// EVERY LEDGER STEP IS FENCED BY THE AUTHORITY (shared_ledger_fence.go): the authority as
+	// read rides as the batch's last member, rewritten unchanged apart from the GenAcqs a ledger's
+	// creation sets.
+	var authNext *mqttOutboundAuthority
+	var authSeq uint64
+	if b.hasLedger {
+		al := jsa.loadOutboundAuthority(b.ID, b.Epoch)
+		next, ferr := mqttSharedAuthorityFence(b, al)
+		if ferr != nil {
+			return mqttSharedWriteResult{Err: fmt.Errorf("refusing the %s batch: %w", b.Shape, ferr)}
+		}
+		authNext, authSeq = next, al.seq
+	}
+
 	var msgs []mqttBatchMsg
 	var groupIdx, ledgerIdx = -1, -1
 	frame := func(subj string, expect uint64, body []byte, batchID string, seq int, commit bool) {
 		m, h := mqttFrameBatchWrite(expect, body, batchID, seq, commit)
 		msgs = append(msgs, mqttBatchMsg{subj: subj, hdr: h, msg: m})
 	}
-	two := b.hasGroup && b.hasLedger
+	two := (b.hasGroup && b.hasLedger) || authNext != nil
 	batchID := _EMPTY_
 	if two {
 		jsa.mu.Lock()
@@ -926,13 +941,18 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 	if b.hasLedger {
 		body, _ := json.Marshal(b.LedgerNext)
 		ledgerIdx = len(msgs)
-		frame(mqttSharedLedgerSubject(getHash(b.ID), b.Gen), b.ledgerExpect, body, batchID, seq, two && !b.hasGroup)
+		frame(mqttSharedLedgerSubject(getHash(b.ID), b.Gen), b.ledgerExpect, body, batchID, seq, two && !b.hasGroup && authNext == nil)
 		seq++
 	}
 	if b.hasGroup {
 		body, _ := json.Marshal(b.GroupNext)
 		groupIdx = len(msgs)
-		frame(mqttSharedGroupSubject(b.Qkey), b.groupExpect, body, batchID, seq, two)
+		frame(mqttSharedGroupSubject(b.Qkey), b.groupExpect, body, batchID, seq, two && authNext == nil)
+		seq++
+	}
+	if authNext != nil {
+		body, _ := json.Marshal(authNext)
+		frame(mqttOutboundAuthoritySubject(getHash(b.ID)), authSeq, body, batchID, seq, true)
 	}
 	if h := mqttTestSharedWireHookV.Load(); h != nil {
 		msgs = (*h)(b.Shape, msgs)
@@ -980,15 +1000,14 @@ func (jsa *mqttJSA) commitSharedLifecycleBatch(b *mqttSharedBatch) mqttSharedWri
 	switch {
 	case err == nil:
 		out := mqttSharedWriteResult{Outcome: mqttSharedWriteLanded}
-		// The PubAck names the LAST member's sequence; in a two-member batch the members take
-		// consecutive sequences, so the earlier one is the sequence before it.
-		last := resp.Sequence
-		if groupIdx >= 0 && ledgerIdx >= 0 {
-			out.LedgerSeq, out.GroupSeq = last-1, last
-		} else if groupIdx >= 0 {
-			out.GroupSeq = last
-		} else {
-			out.LedgerSeq = last
+		// The PubAck names the LAST member's sequence; a batch's members take consecutive
+		// sequences in the order they were framed.
+		first := resp.Sequence - uint64(len(msgs)-1)
+		if ledgerIdx >= 0 {
+			out.LedgerSeq = first + uint64(ledgerIdx)
+		}
+		if groupIdx >= 0 {
+			out.GroupSeq = first + uint64(groupIdx)
 		}
 		return out
 	case mqttIsRecordCASRejection(err):
@@ -1206,11 +1225,10 @@ func mqttCheckSharedLedgerStep(b *mqttSharedBatch) error {
 		if next.State != mqttSharedLedgerSealed {
 			return fmt.Errorf("a seal writes a sealed ledger")
 		}
+		// ONLY AN INSTALLATION CREATES A LEDGER (issue #133): it is the act that records the
+		// generation acquired, so an absent ledger means "never acquired" and has nothing to seal.
 		if prior == nil {
-			if len(next.Acqs) != 0 || !next.Tenure.isZero() {
-				return fmt.Errorf("a seal over absence carries no acquisitions and no tenure")
-			}
-			return nil
+			return fmt.Errorf("a seal over absence: a generation with no ledger never acquired")
 		}
 		if next.Tenure != prior.Tenure || !mqttSharedAcqsEqual(next.Acqs, prior.Acqs) ||
 			!mqttSharedStringsEqual(next.Closed, prior.Closed) {
@@ -1503,10 +1521,6 @@ var (
 func mqttComposeSharedSeal(epoch, id, gen string, l mqttSharedLedgerLoad) (*mqttSharedBatch, error) {
 	b := &mqttSharedBatch{Shape: mqttSharedShapeSeal, Epoch: epoch, ID: id, Gen: gen, hasLedger: true}
 	switch l.status {
-	case mqttOutboundAbsent:
-		b.LedgerNext = &mqttSharedLedger{Epoch: epoch, ID: id, Gen: gen, State: mqttSharedLedgerSealed,
-			Acqs: []mqttSharedAcqRef{}, Closed: []string{}}
-		return b, nil
 	case mqttOutboundValid:
 	default:
 		return nil, fmt.Errorf("the ledger of generation %q reads %v, which licenses no seal", gen, l.status)

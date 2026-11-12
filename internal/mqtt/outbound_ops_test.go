@@ -19,11 +19,6 @@ import (
 	"testing"
 )
 
-// testGenInvented is a well-formed generation no authority in these fixtures stands at.
-// A LIE the operations must overwrite has to be well-formed, or the intent validator refuses
-// it and the derivation is never reached.
-const testGenInvented = "0123456789abcdefghijkZ"
-
 // The OPERATION SURFACE, against the store.
 //
 // These tests are the other half of outbound_boundary_test.go. That file drives the write
@@ -44,38 +39,8 @@ func TestOperationsCarryOneObligationEndToEnd(t *testing.T) {
 
 	jsa := &e.asm.jsa
 
-	// (1) CLAIM. A reservation serves nothing yet.
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-claim", testGen, "tenure-1", "intent-1"); err != nil {
-		t.Fatalf("claiming the client was refused: %v", err)
-	}
-	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	if al.status != mqttOutboundValid || al.rec.State != mqttAuthorityReserving {
-		t.Fatalf("the claim did not install a reservation (status %v)", al.status)
-	}
-	// An admission under it is refused: the reservation grants no serving permission, and
-	// the operation refuses before composing anything.
-	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-early", Op: "op-early",
-		Gen: testGen, Tenure: "tenure-1",
-		Register: freshRegisterLineage(&mqttInflightRecord{
-			State: mqttInflightPublish, PI: 5, Dur: "$MQTT_src", Seq: 1, QoS: 2,
-			Nonce: mqttNewInflightNonce(),
-		}),
-	}); err == nil {
-		t.Fatalf("a publish was admitted under a reservation that serves nothing")
-	}
-
-	// (2) THE METADATA HALF, then the finalization it licenses.
-	if _, err := jsa.opFinalizeClaim(e.id, e.epoch, "txn-fin", "intent-1"); err == nil {
-		t.Fatalf("a reservation was finalized with no committed metadata half")
-	}
-	e.commitCreation(t, al.rec.Creation)
-	if _, err := jsa.opFinalizeClaim(e.id, e.epoch, "txn-fin", "intent-other"); err == nil {
-		t.Fatalf("a finalization naming another proposal was accepted")
-	}
-	if _, err := jsa.opFinalizeClaim(e.id, e.epoch, "txn-fin", "intent-1"); err != nil {
-		t.Fatalf("finalizing the claim was refused: %v", err)
-	}
+	// (1)-(2) ACCEPT AND BIND, the one route to a serving authority (issue #133).
+	e.claim(t, nil, 0, "txn-claim", testGen, "tenure-1")
 
 	// (3) PROVISION the backing resource and ADMIT against it, both through the surface.
 	// The fixture plants nothing: a lifecycle test that wrote the resource itself would be
@@ -188,137 +153,6 @@ func TestOperationsCarryOneObligationEndToEnd(t *testing.T) {
 	}
 }
 
-// TestOperationsReadTheAuthorityTheyActUnder pins the property the whole surface exists
-// for: no operation takes the authority, the predecessor or its sequence from its caller.
-//
-// Each case moves the standing authority to a state the operation may not act under, WITHOUT
-// telling the operation, and the operation must refuse. A surface that took a caller-supplied
-// predecessor would act on the stale one it was handed.
-func TestOperationsReadTheAuthorityTheyActUnder(t *testing.T) {
-	e, done := testNewEnv(t, "f105-ops-reads")
-	defer done()
-
-	jsa := &e.asm.jsa
-
-	// With no authority at all, everything but a claim refuses — and the refusal is the
-	// ABSENCE of a licence, never a fallback that admits work anyway.
-	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-none", Op: "op-none",
-		Gen: testGen, Tenure: "tenure-txn-1",
-		Register: freshRegisterLineage(&mqttInflightRecord{
-			State: mqttInflightPublish, PI: 3, Dur: "$MQTT_src", Seq: 1, QoS: 2,
-			Nonce: mqttNewInflightNonce(),
-		}),
-	}); err == nil {
-		t.Fatalf("a publish was admitted for a client with no authority")
-	}
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {
-		t.Fatalf("an exchange advanced under no authority")
-	}
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-none-close", testGen, "tenure-1", "txn-1"); err == nil {
-		t.Fatalf("a generation was closed for a client with no authority")
-	}
-
-	auth, _ := e.bootstrap(t, "txn-1")
-
-	// A SECOND CLAIM over a SERVING authority is refused — the operation loads it, so a
-	// caller cannot claim by describing the client as free.
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-second", testGen2,
-		"tenure-2", "intent-2"); err == nil {
-		t.Fatalf("a second claim displaced a serving authority")
-	}
-
-	// PREPARING freezes admission, and the admission operation discovers that by reading.
-	// THE INTENT LIES ABOUT ITS PREDECESSOR, deliberately: it names a generation, tenure and
-	// ownership that are not the ones standing. The operation must overwrite all six with
-	// what it read, because a handoff proposing a predecessor that is not there would
-	// finalize over a tenure nobody displaced.
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep", &mqttHandoffIntent{
-		ID: "intent-h", Tenure: "tenure-next", Gen: testGen2,
-		PrevGen: testGenInvented, PrevTenure: "tenure-invented", PrevOwnerTxn: "txn-invented",
-		PrevSessWID: "wid-0", PrevSessSeq: 12, CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: testGenInvented, Tenure: "tenure-invented", OwnerTxn: "txn-invented",
-			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
-		},
-	}); err != nil {
-		t.Fatalf("preparing the handoff was refused: %v", err)
-	}
-	pl := jsa.loadOutboundAuthority(e.id, e.epoch)
-	if pl.status != mqttOutboundValid || pl.rec.State != mqttAuthorityPreparing || pl.rec.Intent == nil {
-		t.Fatalf("the preparation did not land (status %v)", pl.status)
-	}
-	// THE INTENT'S PREDECESSOR MEMBERS WERE DERIVED from the standing authority, not taken
-	// from the caller, which is what stops a handoff proposing a predecessor that is not
-	// there.
-	if pl.rec.Intent.PrevGen != auth.Gen || pl.rec.Intent.PrevTenure != auth.Tenure ||
-		pl.rec.Intent.PrevOwnerTxn != auth.OwnerTxn {
-		t.Fatalf("the preparation carries predecessor %q/%q/%q, want the standing %q/%q/%q",
-			pl.rec.Intent.PrevGen, pl.rec.Intent.PrevTenure, pl.rec.Intent.PrevOwnerTxn,
-			auth.Gen, auth.Tenure, auth.OwnerTxn)
-	}
-	if r := pl.rec.Intent.Retire; r == nil || r.Gen != auth.Gen || r.Tenure != auth.Tenure ||
-		r.OwnerTxn != auth.OwnerTxn {
-		t.Fatalf("the preparation's retirement request names %+v rather than the standing "+
-			"%q/%q/%q", r, auth.Gen, auth.Tenure, auth.OwnerTxn)
-	}
-	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-frozen", Op: "op-frozen",
-		Gen: auth.Gen, Tenure: auth.Tenure,
-		Register: freshRegisterLineage(&mqttInflightRecord{
-			State: mqttInflightPublish, PI: 4, Dur: "$MQTT_src", Seq: 1, QoS: 2,
-			Nonce: mqttNewInflightNonce(),
-		}),
-	}); err == nil {
-		t.Fatalf("a publish was admitted while the authority was preparing")
-	}
-
-	// A cancellation restores the predecessor's ownership, from the intent's own record of
-	// what it displaced, and it needs the aborted verdict the boundary checks.
-	if _, err := jsa.opCancelHandoff(e.id, e.epoch, "txn-cancel", "intent-h"); err == nil {
-		t.Fatalf("a preparation was cancelled with no aborted metadata half")
-	}
-	p, perr := mqttProposalFromHandoff(pl.rec.Intent)
-	if perr != nil {
-		t.Fatalf("viewing the intent as a proposal failed: %v", perr)
-	}
-	if v := jsa.settleProposal(_EMPTY_, e.id, e.epoch, p); v != mqttMetadataAborted {
-		t.Fatalf("settling the intent returned %v, want ABORTED", v)
-	}
-	if _, err := jsa.opCancelHandoff(e.id, e.epoch, "txn-cancel", "intent-h"); err != nil {
-		t.Fatalf("cancelling the preparation was refused: %v", err)
-	}
-	cl := jsa.loadOutboundAuthority(e.id, e.epoch)
-	if cl.rec.State != mqttAuthorityServing || cl.rec.OwnerTxn != auth.OwnerTxn ||
-		cl.rec.Gen != auth.Gen || cl.rec.Tenure != auth.Tenure {
-		t.Fatalf("the cancellation installed %+v rather than restoring the predecessor", cl.rec)
-	}
-
-	// CLOSED admits nothing and is claimable again, by the same three steps as the first
-	// claim.
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close", cl.rec.Gen, cl.rec.Tenure, cl.rec.OwnerTxn); err != nil {
-		t.Fatalf("closing the generation was refused: %v", err)
-	}
-	if _, err := jsa.opAdmitPublish(&mqttAdmitPublishRequest{
-		ID: e.id, Epoch: e.epoch, Txn: "txn-late", Op: "op-late",
-		Gen: auth.Gen, Tenure: auth.Tenure,
-		Register: freshRegisterLineage(&mqttInflightRecord{
-			State: mqttInflightPublish, PI: 6, Dur: "$MQTT_src", Seq: 1, QoS: 2,
-			Nonce: mqttNewInflightNonce(),
-		}),
-	}); err == nil {
-		t.Fatalf("a publish was admitted over a closed authority")
-	}
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", testGen,
-		"tenure-again", "intent-again"); err == nil {
-		t.Fatalf("a post-closure claim reused the closed generation")
-	}
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", testGen2,
-		"tenure-again", "intent-again"); err != nil {
-		t.Fatalf("a post-closure claim of a fresh generation was refused: %v", err)
-	}
-}
-
 // TestOperationsRefuseAnUnreadableAuthority pins the reading that must never be treated
 // as absence.
 //
@@ -340,11 +174,12 @@ func TestOperationsRefuseAnUnreadableAuthority(t *testing.T) {
 		t.Fatalf("the planted authority reads %v, want CORRUPT", load.status)
 	}
 
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-claim", testGen,
-		"tenure-1", "intent-1"); err == nil {
-		t.Fatalf("a client whose authority could not be read was claimed as if it were free")
+	if _, err := jsa.composeAcceptance(mqttAcceptRequest{ID: e.id, Epoch: e.epoch, Txn: "txn-claim",
+		Tenure: "tenure-1", Nonce: "intent-1", At: 1}, jsa.loadOutboundAuthority(e.id, e.epoch),
+		jsa.loadLifecycleRegistryShard(e.epoch, mqttLifecycleRegistryShardFor(getHash(e.id)))); err == nil {
+		t.Fatalf("a client whose authority could not be read was accepted as if it were free")
 	}
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close", testGen, "tenure-1", "txn-1"); err == nil {
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch, testGen, "tenure-1", "txn-1"); err == nil {
 		t.Fatalf("a generation was closed over an authority nothing could read")
 	}
 	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, mqttNewInflightNonce(), mqttExchangeTerminal); err == nil {

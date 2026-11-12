@@ -308,78 +308,6 @@ func TestMQTTAuthoredForkStillClassifies(t *testing.T) {
 // Test 5: the create-side corrupt-watermark refusal survives the deletion beside it
 // ---------------------------------------------------------------------------
 
-// TestMQTTCreateRefusesAnUnreadableRetirementWatermark is the CREATE arm's refusal,
-// which is a separate obligation from the inheritance that used to sit beside it and
-// which the audit deliberately kept.
-//
-// Admitting a session over a watermark this broker cannot read leaves that session's OWN
-// later teardown unable to record a retirement — recordGenRetirement refuses to replace a
-// corrupt standing watermark — so the record would stay MARKED for every future finisher.
-// The existing TestRetirementUnreadableWatermarkRefusesTheConnect covers the RESUME-side
-// reader, which is a different branch reached with a record present; this one runs with
-// the subject EMPTY.
-//
-// All four statuses are exercised, because the refusal must be exactly one of them: an
-// implementation that refused on absent or indeterminate would fail every first-ever
-// CONNECT, and one that refused on none would admit the unusable store.
-func TestMQTTCreateRefusesAnUnreadableRetirementWatermark(t *testing.T) {
-	a, _ := testNewTeardownEnv(t)
-
-	cases := []struct {
-		name   string
-		status mqttRetirementStatus
-		refuse bool
-	}{
-		{"corrupt", mqttRetirementCorrupt, true},
-		{"absent", mqttRetirementAbsent, false},
-		{"indeterminate", mqttRetirementIndeterminate, false},
-		{"valid", mqttRetirementValid, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cid := "create-watermark-" + tc.name
-			idHash := getHash(cid)
-			restore := setMQTTTestRetirementLoadHook(func(hash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
-				if hash != idHash {
-					return a.asm.jsa.loadGenRetirementRecord(a.asm.domainTk, hash)
-				}
-				if tc.status == mqttRetirementValid {
-					return &mqttGenRetirement{
-						ID: cid, Gen: mqttNewSessGen(), MarkerSeq: 3,
-						Nonce: "n", Origin: "o", StartedAt: 1,
-					}, 4, mqttRetirementValid
-				}
-				return nil, 0, tc.status
-			})
-			sess, _, err := a.asm.createOrRestoreSession(cid, a.s.getOpts())
-			restore()
-
-			if tc.refuse {
-				if err == nil {
-					t.Fatal("a create over an UNREADABLE watermark must be refused: its own " +
-						"teardown could never record a retirement")
-				}
-				if !strings.Contains(err.Error(), "unreadable") {
-					t.Fatalf("the refusal must say why, got %v", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("status %v must ADMIT the create, got %v", tc.status, err)
-			}
-			// And whatever it read, it inherited nothing from it. The watermark no longer
-			// carries any record identity, so this arm now measures that the CREATE draws
-			// no parent from a watermark it can read at all.
-			sess.mu.Lock()
-			held := sess.parentForNextWriteLocked()
-			sess.mu.Unlock()
-			if held != _EMPTY_ {
-				t.Fatalf("an admitted create holds no parent, whatever the watermark said: %q", held)
-			}
-		})
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test 6: the register store is refused, not tolerated
 // ---------------------------------------------------------------------------
@@ -508,8 +436,8 @@ func TestMQTTStartupRefusalIsWiredIntoManagerInit(t *testing.T) {
 func TestMQTTProvisionedStreamsExcludeTheRetiredRegister(t *testing.T) {
 	t.Parallel()
 	specs := testBrokerStreamSpecs()
-	if len(specs) != 8 {
-		t.Fatalf("the broker provisions eight streams, got %d", len(specs))
+	if len(specs) != 7 {
+		t.Fatalf("the broker provisions seven streams, got %d", len(specs))
 	}
 	for _, spec := range specs {
 		for _, retired := range []string{mqttRetiredInflightStreamName, mqttRetiredSharedStreamName} {

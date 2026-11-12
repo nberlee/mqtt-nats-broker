@@ -300,7 +300,7 @@ func (rk *mqttRecoveryKick) requeueLocked(k mqttRecoveryKickKey, front bool) {
 }
 
 // visitKickedRoot performs one visit of a kicked root, reloaded fresh, and reports its outcome:
-// gone — concluded, or never this worker's to visit (no discarding closure, no reachable root) —,
+// gone — concluded, or never this worker's to visit (no closure, no reachable root) —,
 // refused by its client's foreground, or charged.
 func (as *mqttAccountSessionManager) visitKickedRoot(s *Server, k mqttRecoveryKickKey, stop func() bool) mqttRecoveryVisitOutcome {
 	if h := mqttTestRecoveryKickVisitV.Load(); h != nil {
@@ -312,8 +312,6 @@ func (as *mqttAccountSessionManager) visitKickedRoot(s *Server, k mqttRecoveryKi
 		return mqttRecoveryVisitGone
 	case st != mqttOutboundValid:
 		return mqttRecoveryVisitCharged // unreadable: spends a visit, the pass owns the rest
-	case !closed.Discard:
-		return mqttRecoveryVisitGone
 	}
 	root, rootSeq, err := as.jsa.loadRecoveryRoot(closed.RootShard, closed.RootOrd)
 	if err != nil {

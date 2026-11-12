@@ -372,66 +372,6 @@ func TestWithdrawRequiresTheMarkerOfThisAllocation(t *testing.T) {
 	testRequireRefusal(t, f.commitWithdrawal(t, nil), "no unsent marker naming")
 }
 
-// T8a/T8b/T8c. The withdrawal is the SERVING connection's decision (issue #107 7b, plan-7b §3.3: an
-// owner-dependent mutation, converted in 7b), and it keeps the generation exception: an earlier
-// generation's unsent obligation is withdrawn by the connection the later generation serves,
-// changing nothing on the authority but its revision. Under a CLOSED authority no connection's
-// entitlement serves, so nothing is withdrawn (no production route withdraws for a generation
-// that is no longer served: plan §3.4's Closure deviation); a G1 connection's stale licence is
-// refused. A batch that changes the authority's state is refused.
-//
-// Mutations: M8a (the entitlement comparison removed -> the closed and stale withdrawals land),
-// M8b (the generation exception not extended -> G2's withdrawal of G1's obligation is refused),
-// M8c (the withdrawal arm skips the shared authority-preservation rule).
-func TestWithdrawUnderTheStandingAuthority(t *testing.T) {
-	t.Parallel()
-	t.Run("closed", func(t *testing.T) {
-		f := testWithdrawAdmitted(t, "withdraw-closed", 1)
-		testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) { a.State = mqttAuthorityClosed })
-		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawUnlicensed {
-			t.Fatalf("a withdrawal under a closed authority must be refused as unlicensed, reported %v", got)
-		}
-		auth, _, _ := f.e.asm.jsa.requireAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
-		if auth.State != mqttAuthorityClosed {
-			t.Fatalf("the refused withdrawal moved the authority to state %d", auth.State)
-		}
-		if x := f.exchange(t); x.Phase != mqttExchangePublish {
-			t.Fatalf("phase %d, want the obligation untouched at Publish", x.Phase)
-		}
-	})
-	t.Run("displaced-generation", func(t *testing.T) {
-		f := testWithdrawAdmitted(t, "withdraw-g1", 1)
-		stale := mqttTestLicence(f.e.sess, nil)
-		var g2, tenure string
-		testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) {
-			a.Gen, a.Tenure, a.OwnerTxn = mqttNewSessGen(), mqttNewInflightNonce(), a.Txn
-			g2, tenure = a.Gen, a.Tenure
-		})
-		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, stale, nil); got != mqttWithdrawUnlicensed {
-			t.Fatalf("G1's stale connection must be refused, reported %v", got)
-		}
-		serving := mqttEntitlementLicence(mqttOutboundEntitlement{Gen: g2, Tenure: tenure}, true)
-		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, serving, nil); got != mqttWithdrawLanded {
-			t.Fatalf("a G1 withdrawal by the connection G2 serves reported %v", got)
-		}
-		auth, _, _ := f.e.asm.jsa.requireAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
-		if auth.Gen != g2 || auth.Tenure != tenure || auth.State != mqttAuthorityServing {
-			t.Fatalf("the withdrawal moved G2's authority: %+v", auth)
-		}
-		if x := f.exchange(t); x.Phase != mqttExchangeWithdrawnUnsent {
-			t.Fatalf("phase %d, want WithdrawnUnsent", x.Phase)
-		}
-	})
-	t.Run("state-changing-body", func(t *testing.T) {
-		f := testWithdrawAdmitted(t, "withdraw-closing-body", 1)
-		err := f.commitWithdrawal(t, func(tr *mqttAuthorityTransition) {
-			tr.Auth.State = mqttAuthorityClosed
-			tr.Auth.Intent, tr.Auth.Creation = nil, nil
-		})
-		testRequireRefusal(t, err, "moves the authority from state")
-	})
-}
-
 // T9 (structural). The only production callers of reapRegisterWithVerdict are the door's two
 // entrances, and the only other register deletes are the generation-level ones, each for a stated
 // reason.
@@ -933,4 +873,66 @@ func testRequireRefusal(t *testing.T, err error, reasons ...string) {
 		}
 	}
 	t.Fatalf("refused for another reason than %q: %v", reasons, err)
+}
+
+// T8a/T8b/T8c. The withdrawal is the SERVING connection's decision (issue #107 7b, plan-7b §3.3: an
+// owner-dependent mutation, converted in 7b), and it keeps the generation exception: an earlier
+// generation's unsent obligation is withdrawn by the connection the later generation serves,
+// changing nothing on the authority but its revision. Under a CLOSED authority no connection's
+// entitlement serves, so nothing is withdrawn (no production route withdraws for a generation
+// that is no longer served: plan §3.4's Closure deviation); a G1 connection's stale licence is
+// refused. A batch that changes the authority's state is refused.
+//
+// Mutations: M8a (the entitlement comparison removed -> the closed and stale withdrawals land),
+// M8b (the generation exception not extended -> G2's withdrawal of G1's obligation is refused),
+// M8c (the withdrawal arm skips the shared authority-preservation rule).
+func TestWithdrawUnderTheStandingAuthority(t *testing.T) {
+	t.Parallel()
+	t.Run("closed", func(t *testing.T) {
+		f := testWithdrawAdmitted(t, "withdraw-closed", 1)
+		testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) { a.State = mqttAuthorityClosed })
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, mqttTestLicence(f.e.sess, nil), nil); got != mqttWithdrawUnlicensed {
+			t.Fatalf("a withdrawal under a closed authority must be refused as unlicensed, reported %v", got)
+		}
+		auth, _, _ := f.e.asm.jsa.requireAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
+		if auth.State != mqttAuthorityClosed {
+			t.Fatalf("the refused withdrawal moved the authority to state %d", auth.State)
+		}
+		if x := f.exchange(t); x.Phase != mqttExchangePublish {
+			t.Fatalf("phase %d, want the obligation untouched at Publish", x.Phase)
+		}
+	})
+	t.Run("displaced-generation", func(t *testing.T) {
+		f := testWithdrawAdmitted(t, "withdraw-g1", 1)
+		stale := mqttTestLicence(f.e.sess, nil)
+		var g2, tenure string
+		testRewriteAuthority(t, f.e, func(a *mqttOutboundAuthority) {
+			g1 := a.Gen
+			a.Gen, a.Tenure, a.OwnerTxn = testNextGenOf(a), mqttNewInflightNonce(), a.Txn
+			testAdoptGenLife(a, a.Gen)
+			testEnrolOutstandingGen(a, g1)
+			g2, tenure = a.Gen, a.Tenure
+		})
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, stale, nil); got != mqttWithdrawUnlicensed {
+			t.Fatalf("G1's stale connection must be refused, reported %v", got)
+		}
+		serving := mqttEntitlementLicence(mqttOutboundEntitlement{Gen: g2, Tenure: tenure}, true)
+		if got := f.e.sess.withdrawUnsent(f.gen, f.subject, f.nonce, f.lin, serving, nil); got != mqttWithdrawLanded {
+			t.Fatalf("a G1 withdrawal by the connection G2 serves reported %v", got)
+		}
+		auth, _, _ := f.e.asm.jsa.requireAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch)
+		if auth.Gen != g2 || auth.Tenure != tenure || auth.State != mqttAuthorityServing {
+			t.Fatalf("the withdrawal moved G2's authority: %+v", auth)
+		}
+		if x := f.exchange(t); x.Phase != mqttExchangeWithdrawnUnsent {
+			t.Fatalf("phase %d, want WithdrawnUnsent", x.Phase)
+		}
+	})
+	t.Run("state-changing-body", func(t *testing.T) {
+		f := testWithdrawAdmitted(t, "withdraw-closing-body", 1)
+		err := f.commitWithdrawal(t, func(tr *mqttAuthorityTransition) {
+			tr.Auth.State = mqttAuthorityClosed
+		})
+		testRequireRefusal(t, err, "moves the authority from state")
+	})
 }

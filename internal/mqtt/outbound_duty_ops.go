@@ -98,7 +98,7 @@ func (jsa *mqttJSA) opResolveDuty(root *mqttRecoveryRoot, d mqttSweptDuty, txn s
 	}
 	_, cerr := jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: root.ID, Epoch: root.Epoch, Txn: txn, Op: "op-" + txn,
+			ID: root.ID, Epoch: root.Epoch, Txn: txn, Scope: root.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -106,7 +106,7 @@ func (jsa *mqttJSA) opResolveDuty(root *mqttRecoveryRoot, d mqttSweptDuty, txn s
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttDutySubject(getHash(root.ID), root.Gen, d.Ord),
@@ -167,7 +167,7 @@ func (jsa *mqttJSA) opResolveDuties(root *mqttRecoveryRoot, ds []mqttSweptDuty, 
 	}
 	_, cerr := jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: root.ID, Epoch: root.Epoch, Txn: txn, Op: "op-" + txn,
+			ID: root.ID, Epoch: root.Epoch, Txn: txn, Scope: root.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -175,7 +175,7 @@ func (jsa *mqttJSA) opResolveDuties(root *mqttRecoveryRoot, ds []mqttSweptDuty, 
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: members,
 	})
@@ -234,7 +234,7 @@ func (jsa *mqttJSA) completeCleanupAndResolve(root *mqttRecoveryRoot, r *mqttOut
 	idHash := getHash(root.ID)
 	_, cerr := jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: root.ID, Epoch: root.Epoch, Txn: txn, Op: "op-" + txn,
+			ID: root.ID, Epoch: root.Epoch, Txn: txn, Scope: root.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -242,7 +242,7 @@ func (jsa *mqttJSA) completeCleanupAndResolve(root *mqttRecoveryRoot, r *mqttOut
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: []mqttTransitionMember{
 			{subj: mqttResourceSubject(idHash, r.Gen, r.Inc), expect: resSeq, body: rbody},
@@ -292,7 +292,7 @@ func (jsa *mqttJSA) opSealAffineProvisioning(root *mqttRecoveryRoot, r *mqttOutb
 // epoch, generation and sealed bound. An identical record is DONE. A conflicting one is an error
 // and retirement stops: two different bounds cannot both describe one sealed inventory, and
 // overwriting would destroy the evidence the release gate reads after the root is gone.
-func (jsa *mqttJSA) publishGenCompletionCert(c *mqttGenCompletionCertificate) error {
+func (jsa *mqttJSA) publishGenCompletionCert(c *mqttGenCompletionCertificate, admit func() bool) error {
 	if verr := mqttValidateGenCert(c, c.ID, c.Epoch, c.Gen); verr != nil {
 		return fmt.Errorf("refusing to publish an unsupported completion certificate: %w", verr)
 	}
@@ -300,8 +300,8 @@ func (jsa *mqttJSA) publishGenCompletionCert(c *mqttGenCompletionCertificate) er
 	if err != nil {
 		return err
 	}
-	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
-	if _, serr := jsa.storeMsg(mqttGenCertSubject(getHash(c.ID), c.Gen), hdr, msg); serr != nil {
+	if serr := jsa.createFencedGenRecord(c.ID, c.Epoch, c.Gen, mqttGenCertSubject(getHash(c.ID), c.Gen),
+		body, mqttGenRecordWhileOpen, admit); serr != nil {
 		stood, lerr := jsa.loadGenCompletionCert(c.ID, c.Epoch, c.Gen)
 		if lerr != nil {
 			return fmt.Errorf("certifying generation %q was unresolved (%v) and the standing "+

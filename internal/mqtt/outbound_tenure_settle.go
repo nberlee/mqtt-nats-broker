@@ -127,7 +127,7 @@ func (sess *mqttSession) tenureStillServes(ent mqttOutboundEntitlement) bool {
 	if err != nil {
 		return true
 	}
-	return auth != nil && (auth.State == mqttAuthorityServing || auth.State == mqttAuthorityPreparing) &&
+	return auth != nil && auth.State == mqttAuthorityServing &&
 		auth.Gen == ent.Gen && auth.Tenure == ent.Tenure
 }
 

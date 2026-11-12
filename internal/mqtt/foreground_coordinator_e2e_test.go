@@ -493,14 +493,39 @@ func testPlantRaw(t *testing.T, e *testOutboundEnv, subject string, body any) ui
 // the floor). Returns the root's sequence.
 func testPlantPoisedRoot(t *testing.T, e *testOutboundEnv, gen string, ord, unresolved uint64) uint64 {
 	t.Helper()
+	testEnrolPlantedOutstanding(t, e, gen)
 	shard := mqttDirShardFor(getHash(e.id))
-	testPlantClosureAt(t, e, gen, shard, ord, true)
+	testPlantClosureAt(t, e, gen, shard, ord)
 	testPlantRaw(t, e, mqttGenLedgerSubject(getHash(e.id), gen), &mqttGenLedger{
 		Lo: 1, Del: 1, ID: e.id, Epoch: e.epoch, Gen: gen, State: mqttGenLedgerSealed, Hi: 2, SealedHi: 2,
 	})
 	return testPlantRoot(t, e, &mqttRecoveryRoot{
 		Shard: shard, Ord: ord, ID: e.id, Epoch: e.epoch, Gen: gen,
 		SweepStart: 1, Resume: 3, Bound: 2, Unresolved: unresolved,
+	})
+}
+
+// testEnrolPlantedOutstanding gives a planted discarded generation the authority state its claim
+// would have left (issue #133): the client's lifecycle closed, gen outstanding at phase open with
+// its release landed. Without it the generation reads unresolved and its records are never written.
+func testEnrolPlantedOutstanding(t *testing.T, e *testOutboundEnv, gen string) {
+	t.Helper()
+	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.status == mqttOutboundAbsent {
+		e.bootstrap(t, "txn-boot")
+	}
+	_, ord, ok := mqttParseGenToken(gen)
+	if !ok {
+		t.Fatalf("fixture: %q is no generation token", gen)
+	}
+	testRewriteOutboundAuthority(t, e, func(a *mqttOutboundAuthority) {
+		a.State, a.Life.Phase, a.Life.Pending = mqttAuthorityClosed, mqttLifecycleClosed, nil
+		if a.Life.NextGenOrd <= ord {
+			a.Life.NextGenOrd = ord + 1
+		}
+		if mqttOutstandingIndex(a.Life, ord) < 0 {
+			a.Life.Outstanding = append(a.Life.Outstanding, mqttOutstandingGen{Ord: ord, Phase: mqttOutstandingOpen,
+				Teardown: mqttOutstandingTeardown{Kind: mqttTeardownMarker, Nonce: "nonce-" + gen, MarkerWID: "wid-" + gen}})
+		}
 	})
 }
 
@@ -741,7 +766,7 @@ func TestUnreadableKickedRootIsChargedUnderAnAnnouncement(t *testing.T) {
 	defer done()
 	testFastKickBackoff(t)
 	shard := mqttDirShardFor(getHash(e.id))
-	testPlantClosureAt(t, e, testGen, shard, 1, true)
+	testPlantClosureAt(t, e, testGen, shard, 1)
 	msg, hdr := mqttFrameBatchWrite(0, []byte("{not a root"), _EMPTY_, 0, false)
 	if _, err := e.asm.jsa.storeMsg(mqttRootSubject(shard, 1), hdr, msg); err != nil {
 		t.Fatalf("planting the unreadable root: %v", err)

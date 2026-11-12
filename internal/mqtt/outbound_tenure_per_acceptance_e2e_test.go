@@ -28,39 +28,41 @@ import (
 // every acceptance, the closing driver's order and withhold, the adoption's settlement and its
 // receiptless continuation, and P2. Mutation ledger: mutation-ledger-8b.md.
 
-// test8bTenureOf returns the resident session's tenure, its acceptance fact's stream
-// sequence read independently by the fact's own subject, its entitlement, and its record
-// sequence.
+// test8bTenureOf returns the resident session's tenure, the order its acceptance holds in the
+// lifecycle read independently from the authority (issue #133: the acceptance ordinal plus one),
+// its entitlement, and its record sequence.
 func test8bTenureOf(t *testing.T, s *Server, cid string) (mqttSharedTenure, uint64, mqttOutboundEntitlement, uint64) {
 	t.Helper()
 	asm, sess := testResidentSession(t, s, cid)
 	sess.mu.Lock()
-	tenure, ref, ent, recSeq := sess.sharedTenure, sess.acceptFact, sess.boundEnt, sess.seq
+	tenure, ent, recSeq := sess.sharedTenure, sess.boundEnt, sess.seq
 	sess.mu.Unlock()
-	if ref.Subj == _EMPTY_ {
-		t.Fatal("the accepted session recorded no acceptance fact")
+	al := asm.jsa.loadOutboundAuthority(cid, testAccountEpoch(asm))
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Life == nil {
+		t.Fatalf("reading the acceptance back from the authority: %v", al.status)
 	}
-	smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, ref.Subj)
-	if err != nil || smsg == nil {
-		t.Fatalf("reading the acceptance fact back: %v", err)
-	}
-	return tenure, smsg.Sequence, ent, recSeq
+	return tenure, al.rec.Life.Accept.Ord + 1, ent, recSeq
 }
 
 // test8bAssertOneTenure asserts the consolidation: the ledger's standing tenure is the
 // session's, its ID is the authority tenure the connection was accepted under, and its order is
-// the acceptance fact's own sequence — never the session record's.
+// the acceptance's own place in its lifecycle — never the session record's sequence.
 func test8bAssertOneTenure(t *testing.T, s *Server, asm *mqttAccountSessionManager, cid, epoch string) {
 	t.Helper()
-	tenure, factSeq, ent, recSeq := test8bTenureOf(t, s, cid)
+	tenure, acceptOrder, ent, recSeq := test8bTenureOf(t, s, cid)
 	if tenure.ID != ent.Tenure {
 		t.Fatalf("the ledger tenure's ID %q is not the authority tenure %q the connection was accepted under", tenure.ID, ent.Tenure)
 	}
-	if tenure.Seq != factSeq {
-		t.Fatalf("the ledger tenure's order %d is not the acceptance fact's sequence %d", tenure.Seq, factSeq)
+	if tenure.Seq != acceptOrder {
+		t.Fatalf("the ledger tenure's order %d is not the acceptance's order %d", tenure.Seq, acceptOrder)
 	}
 	if tenure.Seq == recSeq {
 		t.Fatalf("the ledger tenure's order %d is the session record's sequence", tenure.Seq)
+	}
+	// The ledger is lazy (issue #133): the first acquisition installs it, and the install's
+	// authority fence admits only the current acceptance's tenure. Install the session's own.
+	if _, err := asm.jsa.installSharedTenure(cid, epoch, ent.Gen, tenure); err != nil {
+		t.Fatalf("installing the session's tenure %+v: %v", tenure, err)
 	}
 	l := asm.jsa.loadSharedLedger(cid, epoch, ent.Gen)
 	if l.status != mqttOutboundValid || l.rec.Tenure != tenure {
@@ -120,10 +122,11 @@ func Test8bTenureSurvivesALostResponse(t *testing.T) {
 	test8bAssertOneTenure(t, s, asm, cid, epoch)
 }
 
-// T3: EVERY acceptance installs before it serves — a client with no record included. No
-// SUBSCRIBE runs, so the installation is the only thing that can have created the ledger.
-// Mutation M-install (the installation gated on a restored record).
-func Test8bEveryAcceptanceInstalls(t *testing.T) {
+// T3: an acceptance of a generation that never acquired installs NOTHING (issue #133, the lazy
+// shared ledger): no SUBSCRIBE runs, so no ledger stands and the authority records that the
+// generation did not acquire; its first shared acquisition will create the ledger. Mutation: the
+// installation run at CONNECT over absence (a ledger appears).
+func Test8bAnAcceptanceThatNeverAcquiredHasNoLedger(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
@@ -133,10 +136,12 @@ func Test8bEveryAcceptanceInstalls(t *testing.T) {
 	testMQTTReadConnAckV5(t, r)
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
 	epoch := testAccountEpoch(asm)
-	gen := testServingAt(t, asm, cid, epoch).Gen
-	l := asm.jsa.loadSharedLedger(cid, epoch, gen)
-	if l.status != mqttOutboundValid || l.rec.State != mqttSharedLedgerOpen || len(l.rec.Acqs) != 0 {
-		t.Fatalf("a fresh acceptance must install an open, empty ledger before it serves, it reads %v %+v", l.status, l.rec)
+	auth := testServingAt(t, asm, cid, epoch)
+	if l := asm.jsa.loadSharedLedger(cid, epoch, auth.Gen); l.status != mqttOutboundAbsent {
+		t.Fatalf("an acceptance that never acquired left a shared ledger reading %v %+v", l.status, l.rec)
+	}
+	if auth.Life.GenAcqs {
+		t.Fatal("an acceptance that never acquired records that its generation acquired")
 	}
 }
 
@@ -155,6 +160,8 @@ func Test8bClosureLandsBeforeTheSeal(t *testing.T) {
 	asm := testMQTTGetAccountSessionManager(t, s, cid)
 	epoch := testAccountEpoch(asm)
 	gen := testServingAt(t, asm, cid, epoch).Gen
+	// The ledger is lazy: only a generation that acquired has one to seal.
+	testInstallFixtureTenure(t, testMQTTResidentSession(t, s, cid))
 	var reached atomic.Bool
 	var verdict atomic.Pointer[string]
 	// Observed at EVERY seal composition, wherever it is composed: the property is about the
@@ -202,233 +209,6 @@ func test8bMarked(asm *mqttAccountSessionManager, cid string) (*mqttPersistedSes
 	return ps, smsg.Sequence, true
 }
 
-func test8bReceipt(asm *mqttAccountSessionManager, cid, gen string) (*mqttSessTeardownReceipt, mqttOutboundLoadStatus) {
-	r, _, st := asm.jsa.loadTeardownReceipt(asm.domainTk, getHash(cid), gen)
-	return r, st
-}
-
-func test8bLedgerSealed(asm *mqttAccountSessionManager, cid, epoch, gen string) bool {
-	l := asm.jsa.loadSharedLedger(cid, epoch, gen)
-	return l.status == mqttOutboundValid && l.rec.State == mqttSharedLedgerSealed
-}
-
-// test8bResidue drives the T22 schedule on a session with the given expiry: an unresolved
-// foreign preparation stands, its receipt subject cannot be answered, and a teardown runs —
-// the disconnect for a zero expiry, the expiry itself otherwise. It returns the account, epoch,
-// the retiring generation and the proposal, with the seam still armed.
-func test8bResidue(t *testing.T, s *Server, cid string, expiry uint32) (*mqttAccountSessionManager, string, string, *mqttHandoffIntent) {
-	t.Helper()
-	o := s.getOpts()
-	ci := &mqttV5ConnInfo{clientID: cid}
-	if expiry != 0 {
-		ci.props = mqttV5ConnPropsSessionExpiry(expiry)
-	}
-	c, r := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
-	testMQTTReadConnAckV5(t, r)
-	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testAccountEpoch(asm)
-	gen := testServingAt(t, asm, cid, epoch).Gen
-	i := testPlantUnresolved(t, asm, cid, epoch, "8b-"+cid)
-	receipt := mqttHandoffOutcomeSubject(_EMPTY_, getHash(cid), i.ID)
-	drop := func(_ string, body []byte) bool { return strings.Contains(string(body), receipt) }
-	asm.jsa.testDropRequest.Store(&drop)
-	t.Cleanup(func() { asm.jsa.testDropRequest.Store(nil) })
-	c.Close()
-	wait := 3 * asm.jsa.timeout
-	if expiry != 0 {
-		wait += time.Duration(expiry) * time.Second
-	}
-	checkFor(t, wait, 50*time.Millisecond, func() error {
-		if _, _, marked := test8bMarked(asm, cid); !marked {
-			return errors.New("the record is not marked yet")
-		}
-		return nil
-	})
-	return asm, epoch, gen, i
-}
-
-// T9: THE RESIDUE, as consult 121 reshaped it. A store that cannot answer the boundary's
-// settlement leaves the proposal standing; the teardown claims receiptless, and the closing
-// driver has no licence: the record stays MARKED, no discarding closure, the ledger NOT sealed,
-// the proposal still stands. Mutation M-seal-unlicensed.
-func Test8bReceiptlessTeardownWithholds(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	const cid = "f105-8b-t9"
-	asm, epoch, gen, i := test8bResidue(t, s, cid, 0)
-	time.Sleep(2 * asm.jsa.timeout)
-	if _, _, marked := test8bMarked(asm, cid); !marked {
-		t.Fatal("the withheld teardown must leave the record MARKED")
-	}
-	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
-		t.Fatalf("the residue's teardown carries no receipt, it reads %v", st)
-	}
-	if testClosureDiscards(asm, cid, epoch, gen) {
-		t.Fatal("the residue must leave NO discarding closure")
-	}
-	if test8bLedgerSealed(asm, cid, epoch, gen) {
-		t.Fatal("an unlicensed closing SEALED the ledger with the generation still able to admit")
-	}
-	if standing, _ := testStandingProposal(t, asm, cid, epoch); standing != i.ID {
-		t.Fatalf("the unsettled proposal %q must still stand, got %q", i.ID, standing)
-	}
-}
-
-// T10: the receiptless continuation, reached by an EXPIRY adopter with no CONNECT ahead of it.
-// The residue is created by the first expiry teardown; the store recovers; the record-based
-// expiry adoption settles the preparation (it cancels back to SERVING at the retiring
-// generation), authors the receipt with a CAS of the marker, closes discarding, seals and
-// releases the record. Mutation M-cont (no continuation: the adoption stalls).
-func Test8bExpiryAdoptionContinuesReceiptless(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	const cid = "f105-8b-t10"
-	asm, epoch, gen, i := test8bResidue(t, s, cid, 1)
-	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
-		t.Fatalf("the first expiry teardown must be receiptless, the receipt reads %v", st)
-	}
-	if standing, _ := testStandingProposal(t, asm, cid, epoch); standing != i.ID {
-		t.Fatalf("the proposal must still stand after the first teardown, got %q", standing)
-	}
-	if obj := testResidentObject(asm, cid); obj != nil {
-		asm.cancelSessionExpiry(getHash(cid))
-		asm.removeSession(obj, true)
-	}
-	// The observation is armed BEFORE the store recovers: a background adopter (the re-armed
-	// expiry, the orphan sweep) may reach the continuation first, and that is a legitimate run
-	// of the same path.
-	var adopted atomic.Bool
-	ahook := func(id string) {
-		if id == cid {
-			adopted.Store(true)
-		}
-	}
-	mqttTestReceiptContinuationHookV.Store(&ahook)
-	defer mqttTestReceiptContinuationHookV.Store(nil)
-	asm.jsa.testDropRequest.Store(nil)
-	asm.expireSessionFromRecord(s, getHash(cid))
-	if !adopted.Load() {
-		t.Fatal("the record-based expiry adoption never reached the receiptless continuation")
-	}
-	checkFor(t, 3*asm.jsa.timeout, 50*time.Millisecond, func() error {
-		if !testRecordGone(asm, cid) {
-			return errors.New("the continued adoption did not release the record")
-		}
-		return nil
-	})
-	if r, st := test8bReceipt(asm, cid, gen); st != mqttOutboundValid || !r.Retire.Discard {
-		t.Fatalf("the continuation must author a discarding receipt, it reads %v", st)
-	}
-	if !testClosureDiscards(asm, cid, epoch, gen) {
-		t.Fatal("the continued adoption did not close the generation discarding")
-	}
-	if !test8bLedgerSealed(asm, cid, epoch, gen) {
-		t.Fatal("the continued adoption did not seal the ledger")
-	}
-}
-
-// T12: the continuation is ARBITRATED by the marker, not deduplicated by the receipt slot: an
-// adoption paused before its batch, whose marker is then displaced, writes NO receipt. Mutation
-// M-cont-cas (the receipt written create-only without the marker CAS member).
-func Test8bContinuationLosesToADisplacedMarker(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	const cid = "f105-8b-t12"
-	asm, _, gen, _ := test8bResidue(t, s, cid, 0)
-	if obj := testResidentObject(asm, cid); obj != nil {
-		asm.removeSession(obj, true)
-	}
-	asm.jsa.testDropRequest.Store(nil)
-	ps, seq, marked := test8bMarked(asm, cid)
-	if !marked {
-		t.Fatal("no marker to adopt")
-	}
-	hook := func(id string) {
-		if id != cid {
-			return
-		}
-		// DISPLACE the marker: a re-claim by another teardown, a byte-different marker at the
-		// next sequence.
-		cur, cseq, ok := test8bMarked(asm, cid)
-		if !ok {
-			t.Errorf("the marker vanished before the displacement")
-			return
-		}
-		next := *cur
-		next.Teardown = &mqttSessTeardown{Origin: "peer", Nonce: "nonce-peer", StartedAt: time.Now().Unix()}
-		next.WID = mqttNewRecordWID()
-		body, _ := json.Marshal(&next)
-		if _, err := mqttStoreSessionRecordCASBody(&asm.jsa, asm.domainTk, body, getHash(cid), cseq); err != nil {
-			t.Errorf("displacing the marker: %v", err)
-		}
-	}
-	mqttTestReceiptContinuationHookV.Store(&hook)
-	defer mqttTestReceiptContinuationHookV.Store(nil)
-	err := asm.finishAdoptedTeardown(ps, getHash(cid), seq, s.getOpts())
-	if !errors.Is(err, errMQTTTeardownAdoptionSuperseded) {
-		t.Fatalf("an adoption whose marker was displaced must be superseded, got %v", err)
-	}
-	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundAbsent {
-		t.Fatalf("the losing continuation wrote a receipt (%v): the receipt slot deduplicated, it did not arbitrate", st)
-	}
-}
-
-// T10b: a RECEIPTED marker over a crash-left PREPARING is finished by an adopter with no CONNECT
-// ahead of it, because every adoption settles first. Mutation M-settle-receipted (settle only
-// when receiptless).
-func Test8bReceiptedAdoptionSettlesFirst(t *testing.T) {
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	const cid = "f105-8b-t10b"
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid}, o.MQTT.Host, o.MQTT.Port)
-	testMQTTReadConnAckV5(t, r)
-	asm := testMQTTGetAccountSessionManager(t, s, cid)
-	epoch := testAccountEpoch(asm)
-	gen := testServingAt(t, asm, cid, epoch).Gen
-	// The owner's teardown claims WITH a receipt and then cannot close: a PREPARING planted
-	// between its claim and its close makes the close refuse.
-	var planted atomic.Bool
-	pre := func(tr *mqttAuthorityTransition) {
-		if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionCloseTeardown && planted.CompareAndSwap(false, true) {
-			testPlantUnresolved(t, asm, cid, epoch, "8b-t10b")
-		}
-	}
-	asm.jsa.testTransitionPresend.Store(&pre)
-	t.Cleanup(func() { asm.jsa.testTransitionPresend.Store(nil) })
-	c.Close()
-	checkFor(t, 3*asm.jsa.timeout, 50*time.Millisecond, func() error {
-		if !planted.Load() {
-			return errors.New("the owner's close never reached its send")
-		}
-		if _, _, marked := test8bMarked(asm, cid); !marked {
-			return errors.New("the record is not marked")
-		}
-		return nil
-	})
-	asm.jsa.testTransitionPresend.Store(nil)
-	time.Sleep(asm.jsa.timeout)
-	ps, seq, marked := test8bMarked(asm, cid)
-	if !marked {
-		t.Skip("the owner's close won its race with the planted preparation; nothing to adopt")
-	}
-	if _, st := test8bReceipt(asm, cid, gen); st != mqttOutboundValid {
-		t.Fatalf("the owner's claim must carry a receipt, it reads %v", st)
-	}
-	if obj := testResidentObject(asm, cid); obj != nil {
-		asm.removeSession(obj, true)
-	}
-	if err := asm.finishAdoptedTeardown(ps, getHash(cid), seq, s.getOpts()); err != nil {
-		t.Fatalf("the adopter could not finish a receipted teardown over a PREPARING: %v", err)
-	}
-	if !testRecordGone(asm, cid) || !testClosureDiscards(asm, cid, epoch, gen) {
-		t.Fatal("the adoption did not close discarding and release the record")
-	}
-}
-
 // test8bDivergeAffine makes the resident object's in-memory affine target differ from what
 // its record names, the divergence P2 exists for.
 func test8bDivergeAffine(t *testing.T, asm *mqttAccountSessionManager, cid string) (string, string) {
@@ -456,8 +236,8 @@ func Test8bCleanStartRetiresWhatTheRecordNames(t *testing.T) {
 	memGen, memDur := test8bDivergeAffine(t, asm, cid)
 	var retire atomic.Pointer[mqttRetirementRequest]
 	pre := func(tr *mqttAuthorityTransition) {
-		if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil && tr.Auth.Intent.Retire.Gen == oldGen {
-			r := *tr.Auth.Intent.Retire
+		if tr.Retire != nil && tr.Retire.Gen == oldGen {
+			r := *tr.Retire
 			retire.Store(&r)
 		}
 	}
@@ -507,8 +287,8 @@ func Test8bMovedDisplacedRecordProposesNoStaleHandoff(t *testing.T) {
 	testArmBoundarySettle(t, asm, settle)
 	var stale atomic.Bool
 	pre := func(tr *mqttAuthorityTransition) {
-		if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil &&
-			(tr.Auth.Intent.Retire.AffineGen == memGen || tr.Auth.Intent.Retire.AffineDurable == memDur) {
+		if tr.Retire != nil &&
+			(tr.Retire.AffineGen == memGen || tr.Retire.AffineDurable == memDur) {
 			stale.Store(true)
 		}
 	}
@@ -561,11 +341,11 @@ func Test8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
 	var retired atomic.Pointer[mqttRetirementRequest]
 	var claimed atomic.Bool
 	pre := func(tr *mqttAuthorityTransition) {
-		if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionCloseTeardown {
+		if tr.Attempt != nil && tr.Attempt.Kind == mqttTransitionTeardownClaim {
 			claimed.Store(true)
 		}
-		if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil && tr.Auth.Intent.Retire.Gen == oldGen {
-			r := *tr.Auth.Intent.Retire
+		if tr.Retire != nil && tr.Retire.Gen == oldGen {
+			r := *tr.Retire
 			retired.Store(&r)
 		}
 	}
@@ -594,177 +374,5 @@ func Test8bUnreadableDisplacedRecordRefusesBeforeDetach(t *testing.T) {
 	}
 	if r.AffineGen == memGen || r.AffineDurable == memDur {
 		t.Fatalf("the retry retired the in-memory affine target %q/%q", memGen, memDur)
-	}
-}
-
-// T15c (H-2, consult 123): a clean start whose DISCARD-BOUNDARY settlement cannot answer — a
-// preparation planted after the CONNECT's own top settlement with its receipt unanswerable, or
-// the authority itself unreadable — REFUSES before the detach. Taking the discard arm would mark
-// the record from memory, and the adopter's continuation would then retire what memory names
-// for a generation that may still serve. After the store recovers, the retry hands off naming
-// EXACTLY the displaced record's targets. Mutation P2-unresolved (an unresolved boundary load
-// falls through to the discard arm).
-func Test8bUnresolvedBoundaryRefusesTheCleanStart(t *testing.T) {
-	for _, variant := range []string{"preparing", "indeterminate"} {
-		t.Run(variant, func(t *testing.T) {
-			cid := "f105-8b-t15c-" + variant
-			s, asm, epoch, oldGen, done := testCleanStartEnv(t, cid)
-			defer done()
-			o := s.getOpts()
-			testHoldResident(t, asm, cid)
-			test8bDivergeAffine(t, asm, cid)
-			obj := testResidentObject(asm, cid)
-			before, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			recorded := &mqttPersistedSession{}
-			if err := json.Unmarshal(before.Data, recorded); err != nil {
-				t.Fatal(err)
-			}
-			want := mqttTeardownTargetFromRecord(recorded, getHash(cid))
-			var drop atomic.Pointer[string]
-			dropFn := func(_ string, body []byte) bool {
-				d := drop.Load()
-				return d != nil && strings.Contains(string(body), *d)
-			}
-			asm.jsa.testDropRequest.Store(&dropFn)
-			t.Cleanup(func() { asm.jsa.testDropRequest.Store(nil) })
-			var armed atomic.Bool
-			restore := setMQTTTestClearWindowHook(func(sess *mqttSession, window string) {
-				if sess != obj || window != mqttClearWindowPreFence || !armed.CompareAndSwap(false, true) {
-					return
-				}
-				if variant == "preparing" {
-					i := testPlantUnresolved(t, asm, cid, epoch, "8b-t15c")
-					subj := mqttHandoffOutcomeSubject(_EMPTY_, getHash(cid), i.ID)
-					drop.Store(&subj)
-					return
-				}
-				subj := mqttOutboundAuthoritySubject(getHash(cid))
-				drop.Store(&subj)
-			})
-			defer restore()
-			var retired atomic.Pointer[mqttRetirementRequest]
-			pre := func(tr *mqttAuthorityTransition) {
-				if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil && tr.Auth.Intent.Retire.Gen == oldGen {
-					r := *tr.Auth.Intent.Retire
-					retired.Store(&r)
-				}
-			}
-			asm.jsa.testTransitionPresend.Store(&pre)
-			t.Cleanup(func() { asm.jsa.testTransitionPresend.Store(nil) })
-			ci := &mqttV5ConnInfo{clientID: cid, cleanStart: true}
-			testRefusedConnectV5(t, o, ci)
-			if !armed.Load() {
-				t.Fatal("the discard boundary was never reached, so nothing here is tested")
-			}
-			drop.Store(nil)
-			if _, _, marked := test8bMarked(asm, cid); marked {
-				t.Fatal("the clean start marked the record from memory behind an unresolved boundary")
-			}
-			after, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
-			if err != nil || after.Sequence != before.Sequence {
-				t.Fatalf("the refused clean start moved the record: %d -> %v (%v)", before.Sequence, after, err)
-			}
-			obj.mu.Lock()
-			objGen := obj.gen
-			obj.mu.Unlock()
-			if objGen != oldGen {
-				t.Fatalf("the refused clean start re-minted the incumbent: %q -> %q", oldGen, objGen)
-			}
-			tok := obj.beginRecordTx()
-			if terr := obj.endRecordTx(tok); terr != nil {
-				t.Fatalf("the refused clean start left the record transaction held: %v", terr)
-			}
-			if _, st := test8bReceipt(asm, cid, oldGen); st != mqttOutboundAbsent {
-				t.Fatalf("the refused clean start authored a teardown receipt (%v)", st)
-			}
-			c2, r2 := testMQTTConnectV5(t, ci, o.MQTT.Host, o.MQTT.Port)
-			defer c2.Close()
-			testMQTTReadConnAckV5(t, r2)
-			r := retired.Load()
-			if r == nil {
-				t.Fatal("the retry's handoff carried no retirement")
-			}
-			if r.AffineGen != want.q2AffGen || r.AffineDurable != want.q2AffDur || r.PubRelDurable != want.pubRelDur {
-				t.Fatalf("the retry retired %q/%q/%q, not the displaced record's %q/%q/%q",
-					r.AffineGen, r.AffineDurable, r.PubRelDurable, want.q2AffGen, want.q2AffDur, want.pubRelDur)
-			}
-		})
-	}
-}
-
-// T15d: the disposition's classification, row by row (consult 123). Mutations P2-unresolved and
-// P2-other-gen.
-func Test8bCleanStartDispositionTable(t *testing.T) {
-	const cid = "f105-8b-t15d"
-	o := testMQTTDefaultOptionsV5()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-	c, r := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)}, o.MQTT.Host, o.MQTT.Port)
-	defer c.Close()
-	testMQTTReadConnAckV5(t, r)
-	asm, sess := testResidentSession(t, s, cid)
-	epoch := testAccountEpoch(asm)
-	sess.mu.Lock()
-	gen := sess.gen
-	sess.mu.Unlock()
-	at := func(st mqttAuthorityState, g string) mqttAuthorityLoad {
-		return mqttAuthorityLoad{status: mqttOutboundValid, rec: &mqttOutboundAuthority{State: st, Gen: g}}
-	}
-	type outcome int
-	const (
-		handoff outcome = iota
-		discard
-		refuse
-	)
-	for name, row := range map[string]struct {
-		p    *mqttPreparedClear
-		want outcome
-	}{
-		"not read":              {&mqttPreparedClear{authRead: false}, refuse},
-		"indeterminate":         {&mqttPreparedClear{authRead: true, auth: mqttAuthorityLoad{status: mqttOutboundIndeterminate}}, refuse},
-		"absent":                {&mqttPreparedClear{authRead: true, auth: mqttAuthorityLoad{status: mqttOutboundAbsent}}, discard},
-		"reserving":             {&mqttPreparedClear{authRead: true, auth: at(mqttAuthorityReserving, "gen-other")}, refuse},
-		"preparing at this":     {&mqttPreparedClear{authRead: true, auth: at(mqttAuthorityPreparing, gen)}, refuse},
-		"closed":                {&mqttPreparedClear{authRead: true, auth: at(mqttAuthorityClosed, gen)}, discard},
-		"serving another":       {&mqttPreparedClear{authRead: true, auth: at(mqttAuthorityServing, "gen-other")}, discard},
-		"serving this (proven)": {&mqttPreparedClear{authRead: true, auth: asm.jsa.loadOutboundAuthority(cid, epoch)}, handoff},
-	} {
-		row.p.sess = sess
-		_, ok, err := sess.displacedRetireTargets(row.p)
-		got := discard
-		switch {
-		case err != nil:
-			got = refuse
-		case ok:
-			got = handoff
-		}
-		if got != row.want {
-			t.Errorf("%s: disposition %d (ok=%v err=%v), want %d", name, got, ok, err, row.want)
-		}
-	}
-	// A record with NO write identity, stored at the session's position and matched by the
-	// object, so the record-identity comparison passes and only the explicit refusal can refuse.
-	smsg, err := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(cid)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ps := &mqttPersistedSession{}
-	if err := json.Unmarshal(smsg.Data, ps); err != nil {
-		t.Fatal(err)
-	}
-	ps.WID = _EMPTY_
-	body, _ := json.Marshal(ps)
-	wseq, err := mqttStoreSessionRecordCASBody(&asm.jsa, asm.domainTk, body, getHash(cid), smsg.Sequence)
-	if err != nil {
-		t.Fatalf("storing the WID-less record: %v", err)
-	}
-	sess.mu.Lock()
-	sess.wid, sess.seq = _EMPTY_, wseq
-	sess.mu.Unlock()
-	if _, ok, err := sess.displacedRetireTargets(&mqttPreparedClear{sess: sess, authRead: true, auth: asm.jsa.loadOutboundAuthority(cid, epoch)}); ok || err == nil {
-		t.Errorf("a SERVING record with no write identity must refuse, got ok=%v err=%v", ok, err)
 	}
 }

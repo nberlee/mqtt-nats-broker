@@ -26,12 +26,6 @@ func testReleaseFacts() mqttAdoptedReleaseFacts {
 		Closed:       &mqttGenClosure{},
 		Ledger:       testSealedLedger(10),
 		RootEnrolled: true,
-		// POSITIVELY ESTABLISHED. The zero value is UNKNOWN and blocks, so a fixture that left
-		// it out would be testing the unknown rule in every case. DISCARDING since issue #107 7d: a
-		// reachable root is recovery ownership only where an implemented executor owns what it
-		// leads to, and a preserving root without a certificate is refused
-		// (TestReleaseGateRootArmNeedsADiscard).
-		Discard: mqttFactApplies,
 	}
 }
 
@@ -76,13 +70,6 @@ func TestMetadataReleaseWaitsForTheRightThings(t *testing.T) {
 			func(f *mqttAdoptedReleaseFacts) { f.Ledger = nil },
 			"sealed inventory",
 		},
-		// AN UNKNOWN DISPOSITION IS NOT A DISPOSITION. This is the permissive default a review
-		// required be removed: a caller that cannot say used to pass false, and the gate read
-		// "nobody said" as "no".
-		"an unknown discard disposition": {
-			func(f *mqttAdoptedReleaseFacts) { f.Discard = mqttFactUnknown },
-			"discard disposition",
-		},
 		// NEITHER ENROLLED NOR CERTIFIED means the surviving duties are abandoned: no broker
 		// will ever come back for them, and releasing here is what makes that permanent.
 		"no recovery ownership": {
@@ -99,14 +86,6 @@ func TestMetadataReleaseWaitsForTheRightThings(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("%s was blocked for the wrong reason: %v", name, err)
 		}
-	}
-
-	// A DISCARDING TEARDOWN IS NOT A BLOCKED ONE. What the gate needs is a DISPOSITION, either
-	// way, and a generation whose closure recorded a discard has one.
-	f := testReleaseFacts()
-	f.Discard = mqttFactApplies
-	if err := mqttAdoptedReleaseAuthorized(id, gen, f); err != nil {
-		t.Fatalf("an established discard disposition did not satisfy its condition: %v", err)
 	}
 }
 
@@ -177,33 +156,8 @@ func TestReleaseGateIsVacuousForAnUnconvertedGeneration(t *testing.T) {
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{}); len(b) != 0 {
 		t.Fatalf("a generation that admitted nothing was blocked: %v", b)
 	}
-	// Even with a discard owed: that is a fact ABOUT an inventory, and there is none.
-	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{
-		Discard: mqttFactApplies,
-	}); len(b) != 0 {
-		t.Fatalf("a generation that admitted nothing was blocked: %v", b)
-	}
-
-	// AND THE UNKNOWN FACT IS VACUOUS TOO while there is no inventory, which is what lets
-	// the gate stand on a production path today: the teardown call site cannot establish the
-	// discard disposition, which is UNKNOWN there. (The target enumeration used to be a second
-	// unknown input; it went with the shared-durable enrolment, whose release is now the
-	// shared-group lifecycle's own closing gate, sharedClosingComplete.)
-	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{}); len(b) != 0 {
-		t.Fatalf("unknown facts blocked a generation that has no inventory: %v", b)
-	}
-
-	// THE MOMENT IT HAS AN INVENTORY the conditions apply — including the unknown one, which
-	// is the deadline a review set: the gap closes before an admission creates an inventory,
-	// and after that the same teardown refuses until somebody answers it.
-	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{
-		Closed: &mqttGenClosure{}, Ledger: testSealedLedger(3), RootEnrolled: true,
-	}); len(b) != 1 || b[0].Fact != "the discard disposition" {
-		t.Fatalf("a generation with an inventory and an unknown discard disposition reported %d block(s): %v",
-			len(b), b)
-	}
-	// Without this row the vacuous case above would be satisfied by a gate that never blocked
-	// anything.
+	// THE MOMENT IT HAS AN INVENTORY the conditions apply. Without this row the vacuous case
+	// above would be satisfied by a gate that never blocked anything.
 	if b := mqttAdoptedReleaseBlockedBy(id, gen, mqttAdoptedReleaseFacts{
 		Ledger: testSealedLedger(3),
 	}); len(b) == 0 {
@@ -233,12 +187,6 @@ func TestReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	if f.Ledger != nil || f.Cert != nil || f.RootEnrolled {
 		t.Fatalf("a generation that admitted nothing reported facts: %+v", f)
 	}
-	// AND THE DISPOSITION IS UNKNOWN with no closure standing, which is the honest answer:
-	// there is no record, so nobody has said. It is not the permissive one — the gate blocks
-	// on it — and it is reached without a caller supplying anything.
-	if f.Discard != mqttFactUnknown {
-		t.Fatalf("a generation with no closure reported disposition %v", f.Discard)
-	}
 	if berr := mqttAdoptedReleaseAuthorized(e.id, testGen, f); berr != nil {
 		t.Fatalf("a generation that admitted nothing was blocked: %v", berr)
 	}
@@ -266,7 +214,7 @@ func TestReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	// AND A ROOT IS FOUND AT THE ADDRESS ITS GENERATION'S CLOSURE RECORDS, which is how the gate
 	// establishes recovery ownership without an enumeration that can come back short. The closure
 	// is planted first, because without one there is no address to read and the gate never looks.
-	testPlantClosureAt(t, e, testGen, mqttDirShardFor(getHash(e.id)), 1, false)
+	testPlantClosureAt(t, e, testGen, mqttDirShardFor(getHash(e.id)), 1)
 	root := testEnvRoot(e, 1, 1, 1, 0)
 	testPlantRoot(t, e, root)
 
@@ -354,99 +302,89 @@ func TestReleaseFactsAreReadUnderTheAccountsRecoveryEpoch(t *testing.T) {
 	}
 }
 
-// TestTheDiscardDispositionIsReadFromTheClosure is the producer half of the gate's discard
-// rule, and the reason there is no second "and its record stands" fact beside it.
+// TestAClosureCannotAdmitAnObligation is the arm that makes the closed-set member rule
+// LOAD-BEARING, kept as its own test so a mutation shows it firing.
 //
-// The disposition is a MANDATORY member of the closure record — a body without it is refused
-// rather than defaulted — and the closure is written by the transition that closes the
-// generation, at the moment the protocol event is true. A teardown re-deriving it later would be
-// stating a claim about something it can no longer observe, which is the shape the whole gate
-// exists to remove from its own inputs.
-func TestTheDiscardDispositionIsReadFromTheClosure(t *testing.T) {
-	e, done := testNewEnv(t, "f105-discard-disposition")
+// A create-only resource on a closure is refused twice over — the provisioning rule catches it
+// too — so that arm alone cannot show what this rule uniquely stops. An exchange admitted
+// create-only is the one nothing else looks at: without the rule it lands in a generation that
+// is ENDING, admitted by the act whose whole purpose is to stop admission.
+func TestAClosureCannotAdmitAnObligation(t *testing.T) {
+	e, done := testNewEnv(t, "f105-closure-admits")
 	defer done()
 	e.bootstrap(t, "txn-1")
-
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, "txn-close", al.rec.Gen,
-		al.rec.Tenure, al.rec.OwnerTxn); err != nil {
-		t.Fatalf("closing the generation: %v", err)
-	}
 
-	f, err := e.asm.gatherAdoptedReleaseFacts(e.id, e.epoch, al.rec.Gen)
-	if err != nil {
-		t.Fatalf("gathering facts for a closed generation: %v", err)
+	nonce := mqttNewInflightNonce()
+	x := &mqttOutboundExchange{
+		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: nonce, PI: 9, QoS: 2,
+		Phase: mqttExchangePublish, AdmitTxn: "txn-close-rider-2", Tenure: al.rec.Tenure,
 	}
-	if f.Closed == nil {
-		t.Fatalf("the closure was not read back: %+v", f)
-	}
-	// ENDING A GENERATION IS NOT DISCARDING IT, and the disposition says so POSITIVELY rather
-	// than by being absent.
-	if f.Discard != mqttFactDoesNotApply {
-		t.Fatalf("a non-discarding closure reported disposition %v", f.Discard)
-	}
-
-	// AND A DISCARDING CLOSE-ADMISSION IS REFUSED AT THE BOUNDARY. A discard is authorized by a
-	// retirement intent; this kind carries none, so a discarding closure here would be that
-	// authorization asserted by whoever assembled the batch.
-	e2, done2 := testNewEnv(t, "f105-discard-disposition-2")
-	defer done2()
-	e2.bootstrap(t, "txn-1")
-	al2 := e2.asm.jsa.loadOutboundAuthority(e2.id, e2.epoch)
-	_, cerr := e2.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e2.id, Epoch: e2.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: al2.rec.OwnerTxn, Rev: al2.rec.Rev + 1,
-			Gen: al2.rec.Gen, Tenure: al2.rec.Tenure, OwnerTxn: al2.rec.OwnerTxn,
-		},
-		Prev: al2.rec, PrevSeq: al2.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e2.id, Epoch: e2.epoch, Gen: al2.rec.Gen, Tenure: al2.rec.Tenure,
-			State: mqttAuthorityClosed, Rev: al2.rec.Rev + 1, Txn: "txn-close",
-			OwnerTxn: al2.rec.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: e2.id, Epoch: e2.epoch, Gen: al2.rec.Gen, Txn: "txn-close", Discard: true,
-		},
-	})
-	if cerr == nil {
-		t.Fatalf("a close-admission wrote a discarding closure")
-	}
-	if !strings.Contains(cerr.Error(), "not authority to abandon its obligations") {
-		t.Fatalf("the refusal did not come from the disposition rule: %v", cerr)
-	}
-
-	// AND A DISCARDING CLOSURE READS BACK AS APPLIES. The record is planted directly, because
-	// the transition that legitimately writes one is a FINALIZE carrying a retirement intent
-	// with Discard set — a different boundary, tested where it lives. What is under test here
-	// is the READ: with only the non-discarding case above, a gatherer that hard-coded
-	// "does not apply" passed every assertion, and a mutation showed exactly that.
-	e3, done3 := testNewEnv(t, "f105-discard-disposition-3")
-	defer done3()
-	e3.bootstrap(t, "txn-1")
-	al3 := e3.asm.jsa.loadOutboundAuthority(e3.id, e3.epoch)
-	body, merr := json.Marshal(&mqttGenClosure{
-		ID: e3.id, Epoch: e3.epoch, Gen: al3.rec.Gen, Txn: "txn-discard", Discard: true,
-		// A CLOSURE CARRIES ITS ROOT'S ADDRESS, and a planted one is no exception: the record is
-		// refused on READ without it, so a fixture that omitted it would be testing the decoder
-		// rather than the disposition. Shard 0 is a real shard, so the address is derived the
-		// same way the allocator derives it.
-		RootShard: mqttDirShardFor(getHash(e3.id)), RootOrd: 1,
-	})
+	xbody, merr := json.Marshal(x)
 	if merr != nil {
-		t.Fatalf("marshalling the discarding closure: %v", merr)
+		t.Fatalf("marshalling the exchange: %v", merr)
+	}
+	closing := testClosure(e, al.rec, al.seq, "txn-close-rider-2")
+	closing.Extra = append(closing.Extra, []mqttTransitionMember{{
+		subj: mqttExchangeSubject(getHash(e.id), al.rec.Gen, nonce), expect: 0, body: xbody,
+	}}...)
+	_, xerr := e.asm.jsa.commitAuthorityTransition(closing)
+	if xerr == nil {
+		t.Fatalf("a closure admitted an obligation into the generation it was ending")
+	}
+	if !strings.Contains(xerr.Error(), "and nothing else") {
+		t.Fatalf("the exchange refusal did not come from the closing kind's member rule: %v", xerr)
+	}
+}
+
+// TestAClosureCannotAllocateInventory is the arm that ONLY the closed-set rule stops.
+//
+// Resource and exchange members are each refused a second time by their own kind rules, so
+// neither can show what this rule uniquely adds. An INVENTORY allocation is the one nothing else
+// looks at: the ledger CAS and its duty entries are validated as an allocation — correctly,
+// against the standing ledger — and no rule asks which KIND of transition is taking the ordinal.
+// Without this rule a closure allocates a duty in the generation it is ending.
+func TestAClosureCannotAllocateInventory(t *testing.T) {
+	e, done := testNewEnv(t, "f105-closure-allocates")
+	defer done()
+	e.bootstrap(t, "txn-1")
+	r, _ := testPlantUnsealedResource(t, e, "inc-alloc", mqttResourceRetainedPayload)
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+
+	closing := testClosure(e, al.rec, al.seq, "txn-close-alloc")
+	closing.Extra = append(closing.Extra, []mqttTransitionMember{
+		// SEALED, so this fixture reaches the rule it is about. A closing batch's ledger
+		// must be the sealed one — that is its own rule, and an OPEN body here would be
+		// refused by it before the binding below was ever consulted.
+		testLedgerMember(t, e, 0, testInventoryLedger(e, mqttGenLedgerSealed, 1)),
+		testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyCleanup, r.Inc,
+			mqttDutyNotYetActionable)),
+	}...)
+	_, cerr := e.asm.jsa.commitAuthorityTransition(closing)
+	if cerr == nil {
+		t.Fatalf("a closure allocated a duty in the generation it was ending")
+	}
+	if !strings.Contains(cerr.Error(), "which it does not enrol") {
+		t.Fatalf("the allocation refusal did not come from the enrolment binding: %v", cerr)
+	}
+}
+
+// testPlantClosureAt plants a closure record naming a root address.
+//
+// Direct, because what is under test here is the gate's READ of an address, and the transition
+// that legitimately writes one is the closing batch — a different boundary, tested where it lives.
+func testPlantClosureAt(t *testing.T, e *testOutboundEnv, gen string, shard, ord uint64) {
+	t.Helper()
+	body, err := json.Marshal(&mqttGenClosure{
+		ID: e.id, Epoch: e.epoch, Gen: gen, Txn: "txn-planted-closure",
+		RootShard: shard, RootOrd: ord,
+	})
+	if err != nil {
+		t.Fatalf("marshalling the closure: %v", err)
 	}
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
-	if _, serr := e3.asm.jsa.storeMsg(mqttGenClosureSubject(getHash(e3.id), al3.rec.Gen),
-		hdr, msg); serr != nil {
-		t.Fatalf("planting the discarding closure: %v", serr)
-	}
-	f3, ferr := e3.asm.gatherAdoptedReleaseFacts(e3.id, e3.epoch, al3.rec.Gen)
-	if ferr != nil {
-		t.Fatalf("gathering facts for a discarded generation: %v", ferr)
-	}
-	if f3.Discard != mqttFactApplies {
-		t.Fatalf("a discarding closure reported disposition %v", f3.Discard)
+	if _, serr := e.asm.jsa.storeMsg(mqttGenClosureSubject(getHash(e.id), gen), hdr, msg); serr != nil {
+		t.Fatalf("planting the closure: %v", serr)
 	}
 }
 
@@ -471,8 +409,8 @@ func TestOnlyTheKindsThatAreAboutMembersMayCarryThem(t *testing.T) {
 		}
 	}
 	for _, k := range []mqttTransitionKind{
-		mqttTransitionCloseAdmit, mqttTransitionFinalize, mqttTransitionFinalizeCreation,
-		mqttTransitionPrepareIntent, mqttTransitionCancelIntent, mqttTransitionReserveCreation,
+		mqttTransitionTeardownClaim, mqttTransitionAcceptCreate, mqttTransitionAcceptHandoff,
+		mqttTransitionAcceptReopen, mqttTransitionBind,
 	} {
 		if mqttKindCarriesMembers(k) {
 			t.Fatalf("kind %q moves ownership and may not carry members", k)
@@ -485,23 +423,9 @@ func TestOnlyTheKindsThatAreAboutMembersMayCarryThem(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 	r, _ := testPlantUnsealedResource(t, e, "inc-rider", mqttResourceSourceConsumer)
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	_, cerr := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close-rider", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
-			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
-		},
-		Prev: al.rec, PrevSeq: al.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
-			State: mqttAuthorityClosed, Rev: al.rec.Rev + 1, Txn: "txn-close-rider",
-			OwnerTxn: al.rec.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-rider",
-		},
-		Extra: []mqttTransitionMember{testMaterialResourceMember(t, e, 0, r)},
-	})
+	closing := testClosure(e, al.rec, al.seq, "txn-close-rider")
+	closing.Extra = append(closing.Extra, []mqttTransitionMember{testMaterialResourceMember(t, e, 0, r)}...)
+	_, cerr := e.asm.jsa.commitAuthorityTransition(closing)
 	if cerr == nil {
 		t.Fatalf("a closure carried an obligation member")
 	}
@@ -509,118 +433,4 @@ func TestOnlyTheKindsThatAreAboutMembersMayCarryThem(t *testing.T) {
 		t.Fatalf("the refusal did not come from the closing kind's member rule: %v", cerr)
 	}
 
-}
-
-// TestAClosureCannotAdmitAnObligation is the arm that makes the closed-set member rule
-// LOAD-BEARING, kept as its own test so a mutation shows it firing.
-//
-// A create-only resource on a closure is refused twice over — the provisioning rule catches it
-// too — so that arm alone cannot show what this rule uniquely stops. An exchange admitted
-// create-only is the one nothing else looks at: without the rule it lands in a generation that
-// is ENDING, admitted by the act whose whole purpose is to stop admission.
-func TestAClosureCannotAdmitAnObligation(t *testing.T) {
-	e, done := testNewEnv(t, "f105-closure-admits")
-	defer done()
-	e.bootstrap(t, "txn-1")
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-
-	nonce := mqttNewInflightNonce()
-	x := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Nonce: nonce, PI: 9, QoS: 2,
-		Phase: mqttExchangePublish, AdmitTxn: "txn-close-rider-2", Tenure: al.rec.Tenure,
-	}
-	xbody, merr := json.Marshal(x)
-	if merr != nil {
-		t.Fatalf("marshalling the exchange: %v", merr)
-	}
-	_, xerr := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close-rider-2", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
-			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
-		},
-		Prev: al.rec, PrevSeq: al.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
-			State: mqttAuthorityClosed, Rev: al.rec.Rev + 1, Txn: "txn-close-rider-2",
-			OwnerTxn: al.rec.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-rider-2",
-		},
-		Extra: []mqttTransitionMember{{
-			subj: mqttExchangeSubject(getHash(e.id), al.rec.Gen, nonce), expect: 0, body: xbody,
-		}},
-	})
-	if xerr == nil {
-		t.Fatalf("a closure admitted an obligation into the generation it was ending")
-	}
-	if !strings.Contains(xerr.Error(), "and nothing else") {
-		t.Fatalf("the exchange refusal did not come from the closing kind's member rule: %v", xerr)
-	}
-}
-
-// TestAClosureCannotAllocateInventory is the arm that ONLY the closed-set rule stops.
-//
-// Resource and exchange members are each refused a second time by their own kind rules, so
-// neither can show what this rule uniquely adds. An INVENTORY allocation is the one nothing else
-// looks at: the ledger CAS and its duty entries are validated as an allocation — correctly,
-// against the standing ledger — and no rule asks which KIND of transition is taking the ordinal.
-// Without this rule a closure allocates a duty in the generation it is ending.
-func TestAClosureCannotAllocateInventory(t *testing.T) {
-	e, done := testNewEnv(t, "f105-closure-allocates")
-	defer done()
-	e.bootstrap(t, "txn-1")
-	r, _ := testPlantUnsealedResource(t, e, "inc-alloc", mqttResourceRetainedPayload)
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-
-	_, cerr := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close-alloc", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
-			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
-		},
-		Prev: al.rec, PrevSeq: al.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
-			State: mqttAuthorityClosed, Rev: al.rec.Rev + 1, Txn: "txn-close-alloc",
-			OwnerTxn: al.rec.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-alloc",
-		},
-		Extra: []mqttTransitionMember{
-			// SEALED, so this fixture reaches the rule it is about. A closing batch's ledger
-			// must be the sealed one — that is its own rule, and an OPEN body here would be
-			// refused by it before the binding below was ever consulted.
-			testLedgerMember(t, e, 0, testInventoryLedger(e, mqttGenLedgerSealed, 1)),
-			testDutyMember(t, e, 0, testDuty(e, 1, mqttDutyCleanup, r.Inc,
-				mqttDutyNotYetActionable)),
-		},
-	})
-	if cerr == nil {
-		t.Fatalf("a closure allocated a duty in the generation it was ending")
-	}
-	if !strings.Contains(cerr.Error(), "which it does not enrol") {
-		t.Fatalf("the allocation refusal did not come from the enrolment binding: %v", cerr)
-	}
-}
-
-// testPlantClosureAt plants a closure record naming a root address.
-//
-// Direct, because what is under test here is the gate's READ of an address, and the transition
-// that legitimately writes one is the closing batch — a different boundary, tested where it lives.
-func testPlantClosureAt(t *testing.T, e *testOutboundEnv, gen string, shard, ord uint64, discard bool) {
-	t.Helper()
-	body, err := json.Marshal(&mqttGenClosure{
-		ID: e.id, Epoch: e.epoch, Gen: gen, Txn: "txn-planted-closure", Discard: discard,
-		RootShard: shard, RootOrd: ord,
-	})
-	if err != nil {
-		t.Fatalf("marshalling the closure: %v", err)
-	}
-	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
-	if _, serr := e.asm.jsa.storeMsg(mqttGenClosureSubject(getHash(e.id), gen), hdr, msg); serr != nil {
-		t.Fatalf("planting the closure: %v", serr)
-	}
 }

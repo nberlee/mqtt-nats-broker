@@ -50,7 +50,7 @@ const (
 	goldenQ2In    = "golden-q2in"   // inbound QoS 2 held: PUBREC received, PUBREL withheld
 	goldenQ2Out   = "golden-q2out"  // outbound QoS 2: PUBREC sent, PUBCOMP withheld
 	goldenShared  = "golden-shared" // MQTT 5 shared member, never-expiring session
-	goldenGone    = "golden-gone"   // a session discarded by a clean start: a teardown watermark
+	goldenGone    = "golden-gone"   // a session discarded by a clean start: a closed authority
 	goldenGroup   = "goldengrp"
 	goldenPayload = "golden"
 )
@@ -174,7 +174,7 @@ func storeFormatScenario(t *testing.T, o *Options) {
 	testMQTTDisconnect(t, sc, nil)
 	sc.Close()
 
-	// 6. A session discarded by a clean start: the teardown leaves a watermark.
+	// 6. A session discarded by a clean start: the teardown leaves its authority closed.
 	gc, gr := storeFormatConnect(t, o, goldenGone, false)
 	testMQTTCheckConnAck(t, gr, mqttConnAckRCConnectionAccepted, false)
 	testMQTTDisconnect(t, gc, nil)
@@ -195,7 +195,6 @@ func storeFormatScenario(t *testing.T, o *Options) {
 // was exercised; storeFormatScenarioSubjects pins them one by one.
 var storeFormatScenarioStreams = map[string]uint64{
 	mqttSessStreamName:             4,
-	mqttTeardownStreamName:         1,
 	mqttStreamName:                 1,
 	mqttQoS2IncomingMsgsStreamName: 1,
 	mqttOutStreamName:              1,
@@ -511,12 +510,13 @@ func storeFormatReadBack(t *testing.T, s *Server, o *Options) {
 	}
 	testMQTTSendPIPacket(mqttPacketPubAck, t, sc, spi)
 
-	// 6. The discarded session's watermark is still read, and the client has no session.
+	// 6. The discarded session's generation still reads noncurrent, and the client has no session.
 	t.Logf("read-back step 6")
 	cl := testMQTTGetClient(t, s, goldenSub)
 	sess := cl.mqtt.sess
-	if _, _, st := sess.jsa.loadGenRetirement(sess.domainTk, getHash(goldenGone)); st != mqttRetirementValid {
-		t.Fatalf("%s: the teardown watermark reads as %v, want valid", goldenGone, st)
+	if al := sess.jsa.loadOutboundAuthority(goldenGone, sess.asm.sessStreamEpoch); al.status != mqttOutboundValid ||
+		al.rec.State != mqttAuthorityClosed {
+		t.Fatalf("%s: the discarded generation's authority reads %v, want closed", goldenGone, al.status)
 	}
 	gc, gr := storeFormatConnect(t, o, goldenGone, false)
 	defer gc.Close()

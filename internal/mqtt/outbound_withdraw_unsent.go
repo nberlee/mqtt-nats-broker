@@ -220,7 +220,7 @@ func mqttWithdrawUnsentTransition(prev *mqttOutboundAuthority, prevSeq uint64, t
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: x.Gen, Op: op,
 			Kind: mqttTransitionWithdrawUnsent, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -229,7 +229,7 @@ func mqttWithdrawUnsentTransition(prev *mqttOutboundAuthority, prevSeq uint64, t
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 		Extra: []mqttTransitionMember{
 			{subj: subject, expect: regSeq, body: regBody},
@@ -324,7 +324,7 @@ func (sess *mqttSession) withdrawUnsentHandled(gen, subject, nonce, lin string, 
 	jsa := sess.jsa
 	v := jsa.resolveTransitionHandle(out.Handle)
 	if v == mqttTransitionUnresolved {
-		_ = jsa.abortTransition(&out.Handle.attempt)
+		_ = jsa.abortTransition(&out.Handle.attempt, lic.admit)
 		v = jsa.resolveTransitionHandle(out.Handle)
 	}
 	switch v {
@@ -332,6 +332,9 @@ func (sess *mqttSession) withdrawUnsentHandled(gen, subject, nonce, lin string, 
 		return mqttWithdrawLanded, true
 	case mqttTransitionNeverLanded:
 		return mqttWithdrawNeverLanded, true
+	case mqttTransitionRetired:
+		// RETIRED is no deletion licence: the door refuses as for an unresolved attempt.
+		return mqttWithdrawUnresolved, true
 	}
 	return mqttWithdrawUnresolved, true
 }
@@ -528,7 +531,7 @@ func (jsa *mqttJSA) opTombstoneRegister(r *mqttTombstoneRegisterRequest) (mqttOp
 	}
 	return jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: auth.ID, Epoch: auth.Epoch, Txn: r.Txn, Op: r.Op,
+			ID: auth.ID, Epoch: auth.Epoch, Txn: r.Txn, Scope: r.Ent.Gen, Op: r.Op,
 			Kind: mqttTransitionTombstoneRegister, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: r.Ent.Gen, Tenure: r.Ent.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -537,7 +540,7 @@ func (jsa *mqttJSA) opTombstoneRegister(r *mqttTombstoneRegisterRequest) (mqttOp
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: r.Txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: []mqttTransitionMember{{subj: r.Subject, expect: r.Expect, body: body}},
 	})
@@ -598,9 +601,10 @@ func (sess *mqttSession) storeCancellationTombstone(subject string, expect uint6
 	}
 	v := jsa.resolveTransitionHandle(out.Handle)
 	if v == mqttTransitionUnresolved {
-		_ = jsa.abortTransition(&out.Handle.attempt)
+		_ = jsa.abortTransition(&out.Handle.attempt, lic.admit)
 		v = jsa.resolveTransitionHandle(out.Handle)
 	}
+	// RETIRED is no deletion licence, so it returns the write's error as an unresolved one does.
 	if v == mqttTransitionLanded || v == mqttTransitionSuperseded {
 		return true, nil
 	}

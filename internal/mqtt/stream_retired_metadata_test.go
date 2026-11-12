@@ -44,19 +44,21 @@ func TestMQTTStartupRefusesTheRetiredMetadataStreams(t *testing.T) {
 		mention []string
 		lookups int
 	}{
-		{"both absent", []func() (*StreamInfo, error){absent, absent}, false, nil, 2},
-		{"in-flight present", []func() (*StreamInfo, error){present(mqttRetiredInflightStreamName), absent},
-			true, []string{mqttRetiredInflightStreamName}, 2},
-		{"shared present", []func() (*StreamInfo, error){absent, present(mqttRetiredSharedStreamName)},
-			true, []string{mqttRetiredSharedStreamName}, 2},
-		{"both present", []func() (*StreamInfo, error){present(mqttRetiredInflightStreamName), present(mqttRetiredSharedStreamName)},
-			true, []string{mqttRetiredInflightStreamName, mqttRetiredSharedStreamName}, 2},
+		{"all absent", []func() (*StreamInfo, error){absent, absent, absent}, false, nil, 3},
+		{"in-flight present", []func() (*StreamInfo, error){present(mqttRetiredInflightStreamName), absent, absent},
+			true, []string{mqttRetiredInflightStreamName}, 3},
+		{"shared present", []func() (*StreamInfo, error){absent, present(mqttRetiredSharedStreamName), absent},
+			true, []string{mqttRetiredSharedStreamName}, 3},
+		{"teardown present", []func() (*StreamInfo, error){absent, absent, present(mqttRetiredTeardownStreamName)},
+			true, []string{mqttRetiredTeardownStreamName}, 3},
+		{"both present", []func() (*StreamInfo, error){present(mqttRetiredInflightStreamName), present(mqttRetiredSharedStreamName), absent},
+			true, []string{mqttRetiredInflightStreamName, mqttRetiredSharedStreamName}, 3},
 		// Info alongside a not-found error is decided by the half that says it EXISTS.
 		{"in-flight present with a not-found error", []func() (*StreamInfo, error){
 			func() (*StreamInfo, error) {
 				return &StreamInfo{Config: StreamConfig{Name: mqttRetiredInflightStreamName}}, notFound
-			}, absent,
-		}, true, []string{mqttRetiredInflightStreamName}, 2},
+			}, absent, absent,
+		}, true, []string{mqttRetiredInflightStreamName}, 3},
 		// An undecided lookup fails startup at once: absence is not the default.
 		{"in-flight undecided: no info, no error", []func() (*StreamInfo, error){
 			func() (*StreamInfo, error) { return nil, nil },
@@ -115,9 +117,8 @@ func TestMQTTStartupRefusesALayoutHoldingARetiredMetadataStream(t *testing.T) {
 		Name: mqttSessStreamName,
 		Subjects: []string{
 			mqttSessStreamSubjectPrefix + ">",
-			mqttAcceptSubjectPrefix + ">",
-			mqttHandoffSubjectPrefix + ">",
-			mqttTeardownReceiptSubjectPrefix + ">",
+			"$MQTT.accept.>", // the retired acceptance-fact space
+			"$MQTT.trcpt.>",  // the retired teardown-receipt space
 		},
 		Storage: jetstream.FileStorage,
 	}

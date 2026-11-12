@@ -16,7 +16,6 @@
 package mqtt
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -71,69 +70,5 @@ func TestTheOwnershipBudgetIsOneAbsoluteInterval(t *testing.T) {
 	}
 	if _, err := mqttNewOwnershipBudget(anchor, 0); err == nil {
 		t.Fatalf("a budget of zero was accepted")
-	}
-}
-
-// TestExpiryDispositionsAreNotInterchangeable is the heart of row 9's deadline.
-//
-// Three outcomes, two of which look alike and mean opposite things. Getting them wrong is not a
-// timing bug — it is either closing a generation whose metadata actually committed, or serving a
-// client whose proposal actually lost.
-func TestExpiryDispositionsAreNotInterchangeable(t *testing.T) {
-	// ABORTED: the loser closes its generation and refuses. It does NOT mint a replacement.
-	aborted, err := mqttDisposeExpiredOwnership(mqttProposalAborted)
-	if err != nil {
-		t.Fatalf("disposing an aborted proposal: %v", err)
-	}
-	if !aborted.RefuseConnect || !aborted.AbandonOwn || aborted.LeaveSettleable {
-		t.Fatalf("an aborted proposal disposed %+v, want refuse + close and NOT settleable", aborted)
-	}
-
-	// COMMITTED BUT NOT FINALIZED: not a refusal of the protocol, only of this connection. A
-	// committed slot is never aborted — that is the one act the create-only fence forbids.
-	committed, err := mqttDisposeExpiredOwnership(mqttProposalCommitted)
-	if err != nil {
-		t.Fatalf("disposing a committed proposal: %v", err)
-	}
-	if !committed.RefuseConnect || committed.AbandonOwn || !committed.LeaveSettleable {
-		t.Fatalf("a committed proposal disposed %+v, want refuse + settleable and NOT closed",
-			committed)
-	}
-
-	// UNRESOLVED: the third class. Absence of a committed verdict is NOT proof of
-	// non-commitment, so nothing is aborted.
-	unresolved, err := mqttDisposeExpiredOwnership(mqttProposalUnresolved)
-	if err != nil {
-		t.Fatalf("disposing an unresolved proposal: %v", err)
-	}
-	if !unresolved.RefuseConnect || unresolved.AbandonOwn || !unresolved.LeaveSettleable {
-		t.Fatalf("an unresolved proposal disposed %+v, want refuse + settleable and NOT closed",
-			unresolved)
-	}
-	if !strings.Contains(unresolved.Why, "not proof of non-commitment") {
-		t.Fatalf("the unresolved disposition did not state why it is not an abort: %s",
-			unresolved.Why)
-	}
-
-	// CLOSING AND LEAVING SETTLEABLE ARE MUTUALLY EXCLUSIVE, which is the property that keeps
-	// the aborted case apart from the other two.
-	for name, d := range map[string]mqttExpiryDisposition{
-		"aborted": aborted, "committed": committed, "unresolved": unresolved,
-	} {
-		if d.AbandonOwn && d.LeaveSettleable {
-			t.Fatalf("%s both closed its generation and left the proposal settleable", name)
-		}
-		if !d.RefuseConnect {
-			t.Fatalf("%s did not refuse the connection", name)
-		}
-	}
-
-	// A FINALIZED PROPOSAL HAS A SERVABLE AUTHORITY, so asking what its expiry means is asking
-	// the wrong question — and it is refused rather than answered with a plausible default.
-	if _, err := mqttDisposeExpiredOwnership(mqttProposalFinalized); err == nil {
-		t.Fatalf("a finalized proposal was given an expiry disposition")
-	}
-	if _, err := mqttDisposeExpiredOwnership(mqttProposalState(99)); err == nil {
-		t.Fatalf("an unsupported proposal state was given an expiry disposition")
 	}
 }

@@ -222,10 +222,10 @@ func TestMQTTTakeoverOwedDelayedWill(t *testing.T) {
 		defer closeWit()
 		var released time.Time
 		f.takeoverAfterReturn(id, 1, false, func(closeAt int64) {
-			// M5's precondition: the displaced connection's own acceptance fact sits above
-			// sequence 1, so a baseline of 1 genuinely admits it.
-			if _, seqs := testFactsFor(t, f.asm, id); len(seqs) == 0 || seqs[len(seqs)-1] <= 1 {
-				t.Fatalf("precondition: own acceptance fact above sequence 1, got %v", seqs)
+			// The displaced connection's acceptance allocated its Will's anchor, and no
+			// later acceptance has lowered it: nothing suppresses this Will.
+			if anchors := testWillAnchorsOf(t, f.asm, id); len(anchors) != 1 || anchors[0].MinAt != 0 {
+				t.Fatalf("precondition: one unlowered Will anchor, got %+v", anchors)
 			}
 			testOwedDelayedWaitPast(closeAt, 1)
 			released = time.Now()
@@ -311,16 +311,16 @@ func TestMQTTTakeoverOwedDelayedWill(t *testing.T) {
 		}
 	})
 
-	// Elapsed, but an EARLIER qualifying acceptance exists — standing for a remote
-	// broker's reconnect during the delay that this broker never observed. Only the fact
-	// scan can see it, which is why an elapsed deadline may not be published directly.
+	// Elapsed, but an acceptance before the fire time exists, standing for a remote
+	// broker's reconnect during the delay that this broker never observed. Only the
+	// anchor records it, which is why an elapsed deadline may not be published directly.
 	t.Run("elapsed with an earlier qualifying acceptance is suppressed", func(t *testing.T) {
 		const topic, id = "wtod/t6", "wtod6"
 		f := testNewOwedDelayedFixture(t, topic)
 		rwit, closeWit := testMQTTWillWitness(t, f.o, id+"-w", topic)
 		defer closeWit()
 		f.takeoverAfterReturn(id, 1, false, func(closeAt int64) {
-			testPlantAcceptFact(t, f.asm, id, closeAt+int64(100*time.Millisecond))
+			testPlantAnchorAcceptance(t, f.asm, id, closeAt+int64(100*time.Millisecond))
 			testOwedDelayedWaitPast(closeAt, 1)
 		})
 		if n := testMQTTCountPublishes(t, rwit, topic, 3*time.Second, 500*time.Millisecond); n != 0 {

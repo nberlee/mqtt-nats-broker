@@ -141,6 +141,11 @@ func (jsa *mqttJSA) publishDurableCloseCert(c *mqttDurableCloseCert) error {
 	if err != nil {
 		return err
 	}
+	// UNFENCED, deliberately (issue #133): a certificate is written at every connection close, which
+	// at a takeover coincides with the successor's acceptance, and rewriting the authority beside it
+	// would cost that acceptance its CAS. A certifier paused past its generation's purge leaves an
+	// inert record: it clears only the exact (generation, run, connection) it names, whose registers
+	// are gone with the generation (docs/CONFORMANCE.md).
 	msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
 	if _, serr := jsa.storeMsg(mqttCloseCertSubject(getHash(c.ID), c.Gen, c.Run, c.Conn), hdr, msg); serr != nil {
 		stood, lerr := jsa.loadDurableCloseCert(c.ID, c.Epoch, c.Gen, c.Run, c.Conn)

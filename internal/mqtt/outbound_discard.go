@@ -65,7 +65,7 @@ func mqttDiscardExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: cur.Gen, Op: op,
 			Kind: mqttTransitionDiscardExchange, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -75,7 +75,7 @@ func mqttDiscardExchangeTransition(prev *mqttOutboundAuthority, prevSeq uint64, 
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttExchangeSubject(getHash(prev.ID), cur.Gen, cur.Nonce),

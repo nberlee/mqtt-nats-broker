@@ -152,7 +152,7 @@ func TestBrokerStreamBundlePreflightRefusesAForeignFormatMember(t *testing.T) {
 	}{
 		{"a partial bundle in another format", names[:3], map[string]*string{names[0]: testStrPtr("2"), names[2]: testStrPtr("2")}, true},
 		{"a partial unstamped bundle", names[3:6], map[string]*string{names[3]: nil, names[4]: nil, names[5]: nil}, false},
-		{"a complete bundle with one member in another format", names, map[string]*string{names[7]: testStrPtr("9")}, true},
+		{"a complete bundle with one member in another format", names, map[string]*string{names[len(names)-1]: testStrPtr("9")}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &testBundleLookupStub{info: map[string]*StreamInfo{}}

@@ -9,8 +9,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/nats-io/nuid"
 )
 
 // issue #31 (Slice B): arbitrating two frontends taking over one session from the same
@@ -380,28 +378,18 @@ func testSupersedeInAdoptionWindow(t *testing.T, peer *testTeardownEnv, forClien
 		// account's own sweep loop can be adopting the same marker concurrently: what
 		// this has to produce is "a rival's record is there when the release
 		// classifies", not one particular route to it.
+		// Another broker's displacing CONNECT (issue #133): the only writer that replaces a
+		// marker with a record. Retried, because the account's own sweep loop can be adopting the
+		// same marker concurrently: what this has to produce is "a rival's record is there when
+		// the release classifies", not one particular route to it.
 		var lastErr error
 		for attempt := 0; attempt < 3; attempt++ {
-			// Read WITHOUT the t.Fatalf helper: this runs on whatever goroutine reached
-			// the adoption — a sweep loop, not the test's — so a failure here must be
-			// reported, never used to abort a goroutine that does not own the test.
-			var cur uint64
-			if smsg, lerr := peer.asm.jsa.loadSessionMsg(peer.asm.domainTk, idHash); lerr == nil && smsg != nil {
-				cur = smsg.Sequence
-			} else if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-				lastErr = lerr
-				continue
-			}
-			ps := &mqttPersistedSession{
-				Origin: "rival-frontend", ID: clientID, Gen: mqttNewSessGen(),
-				WID: mqttNewRecordWID(), PWID: mqttNewRecordWID(),
-			}
-			if _, err := mqttStoreSessionRecordCAS(&peer.asm.jsa, peer.asm.domainTk, ps, idHash, cur); err == nil {
-				rivalWID = ps.WID
+			wid, err := testDisplaceMarker(&peer.asm.jsa, peer.asm.domainTk, clientID, peer.asm.sessStreamEpoch)
+			if err == nil {
+				rivalWID = wid
 				return
-			} else {
-				lastErr = err
 			}
+			lastErr = err
 		}
 		// Deliberately NOT a test failure. The hook is global and a background sweep can
 		// reach it for this client ID from an environment whose server is already gone —
@@ -478,19 +466,32 @@ func testStageClaimedMarker(t *testing.T, env *testTeardownEnv, clientID string)
 	if ps == nil {
 		t.Fatal("the provisioned session must have a record to mark")
 	}
-	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
-	ps.Teardown = &mqttSessTeardown{
-		Origin:    "test-abandoned-owner",
-		Nonce:     nuid.Next(),
-		StartedAt: time.Now().Unix(),
-	}
 	// Overdue, so the record-driven expiry path admits it too. The teardown branch runs
 	// ahead of any deletion, so this only decides whether that path looks at the record
-	// at all.
-	ps.ExpiryInterval, ps.DisconnectedAt = 1, time.Now().Unix()-3600
-	markerSeq, err := mqttStoreSessionRecordCAS(&env.asm.jsa, env.asm.domainTk, ps, sess.idHash, seq)
-	if err != nil {
-		t.Fatalf("staging the teardown marker: %v", err)
+	// at all. Written into the marker itself, so no unmarked overdue record ever stands.
+	overdue := func(m *mqttPersistedSession) {
+		m.ExpiryInterval, m.DisconnectedAt = 1, time.Now().Unix()-3600
+	}
+	_ = seq
+	var claimErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		prev, prevSeq, err := env.asm.jsa.requireAuthority(clientID, env.asm.sessStreamEpoch)
+		if err != nil || prev == nil {
+			t.Fatalf("staging the teardown claim: no authority (%v)", err)
+		}
+		// Re-read and re-composed on a lost CAS: a member the closing reads may move under
+		// another writer between the reads and the commit.
+		if claimErr = testCommitTeardownClaimWith(env.asm, clientID, prev, prevSeq, overdue); claimErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if claimErr != nil {
+		t.Fatalf("staging the teardown claim: %v", claimErr)
+	}
+	ps, markerSeq := testLoadSessRecord(t, env, sess.idHash)
+	if ps == nil || ps.Teardown == nil {
+		t.Fatalf("staging the teardown claim left no marker: %+v", ps)
 	}
 	return ps, markerSeq
 }
@@ -827,9 +828,11 @@ func TestRejectionMarkerRepresentsBaseZero(t *testing.T) {
 func TestWonClaimDeletesEvenWhenItsReleaseIsSuperseded(t *testing.T) {
 	a, _ := testNewTeardownEnv(t)
 	sess := testProvisionSession(t, a, "b5order")
-	_, _, pubRelDur := mqttPubRelNames(sess.idHash, sess.gen)
-	if !testConsumerExists(t, a, mqttOutStreamName, pubRelDur) {
-		t.Fatal("the fixture needs the retiring generation's PUBREL consumer to exist")
+	// The target the teardown deletes itself: the inbound QoS 2 hold. (The PUBREL consumer of a
+	// discarded generation belongs to its recovery executor, issue #107 7d.)
+	holdSubj := mqttQoS2HoldSubject(sess.idHash, sess.gen, 1)
+	if _, err := a.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, holdSubj); err != nil {
+		t.Fatalf("the fixture needs the retiring generation's QoS2 hold to exist: %v", err)
 	}
 
 	// A rival replaces the marker once the claim is won, so the exact-sequence release
@@ -858,11 +861,11 @@ func TestWonClaimDeletesEvenWhenItsReleaseIsSuperseded(t *testing.T) {
 	if !errors.Is(err, errMQTTClearSuperseded) {
 		t.Fatalf("the release must report superseded, got %v", err)
 	}
-	if testConsumerExists(t, a, mqttOutStreamName, pubRelDur) {
+	if _, err := a.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, holdSubj); err == nil {
 		t.Fatal("a WON claim deletes its targets before it learns whether it still owns the " +
-			"claim: finding the consumer intact means the release was moved ahead of the " +
+			"claim: finding the hold intact means the release was moved ahead of the " +
 			"deletions (the rejected B5 reordering). That ordering loses the target list to " +
-			"a crash, and PUBREL durables have no orphan reaper")
+			"a crash")
 	}
 }
 
@@ -961,9 +964,17 @@ func TestSessSupersededAdoptionReEntersTheRestore(t *testing.T) {
 	marker, _ := testStageClaimedMarker(t, a, cid)
 	rival, restore := testSupersedeInAdoptionWindow(t, a, cid)
 	defer restore()
+	// The CONNECT DISPLACES a claimed marker whose release facts all stand (sess_teardown_displace.go);
+	// it adopts only when one cannot be read. This CONNECT is made to adopt, the arm the rival
+	// lands in.
+	decline := func(clientID string) bool { return clientID == cid }
+	mqttTestMarkedRecordDeclineDisplaceV.Store(&decline)
+	restoreLoad := func() { mqttTestMarkedRecordDeclineDisplaceV.Store(nil) }
+	defer restoreLoad()
 
 	sess, existed, err := a.asm.createOrRestoreSession(cid, a.s.getOpts())
 	restore()
+	restoreLoad()
 	if err != nil {
 		t.Fatalf("the CONNECT restore must converge, not fail: %v", err)
 	}

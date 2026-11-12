@@ -78,7 +78,7 @@ func mqttMaterializeTransition(auth *mqttOutboundAuthority, authSeq uint64, txn,
 	kind mqttTransitionKind, members []mqttTransitionMember) *mqttAuthorityTransition {
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: auth.ID, Epoch: auth.Epoch, Txn: txn, Op: op,
+			ID: auth.ID, Epoch: auth.Epoch, Txn: txn, Scope: auth.Gen, Op: op,
 			Kind: kind, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -86,7 +86,7 @@ func mqttMaterializeTransition(auth *mqttOutboundAuthority, authSeq uint64, txn,
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: mqttAuthorityServing, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: members,
 	}
@@ -286,7 +286,7 @@ func mqttCloseManifestTransition(prev *mqttOutboundAuthority, prevSeq uint64, tx
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: m.Gen, Op: op,
 			Kind: mqttTransitionDisposeResource, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -294,7 +294,7 @@ func mqttCloseManifestTransition(prev *mqttOutboundAuthority, prevSeq uint64, tx
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 		Extra: []mqttTransitionMember{{subj: mqttManifestSubject(getHash(prev.ID), m.Gen, m.Payload), expect: mSeq, body: body}},
 	}, nil

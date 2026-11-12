@@ -151,9 +151,9 @@ func (c *client) mqttDiscardArmedWill() {
 //
 // It used to discard the owed-delayed Will too, on the reasoning that a reconnect
 // within the Will Delay cancels it. That is the rule, but this was the wrong place
-// to apply it: the reconnect's acceptance is dated by the acceptance fact this
-// CONNECT is about to write, and only the fact scan can compare it with the deadline
-// (mqttAcceptFactQualifies). Discarding without a date destroyed a Will whose delay
+// to apply it: the reconnect's acceptance is dated by the acceptance this CONNECT is
+// about to commit, which lowers the anchor's minAt, and only the anchor decision can
+// compare it with the deadline (decideFromAnchor, issue #133). Discarding without a date destroyed a Will whose delay
 // had already run out, and a Will whose replacing CONNECT was then refused.
 //
 // The takeover tail is the OWNER of that consumption, not the displaced teardown: the
@@ -264,6 +264,9 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	// this runs twice for a graceful DISCONNECT (see mqttHandleClosedClient), and
 	// only the first invocation may act on it.
 	will, disposition, closeObservedAt := c.mqttTakeWillLocked()
+	// THE WILL'S ANCHOR is consumed with the Will (issue #133): this tail holds the disposition,
+	// so it owes the anchor (a delayed Will) or removes it (anything else).
+	anchor, anchorAsm, anchorCID := c.mqttTakeWillAnchorLocked()
 	expiry := uint32(0)
 	switch {
 	case sessionExpiry != nil:
@@ -273,6 +276,7 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 	}
 	if will == nil {
 		c.mu.Unlock()
+		anchorAsm.dropWillAnchor(anchorCID, anchor)
 		return
 	}
 	// MQTT 5.0 Will Delay Interval: defer publication when a delay is set and the
@@ -346,39 +350,44 @@ func (s *Server) mqttHandleWill(c *client, sessionExpiry *uint32, sessGen string
 		// cancels it. See will_outbox.go. Spec5 [3.1.3.2.2], [MQTT-3.1.2-8].
 		if asm != nil && willAllowed {
 			// The outcome is classified PER EXIT, not by the error value: see
-			// mqttWillEnqueueOutcome. Exactly one outcome is retainable -- a refusal
-			// that happened before any enqueue effect -- and an unestablished or
-			// mismatched destination account is that outcome. It used to be a
-			// straight loss here, which contradicted the rule the rest of this code
-			// states: an UNKNOWN destination defers a Will, it never destroys one.
-			// The identity is allocated by the enqueue and returned through this
-			// struct, so a retention below carries exactly the one the refused
-			// attempt used rather than a second one minted here.
+			// mqttWillEnqueueOutcome and mqttAnchorActionFor. A refusal that happened
+			// before any enqueue effect -- an unestablished or mismatched destination
+			// account -- is retained definitely unsent, since an UNKNOWN destination
+			// defers a Will and never destroys one; a create that may have landed
+			// with no fail-safe publication is retained possibly landed.
+			// THE OUTBOX IDENTITY IS THE ANCHOR'S (issue #133), so a retention carries
+			// exactly the one every attempt used, and the anchor is owed before the record
+			// exists, so a claimant that finds the record also finds the anchor owed. A
+			// connection holding no anchor enqueues none, and the enqueue refuses it.
 			identity := &mqttDelayedWillIdentity{}
+			if anchor != nil {
+				identity.WillID = anchor.willID()
+				if aerr := asm.runAnchorTransition(clientID, *anchor, mqttAnchorOwe, fireAt, nil); aerr != nil {
+					s.Warnf("MQTT: the Will anchor of client %q could not be owed (the claimant decides from it armed): %v", clientID, aerr)
+				}
+			}
 			outcome, eerr := asm.enqueueDelayedWill(s, clientID, sessGen, will, props, user,
 				fireAt, originSessionSeq, originSessEpoch, willAccount, identity)
-			if outcome.retainable() {
-				// Retained for RE-ENQUEUE, carrying the original FireAt so the delay
-				// stays the one the client configured and the acceptance facts still
-				// arbitrate it. Not the immediate queue, which publishes on recovery.
-				if !s.retainDelayedWillEnqueue(&mqttOwedDelayedWill{
-					as: asm, identity: *identity,
-					clientID: clientID, sessGen: sessGen, will: will, props: props, user: user,
-					fireAt: fireAt, account: willAccount,
-					originSessSeq: originSessionSeq, originSessEpoch: originSessEpoch,
-				}) {
-					s.Errorf("MQTT: the delayed Will of client %q on %q is LOST: its destination was unavailable (%v) and it could not be retained",
-						clientID, will.topic, eerr)
-				}
-			} else if eerr != nil {
-				// Terminal. Every remaining outcome either published the Will
-				// without its delay or abandoned it, and none may be retried.
+			// Retained for RE-ENQUEUE (or resolution) carrying the original FireAt, so
+			// the delay stays the one the client configured and the anchor still
+			// arbitrates it. Not the immediate queue, which publishes on recovery.
+			if !s.settleDelayedWillEnqueue(&mqttOwedDelayedWill{
+				as: asm, identity: *identity,
+				clientID: clientID, sessGen: sessGen, will: will, props: props, user: user,
+				fireAt: fireAt, account: willAccount,
+				originSessSeq: originSessionSeq, originSessEpoch: originSessEpoch,
+			}, anchor, outcome, eerr) && eerr != nil {
 				s.Errorf("MQTT: the delayed Will of client %q on %q was not durably enqueued: %v",
 					clientID, will.topic, eerr)
 			}
+		} else {
+			// Consumed and not enqueued (unauthorized, or no account manager): never published.
+			anchorAsm.dropWillAnchor(anchorCID, anchor)
 		}
 		return
 	}
+	// AN IMMEDIATE WILL is never suppressed, so its anchor has nothing left to protect.
+	anchorAsm.dropWillAnchor(anchorCID, anchor)
 	pp := c.mqtt.pp
 	pp.topic = will.topic
 	pp.subject = will.subject

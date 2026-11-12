@@ -1236,6 +1236,7 @@ func TestMQTTRejectedRecordPersistDropIsScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
+	testAcceptRigConnection(t, e.asm, other, e.s.createInternalAccountClient())
 	if err := testSessSave(t, other); err != nil {
 		t.Fatalf("persist the second session record: %v", err)
 	}

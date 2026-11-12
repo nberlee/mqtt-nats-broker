@@ -183,7 +183,7 @@ func TestJSARequestObserverDepthControls(t *testing.T) {
 	jsa := &e.asm.jsa
 	o := testObserveJSA(t, jsa)
 
-	streams := []string{mqttSessStreamName, mqttWillQStreamName, mqttTeardownStreamName}
+	streams := []string{mqttSessStreamName, mqttWillQStreamName, mqttOutStreamName}
 	durs := []string{"observer-control-a", "observer-control-b", "observer-control-c"}
 	isStreamInfo := func(s string) bool {
 		for _, st := range streams {

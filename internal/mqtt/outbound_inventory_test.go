@@ -69,6 +69,17 @@ func testSubmitInventory(t *testing.T, e *testOutboundEnv, txn string,
 	return testSubmitInventoryAs(t, e, mqttTransitionDisposeResource, txn, members...)
 }
 
+// testMembersScope is the generation the members belong to, the first one attributed to any, as a
+// production composer scopes a batch naming an earlier generation's records; gen when none is.
+func testMembersScope(gen string, members []mqttTransitionMember) string {
+	for _, m := range members {
+		if mg, ok, _ := mqttMemberGeneration(m.subj); ok {
+			return mg
+		}
+	}
+	return gen
+}
+
 // testSubmitInventoryAs is the same, under a named transition kind.
 //
 // The kind matters because each one declares which member classes it may carry, and those rules
@@ -82,9 +93,10 @@ func testSubmitInventoryAs(t *testing.T, e *testOutboundEnv, kind mqttTransition
 	if al.status != mqttOutboundValid {
 		t.Fatalf("the authority does not load back: status %v", al.status)
 	}
+	scope := testMembersScope(al.rec.Gen, members)
 	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: scope, Op: "op-" + txn,
 			Kind: kind, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -92,6 +104,7 @@ func testSubmitInventoryAs(t *testing.T, e *testOutboundEnv, kind mqttTransition
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
+			Life: mqttLifeOf(al.rec),
 		},
 		Extra: members,
 	})
@@ -115,7 +128,7 @@ func testSubmitInventoryHolding(t *testing.T, e *testOutboundEnv, txn string,
 	}
 	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: testMembersScope(al.rec.Gen, members), Op: "op-" + txn,
 			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -123,6 +136,7 @@ func testSubmitInventoryHolding(t *testing.T, e *testOutboundEnv, txn string,
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
+			Life: mqttLifeOf(al.rec),
 		},
 		Extra: members,
 	})
@@ -559,7 +573,7 @@ func TestSealingForbidsAllocationAndIsNotRevocable(t *testing.T) {
 		SweepStart: 1, Resume: 1, Bound: 1,
 	}
 	if err := testClosingBatch(t, e, al.rec, al.seq, "txn-seal",
-		testClosureRecord(e, "txn-seal", false, shard, 1),
+		testClosureRecord(e, "txn-seal", shard, 1),
 		testLedgerMember(t, e, seq, testInventoryLedger(e, mqttGenLedgerSealed, 1)),
 		testMember(t, mqttShardSubject(shard), 0, hdr),
 		testMember(t, mqttRootSubject(root.Shard, root.Ord), 0, root),
@@ -1140,8 +1154,10 @@ func TestCoverageMustNameTheGenerationItCovers(t *testing.T) {
 		},
 	}, testSlotMembersFor(t, &e.asm.jsa, al.rec, al.seq, x)...)...); err == nil {
 		t.Fatalf("an obligation was covered by a duty entry filed under another generation")
-	} else if !strings.Contains(err.Error(), "no duty entry naming it THERE") {
-		t.Fatalf("the refusal did not come from the coverage rule: %v", err)
+	} else if !strings.Contains(err.Error(), "is scoped to generation") {
+		// A batch is ONE generation's (outcome_scope.go): the other generation's ledger and duty
+		// are refused by the outcome scope before the coverage rule is consulted.
+		t.Fatalf("the refusal did not come from the outcome scope: %v", err)
 	}
 }
 
@@ -1207,7 +1223,7 @@ func TestAClosedGenerationTakesNoFurtherOrdinal(t *testing.T) {
 	al, _ := e.bootstrap(t, "txn-1")
 
 	// CLOSE IT CARRYING NOTHING, so the generation ends with no ledger at all.
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, "txn-close",
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch,
 		al.Gen, al.Tenure, al.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}

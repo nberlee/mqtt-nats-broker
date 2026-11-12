@@ -267,6 +267,19 @@ func (l *mqttCustodyLedger) attemptNeverLanded(gen, nonce string, h *mqttTransit
 	return l.tryRemoveAdmission(nonce)
 }
 
+// attemptRetired records that the attempt's scope retired (mqttTransitionRetired): it drops that
+// attempt and may end the reservation, and it is never a release that re-offers anything. The
+// generation guard makes it a no-op once the ledger serves a successor.
+func (l *mqttCustodyLedger) attemptRetired(gen, nonce string, h *mqttTransitionHandle) {
+	if !l.forGen(gen) {
+		return
+	}
+	if adm := l.heldAdmissions[nonce]; adm != nil {
+		l.dropAttempt(adm, h)
+		l.tryRemoveAdmission(nonce)
+	}
+}
+
 // finishAdmission marks the admission's ladder returned and removes the reservation when
 // nothing it submitted is still unsettled. Deferred on every return of admitInflightPublish.
 func (l *mqttCustodyLedger) finishAdmission(gen, nonce string) bool {

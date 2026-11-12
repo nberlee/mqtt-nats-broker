@@ -679,11 +679,10 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// caller member arrives ALREADY BUILT by the deciding writer, whose lineage disposition
 	// is the one that applies. One call site, in commitAuthorityTransition.
 	{fn: "commitAuthorityTransition", sink: "newAtomicBatchRequest"}: 1,
-
-	// issue #107's metadata commit. Reaches the batch primitive on $MQTT_sess — the session
-	// record, the acceptance fact and the handoff receipt — and writes NO register body at
-	// all: it does not touch the $MQTT.inflight. space. One call site, in commitMetadataAttempt.
-	{fn: "commitMetadataAttempt", sink: "newAtomicBatchRequest"}: 1,
+	// The fenced create beside the authority rewritten as read: an abort's ABORTED outcome, or a
+	// generation's evidence record (completion, readiness, close certificate). NO register body.
+	// One call site, in createBesideAuthority.
+	{fn: "createBesideAuthority", sink: "newAtomicBatchRequest"}: 1,
 
 	// issue #107's shared-group lifecycle writer. Reaches the batch primitive for a two-member
 	// join or release, and writes NO register body: its members are the group record and the
@@ -742,7 +741,6 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// commitMetadataAttempt is — the name-based bypass guard cannot tell one atomic batch from
 	// another, so naming it keeps that limitation visible (issue #107 Gap 1). One call site, in
 	// storeTeardownClaimBatch.
-	{fn: "storeTeardownClaimBatch", sink: "newAtomicBatchRequest"}: 1,
 }
 
 var mqttLineageWriterManifest = map[string]string{
@@ -753,11 +751,13 @@ var mqttLineageWriterManifest = map[string]string{
 	// register body itself, the count above would change and the census would demand a
 	// disposition for it.
 	"commitAuthorityTransition": "carries: no register body of its own, so the caller's disposition applies",
+	// The fenced create writes an outcome or a generation evidence record and the authority it is
+	// fenced by, never a register.
+	"createBesideAuthority": "carries: no register body at all, only the created record and the authority as read",
 
 	// issue #107's metadata commit: NOT A REGISTER WRITER. It commits on $MQTT_sess and has no
 	// register lineage to decide. The entry exists so the census sees it rather than a
 	// future reader assuming an unlisted batch caller is unreachable.
-	"commitMetadataAttempt": "none: writes on $MQTT_sess and carries no register body",
 
 	// issue #107's shared-group lifecycle writer: NOT A REGISTER WRITER. Its atomic batch carries
 	// the group record and the acquisition ledger, neither of which is an in-flight register,

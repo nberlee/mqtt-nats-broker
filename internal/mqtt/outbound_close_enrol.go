@@ -37,16 +37,14 @@ import (
 // are released by the closing from the generation's own acquisition ledger in the $MQTT.shared. space
 // (shared_lifecycle_ops.go, closeSharedGeneration), before its record goes.
 //
-// The AFFINE consumer is enrolled ONLY when the closure DISCARDS. A closure that preserves the
-// session's obligations leaves its affine consumer to the incarnation that continues — the affine
-// generation outlives incarnations, which is exactly why no session-generation fact could ever
-// authorize deleting one (issue #40 course E). `close-admit` cannot carry a discard at all, so a
-// non-discarding closed generation is an ordinary population rather than an edge case, and its
-// affine consumer stays the TEARDOWN's to delete synchronously, as it is today.
+// The AFFINE consumer is enrolled by the closure, and every closure DISCARDS (issue #133): a
+// generation becomes noncurrent only by being discarded. The affine generation outlives
+// incarnations, which is exactly why no session-generation fact could ever authorize deleting one
+// (issue #40 course E); the discarding closure that enrols it is that authorization.
 //
-// Ownership is therefore per TARGET and the selector is the closure's own immutable `Discard`
-// member: exactly one mechanism owns each durable, and which one is a durable fact rather than a
-// property of whichever code path happens to run.
+// Ownership is therefore per TARGET and the selector is the closure itself: exactly one
+// mechanism owns each durable, and which one is a durable fact rather than a property of
+// whichever code path happens to run.
 //
 // # The affine resource carries the PUBREL durable as a FIELD
 //
@@ -85,14 +83,14 @@ type mqttClosingEnrolment struct {
 // mqttComposeClosingEnrolment builds every member a closing batch carries beside its closure.
 //
 // gen is the generation being CLOSED, which is not always the transition's own: a discarding
-// finalization installs its successor while closing its predecessor. discard is that closure's
-// disposition, and it decides whether the affine consumer is enrolled at all.
+// finalization installs its successor while closing its predecessor. Every closure discards
+// (issue #133), so a named affine target is always enrolled.
 //
 // The ledger member SEALS as it allocates, in the one act, because that is what makes the
 // enrolment's completeness establishable at all: after the seal no further ordinal can be taken,
 // so the set of duties naming this generation's durables is fixed by the same batch that wrote
 // them.
-func mqttComposeClosingEnrolment(id, epoch, gen string, discard bool, t mqttClosingTargets,
+func mqttComposeClosingEnrolment(id, epoch, gen string, t mqttClosingTargets,
 	cur *mqttGenLedger, curSeq uint64, hdr *mqttDirShard, hdrSeq uint64) (*mqttClosingEnrolment, error) {
 
 	seal, serr := mqttSealGenLedgerMember(id, epoch, gen, cur, curSeq)
@@ -109,7 +107,7 @@ func mqttComposeClosingEnrolment(id, epoch, gen string, discard bool, t mqttClos
 		return nil, lerr
 	}
 
-	if discard && t.AffineDurable != _EMPTY_ {
+	if t.AffineDurable != _EMPTY_ {
 		inc := mqttNewInflightNonce()
 		sealedHi++
 		r := &mqttOutboundResource{
@@ -211,234 +209,20 @@ func mqttSealedHiOf(members []mqttTransitionMember, id, epoch, gen string) (uint
 // Closing a generation, and settling an ambiguous attempt
 // ---------------------------------------------------------------------------
 
-// mqttCloseEpisodeAttempts bounds ONE closing episode.
-//
-// A bound on the EPISODE and not on the client: exhausting it is an error the caller reports, and
-// a later caller may enter a fresh episode. Unrelated traffic in one directory shard must never
-// become a permanent refusal for a client that happens to hash there.
-const mqttCloseEpisodeAttempts = 4
-
-// opCloseTeardownGeneration commits the AUTHORIZED discarding closure of one generation, on
-// the authority of its durable teardown receipt (issue #107, row 8, Gap 1).
-//
-// It is opCloseGeneration's discarding sibling, and the difference is where the
-// discard's authority comes from. That operation is only ever composed non-discarding by its
-// callers; this one LOADS the receipt written atomically with the teardown marker, validates
-// it against the standing ownership, and derives the retirement AND the closing targets from
-// it. The receipt is what a close-admission lacks — ending a generation is not authority to
-// abandon its obligations — so the boundary permits this kind's discard only because the
-// operation put an authorizing retirement on the transition for it to bind the affine
-// enrolment against.
-//
-// The standing ownership is validated against the receipt, never reloaded-and-retargeted: a
-// resume preserves the generation and changes the tenure, so a receipt captured under one
-// tenure must not close a session another tenure is serving. Once the teardown marker is
-// claimed no resume can land — a CONNECT that reads a marker adopts it — but the check is the
-// same one every closure makes, and it is the fence against a moved ownership.
-func (jsa *mqttJSA) opCloseTeardownGeneration(id, epoch, domainTk, txn, gen string) (mqttOpOutcome, error) {
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no authority, so there is no generation to tear down", id)
-	}
-	rcpt, _, rst := jsa.loadTeardownReceipt(domainTk, getHash(id), gen)
-	switch rst {
+// closeTeardownGeneration is an adopter's close of a marked generation: the claim batch that
+// marked the record wrote the closure in the same act (teardown_claim.go), so the closure
+// stands for every marker an adopter can find. A marker whose generation has no closure is
+// Inconsistent, never closed here: closing it would author a discard no claim decided.
+func (jsa *mqttJSA) closeTeardownGeneration(id, epoch, gen string) error {
+	_, _, status := jsa.loadGenClosure(id, epoch, gen)
+	switch status {
 	case mqttOutboundValid:
-	case mqttOutboundAbsent:
-		// A SERVING authority with no receipt is not authority to discard. An absence never
-		// authorizes abandoning obligations, and inventing a discard from "no receipt" is the
-		// exact shape this protocol exists to forbid.
-		return mqttOpOutcome{}, fmt.Errorf("discarding %q for %q: no durable teardown receipt authorizes it", gen, id)
-	default:
-		return mqttOpOutcome{}, fmt.Errorf("discarding %q for %q: its teardown receipt reads %v, which licenses nothing", gen, id, rst)
-	}
-	return jsa.opCloseTeardownGenerationWith(id, epoch, txn, gen, prev, prevSeq, &rcpt.Retire)
-}
-
-// opCloseTeardownGenerationWith composes and commits the discarding closure from an ALREADY
-// LOADED authority and an ALREADY CONFIRMED receipt authorization. It is what the owner's
-// first-attempt fast path calls: the destroy path loaded the SERVING authority and committed
-// the receipt atomically with the marker, so re-reading either is redundant on the first try.
-// The authority is still validated against the receipt here, and the boundary re-validates the
-// stored predecessor and CAS's at prevSeq — so a peer that moved the authority since it was
-// loaded simply fails this attempt's CAS, and the caller falls back to the full re-reading
-// episode. Skipping the pre-read never skips the arbitration.
-func (jsa *mqttJSA) opCloseTeardownGenerationWith(id, epoch, txn, gen string,
-	prev *mqttOutboundAuthority, prevSeq uint64, ret *mqttRetirementRequest) (mqttOpOutcome, error) {
-
-	if prev.State != mqttAuthorityServing {
-		return mqttOpOutcome{}, fmt.Errorf("discarding %q for %q: the standing authority is in state %d, "+
-			"and a teardown discards a SERVING session; a reservation or preparation is resolved by recovery, not here",
-			gen, id, prev.State)
-	}
-	if prev.Gen != gen {
-		return mqttOpOutcome{}, fmt.Errorf("discarding %q for %q: the standing authority serves %q, "+
-			"so this teardown belongs to a generation that has moved on", gen, id, prev.Gen)
-	}
-	if ret.Gen != gen || ret.Tenure != prev.Tenure || ret.OwnerTxn != prev.OwnerTxn {
-		return mqttOpOutcome{}, fmt.Errorf("discarding %q/%q/%q for %q: the teardown receipt names %q/%q/%q, "+
-			"so it authorizes an ownership that is not the one standing", gen, prev.Tenure, prev.OwnerTxn, id,
-			ret.Gen, ret.Tenure, ret.OwnerTxn)
-	}
-	if !ret.Discard {
-		return mqttOpOutcome{}, fmt.Errorf("discarding %q for %q: its teardown receipt does not discard", gen, id)
-	}
-
-	targets := mqttClosingTargets{
-		AffineDurable: ret.AffineDurable,
-		AffineGen:     ret.AffineGen,
-		PubRelDurable: ret.PubRelDurable,
-	}
-	cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
-	if lerr != nil {
-		return mqttOpOutcome{}, lerr
-	}
-	hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
-	if herr != nil {
-		return mqttOpOutcome{}, herr
-	}
-	enr, cerr := mqttComposeClosingEnrolment(id, epoch, gen, true, targets, cur, curSeq, hdr, hdrSeq)
-	if cerr != nil {
-		return mqttOpOutcome{}, cerr
-	}
-
-	// The retirement is threaded onto the transition, not a member: the boundary reads it
-	// through mqttStandingRetirement to bind the affine enrolment to the target the receipt
-	// selected, exactly as a finalization's retirement binds its own. It is transient — the
-	// permanent record is the discarding closure and the enrolled resource.
-	retCopy := *ret
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCloseTeardown, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Txn: txn, Discard: true,
-			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
-		},
-		Retire: &retCopy,
-		Extra:  enr.Members,
-	})
-}
-
-// closeTeardownGeneration drives one bounded discarding-teardown closing episode, settling
-// ambiguity rather than re-attempting blind.
-//
-// A standing closure of this generation is this teardown's success only when it actually
-// DISCARDS (a Codex correction): "any closure of this generation means success" is too weak
-// here — a non-discarding closure would report a teardown that abandoned obligations as done
-// while the obligations still stood — so a non-discarding closure of the target generation is a
-// contradiction this refuses rather than adopts.
-//
-// # Why a lost acknowledgement is not a failure
-//
-// The batch may have committed. Re-composing on that assumption would take a second ordinal, or
-// be refused by the create-only closure member and reported as a failure of a close that in fact
-// succeeded. So an unresolved send is CLASSIFIED first:
-//
-//	LANDED / SUPERSEDED -> the closure, the enrolment and the root are permanent. The episode is
-//	                       over. SUPERSEDED means a later authority revision stands, which is a
-//	                       different fact from "never landed" and is never a reason to repeat.
-//	NEVER LANDED        -> a durable ABORTED outcome stands for this exact attempt, so nothing of
-//	                       it can ever commit. Re-compose under a NEW identity, against freshly
-//	                       read header, authority and ledger.
-//	UNRESOLVED          -> nothing is known. abortTransition contends for the attempt's own
-//	                       outcome subject with the batch's own member; whoever wins decides it.
-//	                       The abort's FAILURE decides nothing either, so the loop re-reads.
-//
-// # And nothing durable has to remember the attempt
-//
-// A broker that dies mid-episode leaves no orphaned obligation to rediscover: the CLOSURE is a
-// create-only per-generation record, so a later actor reads the state and either finds the
-// generation closed — whoever closed it — or closes it under its own identity. A dangling batch
-// landing afterwards is refused by that same create-only member or by the header CAS it still
-// expects. The frozen handle is an in-process optimization that saves a re-read, never the
-// mechanism.
-func (jsa *mqttJSA) closeTeardownGeneration(id, epoch, domainTk, gen string) error {
-	var lastErr error
-	for attempt := 0; attempt < mqttCloseEpisodeAttempts; attempt++ {
-		if closed, _, status := jsa.loadGenClosure(id, epoch, gen); status == mqttOutboundValid {
-			if closed.Gen == gen {
-				if !closed.Discard {
-					return fmt.Errorf("tearing down generation %q: a NON-discarding closure already "+
-						"stands for it, so this discard did not run and cannot be reported as done", gen)
-				}
-				return nil
-			}
-		} else if status != mqttOutboundAbsent {
-			lastErr = fmt.Errorf("the closure of generation %q reads %v, which licenses nothing", gen, status)
-			continue
-		}
-
-		txn := mqttNewInflightNonce()
-		out, cerr := jsa.opCloseTeardownGeneration(id, epoch, domainTk, txn, gen)
-		if cerr == nil {
-			return nil
-		}
-		lastErr = cerr
-		if out.Handle == nil {
-			continue
-		}
-		if done, serr := jsa.settleCloseAttempt(gen, out.Handle, cerr); serr != nil {
-			return fmt.Errorf("tearing down generation %q: %w", gen, serr)
-		} else if done {
-			return nil
-		}
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("tearing down generation %q did not resolve within one episode", gen)
-	}
-	return fmt.Errorf("tearing down generation %q: %w", gen, lastErr)
-}
-
-// closeTeardownGenerationFast is the OWNER's first-attempt fast path (consult 9).
-//
-// The owner's destroy already loaded the SERVING authority and committed the receipt
-// atomically with the marker, so the full episode's pre-read of the closure, the
-// re-load of the authority and the re-load of the receipt are all redundant on the first
-// try. This carries the exact authority (with its sequence) and the confirmed receipt
-// authorization straight into composition, cutting the close from ~6 JetStream round trips
-// to ~3 on the happy path — which is what a clean disconnect pays, and what a tight-timed
-// concurrent delivery cannot afford to wait behind.
-//
-// Safety is unchanged, because the ARBITRATION is unchanged: the boundary still validates
-// the stored predecessor and the batch still CAS's the authority at prevSeq. A peer that
-// moved the authority since destroy loaded it makes this attempt fail its CAS; the attempt
-// is then resolved (never recomposed blind on a lost ack), and ANY non-success falls back to
-// the full re-reading episode, which reads the durable result and either finds the generation
-// already discarded (success) or refuses a moved ownership. The cached inputs are used for
-// exactly one attempt and never reused.
-func (jsa *mqttJSA) closeTeardownGenerationFast(id, epoch, domainTk, gen string,
-	prev *mqttOutboundAuthority, prevSeq uint64, ret *mqttRetirementRequest) error {
-
-	txn := mqttNewInflightNonce()
-	out, cerr := jsa.opCloseTeardownGenerationWith(id, epoch, txn, gen, prev, prevSeq, ret)
-	if cerr == nil {
 		return nil
+	case mqttOutboundAbsent:
+		return fmt.Errorf("tearing down generation %q: its marker stands with no discarding closure, which no claim writes", gen)
+	default:
+		return fmt.Errorf("tearing down generation %q: its closure reads %v, which licenses nothing", gen, status)
 	}
-	// A lost acknowledgement is resolved before anything is recomposed: the batch may have
-	// committed. Landed or superseded is done; never-landed hands over to the full episode;
-	// anything else is settled with an abort so two attempts can never both be in flight — and
-	// an attempt the abort could not settle STOPS here rather than letting the episode compose
-	// a second close beside it (issue #107 8b, the close-optimization audit).
-	if out.Handle != nil {
-		if done, serr := jsa.settleCloseAttempt(gen, out.Handle, cerr); serr != nil {
-			return fmt.Errorf("tearing down generation %q: %w", gen, serr)
-		} else if done {
-			return nil
-		}
-	}
-	// The cached authority moved or this attempt was aborted: re-read authority, receipt and
-	// closure and drive to a durable result. Never reuse the stale cached inputs beyond here.
-	return jsa.closeTeardownGeneration(id, epoch, domainTk, gen)
 }
 
 // errMQTTClosingUnlicensed: a teardown reached its shared closing with no evidence that the
@@ -462,19 +246,16 @@ var mqttTestClosingFenceHookV atomic.Pointer[func(gen string)]
 //     was written (this driver, or the recovery executor under a discarding closure), so the
 //     seal is that licence made durable — and a closing that crashed after sealing a late join
 //     must be finishable from it;
-//  2. a DISCARDING closure of this generation stands: the obligations are abandoned by an
-//     authorized retirement — seal, release the SEALED set, T4;
-//  3. otherwise admission must be positively fenced — a closure of this generation stands
-//     (read FIRST), or the generation was NEVER AUTHORIZED (mqttAuthorityNeverServed: the
-//     authority read absent, or serving or closed at another generation while no closure of
-//     this one exists — a generation the authority ever served ends with a closure, and a
-//     generation is never proposed again) — AND the ledger must read absent or list no
-//     acquisition, so no acquisition
-//     T3 could release has a dependant; a join landing after that observation can be depended on
-//     by nothing, is preserved by the seal and is released from the sealed set;
-//  4. anything else — SERVING without a receipt, a standing proposal, a preserving closure over a
-//     listed acquisition, an indeterminate read — withholds with errMQTTClosingUnlicensed before
-//     the seal.
+//  2. a closure of this generation stands: every closure discards (issue #133), so the
+//     obligations are abandoned by an authorized retirement — seal, release the SEALED set, T4;
+//  3. otherwise the generation was NEVER AUTHORIZED (mqttAuthorityNeverServed: the authority
+//     read absent, or serving or closed at another generation while no closure of this one
+//     exists — a generation the authority ever served ends with a closure, and a generation is
+//     never proposed again) AND the ledger reads absent or lists no acquisition, so no
+//     acquisition T3 could release has a dependant; a join landing after that observation can
+//     be depended on by nothing, is preserved by the seal and is released from the sealed set;
+//  4. anything else — SERVING without a receipt, a standing proposal, an indeterminate read —
+//     withholds with errMQTTClosingUnlicensed before the seal.
 //
 // The seal stays its own record: the shl.<idHash>.<gen> delayed-write exclusion is never
 // replaced by a lookup of the closure.
@@ -492,8 +273,8 @@ func (jsa *mqttJSA) closeRetiringGeneration(id, epoch, gen string, neverAuthoriz
 	empty := l.status == mqttOutboundAbsent || len(l.rec.Acqs) == 0
 	switch {
 	case sealed:
-	case closed && closure.Discard:
-	case (closed || (cst == mqttOutboundAbsent && neverAuthorized)) && empty:
+	case closed:
+	case cst == mqttOutboundAbsent && neverAuthorized && empty:
 	default:
 		return fmt.Errorf("%w: generation %q (closure %v, ledger %v with %d acquisition(s), never authorized %v)",
 			errMQTTClosingUnlicensed, gen, cst, l.status, mqttSharedLedgerLen(l), neverAuthorized)
@@ -513,39 +294,12 @@ func mqttSharedLedgerLen(l mqttSharedLedgerLoad) int {
 	return len(l.rec.Acqs)
 }
 
-// settleCloseAttempt decides a sent close attempt whose send failed, before anything is
-// recomposed (consult 9's criterion, enforced since issue #107 8b): landed or superseded is done;
-// never-landed leaves nothing in flight, so the caller may compose again; anything else is
-// aborted and resolved again, and an attempt that is STILL not decisive — the abort failed, or
-// the second resolution is unresolved — is returned as an error. Composing a fresh close then
-// would put two attempts in flight, and the CAS and the create-only closure converging on one
-// of them is not the same as the protocol never issuing the second.
-func (jsa *mqttJSA) settleCloseAttempt(gen string, h *mqttTransitionHandle, cerr error) (done bool, err error) {
-	switch v := jsa.resolveTransitionHandle(h); v {
-	case mqttTransitionLanded, mqttTransitionSuperseded:
-		return true, nil
-	case mqttTransitionNeverLanded:
-		return false, nil
-	}
-	if aerr := jsa.abortTransition(&h.attempt); aerr != nil {
-		return false, fmt.Errorf("the close of generation %q was unresolved (%v) and settling it failed: %w", gen, cerr, aerr)
-	}
-	switch v2 := jsa.resolveTransitionHandle(h); v2 {
-	case mqttTransitionLanded, mqttTransitionSuperseded:
-		return true, nil
-	case mqttTransitionNeverLanded:
-		return false, nil
-	default:
-		return false, fmt.Errorf("the close of generation %q stays unresolved after its abort (%v)", gen, cerr)
-	}
-}
-
 // mqttAuthorityNeverServed reports whether a DETERMINATE authority load proves that generation
 // gen was never authorized: the authority is absent, or it serves or is closed at ANOTHER
 // generation. Combined with the absence of a closure of gen (the closing driver reads that), the
 // generation never served: every generation the authority served ends with a permanent closure,
-// and a generation, minted fresh per proposal, is never proposed again. A standing proposal
-// (RESERVING, PREPARING) or an indeterminate read proves nothing.
+// and a generation, allocated once by its lifecycle, is never installed again. An indeterminate
+// read proves nothing.
 func mqttAuthorityNeverServed(al mqttAuthorityLoad, gen string) bool {
 	switch al.status {
 	case mqttOutboundAbsent:

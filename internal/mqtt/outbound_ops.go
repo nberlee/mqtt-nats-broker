@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync/atomic"
 )
 
 // THE OPERATION SURFACE (issue #107).
@@ -230,289 +229,6 @@ func (jsa *mqttJSA) commitOp(t *mqttAuthorityTransition) (mqttOpOutcome, error) 
 // ---------------------------------------------------------------------------
 // Ownership
 // ---------------------------------------------------------------------------
-
-// opClaimClient reserves a client's ownership, over an absent predecessor or a CLOSED one.
-//
-// The reservation serves nothing: it grants no admission right, and only a committed
-// metadata half followed by opFinalizeClaim makes it servable. The predecessor is LOADED —
-// the caller says which client it is claiming, never what stands there now.
-func (jsa *mqttJSA) opClaimClient(id, epoch, txn, gen, tenure, intentID string) (mqttOpOutcome, error) {
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	rev := uint64(1)
-	prevTxn := _EMPTY_
-	if prev != nil {
-		if prev.State != mqttAuthorityClosed {
-			return mqttOpOutcome{}, fmt.Errorf("client %q carries an authority in state %d; only an absent "+
-				"or a CLOSED one may be claimed over", id, prev.State)
-		}
-		rev, prevTxn = prev.Rev+1, prev.OwnerTxn
-	}
-	c := &mqttCreationIntent{ID: intentID, Gen: gen, Tenure: tenure}
-	if verr := mqttValidateCreationIntent(c); verr != nil {
-		return mqttOpOutcome{}, fmt.Errorf("refusing to claim %q on an unsupported proposal: %w", id, verr)
-	}
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionReserveCreation, PrevTxn: prevTxn, Rev: rev,
-			Gen: gen, Tenure: tenure, OwnerTxn: txn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: gen, Tenure: tenure,
-			State: mqttAuthorityReserving, Rev: rev, Txn: txn, OwnerTxn: txn, Creation: c,
-		},
-	})
-}
-
-// opFinalizeClaim turns a standing reservation into a serving authority.
-//
-// It installs exactly what the reservation proposed, and the caller names only WHICH proposal
-// it is answering: the generation, the tenure and the ownership all come from the record.
-// The metadata verdict is the write boundary's to check, and it refuses anything but a
-// permanent COMMITTED one.
-func (jsa *mqttJSA) opFinalizeClaim(id, epoch, txn, intentID string) (mqttOpOutcome, error) {
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil || prev.State != mqttAuthorityReserving || prev.Creation == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no standing reservation to finalize", id)
-	}
-	c := prev.Creation
-	if c.ID != intentID {
-		return mqttOpOutcome{}, fmt.Errorf("the reservation on %q carries proposal %q, not %q", id, c.ID, intentID)
-	}
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionFinalizeCreation, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: c.Gen, Tenure: c.Tenure, OwnerTxn: prev.OwnerTxn, Intent: c.ID,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: c.Gen, Tenure: c.Tenure,
-			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-	})
-}
-
-// opCloseGeneration ends ONE NAMED generation permanently.
-//
-// One operation covers both the ordinary closure of a serving generation and the abandonment
-// of a reservation whose metadata half was positively aborted, because they are one durable
-// act: the authority becomes CLOSED and a permanent closure record lands beside it. An
-// abandoned reservation is never deleted — deleting it would let the next claimant's
-// create-only write succeed against an absence — and the verdict that licenses the
-// abandonment is the boundary's to check.
-//
-// THE CALLER NAMES THE OWNERSHIP IT MEANS — generation, tenure AND the transition that owns
-// it — and this refuses if that is not the one standing. Loading the current authority says
-// what is there; it does not say which owner the request belongs to.
-//
-// The generation alone is not enough, and the case that shows it is the ordinary one: a RESUME
-// PRESERVES THE GENERATION and changes only the tenure. A closure captured under tenure A and
-// delayed until tenure B has finished resuming would otherwise match on the generation and
-// permanently close the generation B is serving.
-func (jsa *mqttJSA) opCloseGeneration(id, epoch, txn, gen, tenure, ownerTxn string) (mqttOpOutcome, error) {
-	// EVERY CLOSURE SEALS AND ROOTS (issue #107, row 6), so this composes the enrolment with an empty
-	// target set rather than being a second, barer way to close a generation. A closure with no
-	// root would be refused at the boundary — and the reason it is refused there rather than
-	// merely composed correctly here is that the rule must hold for a batch assembled by
-	// anything at all.
-
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no authority, so there is no generation to close", id)
-	}
-	if prev.Gen != gen || prev.Tenure != tenure || prev.OwnerTxn != ownerTxn {
-		return mqttOpOutcome{}, fmt.Errorf("closing %q/%q/%q for %q: the standing authority "+
-			"carries %q/%q/%q, so this request belongs to an ownership that has moved on",
-			gen, tenure, ownerTxn, id, prev.Gen, prev.Tenure, prev.OwnerTxn)
-	}
-
-	cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
-	if lerr != nil {
-		return mqttOpOutcome{}, lerr
-	}
-	hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
-	if herr != nil {
-		return mqttOpOutcome{}, herr
-	}
-	// A non-discarding closure enrols no target: the affine consumer stays the incarnation's that
-	// continues (mqttComposeClosingEnrolment), so the seal and the root are the whole enrolment.
-	enr, cerr := mqttComposeClosingEnrolment(id, epoch, gen, false, mqttClosingTargets{}, cur, curSeq, hdr, hdrSeq)
-	if cerr != nil {
-		return mqttOpOutcome{}, cerr
-	}
-
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityClosed, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Txn: txn, Discard: false,
-			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
-		},
-		Extra: enr.Members,
-	})
-}
-
-// mqttTestPrepareHandoffReadHookV runs before a handoff preparation reads the authority: the window
-// between an accept drive's input load and the preparation's own read. nil in production.
-var mqttTestPrepareHandoffReadHookV atomic.Pointer[func(id string)]
-
-// opPrepareHandoffFenced freezes admission and reserves a handoff from the serving authority, for
-// an accepting CONNECT whose fork repair read its reinstated consumers at authority sequence fence
-// (zero: no fence). The intent is the caller's; its Prev* members are filled from the standing
-// authority and the named session record, so no caller can propose a handoff from a predecessor
-// that is not there. The preparation must displace
-// EXACTLY that authority: its own read must stand at fence, and its transition CASes it. A later
-// sequence means the authority was written after those reads — a successor-tenure disposal among
-// the possibilities — and is refused with errMQTTForkFenceMoved, never refreshed (issue #107 7f).
-func (jsa *mqttJSA) opPrepareHandoffFenced(id, epoch, txn string, i *mqttHandoffIntent, fence uint64) (mqttOpOutcome, error) {
-	if h := mqttTestPrepareHandoffReadHookV.Load(); h != nil {
-		(*h)(id)
-	}
-	prev, prevSeq, err := jsa.servingAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if fence != 0 && prevSeq != fence {
-		return mqttOpOutcome{}, fmt.Errorf("preparing the handoff of %q at authority sequence %d, but fork "+
-			"repair read its reinstated consumers at %d: %w", id, prevSeq, fence, errMQTTForkFenceMoved)
-	}
-	if i == nil {
-		return mqttOpOutcome{}, fmt.Errorf("preparing a handoff for %q requires the intent it proposes", id)
-	}
-	next := *i
-	next.PrevGen, next.PrevTenure, next.PrevOwnerTxn = prev.Gen, prev.Tenure, prev.OwnerTxn
-	if next.Retire != nil {
-		next.Retire.Gen, next.Retire.Tenure = prev.Gen, prev.Tenure
-		next.Retire.OwnerTxn = prev.OwnerTxn
-	}
-	if verr := mqttValidateHandoffIntentFor(getHash(id), &next); verr != nil {
-		return mqttOpOutcome{}, fmt.Errorf("refusing to prepare an unsupported handoff for %q: %w", id, verr)
-	}
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionPrepareIntent, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityPreparing, Rev: prev.Rev + 1, Txn: txn,
-			OwnerTxn: prev.OwnerTxn, Intent: &next,
-		},
-	})
-}
-
-// opFinalizeHandoff installs the tenure a standing preparation proposed, and nothing else.
-func (jsa *mqttJSA) opFinalizeHandoff(id, epoch, txn, intentID string) (mqttOpOutcome, error) {
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil || prev.State != mqttAuthorityPreparing || prev.Intent == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no standing preparation to finalize", id)
-	}
-	i := prev.Intent
-	if i.ID != intentID {
-		return mqttOpOutcome{}, fmt.Errorf("the preparation on %q carries intent %q, not %q", id, i.ID, intentID)
-	}
-	t := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionFinalize, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: i.Gen, Tenure: i.Tenure, OwnerTxn: txn, Intent: i.ID,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: i.Gen, Tenure: i.Tenure,
-			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: txn,
-		},
-	}
-	// A handoff that DISCARDS its predecessor's generation closes it in the same batch, and
-	// the closure carries the discard: a closure is the permanent record of WHY a generation
-	// ended, and one that ended a clean start while saying it did not would tell a later
-	// reader the session was resumable. The closure is derived from the intent's own
-	// retirement request, never supplied.
-	if i.Retire != nil && i.Retire.Discard {
-		// AND IT ENROLS THE GENERATION IT CLOSES, in the same batch (issue #107, row 6). The
-		// predecessor's held durables are the intent's to name — it was written while the
-		// predecessor's record still stood, which is what makes them nameable after the accepted
-		// batch displaced that record — and the enrolment, the seal, the shard allocation and the
-		// root all commit with the closure or not at all.
-		cur, curSeq, lerr := jsa.loadGenLedger(id, epoch, i.PrevGen)
-		if lerr != nil {
-			return mqttOpOutcome{}, lerr
-		}
-		hdr, hdrSeq, herr := jsa.loadDirShardAt(mqttDirShardFor(getHash(id)))
-		if herr != nil {
-			return mqttOpOutcome{}, herr
-		}
-		enr, cerr := mqttComposeClosingEnrolment(id, epoch, i.PrevGen, true,
-			mqttClosingTargets{
-				AffineDurable: i.Retire.AffineDurable,
-				AffineGen:     i.Retire.AffineGen,
-				PubRelDurable: i.Retire.PubRelDurable,
-			}, cur, curSeq, hdr, hdrSeq)
-		if cerr != nil {
-			return mqttOpOutcome{}, cerr
-		}
-		t.Closure = &mqttGenClosure{
-			ID: id, Epoch: epoch, Gen: i.PrevGen, Txn: txn, Discard: true,
-			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
-		}
-		t.Extra = append(t.Extra, enr.Members...)
-	}
-	return jsa.commitOp(t)
-}
-
-// opCancelHandoff returns a preparing authority to serving under its ORIGINAL ownership, on
-// proof that the metadata half was positively aborted. The restored body comes from the
-// intent's own record of what it displaced.
-func (jsa *mqttJSA) opCancelHandoff(id, epoch, txn, intentID string) (mqttOpOutcome, error) {
-	prev, prevSeq, err := jsa.requireAuthority(id, epoch)
-	if err != nil {
-		return mqttOpOutcome{}, err
-	}
-	if prev == nil || prev.State != mqttAuthorityPreparing || prev.Intent == nil {
-		return mqttOpOutcome{}, fmt.Errorf("client %q carries no standing preparation to cancel", id)
-	}
-	i := prev.Intent
-	if i.ID != intentID {
-		return mqttOpOutcome{}, fmt.Errorf("the preparation on %q carries intent %q, not %q", id, i.ID, intentID)
-	}
-	return jsa.commitOp(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCancelIntent, Intent: i.ID,
-			PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
-			Gen: i.PrevGen, Tenure: i.PrevTenure, OwnerTxn: i.PrevOwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: id, Epoch: epoch, Gen: i.PrevGen, Tenure: i.PrevTenure,
-			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: i.PrevOwnerTxn,
-		},
-	})
-}
 
 // ---------------------------------------------------------------------------
 // Obligations
@@ -1299,7 +1015,7 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 	}
 	return jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: op,
+			ID: id, Epoch: epoch, Txn: txn, Scope: gen, Op: op,
 			Kind: mqttTransitionProvisionResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -1307,6 +1023,7 @@ func (jsa *mqttJSA) opProvisionResource(id, epoch, txn, op, gen, tenure, inc, na
 		Auth: &mqttOutboundAuthority{
 			ID: id, Epoch: epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: mqttAuthorityServing, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
+			Life: auth.Life,
 		},
 		Extra: members,
 	})
@@ -1342,12 +1059,6 @@ func (jsa *mqttJSA) opReleaseDependency(id, epoch, txn, op, gen, inc string,
 // and the resource is left for the recovery executor (issue #107 7c-lc's handoff to 7d).
 var errMQTTDisposalEntitlementMoved = errors.New("the disposal's entitlement no longer serves")
 
-// errMQTTDisposalEntitlementPreparing reports that the entitlement a disposal was taken under is
-// the one a handoff is PREPARING to displace (issue #107 7f). That is not yet a move: a preparation can
-// be cancelled, which restores exactly this tenure, so the decision is withheld and re-attempted
-// rather than dropped — dropping it would strand the consumer with no successor to settle it.
-var errMQTTDisposalEntitlementPreparing = errors.New("a handoff is preparing to displace the disposal's entitlement")
-
 // mqttRequestDisposalRequest is one route's decision that a logical-use consumer is ended.
 type mqttRequestDisposalRequest struct {
 	ID, Epoch string
@@ -1372,10 +1083,6 @@ func (jsa *mqttJSA) opRequestDisposal(r *mqttRequestDisposalRequest) (mqttOpOutc
 	auth, authSeq, err := jsa.requireAuthority(r.ID, r.Epoch)
 	if err != nil {
 		return mqttOpOutcome{}, err
-	}
-	if auth != nil && auth.State == mqttAuthorityPreparing &&
-		auth.Gen == r.Entitlement.Gen && auth.Tenure == r.Entitlement.Tenure {
-		return mqttOpOutcome{}, fmt.Errorf("disposing of %q/%q: %w", r.Gen, r.Inc, errMQTTDisposalEntitlementPreparing)
 	}
 	if auth == nil || auth.State != mqttAuthorityServing ||
 		auth.Gen != r.Entitlement.Gen || auth.Tenure != r.Entitlement.Tenure {
@@ -1498,7 +1205,7 @@ func (jsa *mqttJSA) commitResourceStep(auth *mqttOutboundAuthority, authSeq uint
 	}
 	return jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: auth.ID, Epoch: auth.Epoch, Txn: txn, Op: op,
+			ID: auth.ID, Epoch: auth.Epoch, Txn: txn, Scope: next.Gen, Op: op,
 			Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -1508,7 +1215,7 @@ func (jsa *mqttJSA) commitResourceStep(auth *mqttOutboundAuthority, authSeq uint
 			// reservation or a preparation and resolves neither.
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(auth.ID), next.Gen, next.Inc),

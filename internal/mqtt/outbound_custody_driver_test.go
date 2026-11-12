@@ -1637,7 +1637,7 @@ func testOwedWithdrawalDutyEnded(t *testing.T, clientID string, discard bool) {
 	if discard {
 		want, what = mqttExchangeDiscarded, "a discarded exchange"
 		jsa, id, epoch := &f.e.asm.jsa, sess.id, f.e.asm.sessStreamEpoch
-		testDiscardPlantClosure(t, jsa, id, epoch, f.gen, true)
+		testDiscardPlantClosure(t, jsa, id, epoch, f.gen)
 		if _, err := jsa.opDiscardExchange(id, epoch, "txn-discard", f.gen, f.lin); err != nil {
 			t.Fatalf("fixture: discarding the obligation was refused: %v", err)
 		}

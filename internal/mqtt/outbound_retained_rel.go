@@ -177,12 +177,12 @@ func (jsa *mqttJSA) checkRetainedRelMembers(a *mqttTransitionAttempt, extra []mq
 				return fmt.Errorf("transition %q advances abandoned retained slot %q without fencing on the "+
 					"authority: its closure read would not be atomic with the batch", a.Txn, e.subj)
 			}
-			closure, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, name.gen)
+			_, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, name.gen)
 			if cst != mqttOutboundValid && cst != mqttOutboundAbsent {
 				return fmt.Errorf("transition %q advances abandoned retained slot %q while generation %q's "+
 					"closure cannot be read (status %v)", a.Txn, e.subj, name.gen, cst)
 			}
-			if closure != nil && closure.Discard {
+			if cst == mqttOutboundValid {
 				return fmt.Errorf("transition %q advances abandoned retained slot %q in discarded generation %q: "+
 					"a discarded generation takes no new canonical PUBREL", a.Txn, e.subj, name.gen)
 			}

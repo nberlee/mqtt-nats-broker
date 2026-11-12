@@ -17,16 +17,15 @@
 // another broker had torn down for the whole remaining life of the connection — the
 // split-brain [MQTT-3.1.4-3] forbids.
 //
-// THE LICENCE, and it needs no new durable state. A valid retirement watermark whose
-// MarkerSeq exceeds our own acknowledged sequence, plus the record authoritatively absent,
-// plus a full in-fence revalidation, positively proves a teardown marker landed on this
-// client's record subject AFTER the record this broker is acknowledged for. Each conjunct
-// earns its place: a claim marker is a CAS against the sequence the claiming party
-// believed current; a failed recordGenRetirement aborts before any deletion and leaves the
-// record MARKED rather than absent; a landed local write moves sess.seq while an ambiguous
-// one arms seqUncertain; and an apply-time watermark regression can only cause a false
-// NEGATIVE. Absence ALONE is not the licence — that is the inference issue #40's site 3 is a
-// finding about.
+// THE LICENCE, and it needs no new durable state. This session's generation reading
+// noncurrent in its authority (outstanding or retired, gen_standing.go), plus the record
+// authoritatively absent, plus a full in-fence revalidation, positively proves that a
+// teardown or a Clean Start ended the generation this broker is bound to. Each conjunct earns
+// its place: a teardown makes its generation noncurrent in the batch that marks the record,
+// before any deletion; a landed local write keeps the generation current while an ambiguous
+// one arms seqUncertain; and no transition makes a noncurrent generation current again.
+// Absence ALONE is not the licence — that is the inference issue #40's site 3 is a finding
+// about.
 //
 // WHY THE DISPOSAL CANNOT SIMPLY CALL clear(). Since issue #40 unit 1 the re-mint requires a
 // permit that only a closed, drained tracker over sess.c == nil can mint, so a bound
@@ -38,18 +37,18 @@
 // reopens the tracker and leaves the incumbent bound with its Will, socket, expiry and
 // disconnect state untouched. The marker stays armed and a later pass asks again.
 //
-// THE WILL IS NOT SUPPRESSED. A retirement watermark proves a TEARDOWN, not a successor
+// THE WILL IS NOT SUPPRESSED. A noncurrent generation proves a TEARDOWN, not a successor
 // connection, so the disposal is unlicensed (issue #86): the remote teardown owned the durable
 // session retirement, not this broker's TCP connection or its connection-local Will.
 // Suppressing it here would report a takeover no record shape can demonstrate.
 //
 // WHAT THIS DOES NOT CLOSE, and it is a stated residual in docs/CONFORMANCE.md: a record
-// GONE with an ABSENT, corrupt, indeterminate or insufficient watermark (MarkerSeq at or
-// below our sequence) has no licence, so the marker stays armed and the client may strand
+// GONE while the authority is unreadable or undecided, or still reads this generation
+// current, has no licence, so the marker stays armed and the client may strand
 // until it sends traffic — which then drives the pre-dispatch settlement as before.
 //
-// See docs/ARCHITECTURE.md, "The incarnation completion lease" and "The
-// generation-retirement watermark", and https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
+// See docs/ARCHITECTURE.md, "The incarnation completion lease", and
+// https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
 
 package mqtt
 
@@ -79,8 +78,8 @@ var mqttTestGoneRetireIdentityHookV atomic.Pointer[func(sess *mqttSession)]
 // durable reads — the BETWEEN-READ seam issue #40's owed item (d) calls for.
 //
 // It is a different seam from the identity hook and cannot be replaced by it: this one
-// runs before the watermark and record reads, so a test can make the record REAPPEAR or
-// the watermark change in exactly the window between the off-gate prefilter's
+// runs before the authority and record reads, so a test can make the record REAPPEAR or
+// the generation's standing change in exactly the window between the off-gate prefilter's
 // observation and the proof's own. Without it, removing either in-fence durable re-read
 // is unprovable, because the prefilter's reads alone would still satisfy every fixture.
 // Nil in production.
@@ -127,10 +126,9 @@ func (as *mqttAccountSessionManager) lockSessionForGoneRetirement(sess *mqttSess
 // fence, and this struct exists so the re-check compares against the exact facts the
 // prefilter acted on rather than against whatever is current.
 type mqttGoneRetireLicence struct {
-	owner     *client // the bound connection the prefilter saw
-	seq       uint64  // our acknowledged record sequence at prefilter time
-	markerSeq uint64  // the watermark's marker sequence at prefilter time
-	gen       string  // the incarnation the prefilter saw
+	owner *client // the bound connection the prefilter saw
+	seq   uint64  // our acknowledged record sequence at prefilter time
+	gen   string  // the incarnation the prefilter saw
 }
 
 // retireGoneBoundSession is the licence-backed bound retirement: the consumer this route
@@ -268,7 +266,7 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 				}
 			}
 		}
-		// Unlicensed: a watermark proves a teardown, never a successor, so the Will is
+		// Unlicensed: a noncurrent generation proves a teardown, never a successor, so the Will is
 		// discharged or consumed rather than discarded (issue #86).
 		d.applyWill(sess, as)
 		// Set AFTER the call, so a death inside it leaves the backstop armed.
@@ -296,7 +294,7 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 
 // prefilterGoneRetirement is the off-gate observation.
 //
-// It reads the durable watermark, which is why it runs before the gate rather than inside
+// It reads the durable authority, which is why it runs before the gate rather than inside
 // it: a JetStream round trip under the client-ID gate would hold off every CONNECT for
 // this client for its duration, once per pass, for a session that in the common case is
 // not eligible at all.
@@ -318,14 +316,11 @@ func (as *mqttAccountSessionManager) prefilterGoneRetirement(sess *mqttSession, 
 	case lic.seq == 0 || lic.seq != observedSeq:
 		return lic, false // the sequence moved since the observation that armed the marker
 	}
-	r, _, status := as.jsa.loadGenRetirement(as.domainTk, idHash)
-	if status != mqttRetirementValid || r.MarkerSeq <= lic.seq {
-		// Absent, unreadable, indeterminate, or a marker that does not reach past our own
-		// record: no licence. The marker stays armed and traffic still drives the
-		// pre-dispatch settlement. Stated residual.
+	if standing, _ := as.genStandingByHash(idHash, lic.gen); standing != mqttGenOutstanding && standing != mqttGenRetired {
+		// Current, or undecided: no licence. The marker stays armed and traffic still drives
+		// the pre-dispatch settlement. Stated residual.
 		return lic, false
 	}
-	lic.markerSeq = r.MarkerSeq
 	return lic, true
 }
 
@@ -333,15 +328,15 @@ func (as *mqttAccountSessionManager) prefilterGoneRetirement(sess *mqttSession, 
 // tracker closed and drained, and the client-ID gate held — and BEFORE the detach.
 //
 // It re-establishes every fact the prefilter observed, because the prefilter took none of
-// those locks and its watermark read predates all of them. The ORDER is prescribed: the
+// those locks and its authority read predates all of them. The ORDER is prescribed: the
 // durable reads run with neither as.mu nor sess.mu held, and only then is the in-memory
 // identity re-checked under as.mu with sess.mu nested — the established lock order, and
 // one acquisition rather than two, because two facts read under two acquisitions are not
 // one observation.
 //
-// The watermark is read BEFORE the final record-absence read, so the last fallible durable
-// observation is the one establishing absence. The retirement fact is monotone even if its
-// single slot is replaced afterwards; absence is not, so absence goes last.
+// The authority is read BEFORE the final record-absence read, so the last fallible durable
+// observation is the one establishing absence. A generation's noncurrency is monotone;
+// absence is not, so absence goes last.
 func (as *mqttAccountSessionManager) proveGoneRetirement(sess *mqttSession, lic mqttGoneRetireLicence) error {
 	if h := mqttTestGoneRetireProofEntryHookV.Load(); h != nil {
 		(*h)(sess)
@@ -350,15 +345,10 @@ func (as *mqttAccountSessionManager) proveGoneRetirement(sess *mqttSession, lic 
 	idHash := sess.idHash
 	sess.mu.Unlock()
 
-	// Durable read 1: the watermark must still be valid and must still name a marker
-	// beyond the sequence this session is acknowledged for.
-	r, _, status := as.jsa.loadGenRetirement(as.domainTk, idHash)
-	if status != mqttRetirementValid {
-		return fmt.Errorf("%w: the watermark is %s", errMQTTGoneRetireNoLicence, mqttRetirementStatusLabel(status))
-	}
-	if r.MarkerSeq <= lic.seq {
-		return fmt.Errorf("%w: the watermark's marker sequence %d does not exceed our record at %d",
-			errMQTTGoneRetireNoLicence, r.MarkerSeq, lic.seq)
+	// Durable read 1: this session's generation must still read noncurrent, outstanding or
+	// retired: a teardown or a Clean Start ended it.
+	if standing, _ := as.genStandingByHash(idHash, lic.gen); standing != mqttGenOutstanding && standing != mqttGenRetired {
+		return fmt.Errorf("%w: generation %q is not shown to be noncurrent", errMQTTGoneRetireNoLicence, lic.gen)
 	}
 
 	// Durable read 2, LAST: the record is still authoritatively absent. An unreadable

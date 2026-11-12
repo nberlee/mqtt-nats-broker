@@ -701,11 +701,10 @@ write](https://github.com/nberlee/mqtt-nats-broker/issues/39).
   2026-10-12; [issue #64](https://github.com/nberlee/mqtt-nats-broker/issues/64).
   Residuals in `docs/CONFORMANCE.md`.
 
-- [x] Reclaim CONNECT acceptance facts, or bound them: decided 2026-10-12 as an accepted
-  residual, neither reclaimed nor bounded; the proposed reclamation rule (recorded in
-  [issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)) is unsound and
-  must not be implemented. The exposure is stated in `docs/CONFORMANCE.md`; general
-  reclamation of these classes is a §2 audit item, not an alpha precondition.
+- [x] Reclaim CONNECT acceptance facts, or bound them: decided 2026-10-12 as a residual,
+  superseded 2026-11-11 by the lifecycle reclamation, which deletes acceptance facts (an
+  acceptance is a field of the lifecycle's authority, a Will anchor its only survivor);
+  [issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133).
 
 - [x] Retire a live generation's outbound history behind a proven contiguous floor `Lo`
   and deletion watermark `Del`, every reader reading `[Lo, Hi]`. Done 2026-10-13;
@@ -964,18 +963,10 @@ blocker: it reverses the 2026-10-23 "not an alpha precondition" disposition.
   exposure stated; an account still holding either retired stream is refused. Done
   2026-11-09 ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
 
-- [ ] Reclaim the permanent records every CONNECT and every discarded generation leaves: per
-  CONNECT the acceptance fact, the handoff outcome and the transition outcomes; per generation
-  the teardown receipt, the acquisition ledger and the generation-scoped `$MQTT.inflight.`
-  classes `docs/CONFORMANCE.md` lists as permanent ("The storage this design keeps in
-  `$MQTT.inflight.`"), not the records already deleted there; and the per-client watermark
-  and authority, which fresh-ID churn leaves unbounded too. Nothing reclaims them within
-  the recovery epoch; the reclaimer must meet the four reopening conditions the audit
-  recorded, all classes together. The design direction is a lifecycle registry, an attempt
-  journal in place of the permanent outcomes, per-anchor acceptance summaries, and the
-  receipts, facts and watermark eliminated rather than reclaimed, with name ownership and
-  group records retained
-  ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
+- [x] Reclaimed the records every CONNECT and every discarded generation leaves: lifecycles,
+  generations and Will anchors on the authority, one-batch acceptance and teardown,
+  `$MQTT_teardown` retired (seven streams), retired generations and lifecycles purged. Done
+  2026-11-11 ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
 
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
@@ -1000,7 +991,7 @@ supported and experimental contracts are deliberately asymmetric:
   upgrade, rollback, backup/restore and downgrade guarantees;
 
 - turning the gate off with experimental state present is **unsupported**; operators must
-  perform the documented all-brokers-stopped reset of all eight `$MQTT_*` streams first;
+  perform the documented all-brokers-stopped reset of all seven `$MQTT_*` streams first;
 
 - detection, migration, reinterpretation and cleanup of incompatible experimental state
 are
@@ -1009,7 +1000,7 @@ are
 - there is no automatic conversion from a persisted shared QoS 2 membership to QoS 1, and
   no migration or legacy reader is owed for experimental state.
 
-This cost is acceptable only for an explicit experiment: the eight streams are one recovery
+This cost is acceptable only for an explicit experiment: the seven streams are one recovery
 unit, so resetting experimental state also resets ordinary sessions, accepted messages,
 retained messages and pending Wills in that account.
 
@@ -1649,10 +1640,8 @@ them in order where a later lint change depends on an earlier cleanup.
   consistency, or HA behavior. Done 2026-10-22
   ([issue #132](https://github.com/nberlee/mqtt-nats-broker/issues/132)).
 
-- [x] Audit reclamation of the per-CONNECT permanent records: all three classes stay
-  retained; reopening needs a protocol that makes every delayed Will durably
-  discoverable, fences every live writer and reader of all three classes, and covers them
-  together. Done 2026-10-23
+- [x] Audit reclamation of the per-CONNECT permanent records: decided 2026-10-23 to retain
+  them, superseded 2026-11-11 by the lifecycle reclamation
   ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
 
 - [x] Scan memory and resource lifetimes: seven defects fixed, the eighth a residual in
@@ -2029,7 +2018,7 @@ The first alpha may be tagged only when:
 
 - [ ] TLS rollover, WebSocket, authentication, authorization, migration, backup,
   restore, upgrade, rollback, and shutdown procedures are documented and tested.
-  **Backup and restore are per-BUNDLE**: all eight broker-owned `$MQTT_*` streams are
+  **Backup and restore are per-BUNDLE**: all seven broker-owned `$MQTT_*` streams are
   one recreation unit, taken and restored together from one point in time, since
   startup refuses a proper subset and refuses members carrying different recovery
   epochs ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)).
@@ -2288,7 +2277,7 @@ follow-ups](https://github.com/nberlee/mqtt-nats-broker/issues/50).
 - [ ] After alpha, write an ADR for or against a schedule-backed delayed-Will timer.
   A schedule may publish only into its own stream, so the ADR must preserve
   [issue #35](https://github.com/nberlee/mqtt-nats-broker/issues/35)'s
-  atomic `$MQTT_sess` record/acceptance fact and must not claim cross-stream
+  atomic `$MQTT_sess` record/authority acceptance batch and must not claim cross-stream
   cancellation. The broker, not the scheduler, remains responsible for MQTT publish
   semantics. See the
   [platform audit](https://github.com/nberlee/mqtt-nats-broker/issues/132).

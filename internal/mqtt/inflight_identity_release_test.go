@@ -1427,7 +1427,7 @@ func TestInflightLiveOwnerContentionNeedsAnOwnershipPredicate(t *testing.T) {
 	if !ok {
 		t.Fatal("B must be able to open a record transaction")
 	}
-	_, _, outcome, cerr := sessB.claimTeardown(tok, cur, curSeq, cur.WID, nil)
+	_, _, outcome, cerr := testClaimTeardown(t, sessB, tok, cur, curSeq, cur.WID)
 	if terr := sessB.endRecordTx(tok); terr != nil {
 		t.Fatalf("B releasing its record transaction: %v", terr)
 	}

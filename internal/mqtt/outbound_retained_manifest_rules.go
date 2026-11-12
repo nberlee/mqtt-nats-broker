@@ -197,13 +197,13 @@ const (
 
 // retainedCloseArm decides a retained close and names the arm that admitted it.
 func (jsa *mqttJSA) retainedCloseArm(a *mqttTransitionAttempt, prev *mqttOutboundAuthority, m *mqttRetainedManifest) (string, error) {
-	closure, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, m.Gen)
+	_, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, m.Gen)
 	if cst != mqttOutboundValid && cst != mqttOutboundAbsent {
 		return _EMPTY_, fmt.Errorf("transition %q closes manifest %q while generation %q's closure cannot be read "+
 			"(status %v)", a.Txn, m.Payload, m.Gen, cst)
 	}
 	if m.Admitted != _EMPTY_ {
-		if closure != nil && closure.Discard {
+		if cst == mqttOutboundValid {
 			return mqttRetainedCloseDiscarded, nil
 		}
 		x, _, xerr := jsa.loadOutboundExchange(a.ID, a.Epoch, m.Gen, m.Admitted)
@@ -232,7 +232,7 @@ func (jsa *mqttJSA) retainedCloseArm(a *mqttTransitionAttempt, prev *mqttOutboun
 		return _EMPTY_, fmt.Errorf("transition %q closes manifest %q while exchange %q at phase %d: %w",
 			a.Txn, m.Payload, m.Admitted, int(x.Phase), errMQTTRetainedMaterialNeeded)
 	}
-	if closure != nil {
+	if cst == mqttOutboundValid {
 		return mqttRetainedCloseClosure, nil
 	}
 	if prev == nil || prev.State != mqttAuthorityServing || prev.Gen != m.Gen {
@@ -294,10 +294,10 @@ func (jsa *mqttJSA) retainedRegisterAgrees(a *mqttTransitionAttempt, m *mqttReta
 
 // retainedMaterialNoLongerNeeded is the retained-material edge's release floor beyond an ending:
 // the exchange carries the retained abandonment fact for this payload, or its generation's closure
-// stands with Discard. Read from the store inside the releasing batch; an unreadable read refuses.
+// stands (every closure discards). Read from the store inside the releasing batch; an unreadable
+// read refuses.
 func (jsa *mqttJSA) retainedMaterialNoLongerNeeded(a *mqttTransitionAttempt, r *mqttOutboundResource, nonce string) error {
-	closure, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, r.Gen)
-	if cst == mqttOutboundValid && closure != nil && closure.Discard {
+	if _, _, cst := jsa.loadGenClosure(a.ID, a.Epoch, r.Gen); cst == mqttOutboundValid {
 		return nil
 	}
 	x, _, xerr := jsa.loadOutboundExchange(a.ID, a.Epoch, r.Gen, nonce)

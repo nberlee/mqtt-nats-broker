@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 )
 
 // What a recovery pass does about an outstanding duty, and what it refuses to do.
@@ -58,34 +57,11 @@ func testDiscardingClose(t *testing.T, e *testOutboundEnv,
 			t.Fatalf("provisioning the second resource: %v", err)
 		}
 	}
-	ps, seq := testStandingSession(t, e)
 	// DERIVED, not invented: the resource's PUBREL durable must be the one its own generation
 	// owns, because that is where the proofs it owes are read from.
 	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), first.Gen)
-
-	intent := &mqttHandoffIntent{
-		ID: "intent-clean", PrevGen: first.Gen, PrevTenure: first.Tenure,
-		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: testGen2, Tenure: "tenure-clean", CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
-			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
-			AffineDurable: durable, AffineGen: affGen, PubRelDurable: pubRelDur,
-		},
-	}
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-clean", intent); err != nil {
-		t.Fatalf("preparing the clean start: %v", err)
-	}
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: intent.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the clean start's metadata half: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin-clean", intent.ID); err != nil {
-		t.Fatalf("finalizing the discarding handoff: %v", err)
-	}
+	e.accept(t, "txn-clean", testGen2, "tenure-clean", true,
+		mqttClosingTargets{AffineDurable: durable, AffineGen: affGen, PubRelDurable: pubRelDur})
 	res, unreadable, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, first.Gen)
 	if rerr != nil || unreadable != 0 {
 		t.Fatalf("enumerating the enrolment: %v (%d unreadable)", rerr, unreadable)
@@ -128,7 +104,7 @@ func TestThePassCompletesAnEnrolledAffineCleanup(t *testing.T) {
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: e.id, Epoch: e.epoch, Gen: gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
 
@@ -211,65 +187,6 @@ func TestThePassIsTheReadinessProducerOfLastResort(t *testing.T) {
 	}
 }
 
-// TestANonDiscardingClosureEnrolsNoAffineTarget is the structural half of the same rule: the
-// pass has no affine input at all for a generation whose obligations were not abandoned, so there
-// is nothing for a discard guard to protect.
-func TestANonDiscardingClosureEnrolsNoAffineTarget(t *testing.T) {
-	e, cleanup := testNewEnv(t, "client-f105-exec-preserving")
-	defer cleanup()
-	auth, _ := e.bootstrap(t, "txn-boot")
-
-	// THE COMPOSER IGNORES TARGETS WITHOUT A DISCARD. Production never passes a non-discarding
-	// closure any target, so the rule is pinned on the composer itself: handed the session's
-	// affine and PUBREL durables with discard false, it enrols no resource at all.
-	led, ledSeq, lerr := e.asm.jsa.loadGenLedger(e.id, e.epoch, auth.Gen)
-	if lerr != nil {
-		t.Fatalf("reading the ledger: %v", lerr)
-	}
-	hdr, hdrSeq, herr := e.asm.jsa.loadDirShardAt(mqttDirShardFor(getHash(e.id)))
-	if herr != nil {
-		t.Fatalf("reading the shard header: %v", herr)
-	}
-	enr, cerr := mqttComposeClosingEnrolment(e.id, e.epoch, auth.Gen, false, mqttClosingTargets{
-		AffineDurable: "$MQTT_Q2AFF_a", AffineGen: "aff-1", PubRelDurable: "$MQTT_PUBREL_x",
-	}, led, ledSeq, hdr, hdrSeq)
-	if cerr != nil {
-		t.Fatalf("composing a non-discarding enrolment: %v", cerr)
-	}
-	if len(enr.Incs) != 0 {
-		t.Fatalf("a non-discarding enrolment minted resource incarnations: %v", enr.Incs)
-	}
-	for _, m := range enr.Members {
-		if strings.HasPrefix(m.subj, mqttResourceSubject(getHash(e.id), auth.Gen, "")) {
-			t.Fatalf("a non-discarding enrolment carries resource member %q", m.subj)
-		}
-	}
-
-	// A close-admission cannot carry a discard at all, which is why this is the ordinary shape.
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
-		auth.OwnerTxn); err != nil {
-		t.Fatalf("closing without a discard: %v", err)
-	}
-	res, unreadable, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, testGen)
-	if rerr != nil || unreadable != 0 {
-		t.Fatalf("enumerating the enrolment: %v (%d unreadable)", rerr, unreadable)
-	}
-	for _, r := range res {
-		if r.Kind == mqttResourceAffineConsumer {
-			t.Fatalf("a non-discarding closure enrolled an affine consumer: %+v", r)
-		}
-	}
-
-	// AND NO PASS DOES ANYTHING ABOUT IT: with no enrolment there is no duty, so the readiness
-	// work is unreachable rather than merely guarded.
-	for i := 0; i < 2*mqttDirShards; i++ {
-		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
-	}
-	if ready, lerr := e.asm.jsa.loadAffineReadiness(e.id, e.epoch, testGen); lerr != nil || ready != nil {
-		t.Fatalf("a readiness assertion was written for a preserving closure: %+v (%v)", ready, lerr)
-	}
-}
-
 // TestAnAbsentAuthorityWithholdsEveryDuty exercises the guard on an ALREADY AUTHORIZED
 // cleanup, so removing it would reach the physical delete rather than being masked by
 // opAuthorizeDeletion's own refusal.
@@ -283,7 +200,7 @@ func TestAnAbsentAuthorityWithholdsEveryDuty(t *testing.T) {
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: e.id, Epoch: e.epoch, Gen: gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
 	// Drive it to DELETE_AUTHORIZED through the ordinary route.
@@ -462,7 +379,7 @@ func TestTheBoundaryJudgesTheEndingAgainstTheBatch(t *testing.T) {
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: e.id, Epoch: e.epoch, Gen: gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
 	if !testSweepUntil(t, e, func() bool {
@@ -532,7 +449,7 @@ func TestCleanupOfG1RunsWhileG2Serves(t *testing.T) {
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: e.id, Epoch: e.epoch, Gen: gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("publishing the readiness: %v", err)
 	}
 	if !testSweepUntil(t, e, func() bool {
@@ -696,7 +613,9 @@ func TestARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 			"under %q", epoch2, epoch)
 	}
 
-	// (3) AND THE FRESH BROKER FINISHES IT, from the persisted evidence alone.
+	// (3) AND THE FRESH BROKER FINISHES IT, from the persisted evidence alone. What it finished is
+	// inspected below, so the reclamation that follows certification is held.
+	asm2.testHoldGenerationRetirement.Store(true)
 	var certified bool
 	for i := 0; i < 6*mqttDirShards && !certified; i++ {
 		asm2.sweepOutboundRecovery(s, nil)
@@ -746,113 +665,6 @@ func TestARestartedBrokerCompletesTheEnrolledAffineCleanup(t *testing.T) {
 	// (5) ONLY NOW, the consumer's absence — which on its own proves nothing.
 	if _, err := asm2.jsa.lookupConsumer(mqttOutStreamName, durable); err == nil {
 		t.Fatal("the affine consumer outlived a completed cleanup")
-	}
-}
-
-// TestTheEndingRuleBindsToItsOwnResource is the wrong-resource fixture, pinned so no other
-// validator can mask the binding.
-//
-// The batch carries a completion for resource A that is independently valid at its own CAS
-// expectation, and a terminal duty continuation for resource B — which EXISTS, stands
-// cleanup-INCOMPLETE, holds a valid pending cleanup duty at the expectation the continuation
-// names, and has NO completion member of its own. Every member passes its own validator; B cannot
-// support its own ending; only the resource binding can reject the pairing.
-func TestTheEndingRuleBindsToItsOwnResource(t *testing.T) {
-	e, cleanup := testNewEnv(t, "client-f105-ending-ab")
-	defer cleanup()
-
-	// TWO resources in one generation, each with its own pending cleanup duty: the affine
-	// consumer the closure enrols, and a source consumer provisioned before it.
-	const affGen = "0123456789abcdefghijkq"
-	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
-	gen, a := testDiscardingClose(t, e, affGen, durable, true)
-	var b *mqttOutboundResource
-	res, _, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, gen)
-	if rerr != nil {
-		t.Fatalf("enumerating the enrolment: %v", rerr)
-	}
-	for _, r := range res {
-		if r.Kind == mqttResourceSourceConsumer {
-			b = r
-		}
-	}
-	if b == nil {
-		t.Fatal("this generation carries no second resource to bind against")
-	}
-
-	// A is driven to an authorized cleanup, so its completion member is independently legal.
-	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
-		ID: e.id, Epoch: e.epoch, Gen: gen,
-		AffGen: affGen, Durable: durable, PubRelDur: a.PubRelDur,
-	}); err != nil {
-		t.Fatalf("publishing the readiness: %v", err)
-	}
-	if !testSweepUntil(t, e, func() bool {
-		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, a.Inc)
-		return cur != nil && cur.State != mqttResourceLive
-	}) {
-		t.Fatal("resource A never reached an authorized cleanup")
-	}
-	curA, seqA, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, a.Inc)
-	if curA.State != mqttResourceDeleteAuthorized {
-		t.Skipf("resource A completed in one visit (state %d), so there is no authorized state to "+
-			"compose A's completion from", curA.State)
-	}
-
-	curB, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, b.Inc)
-	if curB == nil || curB.State == mqttResourceCleanupComplete {
-		t.Fatalf("resource B is not cleanup-incomplete: %+v", curB)
-	}
-	led, _, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, gen)
-	var ordB, seqB uint64
-	for i := uint64(1); i <= led.SealedHi; i++ {
-		d, sq, _ := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, gen, i)
-		if d != nil && d.Ref == b.Inc && d.Kind == mqttDutyCleanup {
-			ordB, seqB = i, sq
-			break
-		}
-	}
-	if ordB == 0 {
-		t.Fatal("resource B has no pending cleanup duty")
-	}
-
-	// THE PAIRING: A's completion, B's ending.
-	nextA := *curA
-	nextA.State, nextA.Outcome = mqttResourceCleanupComplete, mqttCleanupGone
-	abody, merr := json.Marshal(&nextA)
-	if merr != nil {
-		t.Fatalf("marshalling A's completion: %v", merr)
-	}
-	dB, _, _ := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, gen, ordB)
-	dbody, berr := mqttResolvedDutyBody(dB, string(mqttCleanupGone))
-	if berr != nil {
-		t.Fatalf("composing B's ending: %v", berr)
-	}
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	idHash := getHash(e.id)
-	txn := mqttNewInflightNonce()
-	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
-			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
-		},
-		Prev: al.rec, PrevSeq: al.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
-			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
-			Intent: al.rec.Intent, Creation: al.rec.Creation,
-		},
-		Extra: []mqttTransitionMember{
-			{subj: mqttResourceSubject(idHash, gen, a.Inc), expect: seqA, body: abody},
-			{subj: mqttDutySubject(idHash, gen, ordB), expect: seqB, body: dbody},
-		},
-	})
-	if err == nil {
-		t.Fatal("a terminal duty for resource B was earned by a completion for resource A")
-	}
-	if !strings.Contains(err.Error(), "cleanup duty") {
-		t.Fatalf("refused for the wrong reason: %v", err)
 	}
 }
 
@@ -1004,33 +816,11 @@ func testSecondDiscardingClose(t *testing.T, e *testOutboundEnv,
 	if cur.status != mqttOutboundValid || cur.rec == nil {
 		t.Fatalf("no serving authority to close: status %v", cur.status)
 	}
-	ps, seq := testStandingSession(t, e)
 	_, _, pubRelDur := mqttPubRelNames(getHash(e.id), cur.rec.Gen)
-
-	intent := &mqttHandoffIntent{
-		ID: "intent-second-" + nextGen, PrevGen: cur.rec.Gen, PrevTenure: cur.rec.Tenure,
-		PrevOwnerTxn: cur.rec.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: nextGen, Tenure: "tenure-second-" + nextGen, CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: cur.rec.Gen, Tenure: cur.rec.Tenure, OwnerTxn: cur.rec.OwnerTxn,
-			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
-			AffineDurable: durable, AffineGen: affGen, PubRelDurable: pubRelDur,
-		},
-	}
 	prev := cur.rec.Gen
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-second-"+nextGen, intent); err != nil {
-		t.Fatalf("preparing the second close: %v", err)
-	}
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: intent.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the second close's metadata half: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin-second-"+nextGen, intent.ID); err != nil {
-		t.Fatalf("finalizing the second close: %v", err)
-	}
+	// nextGen labels this close; the lifecycle allocates the generation itself.
+	e.accept(t, "txn-second-"+nextGen, _EMPTY_, "tenure-second-"+nextGen, true,
+		mqttClosingTargets{AffineDurable: durable, AffineGen: affGen, PubRelDurable: pubRelDur})
 	res, unreadable, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, prev)
 	if rerr != nil || unreadable != 0 {
 		t.Fatalf("enumerating the second enrolment: %v (%d unreadable)", rerr, unreadable)
@@ -1392,5 +1182,112 @@ func TestAnUnreadableSuffixIsNotACompletedSegment(t *testing.T) {
 		t.Fatal("readiness was published although the walk's own segment could not be " +
 			"established: a no-message response is not an absence certificate, because the " +
 			"pinned server returns it for a failed store read too")
+	}
+}
+
+// TestTheEndingRuleBindsToItsOwnResource is the wrong-resource fixture, pinned so no other
+// validator can mask the binding.
+//
+// The batch carries a completion for resource A that is independently valid at its own CAS
+// expectation, and a terminal duty continuation for resource B — which EXISTS, stands
+// cleanup-INCOMPLETE, holds a valid pending cleanup duty at the expectation the continuation
+// names, and has NO completion member of its own. Every member passes its own validator; B cannot
+// support its own ending; only the resource binding can reject the pairing.
+func TestTheEndingRuleBindsToItsOwnResource(t *testing.T) {
+	e, cleanup := testNewEnv(t, "client-f105-ending-ab")
+	defer cleanup()
+
+	// TWO resources in one generation, each with its own pending cleanup duty: the affine
+	// consumer the closure enrols, and a source consumer provisioned before it.
+	const affGen = "0123456789abcdefghijkq"
+	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
+	gen, a := testDiscardingClose(t, e, affGen, durable, true)
+	var b *mqttOutboundResource
+	res, _, rerr := e.asm.enumerateGenerationResources(e.id, e.epoch, gen)
+	if rerr != nil {
+		t.Fatalf("enumerating the enrolment: %v", rerr)
+	}
+	for _, r := range res {
+		if r.Kind == mqttResourceSourceConsumer {
+			b = r
+		}
+	}
+	if b == nil {
+		t.Fatal("this generation carries no second resource to bind against")
+	}
+
+	// A is driven to an authorized cleanup, so its completion member is independently legal.
+	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
+		ID: e.id, Epoch: e.epoch, Gen: gen,
+		AffGen: affGen, Durable: durable, PubRelDur: a.PubRelDur,
+	}, nil); err != nil {
+		t.Fatalf("publishing the readiness: %v", err)
+	}
+	if !testSweepUntil(t, e, func() bool {
+		cur, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, a.Inc)
+		return cur != nil && cur.State != mqttResourceLive
+	}) {
+		t.Fatal("resource A never reached an authorized cleanup")
+	}
+	curA, seqA, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, a.Inc)
+	if curA.State != mqttResourceDeleteAuthorized {
+		t.Skipf("resource A completed in one visit (state %d), so there is no authorized state to "+
+			"compose A's completion from", curA.State)
+	}
+
+	curB, _, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, gen, b.Inc)
+	if curB == nil || curB.State == mqttResourceCleanupComplete {
+		t.Fatalf("resource B is not cleanup-incomplete: %+v", curB)
+	}
+	led, _, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, gen)
+	var ordB, seqB uint64
+	for i := uint64(1); i <= led.SealedHi; i++ {
+		d, sq, _ := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, gen, i)
+		if d != nil && d.Ref == b.Inc && d.Kind == mqttDutyCleanup {
+			ordB, seqB = i, sq
+			break
+		}
+	}
+	if ordB == 0 {
+		t.Fatal("resource B has no pending cleanup duty")
+	}
+
+	// THE PAIRING: A's completion, B's ending.
+	nextA := *curA
+	nextA.State, nextA.Outcome = mqttResourceCleanupComplete, mqttCleanupGone
+	abody, merr := json.Marshal(&nextA)
+	if merr != nil {
+		t.Fatalf("marshalling A's completion: %v", merr)
+	}
+	dB, _, _ := e.asm.jsa.loadDutyEntryAt(e.id, e.epoch, gen, ordB)
+	dbody, berr := mqttResolvedDutyBody(dB, string(mqttCleanupGone))
+	if berr != nil {
+		t.Fatalf("composing B's ending: %v", berr)
+	}
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	idHash := getHash(e.id)
+	txn := mqttNewInflightNonce()
+	_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
+		Attempt: &mqttTransitionAttempt{
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: gen, Op: "op-" + txn,
+			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
+			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
+		},
+		Prev: al.rec, PrevSeq: al.seq,
+		Auth: &mqttOutboundAuthority{
+			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
+			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
+			Life: mqttLifeOf(al.rec),
+		},
+		Extra: []mqttTransitionMember{
+			{subj: mqttResourceSubject(idHash, gen, a.Inc), expect: seqA, body: abody},
+			{subj: mqttDutySubject(idHash, gen, ordB), expect: seqB, body: dbody},
+		},
+	})
+	if err == nil {
+		t.Fatal("a terminal duty for resource B was earned by a completion for resource A")
+	}
+	if !strings.Contains(err.Error(), "cleanup duty") {
+		t.Fatalf("refused for the wrong reason: %v", err)
 	}
 }

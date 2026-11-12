@@ -80,11 +80,7 @@ func TestARestartedBrokerRetiresADiscardedGenerationsConsumers(t *testing.T) {
 	if facts.Closed == nil || facts.Ledger == nil || facts.Ledger.State != mqttGenLedgerSealed || facts.Ledger.SealedHi == 0 {
 		t.Fatalf("fact 1: no committed closure over a ledger sealed at a bound: closure=%+v ledger=%+v", facts.Closed, facts.Ledger)
 	}
-	// (2) the discard closure.
-	if facts.Discard != mqttFactApplies {
-		t.Fatalf("fact 2: the closure does not carry the discard (disposition %v)", facts.Discard)
-	}
-	// (3) durable recovery ownership - here the enrolled, reachable root: no certificate can stand
+	// (2) durable recovery ownership - here the enrolled, reachable root: no certificate can stand
 	// while the cleanup is outstanding.
 	if !facts.RootEnrolled || facts.Cert != nil {
 		t.Fatalf("fact 3: want an enrolled reachable root and no certificate yet: enrolled=%v cert=%+v", facts.RootEnrolled, facts.Cert)
@@ -122,6 +118,8 @@ func TestARestartedBrokerRetiresADiscardedGenerationsConsumers(t *testing.T) {
 		t.Fatalf("the restarted broker reads recovery epoch %q, want the store's %q", asm2.sessStreamEpoch, epoch)
 	}
 	f.s, f.asm = s2, asm2
+	// The test reads what the discard left, which the generation's retirement would purge.
+	asm2.testHoldGenerationRetirement.Store(true)
 
 	done := func() error {
 		if err := f.obligationDiscarded(t); err != nil {

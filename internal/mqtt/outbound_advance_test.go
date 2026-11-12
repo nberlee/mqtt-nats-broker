@@ -268,20 +268,7 @@ func TestClosedGenerationsObligationStillEnds(t *testing.T) {
 	}
 
 	// Close G1 permanently, then claim a FRESH generation beside it.
-	closing := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: atr.Auth.Rev + 1,
-			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: atr.Auth, PrevSeq: admSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
-			State: mqttAuthorityClosed, Rev: atr.Auth.Rev + 1, Txn: "txn-close",
-			OwnerTxn: auth.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
-	}
+	closing := testClosure(e, atr.Auth, admSeq, "txn-close")
 	closeSeq, clerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
@@ -456,20 +443,7 @@ func TestAdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	if cerr != nil {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
-	closing := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: atr.Auth.Rev + 1,
-			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: atr.Auth, PrevSeq: admSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
-			State: mqttAuthorityClosed, Rev: atr.Auth.Rev + 1, Txn: "txn-close",
-			OwnerTxn: auth.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
-	}
+	closing := testClosure(e, atr.Auth, admSeq, "txn-close")
 	if _, clerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
@@ -510,99 +484,6 @@ func TestAdvanceCannotReopenAClosedGeneration(t *testing.T) {
 	}
 }
 
-// TestAdvancePreservesAPendingProposal pins that cleanup running beside an unresolved
-// proposal cannot quietly replace it.
-//
-// An advance runs while a handoff is PREPARING — completion work does not wait for an
-// ownership decision — and the authority record is rewritten by every transition. If the
-// advance could substitute a different intent, the proposal a CONNECT is waiting to finalize
-// would be swapped for one nobody proposed, and that CONNECT would finalize into ownership
-// it never asked for. DROPPING it is refused by the authority's own shape; REPLACING it with
-// a well-formed intent is refused only here.
-func TestAdvancePreservesAPendingProposal(t *testing.T) {
-	e, done := testNewEnv(t, "f105-advance-pending")
-	defer done()
-
-	auth, authSeq := e.bootstrap(t, "txn-1")
-	src, srcSeq := testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	adm := testAdmission(e, auth, authSeq, "txn-adm", 7,
-		[]mqttResourceDependency{{Resource: src, Seq: srcSeq, Role: mqttRoleSourceReplay}})
-	atr, _ := mqttAdmitPublishTransition(adm)
-	admSeq, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, atr))
-	if cerr != nil {
-		t.Fatalf("the admission was refused: %v", cerr)
-	}
-
-	mkIntent := func(id, tenure string) *mqttHandoffIntent {
-		return &mqttHandoffIntent{
-			ID: id, PrevGen: auth.Gen, PrevTenure: auth.Tenure,
-			PrevOwnerTxn: auth.OwnerTxn, PrevSessWID: "wid-0", PrevSessSeq: 12,
-			Tenure: tenure, Gen: testGen2, CleanReq: true,
-			Retire: &mqttRetirementRequest{
-				Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-				SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
-			},
-		}
-	}
-	standing := mkIntent("intent-1", "tenure-next")
-	prep := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-prep", Op: "op-prep",
-			Kind: mqttTransitionPrepareIntent, PrevTxn: auth.OwnerTxn, Rev: atr.Auth.Rev + 1,
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: atr.Auth, PrevSeq: admSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
-			State: mqttAuthorityPreparing, Rev: atr.Auth.Rev + 1, Txn: "txn-prep",
-			OwnerTxn: auth.OwnerTxn, Intent: standing,
-		},
-	}
-	if _, perr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, prep)); perr != nil {
-		t.Fatalf("the preparation was refused: %v", perr)
-	}
-
-	cur, curSeq := testLoadExchange(t, e, testGen, adm.Exchange.Nonce)
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	// THE PREPARING AUTHORITY MUST LOAD BACK. A record that can be written and not read is
-	// a corrupt authority the moment a broker restarts, and the closed schema will report it
-	// as exactly that.
-	if al.status != mqttOutboundValid {
-		t.Fatalf("the preparing authority does not load back: status %v", al.status)
-	}
-	if al.rec.State != mqttAuthorityPreparing || al.rec.Intent == nil {
-		t.Fatalf("the authority is not preparing with an intent (state %d)", al.rec.State)
-	}
-
-	swapped, serr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-adv-swap", "op-adv",
-		cur, curSeq, mqttExchangePubRecObserved)
-	if serr != nil {
-		t.Fatalf("assembling the advance failed: %v", serr)
-	}
-	swapped = testWithSlotMember(t, &e.asm.jsa, swapped, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
-	testForgeAdvanceAuthority(swapped, al.rec, al.seq, func(_ *mqttTransitionAttempt, o *mqttOutboundAuthority) {
-		o.Intent = mkIntent("intent-9", "tenure-usurper")
-	})
-	testRefusedForgedAdvance(t, e, swapped, "replacing the pending handoff intent")
-
-	// The well-formed advance commits and carries the standing proposal through untouched.
-	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	good, gerr := mqttAdvanceExchangeTransition(al.rec, al.seq, "txn-adv-good", "op-adv",
-		cur, curSeq, mqttExchangePubRecObserved)
-	if gerr != nil {
-		t.Fatalf("assembling the well-formed advance failed: %v", gerr)
-	}
-	good = testWithSlotMember(t, &e.asm.jsa, good, cur.Gen, cur.Nonce, mqttExchangePubRecObserved)
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, good)); err != nil {
-		t.Fatalf("the well-formed advance was refused while preparing: %v", err)
-	}
-	back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if back.rec.State != mqttAuthorityPreparing || back.rec.Intent == nil ||
-		back.rec.Intent.ID != standing.ID || back.rec.Intent.Tenure != standing.Tenure {
-		t.Fatalf("the advance did not carry the pending proposal through: %+v", back.rec.Intent)
-	}
-}
-
 // TestAdvanceIsCheckedAgainstTheStoreNotItsBuilder is the adversarial half of the
 // phase-only guarantee, and the one that matters: the guarantee has to hold at the WRITE
 // BOUNDARY, not in the convenience that composed the transition.
@@ -628,20 +509,7 @@ func TestAdvanceIsCheckedAgainstTheStoreNotItsBuilder(t *testing.T) {
 
 	// Close the generation, so every attempt below runs under the authority state the kind
 	// is exempt for.
-	closing := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: atr.Auth.Rev + 1,
-			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: atr.Auth, PrevSeq: admSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
-			State: mqttAuthorityClosed, Rev: atr.Auth.Rev + 1, Txn: "txn-close",
-			OwnerTxn: auth.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
-	}
+	closing := testClosure(e, atr.Auth, admSeq, "txn-close")
 	if _, clerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing)); clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)
 	}
@@ -833,7 +701,7 @@ func TestNoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 		txn := "txn-via-" + name
 		smuggle := &mqttAuthorityTransition{
 			Attempt: &mqttTransitionAttempt{
-				ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+				ID: e.id, Epoch: e.epoch, Txn: txn, Scope: al.rec.Gen, Op: "op-" + txn,
 				Kind: kind, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 				Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 			},
@@ -842,6 +710,7 @@ func TestNoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 				ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 				State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: txn,
 				OwnerTxn: al.rec.OwnerTxn,
+				Life:     mqttLifeOf(al.rec),
 			},
 			Extra: []mqttTransitionMember{{subj: xchSubj, expect: curSeq, body: regBody}},
 		}
@@ -878,7 +747,7 @@ func TestNoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 		txn := "txn-rebind-" + name
 		reb := &mqttAuthorityTransition{
 			Attempt: &mqttTransitionAttempt{
-				ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+				ID: e.id, Epoch: e.epoch, Txn: txn, Scope: al.rec.Gen, Op: "op-" + txn,
 				Kind: kind, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 				Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 			},
@@ -886,6 +755,7 @@ func TestNoKindMayRegressAnExchangeOrRewriteAnAction(t *testing.T) {
 			Auth: &mqttOutboundAuthority{
 				ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 				State: al.rec.State, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
+				Life: mqttLifeOf(al.rec),
 			},
 			Extra: []mqttTransitionMember{{subj: actSubj, expect: amsg.Sequence, body: actBody}},
 		}

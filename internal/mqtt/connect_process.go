@@ -794,10 +794,8 @@ CHECK:
 		stepReattempts--
 		return nil
 	}
-	// The CONNECT's own ownership state across every drive and re-drive: the intents its drives
-	// proposed, and the ONE foreign proposal it settles (issue #107 8a). Above the label for the same
-	// reason as the budget: a re-drive that reset it would be a fresh acceptance in all but name.
-	ownState := newMQTTConnectOwnershipState()
+	// THE ACCEPTANCE NONCE this CONNECT installed, bound before CONNACK (issue #133).
+	var acceptNonce string
 
 	// R1's re-entry point for this frame: the AUTHORITATIVE restore, from the top. Every
 	// transition that learns its base is not current arrives back here having already
@@ -807,38 +805,27 @@ CHECK:
 	// pass discarded, and re-send deliveries belonging to a dead incarnation.
 restoreSession:
 	tl.begin("session")
-	// SETTLE ANY STANDING OWNERSHIP PROPOSAL FIRST, before the restore, the uncertain-record
-	// resolution, the retirement and the clean-start block (issue #107 8a). Each of those may destroy
-	// or re-propose over what a crashed or concurrent acceptance left mid-flight — a committed
-	// successor record, a predecessor a cancelled handoff would restore — and none of them reads
-	// the authority's proposal. Settling it here is the CONNECT's half; every discard settles at
-	// its own boundary too (prepareClear), because this read is not a fence.
+	// A RESIDENT OBJECT THE AUTHORITY HAS LEFT BEHIND. If the authority now serves a generation
+	// other than the resident object's, an acceptance moved the record past it. The object is
+	// stale, and the existing disposal for exactly that fact applies: the record moved and
+	// nothing establishes who holds it, so the Will stays ours to discharge (issue #86). An
+	// object whose retirement is pending is left to the join below. Acceptances are one batch
+	// each (issue #133), so no proposal stands to be settled first.
+	//
+	// The read is the CONNECT's first ownership request and runs under its deadline: an authority
+	// the store cannot answer for refuses the CONNECT here, within the budget, before the restore,
+	// the discard boundary or any later phase spends its own bound on the same unanswering store.
 	{
-		sres, sload, serr := asm.jsa.settleStandingProposal(cid, asm.sessStreamEpoch, asm.domainTk,
-			ownBudget, time.Now, stepAllow, ownState)
-		if serr != nil {
-			return formatError(fmt.Errorf("settling the standing ownership proposal: %w", serr))
+		sload := asm.jsa.withDeadline(ownBudget.deadline()).loadOutboundAuthority(cid, asm.sessStreamEpoch)
+		if sload.status == mqttOutboundIndeterminate {
+			return formatError(fmt.Errorf("refusing CONNECT for %q: its outbound authority could not be read", cid))
 		}
-		if sres.Outcome != mqttOwnershipSettled {
-			return formatError(fmt.Errorf("refusing CONNECT for %q: a standing ownership proposal is "+
-				"not settled (%s)", cid, sres.Reason))
-		}
-		// A RESIDENT OBJECT THE SETTLED STATE HAS LEFT BEHIND. If the authority now serves a
-		// generation other than the resident object's, a committed proposal moved the record
-		// past it — whoever finalized it, this CONNECT or another settler first. The object is
-		// stale, and the existing disposal for exactly that fact applies: the record moved and
-		// nothing establishes who holds it, so the Will stays ours to discharge (issue #86). An
-		// object whose retirement is pending is left to the join below, which drains its owners
-		// and finishes its discard; nothing here may declare them drained.
-		if exists && es != nil && sload.status == mqttOutboundValid && sload.rec != nil &&
-			sload.rec.State == mqttAuthorityServing {
+		if exists && es != nil && sload.status == mqttOutboundValid && sload.rec != nil && sload.rec.State == mqttAuthorityServing {
 			es.mu.Lock()
 			staleGen := sload.rec.Gen != es.gen
 			pending := es.leases.isRetirementPending()
 			es.mu.Unlock()
 			if staleGen && !pending {
-				// Through the phased helper, like every disposing arm of this CONNECT: the Will
-				// runs after the accept transaction closes and before the gate releases.
 				disposeThroughPhases(nil, mqttDisposalForLineage(false), nil)
 				es, exists, sessp = nil, false, false
 				resumePubs, resumeRels = nil, nil
@@ -949,8 +936,6 @@ restoreSession:
 	// once the successor is serving. Left false, this is a plain discard or a resume.
 	var (
 		cleanStartHandoff bool
-		cshWID            string
-		cshSeq            uint64
 		cshRetiringGen    string
 		cshTargets        mqttCleanStartRetireTargets
 		cshDurs           []string
@@ -1168,7 +1153,7 @@ restoreSession:
 			// Absent or CLOSED authority — including a record already gone — keeps the ordinary
 			// destroy-then-create path.
 			es.mu.Lock()
-			s1WID, s1Seq, s1Gen := es.wid, es.seq, es.gen
+			s1Seq, s1Gen := es.seq, es.gen
 			es.mu.Unlock()
 			// The choice was made ONCE, before the detach, from the discard boundary's own load
 			// (issue #107 8a; see mqttPreparedClear.auth): the disposition proved this object's record
@@ -1210,7 +1195,7 @@ restoreSession:
 					es.jsa.c.Errorf("MQTT: %v", terr)
 				}
 				cleanStartHandoff = true
-				cshWID, cshSeq, cshRetiringGen = s1WID, s1Seq, s1Gen
+				cshRetiringGen = s1Gen
 				cshDurs, cshTargets = durs, *displaced
 				cshQ2AffGen, cshQ2AffDur = displaced.AffineGen, displaced.AffineDurable
 			} else if err := prepared.destroy(capsule.permit, false); err != nil {
@@ -1499,80 +1484,40 @@ restoreSession:
 		return rd.admitCreateRetry()
 	}
 	for {
-		prevWID, prevSeq := es.wid, es.seq
 		var driveTargets mqttCleanStartRetireTargets
 		if cleanStartHandoff {
-			// The predecessor identity was captured BEFORE the reset zeroed es.wid, and its
-			// backing-resource targets ride the discarding handoff's closing batch (issue #107 row 9).
-			prevWID, prevSeq, driveTargets = cshWID, cshSeq, cshTargets
+			// The predecessor's backing-resource targets ride the discarding handoff's closing
+			// batch (issue #107 row 9).
+			driveTargets = cshTargets
 		}
 		tl.begin("ownership")
-		ogen, otenure, ores, oerr := es.driveAcceptToServingAuthority(acceptTok, cid, asm.sessStreamEpoch,
-			!sessp, prevWID, prevSeq, driveTargets, ownBudget, time.Now, retryOK, stepAllow, ownState)
-		// A REFUSAL THAT LEAVES THIS ACCEPTANCE'S OWN ABORTED PROPOSAL STANDING owes its
-		// abandonment, whatever arm below ends the CONNECT: the in-place cleanup may have failed,
-		// or the deadline may have cut it off. The worker runs once this connection is refused,
-		// certified and holding nothing, on exactly this proposal (issue #107 8a).
-		if o := ores.Obs; o.Own != nil && o.Verdict == mqttMetadataAborted && !o.AbandonConfirmed {
-			owedAbandon = func() { asm.abandonOwnProposal(cid, o) }
-		} else {
-			owedAbandon = nil
-		}
-		// THE RE-DRIVE IS LICENSED BY WHAT THE DRIVE ESTABLISHED, never by the identity of its
-		// error (issue #107 8a, consult 120). Checked before the success arm and every retry arm
-		// below: an own proposal that is not COMMITTED and was not provably aborted and
-		// abandoned by this acceptance itself forbids a fresh proposal, so the CONNECT refuses —
-		// whatever error a handler returned. See mqttOwnObservation.forbidsRedrive.
-		if ores.Outcome != mqttOwnershipServable && ores.Obs.forbidsRedrive() {
-			asm.removeSession(es, true)
-			if oerr == nil {
-				oerr = fmt.Errorf("outbound ownership was lost (%s)", ores.Reason)
-			}
-			return fmt.Errorf("refusing CONNECT for %q: this acceptance's own ownership proposal forbids "+
-				"proposing again: %v", cid, oerr)
-		}
-		if oerr == nil && ores.Outcome == mqttOwnershipServable {
-			// THE CONNECTION RECORDS WHAT IT WAS ACCEPTED UNDER. The drive reports servable only for
-			// the tenure it supplied, so this pair is exactly this connection's entitlement.
+		// ONE BATCH PER ACCEPTANCE (issue #133): the ownership and the record land together or
+		// not at all, so nothing is left standing to finalize or abandon.
+		ogen, otenure, ononce, oanchor, oerr := es.acceptOwnership(acceptTok, cid, asm.sessStreamEpoch,
+			!sessp, driveTargets, ownBudget, retryOK, stepAllow, mqttWillIsDelayed(c.mqtt.proto, cp.will, expiry))
+		if oerr == nil {
+			acceptNonce = ononce
+			// THE CONNECTION'S WILL ANCHOR, when its acceptance allocated one: the broker holding
+			// this Will's disposition completes it (will_anchor_ops.go).
+			c.mu.Lock()
+			c.mqtt.willAnchor = oanchor
+			c.mu.Unlock()
+			// THE CONNECTION RECORDS WHAT IT WAS ACCEPTED UNDER.
 			c.setOutboundEntitlement(mqttOutboundEntitlement{Gen: ogen, Tenure: otenure})
 			es.mu.Lock()
 			es.boundEnt, es.boundEntOK = mqttOutboundEntitlement{Gen: ogen, Tenure: otenure}, true
 			es.mu.Unlock()
 			break
 		}
-		// The metadata commit's store error travels WRAPPED: persistRecord returns it as
-		// "unable to persist session ownership metadata (seq=%v): %w", and the ownership
-		// executor and drive pass it through unchanged. IsNatsErr does a bare type assertion
-		// and cannot see a JetStream code through that wrap, so the CAS arms below classify the
-		// UNWRAPPED ApiError (jsAPIError, errors.As) — otherwise a record-CAS contention on the
-		// accept batch would fall through to the refusal arm rather than retrying or re-driving.
-		// This is the same wrap-aware discipline the predecessor-stale arm uses via errors.Is.
-		casErr := jsAPIError(oerr)
-		switch {
-		case casErr != nil && IsNatsErr(casErr, JSStreamWrongLastSequenceConstantErr):
-			// 10164 at a RESERVE or FINALIZE step: same-subject contention on the authority
-			// record, nothing decided. Re-drive the SAME protocol within the redrive budget — the
-			// authority steps are idempotent re-reads, and a standing committed-but-unfinalized
-			// proposal is recovered (finalized as proposed), never re-minted. The METADATA-step
-			// 10164 no longer reaches here: the executor consumes it in place, re-sending the same
-			// frozen attempt (retryOK) so a mere contention never re-runs the drive with a fresh
-			// proposal — which would strand the reservation the first attempt already opened.
-			if aerr := rd.admitCreateRetry(); aerr != nil {
-				asm.detachConnectingClientForReDrive(es, c)
-				return formatError(aerr)
+		if errors.Is(oerr, errMQTTAcceptRecordMoved) || errors.Is(oerr, errMQTTForkFenceMoved) {
+			// A fork fence that moved means fork repair's reads no longer prove what it installed:
+			// the FULL re-drive discards the merge with the object and re-runs fork repair.
+			if errors.Is(oerr, errMQTTForkFenceMoved) {
+				if h := mqttTestForkFenceRedriveV.Load(); h != nil {
+					(*h)(cid)
+				}
 			}
-			time.Sleep(mqttRecordCreateRetryWait)
-			continue
-		case casErr != nil && mqttIsRecordCASRejection(casErr):
-			// 10071 on the metadata commit's record CAS: a peer's record won. The executor has
-			// ALREADY resolved this attempt's permanent receipt slot and settled the proposal
-			// before returning here (Codex consult 10, consult-5 step 4): a resolved-COMMITTED
-			// verdict never reaches this arm — it is adopted and finalized in place — and an
-			// UNRESOLVED slot was aborted and its reservation closed (creation) or its handoff
-			// cancelled, so no own-ABORTED proposal is left standing to be minted over. Re-read
-			// from the authoritative restore, SILENTLY, and re-drive against the winner's record:
-			// this is redrive arbitration against a SETTLED authority, not a fresh proposal over
-			// an unresolved half.
+			// A peer's record won: re-read from the authoritative restore and decide again.
 			endAcceptTx()
 			asm.detachConnectingClientForReDrive(es, c)
 			if aerr := rd.admitCycle(); aerr != nil {
@@ -1581,55 +1526,9 @@ restoreSession:
 			es, exists, sessp = nil, false, false
 			resumePubs, resumeRels = nil, nil
 			goto restoreSession
-		case oerr != nil && errors.Is(oerr, errMQTTForkFenceMoved):
-			// The handoff preparation found the authority past the sequence fork repair read its
-			// reinstated consumers under (issue #107 7f): a write since — a disposal among the
-			// possibilities — means the merge's reads no longer prove what it installed. Nothing
-			// landed. NOT the inner 10164 retry, which re-drives the protocol over the same merged
-			// state with the same fence and can only exhaust: the FULL re-drive discards the
-			// merge with the object and re-runs fork repair on fresh reads.
-			if h := mqttTestForkFenceRedriveV.Load(); h != nil {
-				(*h)(cid)
-			}
-			endAcceptTx()
-			asm.detachConnectingClientForReDrive(es, c)
-			if aerr := rd.admitCycle(); aerr != nil {
-				return formatError(aerr)
-			}
-			es, exists, sessp = nil, false, false
-			resumePubs, resumeRels = nil, nil
-			goto restoreSession
-		case oerr != nil && errors.Is(oerr, errMQTTHandoffPredecessorStale):
-			// The predecessor session record the handoff proposed to displace moved, was torn
-			// down, or changed identity under the acceptance before its metadata half committed
-			// — a rival winning the clear pre-fence window, most often. Nothing landed: the
-			// three-member batch is atomic and its predecessor pre-check refuses before the send,
-			// so sess.seq and the authority are exactly as they were. RE-DRIVE against what now
-			// stands, the same disposition a record-CAS rejection gets: re-read the authoritative
-			// record, re-decide resume/discard/creation, and re-drive the ownership protocol
-			// against the winner. A first attempt that already reserved or prepared has aborted
-			// its own metadata slot and undone that transition before returning here (the
-			// executor cleans up its failed attempt), so the re-drive meets a settled authority
-			// rather than a stalled proposal of its own.
-			endAcceptTx()
-			asm.detachConnectingClientForReDrive(es, c)
-			if aerr := rd.admitCycle(); aerr != nil {
-				return formatError(aerr)
-			}
-			es, exists, sessp = nil, false, false
-			resumePubs, resumeRels = nil, nil
-			goto restoreSession
-		case oerr == nil:
-			// The protocol resolved without a store error but did not reach a servable
-			// authority — the loser bound (this acceptance's own proposal was aborted, its
-			// generation closed), an expiry, or an unresolved verdict. The CONNECT is refused;
-			// nothing is aborted that a later acceptance cannot settle.
-			asm.removeSession(es, true)
-			return fmt.Errorf("refusing CONNECT for %q: outbound ownership not established (%s)", cid, ores.Reason)
-		default:
-			asm.removeSession(es, true)
-			return oerr
 		}
+		asm.removeSession(es, true)
+		return fmt.Errorf("refusing CONNECT for %q: outbound ownership not established: %v", cid, oerr)
 	}
 	// A clean-start HANDOFF has now installed the successor SERVING authority. The metadata
 	// batch displaced the predecessor record; the later finalization closed the predecessor
@@ -1666,26 +1565,27 @@ restoreSession:
 		}
 	}
 	// THE TENURE is this acceptance's ONE tenure (issue #107 8b): the authority tenure it was just
-	// finalized under, ordered by the stream sequence of its own acceptance fact, read back.
-	// Every shared acquisition this connection makes is composed under it, and nothing else
-	// ever borrows it.
+	// accepted under, ordered by its acceptance's ordinal in the lifecycle (issue #133). Every
+	// shared acquisition this connection makes is composed under it, and nothing else ever
+	// borrows it.
 	//
-	// EVERY ACCEPTANCE then projects that tenure onto the generation's acquisition ledger BEFORE
-	// it serves or reconciles anything (the plan's 3.7): the record CAS that landed decides the
-	// SESSION, and the installation carries that decision onto the ledger, which no
-	// session-record write touches. A fresh generation installs too — the installation over absence is the ONLY
-	// creator of a ledger, so a delayed acceptance whose successor already installed learns here
-	// that it was superseded, and no join can create a ledger behind an acceptance that never
-	// installed. Then the verdicts the record carries are executed, an acquisition the record
-	// does not name is cancelled by a subsequent record CAS, and every committed acquisition is
-	// checked against its group. A refusal — superseded by a newer tenure, a generation being
-	// closed, an unreadable fact or ledger — refuses the CONNECT before the CONNACK, as every
-	// other pre-CONNACK disposition does.
+	// An acceptance whose generation ACQUIRED then projects that tenure onto the generation's
+	// standing acquisition ledger BEFORE it serves or reconciles anything (the plan's 3.7): the
+	// record CAS that landed decides the SESSION, and the installation carries that decision onto
+	// the ledger, which no session-record write touches. A generation that never acquired has no
+	// ledger and installs nothing; its first shared acquisition creates the ledger, fenced by the
+	// authority to the current acceptance (shared_ledger_fence.go), so a delayed acceptance whose
+	// successor already accepted learns at the ledger or the authority that it was superseded.
+	// Then the verdicts the record carries are executed, an acquisition the record does not name
+	// is cancelled by a subsequent record CAS, and every committed acquisition is checked against
+	// its group. A refusal — superseded by a newer tenure, a generation being closed, an
+	// unreadable authority or ledger — refuses the CONNECT before the CONNACK, as every other
+	// pre-CONNACK disposition does.
 	tl.begin("tenure")
 	es.mu.Lock()
 	servingTenure := es.boundEnt.Tenure
 	es.mu.Unlock()
-	if terr := es.mintAcceptanceTenure(es.jsa.withDeadline(ownBudget.deadline()), servingTenure); terr != nil {
+	if terr := es.mintAcceptanceTenure(es.jsa.withDeadline(ownBudget.deadline()), servingTenure, acceptNonce); terr != nil {
 		asm.removeSession(es, true)
 		return fmt.Errorf("refusing CONNECT for %q: %w", cid, terr)
 	}
@@ -2238,8 +2138,33 @@ restoreSession:
 		}
 	}
 
-	// GRANT the requested Session Expiry Interval and Clean flag. Everything that
-	// could refuse this CONNECT has now passed, so this is the first moment the
+	// Persist C5b's staged floor/disposition through the existing accept
+	// transaction, before a success CONNACK or any source/drain activation.
+	if err := es.saveDisposalRecovery(c, acceptTok); err != nil {
+		abortAcceptedResume()
+		refusePreConnack(mqttReasonImplementationSpecificError, err.Error())
+		return formatError(err)
+	}
+
+	// THE BIND, THE LAST REFUSABLE STEP BEFORE THE LIFETIME GRANT AND THE CONNACK (issue #133).
+	// Until it lands the acceptance is pending:
+	// a later acceptance supersedes it, and a CONNECT that never gets here leaves it for the
+	// abandonment sweep rather than a serving authority nobody holds. A bind that loses means
+	// this connection's acceptance is gone, so it never serves.
+	tl.begin("accept-bind")
+	if h := mqttTestBeforeBindHookV.Load(); h != nil {
+		(*h)(cid)
+	}
+	if berr := es.bindAcceptance(ownBudget, acceptNonce, stepAllow); berr != nil {
+		abortAcceptedResume()
+		refusePreConnack(mqttReasonImplementationSpecificError, berr.Error())
+		return formatError(berr)
+	}
+
+	// GRANT the requested Session Expiry Interval and Clean flag, AFTER THE BIND (issue #133):
+	// everything that could refuse this CONNECT has now passed, the recovery save and the bind
+	// included, so a refused resume leaves the record on its prior lifetime and only a failed
+	// success CONNACK write can follow a persisted grant. This is the first moment the
 	// session may take on what the client asked for — and it is persisted here
 	// too, because the accept save deliberately carried the OLD lifetime and a
 	// session whose record disagrees with its memory would be resumed, or
@@ -2266,14 +2191,6 @@ restoreSession:
 			}
 			return formatError(g.err)
 		}
-	}
-
-	// Persist C5b's staged floor/disposition through the existing accept
-	// transaction, before a success CONNACK or any source/drain activation.
-	if err := es.saveDisposalRecovery(c, acceptTok); err != nil {
-		abortAcceptedResume()
-		refusePreConnack(mqttReasonImplementationSpecificError, err.Error())
-		return formatError(err)
 	}
 
 	// Spec [MQTT-3.2.0-1]: CONNACK must be the first protocol sent to the session.

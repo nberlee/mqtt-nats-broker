@@ -124,6 +124,7 @@ func TestSessGenContinuity(t *testing.T) {
 	if err != nil || existed {
 		t.Fatalf("createOrRestoreSession: existed=%v err=%v", existed, err)
 	}
+	testAcceptRigConnection(t, asm, sess, s.createInternalAccountClient())
 	gen := sess.gen
 	if !mqttValidSessGen(gen) {
 		t.Fatalf("a new session must mint a generation, got %q", gen)

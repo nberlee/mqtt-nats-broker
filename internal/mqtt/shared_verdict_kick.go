@@ -132,11 +132,27 @@ func (sess *mqttSession) executeDurableVerdicts(gen string) {
 		return
 	}
 	var settled []string
+	// A background executor: registered for the client, every ledger write and fence admitted
+	// per attempt. It WAITS for an announcement to clear rather than being refused: the kick is
+	// the prompt route a verdict settles by (the PUBACK that ends a dependant is itself announced
+	// foreground work and kicks it), and a refused kick would leave the release to the sweep.
+	// A session object no account manager holds runs no worker and admits.
+	var cw *mqttSharedContention
+	if as := sess.asm; as != nil {
+		deregister := as.registerForegroundActor(id)
+		defer deregister()
+		var quit chan struct{}
+		if srv := sess.serverFor(nil); srv != nil {
+			quit = srv.quitCh
+		}
+		admit := func() bool { return as.admitForegroundOrWait(id, quit) }
+		cw = mqttSharedAdmissionOnly(admit)
+	}
 	for _, r := range ps.AcqReleases {
 		if h := mqttTestVerdictKickExecHookV.Load(); h != nil {
 			(*h)(gen, r.Acq)
 		}
-		if ok, _ := sess.jsa.executeSharedRelease(epoch, id, gen, r, nil); ok {
+		if ok, _ := sess.jsa.executeSharedRelease(epoch, id, gen, r, cw); ok {
 			settled = append(settled, r.Acq)
 		}
 	}

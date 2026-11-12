@@ -58,8 +58,8 @@ the reply subjects under `$MQTT.>`.
 `start MQTT listener:` and names the stream and the reason, for example
 `replicas is 1 (want 3)`, `storage is memory (want file)` or a `max_consumers` limit. The
 streams are one unit and are not repaired in place: stop every broker for the account,
-delete all eight streams, and start again, which discards the broker state
-([Operations](OPERATIONS.md#the-eight-streams)). Related refusals:
+delete all seven streams, and start again, which discards the broker state
+([Operations](OPERATIONS.md#the-seven-streams)). Related refusals:
 
 - `broker-owned streams are in another persisted format (...)`: the streams were written
   by a broker release that uses another format, named in the message. Run a release that
@@ -68,10 +68,10 @@ delete all eight streams, and start again, which discards the broker state
 - `broker-owned streams carry no "mqtt_nats_broker_format" metadata (...)`: the streams
   were written before the format was versioned, or by something else — nats-server's own
   MQTT listener leaves such streams ([Migration](MIGRATION.md)). They cannot be read:
-  with every broker stopped, delete all eight.
+  with every broker stopped, delete all seven.
 - `this account holds N of the 8 broker-owned streams ...`: a partial set that stayed
   partial for 30 s. If another broker is starting, wait for it and restart this one;
-  only with every broker stopped, delete all eight.
+  only with every broker stopped, delete all seven.
 - `this account still holds $MQTT_origin, ...`: a stream an earlier build created;
   stop every broker and delete it.
 
@@ -154,7 +154,7 @@ particular streams instead of `$JS.ACK.>`. Grant `$JS.ACK.>`
 
 The streams were created with one replica: `-stream-replicas` was set to `1` on a
 clustered NATS ([Configuration](CONFIGURATION.md#stream-replicas)). Check with
-`nats stream info '$MQTT_sess'`. Moving to three replicas means recreating the eight
+`nats stream info '$MQTT_sess'`. Moving to three replicas means recreating the seven
 streams, which discards the broker state.
 
 ## TLS

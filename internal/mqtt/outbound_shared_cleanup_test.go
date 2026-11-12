@@ -59,23 +59,9 @@ func TestAClosureCarriesTheSealedLedger(t *testing.T) {
 	}
 	unsealed := []mqttTransitionMember{{subj: seal.subj, expect: seal.expect, body: body}}
 
-	_, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close-open", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
-			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
-		},
-		Prev: al.rec, PrevSeq: al.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
-			State: mqttAuthorityClosed, Rev: al.rec.Rev + 1, Txn: "txn-close-open",
-			OwnerTxn: al.rec.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Txn: "txn-close-open",
-		},
-		Extra: unsealed,
-	}))
+	closing := testClosure(e, al.rec, al.seq, "txn-close-open")
+	closing.Extra = unsealed
+	_, cerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if cerr == nil {
 		t.Fatalf("a closure left its generation's inventory open")
 	}
@@ -95,23 +81,9 @@ func TestAClosureCarriesTheSealedLedger(t *testing.T) {
 	// about closing enrolments in general.
 	if oerr := func() error {
 		l := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-		_, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, &mqttAuthorityTransition{
-			Attempt: &mqttTransitionAttempt{
-				ID: e.id, Epoch: e.epoch, Txn: "txn-close-sealed", Op: "op-close",
-				Kind: mqttTransitionCloseAdmit, PrevTxn: l.rec.OwnerTxn, Rev: l.rec.Rev + 1,
-				Gen: l.rec.Gen, Tenure: l.rec.Tenure, OwnerTxn: l.rec.OwnerTxn,
-			},
-			Prev: l.rec, PrevSeq: l.seq,
-			Auth: &mqttOutboundAuthority{
-				ID: e.id, Epoch: e.epoch, Gen: l.rec.Gen, Tenure: l.rec.Tenure,
-				State: mqttAuthorityClosed, Rev: l.rec.Rev + 1, Txn: "txn-close-sealed",
-				OwnerTxn: l.rec.OwnerTxn,
-			},
-			Closure: &mqttGenClosure{
-				ID: e.id, Epoch: e.epoch, Gen: l.rec.Gen, Txn: "txn-close-sealed",
-			},
-			Extra: []mqttTransitionMember{seal},
-		}))
+		closing := testClosure(e, l.rec, l.seq, "txn-close-sealed")
+		closing.Extra = []mqttTransitionMember{seal}
+		_, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 		return err
 	}(); oerr != nil {
 		t.Fatalf("the composer's own sealed member was refused: %v", oerr)

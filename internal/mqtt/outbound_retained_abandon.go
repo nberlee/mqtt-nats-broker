@@ -168,10 +168,15 @@ func (sess *mqttSession) stepRetainedAbandonment(a *mqttRetainedAbandonment) mqt
 	if len(a.handles) > 0 {
 		var keep []*mqttTransitionHandle
 		for _, h := range a.handles {
-			switch sess.settleCustodyHandle(h) {
+			switch sess.settleCustodyHandle(h, sess.admitBackgroundAuthority) {
 			case mqttTransitionLanded, mqttTransitionSuperseded:
 				a.landed = true
 			case mqttTransitionNeverLanded:
+			case mqttTransitionRetired:
+				// The generation retired: the continuation ends here, neither claiming the
+				// abandonment landed nor applying its ACK-only consequence.
+				a.handles = nil
+				return mqttRetainedAbandonPassed
 			default:
 				keep = append(keep, h)
 			}

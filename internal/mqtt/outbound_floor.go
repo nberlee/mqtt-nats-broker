@@ -337,7 +337,7 @@ func (jsa *mqttJSA) opAdvanceFloor(f *mqttFloorAdvance, txn string) error {
 	}
 	_, cerr := jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: f.ID, Epoch: f.Epoch, Txn: txn, Op: "op-" + txn,
+			ID: f.ID, Epoch: f.Epoch, Txn: txn, Scope: f.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionAdvanceFloor, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -345,7 +345,7 @@ func (jsa *mqttJSA) opAdvanceFloor(f *mqttFloorAdvance, txn string) error {
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: members,
 	})
@@ -724,6 +724,9 @@ func (jsa *mqttJSA) mqttLandingProofDecided(attempts []mqttCustodyAttempt, lin s
 		case mqttTransitionLanded, mqttTransitionSuperseded:
 			return mqttLandingCommitted, true
 		case mqttTransitionNeverLanded:
+		case mqttTransitionRetired:
+			// RETIRED proves neither a landing nor its absence.
+			decided = false
 		default:
 			decided = false
 		}
@@ -743,6 +746,10 @@ const (
 	// mqttAbsenceUncertain: an inconsistency (a duty inside the inventory still names it) or an
 	// inventory that could not be read whole. Proves nothing.
 	mqttAbsenceUncertain
+	// mqttAbsenceRetired: the exchange's generation is RETIRED (issue #133), its inventory
+	// reclaimed with it. The work is obsolete and ends, with no acknowledgement consequence: it
+	// is neither an ending the floor proved nor a sign that nothing landed.
+	mqttAbsenceRetired
 )
 
 // classifyExchangeAbsence classifies an exchange that read ABSENT. THE ONE DEFINITION:
@@ -758,6 +765,11 @@ const (
 // matter, since its duty decoded and named that lineage. Cost: one traversal per absence, which
 // is rare.
 func (jsa *mqttJSA) classifyExchangeAbsence(id, epoch, gen, lin string, proof mqttLandingProof) mqttAbsenceVerdict {
+	// A RETIRED GENERATION FIRST: its inventory is purged, so the traversal below would read an
+	// empty inventory as a proved ending, and an unproven landing as nothing landed.
+	if s, _ := jsa.genStandingFromLoad(epoch, getHash(id), gen, jsa.loadOutboundAuthority(id, epoch)); s == mqttGenRetired {
+		return mqttAbsenceRetired
+	}
 	if proof == mqttLandingUnproven {
 		return mqttAbsenceUnproven
 	}

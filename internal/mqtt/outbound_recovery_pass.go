@@ -364,13 +364,13 @@ func (as *mqttAccountSessionManager) visitAdmittedRecoveryRoot(s *Server, root *
 	if !charge() {
 		return
 	}
-	closure, _, cst := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen)
+	_, _, cst := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen)
 	if cst != mqttOutboundValid && cst != mqttOutboundAbsent {
 		s.Debugf("MQTT recovery pass: the closure of %q/%q reads %v, so its disposition is unknown",
 			root.ID, root.Gen, cst)
 		return
 	}
-	discarded := cst == mqttOutboundValid && closure.Discard
+	discarded := cst == mqttOutboundValid
 	swept, out, serr := as.jsa.sweepOneBatchCharged(root, charge, discarded)
 	if serr != nil {
 		// AN UNRESOLVED READ IS NOT AN ANSWER, and sweepOneBatch stops rather than reporting a

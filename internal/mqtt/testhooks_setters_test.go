@@ -293,30 +293,6 @@ func setMQTTTestReDriveClock(h func() time.Time) func() {
 
 // ---- from sess_teardown.go ----
 
-// setMQTTTestRetirementLoadHook installs (or, with nil, clears) the watermark load
-// hook and returns a function that restores the previous value.
-func setMQTTTestRetirementLoadHook(h func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus)) func() {
-	prev := mqttTestRetirementLoadHookV.Load()
-	if h == nil {
-		mqttTestRetirementLoadHookV.Store(nil)
-	} else {
-		mqttTestRetirementLoadHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRetirementLoadHookV.Store(prev) })
-}
-
-// setMQTTTestRetirementStoreHook installs (or, with nil, clears) the watermark store
-// hook and returns a function that restores the previous value.
-func setMQTTTestRetirementStoreHook(h func(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error)) func() {
-	prev := mqttTestRetirementStoreHookV.Load()
-	if h == nil {
-		mqttTestRetirementStoreHookV.Store(nil)
-	} else {
-		mqttTestRetirementStoreHookV.Store(&h)
-	}
-	return mqttTestRestoreOnce(func() { mqttTestRetirementStoreHookV.Store(prev) })
-}
-
 // ---- from sess_uncertain.go ----
 
 func setMQTTTestResolveReattemptHook(h func(sess *mqttSession)) func() {

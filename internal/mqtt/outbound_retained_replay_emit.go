@@ -68,6 +68,9 @@ func (sess *mqttSession) runRetainedStep(c *client, r *mqttRetainedReplay, op fu
 				return mqttRetainedStepLanded
 			case mqttTransitionUnresolved:
 				return mqttRetainedStepUnresolved
+			case mqttTransitionRetired:
+				// The generation retired: the replay step is obsolete and is not retried.
+				return mqttRetainedStepEnded
 			}
 		}
 		refused++
@@ -84,7 +87,7 @@ func (sess *mqttSession) runRetainedStep(c *client, r *mqttRetainedReplay, op fu
 // subscription did, so only a settled verdict, or the bound, returns.
 func (sess *mqttSession) settleRetainedHandle(c *client, r *mqttRetainedReplay, h *mqttTransitionHandle) mqttTransitionVerdict {
 	for attempt := 0; ; attempt++ {
-		v := sess.settleCustodyHandle(h)
+		v := sess.settleCustodyHandle(h, sess.admitBackgroundAuthority)
 		if v != mqttTransitionUnresolved || attempt+1 >= mqttRetainedStepAttempts {
 			return v
 		}
@@ -384,6 +387,13 @@ func (sess *mqttSession) admitRetainedCopyOnce(c *client, r *mqttRetainedReplay,
 			}
 			if v == mqttTransitionUnresolved {
 				// Still unresolved past the bound: possibly landed, so never unadmitted.
+				return mqttLandedRegister{}, false, true
+			}
+			if v == mqttTransitionRetired {
+				// The generation retired: nothing is re-admitted or unadmitted for it.
+				sess.mu.Lock()
+				sess.custody.attemptRetired(gen, f.nonce, out.Handle)
+				sess.mu.Unlock()
 				return mqttLandedRegister{}, false, true
 			}
 		}

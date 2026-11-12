@@ -3,9 +3,8 @@
 package mqtt
 
 import (
+	"errors"
 	"testing"
-
-	"github.com/nats-io/nuid"
 )
 
 // End-to-end coverage for the retirement classifier (qos2_retire_classify.go), issue #40
@@ -42,32 +41,21 @@ func setMQTTTestQoS2RetireSampledHook(h func(verdict mqttQoS2RetireVerdict)) fun
 	return func() { mqttTestQoS2RetireSampledHookV.Store(prev) }
 }
 
-// testPlantPubRelRetirement writes a retirement watermark on the publisher's own client,
-// with the generation and marker sequence the case needs, and returns nothing: the fact
-// is durable and the classifier reads it through the same loadGenRetirement every other
-// reader uses.
-func testPlantPubRelRetirement(t *testing.T, b *testQoS2Broker, gen string, markerSeq uint64) {
+// testPlantPubRelRetirement makes the publisher's generation gen noncurrent in its authority
+// (testRetireGeneration); later has a later generation installed after it and torn down as
+// well, so the closed authority's last generation is not ours. The classifier reads the
+// standing through the same authority read every other reader uses.
+func testPlantPubRelRetirement(t *testing.T, b *testQoS2Broker, gen string, later bool) {
 	t.Helper()
-	cl := testMQTTGetClient(t, b.s, b.pubID)
-	sess := cl.mqtt.sess
-	sess.mu.Lock()
-	idHash, id := sess.idHash, sess.id
-	sess.mu.Unlock()
-	subject := mqttTeardownSubject(b.asm.domainTk, idHash)
-	_, seq, status := b.jsa.loadGenRetirement(b.asm.domainTk, idHash)
-	var expect uint64
-	if status != mqttRetirementAbsent {
-		expect = seq
+	if later {
+		testRetireGenerationUnderLater(t, b.asm, b.pubID, gen)
+		return
 	}
-	r := &mqttGenRetirement{ID: id, Gen: gen, MarkerSeq: markerSeq, Nonce: nuid.Next(), Origin: "peer"}
-	if _, err := b.jsa.storeGenRetirementCAS(subject, expect, r); err != nil {
-		t.Fatalf("planting the retirement watermark: %v", err)
-	}
+	testRetireGeneration(t, b.asm, b.pubID, gen)
 }
 
 // testPubRelSessionFacts returns the publisher session's incarnation generation and its
-// acknowledged record sequence — the two terms the classifier compares the watermark
-// against.
+// acknowledged record sequence.
 func testPubRelSessionFacts(t *testing.T, b *testQoS2Broker) (gen string, seq uint64) {
 	t.Helper()
 	sess := testMQTTGetClient(t, b.s, b.pubID).mqtt.sess
@@ -76,15 +64,15 @@ func testPubRelSessionFacts(t *testing.T, b *testQoS2Broker) (gen string, seq ui
 	return sess.gen, sess.seq
 }
 
-// TestPubRelRefusesUnderAMatchingRetirement is the first dimension: a valid watermark
-// naming THIS incarnation.
+// TestPubRelRefusesUnderAMatchingRetirement: THIS incarnation's generation reads noncurrent,
+// and the closed authority still names it as its last generation (consult 10's bare-Gen case).
 //
-// The hold is one the discard never enumerated, so nothing competes for the claim and
-// both existing fences pass. The only thing that can stop the fan-out is the watermark.
+// The hold is one the discard never enumerated, so nothing competes for the claim and both
+// existing fences pass. The only thing that can stop the fan-out is the classification.
 //
-// Mutations that must fail this: dropping the Gen == sessGen arm; using the exchange's
-// rec.gen instead of the session generation; moving the classifier after the onward
-// store.
+// Mutations that must fail this: classifying "current" on Gen equality alone without the
+// serving state; using the exchange's rec.gen instead of the session generation; moving the
+// classifier after the onward store.
 func TestPubRelRefusesUnderAMatchingRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-match")
@@ -94,12 +82,11 @@ func TestPubRelRefusesUnderAMatchingRetirement(t *testing.T) {
 	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("retired-payload"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
 
-	// The peer's teardown recorded its retirement and then died before deleting
-	// anything — or its enumeration never named this subject. Either way the fact is
-	// durable and the hold is still here, which is exactly the population the claim
-	// cannot see.
+	// The peer's teardown claimed the generation and then died before deleting anything —
+	// or its enumeration never named this subject. Either way the fact is durable and the
+	// hold is still here, which is exactly the population the claim cannot see.
 	gen, _ := testPubRelSessionFacts(t, b)
-	testPlantPubRelRetirement(t, b, gen, 1)
+	testPlantPubRelRetirement(t, b, gen, false)
 
 	testQoS2SendPubRel(t, b.cp, pi)
 	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonPacketIDNotFound {
@@ -120,17 +107,13 @@ func TestPubRelRefusesUnderAMatchingRetirement(t *testing.T) {
 	}
 }
 
-// TestPubRelRefusesUnderASupersedingMarkerSequence is the second dimension, and the
-// reason the classification cannot be generation equality alone.
+// TestPubRelRefusesOnceALaterGenerationEndedOurs: a successor's Clean Start made our
+// generation outstanding and its own generation was torn down after it, so the authority's
+// last generation is not ours. Our generation's standing still refuses.
 //
-// The watermark names a DIFFERENT generation — retire G1, then create and retire G2, and
-// the single slot names G2 while this broker still serves G1 — but its marker landed at a
-// $MQTT_sess sequence beyond the record this broker is acknowledged for, which proves a
-// teardown claimed this client's record subject after ours.
-//
-// Mutations that must fail this: dropping the MarkerSeq > sess.seq arm; requiring
-// generation equality; turning the || into &&.
-func TestPubRelRefusesUnderASupersedingMarkerSequence(t *testing.T) {
+// Mutation that must fail this: classifying on the authority's last generation instead of the
+// session's own.
+func TestPubRelRefusesOnceALaterGenerationEndedOurs(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-superseded")
 	pi := uint16(42)
@@ -139,10 +122,8 @@ func TestPubRelRefusesUnderASupersedingMarkerSequence(t *testing.T) {
 	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("superseded-payload"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
 
-	// A LATER generation's retirement replaced the slot. Our own generation is
-	// therefore unnameable by the watermark, and only the sequence dimension can speak.
-	_, ourSeq := testPubRelSessionFacts(t, b)
-	testPlantPubRelRetirement(t, b, mqttNewSessGen(), ourSeq+1)
+	gen, _ := testPubRelSessionFacts(t, b)
+	testPlantPubRelRetirement(t, b, gen, true)
 
 	testQoS2SendPubRel(t, b.cp, pi)
 	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonPacketIDNotFound {
@@ -155,14 +136,12 @@ func TestPubRelRefusesUnderASupersedingMarkerSequence(t *testing.T) {
 	}
 }
 
-// TestPubRelProceedsUnderANonReachingRetirement is the POSITIVE CONTROL, and without
-// it every mutation above could be "killed" by a classifier that simply refuses
-// everything.
+// TestPubRelProceedsUnderAnotherGenerationsRetirement is the POSITIVE CONTROL, and without it
+// every mutation above could be "killed" by a classifier that simply refuses everything.
 //
-// A valid watermark for another generation whose marker does NOT reach past our own
-// record is evidence about a retirement this incarnation outlived. The release must
-// deliver.
-func TestPubRelProceedsUnderANonReachingRetirement(t *testing.T) {
+// Another generation of the lifecycle reading retired says nothing about ours, which the
+// authority still serves. The release must deliver.
+func TestPubRelProceedsUnderAnotherGenerationsRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-outlived")
 	pi := uint16(43)
@@ -170,23 +149,20 @@ func TestPubRelProceedsUnderANonReachingRetirement(t *testing.T) {
 	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("outlived-payload"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
 
-	// A retirement of an EARLIER generation, at a marker sequence our own record has
-	// already passed: this session was created after that teardown.
-	_, ourSeq := testPubRelSessionFacts(t, b)
-	if ourSeq == 0 {
-		t.Fatal("the publisher session has no acknowledged record sequence, so this case cannot be built")
-	}
-	testPlantPubRelRetirement(t, b, mqttNewSessGen(), ourSeq)
+	// A LATER generation of the lifecycle reads retired: the allocator moved past it.
+	gen, _ := testPubRelSessionFacts(t, b)
+	l, ord, _ := mqttParseGenToken(gen)
+	testPlantPubRelRetirement(t, b, testLifecycleGen(t, l, ord+5), false)
 
 	testQoS2SendPubRel(t, b.cp, pi)
 	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonSuccess {
-		t.Fatalf("PUBCOMP reason = 0x%x, want 0x00: a retirement this incarnation outlived authorizes no refusal", reason)
+		t.Fatalf("PUBCOMP reason = 0x%x, want 0x00: another generation's retirement authorizes no refusal", reason)
 	}
 	b.consumeOne(t, "outlived-payload")
 }
 
-// TestPubRelProceedsWithNoRetirement is the other positive control: the ordinary
-// case, where no watermark exists at all.
+// TestPubRelProceedsWithNoRetirement is the other positive control: the ordinary case, where
+// nothing retired.
 func TestPubRelProceedsWithNoRetirement(t *testing.T) {
 	t.Parallel()
 	b := testQoS2Setup(t, "f036-retire-absent")
@@ -196,7 +172,7 @@ func TestPubRelProceedsWithNoRetirement(t *testing.T) {
 	testMQTTReadPubRecV5(t, b.rp, pi)
 	testQoS2SendPubRel(t, b.cp, pi)
 	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonSuccess {
-		t.Fatalf("PUBCOMP reason = 0x%x, want 0x00 with no retirement watermark at all", reason)
+		t.Fatalf("PUBCOMP reason = 0x%x, want 0x00 with no retirement at all", reason)
 	}
 	b.consumeOne(t, "ordinary-payload")
 }
@@ -225,10 +201,15 @@ func TestPubRelFailsClosedOnAnUnreadableRetirement(t *testing.T) {
 	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("undecidable-payload"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
 
-	// A watermark this broker cannot interpret. It is never repaired in place and never
-	// read leniently, because it may name a retirement newer than anything visible here.
-	restore := setMQTTTestRetirementLoadHook(func(string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
-		return nil, 7, mqttRetirementCorrupt
+	// An authority this broker cannot read. It is never read leniently, because it may say
+	// the generation is no longer served. Scoped to the publisher's authority subject: the
+	// hook is process-global.
+	authSubj := mqttOutboundAuthoritySubject(getHash(b.pubID))
+	restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
+		if subject == authSubj {
+			return errors.New("injected: the authority read is indeterminate")
+		}
+		return nil
 	})
 	defer restore()
 
@@ -252,13 +233,11 @@ func TestPubRelFailsClosedOnAnUnreadableRetirement(t *testing.T) {
 }
 
 // TestPubRelFailsClosedWhileOurOwnWriteIsUnresolved is the third input to the
-// unresolved arm, and it is a distinct fact from an unreadable watermark.
+// unresolved arm, and it is a distinct fact from an unreadable authority.
 //
-// While a write of ours is unresolved, sess.seq still holds the PRE-WRITE base. A
-// classifier that sampled the sequence without the uncertainty flag beside it would
-// compare a marker against a base nobody has classified — and would then answer about a
-// record state that may already have moved. So the release fails closed, exactly as an
-// unreadable watermark does, and both records stay.
+// While a write of ours is unresolved this session cannot say which record it is acknowledged
+// for, so it does not answer for its generation either. The release fails closed, exactly as
+// an unreadable authority does, and both records stay.
 //
 // Mutation: permitting seqUncertain to proceed must fail this test. Without it that
 // mutation SURVIVES, because every other case has a resolved session.
@@ -277,7 +256,7 @@ func TestPubRelFailsClosedWhileOurOwnWriteIsUnresolved(t *testing.T) {
 	// broker cannot decide, and 0x92 would free the packet identifier over an
 	// undecided question.
 	gen, _ := testPubRelSessionFacts(t, b)
-	testPlantPubRelRetirement(t, b, gen, 1)
+	testPlantPubRelRetirement(t, b, gen, false)
 
 	sess := testMQTTGetClient(t, b.s, b.pubID).mqtt.sess
 	sess.mu.Lock()
@@ -378,7 +357,7 @@ func TestPubRelClassifiesBeforeTheOnwardStore(t *testing.T) {
 // Mutations that must fail this: memoizing a negative result (the second release
 // proceeds and the witness receives the message).
 func TestPubRelMemoizesOnlyTheMatchingRetirement(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): its last step installs the process-global load hook.
 	b := testQoS2Setup(t, "f036-retire-memo")
 
 	// 1. No watermark: the release proceeds, and this is the NEGATIVE observation that
@@ -394,7 +373,7 @@ func TestPubRelMemoizesOnlyTheMatchingRetirement(t *testing.T) {
 
 	// 2. The retirement lands. A cached "absent" would make this release proceed.
 	gen, _ := testPubRelSessionFacts(t, b)
-	testPlantPubRelRetirement(t, b, gen, 1)
+	testPlantPubRelRetirement(t, b, gen, false)
 	pi = uint16(48)
 	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("memo-second"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
@@ -405,18 +384,56 @@ func TestPubRelMemoizesOnlyTheMatchingRetirement(t *testing.T) {
 	}
 	testQoS2ExpectNoDelivery(t, b)
 
-	// 3. The slot is replaced by a later generation's retirement whose marker does NOT
-	//    reach past our record, so neither dimension can speak from the durable state
-	//    any more. The remembered positive fact is what must still refuse.
-	_, ourSeq := testPubRelSessionFacts(t, b)
-	testPlantPubRelRetirement(t, b, mqttNewSessGen(), ourSeq)
+	// 3. The authority can no longer be read, so the durable state cannot speak at all. The
+	//    remembered positive fact is what must still refuse.
+	authSubj := mqttOutboundAuthoritySubject(getHash(b.pubID))
+	restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
+		if subject == authSubj {
+			return errors.New("injected: the authority read is indeterminate")
+		}
+		return nil
+	})
+	defer restore()
 	pi = uint16(49)
 	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("memo-third"))
 	testMQTTReadPubRecV5(t, b.rp, pi)
 	testQoS2SendPubRel(t, b.cp, pi)
 	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonPacketIDNotFound {
-		t.Fatalf("third PUBCOMP reason = 0x%x, want 0x%x: a proven retirement survives its slot being replaced",
+		t.Fatalf("third PUBCOMP reason = 0x%x, want 0x%x: a proven retirement is remembered past an unreadable authority",
 			reason, mqttReasonPacketIDNotFound)
 	}
 	testQoS2ExpectNoDelivery(t, b)
+}
+
+// T-qos2-retired (issue #133): the bound session's whole lifecycle is RETIRED, its authority
+// gone: the classification reads the registry and the release is refused, the hold released.
+// Mutation M11: a missing authority read as Proceed.
+func TestPubRelRefusesUnderARetiredLifecycle(t *testing.T) {
+	t.Parallel()
+	b := testQoS2Setup(t, "retired-lifecycle-pubrel")
+	pi := uint16(43)
+	holdSubject := b.holdSubject(t, pi)
+
+	testMQTTPublishV5(t, b.cp, 2, pi, b.topic, []byte("retired-payload"))
+	testMQTTReadPubRecV5(t, b.rp, pi)
+
+	gen, _ := testPubRelSessionFacts(t, b)
+	// The lifecycle's authority is purged and the registry records the lifecycle RETIRED.
+	if err := b.asm.jsa.purgeStream(mqttSessStreamName, mqttOutboundAuthoritySubject(getHash(b.pubID)), 0, false); err != nil {
+		t.Fatalf("purging the authority: %v", err)
+	}
+	testRetireGeneration(t, b.asm, b.pubID, gen)
+	if s, _ := b.asm.genStanding(b.pubID, gen); s != mqttGenRetired {
+		t.Fatalf("fixture: generation %q reads %v, want retired by its lifecycle", gen, s)
+	}
+
+	testQoS2SendPubRel(t, b.cp, pi)
+	if reason, _ := testMQTTReadPubCompV5(t, b.rp, pi); reason != mqttReasonPacketIDNotFound {
+		t.Fatalf("PUBCOMP reason = 0x%x, want 0x%x for a release whose lifecycle retired",
+			reason, mqttReasonPacketIDNotFound)
+	}
+	testQoS2ExpectNoDelivery(t, b)
+	if rec, _, err := b.asm.loadQoS2Record(holdSubject); err != nil || rec != nil {
+		t.Fatalf("the hold survived a refused release: %+v (%v)", rec, err)
+	}
 }

@@ -111,7 +111,7 @@ func (jsa *mqttJSA) opRebindCanonical(r *mqttRebindCanonicalRequest) (mqttOpOutc
 	}
 	return jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: auth.ID, Epoch: auth.Epoch, Txn: r.Txn, Op: r.Op,
+			ID: auth.ID, Epoch: auth.Epoch, Txn: r.Txn, Scope: r.Ent.Gen, Op: r.Op,
 			Kind: mqttTransitionRebindCanonical, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: r.Ent.Gen, Tenure: r.Ent.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -120,7 +120,7 @@ func (jsa *mqttJSA) opRebindCanonical(r *mqttRebindCanonicalRequest) (mqttOpOutc
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: r.Txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: auth.Life,
 		},
 		Extra: []mqttTransitionMember{{subj: r.Subject, expect: r.Expect, body: body}},
 	})
@@ -229,12 +229,17 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 	}
 	// The exchange, read AFTER the record's absence: a PUBCOMP ends it before any disposal.
 	x, _, xerr := jsa.loadOutboundExchange(sess.id, epoch, gen, cur.Lin)
-	if xerr != nil && mqttExchangeReadAbsent(xerr) &&
-		jsa.classifyExchangeAbsence(sess.id, epoch, gen, cur.Lin, mqttLandingValidatedRegister) == mqttAbsenceReclaimed {
-		// RECLAIMED behind the floor (issue #114): the slot's validated register proves the exchange
-		// landed, and a complete inventory without a representative proves it ended — so PUBCOMP
-		// completed it, and there is nothing left to re-materialise.
-		return mqttRematerializeDone
+	if xerr != nil && mqttExchangeReadAbsent(xerr) {
+		switch jsa.classifyExchangeAbsence(sess.id, epoch, gen, cur.Lin, mqttLandingValidatedRegister) {
+		case mqttAbsenceReclaimed:
+			// RECLAIMED behind the floor (issue #114): the slot's validated register proves the
+			// exchange landed, and a complete inventory without a representative proves it ended —
+			// so PUBCOMP completed it, and there is nothing left to re-materialise.
+			return mqttRematerializeDone
+		case mqttAbsenceRetired:
+			// Its generation retired: nothing is left to re-materialise for it.
+			return mqttRematerializeDone
+		}
 	}
 	if xerr != nil || x == nil {
 		return mqttRematerializeRetry
@@ -276,7 +281,7 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 		} else {
 			v = jsa.resolveTransitionHandle(out.Handle)
 			if v == mqttTransitionUnresolved {
-				_ = jsa.abortTransition(&out.Handle.attempt)
+				_ = jsa.abortTransition(&out.Handle.attempt, nil)
 				v = jsa.resolveTransitionHandle(out.Handle)
 			}
 		}
@@ -290,6 +295,11 @@ func (sess *mqttSession) rematerializeOnce(c *client, rm *mqttRematerialization)
 			return mqttRematerializeDone // the successor's recovery owns it now
 		}
 		return mqttRematerializeRetry
+	case mqttTransitionRetired:
+		// The generation retired: the rebind is obsolete, and the published candidate keeps its
+		// exact cleanup.
+		sess.disposeRematerializeCandidate(subject, pubRelSubject, candidate)
+		return mqttRematerializeDone
 	}
 	return mqttRematerializeRetry // unresolved: the candidate is kept, nothing is guessed
 }

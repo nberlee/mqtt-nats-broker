@@ -2,7 +2,6 @@ package mqtt
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -88,6 +87,9 @@ func testNewOrphanEnvWithLogger(t *testing.T, clientID string, h slog.Handler) *
 	asm.sessions[sess.id] = sess
 	asm.sessByHash[sess.idHash] = sess
 	asm.mu.Unlock()
+	// Accepted the way a CONNECT is, so the session's generation is one its lifecycle allocated
+	// and its authority serves it: a record no acceptance wrote is not one the sweep can classify.
+	testAcceptRigConnection(t, asm, sess, c)
 	e := &testOrphanEnv{s: s, asm: asm, sess: sess}
 	e.persist(t)
 	deadline := time.Now().Add(10 * time.Second)
@@ -133,38 +135,22 @@ func (e *testOrphanEnv) forget(t *testing.T) {
 	e.retire(t)
 }
 
-// retire plants a valid retirement watermark naming this session's own generation — the
-// one fact that proves the generation was durably discarded rather than merely absent
-// from this broker's view. See retirementProvenFor.
+// retire makes this session's own generation noncurrent in its authority — the one fact that
+// proves the generation was durably discarded rather than merely absent from this broker's
+// view. See retirementProvenFor.
 func (e *testOrphanEnv) retire(t *testing.T) {
 	t.Helper()
 	e.retireClient(t, e.sess.id, e.sess.gen)
 }
 
-// retireClient plants the watermark for any client ID and generation, for a fixture
-// whose candidate belongs to a session other than the env's own.
+// retireClient retires any client ID's generation, for a fixture whose candidate belongs to a
+// session other than the env's own.
 func (e *testOrphanEnv) retireClient(t *testing.T, clientID, gen string) {
 	t.Helper()
 	idHash := getHash(clientID)
-	subject := mqttTeardownSubject(e.asm.domainTk, idHash)
-	_, seq, status := e.asm.jsa.loadGenRetirement(e.asm.domainTk, idHash)
-	var expect uint64
-	if status != mqttRetirementAbsent {
-		expect = seq
-	}
-	r := &mqttGenRetirement{
-		ID:        clientID,
-		Gen:       gen,
-		MarkerSeq: 1,
-		Nonce:     nuid.Next(),
-		Origin:    "node1",
-	}
-	if _, err := e.asm.jsa.storeGenRetirementCAS(subject, expect, r); err != nil {
-		t.Fatalf("planting the retirement watermark for %q: %v", clientID, err)
-	}
-	// The memo is positive-only and process-local, so a fixture that plants a watermark
-	// AFTER a pass already read an absent one must not be answered from that pass's
-	// memory. It never is — negative outcomes are not cached — and this assertion is
+	testRetireGeneration(t, e.asm, clientID, gen)
+	// The memo is positive-only and process-local, so a fixture that retires a generation
+	// AFTER a pass already read it current must not be answered from that pass's memory. It never is — negative outcomes are not cached — and this assertion is
 	// here so a future change that starts caching them fails a fixture rather than
 	// silently retaining forever.
 	if e.asm.retirementProvenFor(idHash, gen) != mqttRetireProven {
@@ -2359,6 +2345,20 @@ func TestOrphanSweepLeavesForeignConsumersAlone(t *testing.T) {
 // Teardown marker adoption
 // ---------------------------------------------------------------------------
 
+// claimLikeADeadOwner commits the session's teardown claim batch as an owner that then died
+// leaves it (issue #133): the marker with its generation's Outstanding entry, binding record and
+// discarding closure, and nothing deleted.
+func (e *testOrphanEnv) claimLikeADeadOwner(t *testing.T) {
+	t.Helper()
+	prev, prevSeq, err := e.asm.jsa.requireAuthority(e.sess.id, e.asm.sessStreamEpoch)
+	if err != nil || prev == nil {
+		t.Fatalf("no authority to claim under: %v", err)
+	}
+	if err := testCommitTeardownClaim(e.asm, e.sess.id, prev, prevSeq); err != nil {
+		t.Fatalf("committing the teardown claim: %v", err)
+	}
+}
+
 // TestOrphanSweepAdoptsAnAbandonedTeardown pins that a marked record does not pin
 // its resources forever, and that a marker inside the grace still does.
 func TestOrphanSweepAdoptsAnAbandonedTeardown(t *testing.T) {
@@ -2367,21 +2367,7 @@ func TestOrphanSweepAdoptsAnAbandonedTeardown(t *testing.T) {
 	holdSubject := e.hold(t, 1, nuid.Next(), "payload")
 
 	// Mark the record as a broker that claimed the teardown and then died.
-	ps, seq, err := e.asm.loadFenceSession(e.sess.idHash)
-	if err != nil || ps == nil {
-		t.Fatalf("loading the session record: %v", err)
-	}
-	ps.Teardown = &mqttSessTeardown{Origin: "node9", Nonce: nuid.Next(), StartedAt: time.Now().Unix()}
-	// The marker's LINEAGE, exactly as claimTeardown stamps it: an identity of its own,
-	// parented to the record it claimed. The finisher retires that parent BY NAME, so a
-	// marker whose PWID names nothing is a record no teardown could have written — and
-	// one whose retirement can never be recorded.
-	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
-	subject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.sess.idHash
-	if _, err := e.asm.jsa.storeMsg(subject, 0, testMustJSON(t, ps)); err != nil {
-		t.Fatalf("writing the teardown marker: %v", err)
-	}
-	_ = seq
+	e.claimLikeADeadOwner(t)
 	e.dropLocalSession()
 
 	// Inside the grace: the marked record still protects everything it names. The
@@ -2420,20 +2406,7 @@ func TestOrphanSweepFailedAdoptionKeepsReferencesLive(t *testing.T) {
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "payload")
 
-	ps, _, err := e.asm.loadFenceSession(e.sess.idHash)
-	if err != nil || ps == nil {
-		t.Fatalf("loading the session record: %v", err)
-	}
-	ps.Teardown = &mqttSessTeardown{Origin: "node9", Nonce: nuid.Next(), StartedAt: time.Now().Unix()}
-	// The marker's LINEAGE, exactly as claimTeardown stamps it: an identity of its own,
-	// parented to the record it claimed. The finisher retires that parent BY NAME, so a
-	// marker whose PWID names nothing is a record no teardown could have written — and
-	// one whose retirement can never be recorded.
-	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
-	subject := mqttSessStreamSubjectPrefix + e.asm.domainTk + e.sess.idHash
-	if _, err := e.asm.jsa.storeMsg(subject, 0, testMustJSON(t, ps)); err != nil {
-		t.Fatalf("writing the teardown marker: %v", err)
-	}
+	e.claimLikeADeadOwner(t)
 	e.dropLocalSession()
 	e.setGraces(t, 0, 0)
 
@@ -2514,23 +2487,8 @@ func TestOrphanSweepRunsFromTheAccountSweepLoop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Retirement condemnation and the PUBREL orphan class
+// The PUBREL orphan class
 // ---------------------------------------------------------------------------
-
-func (e *testOrphanEnv) retirement(t *testing.T, idHash string) (*mqttGenRetirement, mqttRetirementStatus) {
-	t.Helper()
-	r, _, status := e.asm.jsa.loadGenRetirementRecord(e.asm.domainTk, idHash)
-	return r, status
-}
-
-func (e *testOrphanEnv) sessRecord(t *testing.T, idHash string) *mqttPersistedSession {
-	t.Helper()
-	ps, _, err := e.asm.loadFenceSession(idHash)
-	if err != nil {
-		t.Fatalf("loading the session record of %q: %v", idHash, err)
-	}
-	return ps
-}
 
 // testCreatePubRelConsumer provisions a session incarnation's PUBREL consumer with
 // exactly the three names mqttPubRelNames derives, as the broker does.
@@ -2629,36 +2587,9 @@ func (e *testOrphanEnv) retireOwnedPubRel(t *testing.T, clientID string, o testO
 	durable, idHash, gen := o.durable, o.idHash, o.gen
 
 	// The clean start that discards the generation.
-	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(e.asm.domainTk, idHash))
-	if lerr != nil {
-		t.Fatalf("fixture: %q has no standing session record: %v", clientID, lerr)
-	}
-	ps := &mqttPersistedSession{}
-	if derr := json.Unmarshal(smsg.Data, ps); derr != nil {
-		t.Fatalf("decoding the standing session record of %q: %v", clientID, derr)
-	}
-	intent := &mqttHandoffIntent{
-		ID: "intent-" + mqttNewInflightNonce(), PrevGen: first.Gen, PrevTenure: first.Tenure,
-		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: smsg.Sequence,
-		Gen: mqttNewSessGen(), Tenure: mqttNewInflightNonce(), CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
-			SessWID: ps.WID, SessSeq: smsg.Sequence, Reason: mqttRetireCleanStart, Discard: true,
-		},
-	}
-	if _, err := jsa.opPrepareHandoff(clientID, epoch, mqttNewInflightNonce(), intent); err != nil {
-		t.Fatalf("preparing the clean start of %q: %v", clientID, err)
-	}
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: clientID, Epoch: epoch, IntentID: intent.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the clean start's metadata half for %q: %v", clientID, err)
-	}
-	if _, err := jsa.opFinalizeHandoff(clientID, epoch, mqttNewInflightNonce(), intent.ID); err != nil {
-		t.Fatalf("finalizing the discarding clean start of %q: %v", clientID, err)
-	}
+	_, _ = idHash, first
+	testAcceptAndBind(t, jsa, e.asm.domainTk, clientID, epoch, "txn-clean-"+mqttNewInflightNonce(), _EMPTY_,
+		mqttNewInflightNonce(), true, mqttClosingTargets{})
 	if err := jsa.requireDiscardingClosure(clientID, epoch, gen); err != nil {
 		t.Fatalf("fixture: generation %q of %q was not closed discarding: %v", gen, clientID, err)
 	}
@@ -2688,7 +2619,9 @@ func (e *testOrphanEnv) retireOwnedPubRel(t *testing.T, clientID string, o testO
 // sweep accepts. A missing ownership record is WITHHELD, never read as permission.
 func (e *testOrphanEnv) unownedPubRelConsumer(t *testing.T, clientID string) string {
 	t.Helper()
-	gen := mqttNewSessGen()
+	// A generation of a lifecycle this client's registry records as retired: the client has no
+	// authority, as a crashed broker's leaves none it can reach.
+	gen := testLifecycleGen(t, 1, 0)
 	durable := testCreatePubRelConsumer(t, e, getHash(clientID), gen)
 	e.retireClient(t, clientID, gen)
 	return durable
@@ -2717,109 +2650,6 @@ func testPubRelDiscovered(cands []*mqttPubRelCandidate, durable string) bool {
 	return false
 }
 
-// TestOrphanSweepCondemnsARetiredSurvivor is test 4, reader 3: with no CONNECT and no
-// live winner, the sweep is what recognises the survivor of the claim-won deletion
-// window — and it MARKS ONLY, leaving the finish to the marker-adoption class on a
-// LATER pass.
-//
-// The ordering is the point. Finishing in the same pass would release the record
-// moments after the marker landed, and a survivor broker whose lossy record watch
-// dropped that brief observation would face an ABSENT record instead of a moved one —
-// the issue #40 shape. Deferring keeps it visibly MOVED for at least one backstop cadence.
-//
-// The watermark is produced by the REAL writer, never planted: a planted fence would
-// let this test pass even if no teardown ever recorded one.
-func TestOrphanSweepCondemnsARetiredSurvivor(t *testing.T) {
-	e := testNewOrphanEnv(t, "sweep-condemn")
-	e.setGraces(t, 0, 0)
-	idHash := e.sess.idHash
-	retiredGen := e.sess.gen
-
-	base, baseSeq, err := e.asm.loadFenceSession(idHash)
-	if err != nil || base == nil {
-		t.Fatalf("loading the base record: %+v %v", base, err)
-	}
-
-	// Stage the window: the winner is parked between its claim and its deletions while
-	// a same-base resume applies over the marker.
-	gate := newTestHookGate(t)
-	restore := setMQTTTestTeardownClaimedHook(func(sess *mqttSession, _ string, markerSeq uint64) {
-		if !gate.enter() {
-			return
-		}
-		defer gate.leave()
-		if sess != e.sess {
-			return
-		}
-		survivor := *base
-		survivor.Teardown = nil
-		survivor.WID, survivor.PWID = mqttNewRecordWID(), base.WID
-		if _, serr := mqttStoreSessionRecordCAS(&e.asm.jsa, e.asm.domainTk, &survivor, idHash, markerSeq); serr != nil {
-			t.Errorf("planting the surviving record: %v", serr)
-		}
-	})
-	if cerr := e.sess.clear(false); !errors.Is(cerr, errMQTTClearSuperseded) {
-		restore()
-		t.Fatalf("clear() = %v, want the superseded sentinel", cerr)
-	}
-	restore()
-
-	if r, status := e.retirement(t, idHash); status != mqttRetirementValid || r.Gen != retiredGen {
-		t.Fatalf("the teardown recorded no usable fence: status=%v r=%+v", status, r)
-	}
-	// The winner's own arm condemned the survivor; a SECOND late resume erases that
-	// marker too (matrix row 12), which is the state only the sweep can still repair.
-	marked, markedSeq, err := e.asm.loadFenceSession(idHash)
-	if err != nil || marked == nil || marked.Teardown == nil {
-		t.Fatalf("expected the winner to have condemned the survivor, got %+v (err=%v)", marked, err)
-	}
-	again := *base
-	again.Teardown = nil
-	again.WID, again.PWID = mqttNewRecordWID(), base.WID
-	if _, serr := mqttStoreSessionRecordCAS(&e.asm.jsa, e.asm.domainTk, &again, idHash, markedSeq); serr != nil {
-		t.Fatalf("planting the second surviving record: %v", serr)
-	}
-	if baseSeq == 0 {
-		t.Fatal("staging error: the base record was never persisted")
-	}
-
-	// Pass 1 first-sights the hollow pair and authorizes nothing.
-	e.asm.sweepOrphanedQoS2State(e.s)
-	if ps := e.sessRecord(t, idHash); ps == nil || ps.Teardown != nil {
-		t.Fatalf("the first pass must authorize nothing, got %+v", ps)
-	}
-
-	// Pass 2 MARKS, and only marks.
-	e.asm.sweepOrphanedQoS2State(e.s)
-	ps := e.sessRecord(t, idHash)
-	if ps == nil {
-		t.Fatal("the sweep released the record in the pass that marked it: a survivor broker that " +
-			"dropped the marker observation would see an absent record, not a moved one")
-	}
-	if ps.Teardown == nil {
-		t.Fatal("the sweep did not condemn a record whose generation is durably retired")
-	}
-	if ps.Gen != retiredGen {
-		t.Fatalf("the condemnation must preserve the record's content, got generation %q", ps.Gen)
-	}
-
-	// Pass 3 is the adoption class's own first sighting of that marker: still nothing.
-	e.asm.sweepOrphanedQoS2State(e.s)
-	if got := e.sessRecord(t, idHash); got == nil || got.Teardown == nil {
-		t.Fatalf("a first marker observation must authorize no finish, got %+v", got)
-	}
-
-	// Pass 4 finishes it.
-	e.asm.sweepOrphanedQoS2State(e.s)
-	if got := e.sessRecord(t, idHash); got != nil {
-		t.Fatalf("the marker-adoption class never finished the condemnation, got %+v", got)
-	}
-	// Nothing reaps a fence, so it is still there after every pass.
-	if r, status := e.retirement(t, idHash); status != mqttRetirementValid || r.Gen != retiredGen {
-		t.Fatalf("the retirement fence must be permanent: status=%v r=%+v", status, r)
-	}
-}
-
 // TestOrphanSweepReapsAnOrphanedPubRelDurable is test 9: the companion half. A PUBREL
 // durable on $MQTT_out under a spent name was referenced by NOTHING before this class
 // existed — sweepOrphanedConsumers lists $MQTT_msgs only, and the affine pass judges no
@@ -2834,8 +2664,8 @@ func TestOrphanSweepReapsAnOrphanedPubRelDurable(t *testing.T) {
 		// nothing here waits for a second sighting.
 		e := testNewOrphanEnv(t, "pubrel-orphan")
 		durable, _, _ := e.retiredPubRelConsumer(t, "pubrel-gone")
-		// The missing-ownership arm, in the same pass: carrying the issue #40 watermark for its
-		// own generation, and claimed by no ownership record.
+		// The missing-ownership arm, in the same pass: its generation proven retired, and
+		// claimed by no ownership record.
 		unowned := e.unownedPubRelConsumer(t, "pubrel-unowned")
 
 		cands := e.sweepPubRelConsumers(t)

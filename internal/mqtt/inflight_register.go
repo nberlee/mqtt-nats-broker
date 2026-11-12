@@ -10176,7 +10176,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 		// There is no legacy population to serve: pre-alpha, no releases anywhere, so an
 		// unsupported persisted shape is REFUSED rather than migrated or tolerated. A
 		// developer stream carrying older records resets, which is the documented boundary
-		// (the eight broker-owned streams are one recreation unit, issue #70).
+		// (the seven broker-owned streams are one recreation unit, issue #70).
 		if !mqttInflightStateKnown(rec.State) {
 			// A state this broker genuinely does not write. Opaque: the identifier is
 			// reserved, nothing acts on the record, and the identifier space is
@@ -11883,7 +11883,7 @@ func (sess *mqttSession) recoverInflightRegistersOnce(c *client, census *mqttCus
 	// no new identifier can be issued safely. The session completes what it already has
 	// and accepts nothing new; QoS 0 is unaffected. It is loud rather than silent, and
 	// an operator removing the corrupt record lifts it on the next resume. Recreating
-	// the stream is NOT an alternative: the eight broker-owned streams are one
+	// the stream is NOT an alternative: the seven broker-owned streams are one
 	// recreation unit, so the only other route is a whole-bundle reset (issue #70, and
 	// the compatibility boundary in docs/ARCHITECTURE.md).
 	//

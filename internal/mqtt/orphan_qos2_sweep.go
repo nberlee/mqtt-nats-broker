@@ -11,8 +11,8 @@
 //
 // A session-affine $MQTT_Q2AFF_* consumer is deliberately NOT in that list. It
 // accumulates too, and this file used to collect it, but no positive fact can
-// authorize the delete: the retirement watermark records the SESSION generation while
-// the consumer is keyed by an AFFINE generation that outlives incarnations, and
+// authorize the delete: the authority classifies the SESSION generation while the
+// consumer is keyed by an AFFINE generation that outlives incarnations, and
 // $MQTT_out is interest-retained, so a wrong delete destroys acknowledged QoS 2
 // payloads. issue #40 course E removed that route rather than patching it; the leak is a
 // stated residual in docs/CONFORMANCE.md.
@@ -226,14 +226,6 @@ func (as *mqttAccountSessionManager) sweepOrphanedQoS2State(s *Server) {
 	// not race ahead of teardown, so classifying orphans against a pre-adoption view
 	// would protect resources the adoption has just deleted.
 	as.adoptAbandonedTeardowns(s)
-
-	// (1b) Then condemn the survivors of the claim-won deletion window: records whose
-	// generation is durably RETIRED but which carry no marker, because an unconditional
-	// foreign write evicted it (the same-base boundary, docs/CONFORMANCE.md). Ordered AFTER adoption deliberately — a marker this pass
-	// writes must be finished by a LATER pass, so the record stays visibly MOVED for at
-	// least one backstop cadence rather than vanishing moments after it was marked.
-	// See condemnRetiredSurvivors.
-	as.condemnRetiredSurvivors(s)
 
 	// (2) Candidates BEFORE references (invariant 3). A candidate the later walk does
 	// not reference was already unreferenced when it was listed; the reverse order
@@ -500,12 +492,11 @@ func (as *mqttAccountSessionManager) quarantine() *mqttSweepQuarantine {
 
 // Quarantine keys. Each names one resource; the fingerprint that accompanies it
 // names the exact record or consumer currently occupying it.
-func mqttQuarantineHoldKey(subject string) string      { return "hold|" + subject }
-func mqttQuarantineClaimKey(subject string) string     { return "claim|" + subject }
-func mqttQuarantineTeardownKey(idHash string) string   { return "teardown|" + idHash }
-func mqttQuarantineRetirementKey(idHash string) string { return "retire|" + idHash }
-func mqttQuarantineAssignKey(subject string) string    { return "assign|" + subject }
-func mqttQuarantineInflightKey(subject string) string  { return "inflight|" + subject }
+func mqttQuarantineHoldKey(subject string) string     { return "hold|" + subject }
+func mqttQuarantineClaimKey(subject string) string    { return "claim|" + subject }
+func mqttQuarantineTeardownKey(idHash string) string  { return "teardown|" + idHash }
+func mqttQuarantineAssignKey(subject string) string   { return "assign|" + subject }
+func mqttQuarantineInflightKey(subject string) string { return "inflight|" + subject }
 
 func mqttQuarantineSeqFP(seq uint64) string { return strconv.FormatUint(seq, 10) }
 
@@ -614,129 +605,6 @@ func (as *mqttAccountSessionManager) adoptAbandonedTeardowns(s *Server) {
 // ---------------------------------------------------------------------------
 // Retirement condemnation
 // ---------------------------------------------------------------------------
-
-// condemnRetiredSurvivors marks the records that survived a teardown's deletions:
-// unmarked records whose generation the durable $MQTT_teardown watermark says was
-// RETIRED. It is the reader of last resort for that window — the winner's own
-// release-superseded arm covers the case where the winner is alive, and the CONNECT
-// restore covers a client that comes back, but a winner that crashed after recording
-// the retirement leaves a hollow record that nothing else revisits.
-//
-// It walks the watermarks rather than the records: the watermark IS the fact, one per
-// client, and the walk is bounded by the client-ID population exactly as the
-// will-cancel markers are.
-//
-// MARK ONLY, and NOTHING is ever reaped here. Two things follow from that, both
-// load-bearing:
-//
-//   - The finish belongs to the marker-adoption class on a LATER pass. Releasing the
-//     record in the same pass would remove it moments after the marker landed, and a
-//     survivor broker whose lossy record watch dropped that brief observation would
-//     face an ABSENT record — the documented issue #40 shape, where a bound Keep Alive 0
-//     client strands. Deferring narrows that route to the case where the survivor's
-//     committed-read backstop does not reach the record in time; it does not close it,
-//     and a CONNECT that adopts the marker immediately does not wait at all
-//     (https://github.com/nberlee/mqtt-nats-broker/issues/40).
-//   - A watermark is permanent, so there is no reap step, no reap fingerprint, and no
-//     GC choice that could widen the escape it fences. An older-than-latest retirement
-//     is the stated residual instead.
-//
-// Eligibility is a stable observation of BOTH identities — the record's sequence and
-// the watermark's — so a resave, a peer's teardown or a newer retirement restarts the
-// wait. A malformed watermark, an unreadable record or a record whose names are not
-// this session's mutates nothing for that client: a marker licenses its adopters to
-// delete every durable the record names, which is exactly why it is not written onto a
-// record whose names cannot be accounted for.
-func (as *mqttAccountSessionManager) condemnRetiredSurvivors(s *Server) {
-	grace, q := as.orphanGrace(), as.quarantine()
-	opts := s.getOpts()
-	filter := mqttTeardownSubjectPrefix + as.domainTk + ">"
-	for seq := uint64(1); ; {
-		smsg, err := as.jsa.loadNextMsgFromSeq(mqttTeardownStreamName, filter, seq)
-		if err != nil {
-			if isErrorOtherThan(err, JSNoMessageFoundErr) {
-				s.Debugf("MQTT retirement condemnation sweep ended: %v", err)
-			}
-			return
-		}
-		seq = smsg.Sequence + 1
-		wmSeq := smsg.Sequence
-
-		idHash, perr := mqttTeardownIDHashFromSubject(smsg.Subject, as.domainTk)
-		if perr != nil {
-			continue // not ours to interpret, and not ours to act on
-		}
-		r := &mqttGenRetirement{}
-		if uerr := json.Unmarshal(smsg.Data, r); uerr != nil {
-			s.Warnf("MQTT retirement condemnation: retirement watermark on %q is undecodable: %v", smsg.Subject, uerr)
-			continue
-		}
-		if verr := mqttValidateGenRetirement(r, idHash); verr != nil {
-			s.Warnf("MQTT retirement condemnation: refusing to act on the watermark on %q: %v", smsg.Subject, verr)
-			continue
-		}
-
-		ps, curSeq, lerr := as.loadFenceSession(idHash)
-		if lerr != nil || ps == nil {
-			// Unreadable is not absence, and absence needs no repair: the retired
-			// generation's record is already gone.
-			continue
-		}
-		if ps.Gen != r.Gen {
-			continue // a fresh generation owns the subject; the watermark simply stays
-		}
-		if ps.Teardown != nil {
-			continue // marked already: the adoption class above owns it
-		}
-		if verr := mqttValidateTeardownTargets(ps, idHash); verr != nil {
-			s.Warnf("MQTT retirement condemnation: refusing to condemn the record of %q: %v", idHash, verr)
-			continue
-		}
-
-		fp := mqttQuarantineSeqFP(curSeq) + "|" + mqttQuarantineSeqFP(wmSeq)
-		if !q.observedOrphanFor(mqttQuarantineRetirementKey(idHash), fp, grace) {
-			continue
-		}
-
-		// Act-time re-validation at the SAME identities, as every mutation here gets:
-		// the snapshot above is older than both records, and the claim CAS below must
-		// land on the record this pass verified.
-		cur, reSeq, rerr := as.loadFenceSession(idHash)
-		if rerr != nil || cur == nil || reSeq != curSeq || cur.Gen != r.Gen || cur.Teardown != nil {
-			continue
-		}
-		if verr := mqttValidateTeardownTargets(cur, idHash); verr != nil {
-			continue
-		}
-		rr, reWmSeq, rstatus := as.jsa.loadGenRetirement(as.domainTk, idHash)
-		if rstatus != mqttRetirementValid || reWmSeq != wmSeq || rr.Gen != r.Gen || rr.MarkerSeq != r.MarkerSeq {
-			continue
-		}
-
-		// A transient session on the RETIRING generation, exactly as
-		// finishAdoptedTeardown builds one: the marker is a record write, so it needs a
-		// record transaction and a lineage parented to the record it is derived from.
-		sess := mqttSessionCreate(&as.jsa, cur.ID, idHash, cur.Gen, reSeq, cur.WID, cur.PWID, opts)
-		sess.asm = as
-		sess.domainTk = as.domainTk
-		tok := sess.beginRecordTx()
-		_, _, outcome, cerr := sess.claimTeardown(tok, cur, reSeq, cur.WID, nil)
-		if terr := sess.endRecordTx(tok); terr != nil {
-			s.Errorf("MQTT: %v", terr)
-		}
-		if outcome != mqttTeardownClaimWon {
-			// The subject moved again, or the outcome is unknown. The watermark is
-			// permanent, so the next pass tries again from a fresh observation.
-			s.Debugf("MQTT retirement condemnation: could not condemn the record of %q (%v): %v", idHash, outcome, cerr)
-			continue
-		}
-		s.Warnf("MQTT retirement condemnation: condemned the record of session %q, whose generation %q was torn down",
-			cur.ID, r.Gen)
-		// The record now carries a marker, so this class will skip it from here on; the
-		// slot is released so the adoption class's own wait is the only one left.
-		q.forget(mqttQuarantineRetirementKey(idHash))
-	}
-}
 
 // ---------------------------------------------------------------------------
 // The authoritative session-reference snapshot
@@ -1382,10 +1250,9 @@ func (as *mqttAccountSessionManager) reconcileOneInboundQoS2(s *Server, n *mqttQ
 		// the purge behind it destroys the payload. Absence establishes that no record
 		// and no LOCAL resident names this generation; it cannot distinguish that from
 		// a session live on another broker whose record is absent, which still uses
-		// this very subject. So a matching retirement watermark is required, and
-		// without one the hold is RETAINED, whatever its age: a grace never arbitrated
-		// ownership. See orphan_retire_proof.go for the leak this accepts and why no
-		// bounded variant exists.
+		// this very subject. So the generation must read noncurrent in its authority,
+		// and otherwise the hold is RETAINED, whatever its age: a grace never arbitrated
+		// ownership. See orphan_retire_proof.go.
 		if as.retirementProvenFor(n.idHash, n.gen) != mqttRetireProven {
 			return mqttQoS2SweepDeferred
 		}
@@ -1944,8 +1811,8 @@ func (as *mqttAccountSessionManager) reconcileOrphanInflight(s *Server, grace ti
 		// a session that ended from one live on ANOTHER broker whose record is absent,
 		// and such a session still holds this identifier and its Receive Maximum slot.
 		// Deleting the register there restores it, on a crash, as an ordinary live
-		// delivery for an exchange that has moved on. So a matching retirement watermark
-		// is required and the register is otherwise RETAINED. See orphan_retire_proof.go.
+		// delivery for an exchange that has moved on. So the generation must read
+		// noncurrent in its authority, and the register is otherwise RETAINED. See orphan_retire_proof.go.
 		if as.retirementProvenFor(n.idHash, n.gen) != mqttRetireProven {
 			continue
 		}

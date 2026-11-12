@@ -9,26 +9,19 @@ import (
 // testDisplaceableFacts is a marked record whose retirement is durably owned on every count.
 func testDisplaceableFacts() mqttMarkedRecordFacts {
 	return mqttMarkedRecordFacts{
-		gen:             "g1",
-		markerSeq:       10,
-		receipt:         mqttOutboundValid,
-		watermark:       &mqttGenRetirement{Gen: "g1", MarkerSeq: 10},
-		watermarkStatus: mqttRetirementValid,
-		releaseFacts:    mqttAdoptedReleaseFacts{Closed: &mqttGenClosure{Gen: "g1", Discard: true}},
+		gen:          "g1",
+		markerSeq:    10,
+		auth:         mqttOutboundValid,
+		pendingEntry: true,
+		releaseFacts: mqttAdoptedReleaseFacts{Closed: &mqttGenClosure{Gen: "g1"}},
 	}
 }
 
-// Each of the five facts is necessary: falsifying any one of them alone, or leaving it
+// Each of the four facts is necessary: falsifying any one of them alone, or leaving it
 // undecided, keeps the inline adoption.
 func TestMQTTMarkedRecordDisplaceablePredicate(t *testing.T) {
 	if ok, why := mqttMarkedRecordDisplaceable(testDisplaceableFacts()); !ok {
 		t.Fatalf("a durably owned retirement was refused: %s", why)
-	}
-	// A later retirement's watermark, at a higher marker sequence, still names the claim.
-	later := testDisplaceableFacts()
-	later.watermark = &mqttGenRetirement{Gen: "g1", MarkerSeq: 11}
-	if ok, why := mqttMarkedRecordDisplaceable(later); !ok {
-		t.Fatalf("a watermark past the marker's sequence was refused: %s", why)
 	}
 
 	cases := []struct {
@@ -37,28 +30,11 @@ func TestMQTTMarkedRecordDisplaceablePredicate(t *testing.T) {
 		reason string
 	}{
 		{"foreign targets", func(f *mqttMarkedRecordFacts) { f.targetsErr = errors.New("foreign") }, "not this session's"},
-		{"receipt absent", func(f *mqttMarkedRecordFacts) { f.receipt = mqttOutboundAbsent }, "teardown receipt"},
-		{"receipt indeterminate", func(f *mqttMarkedRecordFacts) { f.receipt = mqttOutboundIndeterminate }, "teardown receipt"},
-		{"watermark absent", func(f *mqttMarkedRecordFacts) {
-			f.watermark, f.watermarkStatus = nil, mqttRetirementAbsent
-		}, "watermark reads"},
-		{"watermark indeterminate", func(f *mqttMarkedRecordFacts) {
-			f.watermark, f.watermarkStatus = nil, mqttRetirementIndeterminate
-		}, "watermark reads"},
-		{"watermark unresolved beside a decoded value", func(f *mqttMarkedRecordFacts) {
-			f.watermarkStatus = mqttRetirementIndeterminate
-		}, "watermark reads"},
-		{"watermark of another generation", func(f *mqttMarkedRecordFacts) {
-			f.watermark = &mqttGenRetirement{Gen: "g0", MarkerSeq: 10}
-		}, "names generation"},
-		{"watermark below the marker", func(f *mqttMarkedRecordFacts) {
-			f.watermark = &mqttGenRetirement{Gen: "g1", MarkerSeq: 9}
-		}, "names generation"},
+		{"authority absent", func(f *mqttMarkedRecordFacts) { f.auth = mqttOutboundAbsent }, "authority reads"},
+		{"authority indeterminate", func(f *mqttMarkedRecordFacts) { f.auth = mqttOutboundIndeterminate }, "authority reads"},
+		{"no pending release of the marker", func(f *mqttMarkedRecordFacts) { f.pendingEntry = false }, "pending release"},
 		{"release facts unreadable", func(f *mqttMarkedRecordFacts) { f.releaseFactsErr = errors.New("unreadable") }, "could not be read"},
-		{"no closure", func(f *mqttMarkedRecordFacts) { f.releaseFacts.Closed = nil }, "discarding closure"},
-		{"preserving closure", func(f *mqttMarkedRecordFacts) {
-			f.releaseFacts.Closed = &mqttGenClosure{Gen: "g1", Discard: false}
-		}, "discarding closure"},
+		{"no closure", func(f *mqttMarkedRecordFacts) { f.releaseFacts.Closed = nil }, "no closure"},
 		{"release gate refuses", func(f *mqttMarkedRecordFacts) { f.releaseErr = errors.New("unsealed") }, "release gate"},
 	}
 	for _, tc := range cases {

@@ -3,19 +3,10 @@ package mqtt
 import (
 	"bytes"
 	"strconv"
-	"strings"
 	"sync"
 )
 
 // ---- from handoff_outcome.go ----
-
-// mqttIsHandoffSubject reports whether a subject is a handoff outcome. The session walks
-// filter on the session prefix and would never see one, but the accept-fact readers and the
-// record-absent paths take subjects from enumerations, so the classification is available
-// rather than assumed.
-func mqttIsHandoffSubject(subject string) bool {
-	return strings.HasPrefix(subject, mqttHandoffSubjectPrefix)
-}
 
 // ---- from inflight_marker.go ----
 
@@ -60,10 +51,10 @@ func mqttGenClosureWalkFilter(idHash string) string {
 	return mqttOutboundRecordSubjectPrefix() + mqttClosureClassTk + "." + idHash + ".*"
 }
 
-// mqttTransitionOutcomeWalkFilter enumerates one client's transition outcomes, and only
-// those.
-func mqttTransitionOutcomeWalkFilter(idHash string) string {
-	return mqttOutboundRecordSubjectPrefix() + mqttOutcomeClassTk + "." + idHash + ".*"
+// mqttTransitionOutcomeWalkFilter enumerates one client's transition outcomes of one
+// generation scope, and only those.
+func mqttTransitionOutcomeWalkFilter(idHash, gen string) string {
+	return mqttOutboundRecordSubjectPrefix() + mqttOutcomeClassTk + "." + idHash + "." + gen + ".*"
 }
 
 // ---- from outbound_exchange.go ----
@@ -77,17 +68,6 @@ func mqttSharedAcqRefEqual(a, b *mqttSharedAcqRef) bool {
 }
 
 // ---- from outbound_ops.go ----
-
-// opPrepareHandoff freezes admission and reserves a handoff from the serving authority.
-//
-// The INTENT is the caller's, because it describes what the accepting connection proposes —
-// its generation, its tenure, and the retirement it requests. Everything derived from the
-// PREDECESSOR is not: the intent's `Prev*` members are filled in from the standing authority
-// and the session record the caller names, so a caller cannot propose a handoff from a
-// predecessor that is not there.
-func (jsa *mqttJSA) opPrepareHandoff(id, epoch, txn string, i *mqttHandoffIntent) (mqttOpOutcome, error) {
-	return jsa.opPrepareHandoffFenced(id, epoch, txn, i, 0)
-}
 
 // ---- from outbound_source_completion.go ----
 

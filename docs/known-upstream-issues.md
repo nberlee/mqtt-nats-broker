@@ -41,7 +41,7 @@ was not repeated.
 
 | ID | One line | Upstream | Blocks | Status |
 |---|---|---|---|---|
-| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register in the `$MQTT.inflight.` space of `$MQTT_sess` at crash or raw-block recovery; since [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) the stream is non-empty for every account from its first accepted CONNECT | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
+| MAXMSGSPER-REVIVAL | A `MaxMsgsPer:1` limit-evicted record revives after raw-block recovery when its successor was explicitly deleted | PR [#8506](https://github.com/nats-io/nats-server/pull/8506) (closed unmerged) | every admitted QoS 1/2 register in the `$MQTT.inflight.` space of `$MQTT_sess` at crash or raw-block recovery; since [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) the stream is non-empty for every account from its first accepted CONNECT; since [issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133) also the session record and every rewritten record a retirement purges | Known upstream, not fixed; not (re)filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) | A failed store read and an empty suffix are the same response, so every enumeration reads a read failure as its own end | Issue [#8632](https://github.com/nats-io/nats-server/issues/8632) | supported suffix enumerations (`scanPubRelRecords`, the account sweeps) and [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) affine cleanup | Filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) | Point-read store failures are classified as absence, invalidating release and ownership decisions | Same root as #8632 (broker-side face) | supported release/ownership point reads | Tracked, not separately filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
 | [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) | A conditional creation is admitted over a record the server could not read, so a create-only CAS does not prove the subject was empty | To be filed | [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) substrate premise (create-only CAS as an absence proof) | Witness ready, not yet filed; reproduces on v2.15.1; store paths unchanged in v2.15.2 |
@@ -91,24 +91,44 @@ dedicated `$MQTT_shared` stream whose `DenyDelete` left no tombstone and so no r
 shape; since 2026-11-09 they are in the `$MQTT.shared.` space of `$MQTT_sess`, a stream
 that deletes, and that immunity is given up
 ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)). A group record
-or ledger is CAS-rewritten under `MaxMsgsPer:1` but never deleted, so the witnessed
-rewritten-then-explicitly-deleted shape does not apply to it; what changes is that it is
-now a permanent neighbour of records that are, and its presence can keep a block holding
+is CAS-rewritten under `MaxMsgsPer:1` but never deleted, so the witnessed
+rewritten-then-explicitly-deleted shape does not apply to it (a shared ledger is purged
+with its generation, below); what changes is that it is now a permanent neighbour of
+records that are, and its presence can keep a block holding
 an eligible deleted register from collapsing. No group-record revival is claimed: none
 has been witnessed. The
 [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) cutover keeps
-permanent records in the `$MQTT.inflight.` space too: every accepted CONNECT CASes the per-client
-authority and leaves at least two permanent transition outcomes, and every admitted
-QoS 1/2 register is written in one batch with its permanent exchange, outcome and
-dependency records, then CAS-rewritten by its acknowledgement advance and
-exact-deleted at terminal cleanup. Name-ownership records and closure certificates
-are permanent too. So the stream stops being collapsible from an account's first
-accepted CONNECT, single-session accounts included; a register is revival-eligible
+long-lived records in the `$MQTT.inflight.` space too: every accepted CONNECT CASes the
+per-client authority and leaves lifecycle-scoped transition outcomes that live until the
+client's lifecycle retires, the lifecycle registry shards and name-ownership records are
+kept for the recovery epoch, and every admitted QoS 1/2 register is written in one batch
+with its exchange, outcome and dependency records, kept until their generation retires,
+then CAS-rewritten by its acknowledgement advance and exact-deleted at terminal cleanup.
+So the stream stops being collapsible from an account's first accepted CONNECT,
+single-session accounts included; a register is revival-eligible
 only once an obligation was admitted and the defect's own conditions hold. The
 neighbours remove whole-stream emptiness as an escape but establish no shared-block
 placement, so the widening is of the POTENTIAL exposure, not a claim that every
 restart revives. The disposition and the per-defect exposure are in
 `docs/CONFORMANCE.md`, "The storage this design keeps in `$MQTT.inflight.`".
+
+**The reclamation of [issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)
+widens it to the session record and to purged records.** A teardown deletes the session
+record at its exact sequence, and a generation's or a lifecycle's retirement purges its
+records by subject filter below a recorded bound; several of those subjects were
+rewritten under `MaxMsgsPer:1` first (the session record by every save and by its
+teardown marker, the authority by every transition, the inventory and shared ledgers),
+so each meets the witnessed rewritten-then-removed shape. A revived session record names
+a generation its authority no longer serves, and it carries no teardown marker when the
+version that revived predates the marker. No revival of a purged record has been
+witnessed, and no broker disposition is claimed for one; the session-record revival has
+been, by `TestMQTTMaxAckPending`. **What the broker does with it:** the CONNECT restore
+treats an unmarked session record whose generation the authority does not serve as
+obsolete, never
+resumes it, deletes it at its exact sequence and reads again; it does not tear the
+generation down a second time. That is the broker reading its own authority, not a repair
+of the store: the defect stays upstream's, and the delete is again an explicit delete of
+a `MaxMsgsPer:1` subject.
 
 **Upstream.** Known as PR
 [#8506](https://github.com/nats-io/nats-server/pull/8506) ("Filestore MaxMsgsPer

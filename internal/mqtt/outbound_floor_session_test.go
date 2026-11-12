@@ -435,11 +435,31 @@ func TestAdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 
 	// ABORTED: nothing landed, the NAK stands (M11).
 	_, ah, alin := compose(778)
-	if err := jsa.abortTransition(&ah.attempt); err != nil {
+	if err := jsa.abortTransition(&ah.attempt, nil); err != nil {
 		t.Fatalf("aborting: %v", err)
 	}
 	if retired, nak := run(alin, 778, ah); !retired || !nak {
 		t.Fatalf("a never-landed admission must retire WITH a NAK (retired %v, nak %v) (M11)", retired, nak)
+	}
+	// RETIRED (issue #133, T-census-retired-nak): the same never-landed admission, but its generation
+	// has since retired. Its work is obsolete: the record retires and NOTHING is NAKed, because a
+	// retired disposition is not "nothing landed" (M31: the retired absence mapped to never landed).
+	_, rh, rlin := compose(781)
+	if err := jsa.abortTransition(&rh.attempt, nil); err != nil {
+		t.Fatalf("aborting: %v", err)
+	}
+	testRetireGeneration(t, e.asm, sess.id, gen)
+	_, ord781, _ := mqttParseGenToken(gen)
+	testRewriteAuthority(t, e, func(a *mqttOutboundAuthority) {
+		if i := mqttOutstandingIndex(a.Life, ord781); i >= 0 {
+			a.Life.Outstanding = append(a.Life.Outstanding[:i], a.Life.Outstanding[i+1:]...)
+		}
+	})
+	if st, _ := e.asm.genStanding(sess.id, gen); st != mqttGenRetired {
+		t.Fatalf("fixture: generation %q reads %v, want retired", gen, st)
+	}
+	if retired, nak := run(rlin, 781, rh); !retired || nak {
+		t.Fatalf("an admission of a retired generation must retire WITHOUT a NAK (retired %v, nak %v) (M31)", retired, nak)
 	}
 }
 

@@ -14,6 +14,7 @@
 package mqtt
 
 import (
+	"errors"
 	"sync/atomic"
 )
 
@@ -413,19 +414,35 @@ func (as *mqttAccountSessionManager) retireRecoveryRoot(s *Server, root *mqttRec
 	cert := &mqttGenCompletionCertificate{
 		ID: root.ID, Epoch: root.Epoch, Gen: root.Gen, SealedHi: root.Bound,
 	}
-	if err := as.jsa.publishGenCompletionCert(cert); err != nil {
+	// Every authority attempt of this conclusion is admitted on its own: the certificate's
+	// fenced batch and each retirement control.
+	admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }
+	if err := as.jsa.publishGenCompletionCert(cert, admit); err != nil {
 		// NOT CONFIRMED, so the root stays. The next visit re-derives retirement and retries the
 		// identical certificate; nothing here concludes the publication failed.
 		s.Debugf("MQTT recovery pass: certifying %q/%q was not confirmed: %v", root.ID, root.Gen, err)
 		return
 	}
-	if derr := as.jsa.deleteMsg(mqttSessStreamName, rootSeq, true); derr != nil {
+	// WAITED FOR: the generation's retirement below is licensed by the root being gone.
+	if derr := as.jsa.deleteMsg(mqttSessStreamName, rootSeq, false); derr != nil {
 		// The certificate stands, so the generation is certified even though its root remains.
 		// The next pass finds the root, re-derives retirement, validates the certificate it
 		// already wrote, and deletes the root again. A conflict or an ambiguity never escalates
 		// to an unconditional delete.
 		s.Debugf("MQTT recovery pass: removing the root of %q/%q was not confirmed: %v",
 			root.ID, root.Gen, derr)
+		return
+	}
+	// AND THE GENERATION RETIRES (issue #133), in the same visit and under its admission: its
+	// work is done, so its records are reclaimed and its Outstanding entry removed. Anything this
+	// visit cannot finish (a release still pending, an announcement, a crash) is completed by the
+	// lifecycle sweep from the phase the authority records.
+	if as.testHoldGenerationRetirement.Load() {
+		return
+	}
+	if rerr := as.jsa.retireGeneration(root.ID, root.Epoch, root.Gen, admit); rerr != nil &&
+		!errors.Is(rerr, errMQTTGenerationNotRetirable) {
+		s.Debugf("MQTT recovery pass: retiring %q/%q: %v", root.ID, root.Gen, rerr)
 	}
 }
 
@@ -434,10 +451,8 @@ func (as *mqttAccountSessionManager) retireRecoveryRoot(s *Server, root *mqttRec
 // # The entitlement is the generation's own durable CLOSURE
 //
 // Not a teardown's transient target, not a marked record, and not a liveness check: the closure
-// says this generation ENDED and its `Discard` member says its obligations were authorized to be
-// abandoned. Those are the two facts the acts rest on, and both are permanent. A generation whose
-// closure does NOT discard never enrols an affine target at all, so this is unreachable for it —
-// and it is refused here as well, because a rule that is only unreachable is not a rule.
+// says this generation ENDED with its obligations abandoned (every closure discards, issue #133).
+// That is the fact the acts rest on, and it is permanent.
 //
 // # The targets come from the resource record
 //
@@ -459,18 +474,9 @@ func (as *mqttAccountSessionManager) performAffineReadiness(s *Server, root *mqt
 	if !b.spend(1) {
 		return
 	}
-	closed, _, status := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen)
-	if status != mqttOutboundValid {
+	if _, _, status := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen); status != mqttOutboundValid {
 		// AN UNREADABLE OR ABSENT CLOSURE ESTABLISHES NOTHING. Without it there is no
-		// entitlement, so the pass does no act at all.
-		return
-	}
-	if !closed.Discard {
-		// NOT THIS GENERATION'S OBLIGATIONS TO ABANDON. Nothing should have enrolled an affine
-		// target here, and the pass refuses to act as though something had.
-		s.Warnf("MQTT recovery pass: generation %q of client %q carries an enrolled affine "+
-			"consumer and a NON-discarding closure, so no discard disposition authorizes its "+
-			"cleanup; nothing is done", root.Gen, root.ID)
+		// entitlement, so the pass does no act at all. A standing one discards (issue #133).
 		return
 	}
 
@@ -530,10 +536,11 @@ func (as *mqttAccountSessionManager) performAffineReadiness(s *Server, root *mqt
 	if !b.spendProgress(1) {
 		return
 	}
+	admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }
 	if rerr := as.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: root.ID, Epoch: root.Epoch, Gen: root.Gen,
 		AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-	}); rerr != nil {
+	}, admit); rerr != nil {
 		s.Debugf("MQTT recovery pass: asserting the affine readiness of %q/%q: %v",
 			root.ID, root.Gen, rerr)
 	}

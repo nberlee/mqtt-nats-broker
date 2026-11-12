@@ -4,6 +4,8 @@ package mqtt
 
 import (
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -76,6 +78,8 @@ func testWillProducerClient(t *testing.T, srv *Server, asm *mqttAccountSessionMa
 	// The CONNECT capture: allowed, and bound to this account.
 	c.willAuthorized = true
 	c.authzSvcAccount = account
+	// The acceptance a real CONNECT with this Will commits allocates the Will's anchor.
+	c.mqtt.willAnchor = testAcceptWithWillAnchor(t, asm, clientID)
 	return c
 }
 
@@ -194,7 +198,7 @@ func TestAnAccountMismatchBeforePersistenceRetainsUnderTheAuthorizedAccount(t *t
 	// "some account is established" check passes here, which is exactly why it is not
 	// sufficient on its own: without the comparison the record would persist under B.
 	setServiceAccount(srv, "some-other-account", true)
-	identity := &mqttDelayedWillIdentity{}
+	identity := &mqttDelayedWillIdentity{WillID: testAnchoredWillID(t, asm, "retain-mismatch")}
 	outcome, err := asm.enqueueDelayedWill(srv, "retain-mismatch", mqttNewSessGen(), will, nil, "alice",
 		fireAt, 1, asm.sessStreamEpoch, accountA, identity)
 	if outcome != mqttWillEnqueueUnavailable {
@@ -348,11 +352,12 @@ func TestDelayedWillRetentionBoundIsSeparateAndCharged(t *testing.T) {
 // destination account has gone away, returning errMQTTWillDestinationUnavailable.
 //
 // That is the SAME sentinel a pre-effect refusal returns. Classifying on it would
-// send this obligation back into retention — and a re-attempt would be a fresh
-// create against a subject whose record may already exist, which is two records for
-// one Will and, if both survive, two publications. The exit decides instead: this
-// one is TERMINAL, no retry and no second publication, whatever the error says.
-func TestAnExhaustedEnqueueWhoseFailSafeRefusesIsTerminalNotRetained(t *testing.T) {
+// retain this obligation as DEFINITELY UNSENT, whose re-attempt is the ordinary
+// enqueue -- fail-safe included, so an unconfirmable retry could publish a Will whose
+// only durable copy may already stand. The exit decides instead: this one is retained
+// POSSIBLY LANDED (plan 5.3), and a possibly-landed re-attempt is a resolution that
+// never takes the fail-safe, whatever the error says.
+func TestAnExhaustedEnqueueWhoseFailSafeRefusesIsRetainedPossiblyLanded(t *testing.T) {
 	srv, asm, account := testDelayedRetryEnv(t)
 	setServiceAccount(srv, account, true)
 
@@ -362,11 +367,16 @@ func TestAnExhaustedEnqueueWhoseFailSafeRefusesIsTerminalNotRetained(t *testing.
 		return 0, errMQTTWillDestinationUnavailable
 	}
 	// And the fail-safe publication refuses with the DESTINATION sentinel — the
-	// value a retainable refusal also carries.
-	asm.testPublishWill = func(*mqttWillOutbox) error { return errMQTTWillDestinationUnavailable }
+	// value a retainable refusal also carries. Counted: the resolution below must
+	// never reach it.
+	var failSafes atomic.Int64
+	asm.testPublishWill = func(*mqttWillOutbox) error {
+		failSafes.Add(1)
+		return errMQTTWillDestinationUnavailable
+	}
 	asm.mu.Unlock()
 
-	identity := &mqttDelayedWillIdentity{}
+	identity := &mqttDelayedWillIdentity{WillID: testAnchoredWillID(t, asm, "exhausted")}
 	outcome, err := asm.enqueueDelayedWill(srv, "exhausted", mqttNewSessGen(), testDelayedWill("exhaust/will"),
 		nil, "alice", time.Now().Add(10*time.Minute).UnixNano(), 1, asm.sessStreamEpoch, account, identity)
 
@@ -377,15 +387,36 @@ func TestAnExhaustedEnqueueWhoseFailSafeRefusesIsTerminalNotRetained(t *testing.
 	if err == nil {
 		t.Fatal("the abandoned exit must report why")
 	}
-	// The assertion this test exists for. The error IS the retainable one; the exit
-	// is not.
+	// The assertion this test exists for. The error IS the one a definitely-unsent
+	// refusal carries; the exit is not that one.
 	if !errorsIsWillDestinationUnavailable(err) {
 		t.Fatalf("fixture: the error %v is not the destination sentinel, so this test does not "+
-			"exercise the collision between a retainable ERROR and a terminal EXIT", err)
+			"exercise the collision between a pre-effect ERROR and a possibly-landed EXIT", err)
 	}
-	if outcome.retainable() {
-		t.Fatal("an exhausted enqueue whose fail-safe refused the destination must NOT be retainable: " +
-			"a create may already have landed, so re-attempting it would write a second record for one Will")
+	if _, retention := mqttAnchorActionFor(outcome); retention != mqttWillRetainPossiblyLanded {
+		t.Fatalf("an exhausted enqueue whose fail-safe refused the destination is retained as %d, want "+
+			"possibly landed: a create may already have landed", retention)
+	}
+
+	// The resolution: the same identity, now sticky possibly landed, with every store
+	// still unresolved. It stays possibly landed and the fail-safe is not invoked again.
+	identity.PossiblyLanded = true
+	before := failSafes.Load()
+	outcome, _ = asm.enqueueDelayedWill(srv, "exhausted", mqttNewSessGen(), testDelayedWill("exhaust/will"),
+		nil, "alice", time.Now().Add(10*time.Minute).UnixNano(), 1, asm.sessStreamEpoch, account, identity)
+	if outcome != mqttWillEnqueueUnconfirmedAbandoned {
+		t.Fatalf("an unresolved resolution returned %v, want it still possibly landed", outcome)
+	}
+	if n := failSafes.Load() - before; n != 0 {
+		t.Fatalf("a possibly-landed resolution invoked the fail-safe %d time(s); it never may", n)
+	}
+}
+
+// Every enqueue outcome has an anchor action and a retention class: an outcome added
+// without one panics here rather than leaving an anchor nothing completes.
+func TestEveryEnqueueOutcomeHasAnAnchorAction(t *testing.T) {
+	for o := mqttWillEnqueueOutcome(0); o < mqttWillEnqueueOutcomes; o++ {
+		mqttAnchorActionFor(o)
 	}
 }
 
@@ -440,6 +471,8 @@ func TestADueDeferredDelayedWillIsEnqueuedNotPublishedDirectly(t *testing.T) {
 		willGen:        mqttNewSessGen(),
 		willSessEpoch:  asm.sessStreamEpoch,
 		willSessionSeq: 1,
+		// The anchor the displaced connection's delay-capable acceptance allocated.
+		willAnchor: testAcceptWithWillAnchor(t, asm, sess.id),
 	}
 	srv.dischargeDeferredWill(asm, sess, action)
 
@@ -483,7 +516,7 @@ func TestRetentionInsertedAfterRecoveryIsStillDischarged(t *testing.T) {
 
 	// The refusal that produces the obligation, while the destination is away.
 	setServiceAccount(srv, _EMPTY_, false)
-	identity := &mqttDelayedWillIdentity{}
+	identity := &mqttDelayedWillIdentity{WillID: testAnchoredWillID(t, asm, "lostwake")}
 	will := testDelayedWill("lostwake/will")
 	fireAt := time.Now().Add(10 * time.Minute).UnixNano()
 	outcome, _ := asm.enqueueDelayedWill(srv, "lostwake", mqttNewSessGen(), will, nil, "alice",
@@ -692,7 +725,7 @@ func TestARefusedParkRestoresTheCloseObservation(t *testing.T) {
 // THE ITEM'S HEADLINE PROPERTY, arbitrated against a CONTROLLED acceptance timestamp
 // on both sides of the close-anchored deadline.
 //
-// The suppression predicate is `At < FireAt` (mqttAcceptFactQualifies). Anchoring
+// The suppression predicate is `MinAt < FireAt` (decideFromAnchor). Anchoring
 // FireAt to the close is what makes that comparison mean what MQTT says: a reconnect
 // DURING the Will Delay suppresses [MQTT-3.1.3-9]; one after the delay has elapsed
 // does not, because the Will is already owed [MQTT-3.1.2-8]. Under the old
@@ -700,7 +733,7 @@ func TestARefusedParkRestoresTheCloseObservation(t *testing.T) {
 // acceptance in that extra slice — one that arrived after the true delay had run out —
 // still qualified and cancelled a Will the client was owed.
 //
-// The fact's timestamp is PLANTED rather than produced by a real CONNECT. A barrier
+// The later acceptance's time is PLANTED rather than produced by a real CONNECT. A barrier
 // orders events; it cannot guarantee a CONNECT's acceptance lands inside a future
 // wall-clock window, and an earlier draft of this fixture depended on exactly that.
 // Both inequalities here hold by construction.
@@ -727,27 +760,13 @@ func TestSuppressionIsDatedByTheCloseAnchoredDeadline(t *testing.T) {
 		if closeAt == 0 {
 			t.Fatal("fixture: no close observation")
 		}
-		// The acceptance is planted FIRST, at a chosen instant relative to the deadline
-		// the producer is about to derive, and the producer is then given an origin
-		// sequence strictly BELOW the fact's — so every other term of the predicate
-		// qualifies and only the DATE decides. Ordering it the other way put the fact
-		// at or below the origin and the sequence term did the disqualifying, which the
-		// fixture's own guard caught.
+		// The later acceptance is planted FIRST, at a chosen instant relative to the
+		// deadline the producer is about to derive, so only the DATE decides.
 		wantFireAt := time.Unix(0, closeAt).Add(delaySecs * time.Second).UnixNano()
-
-		// A throwaway fact for ANOTHER client first, purely to advance the stream so
-		// the real one lands above sequence 1. The producer's origin sequence must be
-		// NONZERO -- the enqueue refuses a zero one and fail-safes instead -- and it
-		// must also be strictly below the real fact's, so there has to be room between.
-		testPlantAcceptFact(t, asm, "sequence-filler", 1)
-
 		at := wantFireAt + int64(offset)
-		_, factSeq := testPlantAcceptFact(t, asm, clientID, at)
-		if factSeq < 2 {
-			t.Fatalf("fixture: the planted fact sits at %d, leaving no nonzero origin below it", factSeq)
-		}
+		testPlantAnchorAcceptance(t, asm, clientID, at)
 
-		srv.mqttHandleWill(c, nil, mqttNewSessGen(), factSeq-1, asm.sessStreamEpoch)
+		srv.mqttHandleWill(c, nil, mqttNewSessGen(), 1, asm.sessStreamEpoch)
 
 		var rec *mqttWillOutbox
 		select {
@@ -762,18 +781,10 @@ func TestSuppressionIsDatedByTheCloseAnchoredDeadline(t *testing.T) {
 			t.Fatalf("the record carries FireAt %v, want the close-anchored %v",
 				time.Unix(0, rec.FireAt), time.Unix(0, wantFireAt))
 		}
-		if factSeq <= rec.OriginSessionSeq {
-			t.Fatalf("fixture: the fact sits at %d, not above the record's origin %d, so the sequence "+
-				"term would disqualify it and the DATE would not be what decides",
-				factSeq, rec.OriginSessionSeq)
-		}
-
-		got := mqttAcceptFactQualifies(&mqttAcceptFact{
-			ClientID: clientID, SessEpoch: asm.sessStreamEpoch, AcceptID: mqttNewAcceptID(), At: at,
-		}, factSeq, asm.sessStreamEpoch, rec)
-		if got != wantSuppressed {
-			t.Fatalf("an acceptance at %v (offset %v from FireAt %v) qualifies=%v, want %v",
-				time.Unix(0, at), offset, time.Unix(0, rec.FireAt), got, wantSuppressed)
+		verdict, _ := asm.decideFromAnchor(rec)
+		if got := verdict == mqttAnchorCancel; got != wantSuppressed || verdict == mqttAnchorDefer {
+			t.Fatalf("an acceptance at %v (offset %v from FireAt %v) decides %v, want suppressed=%v",
+				time.Unix(0, at), offset, time.Unix(0, rec.FireAt), verdict, wantSuppressed)
 		}
 	}
 
@@ -867,5 +878,148 @@ func TestTheOrdinaryProducerRetainsAnAccountMismatch(t *testing.T) {
 		mqttWillQClientFilter(asm.domainTk, retained.identity.CIDHash)); rec != nil {
 		t.Fatalf("a record was persisted under %q despite the mismatch: the fence must refuse BEFORE "+
 			"any enqueue effect, or retention is unsafe", rec.Account)
+	}
+}
+
+// T-possibly-landed (plan 5.3). The enqueue's create LANDS, its acknowledgement and every
+// readback fail, and the fail-safe fails before any effect (a destination refusal), so the
+// Will is retained POSSIBLY LANDED. Then:
+//
+//   - the retry driver, with no kick from anyone, resolves it once readbacks work: it finds
+//     the record, which it reconciles, and the fail-safe never runs a second time;
+//   - a shutdown that drops the entry while it is unresolved leaves its anchor OWED, since
+//     the landed record may be the only copy and still reaches its terminal path.
+func TestAPossiblyLandedWillIsResolvedNeverRepublished(t *testing.T) {
+	const delaySecs = 600
+
+	setup := func(t *testing.T, name string) (*Server, *mqttAccountSessionManager, string, *atomic.Bool, *atomic.Int64) {
+		t.Helper()
+		srv, asm, account := testDelayedRetryEnv(t)
+		setServiceAccount(srv, account, true)
+
+		var landed atomic.Bool
+		asm.mu.Lock()
+		asm.testEnqueueStore = func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error) {
+			if !landed.Load() {
+				if _, err := asm.jsa.storeWillOutboxCAS(subject, expectSeq, rec); err != nil {
+					return 0, err
+				}
+				landed.Store(true)
+			}
+			return 0, fmt.Errorf("injected lost ack")
+		}
+		var failSafes atomic.Int64
+		asm.testPublishWill = func(*mqttWillOutbox) error {
+			failSafes.Add(1)
+			return errMQTTWillDestinationUnavailable
+		}
+		asm.mu.Unlock()
+
+		var readsBlocked atomic.Bool
+		readsBlocked.Store(true)
+		restoreLoad := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
+			if stream == mqttWillQStreamName && readsBlocked.Load() {
+				return fmt.Errorf("injected indeterminate re-read")
+			}
+			return nil
+		})
+		t.Cleanup(restoreLoad)
+
+		clientID := "landed-" + name
+		c := testWillProducerClient(t, srv, asm, account, clientID, "landed/"+name, delaySecs)
+		c.mqttOweWill(3600)
+		srv.mqttHandleWill(c, nil, mqttNewSessGen(), 1, asm.sessStreamEpoch)
+		if !landed.Load() || failSafes.Load() != 1 {
+			t.Fatalf("fixture: landed=%v fail-safes=%d, want the create landed and one failed fail-safe",
+				landed.Load(), failSafes.Load())
+		}
+		// The insertion's own recheck-and-kick runs one pass, which re-attempts the entry
+		// while readbacks still fail. Awaited, so what resolves it later is the retry
+		// driver and not that pass racing the unblock.
+		attempted := func() (int, bool, bool) {
+			q := &srv.owedDelayedWills
+			q.dischargeMu.Lock()
+			defer q.dischargeMu.Unlock()
+			q.mu.Lock()
+			defer q.mu.Unlock()
+			if len(q.owed) != 1 {
+				return len(q.owed), false, false
+			}
+			return 1, q.owed[0].identity.PossiblyLanded, !q.owed[0].retryAt.IsZero()
+		}
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+			held, possiblyLanded, retried := attempted()
+			if held != 1 || !possiblyLanded {
+				t.Fatalf("the unconfirmed, unpublished Will must be retained possibly landed (held %d)", held)
+			}
+			if retried {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("fixture: the insertion's kick never re-attempted the entry")
+			}
+		}
+		return srv, asm, clientID, &readsBlocked, &failSafes
+	}
+
+	t.Run("the retry driver resolves it", func(t *testing.T) {
+		srv, _, _, readsBlocked, failSafes := setup(t, "driver")
+		readsBlocked.Store(false)
+		held := func() int {
+			srv.owedDelayedWills.mu.Lock()
+			defer srv.owedDelayedWills.mu.Unlock()
+			return len(srv.owedDelayedWills.owed)
+		}
+		for deadline := time.Now().Add(10 * time.Second); held() != 0; time.Sleep(50 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d entries still held: the retry driver never resolved the Will", held())
+			}
+		}
+		if n := failSafes.Load(); n != 1 {
+			t.Fatalf("the fail-safe ran %d times; a resolution never takes it", n)
+		}
+	})
+
+	t.Run("a shutdown drop keeps the anchor owed", func(t *testing.T) {
+		srv, asm, clientID, _, _ := setup(t, "shutdown")
+		srv.discardOwedDelayedWills()
+		anchors := testWillAnchorsOf(t, asm, clientID)
+		if len(anchors) != 1 || anchors[0].State != mqttAnchorOwed {
+			t.Fatalf("a dropped possibly-landed Will must leave its anchor owed, got %+v", anchors)
+		}
+	})
+}
+
+// A delayed Will whose connection carries NO anchor names nothing a claimant could ever decide
+// from (issue #133: every delay-capable acceptance allocates one, so this is an invariant
+// failure). The enqueue refuses the record shape and takes the writer-side fail-safe: the
+// Will is published without its delay rather than parked in a record every claimant would
+// defer forever.
+func TestADelayedWillWithNoAnchorIsPublishedNotParked(t *testing.T) {
+	srv, asm, account := testDelayedRetryEnv(t)
+	setServiceAccount(srv, account, true)
+
+	var stored, published atomic.Int64
+	asm.mu.Lock()
+	asm.testEnqueueStore = func(subject string, expectSeq uint64, rec *mqttWillOutbox) (uint64, error) {
+		stored.Add(1)
+		return asm.jsa.storeWillOutboxCAS(subject, expectSeq, rec)
+	}
+	asm.testPublishWill = func(*mqttWillOutbox) error {
+		published.Add(1)
+		return nil
+	}
+	asm.mu.Unlock()
+
+	c := testWillProducerClient(t, srv, asm, account, "anchorless", "anchorless/will", 600)
+	c.mqtt.willAnchor = nil
+	c.mqttOweWill(3600)
+	srv.mqttHandleWill(c, nil, mqttNewSessGen(), 1, asm.sessStreamEpoch)
+
+	if n := stored.Load(); n != 0 {
+		t.Fatalf("an anchorless delayed Will reached the outbox store %d time(s)", n)
+	}
+	if n := published.Load(); n != 1 {
+		t.Fatalf("an anchorless delayed Will was published %d time(s), want the one fail-safe", n)
 	}
 }

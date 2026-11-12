@@ -276,13 +276,11 @@ func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 	defer b.cleanup()
 
 	c.waitStreamCurrent(t, testGlobalAccount, mqttSessStreamName)
-	c.waitStreamCurrent(t, testGlobalAccount, mqttTeardownStreamName)
 
 	const cid = "create-lineage-across"
-	idHash := getHash(cid)
 
-	// Broker A: a clean-start session whose close DISCARDS the record. That teardown
-	// records the retirement watermark, through Raft, before it deletes anything.
+	// Broker A: a clean-start session whose close DISCARDS the record. That teardown makes its
+	// generation noncurrent in the authority, through Raft, before it deletes anything.
 	ca, ra := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true},
 		a.opts.MQTT.Host, a.opts.MQTT.Port)
 	testMQTTCheckConnAck(t, ra, mqttConnAckRCConnectionAccepted, false)
@@ -296,9 +294,6 @@ func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 	widA, sessAGen := sessA.wid, sessA.gen
 	sessA.mu.Unlock()
 	if widA == _EMPTY_ {
-		// A fixture precondition, not a watermark fact: recordGenRetirement refuses a
-		// record carrying no identity, so without this the teardown below would fail
-		// closed and there would be no watermark to replicate.
 		t.Fatal("broker A's record must carry a minted identity")
 	}
 	testMQTTDisconnect(t, ca, nil)
@@ -308,19 +303,10 @@ func TestMQTTRetirementWatermarkTravelsAcrossBrokers(t *testing.T) {
 	// nothing about replication; B's manager has never seen A's memory.
 	asmB := b.s.mqtt.sessmgr.sessions[globalAccountName]
 	deadline := time.Now().Add(testMQTTTimeout)
-	var r *mqttGenRetirement
-	for time.Now().Before(deadline) {
-		if got, _, st := asmB.jsa.loadGenRetirement(asmB.domainTk, idHash); st == mqttRetirementValid {
-			r = got
-			break
+	for !testGenNoncurrent(asmB, cid, sessAGen) {
+		if time.Now().After(deadline) {
+			t.Fatalf("broker B must read broker A's retired generation %q noncurrent", sessAGen)
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-	if r == nil {
-		t.Fatal("the clean-start close must record a retirement watermark readable by broker B")
-	}
-	if r.Gen != sessAGen || r.MarkerSeq == 0 {
-		t.Fatalf("the watermark broker B reads must be broker A's, naming the retired "+
-			"generation with the marker sequence it landed at: %+v want gen %q", r, sessAGen)
 	}
 }

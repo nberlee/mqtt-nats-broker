@@ -431,17 +431,16 @@ broker_matrix() {
 # The accepted-CONNECT batch sentinel and its own mutation.
 #
 # m-accept-split-write replaces the one atomic batch with the independent conditional
-# writes the broker claims it does NOT make. The accepted CONNECT's batch is now the
-# outbound-ownership metadata commit's THREE members — the acceptance fact, the proposal's
-# COMMITTED receipt and the session record — so the mutation acknowledges the fact on its
-# own and then suppresses the record (and the receipt with it) through the sentinel's
-# counterfactual phase, handing the caller an acknowledgement it cannot tell from a real
-# commit. Every member already carries its own per-subject CAS, so removing the batch
-# headers is the whole difference.
+# writes the broker claims it does NOT make. An accepted CONNECT is one authority-transition
+# batch (issue #133): the lifecycle registry on a creation, the outcome, the authority and the
+# session record, which commits last. The mutation writes the members one by one and, before the
+# record, suppresses it through the sentinel's counterfactual phase, handing the caller an
+# acknowledgement it cannot tell from a real commit. Every member already carries its own
+# per-subject CAS, so removing the batch headers is the whole difference.
 #
-# The mutation must produce a TORN batch specifically — a COMMITTED ownership receipt or an
-# acceptance fact durable without the session record its batch was supposed to carry. A
-# CONNECT that merely failed, or a cluster that never formed, is not evidence about
+# The mutation must produce a TORN batch specifically: the acceptance's authority durable
+# without the session record its batch was supposed to carry. A CONNECT that merely failed,
+# or a cluster that never formed, is not evidence about
 # indivisibility, so the row is scored on the sentinel marker rather than on any failure.
 # ---------------------------------------------------------------------------
 
@@ -450,59 +449,44 @@ accept_run() {
   copy_working_tree "$dest"
 
   if [ "$mutate" = mutate ]; then
-    # The three members stop being members of a batch...
-    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
-      '	fb, fh := mqttFrameBatchWrite(0, f.FactBody, batchID, 1, false)' \
-      '	fb, fh := mqttFrameBatchWrite(0, f.FactBody, _EMPTY_, 1, false)'
-    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
-      '	ob, oh := mqttFrameBatchWrite(0, outBody, batchID, 2, false)' \
-      '	ob, oh := mqttFrameBatchWrite(0, outBody, _EMPTY_, 2, false)'
-    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
-      '	rb, rh := mqttFrameBatchWrite(f.BaseSeq, f.RecBody, batchID, 3, true)' \
-      '	rb, rh := mqttFrameBatchWrite(f.BaseSeq, f.RecBody, _EMPTY_, 3, true)'
+    # The members stop being members of a batch...
+    edit "$dest/internal/mqtt/outbound_transition.go" 1 \
+      '			m, h := mqttFrameBatchWrite(expect, body, batchID, seq, commit)' \
+      '			m, h := mqttFrameBatchWrite(expect, body, _EMPTY_, seq, commit)'
     # ... and the store issues them one after the other instead of committing them
     # together. The helper is inserted into the sentinel file, where the
     # counterfactual sits next to the assertion it must break.
-    edit "$dest/internal/mqtt/handoff_metadata.go" 1 \
-      '	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)' \
-      '	bi, err := jsa.metadataCommitSplit(batchID, msgs)'
+    edit "$dest/internal/mqtt/outbound_transition.go" 1 \
+      '		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)' \
+      '		bi, err := jsa.acceptCommitSplit(batchID, msgs, t)'
     edit "$dest/$accept_file" 1 \
       '// MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here' \
-      'func (jsa *mqttJSA) metadataCommitSplit(batchID string, msgs []mqttBatchMsg) (any, error) {
-	fact := msgs[0]
-	fi, err := jsa.newRequest(mqttJSAMsgStore, fact.subj, fact.hdr, fact.msg)
-	if err != nil {
-		return nil, err
-	}
-	resp, _ := fi.(*JSPubAckResponse)
-	if resp == nil || resp.PubAck == nil {
-		return resp, fmt.Errorf("m-accept-split-write: the fact write was not acknowledged")
-	}
-	if aerr := resp.ToError(); aerr != nil {
-		return resp, aerr
-	}
-	// The counterfactual phase suppresses the receipt AND the record, so the tear is
-	// precisely the acceptance fact durable without the record its batch was supposed to
-	// carry. Unarmed, the trailing members are written one after the other and the batch
-	// looks whole.
-	if oerr := jsa.observeMetadataCommit(mqttAcceptStoreSplitRecordPending, batchID, msgs, resp.Sequence); oerr == nil {
-		for _, m := range msgs[1:] {
-			ri, rerr := jsa.newRequest(mqttJSAMsgStore, m.subj, m.hdr, m.msg)
-			if rerr != nil {
-				return nil, rerr
+      'func (jsa *mqttJSA) acceptCommitSplit(batchID string, msgs []mqttBatchMsg, t *mqttAuthorityTransition) (any, error) {
+	var resp *JSPubAckResponse
+	for i, m := range msgs {
+		// The counterfactual phase suppresses the record, which commits last, so the tear is
+		// precisely the acceptance durable without the record its batch was supposed to carry.
+		// Unarmed, every member is written one after the other and the batch looks whole.
+		if i == len(msgs)-1 && t.Record != nil && resp != nil {
+			if oerr := jsa.observeAcceptanceCommit(mqttAcceptStoreSplitRecordPending, batchID, t, resp.Sequence); oerr != nil {
+				break
 			}
-			rr, _ := ri.(*JSPubAckResponse)
-			if rr == nil || rr.PubAck == nil {
-				return rr, fmt.Errorf("m-accept-split-write: a trailing member write was not acknowledged")
-			}
-			if aerr := rr.ToError(); aerr != nil {
-				return rr, aerr
-			}
-			resp = rr
 		}
+		ri, rerr := jsa.newRequest(mqttJSAMsgStore, m.subj, m.hdr, m.msg)
+		if rerr != nil {
+			return nil, rerr
+		}
+		rr, _ := ri.(*JSPubAckResponse)
+		if rr == nil || rr.PubAck == nil {
+			return rr, fmt.Errorf("m-accept-split-write: a member write was not acknowledged")
+		}
+		if aerr := rr.ToError(); aerr != nil {
+			return rr, aerr
+		}
+		resp = rr
 	}
-	// Presented as an acknowledgement of the batch, so the metadata-commit validation
-	// cannot tell three writes from one commit.
+	// Presented as an acknowledgement of the batch, so the transition writer cannot tell
+	// separate writes from one commit.
 	resp.BatchId, resp.BatchSize, resp.Stream = batchID, uint64(len(msgs)), mqttSessStreamName
 	return resp, nil
 }
@@ -522,7 +506,7 @@ accept_run() {
     elif [ "$mutate" = mutate ] && ! grep -qF 'ACCEPT-BATCH-TORN' "$log"; then
       # The kill has to be the TORN PAIR, not a refused CONNECT and not a broken
       # cluster. Both of those fail the sentinel while saying nothing about whether
-      # the acceptance fact can outlive its session record.
+      # the acceptance can outlive its session record.
       outcome=OFFTARGET
     fi
   elif ! grep -qE '^\s*--- PASS: TestMQTTAcceptBatchReplicatedIndivisible' "$log"; then

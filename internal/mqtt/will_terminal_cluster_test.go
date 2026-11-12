@@ -57,7 +57,7 @@ func TestMQTTWillOutboxReplicatedTerminalDoneStands(t *testing.T) {
 	pubs := testCapturePublishes(t, asm)
 
 	clientID := "terminal-" + nuid.Next()
-	rec := testWillFor(asm, clientID, nuid.Next(), testFarFuture(), 1)
+	rec := testWillFor(asm, clientID, testAnchoredWillID(t, asm, clientID), testFarFuture(), 1)
 	subject, pendingSeq := testSeedWill(t, asm, rec)
 	c.waitStreamCurrent(t, testGlobalAccount, mqttWillQStreamName)
 

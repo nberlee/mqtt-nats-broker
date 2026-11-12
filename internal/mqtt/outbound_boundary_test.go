@@ -30,127 +30,6 @@ import (
 // substituted after it was built, and the CAS passes because the sequence is right, so the
 // guarantee held only for callers that chose to use the builder.
 
-// TestPredecessorIsComparedWithTheStore pins that the rules deciding what a transition
-// may displace are conclusions about the STANDING authority.
-//
-// Every kind rule reads t.Prev: which state may be displaced, whether ownership is preserved,
-// whether a proposal is pending. Without this check a caller copies the standing SERVING
-// authority, sets its State to CLOSED, keeps its real sequence, and reserves a fresh
-// generation over it — live ownership displaced with no handoff and no permanent closure.
-func TestPredecessorIsComparedWithTheStore(t *testing.T) {
-	e, done := testNewEnv(t, "f105-prev-boundary")
-	defer done()
-
-	auth, _ := e.bootstrap(t, "txn-1")
-	load := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if load.status != mqttOutboundValid || load.rec.State != mqttAuthorityServing {
-		t.Fatalf("the serving authority does not load back (status %v)", load.status)
-	}
-
-	// THE SUBSTITUTION: a SERVING authority described as CLOSED, at its real sequence, so a
-	// claim may be reserved over it.
-	lying := *load.rec
-	lying.State = mqttAuthorityClosed
-	claim := testReserveCreation(e, &lying, load.seq, "txn-claim", testGen2,
-		"tenure-claim", "intent-claim")
-	if _, err := e.asm.jsa.commitAuthorityTransition(claim); err == nil {
-		t.Fatalf("a claim was reserved over a SERVING authority described as closed: the " +
-			"predecessor is trusted as supplied")
-	}
-	after := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if after.rec.State != mqttAuthorityServing || after.seq != load.seq {
-		t.Fatalf("the refused claim moved the authority: %+v", after.rec)
-	}
-
-	// The same substitution in its other direction: a pending proposal ERASED by describing
-	// a predecessor that carries none. Reach PREPARING first.
-	intent := &mqttHandoffIntent{
-		ID: "intent-1", PrevGen: auth.Gen, PrevTenure: auth.Tenure,
-		PrevOwnerTxn: auth.OwnerTxn, PrevSessWID: "wid-0", PrevSessSeq: 12,
-		Tenure: "tenure-next", Gen: testGen2, CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
-		},
-	}
-	prep := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-prep", Op: "op-prep",
-			Kind: mqttTransitionPrepareIntent, PrevTxn: load.rec.OwnerTxn, Rev: load.rec.Rev + 1,
-			Gen: load.rec.Gen, Tenure: load.rec.Tenure, OwnerTxn: load.rec.OwnerTxn,
-		},
-		Prev: load.rec, PrevSeq: load.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: load.rec.Gen, Tenure: load.rec.Tenure,
-			State: mqttAuthorityPreparing, Rev: load.rec.Rev + 1, Txn: "txn-prep",
-			OwnerTxn: load.rec.OwnerTxn, Intent: intent,
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(prep); err != nil {
-		t.Fatalf("the preparation was refused: %v", err)
-	}
-	load = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if load.rec.State != mqttAuthorityPreparing || load.rec.Intent == nil {
-		t.Fatalf("the authority is not preparing with an intent (state %d)", load.rec.State)
-	}
-
-	// A PREPARING authority described as SERVING with no pending proposal, so an admission
-	// passes the freeze it should have been refused by.
-	erased := *load.rec
-	erased.State, erased.Intent = mqttAuthorityServing, nil
-	admit := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-sneak", Op: "op-sneak",
-			Kind: mqttTransitionAdmitExchange, PrevTxn: erased.OwnerTxn, Rev: erased.Rev + 1,
-			Gen: erased.Gen, Tenure: erased.Tenure, OwnerTxn: erased.OwnerTxn,
-		},
-		Prev: &erased, PrevSeq: load.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: erased.Gen, Tenure: erased.Tenure,
-			State: mqttAuthorityServing, Rev: erased.Rev + 1, Txn: "txn-sneak",
-			OwnerTxn: erased.OwnerTxn,
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(admit); err == nil {
-		t.Fatalf("an admission ran against a PREPARING authority described as serving, and " +
-			"erased its pending handoff")
-	}
-	back := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if back.rec.State != mqttAuthorityPreparing || back.rec.Intent == nil ||
-		back.rec.Intent.ID != intent.ID {
-		t.Fatalf("the refused admission disturbed the pending handoff: %+v", back.rec)
-	}
-
-	// The legitimate transition over the SAME predecessor still commits, so the check
-	// refuses substitutions rather than everything. A cancellation needs its proposal's
-	// metadata half to have been positively ABORTED — the authority record's shape is not
-	// what licenses it.
-	hp, herr := mqttProposalFromHandoff(intent)
-	if herr != nil {
-		t.Fatalf("viewing the pending handoff as a proposal failed: %v", herr)
-	}
-	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, hp); v != mqttMetadataAborted {
-		t.Fatalf("settling the pending handoff returned %v, want ABORTED", v)
-	}
-	cancel := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-cancel", Op: "op-cancel",
-			Kind: mqttTransitionCancelIntent, PrevTxn: back.rec.OwnerTxn, Rev: back.rec.Rev + 1,
-			Gen: intent.PrevGen, Tenure: intent.PrevTenure, OwnerTxn: intent.PrevOwnerTxn,
-			Intent: intent.ID,
-		},
-		Prev: back.rec, PrevSeq: back.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: intent.PrevGen, Tenure: intent.PrevTenure,
-			State: mqttAuthorityServing, Rev: back.rec.Rev + 1, Txn: "txn-cancel",
-			OwnerTxn: intent.PrevOwnerTxn,
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(cancel); err != nil {
-		t.Fatalf("a legitimate cancellation over the standing predecessor was refused: %v", err)
-	}
-}
-
 // TestResourceReleaseMustProveTheObligationEnded is the whole meaning of a deletion
 // authorization, and the correction to the version that only counted.
 //
@@ -193,7 +72,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	}
 	sneak := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-lie", Op: "op-lie",
+			ID: e.id, Epoch: e.epoch, Txn: "txn-lie", Scope: al.rec.Gen, Op: "op-lie",
 			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -201,6 +80,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: "txn-lie", OwnerTxn: al.rec.OwnerTxn,
+			Life: mqttLifeOf(al.rec),
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-rel"),
@@ -220,7 +100,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 	ibody, _ := json.Marshal(&inflated)
 	pin := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-pin", Op: "op-pin",
+			ID: e.id, Epoch: e.epoch, Txn: "txn-pin", Scope: al.rec.Gen, Op: "op-pin",
 			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -228,6 +108,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: "txn-pin", OwnerTxn: al.rec.OwnerTxn,
+			Life: mqttLifeOf(al.rec),
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-rel"),
@@ -315,7 +196,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 		mbody, _ := json.Marshal(&m)
 		bad := &mqttAuthorityTransition{
 			Attempt: &mqttTransitionAttempt{
-				ID: e.id, Epoch: e.epoch, Txn: "txn-after", Op: "op-after",
+				ID: e.id, Epoch: e.epoch, Txn: "txn-after", Scope: al.rec.Gen, Op: "op-after",
 				Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 				Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 			},
@@ -323,6 +204,7 @@ func TestResourceReleaseMustProveTheObligationEnded(t *testing.T) {
 			Auth: &mqttOutboundAuthority{
 				ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 				State: al.rec.State, Rev: al.rec.Rev + 1, Txn: "txn-after", OwnerTxn: al.rec.OwnerTxn,
+				Life: mqttLifeOf(al.rec),
 			},
 			Extra: []mqttTransitionMember{{
 				subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-rel"),

@@ -38,29 +38,7 @@ func testDiscardClose(t *testing.T, e *testOutboundEnv) string {
 		t.Fatalf("fixture: no serving authority to close: %v", al.status)
 	}
 	first := al.rec
-	ps, seq := testStandingSession(t, e)
-	intent := &mqttHandoffIntent{
-		ID: "intent-discard", PrevGen: first.Gen, PrevTenure: first.Tenure,
-		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: testGen2, Tenure: "tenure-discard", CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: first.Gen, Tenure: first.Tenure, OwnerTxn: first.OwnerTxn,
-			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
-		},
-	}
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-discard", intent); err != nil {
-		t.Fatalf("preparing the clean start: %v", err)
-	}
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: intent.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the clean start's metadata half: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin-discard", intent.ID); err != nil {
-		t.Fatalf("finalizing the discarding handoff: %v", err)
-	}
+	e.accept(t, "txn-discard", testGen2, "tenure-discard", true, mqttClosingTargets{})
 	if err := jsa.requireDiscardingClosure(e.id, e.epoch, first.Gen); err != nil {
 		t.Fatalf("fixture: the generation was not closed discarding: %v", err)
 	}
@@ -112,6 +90,8 @@ func testDiscardCertified(e *testOutboundEnv, gen string) bool {
 // while inv fails, until the generation certifies or the bound runs out.
 func testDiscardSweepUntilCertified(t *testing.T, e *testOutboundEnv, gen string, inv func() error) {
 	t.Helper()
+	// What certification left is inspected below, so the reclamation that follows it is held.
+	e.asm.testHoldGenerationRetirement.Store(true)
 	for i := 0; i < 8*mqttDirShards; i++ {
 		e.asm.sweepOutboundRecovery(e.asm.server(), nil)
 		certified := testDiscardCertified(e, gen)
@@ -268,33 +248,26 @@ func TestDiscardCensusSurvivesBudgetAndShutdown(t *testing.T) {
 	testDiscardSweepUntilCertified(t, e, gen, allDiscarded)
 }
 
-// T9: a reachable root is durable recovery ownership only under a DISCARDING closure (M9).
-func TestReleaseGateRootArmNeedsADiscard(t *testing.T) {
+// T9: a reachable root is durable recovery ownership of a closed (discarded) generation, and so
+// is a certificate once the root retired behind it (M9).
+func TestReleaseGateRootArmIsDurableOwnership(t *testing.T) {
 	sealed := &mqttGenLedger{Lo: 1, Del: 1, State: mqttGenLedgerSealed, Hi: 3, SealedHi: 3}
-	base := func(discard mqttFactState) mqttAdoptedReleaseFacts {
-		return mqttAdoptedReleaseFacts{Closed: &mqttGenClosure{}, Ledger: sealed, Discard: discard, RootEnrolled: true}
+	base := func() mqttAdoptedReleaseFacts {
+		return mqttAdoptedReleaseFacts{Closed: &mqttGenClosure{}, Ledger: sealed, RootEnrolled: true}
 	}
-	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", base(mqttFactApplies)); len(blocks) != 0 {
-		t.Fatalf("a discarding generation with a reachable root was refused: %v", blocks)
+	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", base()); len(blocks) != 0 {
+		t.Fatalf("a discarded generation with a reachable root was refused: %v", blocks)
 	}
-	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", base(mqttFactDoesNotApply)); len(blocks) != 1 ||
-		blocks[0].Fact != "durable recovery ownership" {
-		t.Fatalf("a preserving generation with only a root was released: %v", blocks)
-	}
-	empty := base(mqttFactDoesNotApply)
-	empty.Ledger = &mqttGenLedger{Lo: 1, Del: 1, State: mqttGenLedgerSealed}
-	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", empty); len(blocks) != 0 {
-		t.Fatalf("a preserving generation with an EMPTY sealed inventory was refused: %v", blocks)
-	}
-	certified := base(mqttFactDoesNotApply)
-	certified.Cert = &mqttGenCompletionCertificate{SealedHi: 3}
-	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", certified); len(blocks) != 0 {
-		t.Fatalf("a preserving generation that certified was refused: %v", blocks)
-	}
-	retired := base(mqttFactApplies)
+	retired := base()
 	retired.RootEnrolled, retired.Cert = false, &mqttGenCompletionCertificate{SealedHi: 3}
 	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", retired); len(blocks) != 0 {
 		t.Fatalf("a discarded generation whose root retired behind its certificate was refused: %v", blocks)
+	}
+	orphaned := base()
+	orphaned.RootEnrolled = false
+	if blocks := mqttAdoptedReleaseBlockedBy("c", "g", orphaned); len(blocks) != 1 ||
+		blocks[0].Fact != "durable recovery ownership" {
+		t.Fatalf("a generation with neither a root nor a certificate was released: %v", blocks)
 	}
 }
 
@@ -321,7 +294,7 @@ func TestDiscardedPubRelWaitsForAffineReadiness(t *testing.T) {
 		t.Fatalf("the PUBREL consumer was disposed of before the readiness: %+v", r.Disposal)
 	}
 	if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{ID: e.id, Epoch: e.epoch, Gen: gen,
-		AffGen: aff.AffGen, Durable: aff.Name, PubRelDur: aff.PubRelDur}); err != nil {
+		AffGen: aff.AffGen, Durable: aff.Name, PubRelDur: aff.PubRelDur}, nil); err != nil {
 		t.Fatalf("asserting the readiness: %v", err)
 	}
 	e.asm.performDiscardWork(e.asm.server(), root, d, v, newMqttRecoveryBudget())

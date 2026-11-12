@@ -199,6 +199,10 @@ type mqttSession struct {
 	// are written under the accept transaction and reset by every pass.
 	forkFence      uint64
 	forkNotServing map[string]struct{}
+	// displacedMarker is the nonce of the teardown marker this session's base record holds when
+	// the CONNECT that restored it is about to write over that marker (plan 5.1 shape 4): its
+	// acceptance names the release it discharges. Empty otherwise.
+	displacedMarker string
 	// boundEnt is the accepted entitlement of the connection most recently ACCEPTED on this
 	// session object (issue #107 7b): set in the accept loop beside the connection's own
 	// setOutboundEntitlement, kept across a normal detach (a detached close still acts for the
@@ -294,11 +298,6 @@ type mqttSession struct {
 	// installs it on the generation's acquisition ledger before it reconciles or serves. See
 	// mqttSharedTenure and mintAcceptanceTenure.
 	sharedTenure mqttSharedTenure
-	// acceptFact names the acceptance fact the adopted metadata batch committed: its subject and
-	// the digest of its body. Set by adoptCommittedMetadata — the one adoption point of both a
-	// live acknowledgement and a resolved commit — so the association survives a lost response,
-	// and read back by mintAcceptanceTenure for the fact's stream sequence. In-memory only.
-	acceptFact mqttAcceptFactRef
 	// acqReleases are the shared-acquisition RELEASE VERDICTS this session owes, keyed by
 	// acquisition nonce and persisted as mqttPersistedSession.AcqReleases: written into the
 	// record by the transaction that removes or cancels a membership, executed after that
@@ -1013,6 +1012,14 @@ func (sess *mqttSession) setIncarnationLocked(gen string, permit mqttRetirementP
 	}
 	sess.leases = newIncarnationTracker()
 	sess.leases.onReopen = sess.rearmCustodyAfterReopen
+	sess.deriveGenerationLocked(gen)
+}
+
+// deriveGenerationLocked adopts gen and every name scoped by it, without the tracker swap.
+// setIncarnationLocked's body after the swap, and the acceptance's adoption of the generation
+// its authority installed (accept_drive.go) on an object no client is bound to and nothing has
+// yet named by its placeholder generation. sess.mu must be held.
+func (sess *mqttSession) deriveGenerationLocked(gen string) {
 	sess.gen = gen
 	// Generation discard is the one release of custody that is not an observation: the
 	// retiring generation's ledger goes whole, and every late callback that still names it

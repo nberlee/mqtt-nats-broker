@@ -6347,9 +6347,9 @@ func TestMQTTv5SessionExpiryStalePersistAck(t *testing.T) {
 		}
 	}
 	asm.mu.Unlock()
-	nc, js := jsClientConnect(t, s)
+	nc, _ := jsClientConnect(t, s)
 	defer nc.Close()
-	newSeq := testMQTTPlantSessionRecord(t, js, asm.domainTk, "sestale",
+	newSeq := testMQTTPlantSessionRecord(t, asm, "sestale",
 		&mqttPersistedSession{DisconnectedAt: time.Now().Unix(), ExpiryInterval: 30})
 	deliverAck(newSeq)
 	select {
@@ -6421,7 +6421,13 @@ func TestMQTTv5SessionExpiryStaleTimerRecordState(t *testing.T) {
 			// server would, while this server still holds the session and its timer.
 			// WID included, as every real save stamps one: a record with no identity
 			// cannot be retired by name, so a teardown of it fails closed.
-			ps := mqttPersistedSession{Origin: "remote", ID: "seh4", Gen: mqttNewSessGen(),
+			// The same generation: another server's resume keeps it (issue #133), and a record
+			// of a generation the authority does not serve is no broker's.
+			served := asm.jsa.loadOutboundAuthority("seh4", asm.sessStreamEpoch)
+			if served.rec == nil {
+				t.Fatalf("seh4 has no authority: %v", served.status)
+			}
+			ps := mqttPersistedSession{Origin: "remote", ID: "seh4", Gen: served.rec.Gen,
 				WID: mqttNewRecordWID(), ExpiryInterval: 100, DisconnectedAt: test.disconnAt()}
 			b, err := json.Marshal(&ps)
 			require_NoError(t, err)
@@ -6798,14 +6804,9 @@ func TestMQTTv5SessionExpiryOwnerCrashSweep(t *testing.T) {
 	// still reclaim the record.
 	nc, js := jsClientConnect(t, s)
 	defer nc.Close()
-	rec, err := json.Marshal(&mqttPersistedSession{ID: "ghost", Gen: mqttNewSessGen(), Origin: "crashed-node", ExpiryInterval: 1})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	ghostSubj := mqttSessStreamSubjectPrefix + getHash("ghost")
-	if _, err := js.Publish(ghostSubj, rec); err != nil {
-		t.Fatalf("plant ghost record: %v", err)
-	}
+	asm := testMQTTGetGlobalASM(t, s)
+	testMQTTPlantSessionRecord(t, asm, "ghost", &mqttPersistedSession{Origin: "crashed-node", ExpiryInterval: 1})
+	ghostSubj := mqttSessStreamSubjectPrefix + asm.domainTk + getHash("ghost")
 
 	// The periodic sweep stamps the disconnect, arms the 1s deadline, and the
 	// expiry deletes the record.
@@ -7000,15 +7001,21 @@ func TestMQTTv5SessionExpiryCrossReplicaHandoff(t *testing.T) {
 // testMQTTPlantSessionRecord stores a persisted session record for id via a raw
 // JetStream client and returns its stream sequence, so the reconciliation unit
 // tests can drive reconcileRemoteSessionExpiry against known record generations.
-func testMQTTPlantSessionRecord(t testing.TB, js nats.JetStreamContext, domainTk, id string, ps *mqttPersistedSession) uint64 {
+func testMQTTPlantSessionRecord(t testing.TB, asm *mqttAccountSessionManager, id string, ps *mqttPersistedSession) uint64 {
 	t.Helper()
 	ps.ID = id
-	// Every record this broker writes carries an incarnation generation, and one
-	// without is rejected at the boundary (mqttSessGenFromRecord), so a fixture that
-	// does not care about generations still needs a well-formed one. A fixture that
-	// DOES care sets its own and keeps it.
-	if ps.Gen == _EMPTY_ {
-		ps.Gen = mqttNewSessGen()
+	// Every record is written by an acceptance, which creates or advances its authority
+	// (issue #133): a client this fixture plants for first gets one, so the record's generation
+	// is one its lifecycle allocated and serves. A fixture that cares sets its own and keeps it.
+	al := asm.jsa.loadOutboundAuthority(id, asm.sessStreamEpoch)
+	if al.status == mqttOutboundAbsent {
+		txn := mqttNewInflightNonce()
+		testAcceptAndBindAs(t, &asm.jsa, asm.domainTk, id, asm.sessStreamEpoch, txn, _EMPTY_, mqttNewInflightNonce(),
+			false, mqttClosingTargets{}, false)
+		al = asm.jsa.loadOutboundAuthority(id, asm.sessStreamEpoch)
+	}
+	if ps.Gen == _EMPTY_ && al.rec != nil {
+		ps.Gen = al.rec.Gen
 	}
 	// Same rule for the record's own IDENTITY: every save stamps one at the store
 	// boundary, and a teardown of a record that carries none fails closed, because
@@ -7021,7 +7028,7 @@ func testMQTTPlantSessionRecord(t testing.TB, js nats.JetStreamContext, domainTk
 	if err != nil {
 		t.Fatalf("marshal session record: %v", err)
 	}
-	ack, err := js.Publish(mqttSessStreamSubjectPrefix+domainTk+getHash(id), b)
+	ack, err := asm.jsa.storeMsg(mqttSessStreamSubjectPrefix+asm.domainTk+getHash(id), 0, b)
 	if err != nil {
 		t.Fatalf("plant session record for %q: %v", id, err)
 	}
@@ -7139,7 +7146,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 	t.Run("finite arms", func(t *testing.T) {
 		id := "recfinite"
 		h := getHash(id)
-		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		seq := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
 		_, run := testMQTTRunReconcile(t, asm, s, h, seq)
 		run()
 		if testMQTTPendingExpiryTimer(asm, h) == nil {
@@ -7157,7 +7164,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 		if testMQTTPendingExpiryTimer(asm, h) == nil {
 			t.Fatal("precondition: expected a pre-armed timer")
 		}
-		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: 0})
+		seq := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: 0})
 		_, run := testMQTTRunReconcile(t, asm, s, h, seq)
 		run()
 		if testMQTTPendingExpiryTimer(asm, h) != nil {
@@ -7175,7 +7182,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			id := "rec" + tc.name
 			h := getHash(id)
-			seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: tc.expiry})
+			seq := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: tc.expiry})
 			_, run := testMQTTRunReconcile(t, asm, s, h, seq)
 			run()
 			if testMQTTPendingExpiryTimer(asm, h) != nil {
@@ -7187,7 +7194,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 	t.Run("older than observed no-op", func(t *testing.T) {
 		id := "recold"
 		h := getHash(id)
-		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		seq := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
 		// Observe a sequence newer than the record: the worker must not arm from a
 		// snapshot that cannot include the write it observed.
 		_, run := testMQTTRunReconcile(t, asm, s, h, seq+50)
@@ -7204,7 +7211,7 @@ func TestMQTTv5RemoteExpiryReconcileDecision(t *testing.T) {
 		id := "recdue"
 		h := getHash(id)
 		subj := mqttSessStreamSubjectPrefix + asm.domainTk + h
-		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now - 100, ExpiryInterval: 1})
+		seq := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now - 100, ExpiryInterval: 1})
 		_, run := testMQTTRunReconcile(t, asm, s, h, seq)
 		run()
 		// The already-due path arms a 0-delay timer that fires into the record-based
@@ -7233,7 +7240,7 @@ func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
 	asm := testMQTTGetClient(t, s, "ordprobe").mqtt.asm
 	testMQTTSuppressRecordWatch(t, asm)
 
-	nc, js := jsClientConnect(t, s)
+	nc, _ := jsClientConnect(t, s)
 	defer nc.Close()
 	now := time.Now().Unix()
 
@@ -7246,13 +7253,13 @@ func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
 		id := "ordcancel"
 		h := getHash(id)
 		// Old snapshot: connected (its decision would be cancel-the-timer).
-		seqOld := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: 0})
+		seqOld := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: 0})
 		release, done := testMQTTStartParkedReconcile(t, asm, s, h, seqOld)
 		if !testMQTTReconcileEntryPresent(asm, h) {
 			t.Fatal("expected the parked stale worker's watermark entry to be present (inFlight keeps it alive)")
 		}
 		// Newer generation: a finite disconnect. Its worker arms the authoritative timer.
-		seqNew := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		seqNew := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
 		_, runNew := testMQTTRunReconcile(t, asm, s, h, seqNew)
 		runNew()
 		armed := testMQTTPendingExpiryTimer(asm, h)
@@ -7276,13 +7283,13 @@ func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
 		id := "ordreplace"
 		h := getHash(id)
 		// Old snapshot: a long finite deadline (its decision would re-arm long).
-		seqOld := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100000})
+		seqOld := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100000})
 		release, done := testMQTTStartParkedReconcile(t, asm, s, h, seqOld)
 		if !testMQTTReconcileEntryPresent(asm, h) {
 			t.Fatal("expected the parked stale worker's watermark entry to be present (inFlight keeps it alive)")
 		}
 		// Newer generation: a shorter finite deadline. Its worker arms the authoritative timer.
-		seqNew := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		seqNew := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
 		_, runNew := testMQTTRunReconcile(t, asm, s, h, seqNew)
 		runNew()
 		armed := testMQTTPendingExpiryTimer(asm, h)
@@ -7304,7 +7311,7 @@ func TestMQTTv5RemoteExpiryReconcileOrdering(t *testing.T) {
 	t.Run("shutdown prevents installing a timer", func(t *testing.T) {
 		id := "ordshutdown"
 		h := getHash(id)
-		seq := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+		seq := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
 		st, run := testMQTTRunReconcile(t, asm, s, h, seq)
 		// Simulate the account-manager teardown (nil pendingExpiries) for the duration
 		// of this worker, then restore it.
@@ -7345,14 +7352,14 @@ func TestMQTTv5RemoteExpiryReconcileLocalReconnectRace(t *testing.T) {
 	asm := testMQTTGetClient(t, s, "lrprobe").mqtt.asm
 	testMQTTSuppressRecordWatch(t, asm)
 
-	nc, js := jsClientConnect(t, s)
+	nc, _ := jsClientConnect(t, s)
 	defer nc.Close()
 	now := time.Now().Unix()
 
 	id := "lrtarget"
 	h := getHash(id)
 	// A remote disconnect record this replica does not own locally (finite, not due).
-	seqOld := testMQTTPlantSessionRecord(t, js, asm.domainTk, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
+	seqOld := testMQTTPlantSessionRecord(t, asm, id, &mqttPersistedSession{DisconnectedAt: now, ExpiryInterval: 100})
 
 	// Park a stale worker holding that old disconnected snapshot (loaded before the
 	// local session appears).

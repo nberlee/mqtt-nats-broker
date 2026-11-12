@@ -208,7 +208,7 @@ func TestThePassVisitsAnEnrolledRootAndRetiresIt(t *testing.T) {
 	defer cleanup()
 	auth, _ := e.bootstrap(t, "txn-boot")
 
-	if _, err := e.asm.jsa.opCloseGeneration(e.id, e.epoch, mqttNewInflightNonce(), auth.Gen, auth.Tenure,
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch, auth.Gen, auth.Tenure,
 		auth.OwnerTxn); err != nil {
 		t.Fatalf("closing the generation: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestTheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 		if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: other, Durable: otherDur, PubRelDur: r.PubRelDur,
-		}); err != nil {
+		}, nil); err != nil {
 			t.Fatalf("publishing the readiness: %v", err)
 		}
 		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
@@ -402,7 +402,7 @@ func TestTheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 		if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-		}); err != nil {
+		}, nil); err != nil {
 			t.Fatalf("publishing the readiness: %v", err)
 		}
 		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
@@ -427,7 +427,7 @@ func TestTheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 		if err := e.asm.jsa.publishAffineReadiness(&mqttAffineReadiness{
 			ID: e.id, Epoch: e.epoch, Gen: testGen,
 			AffGen: r.AffGen, Durable: r.Name, PubRelDur: r.PubRelDur,
-		}); err != nil {
+		}, nil); err != nil {
 			t.Fatalf("publishing the readiness: %v", err)
 		}
 		_, rseq, _ := e.asm.jsa.loadOutboundResource(e.id, e.epoch, testGen, r.Inc)
@@ -443,6 +443,7 @@ func TestTheSealRequiresAWellFormedReadinessRecord(t *testing.T) {
 func TestReadinessIsIdempotentAndConflictsAreErrors(t *testing.T) {
 	e, cleanup := testNewEnv(t, "client-f105-ready-idem")
 	defer cleanup()
+	e.bootstrap(t, "txn-1") // readiness is fenced by the authority of a live generation
 
 	const affGen = "0123456789abcdefghijkq"
 	_, _, durable := mqttQ2AffineNames(getHash(e.id), affGen)
@@ -451,17 +452,17 @@ func TestReadinessIsIdempotentAndConflictsAreErrors(t *testing.T) {
 		ID: e.id, Epoch: e.epoch, Gen: testGen,
 		AffGen: affGen, Durable: durable, PubRelDur: pubRelDur,
 	}
-	if err := e.asm.jsa.publishAffineReadiness(ready); err != nil {
+	if err := e.asm.jsa.publishAffineReadiness(ready, nil); err != nil {
 		t.Fatalf("the first producer failed: %v", err)
 	}
 	// THE SECOND PRODUCER FINDS THE SAME FACT and is done, rather than competing for the subject.
-	if err := e.asm.jsa.publishAffineReadiness(ready); err != nil {
+	if err := e.asm.jsa.publishAffineReadiness(ready, nil); err != nil {
 		t.Fatalf("an identical second assertion was refused: %v", err)
 	}
 	// A CONFLICTING ONE IS AN ERROR: one generation has one affine consumer.
 	conflicting := *ready
 	conflicting.Durable = "$MQTT_Q2AFF_b"
-	if err := e.asm.jsa.publishAffineReadiness(&conflicting); err == nil {
+	if err := e.asm.jsa.publishAffineReadiness(&conflicting, nil); err == nil {
 		t.Fatal("two different affine consumers were asserted for one generation")
 	}
 }

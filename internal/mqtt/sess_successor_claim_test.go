@@ -54,6 +54,10 @@ func testPlantDeferredAction(t *testing.T, e *testRejectionEnv, delayed bool) *m
 			message: []byte("parked-will"),
 		},
 	}
+	if delayed {
+		// The anchor the parked connection's delay-capable acceptance allocated.
+		action.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
+	}
 	e.sess.mu.Lock()
 	e.sess.deferredDisconnect = action
 	e.sess.mu.Unlock()
@@ -276,7 +280,7 @@ func TestParkedActionOutranksLiveWill(t *testing.T) {
 // negatives assert an OWNERSHIP TRANSITION rather than a publication.
 //
 // "Consume normally" does not mean "the Will appears on the wire": a delayed Will is
-// enqueued against its ORIGINAL deadline and a qualifying acceptance fact may later suppress
+// enqueued against its ORIGINAL deadline and a later acceptance on its anchor may suppress
 // it. What the broker owes is the enqueue.
 func TestDelayedParkedWillReachesTheOutbox(t *testing.T) {
 	e := testNewRejectionEnv(t, "f084delayed")
@@ -535,6 +539,8 @@ func TestRemotePersistEvictionEnqueuesDelayedWill(t *testing.T) {
 		props:   &mqttProperties{willDelay: 3600},
 	}
 	b.bc.mqtt.willDisposition = mqttWillArmed
+	// The anchor a delay-capable CONNECT's acceptance allocates for this Will.
+	b.bc.mqtt.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
 	// DELIBERATELY DIFFERENT from the session's. testNewRejectionEnv sets
 	// sess.expiryInterval to mqttSessionNeverExpire, so a fixture that used the same value
 	// here could not tell the connection-side sample from the session-side one — and the
@@ -744,6 +750,8 @@ func TestTeardownIncompleteConsumesAgainstTheRetiringIncarnation(t *testing.T) {
 		props:   &mqttProperties{willDelay: 3600},
 	}
 	b.bc.mqtt.willDisposition = mqttWillArmed
+	// The anchor a delay-capable CONNECT's acceptance allocates for this Will.
+	b.bc.mqtt.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
 	b.bc.mqtt.sessionExpiry = mqttSessionNeverExpire
 	b.bc.mu.Unlock()
 
@@ -856,6 +864,8 @@ func TestWillExpiryIsReadAtConsumptionNotSnapshotted(t *testing.T) {
 		props:   &mqttProperties{willDelay: 3600},
 	}
 	b.bc.mqtt.willDisposition = mqttWillArmed
+	// The anchor a delay-capable CONNECT's acceptance allocates for this Will.
+	b.bc.mqtt.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
 	// Phase 1 sees never-expire, which would leave the 3600 s delay uncapped.
 	b.bc.mqtt.sessionExpiry = mqttSessionNeverExpire
 	b.bc.mu.Unlock()

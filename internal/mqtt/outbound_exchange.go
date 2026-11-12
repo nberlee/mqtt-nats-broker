@@ -781,7 +781,7 @@ func mqttAcquireActionsTransition(prev *mqttOutboundAuthority, prevSeq uint64, t
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: prev.Gen, Op: op,
 			Kind: mqttTransitionAcquireAction, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -789,6 +789,7 @@ func mqttAcquireActionsTransition(prev *mqttOutboundAuthority, prevSeq uint64, t
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: mqttAuthorityServing, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
+			Life: prev.Life,
 		},
 		Extra: extra,
 	}, nil
@@ -926,7 +927,7 @@ func mqttAdvanceExchangeTransition(prev *mqttOutboundAuthority, _ uint64, txn, o
 	// authority CAS used to cost was every next admission's first attempt.
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op, Kind: mqttTransitionAdvanceExchange,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: cur.Gen, Op: op, Kind: mqttTransitionAdvanceExchange,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
 		Extra: []mqttTransitionMember{{
@@ -949,7 +950,7 @@ func mqttFenceAdvanceOnAuthority(tr *mqttAuthorityTransition, prev *mqttOutbound
 	tr.Auth = &mqttOutboundAuthority{
 		ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 		State: prev.State, Rev: prev.Rev + 1, Txn: a.Txn, OwnerTxn: prev.OwnerTxn,
-		Intent: prev.Intent, Creation: prev.Creation,
+		Life: prev.Life,
 	}
 }
 

@@ -50,9 +50,9 @@
 // transition below disposes BEFORE anything fallible.
 //
 // WHAT THIS DOES NOT CLOSE, and what does: the window in which a teardown that WON its
-// claim has already deleted the consumers a surviving foreign record still names is made
-// recognisable and repaired by the generation-retirement watermark (sess_teardown.go,
-// issue #32); two parentless
+// claim has already deleted the consumers a surviving foreign record still names no longer
+// exists: every record created after a marker is an acceptance's, of a fresh generation
+// (issue #133); two parentless
 // first-creates racing for one empty subject are not recognised, a stated residual
 // (docs/CONFORMANCE.md, R-create; issue #33). Neither is this slice's.
 //
@@ -85,9 +85,8 @@ import (
 //     the claim was won.
 //   - Not "this session is detached". clear() resets state but does not clear sess.c,
 //     which is exactly why the re-drive has to dispose the binding itself.
-//   - Not "the winner's named state is intact". It is not, in one window — the
-//     claim-won deletion window, which the generation-retirement watermark makes
-//     recognisable and repairs (issue #32).
+//   - Not "the winner's named state is intact": a teardown that won its claim has deleted
+//     the retired generation's names.
 //
 // It is deliberately distinct from errMQTTClearRefusedUnresolved, which encodes
 // recoverability of an UNCLASSIFIED state and must never enter the re-drive loop.

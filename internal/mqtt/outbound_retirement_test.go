@@ -452,67 +452,6 @@ func TestCleanupOfAnOldGenerationWhileANewOneServes(t *testing.T) {
 	}
 }
 
-// TestDisposalPreservesAPendingProposal pins that cleanup running beside a reservation
-// or a preparation resolves neither.
-//
-// The disposal builder dropped the creation proposal, which made its own output invalid
-// under RESERVING — a body this broker would refuse to read back — and a transition that
-// rewrote either proposal would silently abandon a handoff nobody resolved.
-func TestDisposalPreservesAPendingProposal(t *testing.T) {
-	base := func(state mqttAuthorityState) *mqttAuthorityTransition {
-		tr := testTransition()
-		tr.Attempt.Kind = mqttTransitionDisposeResource
-		r := testResource(mqttResourceLive, []string{})
-		b, _ := json.Marshal(r)
-		tr.Extra = []mqttTransitionMember{{
-			subj: mqttResourceSubject(getHash(testID), testGen, "inc-1"), expect: 1, body: b,
-		}}
-		prev := testPreparingAuthority()
-		prev.Rev = 1
-		prev.Gen, prev.Tenure, prev.OwnerTxn = tr.Prev.Gen, tr.Prev.Tenure, tr.Prev.OwnerTxn
-		prev.Intent.PrevGen, prev.Intent.PrevTenure, prev.Intent.PrevOwnerTxn = prev.Gen, prev.Tenure, prev.OwnerTxn
-		prev.Intent.Retire.Gen, prev.Intent.Retire.Tenure, prev.Intent.Retire.OwnerTxn = prev.Gen, prev.Tenure, prev.OwnerTxn
-		prev.State = state
-		if state == mqttAuthorityReserving {
-			prev.Intent = nil
-			prev.Creation = &mqttCreationIntent{ID: "create-1", Gen: prev.Gen, Tenure: prev.Tenure}
-		}
-		tr.Prev = prev
-		auth := *prev
-		auth.Rev, auth.Txn = prev.Rev+1, tr.Attempt.Txn
-		tr.Auth = &auth
-		tr.Attempt.Rev = auth.Rev
-		tr.Attempt.Gen, tr.Attempt.Tenure, tr.Attempt.OwnerTxn = auth.Gen, auth.Tenure, auth.OwnerTxn
-		tr.Attempt.PrevTxn = prev.OwnerTxn
-		return tr
-	}
-
-	for name, state := range map[string]mqttAuthorityState{
-		"a pending handoff":            mqttAuthorityPreparing,
-		"a first-creation reservation": mqttAuthorityReserving,
-	} {
-		ok := base(state)
-		if err := mqttCheckTransitionKindRules(ok); err != nil {
-			t.Fatalf("a disposal beside %s was refused: %v", name, err)
-		}
-		dropped := base(state)
-		dropped.Auth.Intent, dropped.Auth.Creation = nil, nil
-		if err := mqttCheckTransitionKindRules(dropped); err == nil {
-			t.Fatalf("a disposal beside %s DROPPED the pending proposal: the authority would "+
-				"remain in that state with nothing left to finalize", name)
-		}
-	}
-
-	// And a rewritten proposal is refused too, not merely a dropped one.
-	rew := base(mqttAuthorityReserving)
-	c := *rew.Prev.Creation
-	c.Tenure = "tenure-elsewhere"
-	rew.Auth.Creation = &c
-	if err := mqttCheckTransitionKindRules(rew); err == nil {
-		t.Fatalf("a disposal rewrote the pending creation proposal")
-	}
-}
-
 // TestResourceDependentListIsNeverNull pins that an empty list is written as `[]`.
 //
 // A null decodes to a nil slice that reads identically to an empty one, so "this record says
@@ -709,7 +648,7 @@ func TestDeletionRequiresSealedProvisioning(t *testing.T) {
 	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	if _, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-forged", Op: "op-forged",
+			ID: e.id, Epoch: e.epoch, Txn: "txn-forged", Scope: al.rec.Gen, Op: "op-forged",
 			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -718,6 +657,7 @@ func TestDeletionRequiresSealedProvisioning(t *testing.T) {
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: "txn-forged",
 			OwnerTxn: al.rec.OwnerTxn,
+			Life:     mqttLifeOf(al.rec),
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-1"),
@@ -781,7 +721,7 @@ func TestProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 		_, err := e.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 			Attempt: &mqttTransitionAttempt{
-				ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+				ID: e.id, Epoch: e.epoch, Txn: txn, Scope: al.rec.Gen, Op: "op-" + txn,
 				Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 				Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 			},
@@ -790,6 +730,7 @@ func TestProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 				ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 				State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: txn,
 				OwnerTxn: al.rec.OwnerTxn,
+				Life:     mqttLifeOf(al.rec),
 			},
 			Extra: []mqttTransitionMember{{
 				subj:   mqttResourceSubject(getHash(e.id), testGen, "inc-1"),
@@ -843,7 +784,7 @@ func TestProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 	al := e2.asm.jsa.loadOutboundAuthority(e2.id, e2.epoch)
 	_, err := e2.asm.jsa.commitAuthorityTransition(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e2.id, Epoch: e2.epoch, Txn: "txn-both", Op: "op-both",
+			ID: e2.id, Epoch: e2.epoch, Txn: "txn-both", Scope: al.rec.Gen, Op: "op-both",
 			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -852,6 +793,7 @@ func TestProvisioningSealIsForwardOnlyAndAlone(t *testing.T) {
 			ID: e2.id, Epoch: e2.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: "txn-both",
 			OwnerTxn: al.rec.OwnerTxn,
+			Life:     mqttLifeOf(al.rec),
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(e2.id), testGen, "inc-2"),

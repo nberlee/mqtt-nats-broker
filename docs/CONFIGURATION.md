@@ -15,7 +15,7 @@ equivalent. Installation and the NATS prerequisites are in
 | `-nats-pass` | `MQTTNB_NATS_PASS` | | NATS password (service conn) |
 | `-nats-name` | `MQTTNB_NATS_NAME` | `mqtt-nats-broker` | Connection name |
 | `-js-domain` | `MQTTNB_JS_DOMAIN` | | JetStream domain; a single subject token. Baked into session subjects, so changing it later orphans existing sessions ([details](ARCHITECTURE.md#jetstream-domain)) |
-| `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | none, required | JetStream replicas of the eight broker-owned streams: the JetStream cluster size (normally 3 for HA), `1` for a single server. Every existing broker-owned stream must have exactly this count ([details](#stream-replicas)) |
+| `-stream-replicas` | `MQTTNB_STREAM_REPLICAS` | none, required | JetStream replicas of the seven broker-owned streams: the JetStream cluster size (normally 3 for HA), `1` for a single server. Every existing broker-owned stream must have exactly this count ([details](#stream-replicas)) |
 | `-host` | `MQTTNB_HOST` | `0.0.0.0` | MQTT listen host |
 | `-port` | `MQTTNB_PORT` | `1883` | MQTT listen port |
 | `-max-conns` | `MQTTNB_MAX_CONNS` | `0` (∞) | Max concurrent clients |
@@ -114,7 +114,7 @@ service connection instead, and gives up per-client NATS authorization
 
 ## Stream replicas
 
-`-stream-replicas` is the JetStream replica count of the eight streams the broker creates
+`-stream-replicas` is the JetStream replica count of the seven streams the broker creates
 in its account, and every durable consumer inherits it. It is the setting that makes
 broker state survive the loss of a NATS server, so an HA deployment sets it explicitly:
 normally `3` on a three-server JetStream cluster.
@@ -127,8 +127,8 @@ The count is also checked: at startup every existing broker-owned stream must ha
 exactly that many replicas, or the broker refuses to start. Changing the setting
 therefore does not change existing streams. The supported way to move to another count
 is the one for any nonconforming stream bundle: stop every broker for the account,
-delete all eight streams, and restart with the new value. That discards every session,
-retained message and in-flight QoS state ([Operations](OPERATIONS.md#the-eight-streams)).
+delete all seven streams, and restart with the new value. That discards every session,
+retained message and in-flight QoS state ([Operations](OPERATIONS.md#the-seven-streams)).
 
 In the Helm chart the embedded topology sets the count itself, `1` for one server and
 the peer count for a cluster; the external topology requires `broker.streamReplicas`

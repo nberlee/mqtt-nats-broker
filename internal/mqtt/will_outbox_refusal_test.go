@@ -229,7 +229,7 @@ func TestMQTTWillOutboxScanRefusesUnsupportedRecords(t *testing.T) {
 
 	// The control: a well-formed due record with no watermark and no session
 	// record, so the fence proceeds and it fires.
-	okRec := dueWillRecord(asm, "refusal-control-pub", "refusal-control-w")
+	okRec := dueWillRecord(asm, "refusal-control-pub", testAnchoredWillID(t, asm, "refusal-control-pub"))
 	okSubject, _ := seedWillRecord(t, asm, okRec)
 
 	// The control fires and its record drains, leaving EXACTLY the refused ones.
@@ -281,7 +281,7 @@ func TestMQTTWillOutboxScanRefusesUnsupportedExpiredClaim(t *testing.T) {
 	}
 	refused := seedRefusedWillFixtures(t, asm, mqttWillPublishing, expired)
 
-	okRec := dueWillRecord(asm, "reclaim-control-pub", "reclaim-control-w")
+	okRec := dueWillRecord(asm, "reclaim-control-pub", testAnchoredWillID(t, asm, "reclaim-control-pub"))
 	okRec.State = mqttWillPublishing
 	expired(okRec)
 	okSubject, _ := seedWillRecord(t, asm, okRec)
@@ -322,7 +322,7 @@ func TestMQTTWillOutboxScanNeverReapsUnsupportedTerminalRecord(t *testing.T) {
 
 	refused := seedRefusedWillFixtures(t, asm, mqttWillDone, nil)
 
-	okRec := dueWillRecord(asm, "reap-control-pub", "reap-control-w")
+	okRec := dueWillRecord(asm, "reap-control-pub", testAnchoredWillID(t, asm, "reap-control-pub"))
 	// A terminal record carries the licence that produced it: the legal shape matrix
 	// refuses a done record with no decision, exactly as it refuses a pending one
 	// that carries one.
@@ -356,8 +356,10 @@ func TestMQTTWillOutboxLoadRefusesUnsupportedRecord(t *testing.T) {
 	asm := testMQTTGetGlobalASM(t, s)
 
 	far := time.Now().Add(time.Hour).UnixNano()
+	var loads uint64
 	load := func(name string, mutate func(rec *mqttWillOutbox)) (*mqttWillOutbox, error) {
-		rec := dueWillRecord(asm, "load-refusal-"+name, "load-"+name)
+		loads++
+		rec := dueWillRecord(asm, "load-refusal-"+name, testWillToken(t, loads))
 		rec.FireAt = far
 		mutate(rec)
 		subject := mqttWillQSubject(asm.domainTk, rec.ClientIDHash, rec.WillID)
@@ -376,6 +378,8 @@ func TestMQTTWillOutboxLoadRefusesUnsupportedRecord(t *testing.T) {
 	}{
 		{"missing-generation", func(rec *mqttWillOutbox) { rec.Gen = _EMPTY_ }},
 		{"unknown-state", func(rec *mqttWillOutbox) { rec.State = mqttWillState("migrating") }},
+		// A single subject token that names no Will anchor: no claimant could decide it.
+		{"will-id-naming-no-anchor", func(rec *mqttWillOutbox) { rec.WillID = "EsO6ckpsgoJSl38ixXzxJm" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := load(tc.name, tc.mutate)
@@ -428,7 +432,8 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 	// The writer-validation refusal whose fail-safe SUCCEEDS: terminal, and now
 	// classified as published-instead rather than reported by a nil error alone.
 	outcome, err := asm.enqueueDelayedWill(s, refusedID, _EMPTY_, will, nil, _EMPTY_,
-		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_, nil)
+		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_,
+		&mqttDelayedWillIdentity{WillID: testWillToken(t, 1)})
 	if err != nil {
 		t.Fatalf("the fail-safe publish must succeed: %v", err)
 	}
@@ -436,8 +441,9 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 		t.Fatalf("outcome %v, want published-instead: the record was refused by its own writer "+
 			"validation and the fail-safe published it", outcome)
 	}
-	if outcome.retainable() {
-		t.Fatal("a published-instead outcome must not be retainable: re-attempting it would publish twice")
+	if action, retention := mqttAnchorActionFor(outcome); retention != mqttWillRetainNone || action != mqttWillAnchorDischarge {
+		t.Fatal("a published-instead outcome must be retained not at all and discharge its anchor: " +
+			"re-attempting it would publish twice")
 	}
 
 	if n := testMQTTCountWillRecordsForClient(t, asm, cidHash); n != 0 {
@@ -455,7 +461,8 @@ func TestMQTTWillOutboxEnqueueRefusesUnsupportedRecord(t *testing.T) {
 	const okID = "enqueue-control-pub"
 	okHash := getHash(okID)
 	if outcome, err := asm.enqueueDelayedWill(s, okID, mqttNewSessGen(), will, nil, _EMPTY_,
-		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_, nil); err != nil {
+		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_,
+		&mqttDelayedWillIdentity{WillID: testAnchoredWillID(t, asm, okID)}); err != nil {
 		t.Fatalf("valid enqueue: %v", err)
 	} else if outcome != mqttWillEnqueueConfirmed {
 		t.Fatalf("outcome %v, want confirmed", outcome)
@@ -535,13 +542,14 @@ func TestMQTTWillOutboxEnqueueExhaustionAfterLandedWriteDuplicates(t *testing.T)
 	// may exist AND the Will went out. Terminal in both directions -- no retry, no
 	// second publication -- which is the outcome class this duplicate window is for.
 	if outcome, err := asm.enqueueDelayedWill(s, exhaustID, mqttNewSessGen(), will, nil, _EMPTY_,
-		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_, nil); err != nil {
+		time.Now().Add(time.Hour).UnixNano(), 1, asm.sessStreamEpoch, _EMPTY_,
+		&mqttDelayedWillIdentity{WillID: testAnchoredWillID(t, asm, exhaustID)}); err != nil {
 		t.Fatalf("the fail-safe publish must succeed: %v", err)
 	} else if outcome != mqttWillEnqueueUnconfirmedPublished {
 		t.Fatalf("outcome %v, want unconfirmed-published", outcome)
-	} else if outcome.retainable() {
-		t.Fatal("an unconfirmed-published outcome must not be retainable: a create may have landed, " +
-			"so a re-attempt would write a second record for one Will")
+	} else if _, retention := mqttAnchorActionFor(outcome); retention != mqttWillRetainNone {
+		t.Fatal("an unconfirmed-published outcome must not be retained: the Will went out, " +
+			"so a re-attempt could only publish it again")
 	}
 	restoreLoad()
 

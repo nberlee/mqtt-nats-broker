@@ -659,6 +659,7 @@ func serveGeneration(t *testing.T, e *testInflightEnv, gen string) {
 	}
 	next := *al.rec
 	next.Gen, next.Tenure, next.Rev, next.Txn = gen, mqttNewInflightNonce(), al.rec.Rev+1, "txn-f119-handoff"
+	testAdoptGenLife(&next, gen)
 	b, _ := json.Marshal(&next)
 	msg, hdr := mqttFrameBatchWrite(al.seq, b, _EMPTY_, 0, false)
 	if _, err := e.asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(e.sess.id)), hdr, msg); err != nil {
@@ -686,7 +687,7 @@ func TestGenerationBranchIsDecidedByTheStore(t *testing.T) {
 		t.Fatalf("fixture: the cancellation must land its pending fence, got %+v", rec)
 	}
 	stillServing := mqttLicenceOf(f.e.c)
-	successor := mqttNewSessGen()
+	successor := testNextGenOf(f.e.asm.jsa.loadOutboundAuthority(f.e.sess.id, f.e.asm.sessStreamEpoch).rec)
 	f.e.sess.mu.Lock()
 	f.e.sess.custody = newMQTTCustodyLedger(successor)
 	f.e.sess.mu.Unlock()

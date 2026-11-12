@@ -66,10 +66,9 @@ func testStandaloneTeardownEnv(t *testing.T, clientID string) (*Server, *mqttAcc
 }
 
 // TestStandaloneTeardownClosesAuthorityDiscarding asserts the durable outcome of a
-// standalone teardown: the retiring generation carries a DISCARDING closure, and the durable
-// teardown receipt that authorized it stands, naming that exact generation with a session-end
-// reason. This is the fact a close-admission could never write, made permanent by an authority
-// the receipt supplies.
+// standalone teardown: the retiring generation carries a DISCARDING closure, and the
+// authority records the teardown that authorized it as that exact generation's Outstanding
+// entry: a marker teardown naming its marker, its release landed.
 func TestStandaloneTeardownClosesAuthorityDiscarding(t *testing.T) {
 	const clientID = "f105-standalone-close"
 	_, asm, epoch, gen, done := testStandaloneTeardownEnv(t, clientID)
@@ -79,21 +78,16 @@ func TestStandaloneTeardownClosesAuthorityDiscarding(t *testing.T) {
 	if st != mqttOutboundValid || cl == nil {
 		t.Fatalf("the retiring generation %q must carry a closure, got status %v", gen, st)
 	}
-	if !cl.Discard {
-		t.Fatalf("the standalone teardown must record a DISCARDING closure, got %+v", cl)
-	}
 
 	// The authorization stands and names this exact generation with a session-end reason: a
 	// discarding close is authorized, never asserted.
-	rcpt, _, rst := asm.jsa.loadTeardownReceipt(asm.domainTk, getHash(clientID), gen)
-	if rst != mqttOutboundValid || rcpt == nil {
-		t.Fatalf("the durable teardown receipt authorizing generation %q's discard must stand, got status %v", gen, rst)
+	entry, auth := testOutstandingEntry(t, asm, clientID, gen)
+	if entry == nil || auth.State != mqttAuthorityClosed {
+		t.Fatalf("the authority must record generation %q's teardown as Outstanding and be closed: %+v", gen, auth)
 	}
-	if !rcpt.Retire.Discard || rcpt.Retire.Gen != gen {
-		t.Fatalf("the receipt must discard generation %q, got %+v", gen, rcpt.Retire)
-	}
-	if rcpt.Retire.Reason != mqttRetireSessionEnd {
-		t.Fatalf("a standalone teardown's receipt reason must be %q, got %q", mqttRetireSessionEnd, rcpt.Retire.Reason)
+	if td := entry.Teardown; td.Kind != mqttTeardownMarker || !mqttOutboundIdentTk(td.Nonce) ||
+		!mqttOutboundIdentTk(td.MarkerWID) || td.Pending {
+		t.Fatalf("a standalone teardown's entry must be a landed marker teardown naming its marker, got %+v", td)
 	}
 }
 

@@ -101,9 +101,6 @@ func TestCleanStartHandoffClosesAndReplacesThePredecessor(t *testing.T) {
 	if st != mqttOutboundValid || cl == nil {
 		t.Fatalf("the predecessor generation %q must carry a closure, got status %v", oldGen, st)
 	}
-	if !cl.Discard {
-		t.Fatalf("the predecessor closure must record the DISCARD, got %+v", cl)
-	}
 
 	// The standing session record is the successor's: a fresh generation matching the serving
 	// authority, and no parent — a clean start starts a new lineage.
@@ -145,9 +142,11 @@ func TestCleanStartHandoffAbortBeforeCommitPreservesThePredecessor(t *testing.T)
 	var armed atomic.Bool
 	armed.Store(true)
 	restore := asm.jsa.setAcceptStoreObserver(func(obs mqttAcceptStoreObs) error {
-		// Fail the FIRST metadata commit issuing after the arm — the clean-start handoff's —
-		// and disarm, so nothing of the successor batch is sent and the retry proceeds.
-		if obs.Phase == mqttAcceptStoreIssuing && armed.CompareAndSwap(true, false) {
+		// Fail EVERY acceptance batch issuing while armed — the clean-start handoff's and each
+		// re-send of it within the CONNECT (issue #133: an acceptance whose batch never left is
+		// re-sent within the per-CONNECT allowance) — so nothing of the successor batch is sent.
+		// The seam is disarmed before the retry below.
+		if obs.Phase == mqttAcceptStoreIssuing && armed.Load() {
 			return fmt.Errorf("f105 test: metadata commit aborted before send")
 		}
 		return nil
@@ -168,6 +167,7 @@ func TestCleanStartHandoffAbortBeforeCommitPreservesThePredecessor(t *testing.T)
 	}
 
 	// The retry, seam disarmed, completes the handoff to a fresh serving generation.
+	armed.Store(false)
 	restore()
 	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
 	defer c2.Close()
@@ -224,70 +224,6 @@ func TestCleanStartHandoffCleansUpThePredecessorConsumer(t *testing.T) {
 		}
 		return nil
 	})
-}
-
-// TestCleanStartHandoffCrashAfterCommitFinalizesAsProposed stops the accepting CONNECT AT
-// its finalization step, after the three-member batch has committed: the step-entry seam fails
-// the step exactly as a process stopping there would, so no in-place settlement runs. The
-// successor record and its COMMITTED receipt are durable, the authority stands PREPARING, and
-// a fresh CONNECT must complete the SAME proposal — finalizing the successor it committed
-// rather than proposing another (Codex consult 6: a committed proposal must finalize exactly
-// as proposed). issue #107 8a: the seam moved from the metadata ACK, where a failure is now a lost
-// response the executor resolves in place (TestLostResponseMetadataCommitFinalizesInPlace),
-// to the finalize step, where only a stopped process leaves this residue.
-func TestCleanStartHandoffCrashAfterCommitFinalizesAsProposed(t *testing.T) {
-	const clientID = "f105-cs-handoff-crash"
-	s, asm, epoch, oldGen, done := testCleanStartEnv(t, clientID)
-	defer done()
-	o := s.getOpts()
-
-	var armed atomic.Bool
-	armed.Store(true)
-	asm.mu.Lock()
-	asm.testOwnershipStepEntry = func(action mqttConnectOwnershipAction) error {
-		// Let the batch COMMIT, then stop at the finalization — the metadata is durable, but
-		// the caller never finalizes and nothing settles in place.
-		if action == mqttOwnershipFinalizeHandoff && armed.CompareAndSwap(true, false) {
-			return fmt.Errorf("f105 test: crash after the metadata commit, before finalization")
-		}
-		return nil
-	}
-	asm.mu.Unlock()
-	restore := func() {
-		asm.mu.Lock()
-		asm.testOwnershipStepEntry = nil
-		asm.mu.Unlock()
-	}
-	defer restore()
-
-	cc, _ := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	testMQTTExpectDisconnect(t, cc)
-	cc.Close()
-	restore()
-
-	// The successor generation the aborted attempt committed: the standing record is already
-	// the successor's, at a fresh generation, and the authority is mid-handoff (PREPARING).
-	smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(asm.domainTk, getHash(clientID)))
-	if lerr != nil {
-		t.Fatalf("reading the committed successor record: %v", lerr)
-	}
-	committed := &mqttPersistedSession{}
-	if err := json.Unmarshal(smsg.Data, committed); err != nil {
-		t.Fatalf("decoding the committed successor record: %v", err)
-	}
-	if committed.Gen == oldGen || committed.Gen == _EMPTY_ {
-		t.Fatalf("the committed record must carry the successor generation, got %q (old %q)", committed.Gen, oldGen)
-	}
-
-	// A fresh CONNECT completes the committed handoff: it must be accepted and leave the
-	// SUCCESSOR serving at exactly the generation the committed batch installed.
-	c2, r2 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: clientID, cleanStart: true}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTReadConnAckV5(t, r2)
-	al := asm.jsa.loadOutboundAuthority(clientID, epoch)
-	if al.status != mqttOutboundValid || al.rec == nil || al.rec.State != mqttAuthorityServing {
-		t.Fatalf("the recovery must leave a serving successor, got %+v", al)
-	}
 }
 
 // TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep is the clean-start
@@ -373,11 +309,8 @@ func TestCleanStartHandoffLeavesAnUnreadablePredecessorRegisterToTheSweep(t *tes
 	if !reached.Load() {
 		t.Fatal("the clean-start predecessor cleanup never reached the predecessor generation's reap")
 	}
-	if cl, _, st := asm.jsa.loadGenClosure(clientID, asm.sessStreamEpoch, predGen); st != mqttOutboundValid || cl == nil || !cl.Discard {
+	if cl, _, st := asm.jsa.loadGenClosure(clientID, asm.sessStreamEpoch, predGen); st != mqttOutboundValid || cl == nil {
 		t.Fatalf("the predecessor generation must be closed discarding, got %+v (status %v)", cl, st)
-	}
-	if w, _, st := asm.jsa.loadGenRetirement(asm.domainTk, hash); st == mqttRetirementValid && w.Gen == predGen {
-		t.Fatal("fixture: a watermark names the predecessor generation, so the closure is not the licence under test")
 	}
 	// The reap refused rather than deleted: the unreadable register still stands at its sequence.
 	if smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, regSubj); lerr != nil || smsg == nil || smsg.Sequence != corruptSeq {

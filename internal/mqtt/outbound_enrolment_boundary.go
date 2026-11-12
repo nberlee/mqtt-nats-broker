@@ -109,9 +109,8 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 		//
 		// Without this, an arbitrary `provision-resource` batch creates a LIVE, SEALED affine
 		// resource with an open ledger and a cleanup duty, skipping the born-PENDING rule and the
-		// discarding-disposition rule together; a later NON-discarding close then roots that
-		// inventory, and the pass authorizes and deletes the consumer with no readiness and no
-		// discard licence behind it. An affine resource is created by the act that CLOSES its
+		// closing-enrolment binding together; a later close then roots that inventory, and the pass
+		// authorizes and deletes the consumer with no readiness and no retirement binding behind it. An affine resource is created by the act that CLOSES its
 		// generation and abandons it, and by nothing else.
 		if inc, found := mqttCreatedAffineResource(a, t, idHash); found {
 			return fmt.Errorf("transition %q creates affine consumer resource %q and writes no "+

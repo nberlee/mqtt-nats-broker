@@ -29,107 +29,7 @@ func testAuthority(state mqttAuthorityState) *mqttOutboundAuthority {
 		ID: testID, Epoch: testEpoch, Gen: testGen, Tenure: "tenure-0",
 		State: state, Rev: 1, Txn: "txn-0", OwnerTxn: "txn-0",
 	}
-	if state == mqttAuthorityPreparing {
-		a.Intent = testPreparingAuthority().Intent
-		a.Intent.PrevGen, a.Intent.PrevTenure, a.Intent.PrevOwnerTxn = a.Gen, a.Tenure, a.OwnerTxn
-		a.Intent.Retire.Gen, a.Intent.Retire.Tenure, a.Intent.Retire.OwnerTxn = a.Gen, a.Tenure, a.OwnerTxn
-	}
 	return a
-}
-
-// TestCompletionDoesNotNeedServingAuthority is the central rule of the completion model,
-// and the one a later change is most likely to break by "tightening" it.
-//
-// Completing an obligation that was ALREADY ADMITTED must not require current serving
-// authority. If it did, transfer and closure would themselves destroy the completion route
-// of every obligation admitted before them — which is the defect issue #107 exists to remove.
-// Beginning new work is the only thing the authority governs.
-func TestCompletionDoesNotNeedServingAuthority(t *testing.T) {
-	for name, state := range map[string]mqttAuthorityState{
-		"serving":   mqttAuthorityServing,
-		"preparing": mqttAuthorityPreparing,
-		"closed":    mqttAuthorityClosed,
-	} {
-		auth := testAuthority(state)
-
-		// Executing an already-acquired action, and recording the client's answer, proceed
-		// under every authority state — including a closed one.
-		for _, op := range []mqttCompletionOp{mqttOpExecuteAcquired, mqttOpObserveAck} {
-			got, err := mqttCompletionAllowed(mqttCompletionInput{
-				Op: op, Auth: auth, Exchange: testExchange(2, mqttExchangePublish),
-			})
-			if err != nil {
-				t.Fatalf("%s/%d: %v", name, op, err)
-			}
-			if got != mqttCompletionProceed {
-				t.Fatalf("under a %s authority, operation %d on an admitted exchange was %d, "+
-					"want PROCEED: completing admitted work must not need serving authority",
-					name, op, got)
-			}
-		}
-
-		// Materializing an owed release is a durable duty with no socket effect, so it too
-		// survives closure.
-		got, err := mqttCompletionAllowed(mqttCompletionInput{
-			Op: mqttOpMaterializeOwed, Auth: auth,
-			Exchange: testExchange(2, mqttExchangePubRecObserved),
-		})
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if got != mqttCompletionProceed {
-			t.Fatalf("under a %s authority, materializing an owed release was %d, want PROCEED", name, got)
-		}
-
-		// And a terminal exchange with nothing outstanding releases.
-		got, err = mqttCompletionAllowed(mqttCompletionInput{
-			Op: mqttOpReleaseTerminal, Auth: auth,
-			Exchange: testExchange(2, mqttExchangeTerminal),
-		})
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if got != mqttCompletionProceed {
-			t.Fatalf("under a %s authority, releasing a drained terminal exchange was %d, want PROCEED", name, got)
-		}
-	}
-}
-
-// TestNewWorkNeedsServingAuthority is the other half: the authority governs beginning,
-// and only beginning.
-func TestNewWorkNeedsServingAuthority(t *testing.T) {
-	for name, state := range map[string]mqttAuthorityState{
-		"preparing": mqttAuthorityPreparing,
-		"closed":    mqttAuthorityClosed,
-	} {
-		got, err := mqttCompletionAllowed(mqttCompletionInput{
-			Op: mqttOpAcquireMore, Auth: testAuthority(state),
-			Exchange: testExchange(2, mqttExchangePublish),
-		})
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if got != mqttCompletionRefuse {
-			t.Fatalf("a %s authority permitted NEW work (%d), want REFUSE", name, got)
-		}
-	}
-	got, err := mqttCompletionAllowed(mqttCompletionInput{
-		Op: mqttOpAcquireMore, Auth: testAuthority(mqttAuthorityServing),
-		Exchange: testExchange(2, mqttExchangePublish),
-	})
-	if err != nil {
-		t.Fatalf("serving: %v", err)
-	}
-	if got != mqttCompletionProceed {
-		t.Fatalf("a serving authority refused new work (%d)", got)
-	}
-	// No authority at all is not permission.
-	got, _ = mqttCompletionAllowed(mqttCompletionInput{
-		Op: mqttOpAcquireMore, Auth: nil, Exchange: testExchange(2, mqttExchangePublish),
-	})
-	if got != mqttCompletionRefuse {
-		t.Fatalf("a missing authority permitted new work (%d): absence is not permission", got)
-	}
 }
 
 // TestOutstandingOutputWithholdsRelease pins the drain.
@@ -209,5 +109,98 @@ func TestPastPubRecNoFurtherPublish(t *testing.T) {
 	})
 	if err == nil && got == mqttCompletionProceed {
 		t.Fatalf("a QoS 1 exchange was permitted to materialize a release")
+	}
+}
+
+// TestNewWorkNeedsServingAuthority is the other half: the authority governs beginning,
+// and only beginning.
+func TestNewWorkNeedsServingAuthority(t *testing.T) {
+	for name, state := range map[string]mqttAuthorityState{
+		"closed": mqttAuthorityClosed,
+	} {
+		got, err := mqttCompletionAllowed(mqttCompletionInput{
+			Op: mqttOpAcquireMore, Auth: testAuthority(state),
+			Exchange: testExchange(2, mqttExchangePublish),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != mqttCompletionRefuse {
+			t.Fatalf("a %s authority permitted NEW work (%d), want REFUSE", name, got)
+		}
+	}
+	got, err := mqttCompletionAllowed(mqttCompletionInput{
+		Op: mqttOpAcquireMore, Auth: testAuthority(mqttAuthorityServing),
+		Exchange: testExchange(2, mqttExchangePublish),
+	})
+	if err != nil {
+		t.Fatalf("serving: %v", err)
+	}
+	if got != mqttCompletionProceed {
+		t.Fatalf("a serving authority refused new work (%d)", got)
+	}
+	// No authority at all is not permission.
+	got, _ = mqttCompletionAllowed(mqttCompletionInput{
+		Op: mqttOpAcquireMore, Auth: nil, Exchange: testExchange(2, mqttExchangePublish),
+	})
+	if got != mqttCompletionRefuse {
+		t.Fatalf("a missing authority permitted new work (%d): absence is not permission", got)
+	}
+}
+
+// TestCompletionDoesNotNeedServingAuthority is the central rule of the completion model,
+// and the one a later change is most likely to break by "tightening" it.
+//
+// Completing an obligation that was ALREADY ADMITTED must not require current serving
+// authority. If it did, transfer and closure would themselves destroy the completion route
+// of every obligation admitted before them — which is the defect issue #107 exists to remove.
+// Beginning new work is the only thing the authority governs.
+func TestCompletionDoesNotNeedServingAuthority(t *testing.T) {
+	for name, state := range map[string]mqttAuthorityState{
+		"serving": mqttAuthorityServing,
+		"closed":  mqttAuthorityClosed,
+	} {
+		auth := testAuthority(state)
+
+		// Executing an already-acquired action, and recording the client's answer, proceed
+		// under every authority state — including a closed one.
+		for _, op := range []mqttCompletionOp{mqttOpExecuteAcquired, mqttOpObserveAck} {
+			got, err := mqttCompletionAllowed(mqttCompletionInput{
+				Op: op, Auth: auth, Exchange: testExchange(2, mqttExchangePublish),
+			})
+			if err != nil {
+				t.Fatalf("%s/%d: %v", name, op, err)
+			}
+			if got != mqttCompletionProceed {
+				t.Fatalf("under a %s authority, operation %d on an admitted exchange was %d, "+
+					"want PROCEED: completing admitted work must not need serving authority",
+					name, op, got)
+			}
+		}
+
+		// Materializing an owed release is a durable duty with no socket effect, so it too
+		// survives closure.
+		got, err := mqttCompletionAllowed(mqttCompletionInput{
+			Op: mqttOpMaterializeOwed, Auth: auth,
+			Exchange: testExchange(2, mqttExchangePubRecObserved),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != mqttCompletionProceed {
+			t.Fatalf("under a %s authority, materializing an owed release was %d, want PROCEED", name, got)
+		}
+
+		// And a terminal exchange with nothing outstanding releases.
+		got, err = mqttCompletionAllowed(mqttCompletionInput{
+			Op: mqttOpReleaseTerminal, Auth: auth,
+			Exchange: testExchange(2, mqttExchangeTerminal),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != mqttCompletionProceed {
+			t.Fatalf("under a %s authority, releasing a drained terminal exchange was %d, want PROCEED", name, got)
+		}
 	}
 }

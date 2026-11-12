@@ -1540,10 +1540,10 @@ func TestMQTTReconcileContendedRepairSaveRetries(t *testing.T) {
 	})
 	defer restoreResult()
 	defer mqttTestSessStoreSuppressV.Store(false)
-	// The CONNECT's accept save IS the outbound-ownership metadata commit (issue #107 cutover), which
-	// commits through commitMetadataAttempt rather than storeSessionMsg, so the store-result hook
-	// above never sees it — it now sees only the repair save. Its landed record sequence is
-	// observed on the ownership seam instead (the ACKED phase carries the session record's
+	// The CONNECT's accept save IS its acceptance batch (issue #133), which commits through the
+	// authority transition rather than storeSessionMsg, so the store-result hook above never
+	// sees it — it sees only the repair save. Its landed record sequence is observed on the
+	// acceptance store seam instead (the ACKED phase carries the session record's
 	// sequence), so the two writes this test counts — the accept and the one repair — are both
 	// captured and their consecutiveness still proves the suppressed attempt stored nothing.
 	recSubj := mqttSessSubject(asm.domainTk, getHash(cid))
@@ -1668,24 +1668,19 @@ func TestMQTTReconcileIndeterminateRefusesConnect(t *testing.T) {
 	// applied only at the grant point, which a refused resume never reaches, so
 	// there is nothing else to write and nothing to put back.
 	//
-	// The CONNECT's accept save IS the outbound-ownership metadata commit (issue #107
-	// cutover): the permanent acceptance fact, the COMMITTED ownership receipt, and the
-	// session record, one atomic batch on consecutive sequences. So the record standing
-	// now is the accept save exactly when it sits mqttAcceptOwnershipBatchSize-1 above
-	// this CONNECT's acceptance fact. Raw stream distance no longer counts record
-	// writes: the in-flight records share $MQTT_sess and the CONNECT's authority
+	// The CONNECT's accept save IS its acceptance batch (issue #133): the authority
+	// carrying the acceptance, then the session record, one atomic batch on consecutive
+	// sequences. So the record standing now is the accept save exactly when the message
+	// right below it is the client's authority. Raw stream distance does not count record
+	// writes: the in-flight records share $MQTT_sess and the CONNECT's other authority
 	// transitions land beside the batch.
-	_, factSeqs := testFactsFor(t, asm, cid)
-	if len(factSeqs) == 0 {
-		t.Fatal("the refused CONNECT left no acceptance fact")
+	below, err := asm.jsa.loadMsg(mqttSessStreamName, recSeqAfter-1)
+	if err != nil {
+		t.Fatalf("read the message below the record at %d: %v", recSeqAfter, err)
 	}
-	newest := factSeqs[0]
-	for _, f := range factSeqs {
-		newest = max(newest, f)
-	}
-	if newest <= recSeqBefore || recSeqAfter != newest+mqttAcceptOwnershipBatchSize-1 {
-		t.Fatalf("record advanced %d -> %d with the newest acceptance fact at %d; want the accept save only",
-			recSeqBefore, recSeqAfter, newest)
+	if recSeqAfter <= recSeqBefore || below.Subject != mqttOutboundAuthoritySubject(getHash(cid)) {
+		t.Fatalf("record advanced %d -> %d over %q; want the accept save only, committed with its authority",
+			recSeqBefore, recSeqAfter, below.Subject)
 	}
 	if ps.ExpiryInterval != mqttSessionNeverExpire || ps.Clean {
 		t.Fatalf("the restored record carries ExpiryInterval=%d Clean=%v, want the session's own persistent lifetime",

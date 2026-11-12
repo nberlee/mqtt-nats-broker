@@ -249,7 +249,7 @@ func (jsa *mqttJSA) releaseHoldsOnce(id, epoch, gen string, auth *mqttOutboundAu
 	}
 	if _, cerr := jsa.commitOp(&mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: id, Epoch: epoch, Txn: txn, Op: "op-" + txn, Kind: mqttTransitionReleaseHolds,
+			ID: id, Epoch: epoch, Txn: txn, Scope: gen, Op: "op-" + txn, Kind: mqttTransitionReleaseHolds,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
 		Extra: members,

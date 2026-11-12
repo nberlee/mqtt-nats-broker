@@ -212,8 +212,18 @@ func (as *mqttAccountSessionManager) sweepAcqReleaseVerdicts(s *Server) {
 		if !mqttValidSessGen(ps.Gen) {
 			return nil
 		}
+		// A REGISTERED ACTOR for this client, every ledger write and fence admitted per attempt:
+		// each one rewrites the client's authority.
+		clientID := ps.ID
+		deregister := as.registerForegroundActor(clientID)
+		defer deregister()
+		admit := func() bool {
+			_, _, idle := as.admitForegroundOrIdle(clientID)
+			return idle == nil
+		}
+		cw := mqttSharedAdmissionOnly(admit)
 		for _, r := range ps.AcqReleases {
-			if _, rerr := as.jsa.executeSharedRelease(as.sessStreamEpoch, ps.ID, ps.Gen, r, nil); rerr != nil {
+			if _, rerr := as.jsa.executeSharedRelease(as.sessStreamEpoch, ps.ID, ps.Gen, r, cw); rerr != nil {
 				s.Debugf("MQTT shared verdict sweep: executing the release of %q for %q: %v", r.Acq, ps.ID, rerr)
 			}
 		}

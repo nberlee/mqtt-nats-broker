@@ -163,6 +163,7 @@ func TestTheClosingSealOutlastsACompetitorsInProcessWrite(t *testing.T) {
 				if !f.consumerExists(t, mqttStreamName, f.src) {
 					t.Fatalf("fixture: the source consumer %q does not exist before the close", f.src)
 				}
+				testGenerationAcquires(t, f)
 				cs.arm()
 			})
 			// The fixture returned only once the record was released: the teardown completed.
@@ -209,13 +210,24 @@ func TestAStalePriorSealRefusalWaitsBeforeItsReRead(t *testing.T) {
 	}
 	mqttTestSharedPauseHookV.Store(&pause)
 	t.Cleanup(func() { mqttTestSharedPauseHookV.Store(prev) })
-	fx = testDiscardTearDownAfter(t, "seal-stale-prior", 1, false, func(f *testDiscardFix) { fx = f })
+	fx = testDiscardTearDownAfter(t, "seal-stale-prior", 1, false, func(f *testDiscardFix) {
+		fx = f
+		testGenerationAcquires(t, f)
+	})
 	if w := waits.Load(); w != 1 {
 		t.Fatalf("the stale-prior refusal took %d contention wait(s), want 1", w)
 	}
 	if err := testLedgerSealedEmpty(fx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// testGenerationAcquires gives the fixture's generation its shared ledger, as its first shared
+// acquisition would: a generation that never acquired has none, and its closing seals nothing
+// (issue #133), so a test of the seal's contention needs one standing.
+func testGenerationAcquires(t *testing.T, f *testDiscardFix) {
+	t.Helper()
+	testInstallFixtureTenure(t, testMQTTResidentSession(t, f.s, f.id))
 }
 
 // testSharedCloser is a clean-session client holding shared subscriptions, beside a peer that
@@ -484,5 +496,47 @@ func TestOneContentionAllowanceCoversTheWholeClosing(t *testing.T) {
 	}
 	if !testSessionRecordStands(sc.f) {
 		t.Fatal("the session record was released although a shared release failed")
+	}
+}
+
+// A recovery visit's shared closing yields to announced foreground work PER ATTEMPT (issue #133):
+// every seal, close and release rewrites the client's authority as its fence, so one sent beside
+// a CONNECT's acceptance or bind would take that CAS from it. With an announcement standing the
+// visit sends nothing and reports itself refused; once it is released the same visit sends again.
+// Mutation: the closing's cw.admits checks dropped (the visit sends under the announcement).
+func TestARecoveryClosingYieldsToAnnouncedForegroundWork(t *testing.T) {
+	visit := func(t *testing.T, sc *testSharedCloser, cs *testContendedSends) (bool, *mqttRecoveryBudget, int) {
+		t.Helper()
+		before, _ := cs.counts()
+		b := &mqttRecoveryBudget{left: mqttRecoveryOpBudget, reserve: mqttRecoveryOpReserve}
+		root := &mqttRecoveryRoot{ID: sc.f.id, Epoch: sc.f.epoch(), Gen: sc.f.gen}
+		done := sc.f.asm.stepSharedClosing(sc.f.s, root, b, nil)
+		after, _ := cs.counts()
+		return done, b, after - before
+	}
+	for _, tc := range []struct {
+		name  string
+		shape mqttSharedShape
+	}{{"seal", mqttSharedShapeSeal}, {"release", mqttSharedShapeRelease}} {
+		t.Run(tc.name, func(t *testing.T) {
+			testDiscardParkAll(t)
+			sc := testConnectSharedCloser(t, "fg-yield-"+tc.name, "$share/g/fgyield"+tc.name+"/topic")
+			cs, _ := testContend(t, tc.shape, ApiErrors[JSStreamWrongLastSequenceConstantErr], 0)
+			// The inline closing fails at this shape with nothing written, leaving it for the visit.
+			mqttTestSharedContentionAllowanceV.Set(time.Nanosecond)
+			cs.arm()
+			sc.c.Close()
+			testWaitSendsSettle(t, cs)
+
+			fg, _ := sc.f.asm.announceForeground(sc.f.id)
+			done, b, sends := visit(t, sc, cs)
+			fg.release()
+			if done || sends != 0 || !b.refused {
+				t.Fatalf("under an announcement: done %v, %d send(s), refused %v; want false, 0, true", done, sends, b.refused)
+			}
+			if _, _, sends = visit(t, sc, cs); sends == 0 {
+				t.Fatal("fixture: with no announcement the visit still sent nothing, so the refusal above proves nothing")
+			}
+		})
 	}
 }

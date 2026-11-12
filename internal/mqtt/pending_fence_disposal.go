@@ -65,7 +65,7 @@ var mqttTestPendingFenceBeforeCommitHookV atomic.Pointer[func(subject string)]
 func mqttFencePendingDisposalTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn string) *mqttAuthorityTransition {
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: "op-fence-pending-disposal",
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: prev.Gen, Op: "op-fence-pending-disposal",
 			Kind: mqttTransitionFencePendingDisposal, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -73,7 +73,7 @@ func mqttFencePendingDisposalTransition(prev *mqttOutboundAuthority, prevSeq uin
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 	}
 }
@@ -148,9 +148,10 @@ func (sess *mqttSession) fenceBeforePendingFenceDisposal(subject string, cur *mq
 	}
 	v := jsa.resolveTransitionHandle(out.Handle)
 	if v == mqttTransitionUnresolved {
-		_ = jsa.abortTransition(&out.Handle.attempt)
+		_ = jsa.abortTransition(&out.Handle.attempt, nil)
 		v = jsa.resolveTransitionHandle(out.Handle)
 	}
+	// RETIRED advances nothing: it is no licence to dispose of the fence.
 	advanced = v == mqttTransitionLanded || v == mqttTransitionSuperseded
 	return advanced
 }

@@ -342,8 +342,6 @@ func TestRetainedCloseTenureFence(t *testing.T) {
 		arm  string // empty: refused
 	}{
 		{name: "another tenure while the producer's serves", a: attempt("other"), prev: auth},
-		{name: "a preparing authority", a: attempt(m.Tenure),
-			prev: with(func(p *mqttOutboundAuthority) { p.State = mqttAuthorityPreparing })},
 		{name: "an unreadable authority", a: attempt(m.Tenure), prev: nil},
 		{name: "a successor serving tenure", a: attempt("successor"),
 			prev: with(func(p *mqttOutboundAuthority) { p.Tenure = "successor" }), arm: mqttRetainedCloseSuccessor},

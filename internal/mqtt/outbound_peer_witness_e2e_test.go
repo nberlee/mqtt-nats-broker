@@ -778,6 +778,7 @@ type testPeerLandedTransition struct {
 	broker  string
 	kind    mqttTransitionKind
 	txn     string
+	scope   string
 	seq     uint64
 	closure *mqttGenClosure // the closure the batch wrote, if any
 	// For an exchange-moving batch: what the generation's closure was, as the store held it, at
@@ -824,7 +825,7 @@ func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountS
 			if !movesExchange && !closes {
 				return send()
 			}
-			rec := testPeerLandedTransition{broker: broker, kind: tr.Attempt.Kind, txn: tr.Attempt.Txn, closure: tr.Closure, phase: written}
+			rec := testPeerLandedTransition{broker: broker, kind: tr.Attempt.Kind, txn: tr.Attempt.Txn, scope: tr.Attempt.Scope, closure: tr.Closure, phase: written}
 			if movesExchange {
 				c, cseq, st := jsa.loadGenClosure(w.cid, w.epoch, w.gen)
 				if st == mqttOutboundValid {
@@ -857,7 +858,7 @@ func (w *testPeerWorld) recordTransitions(t *testing.T, asmA, asmB *mqttAccountS
 		var out []testPeerLandedTransition
 		for _, rec := range recs {
 			if rec.uncertain {
-				o, oseq, st := w.liveJSA(asmA, asmB).loadTransitionOutcome(w.cid, w.epoch, rec.txn)
+				o, oseq, st := w.liveJSA(asmA, asmB).loadTransitionOutcome(w.cid, w.epoch, rec.scope, rec.txn)
 				if st != mqttOutboundValid || o == nil || o.Verdict != mqttOutcomeCommitted {
 					continue
 				}
@@ -902,6 +903,10 @@ func TestDiscardedObligationEndsUnderTheDiscardingClosure(t *testing.T) {
 	release := testDiscardParkAll(t)
 	w := testPeerWorldAtPubRec(t, "f105-peer-discarded")
 	asmA, asmB := w.asmA, w.asmB
+	// The test reads what the discard left (the RETIRED names, the CleanupComplete resources),
+	// which the generation's retirement would purge once its root retires.
+	asmA.testHoldGenerationRetirement.Store(true)
+	asmB.testHoldGenerationRetirement.Store(true)
 
 	var released atomic.Bool
 	w.deletes.setJudge(w.discardJudge(&released, asmB))
@@ -910,7 +915,7 @@ func TestDiscardedObligationEndsUnderTheDiscardingClosure(t *testing.T) {
 	// step — the discard of this obligation — is refused by the boundary for want of a discarding
 	// closure, and the obligation is untouched.
 	if _, err := asmA.jsa.opDiscardExchange(w.cid, w.epoch, mqttNewInflightNonce(), w.gen, w.nonce); err == nil ||
-		!strings.Contains(err.Error(), "only a committed discarding closure licenses its retirement") {
+		!strings.Contains(err.Error(), "only a committed closure licenses its retirement") {
 		t.Fatalf("discarding the obligation of an unclosed generation was not refused for want of the closure: %v", err)
 	}
 	if err := w.evidenceStands(asmA); err != nil {
@@ -940,7 +945,7 @@ func TestDiscardedObligationEndsUnderTheDiscardingClosure(t *testing.T) {
 			"(the discarded generation's is %q)", installedDeliver, genB, deliverB, deliverG)
 	}
 	closure, closureSeq, st := asmB.jsa.loadGenClosure(w.cid, w.epoch, w.gen)
-	if st != mqttOutboundValid || closure == nil || !closure.Discard {
+	if st != mqttOutboundValid || closure == nil {
 		t.Fatalf("the clean start did not close generation %q with Discard: %+v (%v)", w.gen, closure, st)
 	}
 	var closer *testPeerLandedTransition
@@ -1005,7 +1010,7 @@ func TestDiscardedObligationEndsUnderTheDiscardingClosure(t *testing.T) {
 	if m.kind != mqttTransitionDiscardExchange || m.phase != mqttExchangeDiscarded {
 		t.Fatalf("the obligation was ended by a %v transition writing phase %d, want the discard", m.kind, m.phase)
 	}
-	if m.closureAtSend == nil || !m.closureAtSend.Discard || m.closureAtSend.Txn != closure.Txn || m.closureSeqAtSnd >= m.seq {
+	if m.closureAtSend == nil || m.closureAtSend.Txn != closure.Txn || m.closureSeqAtSnd >= m.seq {
 		t.Fatalf("the discard was sent without the discarding closure standing below it: closure %+v seq %d, discard seq %d",
 			m.closureAtSend, m.closureSeqAtSnd, m.seq)
 	}
@@ -1039,7 +1044,7 @@ func requireOneDiscardEnding(t *testing.T, landed func() []testPeerLandedTransit
 	if m.kind != mqttTransitionDiscardExchange || m.phase != mqttExchangeDiscarded {
 		t.Fatalf("the obligation was ended by a %v transition writing phase %d, want the discard writing Discarded", m.kind, m.phase)
 	}
-	if m.closureAtSend == nil || !m.closureAtSend.Discard || m.closureAtSend.Txn != closureTxn || m.closureSeqAtSnd >= m.seq {
+	if m.closureAtSend == nil || m.closureAtSend.Txn != closureTxn || m.closureSeqAtSnd >= m.seq {
 		t.Fatalf("the discard was sent without the discarding closure standing below it: %+v", m)
 	}
 }
@@ -1088,11 +1093,14 @@ func TestExpiredObligationEndsUnderThePeersDiscardingClosure(t *testing.T) {
 	release := testDiscardParkAll(t)
 	w := testPeerWorldAt(t, "f105-peer-expired", 4)
 	asmA, asmB := w.asmA, w.asmB
+	// The test reads what the discard left, which the generation's retirement would purge.
+	asmA.testHoldGenerationRetirement.Store(true)
+	asmB.testHoldGenerationRetirement.Store(true)
 	var released atomic.Bool
 	w.deletes.setJudge(w.discardJudge(&released, asmB))
 
 	if _, err := asmA.jsa.opDiscardExchange(w.cid, w.epoch, mqttNewInflightNonce(), w.gen, w.nonce); err == nil ||
-		!strings.Contains(err.Error(), "only a committed discarding closure licenses its retirement") {
+		!strings.Contains(err.Error(), "only a committed closure licenses its retirement") {
 		t.Fatalf("discarding the obligation of an unexpired generation was not refused for want of the closure: %v", err)
 	}
 	landed := w.recordTransitions(t, asmA, asmB)
@@ -1108,7 +1116,7 @@ func TestExpiredObligationEndsUnderThePeersDiscardingClosure(t *testing.T) {
 	var closureSeq uint64
 	checkFor(t, 20*time.Second, 50*time.Millisecond, func() error {
 		c, seq, st := asmB.jsa.loadGenClosure(w.cid, w.epoch, w.gen)
-		if st != mqttOutboundValid || c == nil || !c.Discard {
+		if st != mqttOutboundValid || c == nil {
 			return fmt.Errorf("no discarding closure for generation %q yet: %+v (%v)", w.gen, c, st)
 		}
 		closure, closureSeq = c, seq
@@ -1182,7 +1190,7 @@ func TestExpiredObligationEndsUnderThePeersDiscardingClosure(t *testing.T) {
 	if len(moves) != 1 || moves[0].kind != mqttTransitionDiscardExchange || moves[0].phase != mqttExchangeDiscarded {
 		t.Fatalf("want exactly one committed DiscardExchange ending the obligation, got %+v", moves)
 	}
-	if m := moves[0]; m.closureAtSend == nil || !m.closureAtSend.Discard || m.closureAtSend.Txn != closure.Txn || m.closureSeqAtSnd >= m.seq {
+	if m := moves[0]; m.closureAtSend == nil || m.closureAtSend.Txn != closure.Txn || m.closureSeqAtSnd >= m.seq {
 		t.Fatalf("the discard was sent without B's expiry closure standing below it: %+v", m)
 	}
 	w.deletes.barrier(t, "after the discard completed", asmB)

@@ -12,11 +12,6 @@ import (
 
 // ---- from handoff_outcome.go ----
 
-// mqttHandoffClientFilter enumerates one client's handoff outcomes, and only those.
-func mqttHandoffClientFilter(domainTk, cidHash string) string {
-	return mqttHandoffSubjectPrefix + domainTk + cidHash + ".*"
-}
-
 // ---- from inflight_slot_classify.go ----
 
 // mqttSlotDispositionNeedsMarker reports whether carrying out this verdict requires the
@@ -135,15 +130,6 @@ func (jsa *mqttJSA) resolveTransition(t *mqttAuthorityTransition) mqttTransition
 	}
 	return jsa.classifyAgainstOutcome(t.Attempt, want)
 }
-
-// ---- from sess_persist.go ----
-
-// mqttAcceptOwnershipBatchSize is how many $MQTT_sess messages an accepted CONNECT commits
-// once its accept save IS the outbound-ownership metadata commit (issue #107 cutover): the permanent
-// acceptance fact, the COMMITTED ownership receipt, and the session record, committed as ONE
-// atomic three-member batch (handoff_metadata.go compose). A caller counting the record advance
-// across a CONNECT accept observes this.
-const mqttAcceptOwnershipBatchSize = 3
 
 // ---- from transport_binding.go ----
 

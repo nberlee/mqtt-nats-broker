@@ -133,6 +133,23 @@ func Test8bADelayedInstallLosesToThePeersTenure(t *testing.T) {
 	sB := testMQTTRunServer(t, oB)
 	t.Cleanup(func() { sB.Shutdown() })
 
+	// THE GENERATION HAS ACQUIRED, so its ledger stands and a resume installs over it (issue #133:
+	// a generation that never acquired has no ledger, and its acceptances install nothing). A
+	// SUBSCRIBE acquires nothing; the first shared delivery does.
+	c0, r0 := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid, props: mqttV5ConnPropsSessionExpiry(3600)},
+		oA.MQTT.Host, oA.MQTT.Port)
+	testMQTTReadConnAckV5(t, r0)
+	testMQTTSubV5(t, c0, r0, 1, []mqttV5SubFilter{{topic: "$share/w2g/w2/delayed", opts: 1}})
+	pc, pr := testMQTTConnectV5(t, &mqttV5ConnInfo{clientID: cid + "-pub", cleanStart: true}, oA.MQTT.Host, oA.MQTT.Port)
+	testMQTTReadConnAckV5(t, pr)
+	testMQTTPublishV5(t, pc, 1, 1, "w2/delayed", []byte("acquire"))
+	testMQTTReadPubAckV5(t, pr, 1)
+	pc.Close()
+	_, pi := testMQTTReadPublishV5(t, r0, "w2/delayed", []byte("acquire"))
+	testMQTTSendPIPacket(mqttPacketPubAck, t, c0, pi)
+	_, _ = c0.Write([]byte{mqttPacketDisconnect, 0})
+	c0.Close()
+
 	// Armed only now, with no other CONNECT in flight: the FIRST installation to arrive is A's.
 	gates := testInstallSharedGates(t, installPt)
 	t.Cleanup(func() { gates.open(installPt) }) // before either server's shutdown

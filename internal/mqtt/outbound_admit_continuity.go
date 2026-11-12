@@ -199,6 +199,9 @@ func (sess *mqttSession) runAdmissionContinuityUnit(gen string, c *mqttAdmission
 			switch sess.jsa.classifyExchangeAbsence(sess.id, c.epoch, gen, c.lin, proof) {
 			case mqttAbsenceReclaimed:
 				retire = true
+			case mqttAbsenceRetired:
+				// The generation retired: the record is obsolete and goes, with no NAK.
+				retire = true
 			case mqttAbsenceUnproven:
 				if decided {
 					retire, nak = true, true

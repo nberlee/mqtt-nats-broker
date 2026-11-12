@@ -168,8 +168,10 @@ func TestMQTTTakeoverSupersededClaimReplicated(t *testing.T) {
 	const cid = "cluster-superseded"
 	asm0 := b0.s.mqtt.sessmgr.sessions[globalAccountName]
 
-	// B's view, taken before A moves the record.
+	// B's view, taken before A moves the record. Accepted the way a CONNECT is (issue #133), so
+	// its generation is its lifecycle's and the authority serves it.
 	sessB := testClusterFreshSession(t, b1.s, cid)
+	testAcceptRigConnection(t, b1.s.mqtt.sessmgr.sessions[globalAccountName], sessB, b1.s.createInternalAccountClient())
 	if _, err := testSaveDetail(t, sessB); err != nil {
 		t.Fatalf("B's first create: %v", err)
 	}

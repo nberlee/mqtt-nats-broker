@@ -257,13 +257,6 @@ var censusComposites = []censusComposite{
 			"epoch is what makes the sequence mean anything — this is one of the three ad hoc " +
 			"couplings issue #70 names",
 	},
-	{
-		kind:    "scan interval",
-		typ:     "mqttWillOutbox",
-		members: []string{"ScanFrom", "ScanEpoch"},
-		reason: "the second of $MQTT_willq's two couplings to $MQTT_sess, same reasoning as the origin " +
-			"interval and dispositioned separately because the two intervals are independent",
-	},
 }
 
 // censusManifest is the audited disposition of every field of every persisted
@@ -437,18 +430,6 @@ func censusManifest() map[string]map[string]censusDisposition {
 		"Started": {kind: container, elems: "mqttPersistedDrainSeq", encoding: encJSON, reason: "one entry per started delivery; the elements carry the identities and are dispositioned under their own type"},
 	}
 
-	m["mqttGenRetirement"] = map[string]censusDisposition{
-		"ID":  {kind: notAnIdentity, encoding: encJSON, reason: "the client ID, for diagnostics; the subject is what addresses the watermark"},
-		"Gen": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the retired incarnation generation, issued with the session record"},
-		"MarkerSeq": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON,
-			reason: "the $MQTT_sess sequence this teardown's claim marker landed at, and the ONLY thing " +
-				"the advance is decided by. Comparable only within the incarnation epoch $MQTT_teardown " +
-				"carries in its stream metadata — one of issue #70's three ad hoc couplings"},
-		"Nonce":     {kind: identityLocal, encoding: encJSON, reason: "this teardown's own identity"},
-		"Origin":    {kind: notAnIdentity, encoding: encJSON, reason: "the authoring broker, for diagnostics; no reader arbitrates on it"},
-		"StartedAt": {kind: notAnIdentity, encoding: encJSON, reason: "a wall-clock stamp for diagnostics"},
-	}
-
 	m["mqttAcceptFact"] = map[string]censusDisposition{
 		"ClientID": {kind: notAnIdentity, encoding: encJSON, reason: "the client ID this acceptance belongs to; the subject addresses it"},
 		// LOCAL, not cross-stream: an acceptance fact is stored ON $MQTT_sess, and this
@@ -602,12 +583,9 @@ func censusManifest() map[string]map[string]censusDisposition {
 			reason: "see the composite oracle: paired with OriginSessionSeq"},
 		"Gen":      {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON, reason: "the incarnation generation that enqueued this Will"},
 		"Decision": {kind: notAnIdentity, encoding: encJSON, reason: "publish or cancel, the terminal verdict"},
-		"ScanFrom": {kind: identityComposite, compos: "scan interval", encoding: encJSON, reason: "see the composite oracle: paired with ScanEpoch"},
-		"ScanEpoch": {kind: identityComposite, compos: "scan interval", encoding: encJSON,
-			reason: "see the composite oracle: paired with ScanFrom"},
 		"DecisionCutoff": {kind: identityCrossStream, issuer: mqttSessStreamName, encoding: encJSON,
-			reason: "the exact $MQTT_sess last sequence the decision was taken against; a pointer so " +
-				"'no cutoff recorded' is distinguishable from sequence zero"},
+			reason: "the revision of the client's $MQTT_sess authority the decision was read from; a " +
+				"pointer so 'no cutoff recorded' is distinguishable from revision zero"},
 	}
 
 	m["mqttPersistedSession"] = map[string]censusDisposition{
@@ -1029,8 +1007,6 @@ func censusRoots() map[string]any {
 		"mqttPersistedDrainSeq":     mqttPersistedDrainSeq{},
 		"mqttPersistedDrainRelease": mqttPersistedDrainRelease{},
 		"mqttPersistedDrain":        mqttPersistedDrain{},
-		"mqttGenRetirement":         mqttGenRetirement{},
-		"mqttAcceptFact":            mqttAcceptFact{},
 		"mqttQoS2RelClaim":          mqttQoS2RelClaim{},
 		"mqttSessTeardown":          mqttSessTeardown{},
 		"mqttPersistedWill":         mqttPersistedWill{},
@@ -1343,18 +1319,8 @@ type censusOracleRow struct {
 // censusSample is issue #70's fourteen-row table, transcribed row for row.
 var censusSample = []censusOracleRow{
 	{
-		holder: mqttTeardownStreamName, what: "stream Metadata + body MarkerSeq", issuer: mqttSessStreamName,
-		satisfiedBy: []string{"mqttGenRetirement.MarkerSeq"},
-		family:      "stream configuration",
-		reason:      "the body half is a manifest row; the epoch half is carried in STREAM METADATA, which is the stream-configuration family and is the carrier no body walk can see",
-	},
-	{
 		holder: mqttWillQStreamName, what: "body OriginSessionSeq + OriginSessEpoch", issuer: mqttSessStreamName,
 		satisfiedBy: []string{"mqttWillOutbox.OriginSessionSeq", "mqttWillOutbox.OriginSessEpoch"},
-	},
-	{
-		holder: mqttWillQStreamName, what: "body ScanFrom + ScanEpoch", issuer: mqttSessStreamName,
-		satisfiedBy: []string{"mqttWillOutbox.ScanFrom", "mqttWillOutbox.ScanEpoch"},
 	},
 	{
 		holder: mqttQoS2AssignStreamName, what: "subject, body SourceSeq/GroupDurable/ClaimHash", issuer: mqttStreamName,
@@ -1421,8 +1387,11 @@ func TestPersistedIdentityCensusRediscoversSample(t *testing.T) {
 	t.Parallel()
 	manifest := censusManifest()
 
-	// FOURTEEN. The sample's drain Started[].RegSeq row went with its field (issue #71), by the
-	// rule stated below: a row asserting a coupling no record carries is a claim about nothing.
+	// TWELVE. The sample's drain Started[].RegSeq row went with its field (issue #71); the Will
+	// outbox's ScanFrom + ScanEpoch row with its fields (issue #133: a delayed Will is decided
+	// from its anchor, so no scan floor is persisted); and the $MQTT_teardown watermark row with
+	// its stream (issue #133: the authority's lifecycle replaced it), by the rule stated below: a
+	// row asserting a coupling no record carries is a claim about nothing.
 	//
 	// The last row added is the one this file predicted. The durable QoS 2 owner
 	// slot couples the in-flight body PubRelDurable/PubRelStreamSeq to `$MQTT_out`, and
@@ -1435,8 +1404,8 @@ func TestPersistedIdentityCensusRediscoversSample(t *testing.T) {
 	// They are back, with the admission half that writes them, so the row is back too.
 	// ActionClaim/ActionClaimSeq still have no row of their own: they are members of the
 	// arbitration relation the ClaimSeq row carries, not a second coupling to $MQTT_sess.
-	if len(censusSample) != 14 {
-		t.Fatalf("the oracle carries %d rows; issue #70's sample, less its deleted carriers, has 14. A row was dropped or added "+
+	if len(censusSample) != 12 {
+		t.Fatalf("the oracle carries %d rows; issue #70's sample, less its deleted carriers, has 12. A row was dropped or added "+
 			"without re-reading the dossier", len(censusSample))
 	}
 

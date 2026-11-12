@@ -3,10 +3,11 @@
 // A foreground authority operation that announces itself loses at most one attempt to each
 // background actor of its client registered at the announcement (its allowance), so its derived
 // budget is sound only while these facts hold: every background admission belongs to a
-// registered actor — one of the five session workers, or a recovery visit — each worker registers
-// at its entry and runs single-flight per session, admitting one attempt at a time, and every
-// authority transition recovery can submit is admitted per attempt or classified as one of the
-// stated exclusions. None of that is visible at the budget's use site, so these tests pin it
+// registered actor — one of the five session workers, or a background root registered for the
+// work it admits (a recovery visit, the lifecycle sweep, a Will-anchor transition) — each worker
+// registers at its entry and runs single-flight per session, admitting one attempt at a time, and
+// every authority write a background root can reach is admitted on every attempt, writes no
+// client authority, or is one of the stated exclusions. None of that is visible at the budget's use site, so these tests pin it
 // against the source.
 //
 // What they cannot do is prove the writers are single-flight. They pin the guard each launcher
@@ -41,6 +42,7 @@ var fgCensusAdmissions = map[string]string{
 	"outbound_retained_replay_emit.go:(mqttSession).admitRetainedCopyOnce":  "retained driver",
 	"outbound_retained_replay_emit.go:(mqttSession).closeAbandonedMaterial": "retained driver",
 	"outbound_retained_replay_emit.go:(mqttSession).runRetainedStep":        "retained driver",
+	"outbound_retained_replay_emit.go:(mqttSession).settleRetainedHandle":   "retained driver",
 	"outbound_retained_replay_emit.go:(mqttSession).transmitRetained":       "retained driver, retained continuations",
 	"outbound_retained_withdraw.go:(mqttSession).withdrawRetainedOnce":      "retained driver, retained continuations",
 }
@@ -477,88 +479,385 @@ func TestForegroundCensusEveryActorRegisters(t *testing.T) {
 	}
 }
 
-// fgCensusRecoveryAdmissions are the recovery visit's admission sites, with the statement that
-// admits, rendered: one per duty step, before the step's first read, and one per floor advancement.
-var fgCensusRecoveryAdmissions = map[string]string{
-	"outbound_duty_exec.go:(mqttAccountSessionManager).executeRecoveryDuty":  "if !as.admitRecoveryAttempt(root.ID, b) { return true }",
-	"outbound_duty_exec.go:(mqttAccountSessionManager).concludeRecoveryRoot": "admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }",
+// THE BACKGROUND AUTHORITY WRITERS. Every write of a client's authority (a transition, a shared
+// ledger batch, which carries the authority as its fence, or a record created beside it) that a
+// background path makes is admitted against the client's coordinator on EVERY attempt, by an
+// actor registered for the work, or is a stated exclusion. The tests below pin that against the
+// source in four parts: the background roots and what they reach; the inventory of every
+// function that calls an authority-writing funnel; where each admission is built and that it is
+// registered for; and, per attempt, that an admission dominates the write it licenses.
+
+// fgCensusFunnels are the calls that write a client's authority. Every authority write in the
+// package goes through one of them.
+var fgCensusFunnels = map[string]bool{
+	"commitOp":                   true,
+	"commitAuthorityTransition":  true,
+	"commitSharedLifecycleBatch": true,
+	"createBesideAuthority":      true,
 }
 
-// fgCensusRecoveryTransitions classifies every function a recovery visit can reach — by name, over
-// the whole package, so a superset of what it does reach — that submits a transition
-// (commitOp, commitAuthorityTransition): how its attempt is admitted, or why it needs none.
-var fgCensusRecoveryTransitions = map[string]string{
-	"outbound_ops.go:(mqttJSA).commitOp":                                     "the funnel itself: every submitter below reaches the store through it",
-	"outbound_discard.go:(mqttJSA).opDiscardExchange":                        "DUTY STEP: admitted by executeRecoveryDuty, one attempt",
-	"outbound_duty_ops.go:(mqttJSA).completeCleanupAndResolve":               "DUTY STEP: admitted by executeRecoveryDuty, one attempt (also the reclamation's step)",
-	"outbound_duty_ops.go:(mqttJSA).opResolveDuty":                           "DUTY STEP: admitted by executeRecoveryDuty, one attempt; its exchange arm is the authority-free hold release",
-	"outbound_duty_ops.go:(mqttJSA).opSealAffineProvisioning":                "DUTY STEP: admitted by executeRecoveryDuty, one attempt",
-	"outbound_ops.go:(mqttJSA).opAuthorizeDeletion":                          "DUTY STEP: admitted by executeRecoveryDuty, one attempt (also the reclamation's step)",
-	"outbound_ops.go:(mqttJSA).opSealProvisioning":                           "DUTY STEP: the reclamation's seal, admitted by executeRecoveryDuty, one attempt",
-	"outbound_ops.go:(mqttJSA).commitResourceStep":                           "DUTY STEP: the disposal and dependency release, admitted by executeRecoveryDuty, one attempt",
-	"outbound_retained_ops.go:(mqttJSA).opCloseRetainedManifest":             "DUTY STEP: the reclamation's manifest close, admitted by executeRecoveryDuty, one attempt",
-	"outbound_material_delete.go:(mqttAccountSessionManager).stepPurgeCount": "DUTY STEP: the reclamation's purge count, admitted by executeRecoveryDuty, one attempt",
-	"outbound_floor.go:(mqttJSA).opAdvanceFloor":                             "FLOOR: admitted immediately before it, after the position deletes (deleteRetiredPositionsUpTo's admit)",
-	"outbound_release_holds.go:(mqttJSA).releaseHoldsOnce":                   "AUTHORITY-FREE bookkeeping (mqttTransitionReleaseHolds): writes no authority; its re-attempts in opReleaseHolds stay inside the admitted duty step",
-	"shared_release_fence.go:(mqttJSA).opFenceSharedRelease":                 "SHARED-LEDGER: the shared closing's release fence, on the group's ledger, not the client's authority",
+// fgCensusBackgroundRoots are the background entries that are not session workers (those admit
+// through admitBackgroundAuthority and are pinned by fgCensusAdmissions): each runs on no
+// connection's path and must admit every authority attempt it reaches.
+var fgCensusBackgroundRoots = map[string]string{
+	"visitAdmittedRecoveryRoot": "a recovery visit past its entry check, registered by visitRecoveryRoot",
+	"sweepLifecycles":           "the lifecycle sweep, on the account ticker",
+	"runAnchorRemovals":         "the account's owed Will-anchor removal loop",
+	"scanWillOutbox":            "the delayed-Will outbox scan",
+	"dischargeOwedDelayedWills": "the delayed-Will retry pass",
+	"discardOwedDelayedWills":   "shutdown's last delayed-Will pass",
+	"sweepAcqReleaseVerdicts":   "the shared-verdict sweep, on the account ticker",
+	"runVerdictKick":            "a session's prompt verdict execution, off the connection's path",
+}
+
+// fgCensusWalkResolutions narrow one call edge of the by-name walk to the receiver type the call
+// is actually made on. The walk follows a call to EVERY function of that name, which keeps it a
+// superset only of what it can resolve; a name shared by many methods makes it reach the whole
+// package and classify nothing. Each entry only narrows, names the receiver whose method is
+// called, and is checked to still apply. Calls through function values are the walk's other
+// blind spot: a closure built in a root is attributed to it (collectBody descends into function
+// literals), and the func-typed parameters and fields the walk cannot follow are the admissions
+// themselves (admit, cw.admit) and nil-in-production test seams.
+var fgCensusWalkResolutions = map[[2]string]string{
+	// mqttInitiateMsgDeliveryJSA issues the Will's publication and reports it: the complete it
+	// calls is the issued publication's, not any of the package's other complete methods.
+	{"mqttInitiateMsgDeliveryJSA", "complete"}: "mqttIssued",
+}
+
+// fgCensusAuthorityWriters classifies EVERY production function that calls an authority-writing
+// funnel, by how its attempt is admitted when a background root reaches it. A function a root
+// reaches must be FUNNEL, ADMITTED or NO CLIENT AUTHORITY; FOREGROUND and SESSION WORKER entries
+// are writers no background root may reach, and EXCLUDED ones are stated in fgCensusExclusions.
+var fgCensusAuthorityWriters = map[string]string{
+	"outbound_ops.go:(mqttJSA).commitOp": "FUNNEL: every op submitter reaches the store through it",
+
+	"generation_retirement.go:(mqttJSA).retireGeneration":                    "ADMITTED: by the admit it is handed, before every control (fgCensusAdmittedAttempts)",
+	"lifecycle_retirement.go:(mqttJSA).retireLifecycle":                      "ADMITTED: by the admit it is handed, before its one fence (fgCensusAdmittedAttempts)",
+	"teardown_claim.go:(mqttAccountSessionManager).releaseTeardownEntry":     "ADMITTED: by the admit it is handed, before every CAS attempt; the teardown's own release passes nil (fgCensusUnadmittedCalls)",
+	"accept_abandon.go:(mqttAccountSessionManager).abandonPendingAcceptance": "ADMITTED: by the admit it is handed, before its one attempt",
+	"will_anchor_ops.go:(mqttAccountSessionManager).runAnchorTransition":     "ADMITTED: by the admit it is handed, before every attempt; background callers go through runBackgroundAnchorTransition",
+	"generation_boundary.go:(mqttJSA).createFencedGenRecordOnce":             "ADMITTED: one attempt of createFencedGenRecord, whose admit is asked before it in its loop",
+	"shared_lifecycle_ops.go:(mqttJSA).sealSharedLedger":                     "ADMITTED: by the closing's cw.admits before every seal attempt",
+	"shared_lifecycle_ops.go:(mqttJSA).executeSharedRelease":                 "ADMITTED: by the closing's cw.admits before every close and release attempt",
+	"outbound_floor.go:(mqttJSA).opAdvanceFloor":                             "ADMITTED: one advancement of deleteRetiredPositionsUpTo, whose admit is asked before it",
+	"outbound_discard.go:(mqttJSA).opDiscardExchange":                        "ADMITTED: a duty step, admitted by executeRecoveryDuty, one attempt",
+	"outbound_duty_ops.go:(mqttJSA).completeCleanupAndResolve":               "ADMITTED: a duty step, admitted by executeRecoveryDuty, one attempt (also the reclamation's step)",
+	"outbound_duty_ops.go:(mqttJSA).opResolveDuty":                           "ADMITTED: a duty step, admitted by executeRecoveryDuty, one attempt; its exchange arm is the authority-free hold release",
+	"outbound_duty_ops.go:(mqttJSA).opSealAffineProvisioning":                "ADMITTED: a duty step, admitted by executeRecoveryDuty, one attempt",
+	"outbound_ops.go:(mqttJSA).opAuthorizeDeletion":                          "ADMITTED: a duty step, admitted by executeRecoveryDuty, one attempt (also the reclamation's step)",
+	"outbound_ops.go:(mqttJSA).opSealProvisioning":                           "ADMITTED: the reclamation's seal, a duty step admitted by executeRecoveryDuty, one attempt",
+	"outbound_ops.go:(mqttJSA).commitResourceStep":                           "ADMITTED: the disposal and dependency release, a duty step admitted by executeRecoveryDuty, one attempt",
+	"outbound_retained_ops.go:(mqttJSA).opCloseRetainedManifest":             "ADMITTED: the reclamation's manifest close, a duty step admitted by executeRecoveryDuty, one attempt",
+	"outbound_material_delete.go:(mqttAccountSessionManager).stepPurgeCount": "ADMITTED: the reclamation's purge count, a duty step admitted by executeRecoveryDuty, one attempt",
+	"shared_release_fence.go:(mqttJSA).opFenceSharedRelease":                 "ADMITTED: the release fence writes only while its generation SERVES, and a recovery visit reaches it only past a discarding closure, where executeSharedRelease's step 1b skips it",
+
+	"outbound_release_holds.go:(mqttJSA).releaseHoldsOnce":      "NO CLIENT AUTHORITY: the authority-free hold release (mqttTransitionReleaseHolds); its re-attempts stay inside the admitted duty step",
+	"shared_lifecycle_ops.go:(mqttJSA).retireSharedIncarnation": "NO CLIENT AUTHORITY: the retiring incarnation's group-only batch carries no ledger, so no authority member",
+
+	"accept_drive.go:(mqttSession).bindAcceptance":                            "FOREGROUND: the CONNECT's bind, announced",
+	"accept_drive.go:(mqttSession).resolveAcceptance":                         "FOREGROUND: the CONNECT's acceptance, announced by acceptOwnership",
+	"sess_persist.go:(mqttSession).commitAcceptShape":                         "FOREGROUND: the CONNECT's acceptance batch, announced by acceptOwnership",
+	"sess_teardown.go:(mqttSession).claimTeardown":                            "FOREGROUND: the connection's own teardown claim (destroyReleasing); the adopted teardown is the stated exclusion",
+	"shared_lifecycle_ops.go:(mqttJSA).installSharedTenure":                   "FOREGROUND: the CONNECT's and the first acquisition's tenure installation",
+	"shared_lifecycle_ops.go:(mqttSession).acquireShared":                     "FOREGROUND: a shared delivery's acquisition, on the delivery path",
+	"shared_lifecycle_ops.go:(mqttSession).abortSharedAcquisition":            "FOREGROUND: a shared delivery's acquisition abort, on the delivery path",
+	"outbound_ops.go:(mqttJSA).opAcquireActions":                              "FOREGROUND: the announced delivery acquisition",
+	"outbound_ops.go:(mqttJSA).opAdmitPublish":                                "FOREGROUND: the announced ordinary admission ladder",
+	"outbound_ops.go:(mqttJSA).opAdmitPublishes":                              "FOREGROUND: the announced admission batch",
+	"outbound_ops.go:(mqttJSA).opReplacePublish":                              "FOREGROUND: the announced admission ladder's replacement",
+	"outbound_ops.go:(mqttJSA).opProvisionResource":                           "FOREGROUND: the announced SUBSCRIBE and resume name claims",
+	"outbound_ack_advance.go:(mqttJSA).opAdvanceExchangeAck":                  "FOREGROUND: the announced PUBACK, PUBREC and PUBCOMP advances",
+	"outbound_ack_advance.go:(mqttJSA).opCompleteExchangeDrain":               "FOREGROUND: the PUBREL holder's drain completion; the retained action drain is the stated exclusion",
+	"outbound_pubrel_rematerialize.go:(mqttJSA).opRebindCanonical":            "FOREGROUND: the PUBREL rematerialization on its connection's path",
+	"outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery":          "EXCLUDED: the denied delivery's disposal timer step (fgCensusExclusions)",
+	"outbound_transition.go:(mqttJSA).abortFencedOnce":                        "SESSION WORKER: one attempt of abortTransition, admitted by the holder's own admission before every attempt (consult 12); foreground holders pass nil",
+	"outbound_withdraw_unsent.go:(mqttJSA).opTombstoneRegister":               "SESSION WORKER: admitted by the withdrawal licence's admit",
+	"outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent":                  "SESSION WORKER: admitted by the withdrawal licence's admit",
+	"pending_fence_disposal.go:(mqttSession).fenceBeforePendingFenceDisposal": "SESSION WORKER: the register reap's fence, on the session's own reap path",
+	"outbound_duty_ops.go:(mqttJSA).opResolveDuties":                          "SESSION WORKER: the custody dispatcher's floor unit, admitted by tryAdmitBackgroundAuthority (fgCensusAdmissions)",
+	"outbound_retained_ops.go:(mqttJSA).opAdmitRetained":                      "SESSION WORKER: the retained driver, admitted by admitBackgroundAuthority (fgCensusAdmissions)",
+	"outbound_retained_ops.go:(mqttJSA).opReserveRetainedPayload":             "SESSION WORKER: the retained driver, admitted by admitBackgroundAuthority (fgCensusAdmissions)",
+	"outbound_retained_ops.go:(mqttJSA).opSealRetainedPayload":                "SESSION WORKER: the retained driver, admitted by admitBackgroundAuthority (fgCensusAdmissions)",
+	"outbound_retained_ops.go:(mqttJSA).opWriteRetainedChunks":                "SESSION WORKER: the retained driver, admitted by admitBackgroundAuthority (fgCensusAdmissions)",
+}
+
+// fgCensusBackgroundSafe are the classes a background root may reach.
+var fgCensusBackgroundSafe = []string{"FUNNEL:", "ADMITTED:", "NO CLIENT AUTHORITY:"}
+
+// fgCensusAdmissionSite is where a background admission is BUILT: the statement, rendered, and
+// the registration that must precede it in the same block (a registered actor spans the work it
+// admits), or the registered root that registers for it.
+type fgCensusAdmissionSite struct {
+	admission    string
+	registration []string
+	registeredBy string
+}
+
+// fgCensusBackgroundAdmissions are every site that builds a background admission against a
+// client's coordinator. The recovery visit's are registered by visitRecoveryRoot (pinned in
+// TestForegroundCensusEveryActorRegisters); the others register for exactly the work they admit.
+var fgCensusBackgroundAdmissions = map[string]fgCensusAdmissionSite{
+	"outbound_duty_exec.go:(mqttAccountSessionManager).executeRecoveryDuty": {
+		admission: "if !as.admitRecoveryAttempt(root.ID, b) { return true }", registeredBy: "visitRecoveryRoot"},
+	"outbound_duty_exec.go:(mqttAccountSessionManager).concludeRecoveryRoot": {
+		admission: "admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }", registeredBy: "visitRecoveryRoot"},
+	"outbound_duty_exec.go:(mqttAccountSessionManager).retireRecoveryRoot": {
+		admission: "admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }", registeredBy: "visitRecoveryRoot"},
+	"outbound_duty_exec.go:(mqttAccountSessionManager).performAffineReadiness": {
+		admission: "admit := func() bool { return as.admitRecoveryAttempt(root.ID, b) }", registeredBy: "visitRecoveryRoot"},
+	"outbound_recovery_shared_closing.go:(mqttAccountSessionManager).stepSharedClosing": {
+		admission: "cw.admit = func() bool { return as.admitRecoveryAttempt(root.ID, b) }", registeredBy: "visitRecoveryRoot"},
+	"lifecycle_retirement.go:(mqttAccountSessionManager).sweepLifecycles": {
+		admission:    "admit := func() bool { _, _, idle := as.admitForegroundOrIdle(id) return idle == nil }",
+		registration: []string{"deregister := as.registerForegroundActor(id)", "defer deregister()"}},
+	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepAcqReleaseVerdicts": {
+		admission:    "admit := func() bool { _, _, idle := as.admitForegroundOrIdle(clientID) return idle == nil }",
+		registration: []string{"deregister := as.registerForegroundActor(clientID)", "defer deregister()"}},
+	"shared_verdict_kick.go:(mqttSession).executeDurableVerdicts": {
+		admission:    "admit := func() bool { return as.admitForegroundOrWait(id, quit) }",
+		registration: []string{"deregister := as.registerForegroundActor(id)", "defer deregister()"}},
+	"will_anchor_ops.go:(mqttAccountSessionManager).runBackgroundAnchorTransition": {
+		admission:    "admit := func() bool { _, _, idle := as.admitForegroundOrIdle(clientID) return idle == nil }",
+		registration: []string{"deregister := as.registerForegroundActor(clientID)", "defer deregister()"}},
+}
+
+// fgCensusAdmissionPrimitives reference the coordinator's admission as its definition, not as a
+// site: the recovery form and the session workers' forms (pinned by fgCensusAdmissions).
+var fgCensusAdmissionPrimitives = map[string]string{
+	"outbound_foreground_priority.go:(mqttAccountSessionManager).admitRecoveryAttempt":  "the recovery visit's non-waiting admission",
+	"outbound_foreground_priority.go:(mqttSession).admitBackgroundAuthority":            "the session workers' admission",
+	"outbound_foreground_priority.go:(mqttSession).tryAdmitBackgroundAuthority":         "the session workers' non-waiting admission",
+	"outbound_foreground_priority.go:(mqttAccountSessionManager).admitForegroundOrWait": "a registered background actor's waiting admission (the verdict kick)",
+}
+
+// fgCensusAdmittedAttempt names, for a function that admits per attempt, the admission call and
+// the attempt it must dominate.
+type fgCensusAdmittedAttempt struct {
+	admit   string // the called identifier or selector: admit, admits, admitRecoveryAttempt
+	attempt string // the call each admission licenses
+}
+
+// fgCensusAdmittedAttempts are the functions whose every attempt must be dominated by an
+// admission: walking out from each attempt call, an earlier statement of an enclosing statement
+// list holds the admission, no further out than the innermost loop body that contains the call.
+// Asked once outside the retry loop does not count.
+var fgCensusAdmittedAttempts = map[string]fgCensusAdmittedAttempt{
+	"generation_retirement.go:(mqttJSA).retireGeneration":                    {"admit", "commitAuthorityTransition"},
+	"lifecycle_retirement.go:(mqttJSA).retireLifecycle":                      {"admit", "commitAuthorityTransition"},
+	"teardown_claim.go:(mqttAccountSessionManager).releaseTeardownEntry":     {"admit", "commitAuthorityTransition"},
+	"accept_abandon.go:(mqttAccountSessionManager).abandonPendingAcceptance": {"admit", "commitAuthorityTransition"},
+	"will_anchor_ops.go:(mqttAccountSessionManager).runAnchorTransition":     {"admit", "commitAuthorityTransition"},
+	"generation_boundary.go:(mqttJSA).createFencedGenRecord":                 {"admit", "createFencedGenRecordOnce"},
+	"outbound_floor.go:(mqttJSA).deleteRetiredPositionsUpTo":                 {"admit", "opAdvanceFloor"},
+	"shared_lifecycle_ops.go:(mqttJSA).sealSharedLedger":                     {"admits", "commitSharedLifecycleBatch"},
+	"shared_lifecycle_ops.go:(mqttJSA).executeSharedRelease":                 {"admits", "commitSharedLifecycleBatch"},
+	"shared_release_fence.go:(mqttJSA).fenceSharedRelease":                   {"admit", "opFenceSharedRelease"},
+}
+
+// fgCensusAdmitParams are the dual-use helpers: they admit by what they are handed, at this
+// argument position, so the caller decides the mode. A call passes the admission it built or was
+// handed (admit, cw), or nil (or a contention without an admission) at a site
+// fgCensusUnadmittedCalls lists, which no background root may reach.
+var fgCensusAdmitParams = map[string]int{
+	"runAnchorTransition":        4,
+	"releaseTeardownEntry":       3,
+	"abandonPendingAcceptance":   4,
+	"retireGeneration":           3,
+	"retireLifecycle":            2,
+	"createFencedGenRecord":      6,
+	"publishGenCompletionCert":   1,
+	"publishAffineReadiness":     1,
+	"deleteRetiredPositionsStep": 3,
+	"deleteRetiredPositionsUpTo": 4,
+	"sealSharedLedger":           3,
+	"executeSharedRelease":       4,
+	"releaseSealedAcquisitions":  4,
+	"fenceSharedRelease":         3,
+}
+
+// fgCensusAdmitForwarders are the functions that hand on an admission they were handed.
+var fgCensusAdmitForwarders = map[string]bool{
+	"publishGenCompletionCert":   true,
+	"publishAffineReadiness":     true,
+	"deleteRetiredPositionsStep": true,
+	"releaseSealedAcquisitions":  true,
+}
+
+// fgCensusUnadmittedCalls are the calls of a dual-use helper that pass no admission, "caller ->
+// helper", each with the route that makes it not background: FOREGROUND (a connection's own path),
+// SESSION WORKER (admitted before the call by the worker's admission) or EXCLUDED
+// (fgCensusExclusions).
+var fgCensusUnadmittedCalls = map[string]string{
+	"will_disposition.go:(Server).mqttHandleWill -> runAnchorTransition":                                         "FOREGROUND: the closing connection owes its own Will's anchor",
+	"sess_uncertain.go:(Server).dischargeDeferredWill -> runAnchorTransition":                                    "FOREGROUND: the deferred disconnect owes its own Will's anchor, on its session's resolution",
+	"sess_teardown.go:(mqttSession).releaseTeardown -> releaseTeardownEntry":                                     "FOREGROUND: the teardown's own release; the adopted teardown is the stated exclusion",
+	"sess_teardown_partition.go:(mqttAccountSessionManager).finishAffinePrerequisites -> publishAffineReadiness": "FOREGROUND: the teardown's own affine prerequisites; the adopted teardown is the stated exclusion",
+	"outbound_floor_unit.go:(mqttSession).runFloorUnit -> deleteRetiredPositionsUpTo":                            "SESSION WORKER: the floor unit, admitted by tryAdmitBackgroundAuthority immediately before",
+	"shared_lifecycle_ops.go:(mqttSession).executeOwnVerdicts -> executeSharedRelease":                           "FOREGROUND: a connection's own release verdicts, on its own path",
+	"shared_lifecycle_ops.go:(mqttJSA).closeSharedGeneration -> sealSharedLedger":                                "FOREGROUND: the teardown's inline shared closing, with its own contention allowance",
+	"shared_lifecycle_ops.go:(mqttJSA).closeSharedGeneration -> releaseSealedAcquisitions":                       "FOREGROUND: the teardown's inline shared closing, with its own contention allowance",
 }
 
 // fgCensusExclusions are the background authority writers that stand OUTSIDE the admission, each
 // stated in outbound_foreground_priority.go; the census pins that each still exists, so a rename
 // cannot silently drop one from the stated list.
 var fgCensusExclusions = map[string]string{
-	"sess_teardown.go:(mqttAccountSessionManager).finishAdoptedTeardown":        "the adopted teardown's completion: the one recovery exclusion",
-	"pubrel_action.go:(mqttSession).startActionDrain":                           "the retained PUBREL action drain's completion",
-	"outbound_disposal.go:(mqttDisposal).step":                                  "the denied delivery's disposal timer step",
-	"outbound_connect_settle.go:(mqttAccountSessionManager).abandonOwnProposal": "abandonOwnProposal's asynchronous settlement",
-	"sess_clear.go:(mqttSession).settleDiscardAuthority":                        "record-driven expiry's clear",
+	"sess_teardown.go:(mqttAccountSessionManager).finishAdoptedTeardown": "the adopted teardown's completion: the one recovery exclusion",
+	"pubrel_action.go:(mqttSession).startActionDrain":                    "the retained PUBREL action drain's completion",
+	"outbound_disposal.go:(mqttDisposal).step":                           "the denied delivery's disposal timer step",
+	"sess_clear.go:(mqttSession).settleDiscardAuthority":                 "record-driven expiry's clear",
 }
 
-// TestForegroundCensusRecoveryAdmitsEveryAttempt: the recovery admission is made exactly at its
-// pinned sites, and every transition a recovery visit can submit is classified.
-func TestForegroundCensusRecoveryAdmitsEveryAttempt(t *testing.T) {
-	t.Parallel()
-	funcs := fgCensusParse(t)
-	sc := censusScanPackage(t)
-	got := sc.FunctionsReferencing("admitRecoveryAttempt")
-	for k := range got {
-		want, ok := fgCensusRecoveryAdmissions[k.String()]
-		if !ok {
-			t.Errorf("%s admits a recovery attempt at an unpinned site", k)
-			continue
-		}
-		f := funcs[k.String()]
-		found := false
-		ast.Inspect(f.fd.Body, func(x ast.Node) bool {
-			if st, ok := x.(ast.Stmt); ok && fgCensusRender(f.fset, st) == want {
-				found = true
-			}
-			return !found
-		})
-		if !found {
-			t.Errorf("%s no longer admits with the pinned statement %q", k, want)
-		}
+// fgCensusCallName is the called identifier: a selector's field, or a bare identifier.
+func fgCensusCallName(c *ast.CallExpr) string {
+	switch fn := c.Fun.(type) {
+	case *ast.SelectorExpr:
+		return fn.Sel.Name
+	case *ast.Ident:
+		return fn.Name
 	}
-	for k := range fgCensusRecoveryAdmissions {
-		if !got[censusFuncKey{File: strings.SplitN(k, ":", 2)[0], Recv: "mqttAccountSessionManager",
-			Name: k[strings.LastIndex(k, ".")+1:]}] {
-			t.Errorf("pinned recovery admission site %s no longer admits", k)
-		}
-	}
+	return ""
+}
 
-	byName := map[string][]censusFuncKey{}
+// fgCensusHasCall reports whether n calls name, not looking inside function literals: a closure
+// runs when it is called, not where it is written.
+func fgCensusHasCall(n ast.Node, name string) bool {
+	found := false
+	ast.Inspect(n, func(x ast.Node) bool {
+		if _, lit := x.(*ast.FuncLit); lit {
+			return false
+		}
+		if c, ok := x.(*ast.CallExpr); ok && fgCensusCallName(c) == name {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// fgCensusAdmitsUnconditionally reports whether s asks admit on every path through it: in an
+// if's init or condition (the guard `if !admit() { return }`), or anywhere in a simple
+// statement. An admission inside a branch body, a loop or a switch asks it on some paths only.
+func fgCensusAdmitsUnconditionally(s ast.Stmt, admit string) bool {
+	switch v := s.(type) {
+	case *ast.IfStmt:
+		return (v.Init != nil && fgCensusHasCall(v.Init, admit)) || fgCensusHasCall(v.Cond, admit)
+	case *ast.ExprStmt, *ast.AssignStmt, *ast.DeclStmt, *ast.ReturnStmt:
+		return fgCensusHasCall(v, admit)
+	}
+	return false
+}
+
+// fgCensusUndominated counts the calls to attempt in f and returns those no admission dominates.
+// From the call outward, an earlier statement of an enclosing statement list must ask admit on
+// every path through it (fgCensusAdmitsUnconditionally), and the walk ends at the innermost enclosing loop or function literal: an admission outside the
+// retry loop is asked once, not per attempt.
+func fgCensusUndominated(f fgCensusFunc, admit, attempt string) (int, []string) {
+	n := 0
+	var bad []string
+	var stack []ast.Node
+	dominated := func() bool {
+		for i := len(stack) - 2; i >= 0; i-- {
+			var list []ast.Stmt
+			switch v := stack[i].(type) {
+			case *ast.FuncLit, *ast.ForStmt, *ast.RangeStmt:
+				return false
+			case *ast.BlockStmt:
+				list = v.List
+			case *ast.CaseClause:
+				list = v.Body
+			case *ast.CommClause:
+				list = v.Body
+			}
+			for _, s := range list {
+				if ast.Node(s) == stack[i+1] {
+					break
+				}
+				if fgCensusAdmitsUnconditionally(s, admit) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	ast.Inspect(f.fd.Body, func(x ast.Node) bool {
+		if x == nil {
+			stack = stack[:len(stack)-1]
+			return false
+		}
+		stack = append(stack, x)
+		if c, ok := x.(*ast.CallExpr); ok && fgCensusCallName(c) == attempt {
+			n++
+			if !dominated() {
+				bad = append(bad, fgCensusRender(f.fset, c))
+			}
+		}
+		return true
+	})
+	return n, bad
+}
+
+// fgCensusBlockWith finds the statement list in f (function literals included) holding a
+// statement that renders as want, and that statement's index.
+func fgCensusBlockWith(f fgCensusFunc, want string) ([]ast.Stmt, int) {
+	var list []ast.Stmt
+	at := -1
+	ast.Inspect(f.fd.Body, func(x ast.Node) bool {
+		if at >= 0 {
+			return false
+		}
+		if b, ok := x.(*ast.BlockStmt); ok {
+			for i, s := range b.List {
+				if fgCensusRender(f.fset, s) == want {
+					list, at = b.List, i
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return list, at
+}
+
+// fgCensusWalk is the by-name call graph with fgCensusWalkResolutions applied.
+type fgCensusWalk struct {
+	byName  map[string][]censusFuncKey
+	callees map[censusFuncKey][]string
+}
+
+func fgCensusNewWalk(t *testing.T, sc *censusScan) *fgCensusWalk {
+	t.Helper()
+	w := &fgCensusWalk{byName: map[string][]censusFuncKey{}, callees: map[censusFuncKey][]string{}}
 	for k := range sc.Funcs {
-		byName[k.Name] = append(byName[k.Name], k)
+		w.byName[k.Name] = append(w.byName[k.Name], k)
 	}
-	callees := map[censusFuncKey][]string{}
 	for _, c := range sc.Calls {
-		callees[c.Fn] = append(callees[c.Fn], c.Callee)
+		w.callees[c.Fn] = append(w.callees[c.Fn], c.Callee)
 	}
+	for edge, recv := range fgCensusWalkResolutions {
+		calls, declared := false, false
+		for _, c := range sc.Calls {
+			if c.Fn.Name == edge[0] && c.Callee == edge[1] {
+				calls = true
+			}
+		}
+		for _, k := range w.byName[edge[1]] {
+			if k.Recv == recv {
+				declared = true
+			}
+		}
+		if !calls || !declared {
+			t.Errorf("the walk resolution %s -> (%s).%s no longer applies (calls %v, declared %v)",
+				edge[0], recv, edge[1], calls, declared)
+		}
+	}
+	return w
+}
+
+// reach is every function reachable from the functions named root.
+func (w *fgCensusWalk) reach(root string) map[censusFuncKey]bool {
 	seen := map[censusFuncKey]bool{}
-	queue := append([]censusFuncKey(nil), byName["visitAdmittedRecoveryRoot"]...)
-	if len(queue) != 1 {
-		t.Fatalf("found %d declarations of visitAdmittedRecoveryRoot, want one", len(queue))
-	}
+	queue := append([]censusFuncKey(nil), w.byName[root]...)
 	for len(queue) > 0 {
 		k := queue[0]
 		queue = queue[1:]
@@ -566,37 +865,82 @@ func TestForegroundCensusRecoveryAdmitsEveryAttempt(t *testing.T) {
 			continue
 		}
 		seen[k] = true
-		for _, n := range callees[k] {
-			queue = append(queue, byName[n]...)
-		}
-	}
-	submitters := map[string]bool{}
-	for k := range seen {
-		for _, n := range callees[k] {
-			if n == "commitOp" || n == "commitAuthorityTransition" {
-				submitters[k.String()] = true
+		for _, n := range w.callees[k] {
+			recv, narrowed := fgCensusWalkResolutions[[2]string{k.Name, n}]
+			for _, c := range w.byName[n] {
+				if !narrowed || c.Recv == recv {
+					queue = append(queue, c)
+				}
 			}
 		}
 	}
+	return seen
+}
+
+// fgCensusBackgroundReach is the union of what every background root reaches.
+func fgCensusBackgroundReach(t *testing.T, sc *censusScan) map[censusFuncKey]bool {
+	t.Helper()
+	w := fgCensusNewWalk(t, sc)
+	all := map[censusFuncKey]bool{}
+	for root := range fgCensusBackgroundRoots {
+		if n := len(w.byName[root]); n != 1 {
+			t.Errorf("found %d declarations of the background root %s, want one", n, root)
+		}
+		for k := range w.reach(root) {
+			all[k] = true
+		}
+	}
+	return all
+}
+
+// TestForegroundCensusBackgroundWritersAreAdmitted: every function calling an authority-writing
+// funnel is classified, and every one a background root reaches is admitted per attempt, writes
+// no client authority, or is the funnel itself.
+func TestForegroundCensusBackgroundWritersAreAdmitted(t *testing.T) {
+	t.Parallel()
+	funcs := fgCensusParse(t)
+	sc := censusScanPackage(t)
+	writers := map[string]bool{}
+	for _, c := range sc.Calls {
+		if fgCensusFunnels[c.Callee] {
+			writers[c.Fn.String()] = true
+		}
+	}
 	var unclassified, stale []string
-	for k := range submitters {
-		if _, ok := fgCensusRecoveryTransitions[k]; !ok {
+	for k := range writers {
+		if _, ok := fgCensusAuthorityWriters[k]; !ok {
 			unclassified = append(unclassified, k)
 		}
 	}
-	for k := range fgCensusRecoveryTransitions {
-		if !submitters[k] {
+	for k := range fgCensusAuthorityWriters {
+		if !writers[k] {
 			stale = append(stale, k)
 		}
 	}
 	sort.Strings(unclassified)
 	sort.Strings(stale)
 	if len(unclassified) > 0 {
-		t.Errorf("transition submitters a recovery visit can reach that no admission or exclusion "+
-			"accounts for (a submitter that retries is admitted per attempt): %v", unclassified)
+		t.Errorf("authority writers no classification accounts for (a new writer states how it is "+
+			"admitted, or why no background root reaches it): %v", unclassified)
 	}
 	if len(stale) > 0 {
-		t.Errorf("fgCensusRecoveryTransitions names functions a recovery visit no longer reaches: %v", stale)
+		t.Errorf("fgCensusAuthorityWriters names functions that no longer write an authority: %v", stale)
+	}
+	for k := range fgCensusBackgroundReach(t, sc) {
+		class, ok := fgCensusAuthorityWriters[k.String()]
+		if !ok {
+			continue
+		}
+		safe := false
+		for _, p := range fgCensusBackgroundSafe {
+			if strings.HasPrefix(class, p) {
+				safe = true
+			}
+		}
+		if !safe {
+			t.Errorf("a background root reaches %s, classified %q: it writes the client's authority "+
+				"without a per-attempt admission", k, class)
+		}
 	}
 	for k := range fgCensusExclusions {
 		if _, ok := funcs[k]; !ok {
@@ -605,12 +949,175 @@ func TestForegroundCensusRecoveryAdmitsEveryAttempt(t *testing.T) {
 	}
 }
 
+// TestForegroundCensusBackgroundAdmissionsAreRegistered: every reference to the coordinator's
+// admission is a pinned site or a primitive; each site builds exactly its pinned admission, and
+// the sites that admit against admitForegroundOrIdle register for the client just before, in the
+// same block, so the actor spans the work it admits.
+func TestForegroundCensusBackgroundAdmissionsAreRegistered(t *testing.T) {
+	t.Parallel()
+	funcs := fgCensusParse(t)
+	sc := censusScanPackage(t)
+	refs := sc.FunctionsReferencing("admitRecoveryAttempt")
+	for k := range sc.FunctionsReferencing("admitForegroundOrIdle") {
+		refs[k] = true
+	}
+	for k := range sc.FunctionsReferencing("admitForegroundOrWait") {
+		refs[k] = true
+	}
+	for k := range refs {
+		_, site := fgCensusBackgroundAdmissions[k.String()]
+		_, prim := fgCensusAdmissionPrimitives[k.String()]
+		if !site && !prim {
+			t.Errorf("%s admits against the coordinator at an unpinned site", k)
+		}
+	}
+	for k := range fgCensusAdmissionPrimitives {
+		if !refs[censusFuncKeyOf(k)] {
+			t.Errorf("the admission primitive %s no longer references the coordinator's admission", k)
+		}
+	}
+	for k, want := range fgCensusBackgroundAdmissions {
+		f, ok := funcs[k]
+		if !ok || !refs[censusFuncKeyOf(k)] {
+			t.Errorf("pinned background admission site %s no longer admits", k)
+			continue
+		}
+		list, at := fgCensusBlockWith(f, want.admission)
+		if at < 0 {
+			t.Errorf("%s no longer admits with the pinned statement %q", k, want.admission)
+			continue
+		}
+		if want.registeredBy != _EMPTY_ {
+			continue
+		}
+		var before []string
+		for _, s := range list[:at] {
+			before = append(before, fgCensusRender(f.fset, s))
+		}
+		joined := "\n" + strings.Join(before, "\n") + "\n"
+		pos := 0
+		for _, r := range want.registration {
+			i := strings.Index(joined[pos:], "\n"+r+"\n")
+			if i < 0 {
+				t.Errorf("%s admits without registering first in the same block (%q missing before %q): "+
+					"an unregistered actor's attempt is outside every allowance", k, r, want.admission)
+				break
+			}
+			pos += i + len(r) + 1
+		}
+	}
+}
+
+// TestForegroundCensusAdmissionDominatesEveryAttempt: in every function that admits per attempt,
+// each attempt is dominated by its admission within its own loop iteration; and every recovery
+// duty step is admitted before the step's first call.
+func TestForegroundCensusAdmissionDominatesEveryAttempt(t *testing.T) {
+	t.Parallel()
+	funcs := fgCensusParse(t)
+	for k, want := range fgCensusAdmittedAttempts {
+		f, ok := funcs[k]
+		if !ok {
+			t.Errorf("the admitted function %s no longer exists", k)
+			continue
+		}
+		n, bad := fgCensusUndominated(f, want.admit, want.attempt)
+		if n == 0 {
+			t.Errorf("%s no longer calls %s, so its admission pins nothing", k, want.attempt)
+		}
+		for _, b := range bad {
+			t.Errorf("%s sends %s with no %s dominating it in the same attempt: an admission asked "+
+				"once, or after the write, admits nothing per attempt", k, b, want.admit)
+		}
+	}
+	// THE DUTY STEP: its one attempt follows the admission, which is the first statement that
+	// calls anything.
+	f, ok := funcs["outbound_duty_exec.go:(mqttAccountSessionManager).executeRecoveryDuty"]
+	if !ok {
+		t.Fatal("executeRecoveryDuty no longer exists")
+	}
+	want := fgCensusBackgroundAdmissions["outbound_duty_exec.go:(mqttAccountSessionManager).executeRecoveryDuty"].admission
+	for _, s := range f.fd.Body.List {
+		calls := false
+		ast.Inspect(s, func(x ast.Node) bool {
+			if _, ok := x.(*ast.CallExpr); ok {
+				calls = true
+			}
+			return !calls
+		})
+		if !calls {
+			continue
+		}
+		if got := fgCensusRender(f.fset, s); got != want {
+			t.Errorf("executeRecoveryDuty's first statement that calls anything is %q, not its admission %q", got, want)
+		}
+		break
+	}
+}
+
+// TestForegroundCensusDualUseHelpersAreCalledInTheirMode: every call of a helper that admits by
+// what it is handed passes the admission its caller built or was handed, or is a listed
+// unadmitted call that no background root reaches (an exclusion excepted).
+func TestForegroundCensusDualUseHelpersAreCalledInTheirMode(t *testing.T) {
+	t.Parallel()
+	sc := censusScanPackage(t)
+	reach := fgCensusBackgroundReach(t, sc)
+	seen := map[string]bool{}
+	for _, c := range sc.Calls {
+		idx, ok := fgCensusAdmitParams[c.Callee]
+		if !ok {
+			continue
+		}
+		caller := c.Fn.String()
+		if idx >= len(c.Args) {
+			t.Errorf("%s calls %s with %d argument(s); its admission is argument %d", caller, c.Callee, len(c.Args), idx)
+			continue
+		}
+		arg := c.Args[idx]
+		_, builds := fgCensusBackgroundAdmissions[caller]
+		_, admitted := fgCensusAdmittedAttempts[caller]
+		forwards := fgCensusAdmitForwarders[c.Fn.Name] || admitted
+		switch {
+		case (arg == "admit" || arg == "cw" || arg == "cw.admits") && (builds || forwards):
+			// cw.admits is the contention's own admission, handed on as a function.
+			continue
+		case arg == "admit":
+			t.Errorf("%s hands %s an admit it neither built at a pinned site nor was handed", caller, c.Callee)
+			continue
+		}
+		key := caller + " -> " + c.Callee
+		seen[key] = true
+		reason, listed := fgCensusUnadmittedCalls[key]
+		if !listed {
+			t.Errorf("%s passes %s no admission (%s) at an unlisted site: a background caller must hand "+
+				"it the admission it built; a foreground one is listed with its route", caller, c.Callee, arg)
+			continue
+		}
+		if reach[c.Fn] && !strings.HasPrefix(reason, "EXCLUDED:") {
+			t.Errorf("%s passes %s no admission, and a background root reaches it", caller, c.Callee)
+		}
+	}
+	for k := range fgCensusUnadmittedCalls {
+		if !seen[k] {
+			t.Errorf("fgCensusUnadmittedCalls names a call that no longer passes no admission: %s", k)
+		}
+	}
+}
+
+// censusFuncKeyOf parses a rendered function key back.
+func censusFuncKeyOf(s string) censusFuncKey {
+	file, rest, _ := strings.Cut(s, ":")
+	if strings.HasPrefix(rest, "(") {
+		recv, name, _ := strings.Cut(rest[1:], ").")
+		return censusFuncKey{File: file, Recv: recv, Name: name}
+	}
+	return censusFuncKey{File: file, Name: rest}
+}
+
 // fgCensusTransientRoots are the functions that build a TRANSIENT session object outside CONNECT:
 // one no connection holds and no worker of its own registers for. A transient object that
 // reached an admission would admit against its client's coordinator without being in any
 // announcement's allowance.
 var fgCensusTransientRoots = []string{
-	"orphan_qos2_sweep.go:(mqttAccountSessionManager).condemnRetiredSurvivors",
 	"outbound_duty_exec.go:(mqttAccountSessionManager).performAffineReadiness",
 	"sess_expiry.go:(mqttAccountSessionManager).expireSessionFromRecord",
 	"sess_teardown.go:(mqttAccountSessionManager).finishAdoptedTeardown",

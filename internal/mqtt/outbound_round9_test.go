@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The findings of implementation review 9, each against the store.
@@ -55,7 +54,7 @@ func TestStaleRequestsDoNotRetargetTheCurrentOwner(t *testing.T) {
 	g2, _ := e.claim(t, closing.Auth, closeSeq, "txn-g2", testGen2, "tenure-g2")
 
 	// THE DELAYED CLOSURE MUST NOT END G2.
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close-late", capturedGen, capturedTenure, capturedOwner); err == nil {
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch, capturedGen, capturedTenure, capturedOwner); err == nil {
 		t.Fatalf("a closure composed for %q ended the standing generation instead", capturedGen)
 	}
 	if al := jsa.loadOutboundAuthority(e.id, e.epoch); al.status != mqttOutboundValid ||
@@ -177,197 +176,6 @@ func TestAcquisitionIsDecidedByTheExchange(t *testing.T) {
 	}
 }
 
-// TestDiscardingHandoffFinalizesThroughTheSurface is finding 3, which was an outright
-// defect rather than a gap: the derived closure left Discard false, and the kind rule refuses
-// exactly that — so every clean-start handoff composed by the surface failed finalization,
-// and with its metadata half committed it could not be cancelled either. The authority would
-// have stayed PREPARING with admission frozen.
-func TestDiscardingHandoffFinalizesThroughTheSurface(t *testing.T) {
-	e, done := testNewEnv(t, "f105-cleanstart-finalize")
-	defer done()
-
-	jsa := &e.asm.jsa
-	i := testIntent(t, e, "clean")
-	testPrepare(t, e, i)
-
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: i.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the clean start's metadata half was refused: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin", i.ID); err != nil {
-		t.Fatalf("finalizing a DISCARDING handoff was refused: %v — a clean start that "+
-			"cannot finalize leaves the authority preparing and admission frozen", err)
-	}
-
-	al := jsa.loadOutboundAuthority(e.id, e.epoch)
-	if al.status != mqttOutboundValid || al.rec.State != mqttAuthorityServing ||
-		al.rec.Gen != i.Gen || al.rec.Tenure != i.Tenure {
-		t.Fatalf("the finalization installed %+v rather than the proposed tenure", al.rec)
-	}
-	// AND THE CLOSURE SAYS THE SESSION WAS DISCARDED. A closure is the permanent record of
-	// WHY a generation ended; one that ended a clean start while saying it did not would
-	// tell a later reader the session was resumable.
-	c, _, st := jsa.loadGenClosure(e.id, e.epoch, i.PrevGen)
-	if st != mqttOutboundValid {
-		t.Fatalf("the discarded generation has no permanent closure (status %v)", st)
-	}
-	if !c.Discard {
-		t.Fatalf("the clean start's closure does not record the discard")
-	}
-}
-
-// TestOperationsReturnTheEvidenceToResolveThemselves is finding 4.
-//
-// An operation composes its transition internally, so on a lost acknowledgement the caller
-// holds neither that transition nor its digest — and calling the operation again is NOT a
-// retry: it reloads the state, composes a different revision, and may be refused because what
-// it asks for already stands. The handle is what makes the ambiguity decidable, and it is
-// returned even when the send fails.
-func TestOperationsReturnTheEvidenceToResolveThemselves(t *testing.T) {
-	e, done := testNewEnv(t, "f105-op-evidence")
-	defer done()
-
-	jsa := &e.asm.jsa
-	e.bootstrap(t, "txn-1")
-	testPlantResource(t, e, "inc-src", mqttResourceSourceConsumer)
-	nonce := testAdmitOn(t, e, "txn-adm", 7, "inc-src")
-
-	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved)
-	if err != nil {
-		t.Fatalf("the advance was refused: %v", err)
-	}
-	if out.Handle == nil {
-		t.Fatalf("the operation returned no handle, so a lost acknowledgement has nothing to ask")
-	}
-	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
-		t.Fatalf("the committed operation's handle resolves %v, want LANDED", v)
-	}
-
-	// AND IT SURVIVES INTERVENING WRITES, which is the whole point: a caller that comes back
-	// after a restart is not asking whether the exchange still stands where it left it, but
-	// whether ITS attempt landed. An advance is authority-free: it installed no ownership, so
-	// nothing can supersede it, and a later advance leaves its answer LANDED (not SUPERSEDED,
-	// which is about an installed authority revision).
-	if _, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangeTerminal); err != nil {
-		t.Fatalf("the second advance was refused: %v", err)
-	}
-	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
-		t.Fatalf("after a later advance the handle resolves %v, want LANDED", v)
-	}
-
-	// A REFUSED operation still yields its handle, and the handle says the attempt never
-	// landed once it is settled — which is what a caller with an ambiguous send does.
-	bad, berr := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved)
-	if berr == nil {
-		t.Fatalf("an advance to a phase already passed was accepted")
-	}
-	if bad.Handle != nil {
-		if v := jsa.resolveTransitionHandle(bad.Handle); v != mqttTransitionUnresolved {
-			t.Fatalf("an unsent attempt's handle resolves %v, want UNRESOLVED", v)
-		}
-	}
-
-	// The metadata half returns its frozen attempt for the same reason, and a RETRY RESENDS
-	// THAT ATTEMPT: the slot is create-only, so a recomposed one would be a different
-	// commit racing the first.
-	i := testIntent(t, e, "evidence")
-	testPrepare(t, e, i)
-	f, _, merr := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: i.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	})
-	if merr != nil {
-		t.Fatalf("the metadata commit was refused: %v", merr)
-	}
-	if f == nil {
-		t.Fatalf("the metadata operation returned no attempt to retry with")
-	}
-	if _, rerr := jsa.commitMetadataAttempt(f); rerr == nil {
-		t.Fatalf("resending the frozen attempt committed a second time")
-	}
-	if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, f.Proposal); v != mqttMetadataCommitted {
-		t.Fatalf("the resent attempt's proposal resolves %v, want COMMITTED", v)
-	}
-}
-
-// TestMetadataCommitsOnlyForAStandingProposal is finding 5.
-//
-// Deriving the receipt proves an attempt is internally consistent; it says nothing about
-// whether the proposal was ever claimed. A caller could invent a creation proposal, supply
-// the standing session sequence and a replacement body at a generation of its choosing, and
-// commit over a LIVE session having reserved nothing — and a creation displaces nothing, so
-// the predecessor check does not reach it either.
-func TestMetadataCommitsOnlyForAStandingProposal(t *testing.T) {
-	e, done := testNewEnv(t, "f105-proposal-provenance")
-	defer done()
-
-	jsa := &e.asm.jsa
-	auth, _ := e.bootstrap(t, "txn-1")
-
-	// AN UNCLAIMED CREATION over a serving authority is refused.
-	invented := testCreationPropAt(t, "invented", mqttNewSessGen())
-	f := testFreezeProposal(t, e, invented, testRecordSeq(t, e))
-	if _, err := jsa.commitMetadataAttempt(f); err == nil {
-		t.Fatalf("a creation nobody reserved committed over a live session")
-	}
-	if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, invented); v != mqttMetadataUnresolved {
-		t.Fatalf("the refused commit left verdict %v behind", v)
-	}
-	if al := jsa.loadOutboundAuthority(e.id, e.epoch); al.rec.Gen != auth.Gen {
-		t.Fatalf("the refused commit moved the authority to %q", al.rec.Gen)
-	}
-
-	// A HANDOFF WHOSE PREPARATION DOES NOT STAND is refused the same way, even though its
-	// receipt and its batch agree perfectly.
-	i := testIntent(t, e, "unprepared")
-	unprepared := testFreezeAttempt(t, e, i, testRecordSeq(t, e))
-	if _, err := jsa.commitMetadataAttempt(unprepared); err == nil {
-		t.Fatalf("a handoff nobody prepared committed")
-	}
-
-	// And the operation refuses to compose one at all, which is the earlier and better
-	// refusal: it reads the proposal from the authority rather than from its caller.
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: "intent-nobody", SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err == nil {
-		t.Fatalf("the metadata operation composed a commit for a proposal nothing carries")
-	}
-
-	testPrepare(t, e, i)
-
-	// WITH A PROPOSAL STANDING, naming ANOTHER one is still refused — and this is the case
-	// that discriminates: the authority now carries a proposal, so an operation that took
-	// the identity from its caller would compose the standing proposal's commit under the
-	// caller's name and report success for a commit it never asked for.
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: "intent-somebody-else", SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err == nil {
-		t.Fatalf("the metadata operation committed the STANDING proposal for a caller that "+
-			"named %q", "intent-somebody-else")
-	}
-	if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataUnresolved {
-		t.Fatalf("the misnamed request committed the standing proposal anyway (verdict %v)", v)
-	}
-
-	// The correctly named one commits, so every refusal above is the provenance and not the
-	// fixture.
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: i.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the standing handoff's metadata half was refused: %v", err)
-	}
-}
-
 // TestResourcesAreProvisionedThroughTheSurface is finding 6.
 //
 // An admission may only depend on a resource that EXISTS, and nothing in the surface created
@@ -462,25 +270,7 @@ func TestAResumeIsNotTheSameOwnership(t *testing.T) {
 	capturedGen, capturedTenure, capturedOwner := first.Gen, first.Tenure, first.OwnerTxn
 
 	// A RESUMING handoff: the same generation, a new tenure, and no retirement.
-	ps, seq := testStandingSession(t, e)
-	resume := &mqttHandoffIntent{
-		ID: "intent-resume", PrevGen: first.Gen, PrevTenure: first.Tenure,
-		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: first.Gen, Tenure: "tenure-resumed", CleanReq: false,
-	}
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-resume", resume); err != nil {
-		t.Fatalf("preparing the resume was refused: %v", err)
-	}
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: resume.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the resume's metadata half was refused: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin-resume", resume.ID); err != nil {
-		t.Fatalf("finalizing the resume was refused: %v", err)
-	}
+	e.accept(t, "txn-resume", first.Gen, "tenure-resumed", false, mqttClosingTargets{})
 	al := jsa.loadOutboundAuthority(e.id, e.epoch)
 	if al.status != mqttOutboundValid || al.rec.Gen != capturedGen ||
 		al.rec.Tenure == capturedTenure {
@@ -489,7 +279,7 @@ func TestAResumeIsNotTheSameOwnership(t *testing.T) {
 
 	// THE DELAYED CLOSURE NAMES THE OLD TENURE, and the generation it names is still the one
 	// standing. It must still be refused.
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close-late",
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch,
 		capturedGen, capturedTenure, capturedOwner); err == nil {
 		t.Fatalf("a closure captured under tenure %q ended the generation a LATER tenure is "+
 			"serving: a resume preserves the generation, so the generation alone does not "+
@@ -501,7 +291,7 @@ func TestAResumeIsNotTheSameOwnership(t *testing.T) {
 
 	// The closure naming the STANDING ownership is accepted, so the refusal is the tenure
 	// and not the fixture.
-	if _, err := jsa.opCloseGeneration(e.id, e.epoch, "txn-close-now",
+	if _, err := testCloseGenerationOp(e.asm, e.id, e.epoch,
 		al.rec.Gen, al.rec.Tenure, al.rec.OwnerTxn); err != nil {
 		t.Fatalf("closing the standing ownership was refused: %v", err)
 	}
@@ -640,62 +430,6 @@ func TestActionMembersAreCheckedAgainstTheirExchange(t *testing.T) {
 	late.AcqTxn = "txn-late"
 	if err := hand("txn-late", late); err == nil {
 		t.Fatalf("an action was written for an exchange the client refused")
-	}
-}
-
-// TestMetadataProvenanceComparesTheWholeProposal is round 10's finding 3.
-//
-// Comparing the proposal's identity and what it PROPOSES leaves its PREDECESSOR uncovered, and
-// those fields are not decoration. A receipt naming a predecessor tenure or ownership the
-// standing intent does not carry passes the session-record check — that one compares the write
-// identity and the generation — takes the permanent COMMITTED slot, and is then read as
-// FOREIGN by every later resolution, because a receipt answers a proposal only if it answers
-// all of it. Neither finalization nor cancellation could then proceed.
-func TestMetadataProvenanceComparesTheWholeProposal(t *testing.T) {
-	e, done := testNewEnv(t, "f105-provenance-whole")
-	defer done()
-
-	jsa := &e.asm.jsa
-	i := testIntent(t, e, "whole")
-	testPrepare(t, e, i)
-
-	for name, mutate := range map[string]func(*mqttHandoffIntent){
-		"another predecessor tenure":   func(m *mqttHandoffIntent) { m.PrevTenure = "tenure-invented" },
-		"another predecessor owner":    func(m *mqttHandoffIntent) { m.PrevOwnerTxn = "txn-invented" },
-		"another predecessor sequence": func(m *mqttHandoffIntent) { m.PrevSessSeq = m.PrevSessSeq - 1 },
-	} {
-		m := *i
-		retire := *i.Retire
-		m.Retire = &retire
-		mutate(&m)
-		m.Retire.Tenure, m.Retire.OwnerTxn = m.PrevTenure, m.PrevOwnerTxn
-		m.Retire.SessSeq = m.PrevSessSeq
-		// The substitution is COHERENT: the attempt's receipt is derived from the mutated
-		// proposal, so nothing internal to it disagrees. Only the standing intent does.
-		f, ferr := testTryFreeze(t, e, &m, m.PrevSessSeq)
-		if ferr != nil {
-			t.Fatalf("freezing the %s attempt failed: %v", name, ferr)
-		}
-		if _, cerr := jsa.commitMetadataAttempt(f); cerr == nil {
-			t.Fatalf("a metadata half naming %s committed for a standing proposal that names "+
-				"something else", name)
-		}
-		if v := jsa.resolveMetadataAttempt(_EMPTY_, e.id, e.epoch, testProp(t, i)); v != mqttMetadataUnresolved {
-			t.Fatalf("the refused %s attempt left verdict %v on the standing proposal", name, v)
-		}
-	}
-
-	// The unmutated attempt commits and the standing proposal can then be finalized, which
-	// is the state the substitutions would have made unreachable.
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: i.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the standing proposal's metadata half was refused: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin", i.ID); err != nil {
-		t.Fatalf("finalizing the committed proposal was refused: %v", err)
 	}
 }
 
@@ -930,67 +664,6 @@ func TestCreatedResourcesOweNothing(t *testing.T) {
 	_ = auth
 }
 
-// TestAClosedGenerationIsNeverClaimedAgain is round 11's finding 4.
-//
-// The kind rules compare a claim with its IMMEDIATE predecessor, and a permanent closure
-// outlives every predecessor it had. So after G1 was closed, G2 served and G2 closed, nothing
-// stopped a claim reserving G1 again with fresh transition and proposal identities: its
-// metadata half commits, its finalization installs SERVING at G1, and new work enters a
-// generation whose permanent closure says it admits none — after which the next closure fails
-// outright, because that slot is already taken.
-func TestAClosedGenerationIsNeverClaimedAgain(t *testing.T) {
-	e, done := testNewEnv(t, "f105-generation-reuse")
-	defer done()
-
-	jsa := &e.asm.jsa
-	g1, g1Seq := e.bootstrap(t, "txn-1")
-
-	closing := testClosure(e, g1, g1Seq, "txn-close-g1")
-	closeSeq, cerr := jsa.commitAuthorityTransition(closing)
-	if cerr != nil {
-		t.Fatalf("closing G1 was refused: %v", cerr)
-	}
-	g2, g2Seq := e.claim(t, closing.Auth, closeSeq, "txn-g2", testGen2, "tenure-g2")
-	closing2 := testClosure(e, g2, g2Seq, "txn-close-g2")
-	if _, err := jsa.commitAuthorityTransition(closing2); err != nil {
-		t.Fatalf("closing G2 was refused: %v", err)
-	}
-
-	// THE HISTORICAL GENERATION IS STILL CLOSED. Its immediate predecessor is now G2's
-	// closure, so nothing local to the claim notices.
-	if _, err := jsa.opClaimClient(e.id, e.epoch, "txn-again", g1.Gen,
-		"tenure-again", "intent-again"); err == nil {
-		t.Fatalf("a claim reserved generation %q, which was permanently closed two "+
-			"generations ago", g1.Gen)
-	}
-	if al := jsa.loadOutboundAuthority(e.id, e.epoch); al.rec.State != mqttAuthorityClosed {
-		t.Fatalf("the refused claim moved the authority to state %d", al.rec.State)
-	}
-
-	// A genuinely fresh generation is claimable, so the refusal is the history and not the
-	// closed predecessor.
-	fresh, _ := e.claim(t, closing2.Auth, 0, "txn-g3", mqttNewSessGen(), "tenure-g3")
-	if fresh.State != mqttAuthorityServing {
-		t.Fatalf("a fresh generation could not be claimed after two closures")
-	}
-
-	// AND A CLEAN START MAY NOT PROPOSE ONE EITHER: a preparation names the generation it
-	// will install, and that is a claim on it.
-	ps, seq := testStandingSession(t, e)
-	reuse := &mqttHandoffIntent{
-		ID: "intent-reuse", PrevGen: fresh.Gen, PrevTenure: fresh.Tenure,
-		PrevOwnerTxn: fresh.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: g1.Gen, Tenure: "tenure-reuse", CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: fresh.Gen, Tenure: fresh.Tenure, OwnerTxn: fresh.OwnerTxn,
-			SessWID: ps.WID, SessSeq: seq, Reason: mqttRetireCleanStart, Discard: true,
-		},
-	}
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-reuse", reuse); err == nil {
-		t.Fatalf("a clean start proposed the permanently closed generation %q", g1.Gen)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Review round 12
 // ---------------------------------------------------------------------------
@@ -1103,25 +776,7 @@ func TestAnActionIsAttributedToWhatAcquiredIt(t *testing.T) {
 	displaced := first.Tenure
 
 	// A RESUME: the same generation, a new tenure.
-	ps, seq := testStandingSession(t, e)
-	resume := &mqttHandoffIntent{
-		ID: "intent-resume", PrevGen: first.Gen, PrevTenure: first.Tenure,
-		PrevOwnerTxn: first.OwnerTxn, PrevSessWID: ps.WID, PrevSessSeq: seq,
-		Gen: first.Gen, Tenure: "tenure-resumed", CleanReq: false,
-	}
-	if _, err := jsa.opPrepareHandoff(e.id, e.epoch, "txn-prep-resume", resume); err != nil {
-		t.Fatalf("preparing the resume was refused: %v", err)
-	}
-	if _, _, err := jsa.opCommitMetadata(&mqttCommitMetadataRequest{
-		ID: e.id, Epoch: e.epoch, IntentID: resume.ID, SessWID: mqttNewSessGen(),
-		Record:   &mqttPersistedSession{Origin: "o"},
-		AcceptID: mqttNewAcceptID(), AcceptAt: time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("the resume's metadata half was refused: %v", err)
-	}
-	if _, err := jsa.opFinalizeHandoff(e.id, e.epoch, "txn-fin-resume", resume.ID); err != nil {
-		t.Fatalf("finalizing the resume was refused: %v", err)
-	}
+	e.accept(t, "txn-resume", first.Gen, "tenure-resumed", false, mqttClosingTargets{})
 
 	hand := func(txn string, acq uint64, mutate func(*mqttOutboundAction)) error {
 		cur := jsa.loadOutboundAuthority(e.id, e.epoch)

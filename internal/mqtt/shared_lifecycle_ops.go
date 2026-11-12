@@ -52,31 +52,28 @@ func (sess *mqttSession) sharedEpoch() string {
 	return sess.asm.sessStreamEpoch
 }
 
-// mintAcceptanceTenure fixes this CONNECT's ONE tenure once its acceptance is finalized
-// (issue #107 8b): the ID is the authority tenure the acceptance was finalized under, and the order
-// is the stream sequence of the acceptance's own create-only fact, READ BACK by the subject
-// the adopted batch committed. Not the session record's sequence: that slot advances with every
-// later save, so after a lost response nothing could say which of its sequences was THIS
-// acceptance's, while the fact's is fixed at write and a later acceptance's lands higher.
-// Immutable for the attempt; every join and fence this connection composes names exactly
-// this. Any readback other than the landed fact refuses: a tenure with no order cannot be
-// installed under the non-regression rule.
-func (sess *mqttSession) mintAcceptanceTenure(jsa *mqttJSA, authTenure string) error {
-	sess.mu.Lock()
-	ref := sess.acceptFact
-	sess.mu.Unlock()
-	if ref.Subj == _EMPTY_ {
-		return fmt.Errorf("session %q adopted no acceptance fact, so its tenure has no order", sess.id)
+// mintAcceptanceTenure fixes this CONNECT's ONE tenure once its acceptance landed (issue #107
+// 8b): the ID is the authority tenure the acceptance installed, and the order is the
+// acceptance's ordinal in its lifecycle (issue #133), read back from the authority by this
+// acceptance's own nonce. The ordinal is fixed at the acceptance and every later acceptance of
+// the lifecycle takes a higher one, so a delayed acceptance learns at the ledger that it was
+// superseded. An authority that does not name this acceptance as its current one refuses: a
+// tenure with no order cannot be installed under the non-regression rule.
+func (sess *mqttSession) mintAcceptanceTenure(jsa *mqttJSA, authTenure, acceptNonce string) error {
+	if authTenure == _EMPTY_ || acceptNonce == _EMPTY_ {
+		return fmt.Errorf("session %q was accepted under no tenure or acceptance", sess.id)
 	}
-	if authTenure == _EMPTY_ {
-		return fmt.Errorf("session %q was finalized under no authority tenure", sess.id)
+	al := jsa.loadOutboundAuthority(sess.id, sess.sharedEpoch())
+	if al.status != mqttOutboundValid || al.rec == nil || al.rec.Life == nil {
+		return fmt.Errorf("session %q: its authority reads %v, so its tenure has no order", sess.id, al.status)
 	}
-	seq, rb := jsa.readAcceptFactSeq(ref.Subj, ref.Digest)
-	if rb != mqttAcceptFactLanded || seq == 0 {
-		return fmt.Errorf("session %q: its acceptance fact %q reads %v, so its tenure has no order", sess.id, ref.Subj, rb)
+	acc := al.rec.Life.Accept
+	if acc.Nonce != acceptNonce || acc.Tenure != authTenure {
+		return fmt.Errorf("session %q: its acceptance %q is no longer the lifecycle's current one, so its tenure has no order",
+			sess.id, acceptNonce)
 	}
 	sess.mu.Lock()
-	sess.sharedTenure = mqttSharedTenure{Seq: seq, ID: authTenure}
+	sess.sharedTenure = mqttSharedTenure{Seq: acc.Ord + 1, ID: authTenure}
 	sess.mu.Unlock()
 	return nil
 }
@@ -293,10 +290,13 @@ func (sess *mqttSession) acquireShared(c *client, group, subject string, maxAckP
 				return mqttSharedAcquisition{Inc: entry.Inc, Acq: acq}, mqttSharedAcquired, nil
 			}
 		case mqttOutboundAbsent:
-			// This CONNECT installed its tenure before it activated, and a ledger is never
-			// deleted within the recovery epoch: an absent ledger contradicts that, and a join
-			// never creates one. Nothing was composed, so nothing needs a fence.
-			return mqttSharedAcquisition{}, mqttSharedAcquireFailed, errMQTTSharedJoinWithoutLedger
+			// THE GENERATION'S FIRST ACQUISITION (issue #133, shared_ledger_fence.go): the ledger is
+			// created by an installation under this tenure, fenced by the authority, and the join
+			// is then composed against it as every join is. A join itself never creates one.
+			if _, ierr := jsa.installSharedTenure(id, epoch, gen, tenure); ierr != nil {
+				return mqttSharedAcquisition{}, mqttSharedAcquireFailed, ierr
+			}
+			continue
 		default:
 			// Unreadable: unresolved. Re-attempt after the read settles.
 			continue
@@ -447,6 +447,9 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 					return false, cerr
 				}
 				mqttTestSharedPause("release:before-close:" + acq.Acq)
+				if !cw.admits() {
+					return false, errMQTTSharedNotAdmitted
+				}
 				if res := jsa.commitSharedLifecycleBatch(b); res.Outcome != mqttSharedWriteLanded {
 					lastErr = res.Err
 					switch cw.absorb(res, mqttSharedReleaseAttemptUnits) {
@@ -464,7 +467,7 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 			// valid discarding closure — absent, preserving, unreadable — takes the fence.
 			if jsa.requireDiscardingClosure(id, epoch, gen) != nil {
 				// STEP 2, then STEP 3.
-				if ferr := jsa.fenceSharedRelease(id, epoch, gen); ferr != nil {
+				if ferr := jsa.fenceSharedRelease(id, epoch, gen, cw.admits); ferr != nil {
 					return false, ferr
 				}
 				mqttTestSharedPause("release:after-fence:" + acq.Acq)
@@ -488,6 +491,9 @@ func (jsa *mqttJSA) executeSharedRelease(epoch, id, gen string, acq mqttSharedAc
 			return false, cerr
 		}
 		mqttTestSharedPause("release:before-send:" + acq.Acq)
+		if !cw.admits() {
+			return false, errMQTTSharedNotAdmitted
+		}
 		res := jsa.commitSharedLifecycleBatch(b)
 		switch res.Outcome {
 		case mqttSharedWriteLanded:
@@ -656,6 +662,15 @@ func (jsa *mqttJSA) sealSharedLedger(id, epoch, gen string, cw *mqttSharedConten
 			lastErr = fmt.Errorf("the ledger of generation %q reads %v", gen, l.status)
 			continue
 		}
+		if l.status == mqttOutboundAbsent {
+			// NOTHING TO SEAL for a generation that never acquired (issue #133): no ledger can
+			// appear once the authority stopped serving it. One that acquired and has none is
+			// an inconsistency, never sealed over.
+			if acquired, aerr := jsa.generationAcquired(id, epoch, gen); aerr != nil || acquired {
+				return nil, fmt.Errorf("the shared ledger of generation %q is absent and it acquired (%v)", gen, aerr)
+			}
+			return nil, nil
+		}
 		b, cerr := mqttComposeSharedSeal(epoch, id, gen, l)
 		if cerr != nil {
 			return nil, cerr
@@ -664,6 +679,9 @@ func (jsa *mqttJSA) sealSharedLedger(id, epoch, gen string, cw *mqttSharedConten
 			return l.rec, nil
 		}
 		mqttTestSharedPause("seal:before-send")
+		if !cw.admits() {
+			return nil, errMQTTSharedNotAdmitted
+		}
 		res := jsa.commitSharedLifecycleBatch(b)
 		if res.Outcome == mqttSharedWriteLanded {
 			return b.LedgerNext, nil
@@ -707,7 +725,11 @@ func (jsa *mqttJSA) sharedClosingComplete(id, epoch, gen string) error {
 	switch l.status {
 	case mqttOutboundValid:
 	case mqttOutboundAbsent:
-		return fmt.Errorf("the shared acquisition ledger of generation %q is absent after its seal was written", gen)
+		// A GENERATION THAT NEVER ACQUIRED HAS NO LEDGER, and its closing is complete (issue #133).
+		if acquired, aerr := jsa.generationAcquired(id, epoch, gen); aerr != nil || acquired {
+			return fmt.Errorf("the shared acquisition ledger of generation %q is absent and it acquired (%v)", gen, aerr)
+		}
+		return nil
 	default:
 		return fmt.Errorf("the shared acquisition ledger of generation %q reads %v, which licenses no release", gen, l.status)
 	}
@@ -722,7 +744,7 @@ func (jsa *mqttJSA) sharedClosingComplete(id, epoch, gen string) error {
 }
 
 // closeSharedGeneration runs T2, T3 and T4 for one retiring generation, on both teardown
-// routes. It is called between recordGenRetirement and deleteTeardownTargets, naming the
+// routes. It is called after the claim and before deleteTeardownTargets, naming the
 // RETIRING generation captured before any reset. An error withholds the record's release
 // with the record still marked, so the adoption repeats it.
 //
@@ -856,9 +878,18 @@ func (sess *mqttSession) installAndReconcileTenure(c *client, tok recordTx) erro
 	if tenure.isZero() {
 		return fmt.Errorf("accepting session %q: its tenure was not minted", id)
 	}
-	led, err := sess.jsa.installSharedTenure(id, epoch, gen, tenure)
-	if err != nil {
-		return fmt.Errorf("accepting session %q: installing its shared tenure: %w", id, err)
+	// A GENERATION THAT NEVER ACQUIRED HAS NO LEDGER (issue #133): there is no tenure to project,
+	// and its first acquisition installs this one. A ledger that stands takes this tenure now.
+	var led *mqttSharedLedger
+	switch l := sess.jsa.loadSharedLedger(id, epoch, gen); l.status {
+	case mqttOutboundAbsent:
+	case mqttOutboundValid:
+		var err error
+		if led, err = sess.jsa.installSharedTenure(id, epoch, gen, tenure); err != nil {
+			return fmt.Errorf("accepting session %q: installing its shared tenure: %w", id, err)
+		}
+	default:
+		return fmt.Errorf("accepting session %q: its shared acquisition ledger reads %v", id, l.status)
 	}
 	mqttTestSharedPause("resume:after-install")
 
@@ -894,7 +925,7 @@ func (sess *mqttSession) installAndReconcileTenure(c *client, tok recordTx) erro
 		}
 	}
 	for _, a := range committed {
-		if _, listed := led.lists(a.Acq); !listed {
+		if listed := led != nil && func() bool { _, ok := led.lists(a.Acq); return ok }(); !listed {
 			return fmt.Errorf("accepting session %q: its record holds shared acquisition %q on group %q, which the "+
 				"generation's ledger does not list; a membership without an acquisition behind it is a shape this "+
 				"broker never writes", id, a.Acq, a.Group)

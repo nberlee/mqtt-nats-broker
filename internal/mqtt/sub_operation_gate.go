@@ -512,13 +512,10 @@ func (c *client) mqttConsumeWillUnderGate(asm *mqttAccountSessionManager, sess *
 	sessGen := sess.gen
 	originSessionSeq := sess.seq
 	sess.mu.Unlock()
-	// The acknowledged record sequence is a sufficient baseline: the accepted-CONNECT
-	// atomic batch stages {acceptance fact, session record} in that order and commits them
-	// together, so this connection's OWN acceptance fact sorts strictly below the record
-	// sequence and cannot suppress the Will it is owed. Suppression reads acceptance facts
-	// only (mqttAcceptFactQualifies / scanAcceptFacts) and no session record, so an
-	// ordinary disconnect save — which creates no fact — cannot move this baseline against
-	// us either.
+	// The acknowledged record sequence is a sufficient baseline: suppression reads the Will
+	// anchor's minAt (decideFromAnchor), which only a LATER acceptance lowers, so this
+	// connection's own acceptance cannot suppress the Will it is owed, and an ordinary
+	// disconnect save, which accepts nothing, cannot move it either (issue #133).
 	// nil expiry: read from the CONNECTION, under the same lock that consumes the Will. The
 	// interval is connection-owned and stays mutable through an MQTT 5 DISCONNECT override,
 	// so a value sampled here could be stale by the time the Will is claimed — and it

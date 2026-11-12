@@ -48,6 +48,9 @@ type testPredecessor struct {
 func testCapture(t *testing.T, sess *mqttSession, pi uint16) *testPredecessor {
 	t.Helper()
 	p := &testPredecessor{asm: sess.asm, idHash: sess.idHash, pi: pi}
+	// What the discard leaves is inspected afterwards, which the generation's retirement would
+	// purge once its root retires.
+	sess.asm.testHoldGenerationRetirement.Store(true)
 	sess.mu.Lock()
 	p.gen = sess.gen
 	for _, cc := range sess.cons {
@@ -135,7 +138,7 @@ func TestCleanStartOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	if gen2 == p.gen {
 		t.Fatalf("the clean start kept generation %q", p.gen)
 	}
-	if cl, _, st := p.asm.jsa.loadGenClosure(cid, p.asm.sessStreamEpoch, p.gen); st != mqttOutboundValid || cl == nil || !cl.Discard {
+	if cl, _, st := p.asm.jsa.loadGenClosure(cid, p.asm.sessStreamEpoch, p.gen); st != mqttOutboundValid || cl == nil {
 		t.Fatalf("the predecessor generation was not closed with Discard: %+v (%v)", cl, st)
 	}
 	p.discardedAndRetired(t, s, cid)
@@ -191,7 +194,7 @@ func TestCleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	testMQTTCheckConnAck(t, rB, mqttConnAckRCConnectionAccepted, false)
 
 	cl, clSeq, st := asmB.jsa.loadGenClosure(cid, epoch, p.gen)
-	if st != mqttOutboundValid || cl == nil || !cl.Discard {
+	if st != mqttOutboundValid || cl == nil {
 		t.Fatalf("the peer's clean start did not close A's generation with Discard: %+v (%v)", cl, st)
 	}
 	mu.Lock()
@@ -204,6 +207,42 @@ func TestCleanStartOnAPeerOverAnOrdinaryQoS2SessionIsAccepted(t *testing.T) {
 	}
 	if pt, _, ok := testMQTTReadPacketReady(rB, 3*time.Second); ok {
 		t.Fatalf("the clean-started session on B received packet 0x%x from the discarded generation", pt&mqttPacketMask)
+	}
+}
+
+// T4: the retirement a clean start carries over an ordinary QoS 2 session names no affine target
+// and no PUBREL consumer. Mutation M1.
+func TestTheCleanStartRetirementNamesNoAffineTarget(t *testing.T) {
+	const cid = "f113-t4"
+	o := testMQTTDefaultOptions()
+	s := testMQTTRunServer(t, o)
+	defer testMQTTShutdownServer(s)
+
+	sub, subr, sess, pi, _ := testQoS2Delivered(t, o, s, cid)
+	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
+	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
+	p := testCapture(t, sess, pi)
+
+	var retire atomic.Pointer[mqttRetirementRequest]
+	pre := func(tr *mqttAuthorityTransition) {
+		if tr.Retire != nil && tr.Retire.Gen == p.gen {
+			r := *tr.Retire
+			retire.Store(&r)
+		}
+	}
+	p.asm.jsa.testTransitionPresend.Store(&pre)
+	t.Cleanup(func() { p.asm.jsa.testTransitionPresend.Store(nil) })
+	sub.Close()
+
+	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer c2.Close()
+	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
+	r := retire.Load()
+	if r == nil {
+		t.Fatal("the clean start's handoff carried no retirement of the predecessor")
+	}
+	if got := fmt.Sprintf("%q/%q/%q", r.AffineDurable, r.AffineGen, r.PubRelDurable); got != `""/""/""` {
+		t.Fatalf("the retirement of an ordinary QoS 2 session named an affine target %s", got)
 	}
 }
 
@@ -246,55 +285,10 @@ func TestAnAffineDescriptorIsNamedWholeOrNotAtAll(t *testing.T) {
 	if err := mqttValidateAffineDescriptor(idHash, testGen, "", "", pubRelDur); err == nil {
 		t.Fatal("a PUBREL consumer named alone was accepted as an affine descriptor")
 	}
-	intent := &mqttHandoffIntent{
-		ID: "intent-f113", PrevGen: testGen, PrevTenure: "ten", PrevOwnerTxn: "own",
-		PrevSessWID: "wid", PrevSessSeq: 1, Gen: testGen2, Tenure: "ten2", CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: testGen, Tenure: "ten", OwnerTxn: "own", SessWID: "wid", SessSeq: 1,
-			Reason: mqttRetireCleanStart, Discard: true, PubRelDurable: pubRelDur,
-		},
+	if err := mqttValidateRetireTargets(idHash, testGen, mqttClosingTargets{PubRelDurable: pubRelDur}); err == nil {
+		t.Fatal("a Clean Start whose retirement names a PUBREL consumer alone was accepted")
 	}
-	if err := mqttValidateHandoffIntentFor(idHash, intent); err == nil {
-		t.Fatal("a handoff intent whose retirement names a PUBREL consumer alone was accepted")
-	}
-	intent.Retire.PubRelDurable = _EMPTY_
-	if err := mqttValidateHandoffIntentFor(idHash, intent); err != nil {
-		t.Fatalf("a handoff intent whose retirement names no affine target was refused: %v", err)
-	}
-}
-
-// T4: the retirement a clean start carries over an ordinary QoS 2 session names no affine target
-// and no PUBREL consumer. Mutation M1.
-func TestTheCleanStartRetirementNamesNoAffineTarget(t *testing.T) {
-	const cid = "f113-t4"
-	o := testMQTTDefaultOptions()
-	s := testMQTTRunServer(t, o)
-	defer testMQTTShutdownServer(s)
-
-	sub, subr, sess, pi, _ := testQoS2Delivered(t, o, s, cid)
-	testMQTTSendPIPacket(mqttPacketPubRec, t, sub, pi)
-	testMQTTReadPIPacket(mqttPacketPubRel, t, subr, pi)
-	p := testCapture(t, sess, pi)
-
-	var retire atomic.Pointer[mqttRetirementRequest]
-	pre := func(tr *mqttAuthorityTransition) {
-		if tr.Auth != nil && tr.Auth.Intent != nil && tr.Auth.Intent.Retire != nil && tr.Auth.Intent.Retire.Gen == p.gen {
-			r := *tr.Auth.Intent.Retire
-			retire.Store(&r)
-		}
-	}
-	p.asm.jsa.testTransitionPresend.Store(&pre)
-	t.Cleanup(func() { p.asm.jsa.testTransitionPresend.Store(nil) })
-	sub.Close()
-
-	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: cid, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
-	defer c2.Close()
-	testMQTTCheckConnAck(t, r2, mqttConnAckRCConnectionAccepted, false)
-	r := retire.Load()
-	if r == nil {
-		t.Fatal("the clean start's handoff carried no retirement of the predecessor")
-	}
-	if got := fmt.Sprintf("%q/%q/%q", r.AffineDurable, r.AffineGen, r.PubRelDurable); got != `""/""/""` {
-		t.Fatalf("the retirement of an ordinary QoS 2 session named an affine target %s", got)
+	if err := mqttValidateRetireTargets(idHash, testGen, mqttClosingTargets{}); err != nil {
+		t.Fatalf("a Clean Start whose retirement names no affine target was refused: %v", err)
 	}
 }

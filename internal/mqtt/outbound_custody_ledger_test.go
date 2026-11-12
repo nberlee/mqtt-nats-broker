@@ -1103,7 +1103,10 @@ func TestCustodyLedgerIsEncapsulated(t *testing.T) {
 				case *ast.AssignStmt:
 					for _, lhs := range x.Lhs {
 						if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "custody" &&
-							!custodyWriters[fd.Name.Name] && fd.Name.Name != "setIncarnationLocked" {
+							!custodyWriters[fd.Name.Name] && fd.Name.Name != "setIncarnationLocked" &&
+							// setIncarnationLocked's generation-derivation half, split out so an
+							// acceptance adopts the generation its authority installed (issue #133).
+							fd.Name.Name != "deriveGenerationLocked" {
 							t.Errorf("%s:%d: %s assigns %s.custody", name, fset.Position(x.Pos()).Line,
 								fd.Name.Name, mqttTestExprString(sel.X))
 						}

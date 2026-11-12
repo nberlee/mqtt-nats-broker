@@ -15,7 +15,7 @@ import (
 // the session gate, a clean-session discard and two JetStream round trips. So a Will
 // consumed late fired late — and, the sharper harm, the window in which a reconnect
 // can still suppress it was WIDER than the client configured. The suppression
-// predicate itself was never wrong: mqttAcceptFactQualifies rejects an acceptance
+// predicate itself was never wrong: decideFromAnchor ignores an acceptance
 // dated at or after FireAt, and its own comment states the rule ("a reconnect after
 // the delay has elapsed does not [suppress], because the Will was already owed").
 // Its INPUT was wrong.

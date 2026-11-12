@@ -82,6 +82,9 @@ func testDiscardTearDownOpts(t *testing.T, id string, qos byte, pubrec bool, bef
 
 	sess := testMQTTResidentSession(t, s, id)
 	f := &testDiscardFix{s: s, asm: sess.asm, id: id}
+	// The tests read what the discard left (the RETIRED names, the CleanupComplete resources),
+	// which the generation's retirement would purge once its root retires.
+	sess.asm.testHoldGenerationRetirement.Store(true)
 	sess.mu.Lock()
 	for _, cc := range sess.cons {
 		f.src = cc.Durable

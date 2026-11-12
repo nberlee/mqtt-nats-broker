@@ -11,34 +11,25 @@ import "fmt"
 // durably owned, none of that is the successor's to do. The clean close releases the
 // client-ID gate at exactly that point (destroyReleasing), and its successor lands here.
 //
-// DURABLY OWNED is five facts, each read, none inferred:
+// DURABLY OWNED is four facts, each read, none inferred:
 //
 //  1. the record names only this session's resources (mqttValidateTeardownTargets), so
 //     nothing a later owner deletes on its strength is another session's;
-//  2. the teardown receipt committed with the marker stands, so the discard was AUTHORIZED
-//     against the exact ownership being retired;
-//  3. the retirement watermark names this generation at or past the marker's sequence, so
-//     the inbound QoS 2 release classifier refuses its releases and the orphan sweep is
-//     licensed (qos2_retire_classify.go, orphan_retire_proof.go);
-//  4. the generation's permanent closure stands with Discard, so its recovery executor owns
-//     its consumers, its exchanges and its shared closing, the orphan sweep is licensed even
-//     after the watermark slot moves on, and no authority can be minted at it again
-//     (checkProposedGenerationIsFresh). Read from the closure subject rather than inferred
-//     from the per-client authority, because fact 5 is VACUOUS for a generation with neither
-//     ledger nor closure and so cannot stand in for it;
-//  5. the release gate both teardown routes apply before releasing a record authorizes it:
+//  2. the authority carries the marker's generation as outstanding with this marker's release
+//     still pending (issue #133, plan 5.1 shape 4): the claim batch committed that entry and its
+//     discarding closure with the marker, so the discard was authorized
+//     against the exact ownership retired, and the displacement discharges exactly that release;
+//  3. the generation's closure stands (every closure discards), so its recovery executor owns its
+//     consumers, its exchanges and its shared closing;
+//  4. the release gate both teardown routes apply before releasing a record authorizes it:
 //     the closure is sealed and its surviving work enrolled or certified.
 //
-// The closure and its Discard member are create-only and immutable, the receipt is
-// create-only, and the release gate's facts are about a closed generation, so none of the
-// five can regress before the successor's write lands. What ARBITRATES the displacement is
-// that write: the accept batch's record CAS at the marker's exact sequence, the authority's
-// reservation CAS and the permanent metadata slot. A continuation that released the record
-// first makes the CAS fail and the CONNECT re-drives into a record-absent create; a
-// continuation that releases after it reads a different generation and leaves it alone
-// (condemnRetiredSurvivor).
+// What ARBITRATES the displacement is the acceptance's own batch: the authority CAS that
+// discharges the pending release, and the record CAS at the marker's exact sequence. A
+// continuation that released the record first makes the record CAS fail and the CONNECT
+// re-drives; one that releases after it reads the release discharged as displaced.
 //
-// Anything short of all five, or any read that cannot be decided, keeps the inline adoption.
+// Anything short of all four, or any read that cannot be decided, keeps the inline adoption.
 
 // mqttMarkedRecordArm is which way a CONNECT went with a marked record.
 type mqttMarkedRecordArm int
@@ -56,10 +47,10 @@ type mqttMarkedRecordFacts struct {
 
 	targetsErr error // mqttValidateTeardownTargets
 
-	receipt mqttOutboundLoadStatus
-
-	watermark       *mqttGenRetirement
-	watermarkStatus mqttRetirementStatus
+	// auth is the client's authority; pendingEntry reports whether it carries this marker's
+	// generation as outstanding with the marker's release still pending.
+	auth         mqttOutboundLoadStatus
+	pendingEntry bool
 
 	releaseFacts    mqttAdoptedReleaseFacts
 	releaseFactsErr error // gatherAdoptedReleaseFacts
@@ -72,17 +63,14 @@ func mqttMarkedRecordDisplaceable(f mqttMarkedRecordFacts) (bool, string) {
 	switch {
 	case f.targetsErr != nil:
 		return false, fmt.Sprintf("the record names resources that are not this session's: %v", f.targetsErr)
-	case f.receipt != mqttOutboundValid:
-		return false, fmt.Sprintf("its teardown receipt reads %v", f.receipt)
-	case f.watermarkStatus != mqttRetirementValid || f.watermark == nil:
-		return false, fmt.Sprintf("its retirement watermark reads %v", f.watermarkStatus)
-	case f.watermark.Gen != f.gen || f.watermark.MarkerSeq < f.markerSeq:
-		return false, fmt.Sprintf("its retirement watermark names generation %q at %d, not %q at %d or later",
-			f.watermark.Gen, f.watermark.MarkerSeq, f.gen, f.markerSeq)
+	case f.auth != mqttOutboundValid:
+		return false, fmt.Sprintf("its authority reads %v", f.auth)
+	case !f.pendingEntry:
+		return false, "its authority carries no pending release of this marker"
 	case f.releaseFactsErr != nil:
 		return false, fmt.Sprintf("its release facts could not be read: %v", f.releaseFactsErr)
-	case f.releaseFacts.Closed == nil || !f.releaseFacts.Closed.Discard:
-		return false, "no discarding closure of its generation stands"
+	case f.releaseFacts.Closed == nil:
+		return false, "no closure of its generation stands"
 	case f.releaseErr != nil:
 		return false, fmt.Sprintf("the release gate refuses: %v", f.releaseErr)
 	}
@@ -99,12 +87,16 @@ func (as *mqttAccountSessionManager) markedRecordFacts(ps *mqttPersistedSession,
 	if f.targetsErr = mqttValidateTeardownTargets(ps, hash); f.targetsErr != nil {
 		return f
 	}
-	if _, _, f.receipt = as.jsa.loadTeardownReceipt(as.domainTk, hash, ps.Gen); f.receipt != mqttOutboundValid {
+	al := as.jsa.loadOutboundAuthority(ps.ID, as.sessStreamEpoch)
+	if f.auth = al.status; f.auth != mqttOutboundValid || al.rec == nil || al.rec.Life == nil {
 		return f
 	}
-	if f.watermark, _, f.watermarkStatus = as.jsa.loadGenRetirement(as.domainTk, hash); f.watermarkStatus != mqttRetirementValid {
+	if _, err := mqttDisplaceRelease(al.rec.Life.Outstanding, ps.Teardown.Nonce); err != nil ||
+		al.rec.State != mqttAuthorityClosed || al.rec.Life.Phase != mqttLifecycleServing ||
+		!mqttOutstandingNamesMarker(al.rec.Life, ps.Gen, ps.Teardown.Nonce) {
 		return f
 	}
+	f.pendingEntry = true
 	if f.releaseFacts, f.releaseFactsErr = as.gatherAdoptedReleaseFacts(ps.ID, as.sessStreamEpoch, ps.Gen); f.releaseFactsErr != nil {
 		return f
 	}

@@ -434,10 +434,9 @@ var mqttTestRecordTxWithdrawGuardHookV atomic.Pointer[func(sess *mqttSession)]
 // validateSessStream verifies a $MQTT_sess stream can carry session records.
 // Derived from what this owner does: a per-subject CAS store (sess.save),
 // loadLastMsgFor reads, filtered forward scans, and exact-sequence CONFIRMED
-// deletes (the teardown release, which session expiry also reaches through clear()). It
-// never purges, so DenyPurge is an audited NON-prerequisite here — a validator
-// that listed it would refuse legitimate deployments for a setting no operation
-// depends on.
+// deletes (the teardown release, which session expiry also reaches through clear()), and the
+// bounded filter purges that reclaim a retired generation and a retired lifecycle (issue #133),
+// so DenyPurge is a prerequisite.
 //
 // MaxConsumers IS a prerequisite now, and it was not before: this owner creates
 // a consumer. Every broker runs its own ephemeral session-record watch over this
@@ -475,25 +474,19 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 	cfg := si.Config
 	if err := validateBrokerOwnedStreamShape(&cfg, []string{
 		mqttSessStreamSubjectPrefix + domainTk + ">",
-		mqttAcceptSubjectPrefix + domainTk + ">",
-		mqttHandoffSubjectPrefix + domainTk + ">",
-		mqttTeardownReceiptSubjectPrefix + domainTk + ">",
 		mqttInflightStreamSubjectPrefix + ">",
 		mqttSharedLifecycleStreamSubjectPrefix + ">",
 	}, wantReplicas); err != nil {
 		return err
 	}
-	// Four operations this owner performs are atomic batches: an accepted CONNECT
-	// commits its record, its permanent acceptance fact and issue #107's handoff
-	// outcome together; a PUBLISH-phase in-flight register commits with its unsent
-	// marker (inflight_marker.go); every issue #107 authority transition commits
-	// its outcome with the authority; and a shared-group join commits the group
-	// record with the acquisition ledger (shared_lifecycle.go). Without the
-	// capability the server rejects the batch headers outright, which would fail
-	// every CONNECT — and, worse, a stream that merely LOOKED right would leave the
-	// split-acceptance interval the fact exists to remove. It is a prerequisite of
-	// operations this owner performs, so it belongs here rather than in the shared
-	// shape: no other broker-owned stream is written in a batch.
+	// Three operations this owner performs are atomic batches: every authority transition,
+	// including an accepted CONNECT and a teardown claim, which commit the session record with
+	// the authority (accept_shapes.go, teardown_claim.go); a PUBLISH-phase in-flight register
+	// with its unsent marker (inflight_marker.go); and a shared-group join, which commits the
+	// group record with the acquisition ledger (shared_lifecycle.go). Without the capability
+	// the server rejects the batch headers outright, which would fail every CONNECT. It is a
+	// prerequisite of operations this owner performs, so it belongs here rather than in the
+	// shared shape: no other broker-owned stream is written in a batch.
 	if !cfg.AllowAtomicPublish {
 		return fmt.Errorf("allow_atomic is not set: an accepted CONNECT, a PUBLISH-phase in-flight register, every outbound authority transition and a shared-group join are each committed in one atomic batch, which the stream would reject")
 	}
@@ -519,9 +512,9 @@ func validateSessStream(si *StreamInfo, domainTk string, wantReplicas int) error
 	if cfg.DenyDelete {
 		return fmt.Errorf("deny_delete is set: it blocks the teardown release, permanently locking the client ID out, and the exact-sequence delete every terminal in-flight path performs")
 	}
-	// DenyPurge is deliberately NOT a prerequisite: nothing purges this stream. The
-	// in-flight reap deletes at exact sequences (issue #38), and the shared-group
-	// records are never removed.
+	if cfg.DenyPurge {
+		return fmt.Errorf("deny_purge is set: it blocks the reclamation of every retired generation and lifecycle, whose records then accumulate for the life of the account")
+	}
 	if cfg.SubjectDeleteMarkerTTL != 0 {
 		return fmt.Errorf("subject_delete_marker_ttl is %v (want 0): a marker after the teardown delete would be read back as an unreadable record", cfg.SubjectDeleteMarkerTTL)
 	}

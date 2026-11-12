@@ -1,4 +1,4 @@
-// Classifying an inbound QoS 2 release against the generation-retirement watermark.
+// Classifying an inbound QoS 2 release against where its generation stands.
 //
 // The release claim decides the occupancy a discard ENUMERATED and competed for, and
 // issue #66's cutoff decides how much of a subject a purge was entitled to destroy. Neither
@@ -8,25 +8,17 @@
 // arriving afterwards fans an acknowledged payload out onward and answers the client
 // 0x00, for a session that no longer exists. That is issue #40's site 2.
 //
-// What makes a decision possible here is that the retirement watermark is written BEFORE
-// any teardown deletion (recordGenRetirement), and a write that cannot be confirmed
-// aborts the teardown with nothing deleted. So a teardown whose enumeration or cutoff
-// predates this hold necessarily recorded its watermark before this classification runs.
-// The watermark is durable evidence of an earlier session-record arbitration; it is not a
-// second arbitration of its own, and it does not replace either fence.
+// What makes a decision possible here is that a teardown makes its generation noncurrent in
+// the same batch that marks the record, before any deletion (teardown_claim.go), and a Clean
+// Start does so in its acceptance batch. So a teardown whose enumeration or cutoff predates
+// this hold necessarily made the generation noncurrent before this classification runs. The
+// authority is durable evidence of that arbitration; it is not a second arbitration of its
+// own, and it does not replace either fence.
 //
-// THE CLASSIFICATION IS TWO-DIMENSIONAL, and one dimension alone is wrong in a way that
-// cost issue #40 an attempt. Refusing on a bare generation MISMATCH is wrong because the
-// watermark is a single slot replaced by increasing MarkerSeq alone: retire G1, then
-// create and retire G2, and a broker still serving G1 reads "a different generation" and
-// fans out. Refusing only on a generation MATCH is wrong for the same slot reason from the
-// other side. So the release is refused iff the watermark is valid AND either it names
-// THIS incarnation, or its MarkerSeq proves the record subject advanced past the record
-// this broker is acknowledged for.
-//
-// MarkerSeq == sess.seq is unreachable for a bound session and has no arm: every sess.seq
-// adoption takes either a store response for this broker's own bytes or a digest-matched
-// readback, and a marked record is never restored into a bound session.
+// The release proceeds only while the authority SERVES this generation: State serving and Gen
+// equal, never Gen alone, because a closed authority keeps its last generation's name. HEAD
+// needed a second dimension (a later marker's sequence past our record) because its watermark
+// was one slot that lost earlier generations; the authority does not (issue #133, consult 10).
 //
 // THE IDENTITY TERM IS THE PACKET LEASE, and this is what issue #40's second attempt found
 // unproved. mqttParse acquires the packet's completion lease against c.mqtt.tracker — the
@@ -37,10 +29,9 @@
 // sess.c == nil can mint, and this lease is an undrained owner. The incarnation, and
 // therefore sess.gen and the hold subject derived from it, are stable here.
 //
-// The lease does NOT stabilize sess.seq — it pins the incarnation, not the sequence, and
+// The lease does NOT stabilize the record — it pins the incarnation, not the sequence, and
 // other admitted owners or local record writers can still advance it. That is why the
-// sample below takes the RECORD TRANSACTION: the fence is what makes sess.seq and
-// seqUncertain one observation rather than two reads that happen to be adjacent.
+// sample below takes the RECORD TRANSACTION, under which an unresolved write of ours refuses.
 //
 // Taking that fence here cannot deadlock against a local destruction, and the argument is
 // structural rather than incidental. The apparent cycle is that a PUBREL holds the release
@@ -51,14 +42,13 @@
 // runs, and a destroyer that closed the tracker first makes packet admission park or
 // refuse before the handler is entered at all.
 //
-// Where the watermark cannot be read or the session's own sequence is unresolved, the
+// Where the authority cannot be read or the session's own write is unresolved, the
 // release FAILS CLOSED — no PUBCOMP, the hold and the claim both retained. An unresolved
 // proof is not permission, and the surrounding PUBREL contract already suppresses PUBCOMP
 // for exactly that reason: MQTT 5 gives PUBCOMP no reason code for "the broker could not
 // decide".
 //
-// See docs/ARCHITECTURE.md, "The generation-retirement watermark", and
-// https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
+// See https://github.com/nberlee/mqtt-nats-broker/issues/131 issue #40.
 
 package mqtt
 
@@ -67,13 +57,12 @@ import (
 	"sync/atomic"
 )
 
-// mqttQoS2RetireVerdict is what the watermark says about this release.
+// mqttQoS2RetireVerdict is what the generation's standing says about this release.
 type mqttQoS2RetireVerdict int
 
 const (
-	// mqttQoS2RetireProceed: no valid watermark reaches this incarnation, so the
-	// release may deliver onward. Absent, and a valid watermark for another
-	// generation whose MarkerSeq does not exceed our own sequence, both land here.
+	// mqttQoS2RetireProceed: the authority serves this incarnation's generation, so the
+	// release may deliver onward.
 	mqttQoS2RetireProceed mqttQoS2RetireVerdict = iota
 
 	// mqttQoS2RetireRetired: positive evidence that this incarnation's session was
@@ -83,7 +72,7 @@ const (
 	mqttQoS2RetireRetired
 
 	// mqttQoS2RetireUnresolved: the question could not be decided — an unreadable or
-	// malformed watermark, an unavailable record fence, or a session whose own record
+	// undecided authority, an unavailable record fence, or a session whose own record
 	// write is unresolved. The exchange is unfinished: no PUBCOMP, and both records
 	// stay.
 	mqttQoS2RetireUnresolved
@@ -122,10 +111,9 @@ var mqttTestQoS2RetireInTxV atomic.Pointer[func(sess *mqttSession)]
 // Returns the verdict and, for an unresolved one, the reason to log. No lock held on
 // entry; performs one JetStream read.
 func (sess *mqttSession) classifyQoS2ReleaseAgainstRetirement(asm *mqttAccountSessionManager) (mqttQoS2RetireVerdict, error) {
-	// The positive memo, read first because it costs nothing. A valid watermark naming a
-	// generation is MONOTONE: once retired, a generation never becomes rightful again,
-	// and single-slot replacement can erase the fact's discoverability but not the fact.
-	// So this result may be remembered — and only this one. The three NEGATIVE outcomes
+	// The positive memo, read first because it costs nothing. A noncurrent generation is
+	// MONOTONE: no transition makes a discarded generation current again. So this result
+	// may be remembered — and only this one. The three NEGATIVE outcomes
 	// are never cached: each can be invalidated by a retirement landing afterwards, and a
 	// finite window never arbitrates ownership.
 	sess.mu.Lock()
@@ -160,11 +148,13 @@ func (sess *mqttSession) classifyQoS2ReleaseAgainstRetirement(asm *mqttAccountSe
 
 // classifyQoS2ReleaseInTx is the classification proper, with the record fence held.
 //
-// The ORDER of the two observations matters and is not arbitrary: the watermark is read
-// FIRST and the session's own sequence sampled after it, so the sequence the MarkerSeq
-// comparison uses is at least as new as the watermark it is compared against. Reading the
-// sequence first would allow a comparison against a sequence that had already advanced,
-// which turns a positive proof into a false negative.
+// It reads where THIS generation stands, from the client's authority (gen_standing.go): only a
+// generation the authority still SERVES proceeds. A noncurrent one, outstanding or retired, was
+// discarded, so its releases fan out nothing; and an unreadable or undecided answer never
+// proceeds. HEAD compared the watermark's marker sequence with this session's acknowledged
+// record, because its single slot lost earlier generations' identities; the authority keeps
+// them, and a teardown makes its generation noncurrent in the same batch that marks the record,
+// so "a teardown landed after my record" is exactly "my generation is not current" (consult 10).
 //
 // The caller holds the record transaction; sess.mu is NOT held by it, because an open
 // transaction does not leave that mutex held.
@@ -173,74 +163,26 @@ func (sess *mqttSession) classifyQoS2ReleaseInTx(asm *mqttAccountSessionManager,
 		(*h)(sess)
 	}
 	sess.mu.Lock()
-	idHash := sess.idHash
-	sess.mu.Unlock()
-
-	r, _, status := asm.jsa.loadGenRetirement(asm.domainTk, idHash)
-	switch status {
-	case mqttRetirementAbsent:
-		// No retirement was ever recorded for this client. issue #70 makes a lone
-		// recreation of $MQTT_teardown a refused state — an account holding seven of
-		// the eight streams fails the account-wide preflight before anything is
-		// provisioned — so absence here is absence rather than a lost fence.
-		return mqttQoS2RetireProceed, nil
-	case mqttRetirementValid:
-	default: // mqttRetirementCorrupt, mqttRetirementIndeterminate
-		// Never repaired in place, and never read leniently: a watermark this broker
-		// cannot interpret may name a retirement newer than anything it can see. Same
-		// fail-closed disposition every other reader of this record applies.
-		return mqttQoS2RetireUnresolved, fmt.Errorf("the retirement watermark is %s", mqttRetirementStatusLabel(status))
-	}
-
-	// The session's own sequence, sampled with its uncertainty in ONE critical section.
-	// Sampling the sequence without the uncertainty flag would read a pre-write base as a
-	// settled sequence: while a write of ours is unresolved sess.seq still holds the
-	// base, so a MarkerSeq comparison against it would answer about a record state
-	// nobody has classified.
-	sess.mu.Lock()
-	ourSeq, uncertain := sess.seq, sess.seqUncertain
+	id, uncertain := sess.id, sess.seqUncertain
 	sess.mu.Unlock()
 	if uncertain {
-		return mqttQoS2RetireUnresolved, fmt.Errorf("this session's own record write is unresolved, so its sequence cannot bound a retirement")
+		// While a write of ours is unresolved this session cannot say which record it is
+		// acknowledged for, so it does not answer for its generation either.
+		return mqttQoS2RetireUnresolved, fmt.Errorf("this session's own record write is unresolved, so its standing cannot be sampled")
 	}
-
-	// Dimension 1: the watermark names THIS incarnation. Positive and monotone, so this
-	// is the one result the memo may keep.
-	if r.Gen == gen {
+	switch standing, _ := asm.genStanding(id, gen); standing {
+	case mqttGenCurrent:
+		return mqttQoS2RetireProceed, nil
+	case mqttGenOutstanding, mqttGenRetired:
+		// Positive and monotone: no transition makes a noncurrent generation current again, so
+		// this is the one result the memo may keep.
 		sess.mu.Lock()
 		if sess.gen == gen {
 			sess.retiredGenProven = gen
 		}
 		sess.mu.Unlock()
 		return mqttQoS2RetireRetired, nil
+	default:
+		return mqttQoS2RetireUnresolved, fmt.Errorf("where generation %q stands cannot be read", gen)
 	}
-
-	// Dimension 2: the watermark names another generation, but its marker landed at a
-	// $MQTT_sess sequence BEYOND the record this broker is acknowledged for — so a
-	// teardown claimed this client's record subject after our own record, and this
-	// incarnation is not the one serving it any more. Not memoized: this is a statement
-	// about our sequence rather than about our generation, and our sequence moves.
-	if r.MarkerSeq > ourSeq {
-		return mqttQoS2RetireRetired, nil
-	}
-
-	// A valid watermark for a generation that is not ours, whose marker does not reach
-	// past our own record. It is evidence about a retirement this incarnation outlived,
-	// which is not evidence about this incarnation.
-	return mqttQoS2RetireProceed, nil
-}
-
-// mqttRetirementStatusLabel names a non-actionable watermark status for a log line.
-func mqttRetirementStatusLabel(status mqttRetirementStatus) string {
-	switch status {
-	case mqttRetirementAbsent:
-		return "absent"
-	case mqttRetirementValid:
-		return "valid"
-	case mqttRetirementCorrupt:
-		return "unreadable or malformed"
-	case mqttRetirementIndeterminate:
-		return "indeterminate"
-	}
-	return "of an unknown status"
 }

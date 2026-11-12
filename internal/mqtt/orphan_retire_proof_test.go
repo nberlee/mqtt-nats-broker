@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -12,17 +13,17 @@ import (
 // site 3.
 //
 // The property under test is one rule, not three site behaviors: any arm that can still
-// destroy live session-generation state requires a valid retirement watermark whose Gen
-// EQUALS the candidate generation, and without that proof it RETAINS. The negatives below
+// destroy live session-generation state requires the candidate generation to read
+// NONCURRENT in its authority (outstanding or retired), and without that proof it RETAINS. The negatives below
 // therefore assert on the EXACT retained state — the payload, the register, the consumer —
 // because "the pass did not crash" and "the record is still there for some other reason"
 // are both things a weaker assertion would accept.
 //
 // The PUBREL consumer arm is the exception, and the tests over it say so: since issue #107 7c-lc its
 // licence is the consumer name's RETIRED ownership alone (Codex consult 14 finding 2), written
-// by opAuthorizeDeletion in the batch that authorizes the resource's deletion. The watermark
-// licenses nothing there, so those negatives plant one beside a missing ownership record and
-// still expect retention, and their controls retire the name through opAuthorizeDeletion.
+// by opAuthorizeDeletion in the batch that authorizes the resource's deletion. The standing
+// licenses nothing there, so those negatives retire the generation beside a missing ownership
+// record and still expect retention, and their controls retire the name through opAuthorizeDeletion.
 //
 // Each negative is paired with a POSITIVE CONTROL. Without those, every mutation that
 // bypasses the gate could be "killed" by a pass that simply retains everything, and the
@@ -35,8 +36,8 @@ import (
 // the census in orphan_retire_proof.go's header, these behavioral tests, and their
 // controls.
 
-// forgetWithoutLicence drops the record and the resident object WITHOUT planting a
-// retirement watermark — the state a session live on ANOTHER broker leaves behind. It is
+// forgetWithoutLicence drops the record and the resident object WITHOUT retiring the
+// generation — the state a session live on ANOTHER broker leaves behind. It is
 // the whole point of the negatives: absence of a record and of a local resident is
 // precisely what issue #40 says does not prove a generation dead.
 func (e *testOrphanEnv) forgetWithoutLicence(t *testing.T) {
@@ -96,63 +97,67 @@ func TestOrphanSweepReclaimsWithMatchingRetirement(t *testing.T) {
 	}
 }
 
-// TestOrphanSweepDifferentGenerationWatermarkAuthorizesNothing is the arm that makes
-// the proof exact-match rather than merely "a watermark exists".
-//
-// A valid watermark naming a DIFFERENT generation is the ordinary steady state once a
-// client has been torn down more than once: the single slot names the latest retirement.
-// It says nothing about the candidate generation, and reading it as a licence would
-// destroy the state of every generation whose slot has since been replaced.
-func TestOrphanSweepDifferentGenerationWatermarkAuthorizesNothing(t *testing.T) {
+// TestOrphanSweepDifferentGenerationRetirementAuthorizesNothing is the arm that makes the
+// proof exact: another generation of the same client reading retired says nothing about
+// the candidate generation, which is still current.
+func TestOrphanSweepDifferentGenerationRetirementAuthorizesNothing(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-othergen-hold")
 	e.setGraces(t, 0, 0)
 	holdSubject := e.hold(t, 1, nuid.Next(), "other-generation-payload")
 	e.forgetWithoutLicence(t)
-	// A LATER generation's retirement occupies the slot.
-	e.retireClient(t, e.sess.id, mqttNewSessGen())
+	// A LATER generation of the same lifecycle reads retired.
+	l, ord, _ := mqttParseGenToken(e.sess.gen)
+	e.retireClient(t, e.sess.id, testLifecycleGen(t, l, ord+5))
 
 	e.settle(t)
 	e.settle(t)
 
 	if !e.holdPresent(t, holdSubject) {
-		t.Fatal("a watermark naming a DIFFERENT generation was read as a licence to destroy this one's hold")
+		t.Fatal("a DIFFERENT generation's retirement was read as a licence to destroy this one's hold")
 	}
 	if e.claimPresent(t, holdSubject) {
-		t.Fatal("a watermark naming a DIFFERENT generation authorized writing a discard fence")
+		t.Fatal("a DIFFERENT generation's retirement authorized writing a discard fence")
 	}
 }
 
-// TestOrphanSweepCorruptWatermarkAuthorizesNothing covers the two remaining negative
-// statuses. Neither is absence and neither is proof: a watermark this broker cannot
-// interpret may name any retirement at all, and an unreadable stream says nothing.
-func TestOrphanSweepCorruptWatermarkAuthorizesNothing(t *testing.T) {
+// TestOrphanSweepUnreadableAuthorityAuthorizesNothing covers the two remaining negative
+// readings. Neither is absence and neither is proof: an authority this broker cannot interpret
+// may say anything at all, and an unreadable stream says nothing.
+func TestOrphanSweepUnreadableAuthorityAuthorizesNothing(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		status mqttRetirementStatus
+		name    string
+		corrupt bool
 	}{
-		{"corrupt", mqttRetirementCorrupt},
-		{"indeterminate", mqttRetirementIndeterminate},
+		{"corrupt", true},
+		{"indeterminate", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := testNewOrphanEnv(t, "f036-"+tc.name+"-hold")
 			e.setGraces(t, 0, 0)
 			holdSubject := e.hold(t, 1, nuid.Next(), tc.name+"-payload")
 			e.forgetWithoutLicence(t)
-			// The hook is process-GLOBAL and Go resumes paused parallel tests between
-			// sequential ones, so an unscoped hook answers for every client in every
-			// concurrently running test — which is how this one made
-			// TestMQTTInflightOrphanReconcile flake. It therefore answers only for THIS
-			// client and DELEGATES every other hash to the real read.
-			ourHash := e.sess.idHash
-			asm := e.asm
-			restore := setMQTTTestRetirementLoadHook(
-				func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
-					if idHash != ourHash {
-						return asm.jsa.loadGenRetirementRecord(asm.domainTk, idHash)
+			// Retired, so only the unreadable authority stands between the pass and the licence.
+			e.retire(t)
+			authSubj := mqttOutboundAuthoritySubject(e.sess.idHash)
+			if tc.corrupt {
+				if _, err := e.asm.jsa.storeMsg(authSubj, 0, []byte(`{"id":`)); err != nil {
+					t.Fatalf("corrupting the authority: %v", err)
+				}
+			} else {
+				// Scoped to THIS client's authority subject: the hook is process-global.
+				restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
+					if subject == authSubj {
+						return errors.New("injected: the authority read is indeterminate")
 					}
-					return nil, 3, tc.status
+					return nil
 				})
-			defer restore()
+				defer restore()
+			}
+			// The positive memo would answer from the retirement just staged; a fresh account
+			// manager reads afresh, as after a restart.
+			e.asm.mu.Lock()
+			e.asm.retirementMemo = nil
+			e.asm.mu.Unlock()
 
 			e.settle(t)
 			e.settle(t)
@@ -220,11 +225,11 @@ func TestOrphanSweepRetainsAnUnlicensedRegister(t *testing.T) {
 // rather than by refs.hasInbound. Deleting the consumer drops every interest-retained PUBREL
 // it holds.
 //
-// This arm's licence is no longer the watermark: since issue #107 7c-lc it is the name's RETIRED
-// ownership alone (Codex consult 14 finding 2), which opAuthorizeDeletion writes in the batch
-// that authorizes the resource's deletion. So the negative is a consumer whose name no
-// ownership record claims, and it CARRIES a matching watermark: that is what separates the
-// landed gate from re-licensing the delete by the watermark (consult 14's rejected option C).
+// This arm's licence is not the generation's standing: since issue #107 7c-lc it is the name's
+// RETIRED ownership alone (Codex consult 14 finding 2), which opAuthorizeDeletion writes in the
+// batch that authorizes the resource's deletion. So the negative is a consumer whose name no
+// ownership record claims, and whose generation IS proven retired: that is what separates the
+// landed gate from re-licensing the delete by the standing (consult 14's rejected option C).
 // The control runs in the SAME passes, so a pass that retains everything fails it.
 func TestOrphanSweepRetainsAnUnlicensedPubRelConsumer(t *testing.T) {
 	e := testNewOrphanEnv(t, "f036-retain-pubrel")

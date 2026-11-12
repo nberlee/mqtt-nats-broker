@@ -180,7 +180,9 @@ func (sess *mqttSession) openAdmissionCustodyLocked(gen string, pi uint16, nonce
 // the abort's own result, decides. Unresolved after that concludes nothing.
 //
 // Session lock NOT held on entry.
-func (sess *mqttSession) settleCustodyHandle(h *mqttTransitionHandle) mqttTransitionVerdict {
+//
+// admit is the holder's background admission, applied to the abort (nil for a foreground holder).
+func (sess *mqttSession) settleCustodyHandle(h *mqttTransitionHandle, admit func() bool) mqttTransitionVerdict {
 	jsa := sess.jsa
 	hook := mqttTestCustodyResolveHook(sess)
 	v := jsa.resolveTransitionHandle(h)
@@ -195,7 +197,7 @@ func (sess *mqttSession) settleCustodyHandle(h *mqttTransitionHandle) mqttTransi
 				return hv
 			}
 		}
-		_ = jsa.abortTransition(&h.attempt)
+		_ = jsa.abortTransition(&h.attempt, admit)
 		v = jsa.resolveTransitionHandle(h)
 	}
 	return v
@@ -228,7 +230,7 @@ func (sess *mqttSession) recordAdmissionAttempt(gen, nonce, lin string, out mqtt
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) settleCustodyAttempt(gen, nonce string, a mqttCustodyAttempt) bool {
-	switch sess.settleCustodyHandle(a.handle) {
+	switch sess.settleCustodyHandle(a.handle, nil) {
 	case mqttTransitionLanded, mqttTransitionSuperseded:
 		sess.mu.Lock()
 		sess.custody.attemptLanded(gen, nonce, a.handle, a.lin)
@@ -241,6 +243,12 @@ func (sess *mqttSession) settleCustodyAttempt(gen, nonce string, a mqttCustodyAt
 		if released {
 			sess.releaseDeferredAfterCustody()
 		}
+	case mqttTransitionRetired:
+		// The scope retired: its work is terminal, so the attempt is dropped with neither the
+		// landing's nor the never-landed release's consequence.
+		sess.mu.Lock()
+		sess.custody.attemptRetired(gen, nonce, a.handle)
+		sess.mu.Unlock()
 	}
 	return false
 }

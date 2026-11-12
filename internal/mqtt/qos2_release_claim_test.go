@@ -50,6 +50,9 @@ func testNewRelClaimEnv(t *testing.T, clientID string) *testRelClaimEnv {
 	if err != nil {
 		t.Fatalf("createOrRestoreSession: %v", err)
 	}
+	// Accepted the way a CONNECT is (issue #133): its generation is its lifecycle's, and the
+	// authority serves it, so its teardown can be claimed.
+	testAcceptRigConnection(t, asm, sess, c)
 	if !mqttValidSessGen(sess.gen) {
 		t.Fatalf("a freshly created session must carry a minted incarnation generation, got %q", sess.gen)
 	}

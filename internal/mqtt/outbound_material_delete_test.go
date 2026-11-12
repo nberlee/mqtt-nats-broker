@@ -468,7 +468,7 @@ func TestMaterialBelongsToTheGenerationThatWritesIt(t *testing.T) {
 	e.bootstrap(t, "txn-1")
 	testPlantUnsealedResource(t, e, "inc-pay", mqttResourceRetainedPayload)
 
-	const otherGen = "zyxwvu9876543210lkjihg"
+	const otherGen = testGen2
 	foreign := testManifest(e, mqttManifestProvisioning, 1, 0)
 	foreign.Gen = otherGen
 	body, merr := json.Marshal(foreign)
@@ -482,8 +482,10 @@ func TestMaterialBelongsToTheGenerationThatWritesIt(t *testing.T) {
 	if err == nil {
 		t.Fatalf("a materialization wrote material of another generation")
 	}
-	if !strings.Contains(err.Error(), "rather than the") {
-		t.Fatalf("the refusal was not the generation rule: %v", err)
+	if !strings.Contains(err.Error(), "is scoped to generation") {
+		// A batch is ONE generation's (outcome_scope.go): the outcome scope refuses the other
+		// generation's member first.
+		t.Fatalf("the refusal was not the outcome scope: %v", err)
 	}
 	// The positive control: the same reservation under this transition's own generation.
 	if err := testSubmitMaterial(t, e, "txn-own",

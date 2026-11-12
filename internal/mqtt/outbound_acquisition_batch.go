@@ -239,7 +239,7 @@ func (sess *mqttSession) acquirePublishActions(secs []*mqttPublishSection) []mqt
 		if err != nil {
 			v = mqttTransitionNeverLanded
 			if out.Handle != nil {
-				v = sess.settleCustodyHandle(out.Handle)
+				v = sess.settleCustodyHandle(out.Handle, nil)
 			}
 		}
 		if h := mqttTestAcquisitionBatchHook.Get(); h != nil {
@@ -254,6 +254,9 @@ func (sess *mqttSession) acquirePublishActions(secs []*mqttPublishSection) []mqt
 				}
 				parts[i].acquired = sess.adoptBatchAcquisition(c, secs[i], parts[i].cur, act)
 			}
+			return parts
+		case mqttTransitionRetired:
+			// The generation retired: nothing is acquired, released or re-offered for it.
 			return parts
 		case mqttTransitionNeverLanded:
 			if out.Handle == nil && !errors.Is(err, errMQTTEntitlementEnded) {
@@ -441,7 +444,7 @@ func (sess *mqttSession) runAcquireSettleOwedUnit(gen string, o *mqttAcquireSett
 //
 // Session lock NOT held on entry.
 func (sess *mqttSession) settleOwedAcquisition(o *mqttAcquireSettleOwed) bool {
-	switch sess.settleCustodyHandle(o.handle) {
+	switch sess.settleCustodyHandle(o.handle, nil) {
 	case mqttTransitionLanded, mqttTransitionSuperseded:
 		for _, tok := range o.toks {
 			sess.drainPublishAction(o.c, tok)
@@ -451,6 +454,9 @@ func (sess *mqttSession) settleOwedAcquisition(o *mqttAcquireSettleOwed) bool {
 		for i := range o.toks {
 			sess.releaseUnacquiredPublishAction(o.c, &o.toks[i])
 		}
+		return true
+	case mqttTransitionRetired:
+		// Decided with no consequence: the generation's work is terminal.
 		return true
 	}
 	return false

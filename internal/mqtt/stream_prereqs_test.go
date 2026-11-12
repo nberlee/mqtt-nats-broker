@@ -136,7 +136,6 @@ func TestValidateSessStream(t *testing.T) {
 		name string
 		mut  func(cfg *StreamConfig)
 	}{
-		{"deny purge is not a prerequisite", func(c *StreamConfig) { c.DenyPurge = true }},
 		{"consumer inactivity limit is not a prerequisite", func(c *StreamConfig) { c.ConsumerLimits.InactiveThreshold = time.Minute }},
 		{"unrelated metadata keys are accepted", func(c *StreamConfig) { c.Metadata["unrelated_key"] = "keepme" }},
 		{"a duplicate window is not a prerequisite", func(c *StreamConfig) { c.Duplicates = 100 * time.Millisecond }},
@@ -556,7 +555,6 @@ func TestEnsureBrokerStream(t *testing.T) {
 var mqttTestBrokerStreamNames = []string{
 	mqttSessStreamName,
 	mqttWillQStreamName,
-	mqttTeardownStreamName,
 	mqttStreamName,
 	mqttQoS2IncomingMsgsStreamName,
 	mqttQoS2AssignStreamName,
@@ -882,7 +880,7 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 	case mqttSessStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges the session stream: session records and in-flight registers leave one at a time through exact-sequence deletes (the in-flight reap since issue #38), and the shared-group records are never removed"}
+		d["DenyPurge"] = fieldDisposition{kind: dispRejected, errWant: "deny_purge"}
 		// This owner DOES create a consumer now: every broker runs its own ephemeral
 		// session-record watch over this stream (sess_record_watch.go), so the
 		// register-commons waiver no longer describes it.
@@ -902,15 +900,6 @@ func dispositionsFor(stream string) map[string]fieldDisposition {
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}
 		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "nothing ever purges the outbox; records leave through exact-sequence deletes"}
-	case mqttTeardownStreamName:
-		register()
-		d["DenyDelete"] = fieldDisposition{kind: dispWaived, reason: "no operation ever deletes a retirement watermark — a fence is permanent by design, and reaping one would unfence a generation whose resources are already deleted"}
-		d["DenyPurge"] = fieldDisposition{kind: dispWaived, reason: "no operation ever purges a retirement watermark — fences are permanent by design"}
-		d["SubjectDeleteMarkerTTL"] = fieldDisposition{kind: dispWaived, reason: "no delete ever occurs here, so no delete marker can ever be created"}
-		// The incarnation epoch is a REAL prerequisite here, not owner-inert
-		// metadata: a watermark orders itself by a $MQTT_sess sequence, so this
-		// stream is only interpretable within the session-stream incarnation it was
-		// created against. See validateTeardownStream.
 	case mqttQoS2IncomingMsgsStreamName:
 		register()
 		d["DenyDelete"] = fieldDisposition{kind: dispRejected, errWant: "deny_delete"}

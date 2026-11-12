@@ -16,6 +16,8 @@
 package mqtt
 
 import (
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -41,11 +43,17 @@ type testBoundaryEnv struct {
 func testNewBoundaryEnv(t *testing.T) *testBoundaryEnv {
 	t.Helper()
 	e := testNewOrphanEnv(t, "boundary-client")
+	// THE AUTHORITY'S OWN GENERATION: every ledger batch is fenced by the authority
+	// (shared_ledger_fence.go), so the fixture's ledger is the generation it serves.
+	al := e.asm.jsa.loadOutboundAuthority("boundary-client", e.asm.sessStreamEpoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("fixture: the boundary client has no authority: %v", al.status)
+	}
 	return &testBoundaryEnv{
 		e:     e,
 		epoch: e.asm.sessStreamEpoch,
 		id:    "boundary-client",
-		gen:   mqttNewSessGen(),
+		gen:   al.rec.Gen,
 		qkey:  mqttSharedGroupKey("g", "foo"),
 	}
 }
@@ -68,6 +76,9 @@ func (x *testBoundaryEnv) ledger(t *testing.T) mqttSharedLedgerLoad {
 // through the production decoders — the assertion that catches a member the store accepts but
 // the decoder refuses.
 func (x *testBoundaryEnv) landed(t *testing.T, what string, b *mqttSharedBatch) {
+	if !b.Tenure.isZero() {
+		testAcceptSharedTenure(t, &x.e.asm.jsa, x.id, x.epoch, b.Tenure)
+	}
 	t.Helper()
 	res := x.commit(b)
 	if res.Outcome != mqttSharedWriteLanded {
@@ -88,9 +99,17 @@ func (x *testBoundaryEnv) landed(t *testing.T, what string, b *mqttSharedBatch) 
 // refused asserts a batch is rejected and stores nothing that changes the current reads.
 func (x *testBoundaryEnv) refused(t *testing.T, what string, b *mqttSharedBatch) {
 	t.Helper()
+	// The batch's own tenure is the accepted one, so the authority fence passes and the refusal
+	// is the shape rule's: a fence refusal would be a fixture not reaching its route.
+	if !b.Tenure.isZero() {
+		testAcceptSharedTenure(t, &x.e.asm.jsa, x.id, x.epoch, b.Tenure)
+	}
 	res := x.commit(b)
 	if res.Outcome == mqttSharedWriteLanded {
 		t.Fatalf("%s: the boundary accepted a batch it must refuse", what)
+	}
+	if errors.Is(res.Err, errMQTTSharedNotCurrent) {
+		t.Fatalf("%s: refused by the authority fence, not by the rule under test: %v", what, res.Err)
 	}
 }
 
@@ -98,6 +117,7 @@ func (x *testBoundaryEnv) refused(t *testing.T, what string, b *mqttSharedBatch)
 // creator of a ledger, which every join then steps from.
 func (x *testBoundaryEnv) install(t *testing.T, tenure mqttSharedTenure) {
 	t.Helper()
+	testAcceptSharedTenure(t, &x.e.asm.jsa, x.id, x.epoch, tenure)
 	b, err := mqttComposeSharedInstall(x.epoch, x.id, x.gen, tenure, x.ledger(t))
 	if err != nil {
 		t.Fatalf("composing the installation: %v", err)
@@ -221,11 +241,13 @@ func TestSharedBoundaryLegalShapesRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSharedBoundaryInstallAndSealOverAbsence(t *testing.T) {
-	// INSTALL over absence (a resume of a generation that never acquired, and the abort init
-	// fence): open([]) under the tenure.
+func TestOnlyAnInstallationCreatesASharedLedger(t *testing.T) {
+	// INSTALL over absence (a generation's first acquisition): open([]) under the tenure, and the
+	// authority records that the generation acquired (issue #133).
 	x := testNewBoundaryEnv(t)
-	inst, err := mqttComposeSharedInstall(x.epoch, x.id, x.gen, testTenure(7),
+	tenure := testTenure(7)
+	testAcceptSharedTenure(t, &x.e.asm.jsa, x.id, x.epoch, tenure)
+	inst, err := mqttComposeSharedInstall(x.epoch, x.id, x.gen, tenure,
 		mqttSharedLedgerLoad{status: mqttOutboundAbsent})
 	if err != nil {
 		t.Fatalf("composing the installation: %v", err)
@@ -234,17 +256,21 @@ func TestSharedBoundaryInstallAndSealOverAbsence(t *testing.T) {
 	if l := x.ledger(t); l.rec.State != mqttSharedLedgerOpen || len(l.rec.Acqs) != 0 {
 		t.Fatalf("the installation did not write open([]): %+v", l.rec)
 	}
-
-	// SEAL over absence (a teardown of a generation that never acquired): sealed([]) with no
-	// tenure. Separate generation so the ledger is genuinely absent.
-	y := testNewBoundaryEnv(t)
-	seal, err := mqttComposeSharedSeal(y.epoch, y.id, y.gen, mqttSharedLedgerLoad{status: mqttOutboundAbsent})
-	if err != nil {
-		t.Fatalf("composing the empty seal: %v", err)
+	if al := x.e.asm.jsa.loadOutboundAuthority(x.id, x.epoch); !al.rec.Life.GenAcqs {
+		t.Fatal("the ledger's creation did not record that the generation acquired")
 	}
-	y.landed(t, "seal over absence", seal)
-	if l := y.ledger(t); l.rec.State != mqttSharedLedgerSealed || !l.rec.Tenure.isZero() || len(l.rec.Acqs) != 0 {
-		t.Fatalf("the empty seal did not write sealed([]) with no tenure: %+v", l.rec)
+
+	// A SEAL never creates one: a generation with no ledger never acquired, and has nothing to
+	// seal. The composer refuses, and so does the boundary for a hand-built seal over absence.
+	y := testNewBoundaryEnv(t)
+	if b, err := mqttComposeSharedSeal(y.epoch, y.id, y.gen, mqttSharedLedgerLoad{status: mqttOutboundAbsent}); err == nil {
+		t.Fatalf("a seal over absence was composed: %+v", b)
+	}
+	forged := &mqttSharedBatch{Shape: mqttSharedShapeSeal, Epoch: y.epoch, ID: y.id, Gen: y.gen, hasLedger: true,
+		LedgerNext: &mqttSharedLedger{Epoch: y.epoch, ID: y.id, Gen: y.gen, State: mqttSharedLedgerSealed,
+			Acqs: []mqttSharedAcqRef{}, Closed: []string{}}}
+	if err := mqttCheckSharedLifecycleBatch(forged); err == nil || !strings.Contains(err.Error(), "a seal over absence") {
+		t.Fatalf("a hand-built seal over absence was not refused by its rule: %v", err)
 	}
 }
 

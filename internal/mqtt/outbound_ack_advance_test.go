@@ -475,19 +475,7 @@ func TestAckAdvanceCrossGenerationEndsAClosedObligation(t *testing.T) {
 		t.Fatalf("the admission was refused: %v", cerr)
 	}
 
-	closing := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-close", Op: "op-close",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: auth.OwnerTxn, Rev: atr.Auth.Rev + 1,
-			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: atr.Auth, PrevSeq: admSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
-			State: mqttAuthorityClosed, Rev: atr.Auth.Rev + 1, Txn: "txn-close", OwnerTxn: auth.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{ID: e.id, Epoch: e.epoch, Gen: testGen, Txn: "txn-close"},
-	}
+	closing := testClosure(e, atr.Auth, admSeq, "txn-close")
 	closeSeq, clerr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
 	if clerr != nil {
 		t.Fatalf("the closure was refused: %v", clerr)

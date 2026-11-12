@@ -22,7 +22,7 @@ import (
 //
 // # The coupling being broken
 //
-// finishAdoptedTeardown runs recordGenRetirement, then the shared closing (seal, release,
+// finishAdoptedTeardown runs the shared closing (seal, release,
 // gate), then deleteTeardownTargets, then releaseTeardown — the metadata release. So metadata
 // release waits on physical deletion finishing, and a CONNECT behind it waits with it.
 //
@@ -146,39 +146,7 @@ type mqttAdoptedReleaseFacts struct {
 	RootEnrolled bool
 	// Cert is the durable completion certificate, nil when none stands.
 	Cert *mqttGenCompletionCertificate
-	// Discard says whether this generation's closure carried an authorized session discard,
-	// which is what distinguishes "this generation ended" from "its obligations were authorized
-	// to be abandoned". A later reader that gets this wrong SERVES obligations it should have
-	// dropped, or drops obligations it should have served.
-	//
-	// A TRI-STATE, not a bool, and the zero value is UNKNOWN. A review required this
-	// distinction explicitly — "distinguish KNOWN-INAPPLICABLE from UNKNOWN, with unknown
-	// WITHHOLDING release" — because a caller that cannot answer otherwise passes false and the
-	// gate reads it as "does not apply".
-	//
-	// THERE IS NOTHING FOR A CALLER TO GET WRONG, because the gatherer DERIVES it from the
-	// closure record, which carries the disposition as a mandatory member and is written in the
-	// transition that closes the generation — at the moment the protocol event is true, rather
-	// than re-derived later by a teardown that no longer has it. That is also why there is no
-	// second "and its record stands" fact beside this one: the record IS the disposition, so a
-	// rule asking whether it is durable would be asking about the message it just read.
-	Discard mqttFactState
 }
-
-// mqttFactState is what a caller has established about one condition.
-//
-// The zero value is UNKNOWN and every rule that consults one treats UNKNOWN as a refusal. That
-// is the whole design: a caller that forgets a field gets a stall, not a release.
-type mqttFactState uint8
-
-const (
-	// mqttFactUnknown: nobody established this either way. Blocks.
-	mqttFactUnknown mqttFactState = iota
-	// mqttFactApplies: the condition holds and its own evidence is required.
-	mqttFactApplies
-	// mqttFactDoesNotApply: POSITIVELY established not to hold. Never inferred from an absence.
-	mqttFactDoesNotApply
-)
 
 // mqttAdoptedReleaseBlockedBy reports which facts forbid releasing this generation's metadata.
 //
@@ -215,40 +183,17 @@ func mqttAdoptedReleaseBlockedBy(id, gen string, f mqttAdoptedReleaseFacts) []mq
 		})
 	}
 
-	if f.Discard == mqttFactUnknown {
-		blocks = append(blocks, mqttReleaseBlock{
-			Fact: "the discard disposition",
-			Why: fmt.Sprintf("nothing has established whether this teardown discards generation "+
-				"%q of client %q, and an unknown disposition is not a disposition: releasing on "+
-				"one treats 'nobody said' as 'no'", gen, id),
-		})
-	}
-
 	// EITHER a reachable enrolled root OR a certificate. Requiring the root alone deadlocks when
 	// recovery finishes first; accepting the certificate alone would release a generation whose
 	// duties nothing has ever traversed.
 	//
-	// A ROOT IS OWNERSHIP ONLY WHERE AN IMPLEMENTED EXECUTOR OWNS WHAT IT LEADS TO (issue #107 7d). Its
-	// executor performs a DISCARDED generation's retirement in full — every obligation ended and
-	// its records deleted, every consumer disposed of, authorized and deleted, the affine and
-	// retained work as before — so there a reachable root is durable recovery ownership even while
-	// a supported step is withheld. A generation closed PRESERVING its obligations is not one any
-	// executor continues (delivery, release and drain need a serving authority), so where its
-	// sealed inventory holds anything a root alone would be a pointer at work no broker performs:
-	// it must have certified complete. An EMPTY sealed inventory has no surviving work for anyone
-	// to own, so its root suffices — which is the abandoned reservation, the one preserving
-	// closure production writes. (An UNKNOWN disposition is refused by its own rule above and is
-	// not restated here.)
-	preservedWork := f.Discard == mqttFactDoesNotApply && f.Ledger != nil && f.Ledger.SealedHi != 0
-	if !f.RootEnrolled || preservedWork {
+	// A ROOT IS OWNERSHIP BECAUSE AN IMPLEMENTED EXECUTOR OWNS WHAT IT LEADS TO (issue #107 7d). Every
+	// closed generation is a discarded one (issue #133), and the executor performs a discarded
+	// generation's retirement in full — every obligation ended and its records deleted, every
+	// consumer disposed of, authorized and deleted, the affine and retained work as before — so a
+	// reachable root is durable recovery ownership even while a supported step is withheld.
+	if !f.RootEnrolled {
 		switch {
-		case f.Cert == nil && f.RootEnrolled:
-			blocks = append(blocks, mqttReleaseBlock{
-				Fact: "durable recovery ownership",
-				Why: fmt.Sprintf("generation %q of client %q was closed preserving its obligations "+
-					"and has not certified complete: its recovery root leads to work no executor "+
-					"performs, so it owns nothing", gen, id),
-			})
 		case f.Cert == nil:
 			blocks = append(blocks, mqttReleaseBlock{
 				Fact: "durable recovery ownership",
@@ -321,19 +266,8 @@ func (as *mqttAccountSessionManager) gatherAdoptedReleaseFacts(id, epoch, gen st
 	switch status {
 	case mqttOutboundValid:
 		f.Closed = closed
-		// THE DISPOSITION IS READ, NOT ASKED FOR. It is a mandatory member of the closure
-		// record — a body without it is refused rather than defaulted — and the closure is
-		// written by the transition that closes the generation, which is the only act that has
-		// the protocol event in front of it. A teardown re-deriving it later would be stating a
-		// claim about something it can no longer observe.
-		f.Discard = mqttFactDoesNotApply
-		if closed.Discard {
-			f.Discard = mqttFactApplies
-		}
 	case mqttOutboundAbsent:
-		// AND AN ABSENT CLOSURE LEAVES IT UNKNOWN, which is the honest answer and not a
-		// permissive one: there is no record, so nobody has said. The gate blocks on it, beside
-		// blocking on the missing closure itself.
+		// The gate blocks on the missing closure itself.
 	default:
 		return f, fmt.Errorf("the closure record of generation %q could not be resolved (status "+
 			"%v), so this broker cannot say whether it has an inventory", gen, status)

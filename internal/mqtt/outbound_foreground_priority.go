@@ -432,6 +432,26 @@ func (sess *mqttSession) admitBackgroundAuthority() bool {
 	}
 }
 
+// admitForegroundOrWait admits ONE authority attempt of a registered background actor of client
+// id, waiting while foreground work of the client is announced. It reports false only when quit
+// closes: the caller then makes no attempt. The actor is registered by its caller, so an
+// announcement's allowance already counts the one attempt it may hold.
+//
+// No lock held on entry.
+func (as *mqttAccountSessionManager) admitForegroundOrWait(id string, quit chan struct{}) bool {
+	for {
+		_, _, idle := as.admitForegroundOrIdle(id)
+		if idle == nil {
+			return true
+		}
+		select {
+		case <-idle:
+		case <-quit:
+			return false
+		}
+	}
+}
+
 // admitRecoveryAttempt admits ONE authority attempt of a recovery visit of client id's root,
 // never waiting. A refusal is remembered for the rest of the visit (b.refused): the visit admits
 // nothing more, and it ends REFUSED whatever its later bookkeeping does.

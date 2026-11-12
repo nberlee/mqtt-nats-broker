@@ -230,6 +230,9 @@ type mqttDeferredDisconnect struct {
 	// v5 Will Delay Interval on a surviving session) from one that is published
 	// immediately.
 	willDelayed bool
+	// willAnchor is the delayed Will's anchor (issue #133), owed by this action's discharge
+	// before it enqueues; nil when the Will is not delayed or allocated no anchor.
+	willAnchor *mqttWillAnchorRef
 }
 
 // mqttRecordDigest is the identity a readback compares against: the digest of the
@@ -1276,7 +1279,9 @@ func (sess *mqttSession) parkClose(c *client, action *mqttDeferredDisconnect, un
 // Lock held on entry (c.mu).
 func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, now time.Time) {
 	will, disposition, closeObservedAt := c.mqttTakeWillLocked()
+	anchor, anchorAsm, anchorCID := c.mqttTakeWillAnchorLocked()
 	if will == nil {
+		anchorAsm.dropWillAnchor(anchorCID, anchor)
 		return
 	}
 	// Same rule as mqttHandleWill: a v5 Will Delay on a session that survives the
@@ -1292,6 +1297,7 @@ func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, no
 		// teardown path, where the connection's snapshot has already been
 		// invalidated, so asking again would drop every Will rather than the denied
 		// ones. issue #81.
+		anchorAsm.dropWillAnchor(anchorCID, anchor)
 		return
 	}
 	action.will = will
@@ -1301,8 +1307,10 @@ func (c *client) mqttTakeWillIntoActionLocked(action *mqttDeferredDisconnect, no
 	action.willDelayed = delayed
 	if !delayed {
 		action.willDeadline = now.UnixNano()
+		anchorAsm.dropWillAnchor(anchorCID, anchor)
 		return
 	}
+	action.willAnchor = anchor
 	// Anchored to the CLOSE, not to this consumption. A parked action is the
 	// latest-consuming route there is -- the gate wait and two JetStream round trips
 	// sit between the close and here -- so re-measuring the delay from now restarts
@@ -1882,9 +1890,9 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 	// a past-due record would let it. That reasoning is right about the RULE and wrong
 	// about who enforces it: an elapsed delay does not extinguish a reconnect's
 	// entitlement to suppress, it decides WHICH reconnects qualify -- and only the
-	// acceptance-fact scan can tell, because a qualifying reconnect may have happened
-	// on a broker this one never observed. `At < FireAt` is the comparison that dates
-	// eligibility (mqttAcceptFactQualifies), and it needs the record. Publishing
+	// Will anchor can tell, because a qualifying reconnect may have happened on a broker
+	// this one never observed. `minAt < FireAt` is the comparison that dates eligibility
+	// (decideFromAnchor), and it needs the record. Publishing
 	// directly skipped that scan entirely, so a reconnect that genuinely occurred
 	// during the Will Delay was ignored.
 	//
@@ -1939,25 +1947,25 @@ func (s *Server) dischargeDeferredWill(asm *mqttAccountSessionManager, sess *mqt
 	// lost: this action is detached from its connection, but the obligation can
 	// still be held on the server and re-attempted when the account returns, which
 	// is what the rest of this code means by an unavailable destination deferring
-	// a Will rather than destroying it.
-	// The identity is allocated by the enqueue and returned through this struct, so
-	// a retention below carries exactly the one the refused attempt used.
+	// a Will rather than destroying it. A create that may have landed is retained too,
+	// possibly landed, and only ever resolved (mqttAnchorActionFor).
+	// The identity is the anchor's, so a retention carries exactly the one every attempt
+	// used. An action holding no anchor enqueues none, and the enqueue refuses it.
 	identity := &mqttDelayedWillIdentity{}
+	if a := action.willAnchor; a != nil {
+		identity.WillID = a.willID()
+		if aerr := asm.runAnchorTransition(sess.id, *a, mqttAnchorOwe, action.willDeadline, nil); aerr != nil {
+			s.Warnf("MQTT: the Will anchor of session %q could not be owed (the claimant decides from it armed): %v", sess.id, aerr)
+		}
+	}
 	outcome, eerr := asm.enqueueDelayedWill(s, sess.id, action.willGen, action.will, action.willProps,
 		action.willUser, action.willDeadline, seq, action.willSessEpoch, action.willAccount, identity)
-	if outcome.retainable() {
-		if !s.retainDelayedWillEnqueue(&mqttOwedDelayedWill{
-			as: asm, identity: *identity,
-			clientID: sess.id, sessGen: action.willGen, will: action.will, props: action.willProps,
-			user: action.willUser, fireAt: action.willDeadline, account: action.willAccount,
-			originSessSeq: seq, originSessEpoch: action.willSessEpoch,
-		}) {
-			s.Errorf("MQTT: the deferred delayed Will of session %q on %q is LOST: its destination was unavailable (%v) and it could not be retained",
-				sess.id, action.will.topic, eerr)
-		}
-		return
-	}
-	if eerr != nil {
+	if !s.settleDelayedWillEnqueue(&mqttOwedDelayedWill{
+		as: asm, identity: *identity,
+		clientID: sess.id, sessGen: action.willGen, will: action.will, props: action.willProps,
+		user: action.willUser, fireAt: action.willDeadline, account: action.willAccount,
+		originSessSeq: seq, originSessEpoch: action.willSessEpoch,
+	}, action.willAnchor, outcome, eerr) && eerr != nil {
 		s.Errorf("MQTT: the deferred delayed Will of session %q on %q was not durably enqueued: %v",
 			sess.id, action.will.topic, eerr)
 	}

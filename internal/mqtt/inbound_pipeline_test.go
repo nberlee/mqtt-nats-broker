@@ -1035,16 +1035,33 @@ func TestMQTTInboundPipeRegistrationsAndJoin(t *testing.T) {
 		f := newInboundPipeFix(t, "pipe-join", nil)
 		hold := f.holdStoreResult(nil, 1)
 		var c *client
+		// THE ORDER IS RECORDED where it happens, not read from which channel a select picks: once
+		// both hooks have fired, a select over two ready channels picks either.
+		var (
+			mu    sync.Mutex
+			order []string
+		)
+		note := func(ev string, ch chan struct{}) {
+			mu.Lock()
+			order = append(order, ev)
+			mu.Unlock()
+			ch <- struct{}{}
+		}
+		seen := func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), order...)
+		}
 		entry := make(chan struct{}, 1)
 		setInboundHook(t, &mqttTestClosedClientEntryV, func(cc *client) {
 			if cc.mqtt != nil && cc.mqtt.cid == f.cid {
-				entry <- struct{}{}
+				note("entry", entry)
 			}
 		})
 		joined := make(chan struct{}, 1)
 		setInboundHook(t, &mqttTestInboundJoinedV, func(cc *client) {
 			if cc.mqtt != nil && cc.mqtt.cid == f.cid {
-				joined <- struct{}{}
+				note("joined", joined)
 			}
 		})
 		f.send(f.pub(1, 1), f.pub(1, 2))
@@ -1054,16 +1071,15 @@ func TestMQTTInboundPipeRegistrationsAndJoin(t *testing.T) {
 		f.nc.Close()
 		select {
 		case <-latch:
-		case <-entry:
-			t.Fatal("the teardown began while an inbound job was still in flight")
 		case <-time.After(15 * time.Second):
 			t.Fatal("the readLoop never noticed the close")
+		}
+		if got := seen(); len(got) != 0 {
+			t.Fatalf("while an inbound job was still in flight: %v", got)
 		}
 		hold.release()
 		select {
 		case <-joined:
-		case <-entry:
-			t.Fatal("the teardown began before the pipe was joined")
 		case <-time.After(15 * time.Second):
 			t.Fatal("the pipe was never joined")
 		}
@@ -1071,6 +1087,9 @@ func TestMQTTInboundPipeRegistrationsAndJoin(t *testing.T) {
 		case <-entry:
 		case <-time.After(15 * time.Second):
 			t.Fatal("the teardown never ran")
+		}
+		if got := seen(); len(got) != 2 || got[0] != "joined" || got[1] != "entry" {
+			t.Fatalf("the teardown began before the pipe was joined: %v", got)
 		}
 	})
 }

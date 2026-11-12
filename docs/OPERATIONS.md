@@ -51,8 +51,8 @@ In order; a failure stops the process with `fatal: <reason>` on stderr and exit 
    these refusals is waited on. `connected to NATS backend` reports `server_version` and
    `jetstream_api_level`.
 7. The MQTT listener starts. With auth passthrough, the broker first asks NATS which
-   account its own service identity belongs to; it then checks the eight broker-owned
-   streams ([below](#the-eight-streams)), waiting up to 30 s on a partial set, and creates
+   account its own service identity belongs to; it then checks the seven broker-owned
+   streams ([below](#the-seven-streams)), waiting up to 30 s on a partial set, and creates
    any that do not exist yet. An initialization JetStream does not answer yet is retried
    with no overall timeout.
 8. TLS reloading starts, and `/readyz` turns `200 ready`.
@@ -104,18 +104,21 @@ broker is alive when it falls due ([details](ARCHITECTURE.md#high-availability))
 Each instance needs a unique node name: the host name, or `-nats-name` where the host
 name is empty. Pods and containers have unique host names by default.
 
-## The eight streams
+## The seven streams
 
-The broker keeps its state in eight JetStream streams in the account its service
-identity belongs to: `$MQTT_sess`, `$MQTT_willq`, `$MQTT_teardown`, `$MQTT_msgs`,
-`$MQTT_qos2in`, `$MQTT_qos2assign`, `$MQTT_out` and `$MQTT_rmsgs`. They are created by
+The broker keeps its state in seven JetStream streams in the account its service
+identity belongs to: `$MQTT_sess`, `$MQTT_willq`, `$MQTT_msgs`, `$MQTT_qos2in`,
+`$MQTT_qos2assign`, `$MQTT_out` and `$MQTT_rmsgs`. They are created by
 the first broker to start and are **one unit**: they are created, checked, recreated,
 backed up and restored together ([details](ARCHITECTURE.md#stream-prerequisites)).
 `$MQTT_sess` also carries the in-flight and shared-group records, which had streams of
-their own (`$MQTT_inflight`, `$MQTT_shared`) before 2026-11-09. An account that still
-holds either is refused at start: delete them together with the unit.
+their own (`$MQTT_inflight`, `$MQTT_shared`) before 2026-11-09. `$MQTT_teardown`, which
+held the generation-retirement watermark, is retired too: the authority's lifecycle now
+records it ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)). An
+account that still holds any of the three is refused at start: delete them together with
+the unit.
 
-At every start the broker checks the unit before it serves: all eight present, or none
+At every start the broker checks the unit before it serves: all seven present, or none
 (it then creates them); and each one's configuration as the broker requires it. A
 partial set is waited on for up to 30 s, since another broker may be creating it, and
 then refused. Nothing is repaired in place: a stream that does not conform refuses the
@@ -133,10 +136,10 @@ Do not:
   ([Configuration](CONFIGURATION.md#stream-replicas)).
 
 **Recreating the unit** is the one supported repair, and the way to change the replica
-count: stop every broker for the account, delete all eight streams, start the brokers.
+count: stop every broker for the account, delete all seven streams, start the brokers.
 It discards every session, retained message and in-flight QoS state.
 
-**Backup and restore** must capture the eight streams at one coherent instant; the broker
+**Backup and restore** must capture the seven streams at one coherent instant; the broker
 cannot detect a restore whose streams come from different moments. A supported
 procedure is open work in the roadmap.
 

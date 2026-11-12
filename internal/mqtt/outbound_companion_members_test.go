@@ -173,7 +173,7 @@ func testCleanupCompletionBatch(t *testing.T, e *testOutboundEnv, r *mqttOutboun
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: auth.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionDisposeResource, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
 			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
 		},
@@ -181,7 +181,7 @@ func testCleanupCompletionBatch(t *testing.T, e *testOutboundEnv, r *mqttOutboun
 		Auth: &mqttOutboundAuthority{
 			ID: auth.ID, Epoch: auth.Epoch, Gen: auth.Gen, Tenure: auth.Tenure,
 			State: auth.State, Rev: auth.Rev + 1, Txn: txn, OwnerTxn: auth.OwnerTxn,
-			Intent: auth.Intent, Creation: auth.Creation,
+			Life: mqttLifeOf(auth),
 		},
 		Extra: extra,
 	}
@@ -253,7 +253,7 @@ func TestCleanupCompletedOnlyWithItsDuty(t *testing.T) {
 	// (3) A terminal cleanup duty naming the same incarnation string in ANOTHER generation. It
 	// is planted beside a resource of that name in that generation, itself cleanup-complete, so
 	// the duty answers for that resource and not this one.
-	const otherGen = "otherGenerationXYZabcd"
+	const otherGen = testGen2
 	// The real authorized record of inc-a, moved to the other generation and completed there: a
 	// well-formed record of that generation, so the duty naming it passes its own checks.
 	ra, _ = load("inc-a")
@@ -270,7 +270,15 @@ func TestCleanupCompletedOnlyWithItsDuty(t *testing.T) {
 	testPlantNewDuty(t, e, gd)
 	foreign := testTerminalDutyMember(t, e, otherGen, ordA)
 	ra, sa = load("inc-a")
-	refused("the same incarnation in another generation", testCleanupCompletionBatch(t, e, ra, sa, &foreign))
+	// A batch is ONE generation's (outcome_scope.go): the other generation's duty is refused by the
+	// outcome scope before the completion rule is consulted.
+	if _, err := jsa.commitAuthorityTransition(testCleanupCompletionBatch(t, e, ra, sa, &foreign)); err == nil ||
+		!strings.Contains(err.Error(), "is scoped to generation") {
+		t.Fatalf("the same incarnation in another generation: not refused by the outcome scope: %v", err)
+	}
+	if r, _ := load("inc-a"); r.State != mqttResourceDeleteAuthorized {
+		t.Fatalf("the refused completion moved the resource to state %d", r.State)
+	}
 
 	// The control: its own cleanup duty's ending beside it, and the completion lands.
 	own := testTerminalDutyMember(t, e, auth.Gen, ordA)

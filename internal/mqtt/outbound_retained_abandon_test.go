@@ -515,7 +515,7 @@ func TestRetainedUnservableProvenUnsentIsWithdrawn(t *testing.T) {
 // advance is refused by the read; (b) a Discard landing AFTER the read — in the presend window —
 // fails the advance's authority CAS atomically. Either way no `rel` is created. An advance may name
 // an earlier generation (mqttKindEndsEarlierGeneration), so the route is real; the Discard is the
-// production discarding close (opCloseTeardownGenerationWith), applied in the window a teardown
+// production teardown claim batch (testCommitTeardownClaim), applied in the window a teardown
 // leaves between its closure and its register reap. (A clean start over a QoS 2 session cannot
 // reach it: issue #115.)
 func TestRetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
@@ -537,13 +537,7 @@ func TestRetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 						t.Errorf("no authority to discard: %v", err)
 						return
 					}
-					rig.sess.mu.Lock()
-					wid, seq := rig.sess.wid, rig.sess.seq
-					rig.sess.mu.Unlock()
-					txn := mqttNewInflightNonce()
-					if _, cerr = jsa.opCloseTeardownGenerationWith(rig.id, rig.epoch, txn, gen1, prev, prevSeq,
-						&mqttRetirementRequest{Gen: gen1, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn, SessWID: wid,
-							SessSeq: seq, Reason: mqttRetireSessionEnd, Discard: true}); cerr == nil {
+					if cerr = testCommitTeardownClaim(rig.asm, rig.id, prev, prevSeq); cerr == nil {
 						return
 					}
 					time.Sleep(20 * time.Millisecond)
@@ -606,7 +600,7 @@ func TestRetainedAbandonedArrowRefusedAfterDiscard(t *testing.T) {
 			if cerr == nil || (want != _EMPTY_ && !strings.Contains(cerr.Error(), want)) {
 				t.Fatalf("the late PUBREC advance of a discarded generation was answered %v, want a refusal %q", cerr, want)
 			}
-			if clo, _, cst := jsa.loadGenClosure(rig.id, rig.epoch, gen1); cst != mqttOutboundValid || clo == nil || !clo.Discard {
+			if clo, _, cst := jsa.loadGenClosure(rig.id, rig.epoch, gen1); cst != mqttOutboundValid || clo == nil {
 				t.Fatalf("the fixture's Discard did not land: %+v (status %v)", clo, cst)
 			}
 			if _, gone := jsa.loadLastMsgFor(mqttSessStreamName, mqttRetainedRelSubject(rig.idHash, gen1, lin)); gone == nil {

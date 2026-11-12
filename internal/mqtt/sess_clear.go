@@ -214,7 +214,6 @@ func (sess *mqttSession) resetForReuseLocked(permit mqttRetirementPermit, freshG
 	sess.subs = nil
 	sess.noLocalSubs = nil
 	sess.rapSubs = nil
-	sess.acceptFact = mqttAcceptFactRef{}
 	sess.subIDs = nil
 	sess.sharedSubs = nil
 	sess.sharedCharged = nil
@@ -420,26 +419,16 @@ func (sess *mqttSession) prepareClear() (*mqttPreparedClear, error) {
 	return p, nil
 }
 
-// settleDiscardAuthority is the discard boundary's ONE authority read, and it SETTLES rather
-// than refuses (issue #107 8a, consult 119). A discard that meets a reservation or preparation some
-// acceptance left standing settles it first — finalize, cancel or close as its verdict licenses
-// — so the discard then sees only states every caller already handles: SERVING at this
-// generation (a receipted discard), ABSENT or CLOSED (receiptless, as always), or a record a
-// committed proposal already moved (the claim supersedes). Refusing instead would hand every
-// discard caller a new outcome to recover from, and some of them — a pending-discard finisher
-// that has already taken its obligation — have nowhere to put it.
+// settleDiscardAuthority is the discard boundary's ONE authority read: the authority the
+// teardown claim will CAS. Acceptances are one batch each (issue #133), so no proposal can
+// stand for it to settle; the claim then reads SERVING at this generation (it claims), or
+// anything else (a successor moved the record, or the generation is no longer current), which
+// the claim's own composition refuses or reports superseded.
 //
 // Placed after the record fence and the in-fence uncertainty check, holding neither sess.mu nor
 // asm.mu. It needs no client-ID gate: it touches no binding and no local state, and the
-// proposal's receipt slot and the authority CAS arbitrate every race durably. The sequence is
-// read under sess.mu and released before any request.
-//
-// THE RESIDUE, stated rather than hidden: a settlement still unresolved when its bound of one
-// request timeout runs out — the store cannot answer — leaves the proposal standing, and the
-// discard proceeds exactly as it did before this boundary existed: a receiptless claim, no
-// authorized discarding closure, no enrolment. The record CAS still arbitrates that claim
-// against the proposal's own metadata commit. docs/CONFORMANCE.md states it ("The discard
-// boundary's settlement can fail", issue #107).
+// authority CAS arbitrates every race durably. The sequence is read under sess.mu and released
+// before any request.
 func (sess *mqttSession) settleDiscardAuthority() (mqttAuthorityLoad, bool) {
 	if sess.asm == nil {
 		return mqttAuthorityLoad{}, false
@@ -451,26 +440,14 @@ func (sess *mqttSession) settleDiscardAuthority() (mqttAuthorityLoad, bool) {
 		// No record: nothing to arbitrate, and destroy reads no authority for it either.
 		return mqttAuthorityLoad{}, false
 	}
-	b, berr := mqttNewOwnershipBudget(time.Now(), sess.jsa.boundarySettlementTotal())
-	if berr != nil {
-		return sess.jsa.loadOutboundAuthority(sess.id, sess.asm.sessStreamEpoch), true
-	}
-	allow := func() error { return mqttOwnershipStepAllowed(b, time.Now(), "discard-boundary settlement") }
-	res, load, err := sess.jsa.settleStandingProposal(sess.id, sess.asm.sessStreamEpoch, sess.domainTk,
-		b, time.Now, allow, newMQTTConnectOwnershipState())
+	// Acceptances are one batch each (issue #133): no proposal can stand, so the boundary only
+	// reads what the discard displaces.
+	load := sess.jsa.loadOutboundAuthority(sess.id, sess.asm.sessStreamEpoch)
 	sess.asm.mu.RLock()
 	hook := sess.asm.testBoundarySettle
 	sess.asm.mu.RUnlock()
 	if hook != nil {
-		hook(sess.id, res.Steps)
-	}
-	if (err != nil || res.Outcome != mqttOwnershipSettled) && sess.jsa.c != nil {
-		reason := res.Reason
-		if err != nil {
-			reason = err.Error()
-		}
-		sess.jsa.c.Warnf("MQTT: the discard of session %q met an ownership proposal it could not settle (%s); "+
-			"it proceeds without a retirement receipt", sess.id, reason)
+		hook(sess.id, 0)
 	}
 	return load, true
 }
@@ -503,17 +480,17 @@ func (p *mqttPreparedClear) destroy(permit mqttRetirementPermit, noWait bool) er
 }
 
 // destroyReleasing is destroy with one addition: onRetirementDurable, when non-nil, is
-// invoked exactly once, as soon as the retirement is DURABLY OWNED — the teardown claim and its
-// receipt on $MQTT_sess, the retirement watermark naming this generation on $MQTT_teardown,
-// and the discarding closure with its recovery root in the $MQTT.inflight. space — and before the shared
+// invoked exactly once, as soon as the retirement is DURABLY OWNED — the teardown claim batch:
+// the marker, the generation's Outstanding entry and the discarding closure with its recovery
+// root — and before the shared
 // closing, the deletions and the record release. The clean close releases the client-ID gate
 // there, so a clean-start successor does not wait for the reclamation that follows: a CONNECT
 // that reads the marked record then finds every fact it needs to displace it
 // (mqttMarkedRecordDisplaceable), and what is left belongs to this continuation, the recovery
 // executor the closure rooted, and the orphan sweep the closure licenses.
 //
-// It is never invoked on a receiptless teardown: with no discarding closure there is no
-// durable owner for the rest, so that teardown keeps the gate to its end.
+// It is invoked only once the claim committed: before it there is no durable owner for the
+// rest, so the teardown keeps the gate until then.
 func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait bool, onRetirementDurable func()) error {
 	sess, tok := p.sess, p.tok
 	defer permit.tr.resolveRetired()
@@ -601,50 +578,23 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 		q2AffGen: q2AffGen, q2AffDur: q2AffDur,
 	}
 
-	// THE DISCARD AUTHORIZATION, captured while the record still stands and the authority
-	// still serves this generation (issue #107, row 8, Gap 1). When present, the claim below
-	// commits a durable teardown receipt in the same atomic batch as the marker, and the
-	// close after it ends this generation's authority discarding — so a reconnect finds
-	// CLOSED and reserves over it rather than SERVING with a deleted record and no way in.
-	//
-	// It is built from the loaded authority's tenure and owning transition, never a reload
-	// at close time: the receipt names the EXACT ownership being retired, and the close
-	// validates the standing authority against it. The targets are the ones just captured
-	// under the fence — the affine consumer, its generation, and the PUBREL proof source —
-	// which is the only moment they are still readable, since the record that named them is
-	// about to go.
-	var receiptAuth *mqttRetirementRequest
-	var closePrev *mqttOutboundAuthority
-	var closePrevSeq uint64
-	if seq != 0 && sess.asm != nil && p.authRead {
-		// The boundary's own load, never a fresher read (see mqttPreparedClear.auth).
-		al := p.auth
-		if al.status == mqttOutboundValid && al.rec != nil &&
-			al.rec.State == mqttAuthorityServing && al.rec.Gen == retiringGen {
-			receiptAuth = &mqttRetirementRequest{
-				Gen: retiringGen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
-				SessWID: retiringWID, SessSeq: seq,
-				Reason: mqttRetireSessionEnd, Discard: true,
-			}
-			receiptAuth.AffineDurable, receiptAuth.AffineGen, receiptAuth.PubRelDurable =
-				mqttAffineRetireDescriptor(q2AffDur, q2AffGen, pubRelDur)
-			// Carried into the close's first-attempt fast path: the authority just read and the
-			// sequence to CAS against. The claim below writes only the marker and the receipt on
-			// $MQTT_sess, never the authority in the $MQTT.inflight. space, so this sequence is still current
-			// when the close commits.
-			closePrev, closePrevSeq = al.rec, al.seq
-		}
+	// THE RETIREMENT THIS DISCARD AUTHORIZES, captured while the record still stands: the targets
+	// just read under the fence (the affine consumer, its generation, and the PUBREL proof source)
+	// are the only moment they are still readable, since the record that named them is about to
+	// go. The claim binds it to the standing ownership and commits it with the marker.
+	ret := mqttRetirementRequest{
+		Gen: retiringGen, SessWID: retiringWID, SessSeq: seq,
+		Reason: mqttRetireSessionEnd,
 	}
+	ret.AffineDurable, ret.AffineGen, ret.PubRelDurable = mqttAffineRetireDescriptor(q2AffDur, q2AffGen, pubRelDur)
 
 	// No persisted record means there is nothing to arbitrate and nothing to
 	// release: the only resources in scope are ones this object created, under a
 	// generation no other broker can name — and no shared acquisition, since acquiring
 	// needs the tenure an accepted CONNECT's record write mints. Delete them and stop.
 	//
-	// A SERVING authority with seq == 0 would be the forbidden SERVING-with-no-record
-	// state, and receiptAuth is nil here by construction (the gate above requires seq != 0),
-	// so this arm never discards an authorized generation on the strength of an absent
-	// record. Resolving that state is proposal recovery's job (Gap 2), not this arm's.
+	// A SERVING authority with seq == 0 would be the forbidden SERVING-with-no-record state;
+	// this arm never discards an authorized generation on the strength of an absent record.
 	if seq == 0 {
 		return sess.deleteTeardownTargets(target, noWait)
 	}
@@ -657,7 +607,12 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	// Four callers are terminal on it and two re-drive. An indeterminate claim is
 	// different again and does fail, so the caller fails closed rather than proceeding
 	// as though a teardown had run. See sess_teardown.go and sess_takeover_redrive.go.
-	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq, retiringWID, receiptAuth)
+	if !p.authRead {
+		return fmt.Errorf("discarding session %q: the discard boundary read no authority, so no generation can be claimed", id)
+	}
+	// THE CLAIM IS THE CLOSE (teardown_claim.go): the marker, the discarding closure and the
+	// generation's Outstanding entry commit as one batch.
+	markerSeq, nonce, claim, err := sess.claimTeardown(tok, &ps, seq, retiringWID, p.auth, ret)
 	switch claim {
 	case mqttTeardownClaimWon:
 	case mqttTeardownClaimSuperseded:
@@ -666,40 +621,10 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 		return err
 	}
 
-	// RECORD THE RETIREMENT, before the first deletion and on a subject a resume
-	// cannot evict. The marker alone cannot carry this fact: it shares the record's
-	// subject, so an unconditional foreign write replaces it and the deletions below
-	// become invisible — a CAS excludes a competing CONDITIONAL write off our base (the
-	// same-base boundary, docs/CONFORMANCE.md) but not one carrying no expectation. A failure here aborts the teardown with
-	// NOTHING deleted, leaving the record marked — the already-handled self-healing
-	// state, which the next CONNECT, the expiry path or the sweep finishes, each
-	// recording the retirement first. See sess_teardown.go.
-	//
-	// retiringWID rides along, captured above BEFORE the reset for the same reason the
-	// generation and the sequence were. It is no longer STORED — the watermark's rwid field
-	// was removed, because a write identity names a record's bytes rather than one
-	// occurrence of them — but it is still the PRECONDITION: a record carrying no identity
-	// cannot be retired by name, so recordGenRetirement fails the teardown closed before
-	// any deletion. Reading sess.wid here would read the zero the reset just wrote.
-	if err := sess.recordGenRetirement(target, nonce, retiringWID, markerSeq); err != nil {
-		return err
-	}
-	// CLOSE THE AUTHORITY, discarding, BEFORE the record is deleted and before the shared
-	// acquisitions are released (issue #107, row 8, Gap 1). The receipt committed with the marker
-	// authorizes it; the close ends this generation with a permanent discarding closure that
-	// seals the inventory, enrols the affine consumer for its recovery owner and roots the
-	// recovery pass. A failure leaves the record MARKED with the receipt beside it, which is
-	// the self-healing state: an adopter loads the same receipt and finishes the same close.
-	// Ordering is the point — the close commits before the record delete, so a crash between
-	// them leaves CLOSED authority and a marker an adopter finishes, never a lost closure.
-	if receiptAuth != nil {
-		if err := sess.jsa.closeTeardownGenerationFast(id, sess.asm.sessStreamEpoch, sess.domainTk,
-			retiringGen, closePrev, closePrevSeq, receiptAuth); err != nil {
-			return fmt.Errorf("discarding session %q: %w", id, err)
-		}
+	{
 		// THE DISCARDED GENERATION'S RETIREMENT STARTS HERE, before the shared closing and
-		// independently of it (issue #107 7d): the closure just committed is the licence of every
-		// step, and the prompt drive visits its root with the recovery executor itself.
+		// independently of it (issue #107 7d): the closure the claim committed is the licence of
+		// every step, and the prompt drive visits its root with the recovery executor itself.
 		sess.asm.kickRecoveryRoot(id, sess.asm.sessStreamEpoch, retiringGen)
 		// THE RETIREMENT IS NOW DURABLY OWNED. Everything below is named by retiringGen and acts
 		// on this removed, re-minted object or on durable state, exactly as finishAdoptedTeardown
@@ -723,8 +648,8 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	// can be admitted under it any more, seal its acquisition ledger (from here no join of this
 	// generation can land), release every acquisition it lists (one arbitrated ledger+group
 	// CAS each, retiring an incarnation whose count reaches zero), and refuse to go on until
-	// the ledger reads sealed and empty. Without that licence — a receiptless teardown over an
-	// authority that can still admit, the boundary's settlement residue — it withholds. Every
+	// the ledger reads sealed and empty. Without that licence — an authority that can still
+	// admit at the generation — it withholds. Every
 	// failure leaves the record MARKED, so the adoption, which settles first, repeats exactly
 	// this from the durable ledger. Named by retiringGen — sess.gen was just re-minted above.
 	if sess.asm != nil {
@@ -772,12 +697,10 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	// THE METADATA RELEASE IS GATED ON DURABLE FACTS ABOUT THE CLOSED GENERATION, on the
 	// owner's own path exactly as on the adopted one (issue #107, row 8). Releasing the record is
 	// what lets a fresh acceptance in; if the old generation still has duties nothing will
-	// traverse, this release makes that permanent. The gate is VACUOUS for a generation with
-	// neither ledger nor closure — the unconverted paths that write no receipt — and it
-	// stands here for the ones that do: once this teardown closed the authority discarding,
-	// the gate refuses the release until the closure is sealed and its surviving work is
+	// traverse, this release makes that permanent. The claim closed the authority discarding,
+	// so the gate refuses the release until the closure is sealed and its surviving work is
 	// enrolled for recovery or certified complete.
-	if receiptAuth != nil && sess.asm != nil {
+	if sess.asm != nil {
 		if facts, ferr := sess.asm.gatherAdoptedReleaseFacts(id, sess.asm.sessStreamEpoch, retiringGen); ferr != nil {
 			return fmt.Errorf("discarding session %q: %w", id, ferr)
 		} else if gerr := mqttAdoptedReleaseAuthorized(id, retiringGen, facts); gerr != nil {
@@ -788,7 +711,7 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	// RELEASE. Always confirmed, even on the no-wait path — see releaseTeardown. The shared
 	// acquisitions were released from the sealed ledger ABOVE, before this; nothing after
 	// the record's release reads it. Spec5 [4.8.2].
-	switch res, cur, curSeq, rerr := sess.releaseTeardown(tok, target, nonce, markerSeq); res {
+	switch res, _, _, rerr := sess.releaseTeardown(tok, target, nonce, markerSeq); res {
 	case mqttTeardownReleased:
 		// Ours, and gone. The shared durables are now safe to consider.
 	case mqttTeardownSuperseded:
@@ -798,14 +721,8 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 		// sentinel cannot name. Same sentinel as the claim arm, and it says the same
 		// thing: the base is not current. It does NOT say
 		// nothing was deleted — the deletions above already ran, legitimately, because
-		// the claim was won.
-		//
-		// That is the claim-won deletion window, and this is where it is REPAIRED rather
-		// than only reported: when the survivor carries the generation we just retired,
-		// it names resources that no longer exist, so it is condemned with a fresh
-		// teardown marker before this returns. The sentinel and every caller's
-		// disposition are unchanged. See sess_teardown.go.
-		sess.condemnRetiredSurvivor(tok, target, cur, curSeq)
+		// the claim was won. No survivor of the retired generation can stand there: every record
+		// created after the marker is an acceptance's, of a fresh generation (plan 6.3b).
 		return fmt.Errorf("discarding session %q: %w", id, errMQTTClearSuperseded)
 	default:
 		return rerr

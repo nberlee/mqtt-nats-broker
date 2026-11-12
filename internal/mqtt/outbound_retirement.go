@@ -700,7 +700,7 @@ func mqttSealProvisioningTransition(prev *mqttOutboundAuthority, prevSeq uint64,
 	// boundary is right; the composer was the thing that had to change.
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: r.Gen, Op: op,
 			Kind: mqttTransitionDisposeResource, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -708,7 +708,7 @@ func mqttSealProvisioningTransition(prev *mqttOutboundAuthority, prevSeq uint64,
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(prev.ID), r.Gen, r.Inc),
@@ -776,7 +776,7 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 	}
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: op,
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: r.Gen, Op: op,
 			Kind: mqttTransitionDisposeResource, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -790,7 +790,7 @@ func mqttAuthorizeDeletionTransition(prev *mqttOutboundAuthority, prevSeq uint64
 			// reservation or a preparation and resolves neither. Dropping the creation
 			// proposal made the output invalid under RESERVING, which is a body this
 			// broker would then refuse to read back.
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 		Extra: []mqttTransitionMember{{
 			subj:   mqttResourceSubject(getHash(prev.ID), r.Gen, r.Inc),

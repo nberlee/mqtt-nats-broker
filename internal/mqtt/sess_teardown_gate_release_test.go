@@ -135,28 +135,6 @@ func testConnectCleanPredecessor(t *testing.T, s *Server, o *Options, id string,
 	return p
 }
 
-// testDropSessionUnretired removes a client's record and residency WITHOUT recording a
-// retirement, unlike testOrphanDropSession: the closure is then the only fact that can license
-// the sweep.
-func testDropSessionUnretired(t *testing.T, asm *mqttAccountSessionManager, idHash string) {
-	t.Helper()
-	asm.mu.Lock()
-	for id, ss := range asm.sessions {
-		if ss.idHash == idHash {
-			delete(asm.sessions, id)
-		}
-	}
-	delete(asm.sessByHash, idHash)
-	asm.mu.Unlock()
-	smsg, err := asm.jsa.loadSessionMsg(asm.domainTk, idHash)
-	if err != nil {
-		t.Fatalf("loading the session record: %v", err)
-	}
-	if err := asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil {
-		t.Fatalf("deleting the session record: %v", err)
-	}
-}
-
 func testHoldsPresent(t *testing.T, asm *mqttAccountSessionManager, subjects []string) int {
 	t.Helper()
 	n := 0
@@ -593,7 +571,7 @@ var errTestContinuationAbandoned = errors.New("test: continuation abandoned at t
 // licenses the orphan sweep; a live session's holds are untouched.
 //
 // M10: drop the closure arm of retirementProvenFor -> the holds are retained.
-func TestMQTTOrphanSweepReapsDiscardedGenerationAfterWatermarkReplaced(t *testing.T) {
+func TestMQTTOrphanSweepReapsAnEarlierDiscardedGeneration(t *testing.T) {
 	o := testMQTTDefaultOptionsV5()
 	s := testMQTTRunServer(t, o)
 	t.Cleanup(func() { testMQTTShutdownServer(s) })
@@ -631,8 +609,8 @@ func TestMQTTOrphanSweepReapsDiscardedGenerationAfterWatermarkReplaced(t *testin
 		if rec, _ := testCleanStartRecord(t, asm, g1.hash); rec != nil {
 			return fmt.Errorf("the successor's record still stands")
 		}
-		if r, _, st := asm.jsa.loadGenRetirement(asm.domainTk, g1.hash); st != mqttRetirementValid || r.Gen != g2Gen {
-			return fmt.Errorf("the watermark does not name the successor yet")
+		if !testGenNoncurrent(asm, id, g2Gen) {
+			return fmt.Errorf("the successor's generation is not noncurrent yet")
 		}
 		return nil
 	})
@@ -655,121 +633,6 @@ func TestMQTTOrphanSweepReapsDiscardedGenerationAfterWatermarkReplaced(t *testin
 	}
 	if n := testHoldsPresent(t, asm, live.holds); n != len(live.holds) {
 		t.Fatal("the sweep reached a live session's inbound QoS 2 state")
-	}
-}
-
-// Without a matching watermark, only a VALID closure of exactly this generation that carried an
-// authorized discard licenses the sweep. Every other closure shape leaves the holds exactly
-// where they are, and creates no discard claim in front of them.
-//
-// M12a: ignore Discard -> the preserving case reaps. M12b: skip the decoder's validation -> the
-// wrong-epoch and wrong-identity cases reap. M12c: accept a non-valid load as proof -> the
-// corrupt and unreadable cases reap.
-func TestMQTTOrphanSweepRetainsWithoutDiscardingClosure(t *testing.T) {
-	type shape struct {
-		name   string
-		plant  func(t *testing.T, asm *mqttAccountSessionManager, id, hash, gen string)
-		reaped bool
-	}
-	plantBody := func(t *testing.T, asm *mqttAccountSessionManager, hash, gen string, body []byte) {
-		t.Helper()
-		msg, hdr := mqttFrameBatchWrite(0, body, _EMPTY_, 0, false)
-		if _, err := asm.jsa.storeMsg(mqttGenClosureSubject(hash, gen), hdr, msg); err != nil {
-			t.Fatalf("planting the closure: %v", err)
-		}
-	}
-	plantClosure := func(id, epoch, gen string, discard bool) func(*testing.T, *mqttAccountSessionManager, string, string, string) {
-		return func(t *testing.T, asm *mqttAccountSessionManager, _, hash, holdGen string) {
-			t.Helper()
-			if epoch == _EMPTY_ {
-				epoch = asm.sessStreamEpoch
-			}
-			if gen == _EMPTY_ {
-				gen = holdGen
-			}
-			body, err := json.Marshal(&mqttGenClosure{
-				ID: id, Epoch: epoch, Gen: gen, Txn: "txn-planted-closure", Discard: discard,
-				// The shard is the BODY's client's, so a body naming another client is refused by
-				// the hash binding alone, not by its shard.
-				RootShard: mqttDirShardFor(getHash(id)), RootOrd: 1,
-			})
-			if err != nil {
-				t.Fatalf("marshalling the closure: %v", err)
-			}
-			plantBody(t, asm, hash, holdGen, body)
-		}
-	}
-	shapes := []shape{
-		{"preserving", nil, false},
-		{"absent", func(*testing.T, *mqttAccountSessionManager, string, string, string) {}, false},
-		{"corrupt", func(t *testing.T, asm *mqttAccountSessionManager, _, hash, gen string) {
-			plantBody(t, asm, hash, gen, []byte(`{"id":`))
-		}, false},
-		{"unreadable", nil, false},
-		{"another generation", nil, false},
-		{"another epoch", nil, false},
-		{"another client", nil, false},
-		{"discarding", nil, true},
-	}
-	for i, sh := range shapes {
-		t.Run(sh.name, func(t *testing.T) {
-			o := testMQTTDefaultOptionsV5()
-			s := testMQTTRunServer(t, o)
-			t.Cleanup(func() { testMQTTShutdownServer(s) })
-			asm := testMQTTGetGlobalASM(t, s)
-			testOrphanSetGraces(t, asm, 0, 0)
-			id := fmt.Sprintf("closure-licence-%d", i)
-
-			// Holds of a generation nothing references any more, with no watermark: the state a
-			// broker that died before its teardown leaves.
-			p := testConnectCleanPredecessor(t, s, o, id, 1, nil, mqttV5ConnPropsSessionExpiry(300))
-			testDropSessionUnretired(t, asm, p.hash)
-			if _, _, st := asm.jsa.loadGenRetirement(asm.domainTk, p.hash); st == mqttRetirementValid {
-				t.Fatal("fixture: a watermark stands, so the closure is not what is under test")
-			}
-
-			plant := sh.plant
-			switch sh.name {
-			case "preserving":
-				plant = plantClosure(id, _EMPTY_, _EMPTY_, false)
-			case "discarding", "unreadable":
-				plant = plantClosure(id, _EMPTY_, _EMPTY_, true)
-			case "another generation":
-				plant = func(t *testing.T, asm *mqttAccountSessionManager, _, hash, gen string) {
-					// A discarding closure of ANOTHER generation of the same client.
-					plantClosure(id, _EMPTY_, _EMPTY_, true)(t, asm, id, hash, mqttNewSessGen())
-				}
-			case "another epoch":
-				plant = plantClosure(id, "another-epoch", _EMPTY_, true)
-			case "another client":
-				plant = plantClosure(id+"-other", _EMPTY_, _EMPTY_, true)
-			}
-			plant(t, asm, id, p.hash, p.gen)
-			if sh.name == "unreadable" {
-				closureSubj := mqttGenClosureSubject(p.hash, p.gen)
-				restore := setMQTTTestLoadLastMsgHook(func(stream, subject string) error {
-					if subject == closureSubj {
-						return errors.New("injected: the closure read is indeterminate")
-					}
-					return nil
-				})
-				t.Cleanup(restore)
-			}
-
-			testOrphanSettle(asm, s)
-			if got := testHoldsPresent(t, asm, p.holds) == 0; got != sh.reaped {
-				t.Fatalf("the hold was reaped=%v, want %v", got, sh.reaped)
-			}
-			if !sh.reaped {
-				claim, _, err := asm.jsa.loadQoS2RelClaim(mqttQoS2ClaimSubjectFor(p.holds[0]))
-				if err != nil {
-					t.Fatalf("loading the release claim: %v", err)
-				}
-				if claim != nil && claim.State == mqttQoS2RelStateDiscarded {
-					t.Fatal("an unlicensed sweep fenced the hold with a discard claim")
-				}
-			}
-		})
 	}
 }
 

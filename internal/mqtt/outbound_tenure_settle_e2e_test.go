@@ -272,8 +272,8 @@ func TestForkFenceRefusesADisposalAfterTheRead(t *testing.T) {
 			injectErr.Store(err)
 		}
 	}
-	mqttTestPrepareHandoffReadHookV.Store(&hook)
-	defer mqttTestPrepareHandoffReadHookV.Store(nil)
+	mqttTestAcceptAuthorityReadHookV.Store(&hook)
+	defer mqttTestAcceptAuthorityReadHookV.Store(nil)
 	var redrives atomic.Int32
 	rh := func(id string) {
 		if id == ci.clientID {
@@ -290,7 +290,7 @@ func TestForkFenceRefusesADisposalAfterTheRead(t *testing.T) {
 		t.Fatalf("injecting the disposal: %v", v)
 	}
 	if !injected.Load() {
-		t.Fatal("fixture: the disposal must have been injected at the preparation's read")
+		t.Fatal("fixture: the disposal must have been injected at the acceptance's authority read")
 	}
 	if redrives.Load() != 1 {
 		t.Fatalf("the fence must have taken exactly one full re-drive, got %d", redrives.Load())

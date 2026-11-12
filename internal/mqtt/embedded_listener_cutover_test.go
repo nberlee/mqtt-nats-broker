@@ -69,7 +69,7 @@ func TestEmbeddedListenerCutover(t *testing.T) {
 			t.Fatalf("the refusal does not name the listener's %s as unstamped: %v", name, err)
 		}
 	}
-	if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
+	if strings.Contains(err.Error(), "of the 7 broker-owned streams") {
 		t.Fatalf("the refusal came from the count rule, not the format check: %v", err)
 	}
 	testStopBringUpServer(t, b)

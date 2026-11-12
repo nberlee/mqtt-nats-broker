@@ -241,6 +241,8 @@ func TestValidateSessStreamCarriesTheInflightAndSharedSpaces(t *testing.T) {
 		{"no atomic publish", func(c *StreamConfig) { c.AllowAtomicPublish = false }, "allow_atomic"},
 		// The exact-sequence delete every terminal in-flight path performs.
 		{"deny delete", func(c *StreamConfig) { c.DenyDelete = true }, "deny_delete"},
+		// The bounded filter purges that reclaim a retired generation and lifecycle (issue #133).
+		{"deny purge", func(c *StreamConfig) { c.DenyPurge = true }, "deny_purge"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			si := good()
@@ -253,17 +255,6 @@ func TestValidateSessStreamCarriesTheInflightAndSharedSpaces(t *testing.T) {
 				t.Fatalf("the refusal must name %q, got: %v", tc.errWant, err)
 			}
 		})
-	}
-
-	// DenyPurge stopped being a prerequisite with issue #38, when the teardown's
-	// per-incarnation FILTER PURGE was replaced by reapIncarnationRegisters, which deletes
-	// at exact sequences; and the shared-group records are never removed at all. Refusing
-	// it would reject a hardened stream this broker can use, for a purge that no longer
-	// exists, so this fails if the rejection comes back.
-	si := good()
-	si.Config.DenyPurge = true
-	if err := validateSessStream(si, _EMPTY_, 3); err != nil {
-		t.Fatalf("deny_purge must be accepted: nothing purges the session stream: %v", err)
 	}
 }
 
@@ -313,6 +304,22 @@ func testNewInflightEnv(t *testing.T, clientID string) *testInflightEnv {
 // session's (sess.c): rigs that need that call bind() themselves, as before.
 func testAcceptRigConnection(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession, c *client) {
 	t.Helper()
+	a := testInstallRigAuthority(t, asm, sess)
+	if c.mqtt == nil {
+		c.mqtt = &mqtt{asm: asm, sess: sess}
+	}
+	ent := mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure}
+	c.setOutboundEntitlement(ent)
+	sess.mu.Lock()
+	sess.boundEnt, sess.boundEntOK = ent, true
+	sess.mu.Unlock()
+}
+
+// testInstallRigAuthority returns the session's SERVING authority, installing one in a freshly
+// allocated lifecycle when none serves, with the session moved to that lifecycle's first
+// generation.
+func testInstallRigAuthority(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession) *mqttOutboundAuthority {
+	t.Helper()
 	epoch := asm.sessStreamEpoch
 	a := &mqttOutboundAuthority{
 		ID: sess.id, Epoch: epoch, Gen: sess.gen, Tenure: mqttNewInflightNonce(),
@@ -322,20 +329,40 @@ func testAcceptRigConnection(t *testing.T, asm *mqttAccountSessionManager, sess 
 		al.rec != nil && al.rec.State == mqttAuthorityServing {
 		a = al.rec
 	} else {
+		// THE RIG'S AUTHORITY BELONGS TO A LIFECYCLE, allocated in the registry the way a creation
+		// allocates one (issue #133), so a later acceptance over it has a lifecycle to accept into.
+		// The session takes the lifecycle's first generation, which no record has named yet.
+		shard := mqttLifecycleRegistryShardFor(getHash(sess.id))
+		rl := asm.jsa.loadLifecycleRegistryShard(epoch, shard)
+		if rl.status != mqttOutboundValid && rl.status != mqttOutboundAbsent {
+			t.Fatalf("reading the lifecycle registry: %v", rl.status)
+		}
+		l := rl.rec.Next
+		rl.rec.Next, rl.rec.Active[getHash(sess.id)] = l+1, l
+		rb, _ := json.Marshal(rl.rec)
+		rmsg, rhdr := mqttFrameBatchWrite(rl.seq, rb, _EMPTY_, 0, false)
+		if _, err := asm.jsa.storeMsg(mqttLifecycleRegistrySubject(shard), rhdr, rmsg); err != nil {
+			t.Fatalf("allocating the rig's lifecycle: %v", err)
+		}
+		gen, gerr := mqttGenToken(l, 0)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		sess.mu.Lock()
+		sess.deriveGenerationLocked(gen)
+		sess.mu.Unlock()
+		a.Gen = gen
+		a.Life = &mqttLifecycleState{
+			L: l, Phase: mqttLifecycleServing, NextGenOrd: 1, NextAcceptOrd: 1, NextAnchorOrd: 1,
+			Accept: mqttAcceptance{Ord: 0, At: time.Now().UnixNano(), Tenure: a.Tenure, Nonce: "nonce-boot"},
+		}
 		b, _ := json.Marshal(a)
 		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
 		if _, err := asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(sess.id)), hdr, msg); err != nil {
 			t.Fatalf("installing serving authority: %v", err)
 		}
 	}
-	if c.mqtt == nil {
-		c.mqtt = &mqtt{asm: asm, sess: sess}
-	}
-	ent := mqttOutboundEntitlement{Gen: a.Gen, Tenure: a.Tenure}
-	c.setOutboundEntitlement(ent)
-	sess.mu.Lock()
-	sess.boundEnt, sess.boundEntOK = ent, true
-	sess.mu.Unlock()
+	return a
 }
 
 // peer restores through a distinct account session manager while sharing the same
@@ -1257,21 +1284,7 @@ func (e *testInflightEnv) installServingAuthority(t *testing.T) {
 // under: there is deliberately no missing-authority fallback.
 func testInstallServingAuthority(t *testing.T, asm *mqttAccountSessionManager, sess *mqttSession) {
 	t.Helper()
-	epoch := asm.sessStreamEpoch
-	a := &mqttOutboundAuthority{
-		ID: sess.id, Epoch: epoch, Gen: sess.gen, Tenure: mqttNewInflightNonce(),
-		State: mqttAuthorityServing, Rev: 1, Txn: "txn-boot", OwnerTxn: "txn-boot",
-	}
-	if al := asm.jsa.loadOutboundAuthority(sess.id, epoch); al.status == mqttOutboundValid &&
-		al.rec != nil && al.rec.State == mqttAuthorityServing {
-		a = al.rec
-	} else {
-		b, _ := json.Marshal(a)
-		msg, hdr := mqttFrameBatchWrite(0, b, _EMPTY_, 0, false)
-		if _, err := asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash(sess.id)), hdr, msg); err != nil {
-			t.Fatalf("installing serving authority: %v", err)
-		}
-	}
+	a := testInstallRigAuthority(t, asm, sess)
 	// AND THE FIXTURE CONNECTION IS ACCEPTED UNDER IT, as a real CONNECT's accept loop records
 	// (issue #107 row 2): an ordinary acquisition names the connection's own entitlement.
 	sess.mu.Lock()
@@ -5421,7 +5434,7 @@ func TestMQTTInflightTeardownReapsRegisters(t *testing.T) {
 // live session claims.
 func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, uint64) {
 	t.Helper()
-	orphanHash, orphanGen := getHash("client-departed"), mqttNewSessGen()
+	orphanHash, orphanGen := getHash("client-departed"), testLifecycleGen(t, 1, 0)
 	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
 	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
@@ -5455,7 +5468,7 @@ func (e *testInflightEnv) seedOrphanRegister(t *testing.T, pi uint16) (string, u
 // leaves behind, which is what issue #40 site 3 says absence does not distinguish from death.
 func (e *testInflightEnv) seedOrphanRegisterWithoutLicence(t *testing.T, pi uint16) string {
 	t.Helper()
-	orphanHash, orphanGen := getHash("client-live-remote"), mqttNewSessGen()
+	orphanHash, orphanGen := getHash("client-live-remote"), testLifecycleGen(t, 1, 0)
 	subject := mqttInflightSubject(orphanHash, orphanGen, pi)
 	rec := freshRegisterLineage(&mqttInflightRecord{State: mqttInflightPublish,
 		PI: pi, Dur: orphanHash + "_" + nuid.Next(), Seq: 3, QoS: 1, Nonce: mqttNewInflightNonce(),
@@ -5466,24 +5479,12 @@ func (e *testInflightEnv) seedOrphanRegisterWithoutLicence(t *testing.T, pi uint
 	return subject
 }
 
-// retireClient plants a valid retirement watermark for one client ID and generation.
+// retireClient retires one client ID's generation.
 func (e *testInflightEnv) retireClient(t *testing.T, clientID, gen string) {
 	t.Helper()
-	idHash := getHash(clientID)
-	subject := mqttTeardownSubject(e.asm.domainTk, idHash)
-	_, seq, status := e.asm.jsa.loadGenRetirement(e.asm.domainTk, idHash)
-	var expect uint64
-	if status != mqttRetirementAbsent {
-		expect = seq
-	}
-	r := &mqttGenRetirement{
-		ID: clientID, Gen: gen, MarkerSeq: 1, Nonce: nuid.Next(), Origin: "node1",
-	}
-	if _, err := e.asm.jsa.storeGenRetirementCAS(subject, expect, r); err != nil {
-		t.Fatalf("planting the retirement watermark for %q: %v", clientID, err)
-	}
-	if e.asm.retirementProvenFor(idHash, gen) != mqttRetireProven {
-		t.Fatalf("the planted retirement watermark does not prove generation %q retired", gen)
+	testRetireGeneration(t, e.asm, clientID, gen)
+	if e.asm.retirementProvenFor(getHash(clientID), gen) != mqttRetireProven {
+		t.Fatalf("the retired generation %q is not proven retired", gen)
 	}
 }
 

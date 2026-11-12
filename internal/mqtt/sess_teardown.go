@@ -50,13 +50,9 @@
 package mqtt
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nuid"
@@ -196,31 +192,32 @@ func (c mqttTeardownClaim) String() string {
 	}
 }
 
-// claimTeardown CASes a teardown marker onto this session's record at the sequence
-// the session believes is current, and returns the sequence the marker landed at.
+// claimTeardown makes this session's generation noncurrent and marks its record, in ONE batch
+// (teardown_claim.go, plan 5.2), and returns the sequence the marker landed at.
 //
-// Every rejection is resolved by RE-READING rather than classified directly, for
-// the reason isQoS2CASRejection documents: 10164 means transient clustered
-// contention, not "the subject moved", so treating a rejection as "somebody else
-// owns this" would abandon teardowns that nothing else will finish. The re-read
-// also recovers the case that matters most in the other direction — an
-// indeterminate write whose marker actually landed, which the nonce identifies as
-// ours.
+// al is the discard boundary's own authority read (mqttPreparedClear.auth), never a fresher one,
+// and ret the retirement it authorizes. Only an authority SERVING this generation is claimed; one
+// serving another generation, or already closed, means another teardown or acceptance owns the
+// record (Superseded); an absent one is Inconsistent, since every record is written by an
+// acceptance that creates or advances its authority.
 //
-// ps must be the record content as it stands, so the marker preserves it: any
-// broker must be able to finish this teardown, and the orphan sweep must keep
-// reading the durables it names as referenced.
-// auth, when non-nil, is the durable discard authorization this claim commits ATOMICALLY
-// with the marker: a create-only teardown receipt naming the exact predecessor ownership,
-// the discard reason and the retirement targets a discarding closure enrols. A caller that
-// will close the retiring generation's authority passes it; a caller that only marks the
-// record for another finisher (the orphan sweep, an adopted re-claim) passes nil and the
-// marker is written by the single-message CAS as before. Either way the ARBITRATION is the
-// marker's CAS on the record's own sequence — the receipt only rides it.
-func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, seq uint64, retiringWID string, auth *mqttRetirementRequest) (markerSeq uint64, nonce string, outcome mqttTeardownClaim, err error) {
-	// The marker IS a record write, so it needs the same authorization as any other
-	// (I8): a writer from a terminated generation must not be able to mark — and so
-	// license the deletion of — a record it no longer owns.
+// Every rejection is resolved by RE-READING both the record and the authority, never classified
+// from the error (isQoS2CASRejection): our marker on the record is Landed; the record at our base
+// with the authority at ours is contention or our own batch in process, so the same frozen batch
+// is re-sent; the record at our base with the authority past ours means the frozen batch can
+// never land, so it is recomposed ONCE against the fresh authority, which must still serve this
+// generation under the same ownership; the record past our base without our marker is the
+// existing supersession; anything unreadable is Indeterminate. Re-sends and the recomposition
+// share the claim's bounded allowance.
+//
+// ps must be the record content as it stands, so the marker preserves it: any broker must be able
+// to finish this teardown, and the orphan sweep must keep reading the durables it names.
+func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, seq uint64, retiringWID string,
+	al mqttAuthorityLoad, ret mqttRetirementRequest) (markerSeq uint64, nonce string, outcome mqttTeardownClaim, err error) {
+
+	// The marker IS a record write, so it needs the same authorization as any other (I8): a
+	// writer from a terminated generation must not be able to mark — and so license the deletion
+	// of — a record it no longer owns.
 	sess.mu.Lock()
 	terr := sess.validateRecordTxLocked(tok)
 	sess.mu.Unlock()
@@ -228,59 +225,58 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 		return 0, _EMPTY_, mqttTeardownClaimIndeterminate,
 			fmt.Errorf("refusing to claim the teardown of session %q: %w", ps.ID, terr)
 	}
+	switch {
+	case al.status == mqttOutboundAbsent:
+		return 0, _EMPTY_, mqttTeardownClaimIndeterminate,
+			fmt.Errorf("refusing to claim the teardown of session %q: its record stands with no authority, which no acceptance writes", ps.ID)
+	case al.status != mqttOutboundValid || al.rec == nil:
+		return 0, _EMPTY_, mqttTeardownClaimIndeterminate,
+			fmt.Errorf("refusing to claim the teardown of session %q: its authority reads %v", ps.ID, al.status)
+	case al.rec.State != mqttAuthorityServing || al.rec.Gen != ret.Gen:
+		return 0, _EMPTY_, mqttTeardownClaimSuperseded, nil
+	}
 
-	// One nonce across every attempt, so a write that landed with its response lost
-	// is recognizable as ours on the re-read instead of looking like a peer's.
+	// One nonce and one marker identity across every attempt, so a batch that landed with its
+	// response lost is recognizable as ours on the re-read instead of looking like a peer's.
 	nonce = nuid.Next()
 	marked := *ps
-	// The marker IS a record write, so it carries a lineage like any other: a fresh
-	// identity of its own, parented to the record it was derived from. retiringWID is
-	// passed in because the snapshot arrives with no lineage — the builder mints none —
-	// so a parent derived from ps would come out empty and the marker would look like a
-	// first create. Every attempt below re-sends THESE bytes, so the identity is minted
-	// once and a write that landed with its response lost stays recognisable.
-	// See sess_fork_lineage.go.
+	// The marker carries a lineage like any other record write: a fresh identity of its own,
+	// parented to the record it was derived from. retiringWID is passed in because the snapshot
+	// arrives with no lineage. See sess_fork_lineage.go.
 	marked.WID, marked.PWID = mqttNewRecordWID(), retiringWID
-	marked.Teardown = &mqttSessTeardown{
-		Origin:    sess.jsa.id,
-		Nonce:     nonce,
-		StartedAt: time.Now().Unix(),
-	}
-	// The marker's bytes, minted once so every attempt re-sends the same identity.
+	marked.Teardown = &mqttSessTeardown{Origin: sess.jsa.id, Nonce: nonce, StartedAt: time.Now().Unix()}
 	markerBody, merr := json.Marshal(&marked)
 	if merr != nil {
 		return 0, nonce, mqttTeardownClaimIndeterminate,
 			fmt.Errorf("unable to encode the teardown marker of session %q: %w", ps.ID, merr)
 	}
-	// The discard authorization, when this claim carries one: a create-only receipt bound to
-	// the marker just minted, staged in the same batch. Composed once, off the marker's own
-	// WID, so the receipt and the marker are provably one act.
-	var receiptSubj string
-	var receiptBody []byte
-	if auth != nil {
-		rcpt, cerr := mqttComposeTeardownReceipt(auth.Gen, nonce, marked.WID, *auth)
-		if cerr != nil {
-			return 0, nonce, mqttTeardownClaimIndeterminate,
-				fmt.Errorf("unable to author the teardown receipt of session %q: %w", ps.ID, cerr)
+	ret.Tenure, ret.OwnerTxn = al.rec.Tenure, al.rec.OwnerTxn
+	req := mqttTeardownClaimRequest{
+		ID: ps.ID, Epoch: sess.asm.sessStreamEpoch, Txn: mqttNewInflightNonce(),
+		Prev: al.rec, PrevSeq: al.seq, Retire: ret,
+		RecSubj: mqttSessSubject(sess.domainTk, sess.idHash), RecSeq: seq,
+		Marker: markerBody, Nonce: nonce, MarkerWID: marked.WID,
+	}
+	t, cerr := sess.jsa.composeTeardownClaim(req)
+	if cerr != nil {
+		// Composition reads the closing members and validates the targets this session's memory
+		// captured, before any CAS could say the record moved. A moved record is the supersession
+		// the CAS would have reported, so it is read before the refusal is classified.
+		if smsg, lerr := sess.jsa.loadSessionMsg(sess.domainTk, sess.idHash); (lerr == nil && smsg.Sequence != seq) ||
+			(lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) {
+			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		}
-		receiptBody, merr = json.Marshal(rcpt)
-		if merr != nil {
-			return 0, nonce, mqttTeardownClaimIndeterminate,
-				fmt.Errorf("unable to encode the teardown receipt of session %q: %w", ps.ID, merr)
-		}
-		receiptSubj = mqttTeardownReceiptSubject(sess.domainTk, sess.idHash, auth.Gen)
+		return 0, nonce, mqttTeardownClaimIndeterminate,
+			fmt.Errorf("unable to compose the teardown claim of session %q: %w", ps.ID, cerr)
 	}
 
 	var lastErr error
+	recomposed := false
 	for attempt := 0; attempt < mqttTeardownClaimAttempts; attempt++ {
-		if auth != nil {
-			markerSeq, err = sess.jsa.storeTeardownClaimBatch(sess.domainTk, sess.idHash, seq,
-				receiptSubj, receiptBody, markerBody)
-		} else {
-			markerSeq, err = mqttStoreSessionRecordCASBody(sess.jsa, sess.domainTk, markerBody, sess.idHash, seq)
-		}
+		authSeq, err := sess.jsa.commitAuthorityTransition(t)
 		if err == nil {
-			return markerSeq, nonce, mqttTeardownClaimWon, nil
+			// The marker commits the batch directly after the authority.
+			return authSeq + 1, nonce, mqttTeardownClaimWon, nil
 		}
 		lastErr = err
 
@@ -290,9 +286,8 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 				return 0, nonce, mqttTeardownClaimIndeterminate,
 					fmt.Errorf("unable to resolve the teardown claim of session %q: %w", ps.ID, lerr)
 			}
-			// The record is gone, so this session was already released — by what, an
-			// absence cannot say. There is nothing to claim and nothing to delete on its
-			// behalf.
+			// The record is gone, so this session was already released — by what, an absence
+			// cannot say. There is nothing to claim and nothing to delete on its behalf.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
 		}
 		cur := &mqttPersistedSession{}
@@ -302,471 +297,42 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 		}
 		switch {
 		case cur.Teardown != nil && cur.Teardown.Nonce == nonce:
-			// Our write landed after all; only the response was lost.
+			// Our batch landed; only the response was lost. The batch is atomic, so the
+			// authority carries our entry with it.
 			return smsg.Sequence, nonce, mqttTeardownClaimWon, nil
-		case cur.Teardown != nil:
-			// A teardown marker that is not ours holds this record. Whoever wrote it — or
-			// the next reader that can interpret the record, a CONNECT or a sweep —
-			// finishes it; we delete nothing.
+		case cur.Teardown != nil, smsg.Sequence != seq:
+			// The record moved past our base, or another teardown's marker holds it. Whoever wrote
+			// it — or the next reader that can interpret it — finishes it; we delete nothing.
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
-		case smsg.Sequence != seq:
-			// The record moved past the sequence this claim resolved against.
+		}
+		// The record is still at our base: the authority decides.
+		fresh := sess.jsa.loadOutboundAuthority(ps.ID, sess.asm.sessStreamEpoch)
+		switch {
+		case fresh.status != mqttOutboundValid || fresh.rec == nil:
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to resolve the teardown claim of session %q: its authority reads %v", ps.ID, fresh.status)
+		case fresh.seq == t.PrevSeq:
+			// Contention, or our own batch still in process: the same frozen batch.
+			continue
+		case recomposed:
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("the authority of session %q moved again under a recomposed teardown claim", ps.ID)
+		case fresh.rec.State != mqttAuthorityServing || fresh.rec.Gen != ret.Gen ||
+			fresh.rec.Tenure != ret.Tenure || fresh.rec.OwnerTxn != ret.OwnerTxn:
 			return 0, nonce, mqttTeardownClaimSuperseded, nil
-		case auth != nil:
-			// The record is unchanged at our base, so the marker CAS would retry — but a
-			// batch that also stages a create-only receipt fails as a WHOLE when the receipt
-			// slot is taken, and retrying the same create can never win. A receipt on this
-			// generation carrying a DIFFERENT nonce is another teardown of the same
-			// generation, which is a supersession this claim cannot displace; only our own
-			// receipt (a landed batch whose response was lost) is compatible with retrying.
-			// A generation is minted fresh per incarnation, so this is belt-and-suspenders
-			// over the record read above, not the primary arbiter.
-			if r, _, rst := sess.jsa.loadTeardownReceipt(sess.domainTk, sess.idHash, auth.Gen); rst == mqttOutboundValid && r.Nonce != nonce {
-				return 0, nonce, mqttTeardownClaimSuperseded, nil
-			}
-			// Our receipt or none: transient contention on the marker, retry the batch.
-		default:
-			// Still exactly the record we resolved against, so the rejection was
-			// transient contention, not a lost race. Retry the same CAS.
+		}
+		// Authority-only movement: the frozen batch can never land. Recompose once against the
+		// fresh authority, under a new transition, revalidating the generation and the caps.
+		recomposed = true
+		req.Prev, req.PrevSeq, req.Txn = fresh.rec, fresh.seq, mqttNewInflightNonce()
+		if t, cerr = sess.jsa.composeTeardownClaim(req); cerr != nil {
+			return 0, nonce, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to recompose the teardown claim of session %q: %w", ps.ID, cerr)
 		}
 	}
 	return 0, nonce, mqttTeardownClaimIndeterminate,
 		fmt.Errorf("unable to claim the teardown of session %q at sequence %v after %d attempts: %w",
 			ps.ID, seq, mqttTeardownClaimAttempts, lastErr)
-}
-
-// ---------------------------------------------------------------------------
-// The durable generation-retirement watermark
-// ---------------------------------------------------------------------------
-
-// A won claim licenses the deletions, and the release that would tell us whether we
-// still own the claim runs AFTER them — it has to, because it proves absence rather
-// than authorship, and reordering it would let an admitted proposal recreate the same
-// shape one step later. So the claim marker is the only durable record of the
-// retirement while the deletions run, and the marker lives on the record's own
-// subject: an UNCONDITIONAL foreign write can land after the marker did — a CAS
-// excludes a competing conditional write off that base (the same-base boundary,
-// docs/CONFORMANCE.md) but not one carrying no expectation — and MaxMsgsPer:1 then
-// EVICTS the marker. What survives is a record
-// naming exactly the resources the winner just deleted, with no marker for any
-// adopter or the orphan sweep to find — a hollow survivor nothing repairs.
-//
-// The fix is to keep the retirement fact OFF the replaceable subject. Every teardown
-// that wins its claim first records a permanent per-client watermark on
-// $MQTT_teardown naming the generation it is retiring, and only then deletes. THREE
-// DESTRUCTIVE readers consume it: the winner's own release-superseded arm, which
-// condemns a same-generation survivor; the CONNECT restore, which refuses to resume a
-// retired generation; and the orphan sweep, which condemns one with no CONNECT at all.
-// A fourth route, the record-absent create, no longer draws a CONCLUSION from it: the
-// write-lineage audit removed its inheritance of the retired record's identity, because
-// every verdict that inheritance produced was a false fork, and the identity field
-// itself was removed later still. What that route retains is a corrupt-status read
-// ALONE — it refuses a create over a watermark it cannot read at all, and draws nothing
-// from one it can.
-//
-// A generation whose retirement was ever RECORDED is retired, and stays fenced:
-// nothing ever reaps a watermark, so no GC choice can widen the residual. The
-// deliberate exception is a crash BETWEEN the won claim and the watermark write,
-// which is non-destructive by construction — the write precedes every deletion, so
-// such a generation has lost nothing and is legitimately resumable.
-//
-// The two escapes that remain are instances of the apply-time CAS hole itself: the
-// watermark names only the LATEST retirement, so an older retired generation can
-// reappear through a proposal that outlived a whole intervening session lifecycle,
-// and a cross-term apply on $MQTT_teardown can regress the watermark. Both are stated
-// in docs/CONFORMANCE.md.
-
-// mqttGenRetirementAttempts bounds the retry of the watermark write. Same shape and
-// same reason as the claim: a CAS rejection is contention, resolved by re-reading,
-// never classified. Exhausting it fails the teardown CLOSED, before any deletion.
-const mqttGenRetirementAttempts = 3
-
-// mqttGenRetirement is the durable per-client retirement watermark on
-// $MQTT_teardown, one record per client subject (MaxMsgsPer:1), permanent.
-//
-// MarkerSeq is the $MQTT_sess sequence this teardown's claim marker landed at, and
-// it is the ORDERING field: replacement is decided by it alone and never by
-// last-writer-wins, so a paused writer cannot make an older retirement final
-// (feedback-durable-arbitration-not-dedup). A landed sequence is never 0, so 0 is
-// how a malformed watermark is recognised. Sequences are comparable across the whole
-// stream by construction, because validateTeardownStream refuses a $MQTT_teardown
-// belonging to any other $MQTT_sess incarnation.
-//
-// Gen names the retired incarnation; ID lets every reader check the record hashes
-// back to the subject it was read from. Nonce, Origin and StartedAt are diagnostic.
-type mqttGenRetirement struct {
-	ID        string `json:"id"`
-	Gen       string `json:"gen"`
-	MarkerSeq uint64 `json:"mseq"`
-	Nonce     string `json:"nonce"`
-	Origin    string `json:"origin"`
-	StartedAt int64  `json:"started"`
-}
-
-// mqttRetirementStatus is the typed outcome of a watermark load. There is
-// deliberately no stale-epoch state: a stream whose watermarks could carry another
-// incarnation's sequences is refused wholesale at provisioning (validateTeardownStream),
-// which is the boundary-compliant refusal, rather than classified per read.
-type mqttRetirementStatus int
-
-const (
-	mqttRetirementAbsent        mqttRetirementStatus = iota // no watermark for this client
-	mqttRetirementValid                                     // decoded and fully validated
-	mqttRetirementCorrupt                                   // decode failure, or a field that fails validation
-	mqttRetirementIndeterminate                             // transient load failure
-)
-
-// validateTeardownStream verifies a $MQTT_teardown stream carries the exact
-// permanent-watermark configuration. Derived from what this owner does: a per-client
-// watermark CAS (create-only, or replacement at a known sequence), exact-subject
-// loadLastMsgFor reads, and one filtered walk by the sweep — and NOTHING else. Global
-// message/byte/age limits would eventually evict a permanent fence; DiscardNew would
-// reject the CAS replacement of a client's prior watermark; a source could occupy a
-// client's slot; a size cap would reject the write that gates every deletion.
-//
-// No operation ever deletes or purges here, by design — a retirement fence is
-// permanent, and an age- or delete-based reap of it would be an unfenced reap of the
-// fence itself — so DenyDelete, DenyPurge and SubjectDeleteMarkerTTL are audited
-// NON-prerequisites. No consumer is ever created, so
-// MaxConsumers and ConsumerLimits are waived, and no Nats-TTL is ever sent, so
-// AllowMsgTTL is inert.
-//
-// bundleEpoch is the account's recovery epoch, minted by $MQTT_sess and adopted from
-// its authoritative re-read. A MarkerSeq is a $MQTT_sess SEQUENCE, so watermarks are
-// comparable to each other only within one incarnation of that stream — the sharpest
-// reason any broker-owned stream needs the stamp, which is why this validator carried
-// a private version of the check before the stamp became the bundle's.
-//
-// Both partial-recreation directions this comment used to describe are now REFUSED
-// before any validator runs: the eight streams are one recreation unit, and an account
-// holding a proper subset fails the account-wide preflight
-// (mqttPreflightBrokerStreamBundle). In particular "$MQTT_teardown recreated alone
-// admits with no historical fences" was a stated residual and is no longer reachable
-// through a supported operation. What remains reachable is administrative deletion or
-// a partial restore, which the compatibility boundary does not support and which
-// docs/CONFORMANCE.md records.
-func validateTeardownStream(si *StreamInfo, domainTk string, wantReplicas int, bundleEpoch string) error {
-	if si == nil {
-		return fmt.Errorf("stream info unavailable")
-	}
-	cfg := si.Config
-	if err := validateBrokerOwnedStreamShape(&cfg, []string{mqttTeardownSubjectPrefix + domainTk + ">"}, wantReplicas); err != nil {
-		return err
-	}
-	if cfg.Retention != LimitsPolicy {
-		return fmt.Errorf("retention is %v (want limits): nothing consumes a retirement watermark, so any other retention drops it immediately", cfg.Retention)
-	}
-	if cfg.Discard != DiscardOld {
-		return fmt.Errorf("discard is %v (want old): DiscardNew would reject the CAS replacement of a client's prior watermark", cfg.Discard)
-	}
-	if cfg.MaxMsgsPer != 1 {
-		return fmt.Errorf("max_msgs_per_subject is %d (want 1): the per-client watermark is a single-slot register its CAS depends on", cfg.MaxMsgsPer)
-	}
-	if cfg.MaxMsgs > 0 || cfg.MaxBytes > 0 || cfg.MaxAge > 0 {
-		return fmt.Errorf("global limits set (max_msgs=%d max_bytes=%d max_age=%v; want all unlimited): they would evict a permanent retirement fence, unfencing a generation whose resources are already deleted",
-			cfg.MaxMsgs, cfg.MaxBytes, cfg.MaxAge)
-	}
-	if len(cfg.Sources) > 0 {
-		return fmt.Errorf("stream has sources (want none): a foreign record could occupy a client's watermark slot")
-	}
-	if cfg.MaxMsgSize > 0 {
-		return fmt.Errorf("max_msg_size is %d (want unlimited): it would reject the watermark write that must land before any teardown deletion", cfg.MaxMsgSize)
-	}
-	// The bundle stamp. This stream's own reason for needing it is the sharpest in
-	// the set — a MarkerSeq is a $MQTT_sess SEQUENCE, comparable only within the
-	// incarnation that issued it — but the check itself is the one every
-	// broker-owned stream now runs, so it is the shared helper rather than a
-	// second mechanism stating the same fact (issue #70).
-	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Test hooks over the watermark's two JetStream operations. Atomic for the reason
-// every other seam here is: the sweep goroutine and a connection's readLoop both
-// reach them, so a plain package variable would be a data race.
-//
-// The load hook returns the classified outcome directly, so a test can present a
-// malformed or unreadable watermark to any reader; the store hook fails the write, so
-// a test can prove the teardown aborts BEFORE its first deletion.
-var (
-	mqttTestRetirementLoadHookV  atomic.Pointer[func(idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus)]
-	mqttTestRetirementStoreHookV atomic.Pointer[func(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error)]
-)
-
-// mqttTeardownSubject returns the per-client retirement watermark subject.
-func mqttTeardownSubject(domainTk, idHash string) string {
-	return mqttTeardownSubjectPrefix + domainTk + idHash
-}
-
-// mqttTeardownIDHashFromSubject extracts the client-ID hash token from a watermark
-// subject, requiring the exact shape this account writes. Derived from the SUBJECT
-// rather than from record content for the reason mqttSessIDHashFromSubject documents:
-// a record is not a trusted input, and a hash taken from its body would let one
-// client's watermark speak for another's.
-func mqttTeardownIDHashFromSubject(subject, domainTk string) (string, error) {
-	prefix := mqttTeardownSubjectPrefix + domainTk
-	if !strings.HasPrefix(subject, prefix) {
-		return _EMPTY_, fmt.Errorf("subject does not belong to this account/domain")
-	}
-	hash := subject[len(prefix):]
-	if !mqttValidIDHashToken(hash) {
-		return _EMPTY_, fmt.Errorf("subject carries a malformed client-ID hash token %q", hash)
-	}
-	return hash, nil
-}
-
-// mqttValidateGenRetirement is the ONE definition of a watermark this broker may act
-// on, shared by the writer and every reader. Sharing it is the point: the three
-// destructive readers draw a conclusion from the watermark — condemn a live record,
-// discard a record at CONNECT — so a reader with its own weaker subset would act on a
-// fact the writer would have refused to record. Anything malformed is CORRUPT
-// and fails closed everywhere: the writer aborts before deleting, the CONNECT is
-// refused, and the sweep mutates nothing for that client. It is never repaired in
-// place.
-//
-// A fourth reader, the record-absent CREATE (createOrRestoreSessionWithin), draws no
-// destructive conclusion and no longer draws a PARENT either — the write-lineage audit
-// deleted that inheritance — but it still reads the watermark for one outcome and still
-// REFUSES the CONNECT on a corrupt one. Conceding there would admit a session into a
-// store whose own later teardown can never record its retirement, because
-// recordGenRetirement refuses to replace a watermark it cannot read, and the record would
-// then stay MARKED for every future finisher.
-func mqttValidateGenRetirement(r *mqttGenRetirement, idHash string) error {
-	if r == nil {
-		return fmt.Errorf("no retirement watermark")
-	}
-	if getHash(r.ID) != idHash {
-		return fmt.Errorf("watermark names a client ID that does not hash back to %q", idHash)
-	}
-	if !mqttValidSessGen(r.Gen) {
-		return fmt.Errorf("watermark carries a malformed retired generation %q", r.Gen)
-	}
-	if r.MarkerSeq == 0 {
-		return fmt.Errorf("watermark carries no teardown marker sequence")
-	}
-	return nil
-}
-
-// storeGenRetirementCAS writes r to subject expecting expectSeq as the subject's
-// current last sequence (0 = create-only), mirroring storeQoS2RelClaimCAS.
-func (jsa *mqttJSA) storeGenRetirementCAS(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error) {
-	b, _ := json.Marshal(r)
-	bb := bytes.Buffer{}
-	bb.WriteString(hdrLine)
-	bb.WriteString(JSExpectedLastSubjSeq)
-	bb.WriteString(":")
-	bb.WriteString(strconv.FormatUint(expectSeq, 10))
-	bb.WriteString(CR_LF)
-	bb.WriteString(CR_LF)
-	hdr := bb.Len()
-	bb.Write(b)
-	resp, err := jsa.storeMsg(subject, hdr, bb.Bytes())
-	if err != nil {
-		return 0, err
-	}
-	return resp.Sequence, nil
-}
-
-// loadGenRetirement is the ONE read every reader and the writer use, honoring the
-// test seam so an injected watermark is seen identically by all of them.
-func (jsa *mqttJSA) loadGenRetirement(domainTk, idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
-	if h := mqttTestRetirementLoadHookV.Load(); h != nil {
-		return (*h)(idHash)
-	}
-	return jsa.loadGenRetirementRecord(domainTk, idHash)
-}
-
-// storeGenRetirement is the writer's store, honoring the test seam. Separate from
-// the raw CAS so a hook can delegate to it after observing the call.
-func (sess *mqttSession) storeGenRetirement(subject string, expectSeq uint64, r *mqttGenRetirement) (uint64, error) {
-	if h := mqttTestRetirementStoreHookV.Load(); h != nil {
-		return (*h)(subject, expectSeq, r)
-	}
-	return sess.jsa.storeGenRetirementCAS(subject, expectSeq, r)
-}
-
-// loadGenRetirementRecord reads a client's watermark and classifies it. The subject
-// sequence is returned on every non-absent outcome (it is available pre-decode) so
-// the writer can CAS at the exact sequence it read.
-func (jsa *mqttJSA) loadGenRetirementRecord(domainTk, idHash string) (*mqttGenRetirement, uint64, mqttRetirementStatus) {
-	smsg, err := jsa.loadLastMsgFor(mqttTeardownStreamName, mqttTeardownSubject(domainTk, idHash))
-	if err != nil {
-		if isErrorOtherThan(err, JSNoMessageFoundErr) {
-			return nil, 0, mqttRetirementIndeterminate
-		}
-		return nil, 0, mqttRetirementAbsent
-	}
-	r := &mqttGenRetirement{}
-	if uerr := json.Unmarshal(smsg.Data, r); uerr != nil {
-		return nil, smsg.Sequence, mqttRetirementCorrupt
-	}
-	if verr := mqttValidateGenRetirement(r, idHash); verr != nil {
-		return r, smsg.Sequence, mqttRetirementCorrupt
-	}
-	return r, smsg.Sequence, mqttRetirementValid
-}
-
-// recordGenRetirement durably records that this teardown is retiring t.gen, and is
-// called between the won claim and the first deletion. ALWAYS confirmed, even on a
-// no-wait discard: a fence that only reached a send queue is not a fence.
-//
-// The advance is decided by MarkerSeq ORDERING ALONE — the generation plays no part
-// in it. A generation-equality early return looks equivalent and is not: it would let
-// a newer same-generation retirement be skipped, leaving a paused older writer's CAS
-// to become the final watermark.
-//
-//   - absent -> create-only CAS.
-//   - standing MarkerSeq >= ours -> done. The standing fence is at least as new as
-//     our fact, and equality is our own write already landed.
-//   - standing MarkerSeq < ours -> CAS-replace at the sequence we loaded.
-//   - corrupt -> fail closed. Never overwritten: a watermark we cannot read may name a
-//     retirement newer than ours, and replacing it would unfence that generation.
-//   - rejection / indeterminate -> re-read and decide again (never classify a
-//     rejection: 10164 is contention).
-//
-// The monotonicity is DECISION-time monotonicity. A CAS admitted before a leader
-// transition applies unchecked, so apply-time regression is possible; that is the
-// stated residual, not something this loop can prevent.
-//
-// retiredWID is the identity of the record this teardown is about to delete. It is NOT
-// stored: the watermark used to carry it as an rwid field, and that field was removed
-// because a write identity names a record's BYTES rather than one OCCURRENCE of them —
-// storeFramedSessionMsg replays acknowledged bytes verbatim and restore adopts WID/PWID
-// unvalidated, so one identity can stand at two sequences and no reader could tell which
-// occurrence a retirement removed. See docs/ROADMAP.md's vanished-record bullet for what an
-// exact reader would need instead.
-//
-// What survives is the PRECONDITION it always doubled as, and it is load-bearing: a
-// session record carrying NO identity cannot be retired by name, so its teardown fails
-// CLOSED here, before any deletion, leaving the record marked for a later finisher.
-// Nothing else in the teardown path checks WID or PWID — mqttValidateTeardownTargets
-// does not — so removing this check with the field would have turned that refusal into a
-// successful teardown of a record nothing can name. Threaded in rather than read off t
-// because the target enumerates the RESOURCES an incarnation owns, while this is a fact
-// about the claim: clear() captures it before its reset, and finishAdoptedTeardown takes
-// the marker's own PWID, the record that teardown claimed rather than the marker the
-// release deletes. See TestRetirementWIDlessRecordFailsClosed.
-func (sess *mqttSession) recordGenRetirement(t *mqttTeardownTarget, nonce, retiredWID string, markerSeq uint64) error {
-	if retiredWID == _EMPTY_ {
-		// The precondition, checked where the removed rwid field's validator row used to
-		// enforce it: before `want` is built and before any deletion, and wrapped by the
-		// same refusal below so the failure still names the retirement it could not record.
-		return fmt.Errorf("refusing to record the retirement of session %q: the record it "+
-			"would retire carries no identity", t.id)
-	}
-	subject := mqttTeardownSubject(sess.domainTk, t.idHash)
-	want := &mqttGenRetirement{
-		ID:        t.id,
-		Gen:       t.gen,
-		MarkerSeq: markerSeq,
-		Nonce:     nonce,
-		Origin:    sess.jsa.id,
-		StartedAt: time.Now().Unix(),
-	}
-	if verr := mqttValidateGenRetirement(want, t.idHash); verr != nil {
-		// Refusing to write what we would refuse to read. Reached only if the teardown
-		// target itself is malformed, which every caller's record already excludes.
-		return fmt.Errorf("refusing to record the retirement of session %q: %w", t.id, verr)
-	}
-	var lastErr error
-	for attempt := 0; attempt < mqttGenRetirementAttempts; attempt++ {
-		cur, seq, status := sess.jsa.loadGenRetirement(sess.domainTk, t.idHash)
-		var expect uint64
-		switch status {
-		case mqttRetirementValid:
-			if cur.MarkerSeq >= markerSeq {
-				return nil
-			}
-			expect = seq
-		case mqttRetirementAbsent:
-			expect = 0
-		case mqttRetirementCorrupt:
-			return fmt.Errorf("refusing to retire generation %q of session %q: its retirement watermark is unreadable",
-				t.gen, t.id)
-		default: // mqttRetirementIndeterminate
-			lastErr = fmt.Errorf("retirement watermark load indeterminate")
-			continue
-		}
-		if _, err := sess.storeGenRetirement(subject, expect, want); err == nil {
-			return nil
-		} else {
-			lastErr = err
-			// The write may have landed with its response lost, or lost the CAS to a
-			// concurrent higher write. A re-read of the durable truth resolves both, and
-			// either way the fence we needed is standing.
-			if sess.retirementFenced(t.idHash, markerSeq) {
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("unable to record the retirement of generation %q of session %q after %d attempts: %w",
-		t.gen, t.id, mqttGenRetirementAttempts, lastErr)
-}
-
-// retirementFenced reports whether the durable watermark is a valid one whose
-// MarkerSeq is at least markerSeq — i.e. whether the fence this teardown needed is
-// standing, whoever wrote it. Used to resolve an ambiguous write.
-func (sess *mqttSession) retirementFenced(idHash string, markerSeq uint64) bool {
-	r, _, status := sess.jsa.loadGenRetirement(sess.domainTk, idHash)
-	return status == mqttRetirementValid && r.MarkerSeq >= markerSeq
-}
-
-// condemnRetiredSurvivor marks the record that superseded this teardown's release
-// when that record is the HOLLOW SURVIVOR of the deletion window: same generation,
-// unmarked, naming resources this teardown has already destroyed.
-//
-// Called from BOTH release-superseded arms — clear()'s and finishAdoptedTeardown's —
-// before they return their existing sentinels. It is a side repair, not a new
-// outcome: no caller disposition changes.
-//
-// MARK ONLY. It writes a fresh teardown marker preserving the record's content and
-// stops: a marked record is the fully-handled self-healing state, and every route out
-// of it already exists. The survivor's broker observes the foreign marker on its
-// session-record watch (or the committed-read backstop) and evicts, its client's
-// reconnect adopts the marker and starts fresh with Session Present false, and with
-// no client the expiry path or the sweep's marker-adoption class finishes it.
-// Deleting or releasing here instead would remove the record before the survivor's
-// broker could observe the move, which is the issue #40 shape rather than a repair.
-func (sess *mqttSession) condemnRetiredSurvivor(tok recordTx, t *mqttTeardownTarget,
-	cur *mqttPersistedSession, curSeq uint64) {
-
-	if cur == nil || curSeq == 0 {
-		return
-	}
-	if cur.Gen != t.gen {
-		// A DIFFERENT generation, so this teardown - which retires one generation, not a
-		// client ID - has no business with it. That is a lineage fact and not a claim that
-		// anyone holds the session (issue #86); it does not need to be one, because the
-		// conclusion drawn is the negative one: do not condemn. This comparison is what
-		// keeps the repair from being collateral damage, so it is the one the mutation
-		// matrix removes.
-		return
-	}
-	if cur.Teardown != nil {
-		// A foreign teardown already owns the survivor; its finisher handles it.
-		return
-	}
-	// A marker LICENSES its adopters to delete every durable the record names, so a
-	// record that fails the name-binding checks is condemned by nothing: it is left to
-	// the unadoptable-record rules rather than marked. Readers 2 and 3 apply the same
-	// check for the same reason.
-	if verr := mqttValidateTeardownTargets(cur, t.idHash); verr != nil {
-		sess.jsa.c.Warnf("MQTT: refusing to condemn the surviving record of session %q: %v", t.id, verr)
-		return
-	}
-	_, _, outcome, err := sess.claimTeardown(tok, cur, curSeq, cur.WID, nil)
-	switch outcome {
-	case mqttTeardownClaimWon:
-		sess.jsa.c.Warnf("MQTT: condemned the record of session %q, which survived the teardown of generation %q and names resources it deleted",
-			t.id, t.gen)
-	default:
-		// The subject moved again, or the outcome is unknown. The watermark still
-		// stands, so readers 2 and 3 remain the backstop; one attempt is all this arm
-		// takes.
-		sess.jsa.c.Debugf("MQTT: could not condemn the surviving record of session %q (%v): %v", t.id, outcome, err)
-	}
 }
 
 // secureQ2AffPubRelProofs records the PUBREC proof carried by every stored PUBREL of the
@@ -1040,7 +606,7 @@ func (sess *mqttSession) deleteTeardownTargets(t *mqttTeardownTarget, noWait boo
 	// indeterminate register now ABORTS the teardown rather than being purged blind, so
 	// the record is not released while a register of unknown status remains. What can then
 	// re-drive it is route-specific: a record-backed teardown keeps its marked record and
-	// its retirement watermark, so a later attempt re-enumerates, while clear()'s
+	// its generation's Outstanding entry, so a later attempt re-enumerates, while clear()'s
 	// no-record branch (seq == 0) returns before the claim and has neither, and the
 	// clean-start predecessor cleanup runs after its record is already displaced — there
 	// nothing re-drives it and only the orphan sweep, under a retirement proof, can reap
@@ -1125,7 +691,15 @@ func (sess *mqttSession) releaseTeardown(tok recordTx, t *mqttTeardownTarget, no
 				// Cannot classify: no conclusion, and therefore no further deletions.
 				return mqttTeardownIndeterminate, nil, 0, fmt.Errorf("unable to verify the teardown release of session %q: %w", t.id, lerr)
 			}
-			return mqttTeardownReleased, nil, 0, nil // absent: done
+			// Absent: the record is released. The lifecycle-scoped half records it; one that
+			// does not land leaves the generation's release pending, which the sweep finishes
+			// from the positive entry and the record's absence (plan 5.2).
+			if sess.asm != nil {
+				if rerr := sess.asm.releaseTeardownEntry(t.id, t.gen, nonce, nil); rerr != nil {
+					sess.jsa.c.Warnf("MQTT: the release of session %q generation %q is not yet recorded: %v", t.id, t.gen, rerr)
+				}
+			}
+			return mqttTeardownReleased, nil, 0, nil
 		}
 		ps := &mqttPersistedSession{}
 		if uerr := json.Unmarshal(smsg.Data, ps); uerr != nil {
@@ -1201,15 +775,7 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	// already refused it earlier (the CONNECT restore compares ps.ID to the connecting
 	// client, and the sweep runs mqttValidateTeardownTargets); the expiry path did not,
 	// and this is where it fails closed.
-	//
-	// The retired record's identity is the MARKER'S PARENT, not the marker's own WID:
-	// claimTeardown parents the marker to the record it claimed, and that record — not
-	// the marker, which this release deletes — is the one this teardown's deletions
-	// remove. It is no longer STORED on the watermark, and passing ps.WID here would
-	// still be wrong: what it supplies is recordGenRetirement's PRECONDITION, and the
-	// marker's own identity would satisfy it for a claimed record that has none. An empty
-	// value is refused there, which is how a record carrying no lineage fails its
-	// adoption closed. See recordGenRetirement.
+
 	// SETTLE FIRST, on EVERY adoption (issue #107 8b). A proposal standing over a marked record can
 	// only be ABORTED — its metadata commit CASes the record at a sequence the marker claimed
 	// past — so settlement cancels a preparation back to its serving predecessor or closes an
@@ -1222,42 +788,21 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	if serr != nil {
 		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, serr)
 	}
-	_, _, rst := as.jsa.loadTeardownReceipt(as.domainTk, idHash, ps.Gen)
-	switch rst {
-	case mqttOutboundValid, mqttOutboundAbsent:
-	default:
-		return fmt.Errorf("adopting the teardown of session %q: its teardown receipt reads %v, which licenses nothing", ps.ID, rst)
+	// THE CLAIM'S OWN EVIDENCE (plan 5.2): a marker is committed with its generation's
+	// Outstanding entry and its discarding closure, as one batch. The
+	// adoption reads the entry naming this marker; a marker the authority does not carry is
+	// Inconsistent, and nothing is deleted on its strength.
+	if auth.status != mqttOutboundValid || auth.rec == nil || auth.rec.Life == nil ||
+		!mqttOutstandingNamesMarker(auth.rec.Life, ps.Gen, ps.Teardown.Nonce) {
+		return fmt.Errorf("adopting the teardown of session %q: the authority (%v) carries no outstanding entry for its marker",
+			ps.ID, auth.status)
 	}
-	// THE RECEIPTLESS CONTINUATION (issue #107 8b, consult 121): no receipt, and the settled authority
-	// still serves this generation. The receipt is committed with the marker itself, CAS'd at
-	// the sequence this adoption holds; the adoption continues from where the marker now stands.
-	if rst == mqttOutboundAbsent && auth.status == mqttOutboundValid && auth.rec != nil &&
-		auth.rec.State == mqttAuthorityServing && auth.rec.Gen == ps.Gen {
-		newSeq, cerr := as.claimTeardownReceipt(ps, idHash, seq, auth)
-		if cerr != nil {
-			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, cerr)
-		}
-		seq, rst = newSeq, mqttOutboundValid
+	// The discarding closure the claim committed: its retirement is the recovery executor's,
+	// promptly and independently of the shared closing below (issue #107 7d).
+	if err := as.jsa.closeTeardownGeneration(ps.ID, as.sessStreamEpoch, ps.Gen); err != nil {
+		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
 	}
-	if err := sess.recordGenRetirement(target, ps.Teardown.Nonce, ps.PWID, seq); err != nil {
-		return err
-	}
-	// COMPLETE THE AUTHORIZED DISCARDING CLOSE the owner may not have finished (issue #107, row 8,
-	// Gap 1). A teardown marker that carries a durable receipt is a standalone discard: the
-	// owner committed the receipt with the marker, then may have crashed before or after
-	// closing the authority. The adopter loads the SAME receipt and drives the SAME close,
-	// which is idempotent — a standing discarding closure of this generation is success, and a
-	// still-SERVING authority is closed now. Only then is it safe never to resume this
-	// generation and to delete its record below. A marker with no receipt is an unconverted
-	// teardown (an orphan-sweep re-claim), which closes nothing and behaves as before.
-	if rst == mqttOutboundValid {
-		if err := as.jsa.closeTeardownGeneration(ps.ID, as.sessStreamEpoch, as.domainTk, ps.Gen); err != nil {
-			return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, err)
-		}
-		// The discarding closure stands: its retirement is the recovery executor's, promptly and
-		// independently of the shared closing below (issue #107 7d).
-		as.kickRecoveryRoot(ps.ID, as.sessStreamEpoch, ps.Gen)
-	}
+	as.kickRecoveryRoot(ps.ID, as.sessStreamEpoch, ps.Gen)
 	// CLOSE THE SHARED ACQUISITIONS of the adopted generation through the ONE closing driver
 	// (issue #107 8b), exactly as on the owner's path and before its first deletion: licensed by the
 	// generation's closure record or a settled authority proving it never served, seal, release
@@ -1326,14 +871,11 @@ func (as *mqttAccountSessionManager) finishAdoptedTeardown(ps *mqttPersistedSess
 	} else if gerr := mqttAdoptedReleaseAuthorized(ps.ID, ps.Gen, facts); gerr != nil {
 		return fmt.Errorf("adopting the teardown of session %q: %w", ps.ID, gerr)
 	}
-	switch res, cur, curSeq, rerr := sess.releaseTeardown(tok, target, ps.Teardown.Nonce, seq); res {
+	switch res, _, _, rerr := sess.releaseTeardown(tok, target, ps.Teardown.Nonce, seq); res {
 	case mqttTeardownReleased:
 	case mqttTeardownSuperseded:
-		// The claim-won deletion window, reached through the ADOPTION path: this
-		// adoption's deletions ran legitimately and the record that survived them may be
-		// the same generation's, naming what is now gone. Condemn it before returning the
-		// sentinel below, which is unchanged.
-		sess.condemnRetiredSurvivor(tok, target, cur, curSeq)
+		// The record moved after this adoption's deletions ran: an acceptance of a fresh
+		// generation, never a survivor of this one (plan 6.3b).
 		// A record that is not ours is there now. Nothing further is ours to delete —
 		// and in particular the group durables its membership may hold are not.
 		//
@@ -1383,24 +925,11 @@ func mqttTeardownTargetFromRecord(ps *mqttPersistedSession, idHash string) *mqtt
 	return t
 }
 
-// settleAdoptedAuthority settles whatever ownership proposal stands for an adopted teardown's
-// client and returns the authority as the settlement last read it (issue #107 8b). The same
-// settlement-arms-only run the discard boundary uses (settleStandingProposal), bounded by one
-// request timeout. A proposal it could not settle is an error: the adoption withholds.
+// settleAdoptedAuthority reads the authority an adopted teardown's client stands under (issue
+// #107 8b). Acceptances are one batch each (issue #133), so no proposal can stand to be settled;
+// an authority the store cannot answer for is an error, and the adoption withholds.
 func (as *mqttAccountSessionManager) settleAdoptedAuthority(id string) (mqttAuthorityLoad, error) {
-	b, berr := mqttNewOwnershipBudget(time.Now(), as.jsa.boundarySettlementTotal())
-	if berr != nil {
-		return mqttAuthorityLoad{}, berr
-	}
-	allow := func() error { return mqttOwnershipStepAllowed(b, time.Now(), "adopted-teardown settlement") }
-	res, load, err := as.jsa.settleStandingProposal(id, as.sessStreamEpoch, as.domainTk, b, time.Now, allow,
-		newMQTTConnectOwnershipState())
-	if err != nil {
-		return load, fmt.Errorf("%w: settling the standing ownership proposal: %v", errMQTTClosingUnlicensed, err)
-	}
-	if res.Outcome != mqttOwnershipSettled {
-		return load, fmt.Errorf("%w: an ownership proposal still stands (%s)", errMQTTClosingUnlicensed, res.Reason)
-	}
+	load := as.jsa.loadOutboundAuthority(id, as.sessStreamEpoch)
 	switch load.status {
 	case mqttOutboundValid, mqttOutboundAbsent:
 		return load, nil

@@ -360,7 +360,7 @@ func TestBrokerStreamBundlePreflightUndecidedFailsClosed(t *testing.T) {
 				if !strings.Contains(err.Error(), n) {
 					t.Fatalf("the refusal must name the undecided stream %s: %v", n, err)
 				}
-				if strings.Contains(err.Error(), "of the 8 broker-owned streams") {
+				if strings.Contains(err.Error(), "of the 7 broker-owned streams") {
 					t.Fatalf("%s was counted as ABSENT rather than undecided: %v", n, err)
 				}
 			})

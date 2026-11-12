@@ -39,10 +39,9 @@ import "fmt"
 //
 // Selecting on "is there a resource record with a cleanup duty" is contradictory: removing either
 // record would then silently make a transferred target synchronous, while the release gate must
-// REFUSE exactly that state. The closure's `Discard` member is immutable, written by the act that
-// had the protocol event in front of it, and it partitions the population without overlap: a
-// discarding closure REQUIRES the enrolment and refuses without it; a non-discarding one enrols
-// no affine target at all and refuses nothing.
+// REFUSE exactly that state. The closure is immutable, written by the act that had the protocol
+// event in front of it, and every closure discards (issue #133): a closed generation with an
+// inventory REQUIRES the enrolment and refuses without it.
 
 // mqttTeardownClass is who owns this generation's transferable cleanup.
 type mqttTeardownClass uint8
@@ -53,22 +52,23 @@ const (
 	mqttTeardownOwnerUnknown mqttTeardownClass = iota //nolint:unused // the zero value is a REFUSAL by name: an unclassified teardown stalls rather than deletes
 	// mqttTeardownOwnerVacuous: nothing was admitted through the authority.
 	mqttTeardownOwnerVacuous
-	// mqttTeardownOwnerPreserving: an inventory exists and its closure does not discard, so
-	// the affine consumer was never transferred.
-	mqttTeardownOwnerPreserving
 	// mqttTeardownOwnerDiscarding: an inventory exists, its closure discards, and the affine
 	// target is enrolled. Its physical deletion belongs to the recovery pass.
 	mqttTeardownOwnerDiscarding
+	// mqttTeardownOwnerObsolete: the generation is RETIRED (issue #133), its closure and ledger
+	// purged with it. Its work is done and its recovery deleted what it owned, so the teardown
+	// deletes nothing: never the vacuous class, which licenses deleting everything.
+	mqttTeardownOwnerObsolete
 )
 
 func (c mqttTeardownClass) String() string {
 	switch c {
 	case mqttTeardownOwnerVacuous:
 		return "vacuous"
-	case mqttTeardownOwnerPreserving:
-		return "enrolled, preserving"
 	case mqttTeardownOwnerDiscarding:
 		return "enrolled, discarding"
+	case mqttTeardownOwnerObsolete:
+		return "retired"
 	}
 	return "indeterminate"
 }
@@ -89,8 +89,8 @@ type mqttTeardownOwnership struct {
 // PUBREL consumers and its retained registers go to the recovery executor (issue #107 7d), and its
 // enrolled affine consumer as before.
 func (o mqttTeardownOwnership) transfers(t *mqttTeardownTarget) {
-	t.deferAffineDelete = o.Class == mqttTeardownOwnerDiscarding && o.Affine != nil
-	t.transferLogical = o.Class == mqttTeardownOwnerDiscarding
+	t.deferAffineDelete = (o.Class == mqttTeardownOwnerDiscarding && o.Affine != nil) || o.Class == mqttTeardownOwnerObsolete
+	t.transferLogical = o.Class == mqttTeardownOwnerDiscarding || o.Class == mqttTeardownOwnerObsolete
 }
 
 // classifyTeardownGeneration decides who owns this generation's transferable cleanup.
@@ -119,22 +119,42 @@ func (as *mqttAccountSessionManager) classifyTeardownGeneration(id, epoch, gen s
 	}
 
 	if closed == nil && led == nil {
-		out.Class = mqttTeardownOwnerVacuous
-		return out, nil
+		// ABSENT IS VACUOUS ONLY WHILE THE GENERATION'S RECORDS CAN STAND. A retired generation's
+		// are purged, so its absence is obsolete completion; one whose retirement is under way
+		// (fenced or bounded) is withheld; and an authority that cannot be read says neither.
+		al := as.jsa.loadOutboundAuthority(id, epoch)
+		if al.status != mqttOutboundValid && al.status != mqttOutboundAbsent {
+			return out, fmt.Errorf("generation %q has no closure and no ledger, and its authority "+
+				"reads %v, so this broker cannot say whether they were never written or purged", gen, al.status)
+		}
+		// Vacuous needs POSITIVE standing that the records can still stand (current, or
+		// outstanding and open). Unresolved is never a licence: a lifecycle whose retirement
+		// purged the authority but has not completed reads unresolved, as does an unreadable
+		// registry, and either may have purged what this would read as never written.
+		switch s, entry := as.jsa.genStandingFromLoad(epoch, getHash(id), gen, al); {
+		case s == mqttGenRetired:
+			out.Class = mqttTeardownOwnerObsolete
+			return out, nil
+		case s == mqttGenOutstanding && entry.Phase != mqttOutstandingOpen:
+			return out, fmt.Errorf("generation %q is being retired (phase %d), so its absent closure "+
+				"and ledger may be purged rather than never written", gen, entry.Phase)
+		case s == mqttGenCurrent, s == mqttGenOutstanding:
+			out.Class = mqttTeardownOwnerVacuous
+			return out, nil
+		default:
+			return out, fmt.Errorf("generation %q has no closure and no ledger, and its standing is %v, "+
+				"so this broker cannot say whether they were never written or purged", gen, s)
+		}
 	}
 	if closed == nil {
 		// AN INVENTORY WITH NO CLOSURE. Not vacuous — there is an inventory — and not enrolled
 		// either, because nothing says the generation ended or what its disposition was. The
 		// release gate refuses this too, and so does this.
 		return out, fmt.Errorf("generation %q of client %q has an inventory and no closure "+
-			"record, so nothing says whether its obligations were abandoned or preserved", gen, id)
-	}
-	if !closed.Discard {
-		out.Class = mqttTeardownOwnerPreserving
-		return out, nil
+			"record, so nothing says its obligations were abandoned", gen, id)
 	}
 
-	// A DISCARDING CLOSURE REQUIRES ITS ENROLMENT. This is the "required enrolment missing" case,
+	// A CLOSURE (every one discards) REQUIRES ITS ENROLMENT. This is the "required enrolment missing" case,
 	// and it refuses HERE, at classification, before any downstream work — a later refusal at the
 	// release gate would leave the deletions already done.
 	res, unreadable, rerr := as.enumerateGenerationResources(id, epoch, gen)
@@ -214,7 +234,7 @@ func (as *mqttAccountSessionManager) finishAffinePrerequisites(s *Server, id, ep
 	if rerr := as.jsa.publishAffineReadiness(&mqttAffineReadiness{
 		ID: id, Epoch: epoch, Gen: gen,
 		AffGen: own.Affine.AffGen, Durable: own.Affine.Name, PubRelDur: own.Affine.PubRelDur,
-	}); rerr != nil {
+	}, nil); rerr != nil {
 		s.Debugf("MQTT teardown: asserting the affine readiness of %q/%q: %v", id, gen, rerr)
 		return
 	}

@@ -190,17 +190,19 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 	// permanent arbitration. An absent ownership is never the verdict — a queued claim can land
 	// after any negative read; the attempt's own outcome subject is the only thing that can end it.
 	if len(it.claims) > 0 {
-		landed := false
+		landed, retired := false, false
 		var open []*mqttTransitionHandle
 		for _, h := range it.claims {
 			switch jsa.resolveTransitionHandle(h) {
 			case mqttTransitionLanded, mqttTransitionSuperseded:
 				landed = true
 			case mqttTransitionNeverLanded:
+			case mqttTransitionRetired:
+				retired = true
 			default:
 				// Abort it: the ABORTED outcome takes the attempt's create-only outcome subject,
 				// after which it can never land. A lost abort is re-resolved on the next step.
-				if aerr := jsa.abortTransition(&h.attempt); aerr != nil {
+				if aerr := jsa.abortTransition(&h.attempt, nil); aerr != nil {
 					open = append(open, h)
 				}
 			}
@@ -213,6 +215,10 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 			return mqttReclaimWithheld, fmt.Errorf("claim of %q not yet settled", it.name)
 		}
 		it.claims = nil
+		if retired && !landed {
+			// The claim's generation retired: its claim retries are obsolete and stop.
+			return mqttReclaimDone, nil
+		}
 		if !landed && it.inc == _EMPTY_ {
 			// NOTHING LANDED, positively: no claim, no resource, no consumer this broker made.
 			return mqttReclaimDone, nil
@@ -254,11 +260,6 @@ func (sess *mqttSession) retireSourceStep(it *mqttSourceRetirement) (mqttReclaim
 		case derr == nil:
 			it.disposed = true
 			return mqttReclaimProgress, nil
-		case errors.Is(derr, errMQTTDisposalEntitlementPreparing):
-			// A HANDOFF IS PREPARING over this decision's tenure (issue #107 7f): withheld, not dropped. A
-			// cancellation restores the tenure and the decision lands; a finalization moves it, and
-			// the next attempt drops the item to the successor's settlement.
-			return mqttReclaimWithheld, derr
 		case errors.Is(derr, errMQTTDisposalEntitlementMoved):
 			// THE ENTITLEMENT MOVED ON: the decision is never re-made under the successor. The
 			// successor's own settlement decides the consumer under ITS entitlement if nothing it

@@ -63,10 +63,10 @@ import (
 // exactly it.
 //
 // wantSubjects is the EXACT subject set, compared order-independently and
-// rejecting duplicates. Most owners name one subject; $MQTT_sess names six,
-// because the permanent CONNECT acceptance facts, the handoff outcomes and the
-// teardown receipts share its stream so that one atomic batch can commit them with
-// the record, and the in-flight and shared-group records share it too. Order
+// rejecting duplicates. Most owners name one subject; $MQTT_sess names three,
+// because the outbound records (the authorities among them) and the shared-group
+// records share its stream so that one atomic batch can commit them with the
+// session record. Order
 // independence is not laxity — JetStream does not promise to return a stream's
 // subjects in the order they were configured — while a duplicate really is a
 // misconfiguration: it would let a multi-subject expectation be satisfied by one
@@ -288,7 +288,7 @@ func validateMsgsStream(si *StreamInfo, wantReplicas, maxAckPending int, bundleE
 		return fmt.Errorf("stream consumer max_ack_pending limit is %d, below the broker's effective cap %d: JetStream would reject every consumer create, failing SUBSCRIBE", l, maxAckPending)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the eight broker-owned streams one recreation unit rather than eight
+	// what makes the seven broker-owned streams one recreation unit rather than seven
 	// independently recoverable stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
@@ -363,7 +363,7 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 		return fmt.Errorf("max_consumers is %d (want unlimited): every broker creates its own ephemeral retained-messages consumer, so a cap eventually rejects a legitimate broker start", cfg.MaxConsumers)
 	}
 	// The bundle stamp: this stream carries the account's recovery epoch, which is
-	// what makes the eight broker-owned streams one recreation unit rather than eight
+	// what makes the seven broker-owned streams one recreation unit rather than seven
 	// independently recoverable stores (issue #70).
 	if err := validateBundleEpochStamp(&cfg, bundleEpoch); err != nil {
 		return err
@@ -372,8 +372,8 @@ func validateRetainedStream(si *StreamInfo, wantReplicas int, bundleEpoch string
 }
 
 // validateBundleEpochStamp checks that a stream carries the account's recovery
-// epoch, which is what makes the eight broker-owned streams ONE recreation unit
-// rather than eight independently recoverable stores.
+// epoch, which is what makes the seven broker-owned streams ONE recreation unit
+// rather than seven independently recoverable stores.
 //
 // The epoch is minted by $MQTT_sess at its creation and adopted by every broker
 // from ensureBrokerStream's authoritative re-read, so a stream stamped with a
@@ -553,7 +553,7 @@ func mqttPreflightBrokerStreamBundle(jsa brokerStreamLookupAPI, specs []brokerSt
 			return fmt.Errorf("the broker-owned streams this account held while this broker was starting are gone: "+
 				"a scan saw some of the %d, and a later one saw none, which only a deletion produces. "+
 				"Do not start brokers while streams are being deleted; see docs/ARCHITECTURE.md "+
-				"\"The eight streams are one recreation unit\"", len(specs))
+				"\"The seven streams are one recreation unit\"", len(specs))
 		}
 		sawPartial = true
 		// No rescan STARTS once the budget is spent: the wait is clamped to what remains,
@@ -588,7 +588,7 @@ func mqttBundleStopped(present, absent []string) error {
 }
 
 // mqttBundleSettleBudget is how long a starting broker keeps rescanning a partial
-// bundle before refusing it: long enough for a peer's provisioning of eight streams on a
+// bundle before refusing it: long enough for a peer's provisioning of seven streams on a
 // replicated cluster, short enough that a genuinely partial bundle is reported while
 // the operator is still looking.
 const mqttBundleSettleBudget = 30 * time.Second
@@ -679,7 +679,7 @@ var mqttTestPreflightLookupHookV atomic.Pointer[func(scan int, name string, pres
 // that the two agree, because guidance naming a different set than the preflight
 // enforces is how an operator is sent to delete the wrong thing.
 const mqttBrokerStreamBundleList = mqttSessStreamName + ", " + mqttWillQStreamName + ", " +
-	mqttTeardownStreamName + ", " + mqttStreamName + ", " + mqttQoS2IncomingMsgsStreamName + ", " +
+	mqttStreamName + ", " + mqttQoS2IncomingMsgsStreamName + ", " +
 	mqttQoS2AssignStreamName + ", " + mqttOutStreamName + ", " + mqttRetainedMsgsStreamName
 
 // mqttBrokerStreamNames is the bundle's names in provisioning order, for
@@ -756,8 +756,10 @@ func mqttRetiredStreamPresent(jsa brokerStreamLookupAPI, name string) (bool, err
 	}
 }
 
-// mqttRefuseRetiredMetadataStreams fails startup when this account still holds
-// $MQTT_inflight or $MQTT_shared, whose subject spaces now live on $MQTT_sess.
+// mqttRefuseRetiredMetadataStreams fails startup when this account still holds a stream the
+// broker no longer defines: $MQTT_inflight or $MQTT_shared, whose subject spaces now live on
+// $MQTT_sess, or $MQTT_teardown, whose generation-retirement watermark the authority's
+// lifecycle replaced (issue #133).
 //
 // Lookup-only and run before the provisioning loop, for the reason
 // mqttRefuseRetiredOriginStream states. Without it a full old layout would still
@@ -770,7 +772,7 @@ func mqttRetiredStreamPresent(jsa brokerStreamLookupAPI, name string) (bool, err
 // streams, because a layout that still has them predates the merge throughout.
 func mqttRefuseRetiredMetadataStreams(jsa brokerStreamLookupAPI) error {
 	var held []string
-	for _, name := range []string{mqttRetiredInflightStreamName, mqttRetiredSharedStreamName} {
+	for _, name := range []string{mqttRetiredInflightStreamName, mqttRetiredSharedStreamName, mqttRetiredTeardownStreamName} {
 		present, err := mqttRetiredStreamPresent(jsa, name)
 		if err != nil {
 			return err
@@ -782,10 +784,11 @@ func mqttRefuseRetiredMetadataStreams(jsa brokerStreamLookupAPI) error {
 	if len(held) == 0 {
 		return nil
 	}
-	return fmt.Errorf("this account still holds %s, whose records this broker now keeps on %s; "+
-		"the layout predates that and is an unsupported persisted shape: stop ALL brokers for "+
-		"this account, delete %s and ALL the broker-owned streams (%s), and restart (this is "+
-		"not a rolling upgrade — see docs/ARCHITECTURE.md \"Compatibility boundary\")",
+	return fmt.Errorf("this account still holds %s, which this broker no longer defines (it keeps "+
+		"those records on %s, or no longer keeps them); the layout predates that and is an "+
+		"unsupported persisted shape: stop ALL brokers for this account, delete %s and ALL the "+
+		"broker-owned streams (%s), and restart (this is not a rolling upgrade — see "+
+		"docs/ARCHITECTURE.md \"Compatibility boundary\")",
 		strings.Join(held, " and "), mqttSessStreamName, strings.Join(held, " and "),
 		mqttBrokerStreamBundleList)
 }
@@ -861,27 +864,18 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 	// the epoch.
 	sessCfg := &StreamConfig{
 		Name: mqttSessStreamName,
-		// SIX subject spaces, one stream: the session records, the permanent
-		// per-CONNECT acceptance facts an accepted CONNECT commits atomically WITH
-		// its record, the permanent handoff outcomes issue #107's ownership handoff
-		// commits in that same batch, the per-generation teardown receipts a
-		// discarding teardown commits with its marker, the outbound in-flight
-		// registers and issue #107 outbound records, and the shared-group lifecycle
-		// records. The first four are top-level rather than nested under "sess.",
-		// because every session walk filters "sess.<domainTk>>" and decodes what it
-		// gets as a session record. A batch is per stream, so the fact cannot live
-		// anywhere else without reintroducing the interval in which a session is
-		// accepted and its evidence is not yet durable. The in-flight and shared
-		// spaces carry no domain token, as when each had a stream of its own: each
+		// THREE subject spaces, one stream: the session records, the outbound in-flight
+		// registers and outbound records (the authorities, closures, outcomes and teardown
+		// bindings an accepted CONNECT or a teardown claim commits atomically WITH the record),
+		// and the shared-group lifecycle records. A batch is per stream, so the records a
+		// batch commits with the session record cannot live anywhere else. The in-flight and
+		// shared spaces carry no domain token, as when each had a stream of its own: each
 		// JetStream domain's session stream claims them for that domain. Every CAS
 		// is per subject, so the families share the stream without any write
 		// waiting behind another family's expectation; what they share is the one
 		// stream leader (docs/ARCHITECTURE.md, "Stream prerequisites").
 		Subjects: []string{
 			mqttSessStreamSubjectPrefix + as.domainTk + ">",
-			mqttAcceptSubjectPrefix + as.domainTk + ">",
-			mqttHandoffSubjectPrefix + as.domainTk + ">",
-			mqttTeardownReceiptSubjectPrefix + as.domainTk + ">",
 			mqttInflightStreamSubjectPrefix + ">",
 			mqttSharedLifecycleStreamSubjectPrefix + ">",
 		},
@@ -904,15 +898,6 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 		Subjects:   []string{mqttWillQSubjectPrefix + as.domainTk + ">"},
 		Storage:    FileStorage,
 		Retention:  LimitsPolicy,
-		Replicas:   replicas,
-		MaxMsgsPer: 1,
-	}
-	teardownCfg := &StreamConfig{
-		Name:       mqttTeardownStreamName,
-		Subjects:   []string{mqttTeardownSubjectPrefix + as.domainTk + ">"},
-		Storage:    FileStorage,
-		Retention:  LimitsPolicy,
-		Discard:    DiscardOld,
 		Replicas:   replicas,
 		MaxMsgsPer: 1,
 	}
@@ -1023,26 +1008,6 @@ func (as *mqttAccountSessionManager) brokerStreamSpecs(s *Server,
 			validate: func(si *StreamInfo) error {
 				if verr := validateWillQStream(si, as.domainTk, replicas, as.sessStreamEpoch); verr != nil {
 					return stopAll(verr, mqttWillQStreamName, "delayed-Will outbox")
-				}
-				return nil
-			},
-		},
-		{
-			name: mqttTeardownStreamName,
-			txt:  "teardown retirement watermark",
-			// Durable per-client generation-retirement watermark stream. Permanent
-			// per-client retention (MaxMsgsPer:1, no global limits so a fence is never
-			// evicted; DiscardOld so a CAS replacement of a client's prior watermark is
-			// never rejected). See sess_teardown.go.
-			cfg:       teardownCfg,
-			preCreate: stampEpoch(teardownCfg),
-			validate: func(si *StreamInfo) error {
-				if verr := validateTeardownStream(si, as.domainTk, replicas, as.sessStreamEpoch); verr != nil {
-					// A MarkerSeq is a $MQTT_sess sequence, so these permanent watermarks
-					// are only comparable within the incarnation they were written under.
-					// That coupling is now the bundle's, not a private pair: an unfenced
-					// generation whose resources are already deleted is the cost.
-					return stopAll(verr, mqttTeardownStreamName, "generation-retirement watermark")
 				}
 				return nil
 			},

@@ -45,7 +45,7 @@ func testDisposeBatch(t *testing.T, e *testOutboundEnv, txn string, members ...m
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: al.rec.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionDisposeResource, PrevTxn: al.rec.OwnerTxn, Rev: al.rec.Rev + 1,
 			Gen: al.rec.Gen, Tenure: al.rec.Tenure, OwnerTxn: al.rec.OwnerTxn,
 		},
@@ -53,6 +53,7 @@ func testDisposeBatch(t *testing.T, e *testOutboundEnv, txn string, members ...m
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: al.rec.Gen, Tenure: al.rec.Tenure,
 			State: al.rec.State, Rev: al.rec.Rev + 1, Txn: txn, OwnerTxn: al.rec.OwnerTxn,
+			Life: mqttLifeOf(al.rec),
 		},
 		Extra: members,
 	}

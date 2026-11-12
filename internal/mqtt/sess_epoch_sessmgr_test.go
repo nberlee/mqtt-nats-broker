@@ -136,9 +136,6 @@ func TestSessionManagerEpochResolution(t *testing.T) {
 	if got := si.CachedInfo().Config.Metadata[mqttSessEpochMetaKey]; got != asm.sessStreamEpoch {
 		t.Fatalf("stream metadata epoch %q != resolved %q", got, asm.sessStreamEpoch)
 	}
-	if _, err := js.Stream(ctx, mqttTeardownStreamName); err != nil {
-		t.Fatalf("will-cancel stream must exist: %v", err)
-	}
 
 	// Reuse: a second getOrCreate returns the same manager with the same epoch.
 	asm2, err := s.getOrCreateMQTTAccountSessionManager(c)

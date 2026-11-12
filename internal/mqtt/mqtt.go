@@ -203,15 +203,6 @@ const (
 	mqttSessStreamName          = "$MQTT_sess"
 	mqttSessStreamSubjectPrefix = mqttPrefix + "sess."
 
-	// Subject prefix for the permanent per-CONNECT acceptance facts, carried on
-	// the SAME stream as the session records so an accepted CONNECT can commit
-	// both in one atomic batch. It is a separate TOP-LEVEL prefix, never a nesting
-	// under "sess.", because every session walk in this package filters
-	// "sess.<domainTk>>" and decodes what it gets as a session record.
-	// One subject per acceptance: <prefix><domainTk><cidHash>.<epoch>.<acceptID>.
-	// See sess_accept_fact.go.
-	mqttAcceptSubjectPrefix = mqttPrefix + "accept."
-
 	// Stream name and subject prefix for the delayed-Will durable outbox
 	// (Layer 2). One subject per Will event: <prefix><domainTk><cidHash>.<willID>,
 	// MaxMsgsPer:1, so each generation is an independent CAS target and an
@@ -219,18 +210,6 @@ const (
 	// will_outbox.go.
 	mqttWillQStreamName    = "$MQTT_willq"
 	mqttWillQSubjectPrefix = mqttPrefix + "willq."
-
-	// Stream name and subject prefix for the durable per-client GENERATION
-	// RETIREMENT watermark (one subject per client, MaxMsgsPer:1, permanent
-	// retention). A teardown that has WON its claim records the retirement here
-	// before it deletes anything, so the fact survives the one thing the session
-	// record cannot: an unconditional foreign write evicting the marker off the
-	// record's own subject. (Two broker-authored CONDITIONAL writes off one base
-	// cannot both apply — see the same-base boundary in docs/CONFORMANCE.md — but a
-	// write carrying no expectation is not excluded by any CAS.) Nothing ever reaps a
-	// watermark. See sess_teardown.go.
-	mqttTeardownStreamName    = "$MQTT_teardown"
-	mqttTeardownSubjectPrefix = mqttPrefix + "teardown."
 
 	// $MQTT_origin was the durable per-client session-interval register, whose sequence
 	// named the interval a client's record subject was in and supplied the identity a
@@ -241,12 +220,13 @@ const (
 	// See mqttRefuseRetiredOriginStream and docs/ARCHITECTURE.md "Compatibility boundary".
 	mqttOriginStreamName = "$MQTT_origin"
 
-	// The two streams whose subject spaces moved onto $MQTT_sess. The broker no
-	// longer defines them, so an account still holding either is refused at
-	// startup; the names survive for that preflight only.
-	// See mqttRefuseRetiredMetadataStreams.
+	// The streams the broker no longer defines: two whose subject spaces moved onto
+	// $MQTT_sess, and the generation-retirement watermark the authority replaced (issue
+	// #133). An account still holding one is refused at startup; the names survive for
+	// that preflight only. See mqttRefuseRetiredMetadataStreams.
 	mqttRetiredInflightStreamName = "$MQTT_inflight"
 	mqttRetiredSharedStreamName   = "$MQTT_shared"
+	mqttRetiredTeardownStreamName = "$MQTT_teardown"
 
 	// Reserved $MQTT_sess metadata key holding the generated stream-incarnation
 	// epoch, and the only valid epoch form: "nuid:<22-character NUID>". The epoch
@@ -258,7 +238,7 @@ const (
 
 	// Reserved stream metadata key naming the persisted format every broker-owned
 	// stream was written in, and the one format this build writes and reads. The
-	// format is everything the broker writes into the eight streams and every rule a
+	// format is everything the broker writes into the seven streams and every rule a
 	// reader applies to it (docs/ARCHITECTURE.md, "The persisted format"). It is a
 	// separate fact from the recovery epoch: a reset changes the incarnation and
 	// keeps the format, and a migration would change the format and keep the
@@ -613,6 +593,11 @@ type mqtt struct {
 	// exactly once by mqttTakeWillLocked. See mqttHandleClosedClient,
 	// mqttHandleWill.
 	willDisposition mqttWillDisposition
+
+	// willAnchor is this connection's Will anchor, when its acceptance allocated one (issue #133):
+	// the delayed Will's outbox identity, and what the tail holding the Will's disposition owes or
+	// removes. Set under c.mu at CONNECT.
+	willAnchor *mqttWillAnchorRef
 
 	// lifetimeOverride is the Session Expiry Interval a v5 DISCONNECT on this
 	// connection instructed the session to end on, or nil when no DISCONNECT

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // The issue #107 arbitration against a real JetStream.
@@ -46,6 +47,9 @@ func testNewEnv(t *testing.T, clientID string) (*testOutboundEnv, func()) {
 	c, r := testMQTTConnect(t, &mqttConnInfo{clientID: clientID, cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
 	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
 	asm := testMQTTGetAccountSessionManager(t, s, clientID)
+	// THE RECOVERY UNIT'S ENV INSPECTS WHAT CERTIFICATION LEAVES, so the generation reclamation that
+	// would purge it is held (retirement is exercised on a real server, retirement_e2e_test.go).
+	asm.testHoldGenerationRetirement.Store(true)
 	asm.mu.RLock()
 	epoch := asm.sessStreamEpoch
 	asm.mu.RUnlock()
@@ -91,6 +95,22 @@ func testNewEnv(t *testing.T, clientID string) (*testOutboundEnv, func()) {
 // test binary otherwise.
 func testClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, clientID string, onFatal func()) {
 	t.Helper()
+	// AND ITS LIFECYCLE IS RETIRED in the registry (issue #133): the minting CONNECT allocated the
+	// client's first lifecycle, and an authority purged beside a standing active entry is a state
+	// the broker refuses. Retired rather than purged, so the allocator moves on and a fixture's
+	// generations (testGen, testGen2: lifecycle 2) never collide with the mint's records.
+	shard := mqttLifecycleRegistryShardFor(getHash(clientID))
+	if rl := asm.jsa.loadLifecycleRegistryShard(asm.sessStreamEpoch, shard); rl.status == mqttOutboundValid {
+		delete(rl.rec.Active, getHash(clientID))
+		body, _ := json.Marshal(rl.rec)
+		msg, hdr := mqttFrameBatchWrite(rl.seq, body, _EMPTY_, 0, false)
+		if _, err := asm.jsa.storeMsg(mqttLifecycleRegistrySubject(shard), hdr, msg); err != nil {
+			if onFatal != nil {
+				onFatal()
+			}
+			t.Fatalf("retiring the minted lifecycle of %q: %v", clientID, err)
+		}
+	}
 	if err := asm.jsa.purgeStream(mqttSessStreamName, mqttOutboundAuthoritySubject(getHash(clientID)), 0, false); err != nil {
 		if onFatal != nil {
 			onFatal()
@@ -106,7 +126,29 @@ func testClearMintedAuthority(t *testing.T, asm *mqttAccountSessionManager, clie
 // OWNERSHIP IS ITS OWN IDENTITY — there is no predecessor whose ownership it could inherit,
 // so the transition that claims the client is the transition that owns it.
 func (e *testOutboundEnv) firstReservation(txn string) *mqttAuthorityTransition {
-	return testReserveCreation(e, nil, 0, txn, testGen, "tenure-"+txn, "intent-"+txn)
+	// A FIRST ACCEPTANCE, composed and not sent (issue #133): the revision-1 transition a fresh
+	// client's ownership starts from, record member included.
+	jsa := &e.asm.jsa
+	al := jsa.loadOutboundAuthority(e.id, e.epoch)
+	reg := jsa.loadLifecycleRegistryShard(e.epoch, mqttLifecycleRegistryShardFor(getHash(e.id)))
+	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttSessSubject(e.asm.domainTk, getHash(e.id)))
+	recordExists := lerr == nil && smsg != nil
+	ca, err := jsa.composeAcceptance(mqttAcceptRequest{
+		ID: e.id, Epoch: e.epoch, Txn: txn, Tenure: "tenure-" + txn, Nonce: "intent-" + txn,
+		At: time.Now().UnixNano(), RecordExists: recordExists,
+	}, al, reg)
+	if err != nil {
+		panic("firstReservation: " + err.Error())
+	}
+	var recSeq uint64
+	if recordExists {
+		recSeq = smsg.Sequence
+	}
+	ca.T.Record = &mqttTransitionMember{
+		subj: mqttSessSubject(e.asm.domainTk, getHash(e.id)), expect: recSeq,
+		body: []byte(`{"id":"` + e.id + `","gen":"` + ca.Gen + `"}`),
+	}
+	return ca.T
 }
 
 // bootstrap installs a SERVING authority the only way one can now be installed: a
@@ -120,6 +162,17 @@ func (e *testOutboundEnv) firstReservation(txn string) *mqttAuthorityTransition 
 //
 // It returns the serving authority and the sequence it stands at, which is what a follow-on
 // transition CASes against.
+// lifeScope is the lifecycle outcome scope of the client's standing authority: where the
+// outcome of an acceptance, a bind or a teardown transition lives.
+func (e *testOutboundEnv) lifeScope(t *testing.T) string {
+	t.Helper()
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	if al.status != mqttOutboundValid {
+		t.Fatalf("fixture: the authority reads %v, so it names no lifecycle scope", al.status)
+	}
+	return mqttLifeScope(al.rec.Life)
+}
+
 func (e *testOutboundEnv) bootstrap(t *testing.T, txn string) (*mqttOutboundAuthority, uint64) {
 	t.Helper()
 	tr, seq := e.bootstrapTr(t, txn)
@@ -145,48 +198,36 @@ func (e *testOutboundEnv) claim(t *testing.T, prev *mqttOutboundAuthority, prevS
 	txn, gen, tenure string) (*mqttOutboundAuthority, uint64) {
 
 	t.Helper()
-	// THROUGH THE OPERATION SURFACE, which is what a converted caller will use: it loads the
-	// predecessor itself, so prev/prevSeq are the fixture's statement of what it EXPECTS to
-	// be there rather than what the operation acts on.
-	if _, err := e.asm.jsa.opClaimClient(e.id, e.epoch, txn, gen, tenure, "intent-"+txn); err != nil {
-		t.Fatalf("the reservation %q was refused: %v", txn, err)
-	}
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if al.status != mqttOutboundValid || al.rec.Creation == nil {
-		t.Fatalf("the reservation %q does not load back (status %v)", txn, al.status)
-	}
-	if prev != nil && al.rec.Rev != prev.Rev+1 {
-		t.Fatalf("the reservation %q landed at revision %d over a predecessor at %d",
-			txn, al.rec.Rev, prev.Rev)
-	}
-	e.commitCreation(t, al.rec.Creation)
-	fin, ferr := e.asm.jsa.opFinalizeClaim(e.id, e.epoch, txn+"-fin", "intent-"+txn)
-	if ferr != nil {
-		t.Fatalf("finalizing the reservation %q was refused: %v", txn, ferr)
-	}
-	fl := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if fl.status != mqttOutboundValid || fl.rec.State != mqttAuthorityServing {
-		t.Fatalf("the finalized authority does not load back (status %v)", fl.status)
-	}
-	return fl.rec, fin.Seq
+	tr, seq := e.claimTr(t, prev, prevSeq, txn, gen, tenure)
+	return tr.Auth, seq
 }
 
+// claimTr installs a SERVING authority the way an accepted CONNECT does (issue #133): one
+// acceptance batch — a creation over an absent authority, a reopen over a closed one — and the
+// bind that clears its pending acceptance. It returns the BIND, the transition standing at the
+// authority, so a fixture that resolves or supersedes it acts on the current revision.
+//
+// gen is the fixture's statement of the generation it expects: the lifecycle allocates it, and
+// testGen / testGen2 are a fresh client's first two (lifecycle 1, ordinals 0 and 1).
 func (e *testOutboundEnv) claimTr(t *testing.T, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn, gen, tenure string) (*mqttAuthorityTransition, uint64) {
 
 	t.Helper()
-	res := testReserveCreation(e, prev, prevSeq, txn, gen, tenure, "intent-"+txn)
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, res))
-	if err != nil {
-		t.Fatalf("the reservation %q was refused: %v", txn, err)
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	if prev != nil && (al.status != mqttOutboundValid || al.rec.Rev != prev.Rev) {
+		t.Fatalf("the claim %q expects a predecessor at revision %d, but the authority reads %v", txn, prev.Rev, al.status)
 	}
-	e.commitCreation(t, res.Auth.Creation)
-	fin := testFinalizeCreation(e, res.Auth, resSeq, txn+"-fin")
-	finSeq, ferr := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, fin))
-	if ferr != nil {
-		t.Fatalf("finalizing the reservation %q was refused: %v", txn, ferr)
-	}
-	return fin, finSeq
+	return e.accept(t, txn, gen, tenure, true, mqttClosingTargets{})
+}
+
+// accept is one acceptance and its bind, of whatever shape the standing authority calls for: a
+// creation, a reopen, a resume (clean false over a serving authority) or a Clean Start handoff,
+// whose closing enrols the retire targets. It returns the bind and the authority's sequence.
+func (e *testOutboundEnv) accept(t *testing.T, txn, gen, tenure string, clean bool,
+	retire mqttClosingTargets) (*mqttAuthorityTransition, uint64) {
+
+	t.Helper()
+	return testAcceptAndBind(t, &e.asm.jsa, e.asm.domainTk, e.id, e.epoch, txn, gen, tenure, clean, retire)
 }
 
 // testAdmitNothing is an admission that carries no obligation of its own.
@@ -202,7 +243,7 @@ func testAdmitNothing(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq u
 	rev := prev.Rev + 1
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
+			ID: e.id, Epoch: e.epoch, Txn: txn, Scope: prev.Gen, Op: "op-" + txn,
 			Kind: mqttTransitionAdmitExchange, PrevTxn: prev.OwnerTxn, Rev: rev,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -210,64 +251,26 @@ func testAdmitNothing(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq u
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: mqttAuthorityServing, Rev: rev, Txn: txn, OwnerTxn: prev.OwnerTxn,
+			Life: mqttLifeOf(prev),
 		},
 	}
 }
 
-// testClosure closes the generation a serving authority stands at, permanently.
-//
-// The revision is derived from the predecessor rather than written as a literal, because the
-// route to a serving authority is three transitions rather than one and a fixture that
-// counted them would break every time the bootstrap gained a step.
+// testClosure composes the close of the generation a serving authority stands at, permanently:
+// the teardown claim batch over the client's standing record, which is the one act that closes
+// a generation (issue #133). Composed, not sent, so a fixture can resolve it, freeze a handle
+// over it or race it.
 func testClosure(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq uint64,
 	txn string) *mqttAuthorityTransition {
 
-	rev := prev.Rev + 1
-	// EVERY CLOSURE SEALS AND ROOTS, so the fixture composes what the boundary requires rather
-	// than a bare closure the boundary would refuse (issue #107, row 6). The enrolment is derived from
-	// the ledger and the shard header as they stand, exactly as the production composer derives
-	// it: a fixture that hand-wrote the members would be asserting the shape rather than reaching
-	// the rule.
-	cur, curSeq, _ := e.asm.jsa.loadGenLedger(e.id, e.epoch, prev.Gen)
-	hdr, hdrSeq, _ := e.asm.jsa.loadDirShardAt(mqttDirShardFor(getHash(e.id)))
-	enr, eerr := mqttComposeClosingEnrolment(e.id, e.epoch, prev.Gen, false,
-		mqttClosingTargets{}, cur, curSeq, hdr, hdrSeq)
-	if eerr != nil {
-		// A fixture that cannot compose its own enrolment would otherwise fail later, at the
-		// boundary, with a message about the rule rather than about the fixture.
-		panic("testClosure: composing the enrolment: " + eerr.Error())
-	}
-	return &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: txn, Op: "op-" + txn,
-			Kind: mqttTransitionCloseAdmit, PrevTxn: prev.OwnerTxn, Rev: rev,
-			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
-		},
-		Prev: prev, PrevSeq: prevSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: prev.Gen, Tenure: prev.Tenure,
-			State: mqttAuthorityClosed, Rev: rev, Txn: txn, OwnerTxn: prev.OwnerTxn,
-		},
-		Closure: &mqttGenClosure{
-			ID: e.id, Epoch: e.epoch, Gen: prev.Gen, Txn: txn,
-			RootShard: enr.RootShard, RootOrd: enr.RootOrd,
-		},
-		Extra: enr.Members,
-	}
-}
-
-// commitCreation commits the metadata half of a creation proposal, which is what licenses
-// the finalization that follows it.
-func (e *testOutboundEnv) commitCreation(t *testing.T, c *mqttCreationIntent) {
-	t.Helper()
-	p, err := mqttProposalFromCreation(c)
+	t, err := testComposeTeardownClaim(e.asm, e.id, prev, prevSeq, txn,
+		mqttRetirementRequest{Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn}, nil)
 	if err != nil {
-		t.Fatalf("the reservation's proposal is uninterpretable: %v", err)
+		// A fixture that cannot compose its own close would otherwise fail later, at the
+		// boundary, with a message about the rule rather than about the fixture.
+		panic("testClosure: " + err.Error())
 	}
-	f := testFreezeProposal(t, e, p, testRecordSeq(t, e))
-	if _, cerr := e.asm.jsa.commitMetadataAttempt(f); cerr != nil {
-		t.Fatalf("the creation's metadata half was refused: %v", cerr)
-	}
+	return t
 }
 
 // TestAbortAndCommitContendForOneSubject is the ambiguity protocol, against the store.
@@ -279,19 +282,30 @@ func (e *testOutboundEnv) commitCreation(t *testing.T, c *mqttCreationIntent) {
 func TestAbortAndCommitContendForOneSubject(t *testing.T) {
 	e, done := testNewEnv(t, "f105-contend")
 	defer done()
+	e.bootstrap(t, "txn-1")
+	current := func() (*mqttOutboundAuthority, uint64) {
+		al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+		if al.status != mqttOutboundValid {
+			t.Fatalf("the authority reads %v", al.status)
+		}
+		return al.rec, al.seq
+	}
 
 	// ABORT FIRST: the commit that follows must be refused, and nothing it carried may
-	// stand — including the authority, which is the member that matters.
-	tr := e.firstReservation("txn-abort-first")
-	if err := e.asm.jsa.abortTransition(tr.Attempt); err != nil {
+	// stand — including the authority, which is the member that matters. The attempt is
+	// composed over the authority as the abort left it, so only the outcome subject contends.
+	prev, prevSeq := current()
+	if err := e.asm.jsa.abortTransition(testAdmitNothing(e, prev, prevSeq, "txn-abort-first").Attempt, nil); err != nil {
 		t.Fatalf("the abort was refused: %v", err)
 	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr)); err == nil {
+	prev, prevSeq = current()
+	tr := testAdmitNothing(e, prev, prevSeq, "txn-abort-first")
+	if _, err := e.asm.jsa.commitAuthorityTransition(tr); err == nil {
 		t.Fatalf("a transition committed after its own attempt was positively aborted")
 	}
-	if al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch); al.status != mqttOutboundAbsent {
-		t.Fatalf("the refused batch left an authority behind (status %v): the losing member "+
-			"must reject the whole batch", al.status)
+	if after, _ := current(); after.Rev != prev.Rev || after.Txn != prev.Txn {
+		t.Fatalf("the refused batch moved the authority to %d/%q: the losing member must reject "+
+			"the whole batch", after.Rev, after.Txn)
 	}
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionNeverLanded {
 		t.Fatalf("an aborted attempt resolved %v, want NEVER LANDED", v)
@@ -299,15 +313,16 @@ func TestAbortAndCommitContendForOneSubject(t *testing.T) {
 
 	// COMMIT FIRST: the abort that follows must fail, and the receipt must still say
 	// COMMITTED.
-	tr2 := e.firstReservation("txn-commit-first")
-	seq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, tr2))
+	prev, prevSeq = current()
+	tr2 := testAdmitNothing(e, prev, prevSeq, "txn-commit-first")
+	seq, err := e.asm.jsa.commitAuthorityTransition(tr2)
 	if err != nil {
 		t.Fatalf("the transition was refused: %v", err)
 	}
 	if seq == 0 {
 		t.Fatalf("the commit returned no authority sequence")
 	}
-	if err := e.asm.jsa.abortTransition(tr2.Attempt); err == nil {
+	if err := e.asm.jsa.abortTransition(tr2.Attempt, nil); err == nil {
 		t.Fatalf("an attempt that had already committed was aborted afterwards")
 	}
 	if v := e.asm.jsa.resolveTransition(tr2); v != mqttTransitionLanded {
@@ -323,8 +338,8 @@ func TestAbortAndCommitContendForOneSubject(t *testing.T) {
 	if al.seq != seq {
 		t.Fatalf("the commit returned sequence %d but the authority stands at %d", seq, al.seq)
 	}
-	if al.rec.OwnerTxn != "txn-commit-first" {
-		t.Fatalf("the authority carries ownership %q, want txn-commit-first", al.rec.OwnerTxn)
+	if al.rec.Txn != "txn-commit-first" {
+		t.Fatalf("the authority names transition %q, want txn-commit-first", al.rec.Txn)
 	}
 }
 
@@ -346,7 +361,7 @@ func TestCommittedOutcomeSurvivesSupersession(t *testing.T) {
 	// advances the revision without moving ownership.
 	second := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-2", Op: "op-2",
+			ID: e.id, Epoch: e.epoch, Txn: "txn-2", Scope: testGen, Op: "op-2",
 			Kind: mqttTransitionAdmitExchange, PrevTxn: "txn-1", Rev: first.Auth.Rev + 1,
 			Gen: testGen, Tenure: first.Auth.Tenure, OwnerTxn: "txn-1",
 		},
@@ -354,6 +369,7 @@ func TestCommittedOutcomeSurvivesSupersession(t *testing.T) {
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: first.Auth.Tenure,
 			State: mqttAuthorityServing, Rev: first.Auth.Rev + 1, Txn: "txn-2", OwnerTxn: "txn-1",
+			Life: mqttLifeOf(first.Auth),
 		},
 	}
 	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, second)); err != nil {
@@ -369,7 +385,7 @@ func TestCommittedOutcomeSurvivesSupersession(t *testing.T) {
 
 	// And the first attempt's own permanent receipt is still readable and still committed:
 	// supersession retracts nothing.
-	o, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, "txn-1")
+	o, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, e.lifeScope(t), "txn-1")
 	if st != mqttOutboundValid || o.Verdict != mqttOutcomeCommitted {
 		t.Fatalf("the superseded attempt's receipt reads back status=%v verdict=%v", st, o.Verdict)
 	}
@@ -474,7 +490,7 @@ func TestClosureLoadsBackAndAbsenceIsNotOpen(t *testing.T) {
 	}
 	admit := &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-late", Op: "op-late",
+			ID: e.id, Epoch: e.epoch, Txn: "txn-late", Scope: testGen, Op: "op-late",
 			Kind: mqttTransitionAdmitExchange, PrevTxn: "txn-1", Rev: al.rec.Rev + 1,
 			Gen: testGen, Tenure: auth.Tenure, OwnerTxn: "txn-1",
 		},
@@ -482,6 +498,7 @@ func TestClosureLoadsBackAndAbsenceIsNotOpen(t *testing.T) {
 		Auth: &mqttOutboundAuthority{
 			ID: e.id, Epoch: e.epoch, Gen: testGen, Tenure: auth.Tenure,
 			State: mqttAuthorityServing, Rev: al.rec.Rev + 1, Txn: "txn-late", OwnerTxn: "txn-1",
+			Life: mqttLifeOf(al.rec),
 		},
 	}
 	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, admit)); err == nil {
@@ -497,12 +514,13 @@ func TestUnresolvedIsNotNeverLanded(t *testing.T) {
 	e, done := testNewEnv(t, "f105-unresolved")
 	defer done()
 
-	tr := e.firstReservation("txn-never-sent")
+	base, baseSeq := e.bootstrap(t, "txn-1")
+	tr := testAdmitNothing(e, base, baseSeq, "txn-never-sent")
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionUnresolved {
 		t.Fatalf("an attempt with no outcome resolved %v, want UNRESOLVED", v)
 	}
 	// Settling it positively is what turns it into a fact.
-	if err := e.asm.jsa.abortTransition(tr.Attempt); err != nil {
+	if err := e.asm.jsa.abortTransition(tr.Attempt, nil); err != nil {
 		t.Fatalf("the abort was refused: %v", err)
 	}
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionNeverLanded {
@@ -545,7 +563,7 @@ func TestAnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
 	}
 
 	// X's outcome subject - and only it - fails to read with an error that is not "no message".
-	hidden := mqttTransitionOutcomeSubject(getHash(e.id), "txn-x")
+	hidden := mqttTransitionOutcomeSubject(getHash(e.id), x.Attempt.Scope, "txn-x")
 	var hits atomic.Int64
 	restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
 		if subject == hidden {
@@ -556,7 +574,7 @@ func TestAnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
 	})
 	t.Cleanup(restore)
 	// ROUTE WITNESS: the read the classifier makes is INDETERMINATE, not absent.
-	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, "txn-x"); st != mqttOutboundIndeterminate {
+	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, x.Attempt.Scope, "txn-x"); st != mqttOutboundIndeterminate {
 		t.Fatalf("the hidden outcome reads back status %v, want INDETERMINATE", st)
 	}
 	before := hits.Load()
@@ -570,183 +588,6 @@ func TestAnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
 	restore()
 	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionSuperseded {
 		t.Fatalf("X resolved %v once its outcome was readable again, want SUPERSEDED", v)
-	}
-}
-
-// TestCancelledPreparationReturnsToServing pins the exit a preparation needs when its
-// metadata half is positively aborted.
-//
-// Without a cancellation the state machine has no move: admission and preparation both
-// require SERVING, finalization requires the proposed ownership, and closing admission would
-// end a session nobody displaced. A broker would have to delete the authority or wait
-// forever, and deleting it is the shape this whole item exists to remove.
-func TestCancelledPreparationReturnsToServing(t *testing.T) {
-	e, done := testNewEnv(t, "f105-cancel")
-	defer done()
-
-	auth, seq := e.bootstrap(t, "txn-1")
-
-	intent := &mqttHandoffIntent{
-		ID: "intent-1", PrevGen: auth.Gen, PrevTenure: auth.Tenure,
-		PrevOwnerTxn: auth.OwnerTxn, PrevSessWID: "wid-0", PrevSessSeq: 12,
-		Tenure: "tenure-next", Gen: testGen2, CleanReq: true,
-		Retire: &mqttRetirementRequest{
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-			SessWID: "wid-0", SessSeq: 12, Reason: mqttRetireCleanStart, Discard: true,
-		},
-	}
-	prep := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-prep", Op: "op-prep",
-			Kind: mqttTransitionPrepareIntent, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 1,
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: auth, PrevSeq: seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
-			State: mqttAuthorityPreparing, Rev: auth.Rev + 1, Txn: "txn-prep",
-			OwnerTxn: auth.OwnerTxn, Intent: intent,
-		},
-	}
-	prepSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, prep))
-	if err != nil {
-		t.Fatalf("the preparation was refused: %v", err)
-	}
-
-	// While PREPARING, no new outbound work may be admitted: the freeze is the point.
-	frozen := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-frozen", Op: "op-frozen",
-			Kind: mqttTransitionAdmitExchange, PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 2,
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: prep.Auth, PrevSeq: prepSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
-			State: mqttAuthorityServing, Rev: auth.Rev + 2, Txn: "txn-frozen", OwnerTxn: auth.OwnerTxn,
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, frozen)); err == nil {
-		t.Fatalf("an exchange was admitted while the authority was preparing")
-	}
-
-	// A cancellation naming ANOTHER intent is refused. This runs BEFORE the good
-	// cancellation: afterwards the authority has advanced, and the store would refuse it on
-	// the CAS without the intent rule ever being reached — which is a fixture passing for
-	// the wrong reason rather than a guard being proved.
-	foreign := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-cancel-foreign", Op: "op-cancel-foreign",
-			Kind: mqttTransitionCancelIntent, Intent: "intent-other",
-			PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 2,
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: prep.Auth, PrevSeq: prepSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
-			State: mqttAuthorityServing, Rev: auth.Rev + 2, Txn: "txn-cancel-foreign", OwnerTxn: auth.OwnerTxn,
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, foreign)); err == nil {
-		t.Fatalf("a cancellation naming another intent was sent")
-	}
-
-	// The cancellation restores the ORIGINAL ownership. It must not install the proposal.
-	cancel := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-cancel", Op: "op-cancel",
-			Kind: mqttTransitionCancelIntent, Intent: intent.ID,
-			PrevTxn: auth.OwnerTxn, Rev: auth.Rev + 2,
-			Gen: auth.Gen, Tenure: auth.Tenure, OwnerTxn: auth.OwnerTxn,
-		},
-		Prev: prep.Auth, PrevSeq: prepSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Tenure: auth.Tenure,
-			State: mqttAuthorityServing, Rev: auth.Rev + 2, Txn: "txn-cancel", OwnerTxn: auth.OwnerTxn,
-		},
-	}
-	// A CANCELLATION FOLLOWS THE PERMANENT VERDICT, not the authority record's shape. The
-	// proposal's metadata half is settled ABORTED first; without that the transition is
-	// refused, which is the point — a preparation may not be cancelled while its batch could
-	// still commit.
-	hp, herr := mqttProposalFromHandoff(intent)
-	if herr != nil {
-		t.Fatalf("viewing the pending handoff as a proposal failed: %v", herr)
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, cancel)); err == nil {
-		t.Fatalf("a cancellation was committed while its metadata half was unresolved")
-	}
-	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, hp); v != mqttMetadataAborted {
-		t.Fatalf("settling the pending handoff returned %v, want ABORTED", v)
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, cancel)); err != nil {
-		t.Fatalf("the cancellation was refused: %v", err)
-	}
-
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if al.status != mqttOutboundValid {
-		t.Fatalf("the cancelled authority does not load back (status %v)", al.status)
-	}
-	if al.rec.State != mqttAuthorityServing {
-		t.Fatalf("the authority is in state %d after cancellation, want serving", al.rec.State)
-	}
-	if al.rec.Gen != auth.Gen || al.rec.OwnerTxn != auth.OwnerTxn {
-		t.Fatalf("the cancellation installed %q/%q rather than restoring %q/%q",
-			al.rec.Gen, al.rec.OwnerTxn, auth.Gen, auth.OwnerTxn)
-	}
-	if al.rec.Intent != nil {
-		t.Fatalf("the cancelled authority still carries a handoff intent")
-	}
-
-}
-
-// TestClosedAuthorityCanClaimAFreshGeneration pins the other missing exit. Closure is
-// permanent and per GENERATION while the authority is per CLIENT, so without a route out a
-// client whose authority reached CLOSED could never be served again — a first claim requires
-// revision 1 and no predecessor, and finalization requires a standing proposal.
-//
-// The route is reserve-creation over the closure, and it is the SAME route as the first
-// claim: there is no kind that installs a serving authority over a closed one, because such a
-// kind would be a second bootstrap with no metadata half — reachable exactly when the first
-// creation was abandoned, which is when it matters most.
-func TestClosedAuthorityCanClaimAFreshGeneration(t *testing.T) {
-	e, done := testNewEnv(t, "f105-reclaim")
-	defer done()
-
-	auth, seq := e.bootstrap(t, "txn-1")
-	closing := testClosure(e, auth, seq, "txn-close")
-	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, closing))
-	if err != nil {
-		t.Fatalf("the close-admission was refused: %v", err)
-	}
-
-	// The claim must name a DIFFERENT generation: it reserves a successor beside the
-	// permanent closure and never reopens the closed one.
-	reuse := testReserveCreation(e, closing.Auth, closeSeq, "txn-reuse", testGen,
-		"tenure-reuse", "intent-reuse")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reuse)); err == nil {
-		t.Fatalf("a post-closure claim reused the closed generation")
-	}
-
-	// AND IT MAY NOT ARRIVE SERVING. The reservation is the only shape a claim takes, so a
-	// caller cannot skip the metadata half by describing its successor as already servable.
-	serving := testReserveCreation(e, closing.Auth, closeSeq, "txn-serving", testGen2,
-		"tenure-serving", "intent-serving")
-	serving.Auth.State, serving.Auth.Creation = mqttAuthorityServing, nil
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, serving)); err == nil {
-		t.Fatalf("a post-closure claim installed a SERVING authority in one step")
-	}
-
-	e.claim(t, closing.Auth, closeSeq, "txn-fresh", testGen2, "tenure-fresh")
-
-	// THE OLD CLOSURE STANDS. The claim reserves a successor; it does not reopen what was
-	// closed, and a reader asking about the old generation must still be told it is closed.
-	c, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen)
-	if st != mqttOutboundValid || c.Txn != "txn-close" {
-		t.Fatalf("the old generation's permanent closure did not survive re-admission (status %v)", st)
-	}
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen2); st != mqttOutboundAbsent {
-		t.Fatalf("the fresh generation reports closure status %v, want ABSENT", st)
 	}
 }
 
@@ -825,7 +666,7 @@ func TestSweepSkipsArbitrationRecords(t *testing.T) {
 	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, testGen); st != mqttOutboundValid {
 		t.Fatalf("the permanent closure did not survive the sweep (status %v)", st)
 	}
-	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, "txn-1"); st != mqttOutboundValid {
+	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, e.lifeScope(t), "txn-1"); st != mqttOutboundValid {
 		t.Fatalf("the permanent outcome did not survive the sweep (status %v)", st)
 	}
 }
@@ -982,7 +823,7 @@ func TestHandleCannotBeBuiltFromAReceipt(t *testing.T) {
 		t.Fatalf("the transition was refused: %v", err)
 	}
 
-	o, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, "txn-1")
+	o, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, tr.Attempt.Scope, "txn-1")
 	if st != mqttOutboundValid {
 		t.Fatalf("the receipt does not load back (status %v)", st)
 	}
@@ -1191,286 +1032,5 @@ func TestObligationMembersAreCheckedAgainstTheirTransition(t *testing.T) {
 	}}
 	if _, err := jsa.commitAuthorityTransition(tr); err == nil {
 		t.Fatalf("a QoS 1 exchange in a PUBREL phase was admitted")
-	}
-}
-
-// TestFirstCreationReservesBeforeItServes closes the bootstrap gap Codex's consult 8
-// named.
-//
-// Virgin creation had no representation: a first admission installs SERVING with no
-// predecessor, while a prepared handoff requires a FULL one — predecessor generation, tenure,
-// ownership transition, session write identity and a nonzero session sequence. So a client
-// with no prior ownership could only be claimed by serving before its metadata committed, or
-// by manufacturing a predecessor from session metadata. The second is forbidden: missing
-// metadata is not evidence that a creation is first.
-//
-// The reservation is the shape that was missing. It grants NO serving permission, it is
-// create-only so exactly one claimant holds it, and it becomes servable only by a
-// finalization bound to its own proposal.
-func TestFirstCreationReservesBeforeItServes(t *testing.T) {
-	e, done := testNewEnv(t, "f105-create")
-	defer done()
-
-	creation := &mqttCreationIntent{ID: "create-1", Gen: testGen, Tenure: "tenure-new"}
-	reserve := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-res", Op: "op-res",
-			Kind: mqttTransitionReserveCreation, Rev: 1,
-			Gen: creation.Gen, Tenure: creation.Tenure, OwnerTxn: "txn-res",
-		},
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Tenure: creation.Tenure,
-			State: mqttAuthorityReserving, Rev: 1, Txn: "txn-res", OwnerTxn: "txn-res",
-			Creation: creation,
-		},
-	}
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reserve))
-	if err != nil {
-		t.Fatalf("the creation reservation was refused: %v", err)
-	}
-
-	// A RESERVATION SERVES NOTHING. An admission under it must be refused, because the
-	// metadata half has not committed and nothing may be owed to a client whose ownership
-	// is not yet established.
-	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if al.status != mqttOutboundValid || al.rec.State != mqttAuthorityReserving {
-		t.Fatalf("the reservation does not load back as reserving (status %v)", al.status)
-	}
-	admit := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-early", Op: "op-early",
-			Kind: mqttTransitionAdmitExchange, PrevTxn: "txn-res", Rev: 2,
-			Gen: creation.Gen, Tenure: creation.Tenure, OwnerTxn: "txn-res",
-		},
-		Prev: al.rec, PrevSeq: al.seq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Tenure: creation.Tenure,
-			State: mqttAuthorityServing, Rev: 2, Txn: "txn-early", OwnerTxn: "txn-res",
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, admit)); err == nil {
-		t.Fatalf("an obligation was admitted under a RESERVATION, before its metadata half committed")
-	}
-
-	// A SECOND claimant cannot reserve the same client: the reservation is create-only.
-	rival := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-rival", Op: "op-rival",
-			Kind: mqttTransitionReserveCreation, Rev: 1,
-			Gen: testGen2, Tenure: "tenure-rival", OwnerTxn: "txn-rival",
-		},
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: testGen2, Tenure: "tenure-rival",
-			State: mqttAuthorityReserving, Rev: 1, Txn: "txn-rival", OwnerTxn: "txn-rival",
-			Creation: &mqttCreationIntent{ID: "create-2", Gen: testGen2, Tenure: "tenure-rival"},
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, rival)); err == nil {
-		t.Fatalf("two claimants both reserved one client's first creation")
-	}
-
-	// Finalization installs exactly the proposal, and only under its own name.
-	wrong := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-fin", Op: "op-fin",
-			Kind: mqttTransitionFinalizeCreation, Intent: "create-other",
-			PrevTxn: "txn-res", Rev: 2,
-			Gen: creation.Gen, Tenure: creation.Tenure, OwnerTxn: "txn-res",
-		},
-		Prev: reserve.Auth, PrevSeq: resSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Tenure: creation.Tenure,
-			State: mqttAuthorityServing, Rev: 2, Txn: "txn-fin", OwnerTxn: "txn-res",
-		},
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, wrong)); err == nil {
-		t.Fatalf("a finalization answering another proposal was admitted: a second claimant " +
-			"could finalize somebody else's reservation into its own tenure")
-	}
-
-	fin := *wrong
-	fa := *wrong.Attempt
-	fa.Intent = creation.ID
-	fin.Attempt = &fa
-	// NOTHING IS SERVED BEFORE THE METADATA HALF COMMITS, and that is checked at the write
-	// boundary rather than left to the caller's own decision function. The finalization
-	// naming the right proposal is still refused until the permanent verdict stands.
-	if _, err := e.asm.jsa.commitAuthorityTransition(&fin); err == nil {
-		t.Fatalf("a reservation was finalized into a serving authority while its metadata " +
-			"half was unresolved")
-	}
-	cp, cerr := mqttProposalFromCreation(creation)
-	if cerr != nil {
-		t.Fatalf("viewing the reservation as a proposal failed: %v", cerr)
-	}
-	mf := testFreezeProposal(t, e, cp, testRecordSeq(t, e))
-	if _, merr := e.asm.jsa.commitMetadataAttempt(mf); merr != nil {
-		t.Fatalf("the reservation's metadata commit was refused: %v", merr)
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(&fin); err != nil {
-		t.Fatalf("the creation finalization was refused: %v", err)
-	}
-	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
-	if al.status != mqttOutboundValid || al.rec.State != mqttAuthorityServing {
-		t.Fatalf("the finalized creation is not serving (status %v)", al.status)
-	}
-	if al.rec.Gen != creation.Gen || al.rec.Tenure != creation.Tenure {
-		t.Fatalf("the finalization installed %q/%q rather than the proposed %q/%q",
-			al.rec.Gen, al.rec.Tenure, creation.Gen, creation.Tenure)
-	}
-	if al.rec.Creation != nil {
-		t.Fatalf("the finalized authority still carries its creation proposal")
-	}
-}
-
-// TestAbandonedReservationIsClosedNotDeleted pins the recoverable abort.
-//
-// No arbitration record is ever deleted, so an abandoned reservation is CLOSED: its
-// generation never served and never can, and a later attempt reserves a FRESH generation
-// beside it. Deleting it instead would make the next claimant's create-only reservation
-// succeed against an absence, which is the inference this mechanism exists to remove.
-func TestAbandonedReservationIsClosedNotDeleted(t *testing.T) {
-	e, done := testNewEnv(t, "f105-create-abort")
-	defer done()
-
-	creation := &mqttCreationIntent{ID: "create-1", Gen: testGen, Tenure: "tenure-new"}
-	reserve := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-res", Op: "op-res",
-			Kind: mqttTransitionReserveCreation, Rev: 1,
-			Gen: creation.Gen, Tenure: creation.Tenure, OwnerTxn: "txn-res",
-		},
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Tenure: creation.Tenure,
-			State: mqttAuthorityReserving, Rev: 1, Txn: "txn-res", OwnerTxn: "txn-res",
-			Creation: creation,
-		},
-	}
-	resSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reserve))
-	if err != nil {
-		t.Fatalf("the creation reservation was refused: %v", err)
-	}
-
-	abandon := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-abandon", Op: "op-abandon",
-			Kind: mqttTransitionCloseAdmit, PrevTxn: "txn-res", Rev: 2,
-			Gen: creation.Gen, Tenure: creation.Tenure, OwnerTxn: "txn-res",
-		},
-		Prev: reserve.Auth, PrevSeq: resSeq,
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Tenure: creation.Tenure,
-			State: mqttAuthorityClosed, Rev: 2, Txn: "txn-abandon", OwnerTxn: "txn-res",
-		},
-		Closure: &mqttGenClosure{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Txn: "txn-abandon",
-		},
-	}
-	// ABANDONMENT ALSO FOLLOWS THE PERMANENT VERDICT. A reservation whose metadata half is
-	// merely unresolved may not be closed: its batch can still commit, and closing it would
-	// end a generation that is about to become the serving one.
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, abandon)); err == nil {
-		t.Fatalf("a reservation was abandoned while its metadata half was unresolved")
-	}
-	cp, cerr := mqttProposalFromCreation(creation)
-	if cerr != nil {
-		t.Fatalf("viewing the reservation as a proposal failed: %v", cerr)
-	}
-	if v := e.asm.jsa.settleProposal(_EMPTY_, e.id, e.epoch, cp); v != mqttMetadataAborted {
-		t.Fatalf("settling the abandoned reservation returned %v, want ABORTED", v)
-	}
-	closeSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, abandon))
-	if err != nil {
-		t.Fatalf("abandoning the reservation was refused: %v", err)
-	}
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, creation.Gen); st != mqttOutboundValid {
-		t.Fatalf("the abandoned generation has no permanent closure (status %v)", st)
-	}
-
-	// A later attempt claims a FRESH generation beside it, by reserving again — the same
-	// route as the first claim, never a shortcut that installs serving over the closure. It
-	// may not reuse the abandoned generation, which is closed permanently.
-	reuse := testReserveCreation(e, abandon.Auth, closeSeq, "txn-reuse", creation.Gen,
-		"tenure-2", "intent-reuse")
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, reuse)); err == nil {
-		t.Fatalf("a later attempt reused the abandoned generation")
-	}
-	e.claim(t, abandon.Auth, closeSeq, "txn-fresh", testGen2, "tenure-2")
-	// The abandoned generation's closure still stands.
-	if _, _, st := e.asm.jsa.loadGenClosure(e.id, e.epoch, creation.Gen); st != mqttOutboundValid {
-		t.Fatalf("the abandoned generation's closure did not survive (status %v)", st)
-	}
-}
-
-// TestReservationCannotServeOrMisdescribeItself covers the two ways a reservation could
-// be subverted into serving before its metadata half commits.
-//
-// Both survived their first mutation run because nothing exercised them: the existing tests
-// build a well-formed reservation and never try to install a serving authority under the
-// reservation kind, nor a reservation whose body disagrees with the proposal it carries.
-func TestReservationCannotServeOrMisdescribeItself(t *testing.T) {
-	e, done := testNewEnv(t, "f105-create-subvert")
-	defer done()
-
-	creation := &mqttCreationIntent{ID: "create-1", Gen: testGen, Tenure: "tenure-new"}
-
-	// A reserve-creation that installs SERVING outright. This is the claim-and-serve shape
-	// the reservation exists to replace: it would own the client and be immediately
-	// servable, before any metadata committed. It carries no creation intent, because a
-	// serving authority may not — which is exactly why the KIND must refuse it rather than
-	// leaving the shape check to do the work.
-	serveNow := &mqttAuthorityTransition{
-		Attempt: &mqttTransitionAttempt{
-			ID: e.id, Epoch: e.epoch, Txn: "txn-serve", Op: "op-serve",
-			Kind: mqttTransitionReserveCreation, Rev: 1,
-			Gen: creation.Gen, Tenure: creation.Tenure, OwnerTxn: "txn-serve",
-		},
-		Auth: &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: creation.Gen, Tenure: creation.Tenure,
-			State: mqttAuthorityServing, Rev: 1, Txn: "txn-serve", OwnerTxn: "txn-serve",
-		},
-	}
-	if err := mqttCheckTransitionKindRules(serveNow); err == nil {
-		t.Fatalf("a reserve-creation installed a SERVING authority: it would own the client " +
-			"and be immediately servable before any metadata committed")
-	}
-	if _, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, serveNow)); err == nil {
-		t.Fatalf("a reserve-creation installing SERVING reached the store")
-	}
-
-	// A reservation whose BODY disagrees with the proposal it carries. Finalization binds
-	// to the proposal, so a body naming something else would make that binding meaningless:
-	// the finalization would check one thing and install another.
-	for name, mutate := range map[string]func(*mqttOutboundAuthority){
-		"generation": func(a *mqttOutboundAuthority) { a.Gen = testGen2 },
-		"tenure":     func(a *mqttOutboundAuthority) { a.Tenure = "tenure-elsewhere" },
-	} {
-		c := *creation
-		auth := &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: c.Gen, Tenure: c.Tenure,
-			State: mqttAuthorityReserving, Rev: 1, Txn: "txn-res", OwnerTxn: "txn-res",
-			Creation: &c,
-		}
-		mutate(auth)
-		if err := mqttValidateOutboundAuthority(auth, e.id, e.epoch); err == nil {
-			t.Fatalf("a reservation whose %s disagrees with its own proposal was admitted: "+
-				"finalization binds to the proposal, so the binding would check one thing "+
-				"and install another", name)
-		}
-	}
-
-	// And a creation intent may not ride on any other state.
-	for name, state := range map[string]mqttAuthorityState{
-		"serving": mqttAuthorityServing,
-		"closed":  mqttAuthorityClosed,
-	} {
-		c := *creation
-		auth := &mqttOutboundAuthority{
-			ID: e.id, Epoch: e.epoch, Gen: c.Gen, Tenure: c.Tenure,
-			State: state, Rev: 1, Txn: "txn-res", OwnerTxn: "txn-res", Creation: &c,
-		}
-		if err := mqttValidateOutboundAuthority(auth, e.id, e.epoch); err == nil {
-			t.Fatalf("a %s authority carrying a creation proposal was admitted", name)
-		}
 	}
 }

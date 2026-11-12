@@ -67,7 +67,7 @@ var mqttTestSharedInventoryUnreadableHookV atomic.Pointer[func(subject string) b
 func mqttFenceSharedReleaseTransition(prev *mqttOutboundAuthority, prevSeq uint64, txn string) *mqttAuthorityTransition {
 	return &mqttAuthorityTransition{
 		Attempt: &mqttTransitionAttempt{
-			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Op: "op-fence-shared-release",
+			ID: prev.ID, Epoch: prev.Epoch, Txn: txn, Scope: prev.Gen, Op: "op-fence-shared-release",
 			Kind: mqttTransitionFenceSharedRelease, PrevTxn: prev.OwnerTxn, Rev: prev.Rev + 1,
 			Gen: prev.Gen, Tenure: prev.Tenure, OwnerTxn: prev.OwnerTxn,
 		},
@@ -75,7 +75,7 @@ func mqttFenceSharedReleaseTransition(prev *mqttOutboundAuthority, prevSeq uint6
 		Auth: &mqttOutboundAuthority{
 			ID: prev.ID, Epoch: prev.Epoch, Gen: prev.Gen, Tenure: prev.Tenure,
 			State: prev.State, Rev: prev.Rev + 1, Txn: txn, OwnerTxn: prev.OwnerTxn,
-			Intent: prev.Intent, Creation: prev.Creation,
+			Life: prev.Life,
 		},
 	}
 }
@@ -107,9 +107,14 @@ func (jsa *mqttJSA) opFenceSharedRelease(prev *mqttOutboundAuthority, prevSeq ui
 // admit nothing and leave serving only through a write that moves the sequence, after which an
 // admission reads the closed ledger; CLOSED or another generation never serves gen again (a
 // generation is never re-proposed); ABSENT admits nothing (there is no missing-authority fallback).
-func (jsa *mqttJSA) fenceSharedRelease(id, epoch, gen string) error {
+func (jsa *mqttJSA) fenceSharedRelease(id, epoch, gen string, admit func() bool) error {
 	var lastErr error
 	for attempt := 0; attempt < mqttSharedReleaseAttempts; attempt++ {
+		// The fence rewrites the authority: a background executor's admission is asked before
+		// every attempt (a client's own path admits).
+		if admit != nil && !admit() {
+			return errMQTTSharedNotAdmitted
+		}
 		al := jsa.loadOutboundAuthority(id, epoch)
 		switch al.status {
 		case mqttOutboundAbsent:

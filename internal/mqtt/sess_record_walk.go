@@ -27,7 +27,7 @@ var errMQTTSessWalkStop = errors.New("session record walk stopped by its visitor
 // all of them.
 //
 // WHY NOT A SEQUENCE WALK. Session records are a sparse class on $MQTT_sess: the stream also
-// holds one permanent acceptance fact, handoff outcome and teardown receipt per CONNECT
+// holds the outbound and shared-group records of every session beside its one record
 // (issue #133), so a few hundred records sit among hundreds of thousands of subjects. A
 // next_by_subj request on the wildcard filter that starts past a match makes the store visit
 // every block up to the next one, and a block whose per-block subject state has expired (two
@@ -61,7 +61,18 @@ var errMQTTSessWalkStop = errors.New("session record walk stopped by its visitor
 // returned unchanged. A walk error is what a failed sequence-walk read was before: the
 // caller's census is incomplete.
 func (as *mqttAccountSessionManager) walkSessionRecords(visit func(*StoredMsg) error) error {
-	filter := mqttSessStreamSubjectPrefix + as.domainTk + ">"
+	return as.walkSparseClass(mqttSessStreamSubjectPrefix+as.domainTk+">", visit)
+}
+
+// walkOutboundAuthorities visits every client's outbound authority, the same way: the
+// authorities are as sparse a class on $MQTT_sess as the session records.
+func (as *mqttAccountSessionManager) walkOutboundAuthorities(visit func(*StoredMsg) error) error {
+	return as.walkSparseClass(mqttOutboundRecordSubjectPrefix()+mqttAuthorityClassTk+".>", visit)
+}
+
+// walkSparseClass is the walk over one sparse subject class of $MQTT_sess (see
+// walkSessionRecords).
+func (as *mqttAccountSessionManager) walkSparseClass(filter string, visit func(*StoredMsg) error) error {
 	page, err := as.jsa.streamSubjectsCompletePage(mqttSessStreamName, filter, 0)
 	if err != nil {
 		return err

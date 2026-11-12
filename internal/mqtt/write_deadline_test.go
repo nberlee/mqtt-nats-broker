@@ -758,6 +758,8 @@ func testWillClient(t *testing.T, e *testRejectionEnv, delaySecs uint32) (*clien
 		props:   &mqttProperties{willDelay: delaySecs},
 	}
 	c.mqtt.willDisposition = mqttWillArmed
+	// The anchor a delay-capable CONNECT's acceptance allocates for this Will.
+	c.mqtt.willAnchor = testArmWillAnchor(t, e.asm, e.clientID)
 	// A non-zero expiry is what makes the CLOSE classify this Will as owed-DELAYED
 	// rather than owed-now. mqttHandleClosedClient reads it through
 	// mqttSessionExpiry, so it has to live on the connection, not be passed in.

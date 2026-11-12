@@ -401,8 +401,12 @@ func (sess *mqttSession) disownPhaseSub(sub *subscription) {
 func (c *client) mqttAbortAcceptedConnect() {
 	c.mu.Lock()
 	c.mqttDiscardWillLocked()
+	// The refused connection's OWN anchor goes with its Will (issue #133): its acceptance can
+	// never serve, so nothing is left for the anchor to protect. Older anchors are untouched.
+	anchor, asm, cid := c.mqttTakeWillAnchorLocked()
 	c.flags.clear(connectReceived)
 	c.mu.Unlock()
+	asm.dropWillAnchor(cid, anchor)
 }
 
 // reconcileResumedConsumers is the resume reconciliation phase. Runs from the

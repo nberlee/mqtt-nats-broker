@@ -58,10 +58,8 @@ const (
 var mqttTestRecoverySharedClosingHookV atomic.Pointer[func(root *mqttRecoveryRoot) (bool, bool)]
 
 // stepSharedClosing advances a discarded generation's shared closing within this visit's budget and
-// reports whether the ledger now reads SEALED and empty. For a root whose closure does not discard
-// it reports true: such a generation's shared ledger is not this owner's (an abandoned reservation
-// never acquired; a preserving closure leaves its acquisitions to the incarnation that continues).
-// An unreadable closure, an exhausted budget, a stop, or any store failure reports false and
+// reports whether the ledger now reads SEALED and empty. For a root whose closure is absent it
+// reports true: such a generation's shared ledger is not this owner's. An unreadable closure, an exhausted budget, a stop, or any store failure reports false and
 // leaves the durable ledger for the next visit, which continues from it (a released entry reads
 // unlisted).
 func (as *mqttAccountSessionManager) stepSharedClosing(s *Server, root *mqttRecoveryRoot,
@@ -75,14 +73,12 @@ func (as *mqttAccountSessionManager) stepSharedClosing(s *Server, root *mqttReco
 	if !b.spend(mqttSharedClosingClosureUnits) {
 		return false
 	}
-	c, _, cst := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen)
+	_, _, cst := as.jsa.loadGenClosure(root.ID, root.Epoch, root.Gen)
 	switch {
 	case cst == mqttOutboundAbsent:
 		return true
 	case cst != mqttOutboundValid:
 		return false
-	case !c.Discard:
-		return true
 	}
 	if !b.spend(mqttSharedClosingSealUnits) {
 		return false
@@ -96,13 +92,18 @@ func (as *mqttAccountSessionManager) stepSharedClosing(s *Server, root *mqttReco
 		}
 		return b.spend(units)
 	})
+	cw.admit = func() bool { return as.admitRecoveryAttempt(root.ID, b) }
 	sealed, err := as.jsa.sealSharedLedger(root.ID, root.Epoch, root.Gen, cw)
 	if err != nil {
 		s.Debugf("MQTT recovery pass: sealing the shared acquisitions of %q/%q: %v", root.ID, root.Gen, err)
 		return false
 	}
 	episodes := 0
-	for _, a := range sealed.Acqs {
+	var acqs []mqttSharedAcqRef
+	if sealed != nil { // nil: the generation never acquired, so it has no ledger to release from
+		acqs = sealed.Acqs
+	}
+	for _, a := range acqs {
 		if (stop != nil && stop()) || episodes >= mqttSharedClosingVisitEpisodes ||
 			!b.spend(mqttSharedClosingReleaseUnits) {
 			return false

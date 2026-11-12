@@ -55,27 +55,3 @@ func testAwaitInitialWillScan(t testing.TB, asm *mqttAccountSessionManager) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
-
-// withLongWillScan pins the claim-scan interval far above any test's duration, so no
-// tick falls due while the test runs - a time-bound assumption (30s), not a disabled
-// loop. It must be called before the manager starts: the loop samples the interval
-// once, after its initial pass, so changing it later leaves a tick phase in the test.
-// Pair it with testAwaitInitialWillScan, which covers the pass that runs before the
-// ticker exists.
-//
-// It also pins the lease above the interval, as production does; a test that needs a
-// short lease sets its own manager's with testShortenWillLease, which takes precedence.
-//
-// mqttWillClaimInterval and mqttWillClaimLease are package globals (the tagged build's
-// init() drops them to 50ms and 2s), so a caller must not be a parallel test. The
-// parallel tests in this package run after every serial one and never call it.
-func withLongWillScan(t testing.TB) {
-	t.Helper()
-	prevInterval, prevLease := mqttWillClaimInterval.Get(), mqttWillClaimLease.Get()
-	mqttWillClaimInterval.Set(30 * time.Second)
-	mqttWillClaimLease.Set(60 * time.Second)
-	t.Cleanup(func() {
-		mqttWillClaimInterval.Set(prevInterval)
-		mqttWillClaimLease.Set(prevLease)
-	})
-}

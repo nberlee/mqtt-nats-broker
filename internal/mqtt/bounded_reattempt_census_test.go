@@ -58,6 +58,14 @@ type reattemptRow struct {
 }
 
 var reattemptCensus = map[string]reattemptRow{
+	"accept_drive.go:(mqttSession).acceptOwnership": {store: 0, fg: 2, fors: []string{"attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++"}, budgets: nil,
+		class:     "FG-AUTHORITY: the CONNECT's acceptance batch, announced; a recomposition follows only an authority-only stale CAS (contention), charged to the derived budget and the ownership deadline",
+		exhausted: "the admitted background writers cannot exhaust it; persistent contention from elsewhere refuses the CONNECT (0x83) and the client reconnects; a re-send of an unchanged batch charges stepAllow, a moved record returns to the CONNECT's restore cycles",
+		done:      "CONVERTED (issue #133, consult 15)"},
+	"accept_drive.go:(mqttSession).bindAcceptance": {store: 0, fg: 2, fors: []string{"attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++"}, budgets: nil,
+		class:     "FG-AUTHORITY: the CONNECT's bind, announced; a recomposition after the authority moved is contention (derived budget and deadline), a re-send of the unchanged frozen bind charges retryOK",
+		exhausted: "the admitted background writers cannot exhaust it; persistent contention from elsewhere refuses the CONNECT before CONNACK and the sweep abandons the acceptance",
+		done:      "CONVERTED (issue #133, consult 15)"},
 	"inflight_marker.go:(mqttAccountSessionManager).deleteInflightMarker": {store: 1, fg: 0, fors: []string{"attempt := 0; attempt < mqttInflightStoreAttempts; attempt++"}, budgets: nil,
 		class:     "REGISTER-DELETE: an exact-sequence marker delete, re-attempted on a store or transport error only",
 		exhausted: "a gone sequence is success, so no writer causes a re-attempt; exhaustion leaves the send intent ambiguous and the entry held, and the next section re-attempts (one AckWait)",

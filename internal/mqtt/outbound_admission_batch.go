@@ -302,6 +302,9 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 		case mqttTransitionLanded, mqttTransitionSuperseded:
 			sess.settleLandedBatch(c, gen, items, life)
 			return nil, nil
+		case mqttTransitionRetired:
+			// The generation retired: never a landed batch, never a resumed ladder.
+			return nil, nil
 		case mqttTransitionUnresolved:
 			// NOTHING CAN BE CONCLUDED, so nothing may be retried or split: a re-attempt of a batch
 			// that landed would meet its own registers, and a split would re-admit its deliveries.
@@ -384,7 +387,7 @@ func (sess *mqttSession) settleBatchAttempt(gen string, items []*mqttBatchAdmiss
 		sess.custody.recordAttempt(gen, it.nonce, mqttCustodyAttempt{handle: out.Handle, lin: it.rec.Lin})
 	}
 	sess.mu.Unlock()
-	v := sess.settleCustodyHandle(out.Handle)
+	v := sess.settleCustodyHandle(out.Handle, nil)
 	released := false
 	sess.mu.Lock()
 	switch v {
@@ -397,6 +400,10 @@ func (sess *mqttSession) settleBatchAttempt(gen string, items []*mqttBatchAdmiss
 			if sess.custody.attemptNeverLanded(gen, it.nonce, out.Handle) {
 				released = true
 			}
+		}
+	case mqttTransitionRetired:
+		for _, it := range items {
+			sess.custody.attemptRetired(gen, it.nonce, out.Handle)
 		}
 	}
 	sess.mu.Unlock()

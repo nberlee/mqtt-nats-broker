@@ -119,6 +119,9 @@ func testProvisionSession(t *testing.T, env *testTeardownEnv, clientID string) *
 	if sess.asm == nil {
 		t.Fatal("createOrRestoreSession must attach the account manager")
 	}
+	// Accepted the way a CONNECT is (issue #133): the generation is its lifecycle's and the
+	// authority serves it, so every name below is derived from the accepted generation.
+	testAcceptRigConnection(t, env.asm, sess, env.s.createInternalAccountClient())
 
 	_, _, pubRelDur := mqttPubRelNames(sess.idHash, sess.gen)
 	ccr := &CreateConsumerRequest{
@@ -330,10 +333,12 @@ func TestSessTeardownLateDeleteIsHarmless(t *testing.T) {
 	if seq <= retiredSeq {
 		t.Errorf("the surviving record must be the fresh one, at a sequence beyond %v, got %v", retiredSeq, seq)
 	}
-	// And the retired incarnation's own resources really are gone.
-	_, _, retiredPubRelDur := mqttPubRelNames(sessA.idHash, retiredGen)
-	if testConsumerExists(t, a, mqttOutStreamName, retiredPubRelDur) {
-		t.Error("the retired incarnation's PUBREL consumer survived its teardown")
+	// And the retired incarnation's own resources really are gone: the inbound QoS 2 hold the
+	// teardown walks itself. (Its PUBREL consumer belongs to the discarded generation's recovery
+	// executor, issue #107 7d.)
+	if _, err := a.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName,
+		mqttQoS2HoldSubject(sessA.idHash, retiredGen, 1)); err == nil {
+		t.Error("the retired incarnation's QoS2 hold survived its teardown")
 	}
 }
 
@@ -344,13 +349,18 @@ func TestSessTeardownLateDeleteIsHarmless(t *testing.T) {
 // entirely (0d, a crashed teardown, which previously leaked until the orphan
 // sweep).
 func TestSessTeardownAdoptedByConnect(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): the decline seam below is process-global.
 	a, b := testNewTeardownEnv(t)
 	const clientID = "adopted"
+	// A CONNECT displaces a claimed marker whose release facts all stand
+	// (TestTeardownClaimIsDisplacedByASuccessor); this one is made to adopt it, the path a
+	// CONNECT takes when a displacement fact cannot be read.
+	decline := func(id string) bool { return id == clientID }
+	mqttTestMarkedRecordDeclineDisplaceV.Store(&decline)
+	t.Cleanup(func() { mqttTestMarkedRecordDeclineDisplaceV.Store(nil) })
 
 	sessA := testProvisionSession(t, a, clientID)
 	retiredGen := sessA.gen
-	_, _, retiredPubRelDur := mqttPubRelNames(sessA.idHash, retiredGen)
 	retiredHold := mqttQoS2HoldSubject(sessA.idHash, retiredGen, 1)
 
 	// Leave a marker with nobody finishing it: A claimed and then "crashed".
@@ -363,7 +373,7 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 		nonce     string
 	)
 	claimTok := sessA.beginRecordTx()
-	markerSeq, nonce, claim, err := sessA.claimTeardown(claimTok, ps, seq, sessA.wid, nil)
+	markerSeq, nonce, claim, err := testClaimTeardown(t, sessA, claimTok, ps, seq, sessA.wid)
 	if claim != mqttTeardownClaimWon {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, err)
 	}
@@ -398,10 +408,8 @@ func TestSessTeardownAdoptedByConnect(t *testing.T) {
 		t.Errorf("the fresh session must not inherit the released record's sequence, got %v", fresh.seq)
 	}
 
-	// The retiring incarnation's resources are gone, and so is its record.
-	if testConsumerExists(t, b, mqttOutStreamName, retiredPubRelDur) {
-		t.Error("the adopting CONNECT left the retiring incarnation's PUBREL consumer behind")
-	}
+	// The retiring incarnation's resources are gone, and so is its record. (Its PUBREL consumer
+	// is the discarded generation's recovery executor's, issue #107 7d.)
 	if _, err := b.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, retiredHold); err == nil {
 		t.Error("the adopting CONNECT left the retiring incarnation's QoS2 hold behind")
 	}
@@ -433,7 +441,7 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 	target := mqttTeardownTargetFromRecord(ps, sessA.idHash)
 
 	tok := sessA.beginRecordTx()
-	markerSeq, nonce, claim, err := sessA.claimTeardown(tok, ps, seq, sessA.wid, nil)
+	markerSeq, nonce, claim, err := testClaimTeardown(t, sessA, tok, ps, seq, sessA.wid)
 	if claim != mqttTeardownClaimWon {
 		t.Fatalf("claimTeardown = %v, err=%v", claim, err)
 	}
@@ -453,8 +461,7 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 		t.Fatalf("release classification = %v (err=%v), want superseded: a no-op delete was read as our own success", res, rerr)
 	}
 	// The superseded outcome hands back the record it classified against, at the
-	// exact sequence: that is the hollow survivor of the claim-won deletion window,
-	// and condemnRetiredSurvivor has to CAS at that sequence.
+	// exact sequence.
 	if cur == nil || curSeq != foreignSeq {
 		t.Fatalf("superseded must return the classifying read, got %+v at %v (want the foreign record at %v)", cur, curSeq, foreignSeq)
 	}
@@ -465,24 +472,26 @@ func TestSessTeardownReleaseIsCAS(t *testing.T) {
 		t.Fatalf("endRecordTx: %v", err)
 	}
 
-	// Our own marker still current, by contrast, is the one retryable outcome and
-	// must end as released once the delete takes.
-	sessA.seq = foreignSeq
-	ps2, seq2 := testLoadSessRecord(t, a, sessA.idHash)
-	tok2 := sessA.beginRecordTx()
-	markerSeq2, nonce2, claim2, err := sessA.claimTeardown(tok2, ps2, seq2, sessA.wid, nil)
+	// Our own marker still current, by contrast, is the one retryable outcome and must end
+	// as released once the delete takes. On a session of its own: A's generation is already
+	// noncurrent, and a claim ends a generation once.
+	sessC := testProvisionSession(t, a, clientID+"-own")
+	ps2, seq2 := testLoadSessRecord(t, a, sessC.idHash)
+	targetC := mqttTeardownTargetFromRecord(ps2, sessC.idHash)
+	tok2 := sessC.beginRecordTx()
+	markerSeq2, nonce2, claim2, err := testClaimTeardown(t, sessC, tok2, ps2, seq2, sessC.wid)
 	if claim2 != mqttTeardownClaimWon {
 		t.Fatalf("second claimTeardown = %v, err=%v", claim2, err)
 	}
-	if res, cur, curSeq, rerr := sessA.releaseTeardown(tok2, target, nonce2, markerSeq2); res != mqttTeardownReleased {
+	if res, cur, curSeq, rerr := sessC.releaseTeardown(tok2, targetC, nonce2, markerSeq2); res != mqttTeardownReleased {
 		t.Fatalf("release classification = %v (err=%v), want released", res, rerr)
 	} else if cur != nil || curSeq != 0 {
 		t.Fatalf("a released teardown has no classifying record to hand back, got %+v at %v", cur, curSeq)
 	}
-	if err := sessA.endRecordTx(tok2); err != nil {
+	if err := sessC.endRecordTx(tok2); err != nil {
 		t.Fatalf("endRecordTx: %v", err)
 	}
-	if got, _ := testLoadSessRecord(t, a, sessA.idHash); got != nil {
+	if got, _ := testLoadSessRecord(t, a, sessC.idHash); got != nil {
 		t.Fatalf("the record should be gone after a released teardown, got %+v", got)
 	}
 }
@@ -506,7 +515,7 @@ func TestSessTeardownNoWaitReleaseIsStillClassified(t *testing.T) {
 
 	sess := testProvisionSession(t, a, clientID)
 	retiredGen := sess.gen
-	_, _, retiredPubRelDur := mqttPubRelNames(sess.idHash, retiredGen)
+	holdSubj := mqttQoS2HoldSubject(sess.idHash, retiredGen, 1)
 
 	if err := sess.clear(true); err != nil {
 		t.Fatalf("a no-wait teardown must still classify its release: %v", err)
@@ -514,7 +523,9 @@ func TestSessTeardownNoWaitReleaseIsStillClassified(t *testing.T) {
 	if ps, _ := testLoadSessRecord(t, a, sess.idHash); ps != nil {
 		t.Fatalf("the record survived a no-wait teardown: %+v", ps)
 	}
-	if testConsumerExists(t, a, mqttOutStreamName, retiredPubRelDur) {
-		t.Error("the retiring incarnation's PUBREL consumer survived a no-wait teardown")
+	// The target the teardown deletes itself; its PUBREL consumer is the discarded
+	// generation's recovery executor's (issue #107 7d).
+	if _, err := a.asm.jsa.loadLastMsgFor(mqttQoS2IncomingMsgsStreamName, holdSubj); err == nil {
+		t.Error("the retiring incarnation's QoS2 hold survived a no-wait teardown")
 	}
 }

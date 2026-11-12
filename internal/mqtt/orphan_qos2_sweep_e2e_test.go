@@ -12,7 +12,6 @@
 package mqtt
 
 import (
-	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -57,30 +56,18 @@ func testOrphanDropSession(t *testing.T, asm *mqttAccountSessionManager, idHash 
 		return
 	}
 	// RECORD THE RETIREMENT before deleting the record, which is the order a real
-	// teardown uses: recordGenRetirement writes the watermark first, and a write it
-	// cannot confirm aborts the teardown with nothing deleted.
+	// teardown uses: its claim makes the generation noncurrent before anything is deleted.
 	//
 	// Since issue #40 unit 2 this is not optional dressing — it is the LICENCE every
 	// destructive sweep arm now requires. Deleting the record alone establishes only
 	// that nothing this broker can see names the generation, which a session live on
 	// ANOTHER broker with no record satisfies equally, so an unlicensed pass RETAINS.
 	// These tests are all about a session that is genuinely gone, so the fixture records
-	// the fact that makes it so. The RETENTION half — absence with no watermark — is
+	// the fact that makes it so. The RETENTION half — absence while the generation is current — is
 	// asserted by TestOrphanSweepRetainsRemoteLiveGenerationWithoutMatchingRetirement
 	// and its siblings.
 	if ps := mqttDecodeSessionRecord(smsg); ps != nil && ps.ID != _EMPTY_ && ps.Gen != _EMPTY_ {
-		wmSubject := mqttTeardownSubject(asm.domainTk, idHash)
-		_, wmSeq, status := asm.jsa.loadGenRetirement(asm.domainTk, idHash)
-		var expect uint64
-		if status != mqttRetirementAbsent {
-			expect = wmSeq
-		}
-		r := &mqttGenRetirement{
-			ID: ps.ID, Gen: ps.Gen, MarkerSeq: smsg.Sequence, Nonce: nuid.Next(), Origin: "orphan-e2e",
-		}
-		if _, werr := asm.jsa.storeGenRetirementCAS(wmSubject, expect, r); werr != nil {
-			t.Fatalf("recording the retirement watermark for %q: %v", idHash, werr)
-		}
+		testRetireGeneration(t, asm, ps.ID, ps.Gen)
 	}
 	// A concurrent teardown may already have removed it; that is the same end state.
 	if err := asm.jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); err != nil &&
@@ -358,21 +345,13 @@ func TestOrphanSweepAdoptsATeardownWhileItsOwnerResumes(t *testing.T) {
 	cp, rp := testQoS2ClusterPub(t, bA, clientID)
 	idHash := testMQTTGetClient(t, bA.s, clientID).mqtt.sess.idHash
 
-	// A broker that claimed the teardown and died.
-	ps, _, err := asmA.loadFenceSession(idHash)
-	if err != nil || ps == nil {
-		t.Fatalf("loading the session record: ps=%v err=%v", ps, err)
+	// A broker that claimed the teardown and died: its claim batch, and nothing deleted.
+	prev, prevSeq, err := asmA.jsa.requireAuthority(clientID, asmA.sessStreamEpoch)
+	if err != nil || prev == nil {
+		t.Fatalf("no authority to claim under: %v", err)
 	}
-	ps.Teardown = &mqttSessTeardown{Origin: "deadnode", Nonce: nuid.Next(), StartedAt: time.Now().Unix()}
-	// The marker's LINEAGE, as claimTeardown stamps it: its own identity, parented to the
-	// record it claimed. The finisher retires that parent by name.
-	ps.WID, ps.PWID = mqttNewRecordWID(), ps.WID
-	raw, err := json.Marshal(ps)
-	if err != nil {
-		t.Fatalf("marshalling the marked record: %v", err)
-	}
-	if _, err := asmA.jsa.storeMsg(mqttSessStreamSubjectPrefix+asmA.domainTk+idHash, 0, raw); err != nil {
-		t.Fatalf("writing the teardown marker: %v", err)
+	if err := testCommitTeardownClaim(asmA, clientID, prev, prevSeq); err != nil {
+		t.Fatalf("committing the teardown claim: %v", err)
 	}
 	cp.Close()
 	testOrphanDropLocalSession(asmA, idHash)
@@ -444,7 +423,7 @@ func TestOrphanSweepTwoSweepersConverge(t *testing.T) {
 
 	// An orphan hold on a generation no record names, written directly so both
 	// brokers see identical durable state and neither owns it in memory.
-	idHash, gen := getHash("two-sweepers"), mqttNewSessGen()
+	idHash, gen := getHash("two-sweepers"), testLifecycleGen(t, 1, 0)
 	holdSubject := mqttQoS2HoldSubject(idHash, gen, 9)
 	pp := &mqttPublish{
 		topic: []byte("orphan/two"), subject: []byte("orphan.two"),
@@ -458,12 +437,7 @@ func TestOrphanSweepTwoSweepersConverge(t *testing.T) {
 	// its durable state directly and never had a record to delete, so nothing else
 	// supplies the retirement fact — and without it BOTH sweepers correctly retain, which
 	// would make this a test about the leak rather than about convergence.
-	if _, err := asmA.jsa.storeGenRetirementCAS(mqttTeardownSubject(asmA.domainTk, idHash), 0,
-		&mqttGenRetirement{
-			ID: "two-sweepers", Gen: gen, MarkerSeq: 1, Nonce: nuid.Next(), Origin: "orphan-e2e",
-		}); err != nil {
-		t.Fatalf("recording the retirement watermark: %v", err)
-	}
+	testRetireGeneration(t, asmA, "two-sweepers", gen)
 
 	// Both sweep concurrently, repeatedly: the first pass fences and purges, a later
 	// one retires the marker, and the interleaving is whatever the cluster gives us.

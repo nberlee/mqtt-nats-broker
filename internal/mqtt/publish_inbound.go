@@ -1722,7 +1722,7 @@ func (j *mqttInboundJob) releaseFences() bool {
 			// The question could not be decided, and no verdict is not permission. The
 			// exchange is unfinished: keep the hold AND the claim, and suppress the
 			// PUBCOMP so the client retries.
-			c.Errorf("Unable to classify the QoS2 release for packet identifier %v against the retirement watermark: %v", pi, werr)
+			c.Errorf("Unable to classify the QoS2 release for packet identifier %v against its generation's standing: %v", pi, werr)
 			return withhold(werr)
 		}
 	}

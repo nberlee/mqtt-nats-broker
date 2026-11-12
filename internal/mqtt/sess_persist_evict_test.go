@@ -139,7 +139,7 @@ func (e *testRejectionEnv) plantPendingWill(t *testing.T) string {
 	e.sess.mu.Lock()
 	gen, seq := e.sess.gen, e.sess.seq
 	e.sess.mu.Unlock()
-	willID := mqttNewRecordWID()
+	willID := testArmWillAnchor(t, e.asm, e.sess.id).willID()
 	subject := mqttWillQSubject(e.asm.domainTk, e.idHash, willID)
 	rec := &mqttWillOutbox{
 		WillID:           willID,
