@@ -233,10 +233,33 @@ func wsClientCount(s *Server) int {
 	return len(s.clients)
 }
 
+// wsHolds reports whether the server holds the registered connection that is the server's
+// end of dialed, a socket this test opened: both endpoints match, since the TCP and
+// WebSocket listeners share s.clients and one source address may reach both. A live
+// server's listener is on a recycled ephemeral port, and a client another test leaked keeps
+// redialing the address it last had (nats.go reconnects by default), so a stranger can sit
+// in this server's upgrade for the whole handshake timeout. A count over every connection
+// would read it as this test's. rawConn is set at construction and never replaced, so it is
+// read without c.mu.
+func wsHolds(s *Server, dialed net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.clients {
+		if c.rawConn != nil &&
+			c.rawConn.RemoteAddr().String() == dialed.LocalAddr().String() &&
+			c.rawConn.LocalAddr().String() == dialed.RemoteAddr().String() {
+			return true
+		}
+	}
+	return false
+}
+
 // wsDescribeClients is the state of every connection the server holds, one line each, so
 // a connection that outlives its bound is attributable from the failure alone: which
-// transport it is, whether it sent CONNECT, its keep-alive, the read deadline its
-// WebSocket carries, whether it is closed, and its age.
+// peer it is, which transport, whether it sent CONNECT, its keep-alive, the read deadline its
+// WebSocket carries, whether it is closed, and its age. It takes each c.mu, which the setup
+// holds across the upgrade, so a connection still upgrading is described once its upgrade
+// ends.
 func wsDescribeClients(s *Server) string {
 	s.mu.Lock()
 	clients := make([]*client, 0, len(s.clients))
@@ -271,18 +294,20 @@ func wsDescribeClients(s *Server) string {
 			}
 			w.dmu.Unlock()
 		}
-		fmt.Fprintf(&b, "  cid=%d id=%q transport=%s connected=%v keepalive=%ds readDeadline=%s closed=%v age=%v\n",
-			c.cid, id, transport, connected, ka, readDL, c.isClosed(), age.Round(time.Millisecond))
+		fmt.Fprintf(&b, "  cid=%d peer=%s id=%q transport=%s connected=%v keepalive=%ds readDeadline=%s closed=%v age=%v\n",
+			c.cid, c.rawConn.RemoteAddr(), id, transport, connected, ka, readDL, c.isClosed(), age.Round(time.Millisecond))
 	}
 	return b.String()
 }
 
-func wsWaitClients(t testing.TB, s *Server, n int, within time.Duration) time.Duration {
+// wsWaitHeld waits until the server holds (held) or no longer holds (!held) its end of
+// dialed, and returns how long that took.
+func wsWaitHeld(t testing.TB, s *Server, dialed net.Conn, held bool, within time.Duration) time.Duration {
 	t.Helper()
 	start := time.Now()
-	for wsClientCount(s) != n {
+	for wsHolds(s, dialed) != held {
 		if time.Since(start) > within {
-			t.Fatalf("server holds %d connections after %v, want %d:\n%s", wsClientCount(s), within, n, wsDescribeClients(s))
+			t.Fatalf("server holds the connection from %s = %v after %v, want %v:\n%s", dialed.LocalAddr(), !held, within, held, wsDescribeClients(s))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -528,9 +553,9 @@ func TestWSOversizedConnectClaimRefused(t *testing.T) {
 	t.Parallel()
 	_, wsAddr, s := startWSBroker(t, nil)
 	c := wsTestDial(t, wsAddr)
-	wsWaitClients(t, s, 1, 5*time.Second)
+	wsWaitHeld(t, s, c.Raw, true, 5*time.Second)
 	_, _ = c.Write([]byte{0x10, 0xFF, 0xFF, 0xFF, 0x7F})
-	wsWaitClients(t, s, 0, 5*time.Second)
+	wsWaitHeld(t, s, c.Raw, false, 5*time.Second)
 }
 
 // WebSocket Pings do not keep a connection alive: before CONNECT the CONNECT deadline closes
@@ -559,7 +584,7 @@ func TestWSPingsDoNotRefreshLiveness(t *testing.T) {
 	defer close(stop)
 	go pinger(c, stop, wsPingMessage)
 	go func() { _, _ = io.Copy(io.Discard, c) }()
-	if el := wsWaitClients(t, s, 0, 5*time.Second); el > 3*time.Second {
+	if el := wsWaitHeld(t, s, c.Raw, false, 5*time.Second); el > 3*time.Second {
 		t.Fatalf("a pinging, CONNECT-less connection lived %v past a 0.5 s CONNECT deadline", el)
 	}
 
@@ -570,7 +595,7 @@ func TestWSPingsDoNotRefreshLiveness(t *testing.T) {
 	defer close(stop2)
 	go pinger(c2, stop2, wsPingMessage)
 	go func() { _, _ = io.Copy(io.Discard, c2) }()
-	if el := wsWaitClients(t, s, 0, 6*time.Second); el > 4*time.Second {
+	if el := wsWaitHeld(t, s, c2.Raw, false, 6*time.Second); el > 4*time.Second {
 		t.Fatalf("a pinging client with Keep Alive 1 lived %v", el)
 	}
 
@@ -581,7 +606,7 @@ func TestWSPingsDoNotRefreshLiveness(t *testing.T) {
 	defer close(stop3)
 	go pinger(c3, stop3, wsPongMessage)
 	go func() { _, _ = io.Copy(io.Discard, c3) }()
-	if el := wsWaitClients(t, s, 0, 6*time.Second); el > 4*time.Second {
+	if el := wsWaitHeld(t, s, c3.Raw, false, 6*time.Second); el > 4*time.Second {
 		t.Fatalf("a client sending unsolicited Pongs with Keep Alive 1 lived %v", el)
 	}
 }
@@ -683,7 +708,7 @@ func TestWSShutdownDuringAStalledUpgrade(t *testing.T) {
 	}
 	defer raw.Close()
 	_, _ = raw.Write([]byte("GET /mqtt HTTP/1.1\r\nHost: x\r\n"))
-	wsWaitClients(t, s, 1, 5*time.Second)
+	wsWaitHeld(t, s, raw, true, 5*time.Second)
 	time.Sleep(100 * time.Millisecond)
 	select {
 	case <-s.BeginShutdown():

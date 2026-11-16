@@ -3119,7 +3119,8 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 	// register, exchange and duty entry together, never a register alone.
 	e.landAdmission(t, pi, 2, dur, sseq, nonce)
 	// And the UNSUBSCRIBE's consumer delete completed, so nothing can classify the source.
-	if _, err := e.asm.jsa.deleteConsumer(mqttStreamName, dur, true); err != nil {
+	// Awaited: a no-wait delete may still be on the wire when the restart reads.
+	if _, err := e.asm.jsa.deleteConsumer(mqttStreamName, dur, false); err != nil {
 		t.Fatalf("delete the source consumer: %v", err)
 	}
 
@@ -3134,19 +3135,25 @@ func TestMQTTInflightCancelledRegisterSurvivesCrashBeforeConfirm(t *testing.T) {
 
 	restored.mu.Lock()
 	_, reserved := restored.pendingPublish[pi]
-	inflight := restored.receiveMaxOccupancyLocked()
 	incomplete := restored.piSpaceIncomplete
 	intents := len(restored.voidedRegNonces)
-	// The admission's exchange is custody too (issue #107 row 5): the void must end it, or the
-	// identifier stays held by the ledger whatever the maps say.
-	custodyHeld := restored.custody.holdsPI(pi) || restored.custody.withholdsAllocation()
 	restored.mu.Unlock()
-	if custodyHeld {
-		t.Fatalf("the cancelled admission's custody must end with the void: identifier %d is still held", pi)
-	}
 	if reserved {
 		t.Fatalf("identifier %d was never transmitted, so it must not be reserved", pi)
 	}
+	// The admission's exchange is custody too (issue #107 row 5): the void must end it, or the
+	// identifier stays held by the ledger whatever the maps say. The withdrawal that ends it
+	// lands during recovery, but its release reaches the ledger through the custody hint's
+	// dispatcher, after recovery returns; so it converges within the bound rather than
+	// holding at the instant recovery returns.
+	waitFor(t, fmt.Sprintf("the cancelled admission's custody to end with the void, releasing identifier %d", pi), func() bool {
+		restored.mu.Lock()
+		defer restored.mu.Unlock()
+		return !restored.custody.holdsPI(pi) && !restored.custody.withholdsAllocation()
+	})
+	restored.mu.Lock()
+	inflight := restored.receiveMaxOccupancyLocked()
+	restored.mu.Unlock()
 	if inflight != 0 {
 		t.Fatalf("a never-transmitted delivery must consume no Receive Maximum slot, got %d", inflight)
 	}
