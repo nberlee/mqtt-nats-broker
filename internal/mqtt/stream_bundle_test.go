@@ -634,8 +634,8 @@ func TestBrokerStreamBundlePreflightRescans(t *testing.T) {
 			case err = <-done:
 			case <-time.After(budget + 5*time.Second):
 				close(quit)
-				<-done
-				t.Fatalf("still rescanning %s after a %s budget", budget+5*time.Second, budget)
+				err = <-done
+				t.Fatalf("still rescanning %s after a %s budget (returned %v once stopped)", budget+5*time.Second, budget, err)
 			}
 			if err == nil {
 				t.Fatalf("%d of %d present throughout must be refused", k, len(names))

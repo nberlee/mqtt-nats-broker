@@ -148,6 +148,24 @@ func TestGoMemoryLimitEnvironmentWins(t *testing.T) {
 	}
 }
 
+// TestGoMemoryLimitEmptyEnvironmentDerives pins that an empty GOMEMLIMIT is
+// unset, as the runtime reads it: the container limit is read and the ratio
+// applied, rather than the runtime's unlimited default left in force.
+func TestGoMemoryLimitEmptyEnvironmentDerives(t *testing.T) {
+	src := &countingSource{limit: 1000 * mib}
+	isolateGoMemoryLimit(t, src.provide)
+	t.Setenv("GOMEMLIMIT", "")
+
+	applyGoMemoryLimit(slog.New(&recordingHandler{}))
+
+	if n := src.called(); n != 1 {
+		t.Errorf("container limit read %d times with GOMEMLIMIT empty, want 1", n)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 943718400 {
+		t.Errorf("Go memory limit = %d, want 90 percent of the container's 1000 MiB", got)
+	}
+}
+
 // TestGoMemoryLimitAutomemlimitOverride pins the library's own control: a ratio
 // replaces 0.9, "off" disables the derivation, and a malformed value is logged
 // and changes nothing rather than failing startup.

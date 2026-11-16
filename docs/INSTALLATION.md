@@ -18,6 +18,14 @@ mixed-version cluster is unsupported. `go.mod` pins the exact version tested; "J
 behaviors this design depends on" in [Architecture](ARCHITECTURE.md) lists what a
 version bump has to re-verify.
 
+**Not v2.15.3.** It is above the floor and passes every startup check, but while a peer
+recovers a consumer it can report it not found, and the broker then replaces that
+client's durable and skips what it still owed (CONSUMERINFO-NONODE-NOTFOUND,
+[known upstream issues](known-upstream-issues.md); the residual is in
+[Conformance](CONFORMANCE.md#broker-owned-stream-prerequisites-startup-refusal-a-snapshot-and-dropped-fallbacks)).
+Run v2.15.2 on every peer until a release carries
+[nats-server#8894](https://github.com/nats-io/nats-server/pull/8894).
+
 **Header support.** Do not set `no_header_support` on any peer; the broker refuses a
 connected server that has it.
 

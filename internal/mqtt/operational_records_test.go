@@ -208,8 +208,8 @@ func TestInitializationRetryIsAFrozenRecord(t *testing.T) {
 	s := startupTestServer(t, ns.ClientURL(), "node-a", "", "", func(o *Options) { o.MQTT.JSAPITimeout = 15 * time.Second })
 	logs := captureServerLog(s)
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- s.Start(ctx) }()
+	done := make(chan struct{})
+	go func() { _ = s.Start(ctx); close(done) }()
 	select {
 	case <-entered:
 	case <-time.After(60 * time.Second):

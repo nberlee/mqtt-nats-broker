@@ -1738,6 +1738,14 @@ them in order where a later lint change depends on an earlier cleanup.
   chart's optional NATS dependency and the shared-pod example override the server image
   to `synadia/nats-server:2.15.2-alpine3.22`. Done 2026-10-27.
 
+- [x] Move the toolchain to Go 1.27.4 and `jwt` to 2.8.3, `nkeys` to 0.4.17,
+  `automemlimit` to 1.0.2, `klauspost/compress` to 1.20.4, the `golang.org/x` modules to
+  their latest, and golangci-lint to 2.15.0; nats-server 2.15.3 assessed and not adopted
+  (CONSUMERINFO-NONODE-NOTFOUND, `docs/known-upstream-issues.md`). Done 2026-11-16.
+
+- [ ] Move the pin and the floor to the nats-server release that carries
+  [nats-server#8894](https://github.com/nats-io/nats-server/pull/8894) (expected 2.15.4).
+
 - [x] Enable `js_ack_fc_v2` in clustered CI (`TestMQTTAckReplyLayoutV2Replicated`); a
   service grant positional on the v1 layout silently denies every v2 acknowledgement
   (`docs/ARCHITECTURE.md` "Recommended NATS permissions").

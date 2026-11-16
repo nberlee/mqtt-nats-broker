@@ -27,15 +27,16 @@ chapters P and U by name) and none is an alpha blocker. The alpha gate owes only
 the dependency floor: when a correction ships, the pin and the documented floor
 move onto it and the item is ticked.
 
-Pin: `nats-server v2.15.2` (latest release), moved from v2.15.1 on 2026-10-27. Every issue
-below was re-reproduced on v2.15.1 on 2026-10-11 with its real-server witness, and the
-store functions each one cites are byte-identical between v2.15.0 and v2.15.1
-(`docs/ARCHITECTURE.md`, "The v2.15.0 → v2.15.1 audit") and again between v2.15.1 and
-v2.15.2 ("The v2.15.1 → v2.15.2 audit": the one store change, `readStreamState`'s bounds
-checks, touches only a malformed index state file). Their witnesses were not re-run on
-v2.15.2. CALLOUT-CONN-TYPES is corrected in v2.15.2, and its witness was re-run on both.
-The earlier check against `main` (`v2.16.0-dev`) dates from each issue's own section and
-was not repeated.
+Pin: `nats-server v2.15.2`, moved from v2.15.1 on 2026-10-27 (v2.15.3, the latest release,
+is not adopted). Every issue below was re-reproduced on v2.15.1 on 2026-10-11 with its
+real-server witness, and the store functions each one cites are byte-identical between
+v2.15.0 and v2.15.1 (`docs/ARCHITECTURE.md`, "The v2.15.0 → v2.15.1 audit") and again
+between v2.15.1 and v2.15.2 ("The v2.15.1 → v2.15.2 audit": the one store change,
+`readStreamState`'s bounds checks, touches only a malformed index state file). Their
+witnesses were not re-run on v2.15.2. CALLOUT-CONN-TYPES is corrected in v2.15.2, and its
+witness was re-run on both. The earlier check against `main` (`v2.16.0-dev`) dates from
+each issue's own section and was not repeated. v2.15.3 was assessed on 2026-11-13 and is
+not adopted: it introduces CONSUMERINFO-NONODE-NOTFOUND, below.
 
 ## Index
 
@@ -48,6 +49,7 @@ was not repeated.
 | INPROCESS-REFUSAL | A connect the server refuses over an in-process connection waits out the server's write deadline and reports a closed pipe instead of the refusal | To be reported to nats.go and nats-server after the alpha (ROADMAP section 8) | embedded mode's refusal latency for a wrong MQTT credential or service credential (a stated residual, not a blocker) | Witness ready; reproduces on v2.15.1 with nats.go v1.54.0; `InProcessConn` unchanged on `main` |
 | PUSH-DIDNOTDELIVER | A push consumer that fails to route a delivery does not requeue it (the pull branch does), so it waits for AckWait | To be reported by the owner | a QoS 1/2 offer racing a subscriber's detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced on v2.15.2 with an embedded-server witness (6 of 200 rounds wait for AckWait); same source on `main` |
 | DRAIN-ACROSS-RECONNECT | nats.go re-sends SUB for a draining subscription on reconnect and later removes it locally without an UNSUB, leaving server interest | To be reported by the owner | delivery subscriptions drained at detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced with nats.go v1.55.0 (3 of 3, `ForceReconnect`); same source on `main` |
+| CONSUMERINFO-NONODE-NOTFOUND | A member holding a committed consumer's assignment, before its Raft node exists, answers consumer info "not found" after 500 ms, and wins when the leader answers slower | PR [#8894](https://github.com/nats-io/nats-server/pull/8894) (open, LGTM) fixes PR [#8741](https://github.com/nats-io/nats-server/pull/8741) | moving the pin and the floor to v2.15.3; a deployment that runs v2.15.3 servers anyway (a stated residual) | Reproduced on v2.15.3 (2 of 3), not on v2.15.2 (0); pin held at v2.15.2 |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -324,3 +326,32 @@ removal, 3 of 3 runs.
 keeps a JetStream push consumer active while its session is offline; its messages are
 pushed and discarded on every AckWait cycle until the next reconnect
 (`docs/CONFORMANCE.md`). The broker does not work around it.
+
+## CONSUMERINFO-NONODE-NOTFOUND: a recovering member reports a committed consumer not found
+
+**What.** v2.15.3 changed `jsConsumerInfoRequest` (`server/jetstream_api.go`, the
+`node == nil` branch): a member that holds a consumer's assignment but has not created the
+consumer's Raft node yet now answers `$JS.API.CONSUMER.INFO` with "consumer not found"
+(10014) after `errRespDelay` (500 ms), where v2.15.2 answered success with the
+assignment's configuration. Commit
+[384ae21b6d4b](https://github.com/nats-io/nats-server/commit/384ae21b6d4bb31ef2d7d8d8b16629f0b8041983),
+PR [#8741](https://github.com/nats-io/nats-server/pull/8741), released in v2.15.3. It is
+right for an assignment that is not committed, and wrong for a committed one whose node is
+only being created, which every restart and `resetClusteredState` produce. A requester
+takes the first reply; when the leader's valid reply is slower than 500 ms, the false one
+wins.
+
+**Why it matters here.** The broker reads a consumer-info "not found" as absence
+(`mqttClassifyConsumerInfoResponse`), and on the client's reconnect replaces the durable
+with a fresh `DeliverNew` consumer, so the old durable's undelivered and unacknowledged
+messages are skipped.
+
+**Witness.** A 3-node cluster, 120 committed R3 durables with a backlog, one server
+restarted and probed through, with witness-only delays widening both the window without a
+Raft node (50 ms per consumer) and the leader's reply (700 ms): a committed consumer was
+reported not found in 2 of 3 runs on v2.15.3 and in none on v2.15.2. Without the leader
+delay, over 2.5 million replies gave none on either.
+
+**Upstream.** PR [#8894](https://github.com/nats-io/nats-server/pull/8894), "Consumer info
+not found for consumer without Raft node yet", open and approved on 2026-11-16. The pin and
+the floor stay at v2.15.2 and move to the release that carries the fix.

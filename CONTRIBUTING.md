@@ -30,9 +30,9 @@ with `mqtt_experimental_shared_qos2`); each must be clean. Markdown rules live i
 `.markdownlint.jsonc`; vendored third-party docs are excluded via `.markdownlintignore`,
 since their style is upstream's decision. CI runs the same linter and configuration: it
 builds the pinned golangci-lint with the module's Go and runs `make lint-go`. Build it the
-same way locally (`GOTOOLCHAIN=go1.27.3 go install
-github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`): the release binaries are
-built with Go 1.27.0 and cannot read the export data Go 1.27.3 writes, so they report
+same way locally (`GOTOOLCHAIN=go1.27.4 go install
+github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0`): the release binaries are
+built with Go 1.27.0 and cannot read the export data Go 1.27.3 and later write, so they report
 every import as a typecheck error.
 
 The documents `docs/WIKI.md` lists are also published as the GitHub Wiki, and

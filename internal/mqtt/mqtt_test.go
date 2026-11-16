@@ -3844,7 +3844,12 @@ func TestMQTTConnAckFirstPacket(t *testing.T) {
 func TestMQTTRedeliveryAckWait(t *testing.T) {
 	t.Parallel()
 	o := testMQTTDefaultOptions()
-	o.MQTT.AckWait = 250 * time.Millisecond
+	// The cycle the reads below expect (each redelivery round offering foo1 and then foo2) holds
+	// only while AckWait exceeds two first deliveries: every QoS 1 delivery is admitted durably,
+	// a few JetStream round trips, before its frame is written, and foo2 is offered after foo1's
+	// write. That is about 50 ms each, 200 to 300 ms under -race on a loaded runner, where a
+	// 250 ms AckWait redelivered foo1 before foo2's first frame. One second keeps the margin.
+	o.MQTT.AckWait = time.Second
 	s := testMQTTRunServer(t, o)
 	defer testMQTTShutdownServer(s)
 

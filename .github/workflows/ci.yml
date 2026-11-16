@@ -190,11 +190,11 @@ jobs:
       #
       # BUILT WITH THIS JOB'S GO (`goinstall`), not the release binary: golangci-lint's releases
       # (v2.14.0 and v2.15.0 alike) are built with Go 1.27.0, whose importer cannot read the
-      # export data Go 1.27.3 writes ("export data version 5 is greater than maximum supported
+      # export data Go 1.27.3 and later write ("export data version 5 is greater than maximum supported
       # version 4"), so the release binary type-checks nothing on the go.mod toolchain.
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.14.0
+          version: v2.15.0
           install-mode: goinstall
           install-only: true
       - name: golangci-lint (four passes)

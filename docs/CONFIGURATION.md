@@ -140,11 +140,11 @@ cluster configuration would inherit it: state `1` for the one server it ships.
 
 At startup the broker sets the Go soft memory limit to 90 percent of the container's
 memory limit (cgroup v1 or v2), so the GC tightens before the kernel's OOM killer acts.
-`GOMEMLIMIT` in the environment overrides this entirely; `AUTOMEMLIMIT=<ratio>` changes
-the fraction and `AUTOMEMLIMIT=off` disables it. With no container limit the Go limit is
-unlimited. A failure to read the limit is logged and does not stop startup
-([details](ARCHITECTURE.md#the-go-memory-limit-follows-the-container-limit)). These
-two variables have no flag and no `MQTTNB_` form.
+A non-empty `GOMEMLIMIT` overrides this entirely (an empty one counts as unset);
+`AUTOMEMLIMIT=<ratio>` changes the fraction and `AUTOMEMLIMIT=off` disables it. With no
+container limit the Go limit is unlimited. A failure to read the limit is logged and does
+not stop startup ([details](ARCHITECTURE.md#the-go-memory-limit-follows-the-container-limit)).
+These two variables have no flag and no `MQTTNB_` form.
 
 ## MQTT over WebSocket
 

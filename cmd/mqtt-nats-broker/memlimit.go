@@ -19,7 +19,8 @@ const goMemoryLimitRatio = 0.9
 var goMemoryLimitSource memlimit.Provider = memlimit.FromCgroup
 
 // applyGoMemoryLimit derives the Go soft memory limit from the container limit,
-// once, at startup. An operator's GOMEMLIMIT wins and nothing is derived;
+// once, at startup. An operator's non-empty GOMEMLIMIT wins and nothing is
+// derived (an empty one is unset, for the runtime and the library alike);
 // AUTOMEMLIMIT replaces the ratio or, set to "off", disables the derivation. A
 // container with no limit leaves the runtime explicitly unlimited. Failing to
 // read the limit is never fatal: it is GC tuning, the kernel ceiling still

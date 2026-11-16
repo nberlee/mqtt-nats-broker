@@ -31,8 +31,8 @@ sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Quickstart
 
-The broker needs nats-server 2.15.2 or newer with one server option set; the
-prerequisites, the binary and both container images are in
+The broker needs nats-server 2.15.2 or newer, but not 2.15.3, with one server option
+set; the prerequisites, the binary and both container images are in
 [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 Run a broker + NATS locally:

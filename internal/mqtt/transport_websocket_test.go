@@ -497,8 +497,8 @@ func TestWSConnPongWaitsForAHalfWrittenFrame(t *testing.T) {
 	<-tc.held // the header is out, the payload is held
 
 	go func() { _, _ = feed.Write(wsPing("x")) }()
-	readErr := make(chan error, 1)
-	go func() { _, err := w.Read(make([]byte, 8)); readErr <- err }()
+	readReturned := make(chan struct{})
+	go func() { _, _ = w.Read(make([]byte, 8)); close(readReturned) }()
 	time.Sleep(100 * time.Millisecond)
 	tc.mu.Lock()
 	onWire := tc.out.Len()
@@ -519,7 +519,7 @@ func TestWSConnPongWaitsForAHalfWrittenFrame(t *testing.T) {
 		t.Fatalf("frames = %+v, want the binary frame then the Pong", fs)
 	}
 	feed.Close()
-	<-readErr
+	<-readReturned
 }
 
 // Concurrent application writes and Pongs under -race: every byte on the wire belongs to a
@@ -747,8 +747,8 @@ func TestWSConnCapDuringAPongReachesTheSocket(t *testing.T) {
 	pong := wsTestServerFramePong("x")
 	gate := tc.holdPayload(pong)
 	go func() { _, _ = feed.Write(append(wsPing("x"), wsBin("y")...)) }()
-	readErr := make(chan error, 1)
-	go func() { _, err := w.Read(make([]byte, 8)); readErr <- err }()
+	readReturned := make(chan struct{})
+	go func() { _, _ = w.Read(make([]byte, 8)); close(readReturned) }()
 	<-tc.held
 	ctl := tc.currentWriteDL()
 	if ctl.IsZero() {
@@ -766,7 +766,7 @@ func TestWSConnCapDuringAPongReachesTheSocket(t *testing.T) {
 		t.Fatalf("socket deadline %v during the Pong, want the earlier cap %v", tc.currentWriteDL(), capDL)
 	}
 	close(gate)
-	<-readErr
+	<-readReturned
 	if !tc.currentWriteDL().Equal(capDL) {
 		t.Fatal("after the Pong the socket does not hold the core's deadline")
 	}

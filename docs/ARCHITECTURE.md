@@ -78,7 +78,10 @@ When the dependency advances, plans may adopt the new current behavior directly.
 
 The floor is **nats-server 2.15.2**. Older releases are unsupported outright: there
 are no fallbacks. Every JetStream peer must meet the floor; a mixed-version cluster
-is unsupported. An embedded server (see "Embedded NATS") is the pinned module itself, so
+is unsupported. v2.15.3 is above the floor but not adopted: it reports a committed consumer
+not found while a member recovers it (CONSUMERINFO-NONODE-NOTFOUND,
+`docs/known-upstream-issues.md`), a residual stated in `docs/CONFORMANCE.md`. An embedded
+server (see "Embedded NATS") is the pinned module itself, so
 it meets the floor by construction.
 
 **The NATS dependency contract.** What every JetStream peer must provide, stated once:
@@ -10120,8 +10123,9 @@ asked before the attempt; a foreground holder passes none, because it must not w
 own announcement, and a refusal (`errMQTTAbortNotAdmitted`) leaves the attempt unresolved
 for the holder's retry. An unresolved failed attempt needs no abort when the sequence proof
 completes; any other (its authority still standing as expected, an outcome or authority
-read that cannot be answered, a zero expectation) may require an abort authority write. Background abort attempts yield to announced foreground work, so settlement and
-release of associated local resources may be delayed under sustained foreground load.
+read that cannot be answered, a zero expectation) may require an abort authority write.
+Background abort attempts yield to announced foreground work, so settlement and release
+of associated local resources may be delayed under sustained foreground load.
 Pending handles retain a retry owner. Admission does not revoke already-admitted requests
 or exclude remote writers.
 
@@ -16966,7 +16970,7 @@ subject index, which is why it asserts the broker-allocated share.
 The process derives its Go soft memory limit (`GOMEMLIMIT`) from the container's
 memory limit once at startup, before TLS is resolved or NATS is dialed
 (`applyGoMemoryLimit`, `cmd/mqtt-nats-broker/memlimit.go`), using
-`github.com/KimMachineGun/automemlimit` v1.0.0. Without it the garbage collector paces
+`github.com/KimMachineGun/automemlimit` v1.0.2. Without it the garbage collector paces
 only by `GOGC`, so the heap can grow past the cgroup ceiling between collections and
 the kernel kills the pod where the runtime could have collected harder. Go 1.27 does
 not derive this itself (golang/go#75164 is still an open proposal), and a Kubernetes
@@ -16975,8 +16979,9 @@ the derivation and the manifest only sets the limit.
 
 The outcome, in precedence order:
 
-1. `GOMEMLIMIT` present in the environment: nothing is derived; the runtime's own
-   parse of it stands.
+1. `GOMEMLIMIT` set to a non-empty value: nothing is derived; the runtime's own parse
+   of it stands. An empty `GOMEMLIMIT` counts as unset, as it does for the runtime, so
+   the derivation below proceeds.
 2. `AUTOMEMLIMIT=off`: nothing is derived. `AUTOMEMLIMIT=<r>` with r in (0, 1]
    replaces the ratio. A malformed or out-of-range value is logged at error level and
    changes nothing.
@@ -17003,7 +17008,7 @@ runtime's variable and `AUTOMEMLIMIT` the library's; neither is a broker setting
 neither has an `MQTTNB_` form or a flag.
 
 Cgroup v1 and v2 parsing is the library's, covered by its pinned fixture suite
-(`memlimit/cgroups_test.go` at v1.0.0); the broker's tests cover its own wiring
+(`memlimit/cgroups_test.go` at v1.0.2); the broker's tests cover its own wiring
 (`cmd/mqtt-nats-broker/memlimit_test.go`).
 
 ## The runtime image

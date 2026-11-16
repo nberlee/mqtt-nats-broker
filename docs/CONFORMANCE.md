@@ -478,9 +478,9 @@ its bounded restore cycles; and a creation's registry-shard CAS contends with ot
 clients' lifecycle completions on the same shard, which no client's announcement covers.
 The cost on the other side: under sustained foreground load a background abort (avoided
 when the authority sequence proves the attempt never landed; written whenever that proof
-cannot complete), a generation's reclamation, an anchor's discharge and an abandonment wait, and what waits on
-them (the settlement of local resources, the storage, the lifecycle's retirement) is
-delayed.
+cannot complete), a generation's reclamation, an anchor's discharge and an abandonment
+wait, and what waits on them (the settlement of local resources, the storage, the
+lifecycle's retirement) is delayed.
 
 **The ownership deadline caps the protocol's requests, not the whole CONNECT.** The budget
 is anchored at
@@ -5934,6 +5934,17 @@ precedent established:
   What such a peer does to the broker is whatever it lacks, surfacing as the request
   that needed it failing. The version on every peer stays a deployment prerequisite.
 
+- **A v2.15.3 peer can report a committed consumer not found while it recovers it.** It
+  is above the floor and passes every check, but while it holds a consumer's assignment
+  before the consumer's Raft node exists it answers consumer info "not found" after
+  500 ms, and that answer wins when the consumer's leader answers slower
+  (CONSUMERINFO-NONODE-NOTFOUND, `docs/known-upstream-issues.md`). The broker takes it as
+  absence and, on the client's next reconnect, replaces that client's durable, so the
+  messages the old durable still owed are skipped. v2.15.2 does not do this; the pin and
+  the floor stay there until a release carries
+  [nats-server#8894](https://github.com/nats-io/nats-server/pull/8894). Run v2.15.2 on
+  every peer meanwhile.
+
 - **This project's own external conformance environments meet both prerequisites,
   and assert them.** All three launches — the two CI conformance jobs
   (`.github/workflows/ci.yml`) and `test/conformance/docker-compose.yml` — run
@@ -6598,7 +6609,7 @@ Not an MQTT conformance item; an operational limit of the startup derivation in
   explicitly unlimited; there is no fallback to host memory.
 - A failure to discover or read the limit is logged and leaves the runtime's prior
   limit, normally unlimited, in force; startup is not refused.
-- An operator's `GOMEMLIMIT` disables the derivation entirely, and `AUTOMEMLIMIT`
+- An operator's non-empty `GOMEMLIMIT` disables the derivation entirely, and `AUTOMEMLIMIT`
   replaces the ratio or turns it off; both are read as their owners define them, not
   validated by the broker.
 
