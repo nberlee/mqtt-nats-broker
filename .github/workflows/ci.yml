@@ -536,10 +536,11 @@ jobs:
           for _ in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
       - name: run conformance suites
         run: ./test/conformance/run.sh
-      # A failed suite keeps its per-test output and the broker's log: run.sh prints only
-      # the regression names, which is not enough to diagnose an intermittent failure.
+      # Every run keeps its per-test output and the broker's log: run.sh prints only the
+      # regression names, which is not enough to diagnose an intermittent failure, and a
+      # green run's slow-CONNECT lines are the near misses a later red is compared with.
       - name: upload conformance results
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: conformance-results
@@ -585,9 +586,10 @@ jobs:
       - name: run Paho interoperability suite
         run: SUITES=paho ./test/conformance/run.sh
       # Same reason as the conformance job: an intermittent Paho regression (test_subscribe_failure
-      # and test_server_keep_alive on run 40584306314) left nothing to diagnose it with.
+      # and test_server_keep_alive on run 40584306314) left nothing to diagnose it with, and a
+      # green run's CONNECTs between the 250 ms slow line and the suite's 0.3 s window are logged.
       - name: upload Paho results
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: paho-results

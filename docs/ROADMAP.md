@@ -1692,7 +1692,8 @@ them in order where a later lint change depends on an earlier cleanup.
   staging nats-server syncs on commit; yielding background admission to any announced
   CONNECT of the account cut p90 by about 15%. The slow-CONNECT line now reports each
   step's batch and request waits, so a CI red shows whether a slow step waited on its own
-  requests before the fix is chosen.
+  requests before the fix is chosen; the Paho and conformance jobs keep `broker.log` on
+  every run, so a green run's near misses (250-300 ms) are read as well.
 
 - [ ] Overlap a clean-start CONNECT's independent JetStream reads. Its requests run one
   at a time (about 22 reads beside three durable commits); the reads that do not depend
