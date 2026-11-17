@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -112,11 +113,20 @@ func runWithCluster(m *testing.M, external, embedded string) (int, error) {
 		}
 	}
 	// The images the NATS chart runs, loaded from the daemon so the node pulls nothing.
-	for _, img := range thirdPartyImages {
-		if _, err := run(ctx, nil, "docker", "pull", img); err != nil {
+	// Each is multi-platform, and pulled and saved for this host's platform alone: under
+	// Docker's containerd image store a whole-image save carries the index naming every
+	// platform but the blobs of the pulled one only, and kind's import, which takes all
+	// platforms, then fails on a digest that is not in the archive.
+	platform := "linux/" + runtime.GOARCH
+	for i, img := range thirdPartyImages {
+		if _, err := run(ctx, nil, "docker", "pull", "--platform", platform, img); err != nil {
 			return 0, err
 		}
-		if _, err := run(ctx, nil, env.kind, "load", "docker-image", img, "--name", env.cluster); err != nil {
+		archive := filepath.Join(dir, fmt.Sprintf("image-%d.tar", i))
+		if _, err := run(ctx, nil, "docker", "save", "--platform", platform, "-o", archive, img); err != nil {
+			return 0, err
+		}
+		if _, err := run(ctx, nil, env.kind, "load", "image-archive", archive, "--name", env.cluster); err != nil {
 			return 0, err
 		}
 	}

@@ -58,13 +58,16 @@ type testForegroundSchedule struct {
 	parkTxn []string
 	trigger bool // the foreground under test is the next claim
 	window  bool // the claim under test is announced
-	// windowStamp is the window's announcement, by the handshake's count of announcements.
-	windowStamp uint64
-	claims      int
-	fails       int
-	inWindow    []string // background admissions and commits observed inside the window
-	capture     int      // the admission-parked entry whose batch the next background presend is
-	depth       int      // announcements standing; the window closes when it returns to zero
+	// released says the coordinator, under fgMu, has released the window's last announcement.
+	// The window closes at the release hook, which runs after that release; a background writer
+	// waiting at its admission is woken by the release itself and may be admitted and commit
+	// before the hook runs. Such a commit comes after the window, whatever the hooks' order.
+	released bool
+	claims   int
+	fails    int
+	inWindow []string // background admissions and commits observed inside the window
+	capture  int      // the admission-parked entry whose batch the next background presend is
+	depth    int      // announcements standing; the window closes when it returns to zero
 	// fails is how many claim attempts the schedule costs; by default one per parked entry.
 	wantFails int
 	// onClaim runs at the claim's first attempt, before the hold, for a schedule that releases
@@ -106,7 +109,7 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 		switch {
 		case on && sch.trigger && !sch.window && sch.claims == 0:
 			sch.window = true
-			sch.windowStamp = stamp
+			sch.released = false
 			sch.events = append(sch.events, "announce")
 		case !on && sch.window && sch.depth == 0:
 			// Overlapping foreground scopes keep the window open: background waits for all of them.
@@ -117,12 +120,9 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 	}
 	admit := func(stamp uint64) {
 		sch.mu.Lock()
-		// DECIDED INSIDE THE WINDOW, by the announcement count the admission read under the
-		// handshake's lock: an admission decided just before the window's announcement may reach
-		// this hook after it, and is the one attempt the window allows, not a breach.
-		if sch.window && stamp >= sch.windowStamp {
-			sch.inWindow = append(sch.inWindow, "admit")
-		}
+		// Whether this admission breached the window is decided by the coordinator hook, which
+		// sees it under fgMu; this hook runs after fgMu is released, in any order with the
+		// window's own hooks, and serves only to park an attempt at its admission.
 		for k, pat := range sch.park {
 			if pat == "admit" && sch.parkTxn[k] == _EMPTY_ {
 				sch.parkTxn[k] = "admission"
@@ -247,11 +247,37 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 				return seq, err
 			}
 		}
-		if sch.window && err == nil {
+		if sch.window && !sch.released && err == nil {
 			sch.inWindow = append(sch.inWindow, "commit:"+at.Attempt.Op)
 		}
 		return seq, err
 	}
+	// The coordinator's own order, observed under fgMu. An admission it decides while an
+	// announcement of the client stands (N > 0) is a breach, recorded at the decision itself, so
+	// no delay between the decision and any hook can move it outside the window. The window's
+	// last release is the instant from which the coordinator admits again, and an announcement
+	// standing again ends that.
+	// The hook it replaces, chained to; atomic because the hook may run before Swap returns.
+	var prevEv atomic.Pointer[func(mqttForegroundEvent)]
+	coordinator := func(ev mqttForegroundEvent) {
+		if ev.ID == clientID {
+			sch.mu.Lock()
+			switch {
+			case ev.Kind == mqttForegroundAdmitted && ev.N > 0 && (sch.window || sch.trigger):
+				sch.inWindow = append(sch.inWindow, "admit")
+			case !sch.window:
+			case ev.Kind == mqttForegroundReleased && ev.N == 0:
+				sch.released = true
+			case ev.Kind == mqttForegroundAnnounced:
+				sch.released = false
+			}
+			sch.mu.Unlock()
+		}
+		if prev := prevEv.Load(); prev != nil {
+			(*prev)(ev)
+		}
+	}
+	prevEv.Store(mqttTestForegroundEventV.Swap(&coordinator))
 	jsa.testTransitionPresend.Store(&presend)
 	jsa.testTransitionCommit.Store(&commit)
 	as.mu.Lock()
@@ -265,6 +291,7 @@ func testForegroundScheduleUp(t *testing.T, clientID string, sess *mqttSession, 
 	}
 	as.mu.Unlock()
 	t.Cleanup(func() {
+		mqttTestForegroundEventV.Store(prevEv.Load())
 		jsa.testTransitionPresend.Store(nil)
 		jsa.testTransitionCommit.Store(nil)
 		sess.testForegroundAnnounce.Store(nil)
