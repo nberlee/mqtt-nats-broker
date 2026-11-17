@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"runtime"
 	"strings"
@@ -1311,7 +1312,9 @@ func TestMQTTRetainedSendReleasesOnTheWriteWithoutADiscard(t *testing.T) {
 // T10 — DISCARD AT PUBLISH. An admitted retained delivery left unacknowledged, then a clean-start
 // CONNECT discards the generation: the closed generation's recovery pass reclaims the copy — chunks
 // and manifest gone, the owner CleanupComplete, both payload duties terminal — without waiting for
-// a PUBACK that will never come.
+// a PUBACK that will never come. The generation's retirement purges the owner and the duties with
+// every other record of the generation (issue #133), so it is held while they are read, and then
+// released: the generation retires and leaves neither behind.
 func TestRetainedDiscardReclaimsTheCopy(t *testing.T) {
 	// The recovery pass rides the session-expiry sweep's cadence.
 	defer setMQTTSessionExpirySweepInterval(100 * time.Millisecond)()
@@ -1331,6 +1334,8 @@ func TestRetainedDiscardReclaimsTheCopy(t *testing.T) {
 	if merr != nil {
 		t.Fatalf("no copy: %v", merr)
 	}
+	r.asm.testHoldGenerationRetirement.Store(true)
+	defer r.asm.testHoldGenerationRetirement.Store(false)
 	sub.Close()
 
 	c2, r2 := testMQTTConnect(t, &mqttConnInfo{clientID: r.id, cleanSess: true}, r.o.MQTT.Host, r.o.MQTT.Port)
@@ -1366,6 +1371,17 @@ func TestRetainedDiscardReclaimsTheCopy(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+
+	r.asm.testHoldGenerationRetirement.Store(false)
+	testDriveRetirement(t, r.s, r.asm, func() error {
+		if st, _ := r.asm.genStanding(r.id, gen); st != mqttGenRetired {
+			return fmt.Errorf("the discarded generation %q reads %v, want retired", gen, st)
+		}
+		if res, _, _ := r.asm.jsa.loadOutboundResource(r.id, r.epoch, gen, m.Inc); res != nil {
+			return fmt.Errorf("the retired generation's copy owner remains: %+v", res)
+		}
+		return nil
+	})
 }
 
 // T14 — A FAILED PUBREL ACQUISITION IS RETRIED BY THE DRIVER, the client silent. The PUBREC handler's
