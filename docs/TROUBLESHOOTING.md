@@ -64,12 +64,12 @@ delete all seven streams, and start again, which discards the broker state
 - `broker-owned streams are in another persisted format (...)`: the streams were written
   by a broker release that uses another format, named in the message. Run a release that
   reads it; deleting the streams discards all the state that release can still read
-  ([The persisted format](ARCHITECTURE.md#the-persisted-format)).
+  ([Upgrades and rollbacks](OPERATIONS.md#upgrades-and-rollbacks)).
 - `broker-owned streams carry no "mqtt_nats_broker_format" metadata (...)`: the streams
   were written before the format was versioned, or by something else — nats-server's own
   MQTT listener leaves such streams ([Migration](MIGRATION.md)). They cannot be read:
   with every broker stopped, delete all seven.
-- `this account holds N of the 8 broker-owned streams ...`: a partial set that stayed
+- `this account holds N of the 7 broker-owned streams ...`: a partial set that stayed
   partial for 30 s. If another broker is starting, wait for it and restart this one;
   only with every broker stopped, delete all seven.
 - `this account still holds $MQTT_origin, ...`: a stream an earlier build created;

@@ -71,6 +71,11 @@ jobs:
       - name: go vet
         if: matrix.shard == 0
         run: go vet -tags mqtt_fulltests ./...
+      # The backup procedure's natscli commands, run as docs/OPERATIONS.md writes them; the
+      # shards skip TestBackupRestoreWithNatsCLI, which needs the binary.
+      - name: backup and restore with natscli
+        if: matrix.shard == 0
+        run: make backup-cli-test
       - name: test
         run: make test-shard TEST_TAGS=mqtt_fulltests SHARD=${{ matrix.shard }} SHARDS=8
 
@@ -117,7 +122,7 @@ jobs:
       - name: test
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
-        run: go test -tags mqtt_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
+        run: go test -tags mqtt_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTAckReplyLayoutV2Replicated|TestNetworkRestoreOfAReplicatedBundle|TestColdStoreCopyOfAReplicatedBundle)' ./internal/mqtt/
       - name: test (embedded-NATS cluster)
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'

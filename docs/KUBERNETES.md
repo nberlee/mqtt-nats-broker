@@ -51,6 +51,44 @@ for the endpoint to leave the Service before it disconnects clients. The pod's
 termination grace must cover that wait plus the broker's shutdown budgets; the chart
 sets 60 s, 75 s embedded ([Operations](OPERATIONS.md#shutdown)).
 
+## Backups and upgrades
+
+The procedures are in [Operations](OPERATIONS.md#backup-and-restore) and
+[Operations](OPERATIONS.md#upgrades-and-rollbacks); what is particular to the chart:
+
+- **Rollouts.** `helm upgrade` and `helm rollback` replace the pods the workload's way.
+  The external topology's Deployment uses Kubernetes' default rolling update (a quarter
+  of the pods surged and a quarter unavailable, rounded up and down): with up to three
+  replicas no old broker stops before a new one is ready, with four or more up to a
+  quarter can stop at once. The embedded StatefulSet replaces one pod at a time, highest
+  ordinal first. A release that refuses the streams never turns ready, so the rollout
+  stops there; in the embedded topology the refusing pod's NATS server is down with it
+  (one replica: an outage) until it is rolled back.
+- **Holding the embedded StatefulSet at zero pods**, for a cold copy, its restore or an
+  offline upgrade: `kubectl scale statefulset <name> --replicas=0`, and on every
+  `helm upgrade` until the hold ends pass
+  `--set-json 'statefulSet.patch=[{"op":"replace","path":"/spec/replicas","value":0}]'`
+  (keeping any `statefulSet.patch` entries of your own in the list). The top-level
+  `replicas: 0` does not hold it (the chart reads an empty count as its default), and
+  `replicas` keeps sizing the cluster configuration for the pods that come back.
+  `helm rollback` takes no values and reapplies a revision's stored replica count, so
+  during a hold roll back with `helm upgrade` to the previous chart or image instead.
+  End the hold with a `helm upgrade` that sets the patch list back explicitly, for
+  example `--reuse-values --set-json 'statefulSet.patch=[]'`: an upgrade that only
+  leaves the patch out keeps it, because Helm reuses the release's stored values when
+  none are given.
+- **The volumes.** Each pod's store is the claim `data-<statefulset>-<ordinal>`; scaling
+  down keeps the claims. Copy them once every pod has terminated and its volume is
+  detached. To restore, keep the hold, delete each claim and recreate it under the same
+  name from its copy (a volume snapshot as its `dataSource`), each to the ordinal it came
+  from, then end the hold.
+- **Resetting the streams across a format change**: hold at zero, delete every `data-`
+  claim, deploy the new release under the hold, end it. This discards everything the
+  embedded servers store, so it applies only when they hold nothing but the seven
+  broker-owned streams (the chart's configuration; the broker does not check it). An
+  embedded configuration that stores other streams has no supported reset across a
+  format change ([Conformance](CONFORMANCE.md#backup-and-restore-what-the-procedures-leave)).
+
 ## TLS Secrets
 
 Mount the TLS Secret as a directory, never with `subPath`, or certificate renewals never

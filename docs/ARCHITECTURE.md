@@ -327,8 +327,9 @@ releases is newer.
 
 **Across a bump, an offline transition.** Stop every broker on the account; convert the
 bundle (when that break ships a migration) or reset it; then start only brokers of the new
-version. No rolling upgrade crosses a version change. Alpha decides, per break, between a
-migration and a refusal with guidance; beta keeps its commitments (see "Release phases").
+version (`docs/OPERATIONS.md`, "Upgrades and rollbacks"). No rolling upgrade crosses a
+version change. Alpha decides, per break, between a migration and a refusal with guidance;
+beta keeps its commitments (see "Release phases").
 
 **When the pre-release rule expires.** "A mixed fleet does not exist" holds until the first
 release. From the first release a mixed fleet exists **within one version**, and every
@@ -1464,6 +1465,75 @@ that table, that `TestBrokerStreamSpecTable` pins the table, and that
 `TestStreamValidatorFieldCoverage` requires every validator to reject a foreign
 stamp — a validator that forgot the check fails that bijection.
 
+### Backing up and restoring the bundle
+
+The operator procedures are in `docs/OPERATIONS.md` ("Backup and restore", "Upgrades and
+rollbacks"); this is why they have the shape they do. No broker code takes part: a backup
+is JetStream's own stream snapshot (natscli's `nats backup`, over
+`$JS.API.STREAM.SNAPSHOT` and `$JS.API.STREAM.RESTORE`) or a copy of the servers' stores,
+and what the broker contributes is the start-time refusal of a proper subset or a mixed
+epoch above.
+
+**What stopping every broker buys, and what it does not.** Only a broker writes a record
+that names another stream's state, so with every broker stopped the seven are captured
+without a cross-stream writer, and members snapshotted one after another hold the
+broker-written records exactly as the last broker left them. The streams are not frozen:
+nats-server keeps expiring messages, keeps its consumers' timers, and on a `$MQTT_rmsgs`
+with `Sources` keeps ingesting. Each of those changes one stream on its own, so the set a
+backup captures is the state an outage of every broker leaves, observed per member at
+its own instant, which a start already recovers from: a delivery whose source expired
+between two members' snapshots is the possibly transmitted PUBLISH over a gone source
+whose identifier recovery keeps reserved until the client acknowledges it (see
+"Outbound in-flight registers"), and nats-server drops at restore an archived
+message whose TTL has elapsed meanwhile. A broker still running during the capture is
+undetectable afterwards; that precondition is the operator's.
+
+**Consumers are part of the backup.** `$MQTT_msgs` and `$MQTT_out` are InterestPolicy
+streams whose durables carry retention and delivery state, and a delivery the broker
+rebuilds on resume from its register is redelivered by its consumer, at most one AckWait
+after the start, since a rebuilt entry has no acknowledgement subject to NAK (see
+`resendPendingRedelivery`). A restored durable is adopted by name, keeping its persisted
+`DeliverSubject` and configuration, the zero inactivity threshold a depended-on consumer
+needs included. A restored per-run ephemeral (the retained index's observer, the
+session-record watch) is what a crashed run leaves: a new run creates its own under new
+names and never adopts it, and its inactivity threshold reaps it (see "Per-run ephemeral
+consumer identity").
+
+**A network snapshot on a clustered JetStream loses the acknowledgements above the
+floor.** nats-server 2.15.2 snapshots a consumer on a clustered server from consumer
+info, which has no sparse pending state, and writes one with acknowledgements pending at
+its ACK FLOOR; the selector is the server being clustered, not the stream's replica count.
+After a restore every stored delivery above the floor is offered again. An acknowledged
+QoS 1 delivery there is sent again (permitted at QoS 1; `docs/CONFORMANCE.md` states it).
+A completed QoS 2 delivery there is NOT: its slot stays `pubrel_terminal` while its source
+may still be re-offered — stored and above the floor — because the PUBCOMP finalizer
+retains the slot for a Live or Unknown source before any deletion (`pubrel_action.go`,
+`mqttTerminalRetainedReoffer`), the only deletion of a `pubrel_terminal` slot is behind
+that check, and recovery installs the matching retirement before source interest opens.
+The re-offer is withheld by the retired-source check in the delivery path. A copy of the
+stores keeps the consumer state as stored and offers neither again.
+
+**A restore is complete only when all seven reported success.** nats-server creates the
+stream before reading the archive and activates what it restored even when the restore
+fails part-way, so a failed member can stand configured, epoch-stamped and
+format-stamped with records missing, and the start-time checks admit it. The procedure
+therefore restarts the whole restore on any failure, whatever is present.
+
+**A network snapshot of a `$MQTT_rmsgs` with `Sources` is not a coherent capture of the
+retained set.** The snapshot bounds itself by the last sequence when it starts and walks
+the live store, so a sourced replacement arriving meanwhile can evict the old per-topic
+record while the replacement lies past the bound; and the archive does not carry the
+store's sourcing checkpoint, so after a restore nats-server reconstructs the sourcing
+position from the restored messages. A copy of a stopped store carries both. Stated as a
+residual, with no broker mechanism.
+
+**Across a format version or an embedded nats-server version, offline.** A format change
+is the refusal in "The persisted format", with the reset or a restore of a previous
+release's backup as the way across and back; an embedded nats-server change moves every
+pod together, because a mixed-version JetStream cluster is unsupported, and keeps the
+store. Two releases of one format serving one account is the coexistence contract in
+"The broker-to-broker protocol"; one build cannot test it.
+
 ### What a persisted record references that another stream issues
 
 Which durable identities cross a stream boundary is enumerated in
@@ -1912,7 +1982,7 @@ Operational constraints for the coupled streams:
   A common epoch detects a bundle assembled across incarnations; it does NOT prove seven
   independently restored snapshots came from one coherent instant, so restore skew
   within one incarnation is undetectable and the "one point in time" is the operator's
-  to guarantee.
+  to guarantee: every broker stopped (see "Backing up and restoring the bundle").
 - **A reset requires restarting every broker serving the account before MQTT traffic
   resumes.** The recovery epoch is captured once per account manager
   (`as.sessStreamEpoch`); a live manager that outlives the reset retains the stale

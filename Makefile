@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 IMAGE   ?= ghcr.io/nberlee/mqtt-nats-broker
 
-.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof config-surface-fixture operational-interface-fixture store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
+.PHONY: build test vet lint lint-go lint-md core-build core-test full-suite test-shard experimental-shared-qos2-tests cluster-failover-tests backup-cli-test image-smoke-external image-smoke-embedded kubernetes-render helm-check release-version helm-package chart-registry-check helm-publish helm-smoke bench-inbound bench-jspaths bench-outbound depproof config-surface-fixture operational-interface-fixture store-format-fixture soak resource-soak run docker docker-multiarch conformance wiki tidy clean
 
 # Paired soak knobs (see the `soak` target).
 SOAK_RUNS ?= 20
@@ -19,6 +19,9 @@ KUSTOMIZE_VERSION := v5.8.1
 # kind node's Kubernetes version, checked against the pinned digests. Helm keeps its
 # cache, configuration and data under bin/, never in the user's home.
 HELM_VERSION    := v4.3.1
+# The natscli whose commands docs/OPERATIONS.md's backup procedure is written in
+# (see `backup-cli-test`), go-installed like helm.
+NATSCLI_VERSION := v0.5.1
 KIND_VERSION    := v0.33.0
 KUBECTL_VERSION := v1.37.0
 KUBECTL_SHA256_amd64 := 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
@@ -82,9 +85,13 @@ test-shard: ## Run shard SHARD of SHARDS of the tagged suite (TEST_TAGS) under -
 experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
 	go test -tags 'mqtt_fulltests mqtt_experimental_shared_qos2' ./internal/mqtt/
 
-cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, the v2 acknowledgement-layout witness, and an embedded-NATS cluster forming from a staggered start.
-	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqtt_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated|TestMQTTQoS0Downgrade.*Replicated|TestMQTTAckReplyLayoutV2Replicated)' ./internal/mqtt/
+cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, the v2 acknowledgement-layout witness, the replicated bundle's network restore and cold copy, and an embedded-NATS cluster forming from a staggered start.
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqtt_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated|TestMQTTQoS0Downgrade.*Replicated|TestMQTTAckReplyLayoutV2Replicated|TestNetworkRestoreOfAReplicatedBundle|TestColdStoreCopyOfAReplicatedBundle)' ./internal/mqtt/
 	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -race -run '^TestEmbeddedClusterFormsAfterFirstProbeFails$$' ./cmd/mqtt-nats-broker/
+
+backup-cli-test: ## Run the documented backup and restore commands with the pinned natscli against a broker
+	GOBIN=$(CURDIR)/bin go install github.com/nats-io/natscli/nats@$(NATSCLI_VERSION)
+	MQTTNB_NATSCLI=$(CURDIR)/bin/nats go test -tags mqtt_fulltests -count=1 -run '^TestBackupRestoreWithNatsCLI$$' ./internal/mqtt/
 
 depproof: ## Dependency canary: JetStream write-contract regressions plus every mutation
 	./test/depproof/run.sh --matrix

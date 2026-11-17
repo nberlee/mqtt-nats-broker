@@ -1745,6 +1745,8 @@ them in order where a later lint change depends on an earlier cleanup.
 
 - [ ] Move the pin and the floor to the nats-server release that carries
   [nats-server#8894](https://github.com/nats-io/nats-server/pull/8894) (expected 2.15.4).
+  Not a first-alpha prerequisite: the first alpha ships on 2.15.2 (owner decision
+  2026-11-17).
 
 - [x] Enable `js_ack_fc_v2` in clustered CI (`TestMQTTAckReplyLayoutV2Replicated`); a
   service grant positional on the v1 layout silently denies every v2 acknowledgement
@@ -1900,6 +1902,12 @@ them in order where a later lint change depends on an earlier cleanup.
 - [x] Include Kubernetes Secret and live TLS rollover examples: `docs/AUTHENTICATION.md`,
   "Kubernetes".
 
+- [x] Document and test backup, restore, upgrade and rollback: a network backup with
+  natscli or a cold copy of the stores, every broker stopped, all seven restored from one
+  set; upgrades and rollbacks decided by the persisted format and the embedded nats-server
+  version (`docs/OPERATIONS.md`, `docs/KUBERNETES.md`; residuals in `docs/CONFORMANCE.md`).
+  Done 2026-11-17.
+
 ## 7. Finish provenance and release documentation
 
 ### Remove porting-era terminology
@@ -1939,7 +1947,10 @@ them in order where a later lint change depends on an earlier cleanup.
   source carries it. The GitHub release body is that entry, copied at release time:
   `.github/workflows/release.yml` sets no body and generates none. Generated release notes
   are not adopted, because GitHub builds them from merged pull requests and this
-  repository's history is direct commits. Open until the alpha is published.
+  repository's history is direct commits. Each entry states the persisted format the
+  release reads and writes and the nats-server version it embeds, which decide how to
+  upgrade to it (`docs/OPERATIONS.md`, "Upgrades and rollbacks"). Open until the alpha is
+  published.
 
 - [x] Replace the README's duplicate roadmap with a short link to this file.
 

@@ -1627,6 +1627,43 @@ embedded:
 	if got, _ := field(sts, "spec", "volumeClaimTemplates", 0, "spec", "volumeMode"); got != "Filesystem" {
 		t.Errorf("embedded.storage.merge: volumeMode %v, want Filesystem", got)
 	}
+
+	// Holding an embedded cluster at zero pods through a Helm operation, as a cold-copy
+	// restore and an offline upgrade do (docs/KUBERNETES.md): `replicas: 0` cannot, since
+	// the chart defaults an empty count and zero is empty, so the documented hold is a
+	// statefulSet.patch. It must stop every pod and change nothing else — the cluster's
+	// route list and the stream replicas stay sized for the cluster that comes back.
+	cluster := "topology: embedded\nembedded:\n  cluster:\n    enabled: true\n"
+	sized := helmTemplate(t, bin, helmChartDir, writeValues(t, "embedded-cluster", cluster))
+	held := helmTemplate(t, bin, helmChartDir, writeValues(t, "embedded-cluster-held", cluster+`
+statefulSet:
+  patch:
+    - op: replace
+      path: /spec/replicas
+      value: 0
+`))
+	sizedSts, heldSts := findObject(t, sized, "StatefulSet"), findObject(t, held, "StatefulSet")
+	if got, _ := field(sizedSts, "spec", "replicas"); got != 3 {
+		t.Fatalf("the embedded cluster renders %v pods, want 3", got)
+	}
+	if got, _ := field(heldSts, "spec", "replicas"); got != 0 {
+		t.Errorf("the documented hold renders %v pods, want 0", got)
+	}
+	if a, b := fmt.Sprint(mustMap(t, sizedSts, "spec", "template")), fmt.Sprint(mustMap(t, heldSts, "spec", "template")); a != b {
+		t.Errorf("the hold changed the pod template:\n%s\nwant\n%s", b, a)
+	}
+	if a, b := fmt.Sprint(findObject(t, sized, "ConfigMap")), fmt.Sprint(findObject(t, held, "ConfigMap")); a != b {
+		t.Errorf("the hold changed the NATS configuration:\n%s\nwant\n%s", b, a)
+	}
+	// Ending the hold sets the patch list back explicitly; the emptied list renders the
+	// cluster's own count again.
+	released := helmTemplate(t, bin, helmChartDir, writeValues(t, "embedded-cluster-released", cluster+`
+statefulSet:
+  patch: []
+`))
+	if got, _ := field(findObject(t, released, "StatefulSet"), "spec", "replicas"); got != 3 {
+		t.Errorf("the released hold renders %v pods, want 3", got)
+	}
 }
 
 func findObject(t *testing.T, objs []map[string]any, kind string) map[string]any {

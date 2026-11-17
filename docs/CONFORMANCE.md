@@ -6017,6 +6017,41 @@ the compatibility boundary (no released contract exists for either):
   `MaxMsgsPer` in place either — `$MQTT_rmsgs` is create-then-validate like
   every other broker-owned stream.
 
+### Backup and restore: what the procedures leave
+
+The supported procedures (`docs/OPERATIONS.md`, "Backup and restore" and "Upgrades and
+rollbacks"; the mechanism in `docs/ARCHITECTURE.md`, "Backing up and restoring the
+bundle") restore every state they capture, witnessed in
+`bundle_backup_restore_fulltests_test.go`, `bundle_cold_copy_cluster_test.go` and
+`bundle_backup_natscli_fulltests_test.go`. What they leave, stated as behavior:
+
+- **A backup needs every broker for the account stopped**, and a cold copy every NATS
+  server as well: MQTT service is down for its duration. A broker running during a
+  capture is not detected afterwards.
+- **A failed restore can be admitted.** A member whose restore failed part-way can stand
+  configured and stamped with records missing; the start-time checks pass it
+  (`TestFailedRestoreCanBeAdmitted`). The procedure restarts the whole restore on any
+  failure.
+- **After a network restore from a clustered JetStream, a QoS 1 message a client
+  acknowledged above its consumer's acknowledgement floor is delivered to it again**,
+  once, as a new delivery: DUP 0, under an identifier allocated afresh, which need not
+  be the one it had
+  (`TestNetworkRestoreOfAReplicatedBundleReoffersAboveTheAckFloor`). nats-server 2.15.2
+  writes a clustered consumer with acknowledgements pending at its floor. Completed QoS 2
+  messages are not delivered again; a cold copy delivers neither again.
+- **A network backup of a `$MQTT_rmsgs` with `Sources` is not a coherent capture of the
+  retained messages**: a sourced replacement arriving during the backup can leave a topic
+  with neither message, and after the restore the sourcing resumes from the restored
+  messages, so upstream messages may arrive again or be skipped.
+- **Across a format change the MQTT state does not carry over**: no release converts
+  formats, and the way back is a backup taken before the upgrade, losing everything
+  since. An embedded configuration whose NATS servers store anything besides the seven
+  streams has no supported reset across a format change: deleting the seven needs the
+  server running, and in that topology it runs only inside a broker that refuses them.
+- **Two releases of one format serving together is untested** until a second release
+  exists; `TestRollingRestartWithinOneBuildKeepsSessions` witnesses a rolling replacement
+  within one build only.
+
 ### The configuration surface: what startup does not refuse
 
 The settings are read strictly and the chart's values are checked against their schema
