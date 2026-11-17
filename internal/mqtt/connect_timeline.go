@@ -16,6 +16,7 @@ package mqtt
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,62 @@ type mqttConnectSpan struct {
 	begin, end time.Time
 	cleanup    bool // a deferred cleanup, run after the body returned
 	exited     bool // the body span the function returned from
+	// at and through are the CONNECT's request tally when the step began and ended: what the
+	// step itself waited on JetStream for is their difference.
+	at, through mqttRequestCounts
+}
+
+// mqttRequestTally counts the JetStream requests a CONNECT's ownership protocol waited on, by the
+// views its ownership budget hands out (the acceptance, the bind, the tenure and the settlement
+// read): how many, how long in total, and the longest. Atomic batches are counted apart from every
+// other request, since a batch's commit is where the store's own work queues. It explains where a
+// slow step's time went — one long wait or many — and nothing else reads it.
+type mqttRequestTally struct {
+	mu         sync.Mutex
+	c          mqttRequestCounts
+	batchWaits []time.Duration // every batch's wait, in order: a step's longest is over its own
+}
+
+type mqttRequestCounts struct {
+	batches, requests  int
+	batchWait, reqWait time.Duration
+}
+
+// record counts one answered (or timed-out) request that waited d. A nil tally counts nothing.
+func (t *mqttRequestTally) record(batch bool, d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if batch {
+		t.c.batches++
+		t.c.batchWait += d
+		t.batchWaits = append(t.batchWaits, d)
+		return
+	}
+	t.c.requests++
+	t.c.reqWait += d
+}
+
+// longest is the longest wait among batches [from, to).
+func (t *mqttRequestTally) longest(from, to int) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var m time.Duration
+	for _, d := range t.batchWaits[from:to] {
+		m = max(m, d)
+	}
+	return m
+}
+
+func (t *mqttRequestTally) snapshot() mqttRequestCounts {
+	if t == nil {
+		return mqttRequestCounts{}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.c
 }
 
 // mqttConnectTimeline records where a CONNECT spent its time, as an ordered list of spans each
@@ -42,6 +99,7 @@ type mqttConnectSpan struct {
 // charged to the step the body returned from.
 type mqttConnectTimeline struct {
 	now       func() time.Time
+	tally     mqttRequestTally
 	start     time.Time
 	spans     []mqttConnectSpan
 	connAckAt time.Time
@@ -59,6 +117,7 @@ func newMQTTConnectTimeline(now func() time.Time) *mqttConnectTimeline {
 func (tl *mqttConnectTimeline) closeOpen(at time.Time) {
 	if n := len(tl.spans); n > 0 && tl.spans[n-1].end.IsZero() {
 		tl.spans[n-1].end = at
+		tl.spans[n-1].through = tl.tally.snapshot()
 	}
 }
 
@@ -69,7 +128,7 @@ func (tl *mqttConnectTimeline) open(name string, cleanup bool) {
 	if n := tl.count[name]; n > 1 {
 		name = fmt.Sprintf("%s#%d", name, n)
 	}
-	tl.spans = append(tl.spans, mqttConnectSpan{name: name, begin: at, cleanup: cleanup})
+	tl.spans = append(tl.spans, mqttConnectSpan{name: name, begin: at, cleanup: cleanup, at: tl.tally.snapshot()})
 }
 
 // begin ends the open step and opens name. A begin after the body returned is ignored: the body
@@ -134,6 +193,13 @@ func (tl *mqttConnectTimeline) report(clientID string, connErr error, threshold 
 			b.WriteByte(',')
 		}
 		fmt.Fprintf(&b, " %s %s", sp.name, mqttSpanDuration(sp.end.Sub(sp.begin)))
+		switch d := sp.through.minus(sp.at); {
+		case d.batches > 0:
+			fmt.Fprintf(&b, " [%d batches %s max %s / %d requests %s]", d.batches, mqttSpanDuration(d.batchWait),
+				mqttSpanDuration(tl.tally.longest(sp.at.batches, sp.through.batches)), d.requests, mqttSpanDuration(d.reqWait))
+		case d.requests > 0:
+			fmt.Fprintf(&b, " [%d requests %s]", d.requests, mqttSpanDuration(d.reqWait))
+		}
 		if sp.exited && connErr != nil {
 			b.WriteString(" (failed here)")
 		}
@@ -142,6 +208,14 @@ func (tl *mqttConnectTimeline) report(clientID string, connErr error, threshold 
 		fmt.Fprintf(&b, "; error: %q", connErr.Error())
 	}
 	return b.String(), took >= threshold
+}
+
+// minus is what was counted between from and c.
+func (c mqttRequestCounts) minus(from mqttRequestCounts) mqttRequestCounts {
+	return mqttRequestCounts{
+		batches: c.batches - from.batches, requests: c.requests - from.requests,
+		batchWait: c.batchWait - from.batchWait, reqWait: c.reqWait - from.reqWait,
+	}
 }
 
 func mqttSpanDuration(d time.Duration) string {

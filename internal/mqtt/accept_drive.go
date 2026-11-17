@@ -69,7 +69,7 @@ func (sess *mqttSession) acceptOwnership(tok recordTx, clientID, sessEpoch strin
 	targets mqttCleanStartRetireTargets, budget *mqttOwnershipBudget, retryOK, stepAllow func() error,
 	willDelayCapable bool) (gen, tenure, nonce string, anchor *mqttWillAnchorRef, err error) {
 
-	jsa := sess.jsa.withDeadline(budget.deadline())
+	jsa := budget.deadlineView(sess.jsa)
 	id := sess.id
 	epoch := _EMPTY_
 	if sess.asm != nil {
@@ -247,7 +247,7 @@ var errMQTTAcceptanceLost = errors.New("this connection's acceptance is no longe
 // bindAcceptance binds this CONNECT's pending acceptance before CONNACK (plan 5.1's bind
 // resolver, authority-only: the bind moves no record).
 func (sess *mqttSession) bindAcceptance(budget *mqttOwnershipBudget, nonce string, retryOK func() error) error {
-	jsa := sess.jsa.withDeadline(budget.deadline())
+	jsa := budget.deadlineView(sess.jsa)
 	id := sess.id
 	epoch := _EMPTY_
 	if sess.asm != nil {

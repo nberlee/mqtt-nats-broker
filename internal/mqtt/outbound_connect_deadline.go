@@ -46,7 +46,7 @@ var errMQTTRequestNotSent = errors.New("request not sent")
 // shares the core — replies, send queue, test seams — so it is the same assistant, bounded.
 // A zero t returns a view with no cap beyond the per-request timeout.
 func (jsa *mqttJSA) withDeadline(t time.Time) *mqttJSA {
-	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: t, gate: jsa.gate}
+	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: t, gate: jsa.gate, tally: jsa.tally}
 }
 
 // withRequestGate returns a view of jsa whose every request is admitted by gate first, keeping
@@ -54,7 +54,7 @@ func (jsa *mqttJSA) withDeadline(t time.Time) *mqttJSA {
 // (the exclusion-reclaim pass, issue #121) runs its multi-request operations — commit, resolve, abort
 // — on this view, so no request inside them escapes the gate.
 func (jsa *mqttJSA) withRequestGate(gate func() bool) *mqttJSA {
-	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: jsa.deadline, gate: gate}
+	return &mqttJSA{mqttJSACore: jsa.mqttJSACore, deadline: jsa.deadline, gate: gate, tally: jsa.tally}
 }
 
 // mqttTestRequestGateRefusals and mqttTestRequestGateAdmits count the requests a view's gate refused

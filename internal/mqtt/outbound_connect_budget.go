@@ -72,6 +72,19 @@ type mqttOwnershipBudget struct {
 	// frozen: a retry may consume the budget and may never extend it.
 	Anchor time.Time
 	Total  time.Duration
+	// tally, when set, counts the requests of every view the budget hands out (deadlineView): the
+	// CONNECT's slow-CONNECT line reports them per step (connect_timeline.go).
+	tally *mqttRequestTally
+}
+
+// deadlineView is jsa capped at the budget's deadline and counted in its tally. A nil budget caps
+// and counts nothing, as its deadline does.
+func (b *mqttOwnershipBudget) deadlineView(jsa *mqttJSA) *mqttJSA {
+	v := jsa.withDeadline(b.deadline())
+	if b != nil {
+		v.tally = b.tally
+	}
+	return v
 }
 
 // mqttConnectOwnershipBudget is the absolute allowance the accepted CONNECT's ownership

@@ -15610,6 +15610,18 @@ step the function returned from is marked, with "(failed here)" when it returned
 error. The reporter is the function's first defer, so it runs last and reads the final
 error.
 
+A step that waited on JetStream through the views the CONNECT's ownership budget hands out
+(the session settlement read, the acceptance, the tenure and the bind) says how:
+`[2 batches 300.0ms max 280.0ms / 1 requests 1.0ms]` counts its atomic batches, their
+summed and longest wait, and its other requests (a step with no batch prints only the
+latter). A wait runs from the request's enqueueing to its reply or timeout, so it holds
+the broker's send queue, the transport and the reply's delivery as well as the server's
+own work; a long batch wait says the time went to that request, not that the store
+queued it. Only those views count: the tenure step's installation and reconciliation
+(`installAndReconcileTenure`) run on the session's own view and are not counted, so a
+long tenure step with short counted waits may still have spent its time on JetStream,
+and no background writer of the session is attributed to the CONNECT.
+
 The line is diagnostic text, not part of the operational interface: its wording and
 fields may change until §1 "Operational interface" freezes what operators alert on.
 The threshold is provisional — below the Paho suite's 0.3 s CONNACK window and above

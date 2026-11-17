@@ -118,6 +118,15 @@ func TestSlowConnectNamesTheOwnershipStep(t *testing.T) {
 	if !strings.HasPrefix(rep.line, `CONNECT from client "`+id+`": success CONNACK after `) {
 		t.Fatalf("report does not lead with the success CONNACK: %s", rep.line)
 	}
+	// The pause is not JetStream's: the step names its own acceptance batch, and the batch's wait
+	// is far below the pause the step took.
+	m := regexp.MustCompile(`ownership [0-9.]+ms \[([0-9]+) batches [0-9.]+ms max ([0-9.]+)ms`).FindStringSubmatch(rep.line)
+	if m == nil || m[1] == "0" {
+		t.Fatalf("the ownership step does not report its acceptance batch: %s", rep.line)
+	}
+	if longest, _ := strconv.ParseFloat(m[2], 64); time.Duration(longest*float64(time.Millisecond)) >= pause {
+		t.Fatalf("the acceptance batch is reported as waiting %sms, the pause was not JetStream's: %s", m[2], rep.line)
+	}
 }
 
 func TestSlowConnectNamesTheTenureStep(t *testing.T) {

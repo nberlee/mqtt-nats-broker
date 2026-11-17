@@ -55,6 +55,36 @@ func TestConnectTimelineAttributesEachStep(t *testing.T) {
 	}
 }
 
+// Each step reports the JetStream waits it made itself: its batches with their longest, and its
+// other requests. The longest is the step's own, not the CONNECT's: a step with one short batch
+// after another step's long one reports its own.
+func TestConnectTimelineCountsEachStepsRequests(t *testing.T) {
+	clk := &testTimelineClock{t: time.Unix(1000, 0)}
+	tl := newMQTTConnectTimeline(clk.now)
+	tl.begin("session")
+	tl.tally.record(false, 2*time.Millisecond)
+	clk.advance(3)
+	tl.begin("ownership")
+	tl.tally.record(false, time.Millisecond)
+	tl.tally.record(true, 280*time.Millisecond)
+	tl.tally.record(true, 20*time.Millisecond)
+	clk.advance(302)
+	tl.begin("bind")
+	clk.advance(1)
+	tl.begin("accept-bind")
+	tl.tally.record(true, 4*time.Millisecond)
+	clk.advance(5)
+	tl.connAck()
+
+	line, _ := tl.report("c", nil, 250*time.Millisecond)
+	want := `CONNECT from client "c": success CONNACK after 311.0ms; admit 0.0ms, session 3.0ms [1 requests 2.0ms], ` +
+		`ownership 302.0ms [2 batches 300.0ms max 280.0ms / 1 requests 1.0ms], bind 1.0ms, ` +
+		`accept-bind 5.0ms [1 batches 4.0ms max 4.0ms / 0 requests 0.0ms], after-connack 0.0ms`
+	if line != want {
+		t.Fatalf("report =\n %s\nwant\n %s", line, want)
+	}
+}
+
 func TestConnectTimelineThresholdIsOnTheConnAck(t *testing.T) {
 	for _, c := range []struct {
 		toConnAck, after int

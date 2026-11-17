@@ -513,6 +513,9 @@ func (s *Server) mqttProcessConnect(c *client, cp *mqttConnectProto, trace bool)
 	}
 	asm.mu.RUnlock()
 	ownBudget, _ := mqttNewOwnershipBudget(ownBudgetAnchor, ownBudgetTotal)
+	if ownBudget != nil {
+		ownBudget.tally = &tl.tally
+	}
 
 	// Most of the session state is altered only in the readLoop so does not
 	// need locking. For things that can be access in the readLoop and in
@@ -816,7 +819,7 @@ restoreSession:
 	// the store cannot answer for refuses the CONNECT here, within the budget, before the restore,
 	// the discard boundary or any later phase spends its own bound on the same unanswering store.
 	{
-		sload := asm.jsa.withDeadline(ownBudget.deadline()).loadOutboundAuthority(cid, asm.sessStreamEpoch)
+		sload := ownBudget.deadlineView(&asm.jsa).loadOutboundAuthority(cid, asm.sessStreamEpoch)
 		if sload.status == mqttOutboundIndeterminate {
 			return formatError(fmt.Errorf("refusing CONNECT for %q: its outbound authority could not be read", cid))
 		}
@@ -1585,7 +1588,7 @@ restoreSession:
 	es.mu.Lock()
 	servingTenure := es.boundEnt.Tenure
 	es.mu.Unlock()
-	if terr := es.mintAcceptanceTenure(es.jsa.withDeadline(ownBudget.deadline()), servingTenure, acceptNonce); terr != nil {
+	if terr := es.mintAcceptanceTenure(ownBudget.deadlineView(es.jsa), servingTenure, acceptNonce); terr != nil {
 		asm.removeSession(es, true)
 		return fmt.Errorf("refusing CONNECT for %q: %w", cid, terr)
 	}

@@ -1684,6 +1684,16 @@ them in order where a later lint change depends on an earlier cleanup.
   the measured CONNECT slowdown during a predecessor's reclamation; adopters and the
   sweep keep width 32 (`docs/ARCHITECTURE.md`). Done 2026-11-07.
 
+- [ ] Bring a reconnecting client's CONNECT back under the Paho suite's 0.3 s CONNACK
+  window (its interop job is red on main). Measured 2026-11-17: a same-ID clean start
+  right after a close takes 250-330 ms on a slow store because its claim, acceptance and
+  bind batches queue behind other clients' background batches (generation retirement,
+  completion certificates, recovery) on `$MQTT_sess`, each an R1 atomic batch whose
+  staging nats-server syncs on commit; yielding background admission to any announced
+  CONNECT of the account cut p90 by about 15%. The slow-CONNECT line now reports each
+  step's batch and request waits, so a CI red shows whether a slow step waited on its own
+  requests before the fix is chosen.
+
 - [ ] Overlap a clean-start CONNECT's independent JetStream reads. Its requests run one
   at a time (about 22 reads beside three durable commits); the reads that do not depend
   on each other can be issued together, shortening the CONNECT on slow storage and the

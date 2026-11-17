@@ -58,6 +58,9 @@ type mqttJSA struct {
 	// prefetched, when set, answers the first read of each subject a transition's write boundary
 	// prefetched (outbound_boundary_prefetch.go). Nil on every other view.
 	prefetched *mqttPrefetchedReads
+	// tally, when set, counts every request this view waited on (the CONNECT's ownership
+	// budget's views, connect_timeline.go). Nil on every other view.
+	tally *mqttRequestTally
 }
 
 // mqttJSACore is the state every view of one account's assistant shares.
@@ -312,6 +315,7 @@ func (jsa *mqttJSA) newRequestExMultiSubjects(kind string, subjects []string, hd
 	c := 0
 	responses := make([]*mqttJSAResponse, len(msgs))
 	start := time.Now()
+	defer func() { jsa.tally.record(false, time.Since(start)) }()
 	t := time.NewTimer(wait)
 	defer t.Stop()
 	abandon := jsa.startupAbandonCh()
@@ -420,6 +424,7 @@ func (jsa *mqttJSA) newAtomicBatchRequest(kind string, msgs []mqttBatchMsg) (any
 	}
 
 	start := time.Now()
+	defer func() { jsa.tally.record(true, time.Since(start)) }()
 	t := time.NewTimer(wait)
 	defer t.Stop()
 	select {
