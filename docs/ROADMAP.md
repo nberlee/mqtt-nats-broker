@@ -1406,6 +1406,12 @@ At the v2.15.1 pin (2026-10-11) the store functions all four cite are byte-ident
 v2.15.0 and every witness still reproduces, so none closed with that bump; at the v2.15.2
 pin (2026-10-27) they are byte-identical again, so none closed with that one either.
 
+[issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183), a reconnecting
+client's CONNECT missing the Paho suite's 0.3 s CONNACK read, moved here from section 2 on
+2026-11-17 by the owner: an R1 atomic batch syncs its staging store under the stream's
+locks, so a CONNECT waits for other writers' syncs. Its record is
+`docs/known-upstream-issues.md` (BATCH-SYNC-UNDER-STREAM-LOCK); it is not an alpha blocker.
+
 - [x] Retire the [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111)
   point-read absence census: tests, manifests and dossier deleted; its two broker-contract
   checks survive as `internal/mqtt/jsa_msgget_transport_test.go`. Not a broker repair,
@@ -1683,17 +1689,6 @@ them in order where a later lint change depends on an earlier cleanup.
   inbound QoS 2 holds at a provisional width of 8 once the gate is released, which cut
   the measured CONNECT slowdown during a predecessor's reclamation; adopters and the
   sweep keep width 32 (`docs/ARCHITECTURE.md`). Done 2026-11-07.
-
-- [ ] Bring a reconnecting client's CONNECT back under the Paho suite's 0.3 s CONNACK
-  window (its interop job is red on main). Measured 2026-11-17: a same-ID clean start
-  right after a close takes 250-330 ms on a slow store because its claim, acceptance and
-  bind batches queue behind other clients' background batches (generation retirement,
-  completion certificates, recovery) on `$MQTT_sess`, each an R1 atomic batch whose
-  staging nats-server syncs on commit; yielding background admission to any announced
-  CONNECT of the account cut p90 by about 15%. The slow-CONNECT line now reports each
-  step's batch and request waits, so a CI red shows whether a slow step waited on its own
-  requests before the fix is chosen; the Paho and conformance jobs keep `broker.log` on
-  every run, so a green run's near misses (250-300 ms) are read as well.
 
 - [ ] Overlap a clean-start CONNECT's independent JetStream reads. Its requests run one
   at a time (about 22 reads beside three durable commits); the reads that do not depend

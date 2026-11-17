@@ -85,6 +85,13 @@ delivery through the manifest";
 baselined: it has not failed on CI's storage, and a baseline entry would hide a regression
 there.
 
+A test can also fail intermittently with a `TimeoutError` in `connect`, when a clean-start
+CONNECT misses the suite's 0.3 s CONNACK read (see "CONNECT latency on an R1 file-backed
+session stream" under "Known deviations";
+[issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183)). It is not
+baselined: the test is otherwise passing, and the failure is explained by an upstream
+defect.
+
 ### Broker behavior fixed to pass this suite
 
 - **Outbound flow control** (`test_flow_control1`): QoS 1/2 deliveries are throttled to
@@ -4199,6 +4206,19 @@ missing-close- observation fallback is unchanged.
 - **A park's disconnect stamp is still dated at the park, not at the close**, so
   a slow ownership-gate spin dates it late. Pre-existing, unchanged, and subsumed
   by the first residual above.
+
+### CONNECT latency on an R1 file-backed session stream — UPSTREAM DEFECT
+
+[issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183), tracked in
+`docs/known-upstream-issues.md` (BATCH-SYNC-UNDER-STREAM-LOCK). A CONNECT commits durable
+atomic batches on `$MQTT_sess` before its success CONNACK. In nats-server v2.15.2 an R1
+batch's staging store is synced while the stream's locks are held, so a CONNECT can wait
+for other clients' session-stream commits, background reclamation included, as well as
+its own staging sync. Same-ID clean starts right after a cleanup have exceeded the Paho
+suite's 0.3 s CONNACK read while their plain requests answered in under a millisecond.
+The broker gives no bound on CONNECT latency on such a store. Not an alpha blocker: it
+closes when a nats-server release syncs outside the stream-wide locks and CONNECT latency
+is re-measured on it.
 
 ### A reconnect racing its own DISCONNECT
 

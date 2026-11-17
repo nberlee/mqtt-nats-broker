@@ -28,15 +28,18 @@ the dependency floor: when a correction ships, the pin and the documented floor
 move onto it and the item is ticked.
 
 Pin: `nats-server v2.15.2`, moved from v2.15.1 on 2026-10-27 (v2.15.3, the latest release,
-is not adopted). Every issue below was re-reproduced on v2.15.1 on 2026-10-11 with its
-real-server witness, and the store functions each one cites are byte-identical between
-v2.15.0 and v2.15.1 (`docs/ARCHITECTURE.md`, "The v2.15.0 → v2.15.1 audit") and again
-between v2.15.1 and v2.15.2 ("The v2.15.1 → v2.15.2 audit": the one store change,
-`readStreamState`'s bounds checks, touches only a malformed index state file). Their
+is not adopted). The issues recorded before that pin (MAXMSGSPER-REVIVAL, issue #110,
+issue #111, issue #112, INPROCESS-REFUSAL and CALLOUT-CONN-TYPES) were re-reproduced on
+v2.15.1 on 2026-10-11 with their real-server witnesses, and the store functions each one
+cites are byte-identical between v2.15.0 and v2.15.1 (`docs/ARCHITECTURE.md`, "The
+v2.15.0 → v2.15.1 audit") and again between v2.15.1 and v2.15.2 ("The v2.15.1 → v2.15.2
+audit": the one store change, `readStreamState`'s bounds checks, touches only a malformed
+index state file). Their
 witnesses were not re-run on v2.15.2. CALLOUT-CONN-TYPES is corrected in v2.15.2, and its
 witness was re-run on both. The earlier check against `main` (`v2.16.0-dev`) dates from
 each issue's own section and was not repeated. v2.15.3 was assessed on 2026-11-13 and is
-not adopted: it introduces CONSUMERINFO-NONODE-NOTFOUND, below.
+not adopted: it introduces CONSUMERINFO-NONODE-NOTFOUND, below. Each issue recorded
+later names the versions and `main` revision it was tested on in its own section.
 
 ## Index
 
@@ -50,6 +53,7 @@ not adopted: it introduces CONSUMERINFO-NONODE-NOTFOUND, below.
 | PUSH-DIDNOTDELIVER | A push consumer that fails to route a delivery does not requeue it (the pull branch does), so it waits for AckWait | To be reported by the owner | a QoS 1/2 offer racing a subscriber's detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced on v2.15.2 with an embedded-server witness (6 of 200 rounds wait for AckWait); same source on `main` |
 | DRAIN-ACROSS-RECONNECT | nats.go re-sends SUB for a draining subscription on reconnect and later removes it locally without an UNSUB, leaving server interest | To be reported by the owner | delivery subscriptions drained at detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced with nats.go v1.55.0 (3 of 3, `ForceReconnect`); same source on `main` |
 | CONSUMERINFO-NONODE-NOTFOUND | A member holding a committed consumer's assignment, before its Raft node exists, answers consumer info "not found" after 500 ms, and wins when the leader answers slower | PR [#8894](https://github.com/nats-io/nats-server/pull/8894) (open, LGTM) fixes PR [#8741](https://github.com/nats-io/nats-server/pull/8741) | moving the pin and the floor to v2.15.3; a deployment that runs v2.15.3 servers anyway (a stated residual) | Reproduced on v2.15.3 (2 of 3), not on v2.15.2 (0); pin held at v2.15.2 |
+| BATCH-SYNC-UNDER-STREAM-LOCK ([issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183)) | An R1 atomic batch commit syncs its staging store while holding the stream's locks, so every writer of the stream waits for it | To be reported by the owner | CONNECT latency on an R1 file-backed `$MQTT_sess` (Paho's 0.3 s CONNACK read), a stated residual, not a blocker | Reproduced on v2.15.2 with an embedded-server witness; same ordering on `main` |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -355,3 +359,33 @@ delay, over 2.5 million replies gave none on either.
 **Upstream.** PR [#8894](https://github.com/nats-io/nats-server/pull/8894), "Consumer info
 not found for consumer without Raft node yet", open and approved on 2026-11-16. The pin and
 the floor stay at v2.15.2 and move to the release that carries the fix.
+
+## BATCH-SYNC-UNDER-STREAM-LOCK: an R1 batch commit syncs while holding the stream's locks
+
+[issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183).
+
+**What.** An R1 file-storage atomic batch stages its messages in a store created with
+`SyncOnFlush` (`newBatchStore`, `server/jetstream_batching.go`). Its commit takes the
+stream's `isolateMu`, `mu` and batch lock (`processJetStreamAtomicBatchMsg`,
+`server/stream.go`) and, still holding them, calls `readyForCommit`, whose
+`FlushAllPending` syncs the staging store. Every other writer of the stream, a plain
+publish included, waits for that sync. The sync itself is purposeful: at restart a
+committed batch's unapplied tail is replayed from the staging store.
+
+**Why it matters here.** A CONNECT commits atomic batches on `$MQTT_sess` (ownership,
+acceptance and bind), as do other clients' CONNECTs and background reclamation. In CI a
+same-ID clean start spent 231 ms and 332 ms in single batch requests while its plain
+requests answered in 0.3-0.5 ms, missing the Paho suite's 0.3 s CONNACK read
+(`docs/CONFORMANCE.md`, "CONNECT latency on an R1 file-backed session stream"). Whether
+such a wait is one slow sync or a queue of several is not established.
+
+**Witness.** An embedded v2.15.2 server, one R1 file stream with `allow_atomic` and default
+sync, local NVMe, 300 samples per condition with every acknowledgement validated: a plain
+publish's median goes from 0.34 ms to 20 ms (p99 41 ms) while four other connections
+commit batches on the same stream. Local runs did not reproduce a 300 ms tail.
+
+**Upstream.** To be reported by the owner; no matching issue was found in a search on
+2026-11-17 (#8810, group commit for `sync_interval: always`, is adjacent). The same
+ordering is on `main` at `fc69bed`. When a release syncs outside the stream-wide locks,
+the pin moves onto it and CONNECT latency is re-measured: a correction cannot by itself
+guarantee that a CONNECT's own batch syncs finish within 300 ms.
