@@ -4326,14 +4326,6 @@ the failing rounds traced, no offer reached any broker callback. These remain:
   (`docs/known-upstream-issues.md`, PUSH-DIDNOTDELIVER). The broker never sees a reply
   subject for it. The remaining failing rounds are consistent with this; they are not
   individually attributed.
-- **A service-connection reconnect around a drain.** nats.go suppresses the UNSUB while
-  reconnecting, re-sends SUB for a draining subscription and later removes it locally
-  without an UNSUB (`docs/known-upstream-issues.md`, DRAIN-ACROSS-RECONNECT). The server
-  keeps that interest until the next reconnect: an offline session's messages are pushed
-  to it and discarded on every AckWait cycle. A late NAK published across such a reconnect
-  can reach that interest (discarded, AckWait) or the still-draining predecessor, whose
-  second decision records a marker instead of NAKing again (at most one late NAK per
-  source per resume). No message is lost; its prompt redelivery is.
 - **A late NAK can duplicate.** A NAK decided before the successor mapped the same,
   already routed offer is published after it: one extra copy with the same packet
   identifier and DUP set.
@@ -4342,8 +4334,7 @@ the failing rounds traced, no offer reached any broker callback. These remain:
 - **A marker for a durable the session no longer references** is skipped by every reader
   and stays in memory until the first reader pass at which the absence is settled (no
   record transaction open, no record write unresolved), a purge of that durable or a
-  clear. A predecessor queue held across a reconnect-resent subscription can recreate
-  such markers beyond the consumer's MaxAckPending.
+  clear.
 - **Shared, session-affine QoS 2 and PUBREL deliveries** keep the unsubscribe at detach,
   and a server shutdown unsubscribes every delivery subscription not already being
   drained.

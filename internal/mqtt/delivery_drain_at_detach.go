@@ -54,9 +54,12 @@ func mqttOriginOf(sub *subscription, cc *client) mqttOfferOrigin {
 // subscription: its at-most-one Drain (drainDeliveriesAtDetach), guarded by sess.mu. Claimed is
 // set before the lock is released to call Drain, so no second teardown issues another or falls
 // back to an unsubscribe that would cancel it. Issued is set only after Drain returned nil, in
-// the section that runs the handoff: from then on the UNSUB precedes, on the service
-// connection, any NAK published for this subscription's offers, which is what licenses the
-// writer's late NAK. Claimed alone licenses nothing.
+// the section that runs the handoff: from then on no redelivery caused by a NAK published for
+// this subscription's offers (on the same service connection) can reach the subscription,
+// which is what licenses the writer's late NAK. While connected the UNSUB is already buffered
+// ahead of the NAK; while reconnecting nats.go suppresses the UNSUB, but the subscription is
+// marked draining and the reconnect re-sends no SUB for it before flushing the buffered NAK
+// (resendSubscriptions, nats.go v1.56.0). Claimed alone licenses nothing.
 //
 // A cell rather than fields of the subscription so that an origin can read the drain state
 // after the subscription and its connection are gone, without keeping either.

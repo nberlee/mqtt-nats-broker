@@ -647,7 +647,7 @@ Correctness rests on these specific semantics, each stated as the contract the
 code assumes. This is the list a version bump has to re-verify — it is what makes
 the "no fallbacks" stance reviewable rather than implicit.
 
-The pinned dependency is **nats-server v2.15.2**, with `nats.go` 1.55.0. This is the
+The pinned dependency is **nats-server v2.15.2**, with `nats.go` 1.56.0. This is the
 *pin*, the version CI builds and tests against, and it is a different statement from the
 deployment floor above, which is **2.15.2** on every JetStream peer; the two name the same
 release. The pin carries the fix to the upstream `CONSUMER.CREATE` versus `CONSUMER.LIST`
@@ -759,6 +759,40 @@ byte-identical, so every row of this list, every `make depproof` anchor and ever
   subscription that represents several members is picked in proportion to their number.
   It changes only how a delivery is spread across remote queue members.
 - **OCSP** (`ocsp.go`, `ocsp_peer.go`) and the build files: not reached.
+
+#### The nats.go v1.55.0 → v1.56.0 audit
+
+Every non-test file of the two module trees was compared; the client changed in
+`nats.go`, `ws.go`, `js.go`, `object.go` and, under `jetstream/`, `publish.go`, `pull.go`
+and a comment in `jetstream.go`. This records what the client changed.
+
+- **Drain across a reconnect** (`resendSubscriptions`): a draining subscription is no
+  longer re-sent on reconnect (nats-io/nats.go#2232), so a drain that spans a reconnect
+  ends with no server interest. That corrects DRAIN-ACROSS-RECONNECT
+  (`docs/known-upstream-issues.md`); `TestDrainedSubscriptionLeavesNoServerInterestAcrossReconnect`
+  fails on v1.55.0 and passes on v1.56.0.
+- **TLS selection** (nats-io/nats.go#2245): `TLSConfig`, `RootCAsCB` or `TLSCertCB` set on
+  the options now ask for TLS as `Secure` does, `SetServerPool` with a `tls://` URL turns
+  TLS on, and `ErrSecureConnWanted` is returned wrapped. When TLS follows a plaintext INFO,
+  that INFO's `connect_urls` are not used: against a 2.12 or later server the client waits
+  up to its connect `Timeout`, after the first PONG, for the INFO the server sends inside
+  TLS (`readPostPongInfo`). A discovered server takes the credentials the client used for
+  the server that reported it, never user info inside a `connect_urls` entry, and a bare IP
+  discovered through an IP entry keeps that entry's TLS name.
+- **Reconnect errors**: a reconnect attempt that fails in `processConnectInit` (a TLS
+  verification failure among them) is reported to `ReconnectErrCB` (nats-io/nats.go#2229).
+- **Headers**: an inline status after `NATS/1.0` must be preceded by a space or tab, or the
+  message is `ErrBadHeaderMsg` (nats-io/nats.go#2237); `PublishMsg` encodes headers into a
+  pooled buffer.
+- **JetStream**: the pull consumer's `fetch` is rewritten around a callback subscription
+  with no pending limits (nats-io/nats.go#2205); both reconnect watchers that reset pending
+  publish acknowledgements take their status channel as an argument (#2216, #2218); an
+  object-store link passes the caller's options on (#2220).
+- **WebSocket client** (`ws.go`): malformed close frames and a compressed frame without
+  negotiated compression are protocol errors (#2225, #2226).
+- **Unchanged:** the in-process connect path INPROCESS-REFUSAL cites (`createConn`,
+  `connect`, `timeoutWriter`, the `FlusherTimeout` install) is byte-identical;
+  `processConnectInit` and `sendConnect` changed only on the TLS-after-INFO branches.
 
 #### The v2.15.0-RC.1 → v2.15.0 GA audit
 
@@ -11411,8 +11445,12 @@ subscriptions, so the predecessor's queue is not left to the predecessor's own l
 close. A server shutdown unsubscribes, as before: a shutdown is not a resume. A
 subscription is drained at most once, in two states of the cell under `sess.mu`:
 `claimed` before `Drain()` is called, `issued` after it returned nil. Only issued
-licenses a NAK, because only then is the UNSUB already in the service connection's
-buffer ahead of it (late NAKs are published on the same service connection).
+licenses a NAK, because only then can no redelivery it causes reach the drained
+subscription (late NAKs are published on the same service connection): while connected,
+the UNSUB is already in the connection's buffer ahead of the NAK; while reconnecting,
+nats.go suppresses the UNSUB but the subscription is already marked draining, and the
+reconnect re-sends no SUB for a draining subscription before it flushes the buffered NAK
+(`resendSubscriptions`, nats.go v1.56.0).
 
 **Who owns a drained offer.** A drained offer reaches the detached arm of the delivery
 callback, which never acks or transmits it; it goes to `recordWithheldAttemptLocked`, the
@@ -11437,8 +11475,7 @@ keeps neither (see "Resource lifetime and shutdown release"). After the existing
   starts and never replayed), so nothing waits for one. A reconciliation subscription a
   refused resume's cleanup unsubscribes is not drained and keeps the older behaviour.
 - **At most one late NAK per source per cutoff** (`lateNAKed`), from the writer or the
-  handoff; a second decision for the same source records a marker. That bounds the
-  repetition a reconnect can cause (below).
+  handoff; a second decision for the same source records a marker.
 - Live-capacity withholding and every offer of the bound connection record as before.
 
 **Only a durable the record references is honored.** `recordSelectionLocked` is the
@@ -11462,7 +11499,7 @@ markers so later passes pay nothing for them.
 
 What remains is in `docs/CONFORMANCE.md` ("A QoS 1 publish racing its subscriber's detach
 can still wait for AckWait"): the push consumer's `didNotDeliver` that does not requeue,
-the reconnect around a drain, the late-NAK duplicate, allocations in flight at the detach,
+the late-NAK duplicate, allocations in flight at the detach,
 unreferenced markers awaiting a settled reader pass, the unsubscribing classes, and a
 rejoined shared group.
 

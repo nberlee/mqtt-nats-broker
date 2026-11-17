@@ -163,16 +163,16 @@ func (sess *mqttSession) deferredNaksLocked() []string {
 // offer of ANOTHER connection decided after that read would wait for a freed slot or AckWait,
 // so:
 //
-//   - its subscription's drain ISSUED (the UNSUB is on the service connection ahead of any NAK
-//     published after this section), the durable one the session's record references
-//     (recordReferencesDurableLocked), and this source not yet late-NAKed under this cutoff:
+//   - its subscription's drain ISSUED (no redelivery a NAK published after this section causes
+//     can reach that subscription: see mqttDetachDrain), the durable one the session's record
+//     references (recordReferencesDurableLocked), and this source not yet late-NAKed under this
+//     cutoff:
 //     nothing is recorded and the caller owes the NAK, published after it unlocks;
 //   - otherwise the marker is recorded and tagged with its origin subscription, so the drain
 //     that subscription issues later NAKs it (handOffLateMarkersLocked).
 //
 // At most one late NAK per source per cutoff (sess.lateNAKed): a second decision for the same
-// source records a marker, which bounds what a reconnect re-routing the NAK back to a still
-// draining predecessor can repeat. Recording itself stays permissive; the readers skip a
+// source records a marker. Recording itself stays permissive; the readers skip a
 // marker whose durable the record no longer references.
 //
 // Lock held on entry.

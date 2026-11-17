@@ -821,9 +821,8 @@ func TestDuplicateFromALateNAKCarriesTheSameIdentifierAndDUP(t *testing.T) {
 	testMQTTSendPIPacket(mqttPacketPubAck, t, c2, pi)
 }
 
-// T15: each source gets at most one late NAK per cutoff. A drained offer that comes back to the
-// still-draining predecessor (a NAK routed to interest a service reconnect re-sent) is decided
-// again, and the second decision records a marker instead of NAKing again.
+// T15: each source gets at most one late NAK per cutoff. A drained offer the still-draining
+// predecessor decides a second time records a marker instead of NAKing again.
 func TestLateNAKIsIssuedAtMostOncePerSource(t *testing.T) {
 	rig := drainRigStart(t, "t15")
 	dur := rig.durable()
