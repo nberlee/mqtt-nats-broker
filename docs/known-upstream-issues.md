@@ -55,6 +55,7 @@ since 2026-11-17.
 | PUSH-DIDNOTDELIVER | A push consumer that fails to route a delivery does not requeue it (the pull branch does), so it waits for AckWait | To be reported by the owner | a QoS 1/2 offer racing a subscriber's detach ([issue #170](https://github.com/nberlee/mqtt-nats-broker/issues/170)), a stated residual, not a blocker | Reproduced on v2.15.2 with an embedded-server witness (6 of 200 rounds wait for AckWait); same source on `main` |
 | CONSUMERINFO-NONODE-NOTFOUND | A member holding a committed consumer's assignment, before its Raft node exists, answers consumer info "not found" after 500 ms, and wins when the leader answers slower | PR [#8894](https://github.com/nats-io/nats-server/pull/8894) (open, LGTM) fixes PR [#8741](https://github.com/nats-io/nats-server/pull/8741) | moving the pin and the floor to v2.15.3; a deployment that runs v2.15.3 servers anyway (a stated residual) | Reproduced on v2.15.3 (2 of 3), not on v2.15.2 (0); pin held at v2.15.2 |
 | BATCH-SYNC-UNDER-STREAM-LOCK ([issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183)) | An R1 atomic batch commit syncs its staging store while holding the stream's locks, so every writer of the stream waits for it | To be reported by the owner | CONNECT latency on an R1 file-backed `$MQTT_sess` (Paho's 0.3 s CONNACK read), a stated residual, not a blocker | Reproduced on v2.15.2 with an embedded-server witness; same ordering on `main` |
+| STREAMINFO-NOTFOUND-AFTER-CREATE ([issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184)) | STREAM.INFO right after an acknowledged clustered create can answer "stream not found" (10059) | To be reported by the owner | startup of a clustered broker that creates its streams (a stated residual, not a blocker) | Reproduced on v2.15.2 with an embedded-cluster witness (6 of 2400 reads); handler unchanged on `main` |
 
 ## MAXMSGSPER-REVIVAL: a limit-evicted record revives on raw-block recovery
 
@@ -387,3 +388,35 @@ commit batches on the same stream. Local runs did not reproduce a 300 ms tail.
 ordering is on `main` at `fc69bed`. When a release syncs outside the stream-wide locks,
 the pin moves onto it and CONNECT latency is re-measured: a correction cannot by itself
 guarantee that a CONNECT's own batch syncs finish within 300 ms.
+
+## STREAMINFO-NOTFOUND-AFTER-CREATE: a just-created stream is reported not found
+
+[issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184).
+
+**What.** On a JetStream cluster, a STREAM.INFO sent right after a stream create was
+acknowledged can be answered "stream not found" (10059). Every server receives the
+request and the requester takes the first reply. `jsStreamInfoRequest`
+(`server/jetstream_api.go`) lets a server that is not the stream leader answer when it is
+the new group's preferred peer, or when it holds only the in-flight assignment; it then
+looks the stream up locally and answers "not found" if the stream has not been created
+there yet. That path is a source reading; the witness shows the reply, not which branch
+sent it.
+
+**Why it matters here.** At startup a broker creates each `$MQTT_*` stream (or loses the
+create race to a peer) and re-reads it (`ensureBrokerStream`). "Not found" for a stream
+the cluster acknowledged is a refusal, not a retryable answer, so startup exits. In CI an
+embedded three-node image test lost one broker this way
+(`docs/CONFORMANCE.md`, "A clustered broker can exit at startup on a just-created
+stream").
+
+**Witness.** An embedded three-node v2.15.2 cluster; each round all three nodes create the
+same new R3 stream at once, and each reads it once its own create returns: 6 of 2400 reads
+answered 404/10059 across three runs (2 of 600, 0 of 900, 4 of 900), the last four each
+right after that client's own create had succeeded. A sequential create-then-read gave 0
+of 400.
+
+**Upstream.** To be reported by the owner; no matching issue was found in a search on
+2026-11-21. The consumer-info analogue was fixed by PR
+[#8894](https://github.com/nats-io/nats-server/pull/8894) (CONSUMERINFO-NONODE-NOTFOUND,
+above); the stream-info handler is unchanged on `main` at `a0385c9`. When a release stops
+answering "not found" for an assigned stream, the pin moves onto it.

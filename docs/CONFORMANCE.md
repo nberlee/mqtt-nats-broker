@@ -5790,6 +5790,23 @@ resetting the whole seven-stream bundle — recreating this stream alone is REFU
 the next startup, since the broker-owned streams are one recreation unit; it is not a
 rolling upgrade.
 
+### A clustered broker can exit at startup on a just-created stream — UPSTREAM DEFECT
+
+[issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184), tracked in
+`docs/known-upstream-issues.md` (STREAMINFO-NOTFOUND-AFTER-CREATE). At startup the broker
+re-reads every `$MQTT_*` stream it created or found created by a peer. On a JetStream
+cluster, nats-server v2.15.2 can answer that read "stream not found" for a stream whose
+creation it has just acknowledged, and the broker treats "not found" as a refusal: its
+startup ends with `lookup stream "<name>" after create: stream not found (10059)` and the
+process exits. A supervisor restart (a Kubernetes pod, a container restart policy) brings
+it up once all seven streams exist: when another broker completes the bundle, or when the
+exit came after the last create. If the exiting broker was the only one provisioning and
+left one to six streams, every restart refuses the partial bundle and the documented
+whole-bundle reset is required (see "A concurrent first start refuses only when a peer
+outlasts the settle budget" under "Broker-owned stream prerequisites", below). Observed
+once in CI, when three brokers created their streams at the same moment; not an alpha
+blocker.
+
 ### Broker-owned stream prerequisites: startup refusal, a snapshot, and dropped fallbacks
 
 Every broker-owned `$MQTT_*` stream is validated at account-manager initialization

@@ -1412,6 +1412,12 @@ client's CONNECT missing the Paho suite's 0.3 s CONNACK read, moved here from se
 locks, so a CONNECT waits for other writers' syncs. Its record is
 `docs/known-upstream-issues.md` (BATCH-SYNC-UNDER-STREAM-LOCK); it is not an alpha blocker.
 
+[issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184), a clustered broker
+exiting at startup because nats-server answered "stream not found" for a stream it had
+just created, was classified here on 2026-11-21 after the alpha-gate audit found it as an
+unexplained CI failure. Its record is `docs/known-upstream-issues.md`
+(STREAMINFO-NOTFOUND-AFTER-CREATE); it is not an alpha blocker.
+
 - [x] Retire the [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111)
   point-read absence census: tests, manifests and dossier deleted; its two broker-contract
   checks survive as `internal/mqtt/jsa_msgget_transport_test.go`. Not a broker repair,
@@ -2034,11 +2040,12 @@ The first alpha may be tagged only when:
   documentation"). Done 2026-11-01.
 
 - [ ] The full test, race, lint, conformance, Paho, container, and deployment
-  gates pass with no unexplained failures or skips. Audited 2026-11-21: two CI failures
-  are unexplained, [issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184)
-  and [issue #185](https://github.com/nberlee/mqtt-nats-broker/issues/185); the Paho
-  CONNECT timeouts are explained by
-  [issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183).
+  gates pass with no unexplained failures or skips. Audited 2026-11-21: one CI failure
+  is unexplained, [issue #185](https://github.com/nberlee/mqtt-nats-broker/issues/185);
+  the Paho CONNECT timeouts are explained by
+  [issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183), and a clustered
+  broker's startup exit by
+  [issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184).
 
 - [ ] CI is green from a clean checkout on every supported architecture.
 
