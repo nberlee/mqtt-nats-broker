@@ -2016,24 +2016,29 @@ them in order where a later lint change depends on an earlier cleanup.
 
 The first alpha may be tagged only when:
 
-- [ ] Every unconditional alpha blocker is complete.
+- [x] Every unconditional alpha blocker is complete. Audited 2026-11-21: sections 0 and 1
+  have no open box, and the 2.15.4 pin is not a first-alpha prerequisite.
 
 - [x] The supported HA scope is documented: multi-frontend (section 0.2,
   decided 2026-08-10). Its blockers are unconditional, so the gate above
   covers them.
 
-- [ ] Every release-verification investigation is closed or has produced a
-  confirmed finding with an explicit release disposition.
+- [x] Every release-verification investigation is closed or has produced a
+  confirmed finding with an explicit release disposition. Audited 2026-11-21.
 
-- [ ] Every post-alpha candidate has an explicit disposition; an unchecked
-  post-alpha item does not by itself block the alpha.
+- [x] Every post-alpha candidate has an explicit disposition; an unchecked
+  post-alpha item does not by itself block the alpha. Audited 2026-11-21.
 
 - [x] Every finding is a GitHub issue and the repository holds no finding ID, no
   findings-directory path and no test file named for a finding (section 7, "Release
   documentation"). Done 2026-11-01.
 
 - [ ] The full test, race, lint, conformance, Paho, container, and deployment
-  gates pass with no unexplained failures or skips.
+  gates pass with no unexplained failures or skips. Audited 2026-11-21: two CI failures
+  are unexplained, [issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184)
+  and [issue #185](https://github.com/nberlee/mqtt-nats-broker/issues/185); the Paho
+  CONNECT timeouts are explained by
+  [issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183).
 
 - [ ] CI is green from a clean checkout on every supported architecture.
 
@@ -2041,8 +2046,9 @@ The first alpha may be tagged only when:
 
 - [ ] The scratch image and Helm chart install successfully in a clean cluster.
 
-- [ ] TLS rollover, WebSocket, authentication, authorization, migration, backup,
+- [x] TLS rollover, WebSocket, authentication, authorization, migration, backup,
   restore, upgrade, rollback, and shutdown procedures are documented and tested.
+  Audited 2026-11-21.
   **Backup and restore are per-BUNDLE**: all seven broker-owned `$MQTT_*` streams are
   one recreation unit, taken and restored together from one point in time, since
   startup refuses a proper subset and refuses members carrying different recovery
@@ -2050,8 +2056,9 @@ The first alpha may be tagged only when:
   Skew WITHIN one incarnation is undetectable, so the procedure has to
   guarantee the coherent instant rather than rely on the check.
 
-- [ ] Release artifacts use the final product name, `mqtt-nats-broker`,
-  consistently (section 1, "Product name").
+- [x] Release artifacts use the final product name, `mqtt-nats-broker`,
+  consistently (section 1, "Product name"). Audited 2026-11-21: images, chart and
+  release binaries.
 
 ## 8. Post-alpha candidates and scope cleanup
 
@@ -2268,10 +2275,10 @@ follow-ups](https://github.com/nberlee/mqtt-nats-broker/issues/50).
   or repairing incompatible experimental state is unsupported.
 
 - [ ] Consolidate embedded NATS servers across the fork-repair test fixtures. **Test
-  infrastructure, not a broker gap.** `sess_fork_repair_test.go` starts one embedded
-  server per subtest through `testNewInflightEnv`/`runNATS`, roughly 37 for the file.
-  Sharing one server per top-level test would cut ~25 of them, but it is NOT a harmless
-  count optimization; the constraints a plan must answer, recorded in
+  infrastructure, not a broker gap, and not an alpha blocker.** `sess_fork_repair_test.go`
+  starts one embedded server per subtest through `testNewInflightEnv`/`runNATS`, roughly
+  37 for the file. Sharing one server per top-level test would cut ~25 of them, but it is
+  NOT a harmless count optimization; the constraints a plan must answer, recorded in
   [issue #29](https://github.com/nberlee/mqtt-nats-broker/issues/29)'s implementation
   record: a fresh `Server`+account-manager+connection+node name per subtest (a shared asm
   lets `dropPersistObservations` installs clobber each other, and the hard-coded `node1`
@@ -2283,7 +2290,8 @@ follow-ups](https://github.com/nberlee/mqtt-nats-broker/issues/50).
   table, since shared state can mask a discriminator whose assertions are unchanged.
 
 - [ ] Force two session-record proposals into the clustered pre-proposal window.
-  **Test infrastructure, not a broker gap, and deliberately not a §0.2 blocker.** Its
+  **Test infrastructure, not a broker gap, not an alpha blocker, and deliberately not a
+  §0.2 blocker.** Its
   subject is the SAME-TERM clustered admission/apply window, which still exists: the
   in-process per-subject map refusing the second same-base write with 10164 is exactly
   what it targets. The CROSS-ELECTION consequence once attributed to it is retired (the
