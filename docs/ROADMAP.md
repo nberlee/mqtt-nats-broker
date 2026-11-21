@@ -2040,12 +2040,13 @@ The first alpha may be tagged only when:
   documentation"). Done 2026-11-01.
 
 - [ ] The full test, race, lint, conformance, Paho, container, and deployment
-  gates pass with no unexplained failures or skips. Audited 2026-11-21: one CI failure
-  is unexplained, [issue #185](https://github.com/nberlee/mqtt-nats-broker/issues/185);
-  the Paho CONNECT timeouts are explained by
-  [issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183), and a clustered
+  gates pass with no unexplained failures or skips. Audited 2026-11-21: every CI failure
+  on main since 2026-11-05 is explained. The Paho CONNECT timeouts by
+  [issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183), a clustered
   broker's startup exit by
-  [issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184).
+  [issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184), and
+  [issue #185](https://github.com/nberlee/mqtt-nats-broker/issues/185) by the admission
+  livelock fixed in 66ee4af. Judged again on the release-candidate commit.
 
 - [ ] CI is green from a clean checkout on every supported architecture.
 
