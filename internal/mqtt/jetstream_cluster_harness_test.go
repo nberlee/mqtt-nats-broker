@@ -342,6 +342,54 @@ func (c *testJetStreamCluster) waitStreamCurrent(t *testing.T, account, stream s
 	})
 }
 
+// waitConsumerLeaders blocks until every consumer of the named streams has a leader on
+// some running node. A stream leader says nothing about its consumers: after a whole
+// cluster restarts, each consumer elects its own leader, and until it has one its info
+// request goes unanswered, which refuses a resume that needs it. The consumers are listed
+// again on every poll, so one deleted meanwhile is not waited for.
+func (c *testJetStreamCluster) waitConsumerLeaders(t *testing.T, account string, streams []string) {
+	t.Helper()
+	want := make(map[string]bool, len(streams))
+	for _, s := range streams {
+		want[s] = true
+	}
+	checkFor(t, 20*time.Second, 200*time.Millisecond, func() error {
+		consumers := map[[2]string]bool{}
+		for _, n := range c.nodes {
+			if !n.running {
+				continue
+			}
+			jsz, err := n.ns.Jsz(&natsserver.JSzOptions{Account: account, Accounts: true, Streams: true, Consumer: true})
+			if err != nil {
+				return err
+			}
+			for _, ad := range jsz.AccountDetails {
+				for _, sd := range ad.Streams {
+					if !want[sd.Name] {
+						continue
+					}
+					for _, ci := range sd.Consumer {
+						consumers[[2]string{sd.Name, ci.Name}] = true
+					}
+				}
+			}
+		}
+		for sc := range consumers {
+			led := false
+			for _, n := range c.nodes {
+				if n.running && n.ns.JetStreamIsConsumerLeader(account, sc[0], sc[1]) {
+					led = true
+					break
+				}
+			}
+			if !led {
+				return fmt.Errorf("no leader for consumer %q of stream %q yet\n%s", sc[1], sc[0], c.describe())
+			}
+		}
+		return nil
+	})
+}
+
 // stopNode shuts one node down and marks it stopped. Callers must never stop more
 // than one node of a 3-node cluster at once, or JetStream loses quorum.
 func (c *testJetStreamCluster) stopNode(n *testJSClusterNode) {

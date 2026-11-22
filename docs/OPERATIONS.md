@@ -192,7 +192,11 @@ Restore, from ONE backup set, never members of two:
    all seven again, however many are present: a failed restore can leave its stream in
    place, configured and stamped like a complete one but missing records, and nothing at
    start detects that.
-5. Start the brokers.
+5. On a JetStream cluster, wait until every consumer of the seven reports a leader
+   (`nats consumer report '$MQTT_sess'`, ...); a single server's consumers report none and
+   need no wait. Then start the brokers. Until a clustered consumer has a leader, its
+   information request goes unanswered and a client whose session needs it is refused at
+   CONNECT.
 
 ### Cold copy
 
@@ -213,7 +217,11 @@ Restore: with every broker and server stopped, put every store back from ONE cop
 each to the server it came from (the same server names, cluster name and routes: a
 server's identity and its replication state are in its store), kept away from any cluster
 still running on the originals. Start the servers, wait until every stream reports a
-leader and current replicas (`nats stream info`), then start the brokers.
+leader and current replicas (`nats stream info`) and, on a cluster, every consumer of the
+seven a leader (`nats consumer report`; a single server's consumers report none and need
+no wait), then start the brokers. On a cluster each consumer elects its own leader after
+the servers start, and a client whose session needs one without it is refused at
+CONNECT.
 
 ### What a restore brings back
 

@@ -220,6 +220,7 @@ func TestNetworkRestoreOfAReplicatedBundleReoffersAboveTheAckFloor(t *testing.T)
 		c.waitStreamLeader(t, c.account, name)
 		c.waitStreamCurrent(t, c.account, name)
 	}
+	c.waitConsumerLeaders(t, c.account, mqttTestBrokerStreamNames)
 
 	all := testServeReplicatedBundle(t, c.startBroker(t, 0), sc)
 	m2 := all["m2"]
@@ -261,6 +262,7 @@ func TestColdStoreCopyOfAReplicatedBundleKeepsConsumerState(t *testing.T) {
 		c.waitStreamLeader(t, c.account, name)
 		c.waitStreamCurrent(t, c.account, name)
 	}
+	c.waitConsumerLeaders(t, c.account, mqttTestBrokerStreamNames)
 
 	all := testServeReplicatedBundle(t, c.startBroker(t, 0), sc)
 	if n := len(all["m2"]); n != 0 {
