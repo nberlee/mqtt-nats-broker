@@ -124,9 +124,11 @@ are builds of an unreleased tree with no compatibility promise; a commit whose C
 publishes nothing. `latest` and the version tags are only ever releases.
 
 A pull request's images (`pr-<number>`, `pr-<number>-<short commit>`, and their
-`-embedded` variants) are built only after the repository owner approves that run; a run
-stops before building if the approval environment is missing or does not require the
-owner's review.
+`-embedded` variants) are built from the pull request's head only once its CI has passed
+and the repository owner has approved the build, and only while the pull request is still
+open at that commit. A pull request's CI runs its own workflow files and tests it merged
+with its base, so the owner's approval is the gate; the build stops if the approval
+environment is missing or does not require the owner's review.
 
 ## Kubernetes
 

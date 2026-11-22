@@ -1,36 +1,54 @@
 name: PR images
 
-# A pull request's images, built only after the owner approves the run: the `pr-images`
-# environment requires the owner's review, so every run waits at that gate and nothing is
-# built or pushed before it. pull_request_target runs this file as it is on main, so a pull
-# request cannot change what publishes; it builds the pull request's head only once
-# approved. Approving means trusting that head's Dockerfile and build steps.
+# A pull request's images, built only after its CI passed AND the owner approved the run.
+# This runs when ci.yml completes for a pull request, and does nothing unless that run
+# succeeded; then the `pr-images` environment requires the owner's review, so nothing is
+# built or pushed before the owner approves. workflow_run runs this file as it is on main,
+# so a pull request cannot change what publishes.
+#
+# What CI passing is worth: a pull request's CI runs the pull request's own workflow files,
+# which the pull request can change, and it tests the pull request merged with its base,
+# while this builds the pull request's head. So the green run is a filter, not the gate:
+# the owner's approval, after reading the pull request, is. Approving means trusting that
+# head's Dockerfile and build steps.
 #
 # A job naming a missing environment creates it unprotected, so approval-gate checks
 # first that pr-images exists and requires the owner's review, and stops the run if not.
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
   contents: read
 
-# A newer push to the pull request supersedes a run still waiting for approval.
+# A newer CI run for the same pull request branch supersedes a run still waiting for
+# approval.
 concurrency:
-  group: pr-images-${{ github.event.pull_request.number }}
+  group: pr-images-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
 jobs:
   approval-gate:
     name: PR images (approval gate)
-    # Fails closed: unless the pr-images environment exists and requires the owner's
-    # review, the owner's alone, nothing below runs. Without this, a missing environment would be created
-    # unprotected by the job that names it. It checks out nothing and builds nothing.
-    if: github.repository == 'nberlee/mqtt-nats-broker'
+    # Fails closed: unless the CI run was a pull request's and succeeded, the commit it
+    # tested is still that pull request's head, and the pr-images environment exists and
+    # requires the owner's review, the owner's alone, nothing below runs. It checks out
+    # nothing and builds nothing.
+    if: >-
+      github.repository == 'nberlee/mqtt-nats-broker' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.path == '.github/workflows/ci.yml' &&
+      github.event.workflow_run.conclusion == 'success'
     permissions:
       actions: read
+      pull-requests: read
     runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      sha: ${{ steps.pr.outputs.sha }}
+      short: ${{ steps.pr.outputs.short }}
     steps:
       - name: the environment requires the owner's review
         env:
@@ -44,17 +62,42 @@ jobs:
           jq -e '[.protection_rules[]? | select(.type == "required_reviewers")
                  | .reviewers[]? | "\(.type):\(.reviewer.login // .reviewer.slug)"]
                  == ["User:nberlee"]' env.json
+      - name: the pull request whose head CI tested
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # The run's own pull request list is empty for a fork, so the open pull request
+          # is found by its head branch, and must still be at the commit CI tested.
+          gh api -X GET "repos/$REPO/pulls" -f state=open -f "head=$HEAD_OWNER:$HEAD_BRANCH" \
+            --jq '[.[] | {number, sha: .head.sha}]' > prs.json
+          number=$(jq -r --arg sha "$HEAD_SHA" \
+            '[.[] | select(.sha == $sha)] | if length == 1 then .[0].number else "" end' prs.json)
+          if [ -z "$number" ]; then
+            echo "no open pull request is at $HEAD_SHA (it moved on, closed, or is ambiguous): nothing to build"
+            exit 1
+          fi
+          {
+            echo "number=$number"
+            echo "sha=$HEAD_SHA"
+            echo "short=${HEAD_SHA::7}"
+          } >> "$GITHUB_OUTPUT"
 
   images:
     name: PR images (${{ matrix.variant }})
     # Tags `pr-<number>` and `pr-<number>-<short head>`, the embedded variant suffixed
     # `-embedded`. Never `main`, `sha-`, `latest` or a version tag.
-    if: github.repository == 'nberlee/mqtt-nats-broker'
     needs: approval-gate
     environment: pr-images
     permissions:
       contents: read
       packages: write
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
@@ -63,15 +106,25 @@ jobs:
           - { variant: embedded, target: embedded, suffix: '-embedded' }
     runs-on: ubuntu-latest
     steps:
+      # Approval can come long after approval-gate looked: the pull request must still be
+      # open and at the commit approved, or nothing is built.
+      - name: the pull request is still open at the approved commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ needs.approval-gate.outputs.number }}
+          HEAD_SHA: ${{ needs.approval-gate.outputs.sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$NUMBER" > pr.json
+          jq -e --arg sha "$HEAD_SHA" --arg repo "$HEAD_REPO" \
+            '.state == "open" and .head.sha == $sha and .head.repo.full_name == $repo' pr.json
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ github.event.workflow_run.head_repository.full_name }}
+          ref: ${{ needs.approval-gate.outputs.sha }}
           persist-credentials: false
-      - name: short head
-        id: head
-        env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: echo "short=${HEAD_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - name: Log in to ghcr.io
@@ -83,18 +136,17 @@ jobs:
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v6
-        env:
-          # The labels name the pull request's head, the commit built, not main's.
-          DOCKER_METADATA_PR_HEAD_SHA: 'true'
         with:
           images: ghcr.io/${{ github.repository }}
-          context: workflow
           flavor: |
             latest=false
             suffix=${{ matrix.suffix }}
           tags: |
-            type=raw,value=pr-${{ github.event.pull_request.number }}
-            type=raw,value=pr-${{ github.event.pull_request.number }}-${{ steps.head.outputs.short }}
+            type=raw,value=pr-${{ needs.approval-gate.outputs.number }}
+            type=raw,value=pr-${{ needs.approval-gate.outputs.number }}-${{ needs.approval-gate.outputs.short }}
+          # The labels name the commit built, not main's.
+          labels: |
+            org.opencontainers.image.revision=${{ needs.approval-gate.outputs.sha }}
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -105,6 +157,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+            VERSION=pr-${{ needs.approval-gate.outputs.number }}-${{ needs.approval-gate.outputs.sha }}
           provenance: true
           sbom: true
