@@ -1,53 +1,225 @@
 # mqtt-nats-broker
 
-A standalone, horizontally-scalable **MQTT 3.1.1 / 5.0** broker that uses an
-**external NATS/JetStream cluster** as its highly-available backend for sessions,
-retained messages, QoS1/2 persistence, and message routing.
+**An MQTT 3.1.1 and 5.0 broker that keeps every durable fact in NATS JetStream.**
+Run as many broker instances as your connections need, lose any of them, and your
+clients reconnect to any other instance and resume their sessions, retained messages and
+in-flight QoS 1/2 exchanges.
 
 [![CI](https://github.com/nberlee/mqtt-nats-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/nberlee/mqtt-nats-broker/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **Status: pre-release working broker.** There is no public broker release or
-> supported persisted-state format yet. The default build serves MQTT 3.1.1/5.0
-> end-to-end — CONNECT, SUBSCRIBE, PUBLISH (QoS0), retained/sessions via
-> JetStream, and auth passthrough with per-client NATS authorization — verified
-> with a real MQTT client in CI. The upstream regression suite runs in CI against the
-> standalone broker (behind the `mqtt_fulltests` tag). See
-> [CONTRIBUTING.md](CONTRIBUTING.md#test-suites-and-build-tags).
+> **Status: pre-release.** The first alpha is being prepared; there is no published
+> release and no supported persisted-state format yet. The release checklist is
+> [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## Why
+## Why this broker
 
-NATS server ships MQTT **3.1.1** embedded. The **MQTT 5.0** implementation this
-project is built on will not be merged upstream. Rather than fork the whole
-server, this runs the MQTT layer as its own service backed by an external
-NATS/JetStream cluster — so you get MQTT 5 **and** NATS-grade HA without carrying
-a server fork.
+nats-server ships an MQTT 3.1.1 listener inside the server. This project runs MQTT as
+its own service in front of a JetStream cluster, so you get **MQTT 5** and
+**JetStream-grade durability** without carrying a fork of nats-server.
+
+| | What you get |
+|---|---|
+| **Stateless frontends, real HA** | Sessions, subscriptions, retained messages, delayed Wills and QoS 1/2 exchanges live in replicated JetStream streams. Brokers scale horizontally behind a plain TCP load balancer; a client reconnecting to another instance takes its session over, and a delayed Will the broker has durably enqueued fires from whichever broker is alive when it falls due. |
+| **Correctness first** | Session ownership between brokers is arbitrated in JetStream with conditional writes and atomic batches, not by timeouts. Every known behavior gap is written down in [docs/CONFORMANCE.md](docs/CONFORMANCE.md), and a defect found in the data layer is reproduced against a real nats-server and tracked in [docs/known-upstream-issues.md](docs/known-upstream-issues.md), never papered over. |
+| **Conformance you can rerun** | 124/124 MQTT 3.1.1 and 106/106 MQTT 5.0 normative checks pass, and the Eclipse Paho interoperability suite runs in CI on every push. |
+| **Cloud native** | `FROM scratch` multi-arch images, non-root, read-only root filesystem, health and readiness endpoints, graceful draining shutdown, live TLS certificate rollover, structured logs and a Helm chart. |
+| **Your NATS, your rules** | MQTT credentials pass through to NATS: each client is held to its own NATS identity's publish and subscribe permissions, on every path including retained messages and Wills. |
+| **Pick a topology** | Put the broker in front of a NATS cluster you already run, or run the image with JetStream embedded and no NATS deployment at all. |
 
 ## How it works
 
-Stateless MQTT frontends sit in front of a replicated JetStream cluster. All
-durable state lives in JetStream, so any client can reconnect to any frontend and
-sessions survive instance loss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+```mermaid
+flowchart LR
+    subgraph clients["MQTT clients"]
+        c1["device<br/>MQTT 3.1.1"]
+        c2["app<br/>MQTT 5.0"]
+        c3["browser<br/>MQTT over WebSocket"]
+    end
+    lb["TCP load balancer"]
+    subgraph brokers["mqtt-nats-broker (stateless, scale out)"]
+        b1["broker 1"]
+        b2["broker 2"]
+        b3["broker N"]
+    end
+    subgraph js["NATS JetStream cluster (R3)"]
+        s1[("sessions and ownership<br/>$MQTT_sess")]
+        s2[("messages and deliveries<br/>$MQTT_msgs, $MQTT_out")]
+        s3[("retained, Wills, QoS 2<br/>$MQTT_rmsgs and three more")]
+    end
+    natsapps["core NATS applications"]
+    c1 & c2 & c3 --> lb
+    lb --> b1 & b2 & b3
+    b1 & b2 & b3 <--> js
+    natsapps <-->|"MQTT topic a/b = NATS subject a.b"| js
+```
+
+The brokers hold no durable state of their own. Seven broker-owned streams carry it,
+replicated by JetStream (`-stream-replicas`, normally 3), and MQTT topics map onto
+NATS subjects so core NATS applications can publish to and subscribe from MQTT clients
+directly. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the mechanism in full.
+
+### Losing a broker
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MQTT client
+    participant A as broker A
+    participant B as broker B
+    participant J as JetStream
+    C->>A: CONNECT, Clean Start = 0, Session Expiry > 0
+    A->>J: claim the session
+    Note over A: broker A is lost
+    C->>B: CONNECT again, same client ID, before the session expires
+    B->>J: take the session over (arbitrated, not timed)
+    J-->>B: session, subscriptions, in-flight QoS 1/2
+    B-->>C: CONNACK, Session Present = 1
+    B->>C: redeliver what is still owed
+```
+
+A session resumes when the client keeps it (MQTT 5: Clean Start 0 with a nonzero
+Session Expiry Interval; MQTT 3.1.1: Clean Session 0) and reconnects with the same
+client identifier before it expires. When both brokers are alive, the old connection is
+closed with reason code 0x8E
+(session taken over). The same applies between a TCP and a WebSocket connection of one
+client identifier. A delayed Will that was durably enqueued survives the loss of its
+broker: another broker publishes it once the claimant's lease runs out, at least once
+rather than exactly once, while JetStream keeps quorum. A Will not yet enqueued when
+its broker crashes can be lost
+([details](docs/CONFORMANCE.md#delayed-will-suppression-the-will-anchor-and-what-still-escapes-it)).
+A JetStream node failing is a separate event: the stream's Raft
+group elects a new leader and the brokers carry on, as long as quorum survives.
+
+## Deployment styles
+
+```mermaid
+flowchart TB
+    subgraph ext["External NATS"]
+        direction LR
+        eb["broker pods<br/>(Deployment)"] --> en[("your NATS<br/>JetStream cluster")]
+    end
+    subgraph emb["Embedded JetStream"]
+        direction LR
+        p1["pod: broker + JetStream"] <--> p2["pod: broker + JetStream"] <--> p3["pod: broker + JetStream"]
+    end
+    subgraph shared["Inside the NATS chart's pods"]
+        direction LR
+        n1["NATS pod<br/>+ broker container"] <--> n2["NATS pod<br/>+ broker container"]
+    end
+```
+
+| Style | Use it when | Start with |
+|---|---|---|
+| **External NATS** | you already run NATS, or want brokers and storage scaled separately | the binary, `ghcr.io/nberlee/mqtt-nats-broker`, or the Helm chart with `topology: external` |
+| **Embedded JetStream** | you want one self-contained deployment: a single container, or a StatefulSet of three or more | `ghcr.io/nberlee/mqtt-nats-broker:<tag>-embedded`, or the Helm chart's default |
+| **Shared pod** | you run the official NATS Helm chart and want the broker beside each server | the values file in [docs/deploy/nats-chart-shared-pod](docs/deploy/nats-chart-shared-pod/README.md) |
+
+All of them run on Kubernetes ([docs/KUBERNETES.md](docs/KUBERNETES.md)), with
+`/healthz` and `/readyz` probes, a drain on SIGTERM, and documented backup, restore,
+upgrade and rollback procedures ([docs/OPERATIONS.md](docs/OPERATIONS.md)).
 
 ## Quickstart
 
-The broker needs nats-server 2.15.2 or newer, but not 2.15.3, with one server option
-set; the prerequisites, the binary and both container images are in
-[docs/INSTALLATION.md](docs/INSTALLATION.md).
-
-Run a broker + NATS locally:
+A broker and a NATS server, from the repository:
 
 ```sh
 docker compose -f test/conformance/docker-compose.yml up --build
 ```
 
-Or run the binary against an existing NATS cluster, with `-stream-replicas` set to its
-JetStream cluster size (`1` for a single server):
+One container with JetStream embedded, nothing else to run (built locally until the
+first release publishes `ghcr.io/nberlee/mqtt-nats-broker:<version>-embedded`):
+
+```sh
+docker build --target embedded -t mqtt-nats-broker:embedded .
+docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
+  -v mqtt-data:/data -e MQTTNB_STREAM_REPLICAS=1 \
+  -e MQTTNB_NATS_USER=service -e MQTTNB_NATS_PASS=change-me \
+  -e MQTTNB_DEFAULT_USER=mqtt -e MQTTNB_DEFAULT_PASS=change-me-too \
+  mqtt-nats-broker:embedded
+```
+
+In front of an existing NATS cluster, with `-stream-replicas` set to its JetStream
+cluster size:
 
 ```sh
 go build ./cmd/mqtt-nats-broker
 ./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -stream-replicas 3 -port 1883
 ```
+
+On Kubernetes, from the repository until the first release publishes the chart to
+`oci://ghcr.io/nberlee/charts/mqtt-nats-broker` and its images: push the embedded image
+built above to a registry your cluster pulls from, and point the chart at it. The chart
+never creates its credentials Secret, so create it first; the chart's
+[Before installing](charts/mqtt-nats-broker/README.md#before-installing) lists the rest:
+
+```sh
+kubectl create secret generic mqtt-nats-broker-nats \
+  --from-literal=user=<service user> --from-literal=password=<service password> \
+  --from-literal=default-user=<anonymous user> --from-literal=default-password=<anonymous password>
+helm dependency build charts/mqtt-nats-broker
+helm install broker charts/mqtt-nats-broker \
+  --set image.fullImageName=<registry>/mqtt-nats-broker:embedded   # one embedded broker
+```
+
+The broker needs nats-server 2.15.2 (not 2.15.3) with one server option set; the
+prerequisites and both images are in [docs/INSTALLATION.md](docs/INSTALLATION.md).
+
+## Conformance
+
+| Suite | Result |
+|---|---|
+| [vibesrc/mqttconformance](https://github.com/vibesrc/mqttconformance), MQTT 3.1.1 | **124 / 124** normative statements |
+| [vibesrc/mqttconformance](https://github.com/vibesrc/mqttconformance), MQTT 5.0 | **106 / 106** normative statements |
+| Eclipse Paho MQTT 5.0 interoperability | **26 / 27**; the one baselined test is a spec-permitted delivery choice |
+
+Every suite runs in CI against the real broker binary, next to more than 3,400
+end-to-end and protocol tests, three-node JetStream failover tests, and image and Helm
+installs on amd64 and arm64. The details, and every residual stated as current
+behavior, are in [docs/CONFORMANCE.md](docs/CONFORMANCE.md).
+
+## Features
+
+| Feature | 3.1.1 | 5.0 |
+|---|---|---|
+| QoS 0 / 1 / 2 | ✅ | ✅ |
+| Retained messages | ✅ | ✅ |
+| Persistent sessions (JetStream) | ✅ | ✅ |
+| Shared subscriptions | — | ✅ QoS 0/1; QoS 2 experimental and not part of alpha |
+| Will (+ delay) | ✅ | ✅ (delay) |
+| Message / session expiry, reason codes, properties | — | ✅ |
+| TLS / mTLS, live certificate rollover | ✅ | ✅ |
+| Auth passthrough (per-client NATS authorization) | ✅ | ✅ |
+| HA cross-instance session takeover | ✅ | ✅ |
+| MQTT over WebSocket / secure WebSocket | ✅ | ✅ |
+
+MQTT 5 is always enabled. A shared subscription requesting QoS 2 is granted QoS 1 for
+the alpha, while non-shared QoS 2 is unchanged; the experimental shared QoS 2 code is
+kept behind a test-only option
+([roadmap chapter](docs/ROADMAP.md#p-shared-subscription-qos-2-post-alpha--maybe-someday)).
+
+## Security in one minute
+
+- **Credentials pass through to NATS.** An MQTT client's user name and password dial
+  NATS as that user; the broker refuses an identity outside its service account and
+  enforces that identity's publish and subscribe permissions on every route, including
+  the stored, retained and Will paths. Anonymous clients use configured default
+  credentials.
+- **Permissions are read once, at CONNECT.** A changed ACL reaches the routes the
+  broker serves for a client only when that client reconnects; that and the other
+  residuals are in
+  [docs/CONFORMANCE.md](docs/CONFORMANCE.md#authorization-of-the-authenticated-identity--closed-with-residuals).
+- **Deny MQTT identities the internals.** The broker reserves `$MQTT.>`; deny it in
+  both directions for every MQTT client identity, together with the JetStream API
+  (`$JS.>`, and `$KV.>` and `$O.>` as default isolation). An MQTT topic maps onto a
+  NATS subject, so without that ACL a client could publish to
+  `$JS/API/STREAM/DELETE/$MQTT_sess`. The recommended ACL is
+  `test/conformance/nats.conf`.
+- **Least privilege for the broker itself.** The service identity's grants are listed
+  in [Recommended NATS permissions](docs/ARCHITECTURE.md#recommended-nats-permissions).
+
+The deployment guide, with user/password and operator (JWT) examples, is
+[docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
 
 ## Documentation
 
@@ -63,65 +235,6 @@ go build ./cmd/mqtt-nats-broker
 
 The same documents are published as the project's GitHub Wiki at each release
 ([docs/WIKI.md](docs/WIKI.md)).
-
-## Authentication
-
-Auth is **passed through to NATS**: an MQTT client's username/password dial a
-dedicated `*nats.Conn`, and the broker asks NATS who that is (`$SYS.REQ.USER.INFO`).
-It refuses an identity outside the service connection's account, and holds the client
-to that identity's publish and subscribe permissions on every route, including the
-stored, retained and Will paths that ride the service connection. Anonymous clients
-use the configured default credentials. The permissions are read once, at CONNECT;
-that and the other residuals are in
-[docs/CONFORMANCE.md](docs/CONFORMANCE.md#authorization-of-the-authenticated-identity--closed-with-residuals).
-[docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) has the deployment guide, with
-user/password and operator (JWT) examples, and
-[docs/MIGRATION.md](docs/MIGRATION.md) moves a deployment from nats-server's own MQTT
-listener.
-
-The broker reserves `$MQTT.>` for its own state and refuses client publishes,
-subscribes, and Will topics that target it. Deny both directions on that prefix
-for the MQTT client identity as well — the broker's checks bind MQTT clients,
-the ACL binds anyone using the same credentials to reach NATS directly. See
-[Reserved `$MQTT.>` namespace](docs/ARCHITECTURE.md#reserved-mqtt-namespace) for
-the topic mapping and the exact permissions.
-
-The MQTT client identity must also be denied the JetStream API, `$JS.>` in both
-directions (and `$KV.>` and `$O.>` as default isolation): an MQTT topic maps onto a
-NATS subject, so a client publishing to `$JS/API/STREAM/DELETE/$MQTT_sess` would
-otherwise delete the broker's session stream. The recommended ACL is
-`test/conformance/nats.conf` ([details](docs/ARCHITECTURE.md#what-a-deployment-must-allow)).
-
-## Feature matrix
-
-| Feature | 3.1.1 | 5.0 |
-|---|---|---|
-| QoS 0 / 1 / 2 | ✅ | ✅ |
-| Retained messages | ✅ | ✅ |
-| Persistent sessions (JetStream) | ✅ | ✅ |
-| Shared subscriptions | — | ✅ QoS 0/1; QoS 2 experimental and not part of alpha |
-| Will (+ delay) | ✅ | ✅ (delay) |
-| Message / session expiry, reason codes, properties | — | ✅ |
-| TLS / mTLS | ✅ | ✅ |
-| Auth passthrough (per-client NATS authorization) | ✅ | ✅ |
-| HA cross-instance session takeover | ✅ | ✅ |
-| MQTT over WebSocket / secure WebSocket | ✅ | ✅ |
-
-(MQTT 5 is always enabled; the shared-QoS-2 gate is a separate feature boundary.
-For the alpha, a shared filter requesting QoS 2 is accepted at granted QoS 1 by
-default, while non-shared QoS 2 is unchanged. The current affine shared-QoS-2
-implementation and tests remain in the tree behind a programmatic test option that
-the production command does not expose, with no persistence upgrade or downgrade
-guarantee. All supported rows above are covered
-by end-to-end tests driving real MQTT clients against the broker over in-process
-JetStream — including load-balanced shared QoS 0/1 subscriptions, message expiry,
-and reconnect-to-a-different-instance takeover. See the
-[dedicated post-alpha roadmap chapter](docs/ROADMAP.md#p-shared-subscription-qos-2-post-alpha--maybe-someday).)
-
-## Roadmap
-
-The authoritative pre-alpha release checklist is maintained in
-[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
