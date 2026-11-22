@@ -4,19 +4,22 @@ The broker is tested against the conformance suites named in the project plan.
 Results below are from running each suite against the running broker
 (`cmd/mqtt-nats-broker`) backed by a JetStream-enabled NATS server.
 
-**No NEW residual may be conditioned on a rollout.** Every broker in existence is built
-from this tree — see "Compatibility boundary" in `docs/ARCHITECTURE.md`, which is
-normative — so "protection is per broker until the fleet upgrades" is not a real
-qualification, and writing one invites a future change to preserve behavior for a broker
-that will never run. State what a broker running this code does.
+**No NEW residual may be conditioned on a rollout.** Brokers of different builds share an
+account only within one format version, where the predecessor rule makes every change
+coexist with the release before it; across versions a broker refuses the other's store
+(see "Compatibility boundary" in `docs/ARCHITECTURE.md`, which is normative). So
+"protection is per broker until the fleet upgrades" is not a real qualification, and
+writing one invites a future change to preserve behavior for a broker that cannot run
+beside it. State what a broker running this code does.
 
 The rule applies throughout this document: every residual below states what a broker
 running this code does, and a limit that is real is stated as the scope of the
 mechanism that enforces it, not as a property of a fleet's version mix.
 
-That holds until the first release. Alpha still promises no version compatibility and
-decides each break case by case; beta keeps the contracts and guarantees compatibility
-within them. See "Release phases" under the compatibility boundary.
+Since the first release, v0.1.0-alpha.1, the alpha phase applies: no version
+compatibility is promised and each break is decided case by case; beta keeps the
+contracts and guarantees compatibility within them. See "Release phases" under the
+compatibility boundary.
 
 ## Supported-alpha boundary for shared subscriptions
 
@@ -5565,11 +5568,11 @@ Residuals and hard requirements:
   no identity to scope an arbitration with, so its inbound QoS 2 release could not
   be arbitrated against a session discard, and the discard would blind-purge a held
   payload whose releaser had already claimed it — silent loss, and strictly worse
-  than the ordering deviation the claim exists to fix. The broker is pre-release and
-  its `$MQTT_*` schemas carry no compatibility contract, so the remedy is to
-  recreate the development store. A record carrying a subscription in the reserved
-  `$MQTT.>` namespace is refused on the same terms and for the same reason (see the
-  namespace section of `docs/ARCHITECTURE.md`).
+  than the ordering deviation the claim exists to fix. No released broker writes
+  such a record, and the `$MQTT_*` schemas carry no compatibility contract across
+  versions, so the remedy is to recreate the store. A record carrying a subscription in
+  the reserved `$MQTT.>` namespace is refused on the same terms and for the same
+  reason (see the namespace section of `docs/ARCHITECTURE.md`).
 - **A refused restore can defer a due session expiry to a later sweep pass.** Every
   refusal on that path returns while the client ID is still registered in the
   in-process `sessLocked` map, and `expireSessionFromRecord` yields to that

@@ -54,16 +54,19 @@ test/conformance       compose env + conformance runner + baselines
 
 ## Planning and compatibility assumptions
 
-This project is working toward its **first public release**. Use these defaults
-in design documents and implementation plans unless a task explicitly changes
-them:
+This project is in **alpha**: its first release, v0.1.0-alpha.1, shipped on
+2026-11-22. Use these defaults in design documents and implementation plans unless
+a task explicitly changes them (`docs/ARCHITECTURE.md`, "Compatibility boundary"):
 
-- There is no released broker version, persisted MQTT-state format, or
-  mixed-version broker deployment to support yet.
-- Do not add migration code, dual readers/writers, legacy fallbacks, or rolling-
-  upgrade protocols for pre-release contents of the internal `$MQTT_*`
-  JetStream streams. Prefer the clean current schema and fail fast with an
-  actionable instruction to recreate development data when necessary.
+- No version compatibility is promised. A change that an earlier broker of the
+  same persisted format would decode or decide differently bumps the format, and
+  each such break ships a migration or a refusal with recreate guidance, decided
+  case by case. Within one format version, a change coexists with the release
+  before it.
+- Do not add dual readers/writers, legacy fallbacks, or rolling-upgrade protocols
+  across format versions for the internal `$MQTT_*` JetStream streams. Prefer the
+  clean current schema and fail fast with an actionable instruction to recreate
+  the data when the break ships a refusal.
 - Support only the current JetStream behavior and APIs exercised by the latest
   `nats-server/v2` version pinned in `go.mod` and CI. Do not add compatibility
   branches for older JetStream releases.

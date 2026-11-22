@@ -8,6 +8,13 @@ permissions:
   contents: write
   packages: write
 
+# One run per tag at a time, never cancelled: a second run for the same tag (a tag moved
+# and pushed again) starts only once the first has finished, and its first check then
+# finds the release and refuses, so two runs cannot publish over each other.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -23,6 +30,19 @@ jobs:
       - uses: actions/checkout@v7
       - name: check the tag
         run: printf '%s\n' "$GITHUB_REF_NAME" | make -s release-version
+      # The release's notes are its CHANGELOG.md entry, committed before the tag
+      # (docs/ROADMAP.md, "Release documentation"): a tag without one publishes nothing.
+      # A tag already released is not published again (.github/check_unreleased.sh); every
+      # job that pushes to the registry repeats the check, since re-running one job alone
+      # does not re-run this one.
+      - name: the tag is not released yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sh .github/check_unreleased.sh
+      - name: check the changelog entry
+        run: |
+          v=$(printf '%s\n' "$GITHUB_REF_NAME" | make -s release-version)
+          python3 .github/release_notes.py CHANGELOG.md "$v" > /dev/null
 
   image:
     name: build & push multi-arch image
@@ -31,8 +51,13 @@ jobs:
     # The chart job checks its default image against these.
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
+      - name: the tag is not released yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sh .github/check_unreleased.sh
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - name: Log in to ghcr.io
@@ -52,6 +77,7 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -70,8 +96,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
+      - name: the tag is not released yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sh .github/check_unreleased.sh
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
       - name: Log in to ghcr.io
@@ -96,6 +127,7 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -135,13 +167,13 @@ jobs:
             -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
             -o "$out" ./cmd/mqtt-nats-broker
           sha256sum "$out" > "$out.sha256"
-      - uses: softprops/action-gh-release@v3
+      # The GitHub release is created once, by the release job, with its notes and every
+      # binary: nothing is public on the release page before its notes are complete.
+      - uses: actions/upload-artifact@v7
         with:
-          # A version with a pre-release part (v0.1.0-alpha.1) is published as a GitHub
-          # pre-release, as the images leave `latest` to releases without one.
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            mqtt-nats-broker_*
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: mqtt-nats-broker_*
+          if-no-files-found: error
 
   chart:
     name: package & push the Helm chart
@@ -154,6 +186,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: the tag is not released yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sh .github/check_unreleased.sh
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27'
@@ -166,6 +202,56 @@ jobs:
           make helm-publish TAG="$GITHUB_REF_NAME" \
             CHART_REGISTRY="oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts" \
             HELM_REGISTRY_USER="$GITHUB_ACTOR"
+
+  release:
+    name: GitHub release
+    # Creates the GitHub release in one step, with every binary and its notes: the
+    # version's CHANGELOG.md entry, then what this run published, both images and the
+    # chart with their digests, which exist only once the tag is built and so are written
+    # here and not in the changelog. A version with a pre-release part (v0.1.0-alpha.1) is
+    # a GitHub pre-release, as the images leave `latest` to releases without one.
+    needs: [version, image, image-embedded, chart, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          EMBEDDED_DIGEST: ${{ needs.image-embedded.outputs.digest }}
+        run: |
+          set -euo pipefail
+          v=$(printf '%s\n' "$GITHUB_REF_NAME" | make -s release-version)
+          python3 .github/release_notes.py CHANGELOG.md "$v" > entry.md
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY,,}"
+          tok=$(curl -fsS -u "$GITHUB_ACTOR:$GH_TOKEN" \
+            "https://ghcr.io/token?scope=repository:$owner/charts/mqtt-nats-broker:pull" | jq -r .token)
+          chart=$(curl -fsSI -H "Authorization: Bearer $tok" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/$owner/charts/mqtt-nats-broker/manifests/$v" \
+            | tr -d '\r' | awk -F': ' 'tolower($1) == "docker-content-digest" { print $2 }')
+          test -n "$IMAGE_DIGEST" && test -n "$EMBEDDED_DIGEST" && test -n "$chart"
+          test "$(ls dist | wc -l)" -eq 8
+          {
+            cat entry.md
+            echo
+            echo '### Artifacts'
+            echo
+            echo "- Container image, broker in front of your NATS (linux/amd64, linux/arm64): \`ghcr.io/$repo:$v\` (\`$IMAGE_DIGEST\`)"
+            echo "- Container image, broker with JetStream embedded (linux/amd64, linux/arm64): \`ghcr.io/$repo:$v-embedded\` (\`$EMBEDDED_DIGEST\`)"
+            echo "- Helm chart: \`oci://ghcr.io/$owner/charts/mqtt-nats-broker\`, version \`$v\` (\`$chart\`)"
+            echo '- Binaries for Linux and macOS on amd64 and arm64, with SHA-256 checksums, attached below.'
+          } > notes.md
+          prerelease=()
+          case "$v" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md "${prerelease[@]}"
 
   wiki:
     name: publish the wiki

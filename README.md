@@ -8,8 +8,10 @@ in-flight QoS 1/2 exchanges.
 [![CI](https://github.com/nberlee/mqtt-nats-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/nberlee/mqtt-nats-broker/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **Status: pre-release.** The first alpha is being prepared; there is no published
-> release and no supported persisted-state format yet. The release checklist is
+> **Status: alpha.** The first release,
+> [v0.1.0-alpha.1](https://github.com/nberlee/mqtt-nats-broker/releases/tag/v0.1.0-alpha.1),
+> shipped on 2026-11-22. Alpha promises no compatibility between versions; each break
+> is decided case by case and named in [CHANGELOG.md](CHANGELOG.md). The roadmap is
 > [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why this broker
@@ -127,17 +129,16 @@ A broker and a NATS server, from the repository:
 docker compose -f test/conformance/docker-compose.yml up --build
 ```
 
-One container with JetStream embedded, nothing else to run (built locally here; every
-green commit on `main` is also published as `ghcr.io/nberlee/mqtt-nats-broker:main-embedded`,
-see [Commit images](docs/INSTALLATION.md#commit-images)):
+One container with JetStream embedded, nothing else to run (every green commit on `main`
+is also published as `main-embedded`, see
+[Commit images](docs/INSTALLATION.md#commit-images)):
 
 ```sh
-docker build --target embedded -t mqtt-nats-broker:embedded .
 docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
   -v mqtt-data:/data -e MQTTNB_STREAM_REPLICAS=1 \
   -e MQTTNB_NATS_USER=service -e MQTTNB_NATS_PASS=change-me \
   -e MQTTNB_DEFAULT_USER=mqtt -e MQTTNB_DEFAULT_PASS=change-me-too \
-  mqtt-nats-broker:embedded
+  ghcr.io/nberlee/mqtt-nats-broker:0.1.0-alpha.1-embedded
 ```
 
 In front of an existing NATS cluster, with `-stream-replicas` set to its JetStream
@@ -148,19 +149,16 @@ go build ./cmd/mqtt-nats-broker
 ./mqtt-nats-broker -nats nats://nats-1:4222,nats://nats-2:4222 -stream-replicas 3 -port 1883
 ```
 
-On Kubernetes, from the repository until the first release publishes the chart to
-`oci://ghcr.io/nberlee/charts/mqtt-nats-broker` and its images: push the embedded image
-built above to a registry your cluster pulls from, and point the chart at it. The chart
-never creates its credentials Secret, so create it first; the chart's
+On Kubernetes, from the published chart. The chart never creates its credentials Secret,
+so create it first; the chart's
 [Before installing](charts/mqtt-nats-broker/README.md#before-installing) lists the rest:
 
 ```sh
 kubectl create secret generic mqtt-nats-broker-nats \
   --from-literal=user=<service user> --from-literal=password=<service password> \
   --from-literal=default-user=<anonymous user> --from-literal=default-password=<anonymous password>
-helm dependency build charts/mqtt-nats-broker
-helm install broker charts/mqtt-nats-broker \
-  --set image.fullImageName=<registry>/mqtt-nats-broker:embedded   # one embedded broker
+helm install broker oci://ghcr.io/nberlee/charts/mqtt-nats-broker \
+  --version 0.1.0-alpha.1   # one embedded broker with its own JetStream
 ```
 
 The broker needs nats-server 2.15.2 (not 2.15.3) with one server option set; the

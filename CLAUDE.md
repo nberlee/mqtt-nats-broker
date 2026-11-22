@@ -18,24 +18,27 @@ files under `internal/mqtt/` (`qos2_move.go`, `qos2_shared_affine.go`,
 - `docs/CONFORMANCE.md` records stated residuals. A residual documented there
   is a constraint on a fix, not a free target.
 - `docs/ARCHITECTURE.md`'s "Compatibility boundary" is **normative for every
-  plan**: no migration, legacy-format or rolling-upgrade machinery, no residual
-  conditioned on a rollout, and an unsupported persisted shape is **refused**
-  rather than migrated
+  plan**: no legacy-format or rolling-upgrade machinery across format versions, no
+  residual conditioned on a rollout, and a persisted shape the current format does
+  not define is **refused**, never read around; a format break ships a migration
+  or a refusal, chosen for that break
   ([issue #60](https://github.com/nberlee/mqtt-nats-broker/issues/60),
   [issue #61](https://github.com/nberlee/mqtt-nats-broker/issues/61),
-  [issue #62](https://github.com/nberlee/mqtt-nats-broker/issues/62)). There is
-  no release yet, so a mixed fleet is a population that does not exist; reasoning
-  about one costs review rounds and invites preserving behavior for a broker that
-  will never run. After the first release the phases in that section apply:
-  **alpha** still guarantees no version compatibility and decides each break case
-  by case (what compatibility would cost to build against how destructive the
-  break is for an operator); **beta** keeps the contracts and guarantees
-  compatibility within them. From the first release a mixed fleet exists within
-  one format version, which is also the broker-to-broker protocol's version
-  (`docs/ARCHITECTURE.md`, "The broker-to-broker protocol").
-  The contracts themselves (format and protocol
-  versions, the NATS floor, configuration, permissions, operational interface)
-  are in place before the first release: `docs/ROADMAP.md` §1.
+  [issue #62](https://github.com/nberlee/mqtt-nats-broker/issues/62)). The first
+  release, v0.1.0-alpha.1, shipped on 2026-11-22, so the **alpha** phase of that
+  section applies: no version compatibility is guaranteed, and each break across
+  versions is decided case by case (what compatibility would cost to build against
+  how destructive the break is for an operator: a refusal with recreate guidance,
+  a purge, a migration); **beta** keeps the contracts and guarantees compatibility
+  within them. Within one format version, which is also the broker-to-broker
+  protocol's version, a mixed fleet now exists: every change that keeps the version
+  owes coexistence with its predecessor, and a change an earlier broker of the same
+  version would decode or decide differently bumps the version
+  (`docs/ARCHITECTURE.md`, "The broker-to-broker protocol"). Across versions there
+  is no mixed fleet: a broker refuses a store of another version, so reasoning
+  about one costs review rounds for a population that cannot run. The contracts
+  themselves (format and protocol versions, the NATS floor, configuration,
+  permissions, operational interface) are in place: `docs/ROADMAP.md` §1.
 
 Any change to a mechanism updates `docs/ARCHITECTURE.md`; any behavior gap it
 leaves updates `docs/CONFORMANCE.md`. Both in the same change, not later.

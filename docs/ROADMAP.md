@@ -1952,48 +1952,22 @@ them in order where a later lint change depends on an earlier cleanup.
 
 - [x] Remove the pre-release changelog before the first alpha. Done 2026-10-26.
 
-- [ ] Start a changelog with the first published alpha, or generate release
-  notes from Git history and pull requests. **Decided 2026-10-26: a hand-written
-  changelog.** `CHANGELOG.md` in Keep a Changelog format starts again with a versioned,
-  dated entry for the first published alpha, committed before the alpha tag so the tagged
-  source carries it. The GitHub release body is that entry, copied at release time:
-  `.github/workflows/release.yml` sets no body and generates none. Generated release notes
-  are not adopted, because GitHub builds them from merged pull requests and this
-  repository's history is direct commits. Each entry states the persisted format the
-  release reads and writes and the nats-server version it embeds, which decide how to
-  upgrade to it (`docs/OPERATIONS.md`, "Upgrades and rollbacks"). Open until the alpha is
-  published.
+- [x] Start a hand-written changelog (`CHANGELOG.md`, Keep a Changelog) with the first
+  published alpha; each entry names its persisted format and nats-server version, and the
+  release workflow writes the GitHub release body from it, adding the published images and
+  chart with their digests. Done 2026-11-22 with v0.1.0-alpha.1.
 
 - [x] Replace the README's duplicate roadmap with a short link to this file.
 
-- [ ] Make version-controlled files under `docs/` the source of truth for a
-  GitHub Wiki. **Implemented 2026-10-26; open until the first publication is verified.**
-  `docs/WIKI.md` is the Home page and its `## Pages` list is the manifest; `cmd/wikigen`
-  renders the listed documents, splitting one over the 400,000-byte page budget at its
-  sections, rewriting links to pages, anchors and commit-pinned repository URLs, and
-  `TestRepositoryDocsRenderAsWiki` fails `make test` on a broken link, a missing anchor,
-  Markdown outside the published subset (judged by a GFM parse: no raw HTML,
-  reference-style links or footnotes, plain headings) or an oversized section
-  (`docs/ARCHITECTURE.md`, "The wiki is generated from docs/").
+- [x] Make version-controlled files under `docs/` the source of truth for the GitHub Wiki
+  (`docs/WIKI.md` and `cmd/wikigen`). First publication verified 2026-11-22.
 
-- [ ] Publish the wiki from CI so it cannot drift from repository docs. **Implemented
-  2026-10-26; open until the first publication is verified.** The release workflow's
-  `wiki` job renders each release tag and `wikigen publish` pushes it, guarded by the
-  wiki's `.wiki-publication` record so an older release or a moved tag never replaces
-  newer pages; a rejected push is re-judged against what landed. The wiki mirrors the
-  newest release, so `docs/` runs ahead of it between releases, and web edits are
-  overwritten at the next one. Not verifiable before a release: the push with
-  `GITHUB_TOKEN` and GitHub's rendering of the pages, which waits on "Before the first
-  push" below and the alpha tag. The wiki repository the release pushes to exists: its
-  first page was created in GitHub's web UI by 2026-11-01.
+- [x] Publish the wiki from CI at each release tag (release.yml `wiki` job,
+  `.wiki-publication` guard). First publication, v0.1.0-alpha.1, verified 2026-11-22.
 
-- [ ] Include installation, configuration, architecture, TLS, Helm/Kubernetes,
+- [x] Include installation, configuration, architecture, TLS, Helm/Kubernetes,
   authentication and authorization, migration, operations, troubleshooting, conformance,
-  and provenance pages. **Implemented 2026-10-26; open with the two items above.** New
-  `docs/INSTALLATION.md`, `CONFIGURATION.md`, `TLS.md`, `KUBERNETES.md`, `OPERATIONS.md`
-  and `TROUBLESHOOTING.md` take the README's installation, flag table, TLS and WebSocket
-  sections (the README keeps a short quickstart and links); the chart README and the two
-  deploy READMEs are published as they are.
+  and provenance pages in the wiki. Published 2026-11-22.
 
 - [x] Every finding is a GitHub issue, and every reference to one points at its issue: #3
   to #145, label `finding`, and no mapping file (the issue titles are the mapping). Done

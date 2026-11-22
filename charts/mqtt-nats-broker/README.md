@@ -2,7 +2,8 @@
 
 An MQTT 3.1.1 and 5.0 broker over NATS JetStream. A release publishes the chart as an OCI
 artifact beside the images, with the release's version as its version and its default
-image tag; there is no release yet, so the version in this directory is a placeholder.
+image tag; the version in this directory is the latest release's, which the release
+workflow sets again from the tag when it packages the chart.
 
 ## Topologies
 

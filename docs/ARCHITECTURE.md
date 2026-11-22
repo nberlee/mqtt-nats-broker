@@ -49,18 +49,19 @@ Authors' Apache-2.0 header, and the per-feature protocol files (`qos2_move.go`,
 
 ## Compatibility boundary
 
-The broker is **pre-release** and is being designed for its first public
-release. Its internal persisted MQTT state and `$MQTT_*` JetStream stream
-schemas do not have a backward-compatibility contract yet. During this phase,
-schema changes may require development streams to be recreated; designs should
-not carry migration, legacy-format, or mixed-version rolling-upgrade machinery
-unless a concrete released contract is identified first.
+The broker is in **alpha**: its first release, v0.1.0-alpha.1, shipped on 2026-11-22.
+Its persisted MQTT state and `$MQTT_*` JetStream stream schemas carry a format version
+and no compatibility contract across versions: a breaking change bumps the version (see
+"The persisted format") and ships, decided per break, a migration or a refusal with
+recreate guidance. Designs carry no legacy-format or mixed-version rolling-upgrade
+machinery beyond that decision; within one version, brokers coexist (see "The
+broker-to-broker protocol").
 
-**Release phases.** The rule above holds until the first release. **Alpha** still
-guarantees no version compatibility: each breaking change is decided case by case,
+**Release phases.** **Alpha**, the current phase, guarantees no version compatibility:
+each breaking change is decided case by case,
 weighing what compatibility would cost to build against how destructive the break is for
 an operator (a refusal with recreate guidance, a purge, a migration). What makes later
-compatibility possible is in place by the first release, though: versions on the
+compatibility possible was in place by the first release, though: versions on the
 persisted format (in place: see "The persisted format" below) and the broker-to-broker
 records (in place, the same version: see "The broker-to-broker protocol" below),
 a checked NATS floor, and frozen
@@ -201,7 +202,7 @@ value** is refused naming that value, telling the operator to run a release that
 with the reset offered last and named as destructive. Like every startup check, both are a
 snapshot: a stamp edited after a manager initialized is seen at the next initialization.
 
-**The change rules** take effect at the first release:
+**The change rules** apply since the first release, v0.1.0-alpha.1:
 
 - An **additive** change needs no bump, and is narrow: a field or record class is additive
   only if a broker of the earlier format decodes it, ignores it with unchanged decisions,
@@ -215,9 +216,9 @@ snapshot: a stamp edited after a manager initialized is seen at the next initial
 - A **breaking** change bumps the format and ships, per the release phases above, either a
   migration or a refusal with guidance — never "retain and ignore", reading a store whose
   meaning changed and skipping what the reader does not understand.
-- **Before the first release** format 1 is not frozen: a change may rewrite it in place,
-  and its golden fixture is regenerated with it. At the first release format 1 freezes,
-  and its fixture with it.
+- **Format 1 froze at the first release**, v0.1.0-alpha.1, and its golden fixture with
+  it. Before then it was rewritten in place; now a change to it is additive or bumps the
+  format.
 
 **The golden fixtures.** `internal/mqtt/testdata/storeformat/<format>/` holds a
 nats-server store directory that a broker of that format's build wrote while running a
@@ -316,14 +317,14 @@ coordination rule is part of what a record means, and a live header is decoded b
 broker that decodes the stored copy beside it. Two keys invite the half-bump; one key on
 the carrier every broker already checks does not.
 
-**The predecessor rule**, effective from the first release: two releases carrying the same
-version **coexist in both directions** — concurrent writes, cleanup and decisions over each
-other's records, and each other's live publications. The additive rule in "The persisted
-format" extends to the decision rules and to the live envelope: a change an earlier broker
-of the same version would decide differently on, or a live header it would misread, is
-breaking and bumps the version, even when no record's encoding changes. A broker meeting a
-store stamped with another version refuses at initialization, whichever of the two
-releases is newer.
+**The predecessor rule**, in effect since the first release (v0.1.0-alpha.1): two
+releases carrying the same version **coexist in both directions** — concurrent writes,
+cleanup and decisions over each other's records, and each other's live publications. The
+additive rule in "The persisted format" extends to the decision rules and to the live
+envelope: a change an earlier broker of the same version would decide differently on, or
+a live header it would misread, is breaking and bumps the version, even when no record's
+encoding changes. A broker meeting a store stamped with another version refuses at
+initialization, whichever of the two releases is newer.
 
 **Across a bump, an offline transition.** Stop every broker on the account; convert the
 bundle (when that break ships a migration) or reset it; then start only brokers of the new
@@ -331,8 +332,8 @@ version (`docs/OPERATIONS.md`, "Upgrades and rollbacks"). No rolling upgrade cro
 version change. Alpha decides, per break, between a migration and a refusal with guidance;
 beta keeps its commitments (see "Release phases").
 
-**When the pre-release rule expires.** "A mixed fleet does not exist" holds until the first
-release. From the first release a mixed fleet exists **within one version**, and every
+**Since the pre-release rule expired.** "A mixed fleet does not exist" held until the
+first release. Since v0.1.0-alpha.1 a mixed fleet exists **within one version**, and every
 change that keeps the version owes coexistence with its predecessor.
 
 **What enforces it, and what does not.** The initialization refusal enforces the version
@@ -391,13 +392,14 @@ use (`MQTTNB_HELM`, `MQTTNB_TEST_RUN_BROKER`, ...), the usage text's wording, th
 bounds in `docs/CONFIGURATION.md`, and `GOMEMLIMIT`/`AUTOMEMLIMIT`, which are the Go
 runtime's and automemlimit's.
 
-**How it changes, until the first release.** By editing it: a rename, a removal or a
-changed default edits the table or the chart, regenerates the fixture or the schema, and
-updates the docs, in one change. There is no deprecation period, no alias, no warning and
-no refusal that names a former setting. A removed flag meets the flag package's generic
+**How it changes during alpha.** As a break decided case by case (see "Release phases"),
+by editing it: a rename, a removal or a changed default edits the table or the chart,
+regenerates the fixture or the schema, and updates the docs, in one change, which the
+release's changelog entry names. No deprecation period, alias, warning or refusal that
+names a former setting is promised; whether a renamed or removed setting gets one is
+decided after the alpha (`docs/ROADMAP.md` §8). A removed flag meets the flag package's generic
 refusal of an undefined flag, a removed variable is simply not read, and a removed chart
-value meets the schema's refusal of an unknown key. What applies from the first release is
-decided then, under "Release phases" above.
+value meets the schema's refusal of an unknown key.
 
 ### The permission contract
 
@@ -535,10 +537,10 @@ witnesses and the record witnesses assert literal expectations against the real 
 tests drive, not for every path that reaches it; the census pins producers by function,
 not by the branch inside it.
 
-**How it changes, until the first release.** By editing the definition: the pin is
-regenerated and the docs follow, in one change, with no alias for a former message and no
-dual emission. What applies from the first release is decided then, under "Release
-phases" above.
+**How it changes during alpha.** As a break decided case by case (see "Release phases"),
+by editing the definition: the pin is regenerated and the docs follow, in one change,
+which the release's changelog entry names, with no alias for a former message and no dual
+emission.
 
 ### Shared-subscription QoS boundary
 
@@ -17605,8 +17607,8 @@ its artifacts: `ghcr.io/<owner>/charts/mqtt-nats-broker:<version>`, an OCI artif
 CI's `helm-publish` job runs the same target against an authenticated `registry:2` on the
 runner, with the image tags metadata-action derives from a synthetic tag, the refusals of
 `release-version`, and a push without the login's credential refused. The GHCR push
-itself, its `GITHUB_TOKEN` login and the jobs' ordering on a real tag are exercised first
-by the first release.
+itself, its `GITHUB_TOKEN` login and the jobs' ordering on a real tag were first exercised
+by v0.1.0-alpha.1, which published the chart.
 
 ## The wiki is generated from docs/
 
@@ -17700,7 +17702,7 @@ stops, a newer one behind an older one publishes.
 **Prerequisites and limits.** The wiki repository exists only once its first page has
 been created in GitHub's web UI. Web edits are overwritten by the next release, and
 restricting wiki editing to collaborators is a repository setting. The publication and
-GitHub's rendering of the pages are unverified until the first release; the tests run
+GitHub's rendering of the pages were first verified with v0.1.0-alpha.1; the tests run
 the publication against local repositories.
 
 ## C5 recovery reservation ownership
