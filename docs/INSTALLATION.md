@@ -113,6 +113,21 @@ Mount your own nats-server configuration and point `MQTTNB_NATS_EMBEDDED_CONFIG`
 for other accounts, TLS, or a cluster of broker pods (`embedded/nats-cluster.conf` is
 an example) ([details](ARCHITECTURE.md#embedded-nats)).
 
+### Commit images
+
+Every commit on `main` whose CI passes is also published, both images, multi-arch, with
+provenance and an SBOM: `sha-<short commit>` for that commit, the embedded image suffixed
+as before (`sha-<short commit>-embedded`). `main` and `main-embedded` move to the head of
+`main` once that commit's images are published, so a head whose CI went red leaves them
+on an earlier commit. These
+are builds of an unreleased tree with no compatibility promise; a commit whose CI went red
+publishes nothing. `latest` and the version tags are only ever releases.
+
+A pull request's images (`pr-<number>`, `pr-<number>-<short commit>`, and their
+`-embedded` variants) are built only after the repository owner approves that run; a run
+stops before building if the approval environment is missing or does not require the
+owner's review.
+
 ## Kubernetes
 
 A Helm chart, example manifests, and values that run the broker inside the official

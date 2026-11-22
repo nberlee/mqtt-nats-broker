@@ -127,8 +127,9 @@ A broker and a NATS server, from the repository:
 docker compose -f test/conformance/docker-compose.yml up --build
 ```
 
-One container with JetStream embedded, nothing else to run (built locally until the
-first release publishes `ghcr.io/nberlee/mqtt-nats-broker:<version>-embedded`):
+One container with JetStream embedded, nothing else to run (built locally here; every
+green commit on `main` is also published as `ghcr.io/nberlee/mqtt-nats-broker:main-embedded`,
+see [Commit images](docs/INSTALLATION.md#commit-images)):
 
 ```sh
 docker build --target embedded -t mqtt-nats-broker:embedded .

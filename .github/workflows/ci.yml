@@ -9,9 +9,12 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push supersedes its older run. A commit on main is never
+# cancelled: its run publishes that commit's images (commit-images), and a cancelled
+# publication could leave main and main-embedded on different commits.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-test:
@@ -600,3 +603,132 @@ jobs:
       - name: stop broker
         if: always()
         run: kill "$(cat broker.pid)" 2>/dev/null || true
+
+  commit-images:
+    name: commit images (${{ matrix.variant }})
+    # A green commit on main is published as an image of that commit, beside the release
+    # images: `sha-<short>`, the embedded variant suffixed `-embedded` as release.yml
+    # suffixes it. The moving `main` tags are commit-images-main's. `latest` and the
+    # version tags stay release.yml's. Every gating job above must pass first, so a
+    # commit that went red (an intermittent Paho CONNECT timeout included, issue #183)
+    # publishes nothing. Only this repository publishes: a fork's main does not.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      github.repository == 'nberlee/mqtt-nats-broker'
+    needs:
+      - build-test
+      - fulltests
+      - cluster-failover
+      - depproof
+      - lint
+      - docker
+      - kubernetes-manifest
+      - helm-chart
+      - helm-install
+      - helm-publish
+      - image-external
+      - image-embedded
+      - release-tags
+      - conformance
+      - paho
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: external, target: '', suffix: '' }
+          - { variant: embedded, target: embedded, suffix: '-embedded' }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # latest=false: on the default branch the action would otherwise add `latest`.
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=main-${{ github.sha }}
+          provenance: true
+          sbom: true
+
+  commit-images-main:
+    name: commit images (move main)
+    # Points `main` and `main-embedded` at the images of main's CURRENT head, when that
+    # commit's images are published; otherwise it leaves them. Not this run's commit: a
+    # promotion queued behind another can be replaced by an older one, so every promotion
+    # promotes the head, and whichever runs last brings the tags up to it. One run at a
+    # time, so two promotions cannot interleave their check and their writes.
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      github.repository == 'nberlee/mqtt-nats-broker'
+    needs: commit-images
+    concurrency:
+      group: commit-images-main
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: move main to the head's images, if they are published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/$REPO/commits/main" --jq .sha)
+          # Published means both commit-images jobs of the head's push run succeeded; the
+          # run's job record says so, not a registry error message. Any API failure fails
+          # this job rather than passing for "not published".
+          runs=$(gh api "repos/$REPO/actions/runs?head_sha=$head&event=push&branch=main" \
+            --jq '[.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | .id]')
+          published=false
+          for id in $(printf '%s' "$runs" | jq -r '.[]'); do
+            ok=$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == "commit images (external)" or .name == "commit images (embedded)")
+                    | select(.conclusion == "success")] | length')
+            if [ "$ok" = 2 ]; then published=true; break; fi
+          done
+          if [ "$published" != true ]; then
+            echo "main's head $head has no published commit images (yet): leaving the main tags alone"
+            exit 0
+          fi
+          image="ghcr.io/${REPO,,}"
+          short="${head::7}"
+          # Two writes, not one: a runner lost between them leaves the two main tags on
+          # different commits until a promotion runs again.
+          docker buildx imagetools create -t "$image:main" "$image:sha-$short"
+          docker buildx imagetools create -t "$image:main-embedded" "$image:sha-$short-embedded"
