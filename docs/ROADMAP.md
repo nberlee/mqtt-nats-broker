@@ -968,6 +968,38 @@ blocker: it reverses the 2026-10-23 "not an alpha precondition" disposition.
   `$MQTT_teardown` retired (seven streams), retired generations and lifecycles purged. Done
   2026-11-11 ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)).
 
+### 0.6 Findings from the first production deployment
+
+Added 2026-11-22 at the user's request: defects a 3-pod embedded deployment (NFS-backed
+store, R3) logged over five days on `780fd9d` and during its rollout to v0.1.0-alpha.1.
+Ordered by severity. The evidence and the source reading are in each issue; none is
+reproduced yet.
+
+- [ ] A teardown claim resends its frozen batch after a cross-client directory-shard move,
+  and the failed discard strands the session's record, authority and consumers; a creation
+  resends against a moved registry shard the same way
+  ([issue #186](https://github.com/nberlee/mqtt-nats-broker/issues/186)).
+
+- [ ] A JetStream timeout creating a subscription's consumer refuses the filter with
+  SUBACK 0x80 on an open connection and nothing retries, so a client that does not retry
+  stays deaf on it ([issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187)).
+
+- [ ] Fourteen clients on one pod disposed with 0x89 within 26 s, with nothing logged:
+  decide whether the session records' absence was real or the store misreported it
+  ([issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190)).
+
+- [ ] The ledger high-water refusal lacks the stale-expectation marker, so a delivery
+  admission gives up at the base budget and the message is re-offered out of order
+  ([issue #189](https://github.com/nberlee/mqtt-nats-broker/issues/189)).
+
+- [ ] `/readyz` stays ready while JetStream cannot serve the broker's requests
+  ([issue #188](https://github.com/nberlee/mqtt-nats-broker/issues/188)).
+
+- [ ] One small change for the passthrough connections: a structured error handler, a
+  denied `$SYS.REQ.USER.INFO` refused without waiting out 2 s, and log labels that name
+  the account actually used rather than `$G`
+  ([issue #191](https://github.com/nberlee/mqtt-nats-broker/issues/191)).
+
 ## P. Shared-subscription QoS 2 (post-alpha / maybe someday)
 
 This chapter is the **only active roadmap home** for session-affine shared-subscription
