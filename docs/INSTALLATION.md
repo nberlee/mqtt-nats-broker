@@ -74,14 +74,16 @@ with `-nats-user`/`-nats-pass` or `-nats-creds`.
 
 Both images are multi-arch (amd64 and arm64), `FROM scratch` (the binary and the system
 CA bundle only), run as the numeric user `65532:65532`, and support a read-only root
-filesystem.
+filesystem. Each release is tagged with its version (`0.1.0-alpha.1`, the embedded image
+`0.1.0-alpha.1-embedded`); `latest` and `latest-embedded` name the newest release that is
+not a pre-release, so an alpha is pulled by its version.
 
 The external-NATS image:
 
 ```sh
 docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
   -e MQTTNB_NATS_URLS=nats://nats:4222 -e MQTTNB_STREAM_REPLICAS=3 \
-  ghcr.io/nberlee/mqtt-nats-broker:latest
+  ghcr.io/nberlee/mqtt-nats-broker:0.1.0-alpha.1
 ```
 
 `MQTTNB_STREAM_REPLICAS` is the JetStream cluster size, as for the binary.
@@ -103,7 +105,7 @@ docker run --rm --read-only --cap-drop ALL -p 1883:1883 -p 8080:8080 \
   -v mqtt-data:/data -e MQTTNB_STREAM_REPLICAS=1 \
   -e MQTTNB_NATS_USER=service -e MQTTNB_NATS_PASS=change-me \
   -e MQTTNB_DEFAULT_USER=mqtt -e MQTTNB_DEFAULT_PASS=change-me-too \
-  ghcr.io/nberlee/mqtt-nats-broker:latest-embedded
+  ghcr.io/nberlee/mqtt-nats-broker:0.1.0-alpha.1-embedded
 ```
 
 The image sets no stream replica count: `1` above is the one server its baked

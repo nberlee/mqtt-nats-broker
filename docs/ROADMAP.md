@@ -2039,20 +2039,24 @@ The first alpha may be tagged only when:
   findings-directory path and no test file named for a finding (section 7, "Release
   documentation"). Done 2026-11-01.
 
-- [ ] The full test, race, lint, conformance, Paho, container, and deployment
+- [x] The full test, race, lint, conformance, Paho, container, and deployment
   gates pass with no unexplained failures or skips. Audited 2026-11-21: every CI failure
   on main since 2026-11-05 is explained. The Paho CONNECT timeouts by
   [issue #183](https://github.com/nberlee/mqtt-nats-broker/issues/183), a clustered
   broker's startup exit by
   [issue #184](https://github.com/nberlee/mqtt-nats-broker/issues/184), and
   [issue #185](https://github.com/nberlee/mqtt-nats-broker/issues/185) by the admission
-  livelock fixed in 66ee4af. Judged again on the release-candidate commit.
+  livelock fixed in 66ee4af. Green on c928d31 (run 45048364547), 2026-11-22; the tag
+  waits for its own commit's green run.
 
-- [ ] CI is green from a clean checkout on every supported architecture.
+- [x] CI is green from a clean checkout on every supported architecture. Green on
+  c928d31, 2026-11-22.
 
-- [ ] MQTT 3.1.1 and 5.0 conformance baselines have no unexplained regression.
+- [x] MQTT 3.1.1 and 5.0 conformance baselines have no unexplained regression. Green on
+  c928d31, 2026-11-22.
 
-- [ ] The scratch image and Helm chart install successfully in a clean cluster.
+- [x] The scratch image and Helm chart install successfully in a clean cluster. Green on
+  c928d31 (helm install, amd64 and arm64), 2026-11-22.
 
 - [x] TLS rollover, WebSocket, authentication, authorization, migration, backup,
   restore, upgrade, rollback, and shutdown procedures are documented and tested.

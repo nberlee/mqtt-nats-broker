@@ -137,6 +137,9 @@ jobs:
           sha256sum "$out" > "$out.sha256"
       - uses: softprops/action-gh-release@v3
         with:
+          # A version with a pre-release part (v0.1.0-alpha.1) is published as a GitHub
+          # pre-release, as the images leave `latest` to releases without one.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             mqtt-nats-broker_*
 
