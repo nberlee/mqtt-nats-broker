@@ -643,7 +643,9 @@ limits:
   - **A serving generation's storage is still unbounded.** Every transition's outcome,
     every acquisition's action record, every resource record, closure and certificate
     stays on `$MQTT.inflight.` until its generation retires
-    ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133));
+    ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)); a production
+    persistent QoS 1 subscriber accumulated about 180k such records a day
+    ([issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192));
     [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114)
     reclaims a live generation's exchanges and duties only.
   - **An obligation that never ends in a live generation is carried, not reclaimed**: a

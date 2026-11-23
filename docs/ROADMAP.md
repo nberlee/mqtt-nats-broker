@@ -975,6 +975,11 @@ store, R3) logged over five days on `780fd9d` and during its rollout to v0.1.0-a
 Ordered by severity. The evidence and the source reading are in each issue; none is
 reproduced yet.
 
+- [ ] A serving generation's transition outcomes and action records are reclaimed only by
+  its purge, so a long-lived persistent QoS 1 subscriber grows `$MQTT_sess` by about 180k
+  records a day toward an OOM of its stream leader
+  ([issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192)).
+
 - [x] A frozen batch whose shared directory or registry shard moved is recomposed rather than
   re-sent, after resolving an earlier commit, within a shared-shard allowance; an indeterminate
   claim is the stated reconnect residual. Done 2026-11-22
