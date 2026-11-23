@@ -830,6 +830,12 @@ func (s *Server) mqttHandleClosedClient(c *client) {
 				asm.addSession(sess, true)
 				c.Warnf("MQTT: clean-session discard of %q deferred until its incarnation drains", sess.id)
 			case errors.Is(err, errMQTTClearRefusedUnresolved) && s.reparkRefusedDiscard(asm, sess, time.Now().Unix()):
+			case errors.Is(err, errMQTTTeardownClaimUnresolved):
+				// The claim ran on an object already re-minted for it, so there is nothing to park:
+				// the stated residual (docs/CONFORMANCE.md), named so an operator can act on it.
+				c.Errorf("MQTT: clean-session discard of %q could not establish its teardown claim; "+
+					"cleanup may remain pending, and an unmarked expiry-zero record is reclaimed only by "+
+					"a later CONNECT on this client ID: %v", sess.id, err)
 			default:
 				c.Errorf("%s", err.Error())
 			}

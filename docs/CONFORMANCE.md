@@ -4073,6 +4073,17 @@ Residuals:
     consumers: nothing reaps it autonomously (the retry pass needs residency, the expiry
     sweep skips `ExpiryInterval == 0`, and the consumer sweep reads the record's consumers
     as referenced), so only a later CONNECT on the same client ID discards it.
+  - **A clean close whose teardown claim ends Indeterminate reaches the same state**
+    ([issue #186](https://github.com/nberlee/mqtt-nats-broker/issues/186)): a store read
+    failed, the claim's outcome could not be established, or contention outlasted the claim's
+    shared-shard allowance and then its counted budget. Nothing is deleted, and the session
+    object was already re-minted for the claim, so nothing parks the discard. If no claim
+    committed, the expiry-0 record stands unmarked with its authority SERVING and its
+    consumers, and only a later CONNECT on the same client ID discards it; if one did commit
+    (its acknowledgement lost and the re-read failed), the record is marked and the orphan
+    sweep finishes it. The close logs `could not establish its teardown claim` naming the
+    client ID. A directory shard moved by another client's closing or a recovery pass no
+    longer leads here: the claim recomposes.
   - **The same crash can lose that close's WILL, because the recovery runs BEFORE the Will
     is published.** The refusal deliberately keeps the Will out of the parked action, so
     the close publishes it by falling through to `mqttHandleWill`, after the recovery has

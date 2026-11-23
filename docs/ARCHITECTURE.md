@@ -950,7 +950,13 @@ to which 2.15.1 added `n.scaleUp` (see the v2.15.0 → v2.15.1 audit above); `de
   than lineage. A rejection is reported structurally (`JSStreamWrongLastSequenceErrF`
   10071, or 10164 under clustered inflight contention). 10164 means *transient
   contention*, not "the subject moved", so every rejection is resolved by re-reading
-  rather than classified directly.
+  rather than classified directly. Inside an atomic batch the per-subject check
+  (`checkMsgHeadersPreClusteredProposal`, `server/jetstream_batching.go:765-813`, run on
+  both the clustered and the standalone path) answers **10164** while another proposal for
+  that subject is in process and **10071**, carrying the stored sequence, once the stored
+  sequence differs from the expectation. So a member on a subject other clients write can
+  refuse a batch with either code, and only a re-read of that subject says whether the
+  frozen batch can still land (see "A frozen batch against a moved shared shard").
 - **A stream purge takes a subject filter and a sequence CUTOFF together**
   (`JSApiStreamPurgeRequest`). `Sequence` means "purge up to but **not including** this
   sequence" and combines with `Subject`, so one request can remove a subject's records at
@@ -10012,11 +10018,42 @@ CONNECT's bind can no longer win, so it refuses before CONNACK.
 
 **Resolving a failed acceptance** (`resolveAcceptance`, `internal/mqtt/accept_drive.go`)
 uses the batch's own atomicity: an acceptance landed iff the authority names its nonce.
-Same-subject contention (10164) decided nothing, so the SAME frozen batch is re-sent
-within the CONNECT's create-retry allowance; an authority past the frozen expectation means
-the batch can never land, so it is recomposed against what stands (`mqttAcceptAttempts`
-bounds the compositions); an authority still as frozen with the batch refused means the
-record moved, and the CONNECT reads it again (`errMQTTAcceptRecordMoved`). A creation
+Same-subject contention (10164) decided nothing, so unless a shared shard the batch
+expects has moved, the SAME frozen batch is re-sent within the CONNECT's create-retry
+allowance, after the authority-contention backoff; an authority past the frozen expectation
+means the batch can never land, so it is recomposed against what stands (the announcement's
+derived budget bounds the compositions); so does a moved shared shard (below), after the
+authority is read once more; an authority and shared shards still as frozen with the batch
+refused by a record CAS means the record moved, and the CONNECT reads it again
+(`errMQTTAcceptRecordMoved`).
+
+**A frozen batch against a moved shared shard** (`internal/mqtt/frozen_shared_members.go`,
+[issue #186](https://github.com/nberlee/mqtt-nats-broker/issues/186)). Two batch families
+carry a member on a subject other clients write: every closing batch (the teardown claim,
+the Clean Start handoff) carries its directory shard, whose header every closing in the shard
+and every broker's recovery pass move, and a creation carries its lifecycle registry shard,
+which every creation and lifecycle retirement in the shard moves. Neither subject is ever
+deleted or purged (no purge filter matches a `shard.<n>` or `registry.<n>` token), so a moved
+shard never returns to the expectation and a frozen batch expecting it can never land. Each
+resolver therefore re-reads those members after a refusal, and the rules are:
+
+- **Movement proves the future, not the past.** From the shared read on, the frozen batch
+  cannot commit; an earlier ambiguous send may have committed before it. So the batch's
+  landed witness is read AFTER the shared read (the record's marker nonce for the claim, the
+  authority's acceptance nonce for an acceptance): ours is landed and adopted; a readable
+  answer that is not ours recomposes from fresh reads; an unreadable one licenses nothing
+  (the claim is Indeterminate, the CONNECT refuses).
+- **A refusal that moved nothing is re-sent frozen**, after the authority-contention backoff,
+  because recomposing an acceptance mints a new nonce that could meet its own landed
+  predecessor.
+- **Shared movement is another client's write**, which the announcement's derived budget
+  does not count. While a shared-shard allowance of one JetStream API request's time stands
+  (one per claim; one per CONNECT, kept on its ownership budget so no re-drive replenishes
+  it), a recomposition it forces spends no counted attempt; once spent, it counts, so every
+  loop ends. The CONNECT's ownership deadline is still checked before every recomposition.
+
+The session record is not a shared member: ordinary persistence writes it alone, and both
+resolvers keep their own record re-read for it. A creation
 carries an outcome too, for the same resolution, and is never aborted. Fork repair's fence
 is kept: the acceptance must displace exactly the authority fork repair read its consumers
 under (see "Repairing a recognised fork").
@@ -10075,12 +10112,15 @@ marked. The claim requires an authority serving exactly this generation under th
 retirement's ownership; one serving another generation, or already closed, means another
 teardown or acceptance owns the record (superseded), and an absent one is Inconsistent.
 A rejection is resolved by re-reading both the record and the authority, never from the
-error: our marker on the record is landed; the record at our base with the authority as
-frozen is contention or our own batch in process, and the same frozen batch is re-sent;
-the record at our base with the authority past it means the frozen batch can never land,
-so it is recomposed ONCE against the fresh authority, which must still serve this
-generation under the same ownership; the record past our base without our marker is a
-supersession, and nothing is deleted.
+error: our marker on the record is landed; the record at our base with the authority and
+the directory shard as frozen is contention or our own batch in process, and the same
+frozen batch is re-sent after the authority-contention backoff; the directory shard moved
+under it (below) means the frozen batch can never land, so the record is read once more
+and, still unmarked at our base, the claim is recomposed against the same authority; the
+record at our base with the authority past it means the same, so it is recomposed ONCE
+against the fresh authority, which must still serve this generation under the same
+ownership; the record past our base without our marker is a supersession, and nothing is
+deleted.
 
 A Clean Start makes its predecessor noncurrent in the handoff batch instead, with a
 `handoff-discard` entry: the successor's record replaced the predecessor's, so there is no
@@ -10935,8 +10975,10 @@ too. A blind loop would be wrong for them: a re-sent acceptance whose first send
 would be refused by the very state it created. So each failed send is resolved by
 re-reading the authority (see "An acceptance is one batch"): an acceptance whose nonce the
 authority names, or a bind whose outcome landed, HAPPENED; a frozen batch whose authority
-expectation went stale can never land and is recomposed against what stands;
-same-subject contention re-sends the same frozen batch. Re-sends and recompositions draw
+expectation went stale, or one expecting a shared shard that moved (see "A frozen batch
+against a moved shared shard"), can never land and is recomposed against what stands;
+same-subject contention with nothing shared moved re-sends the same frozen batch after the
+authority-contention backoff. Re-sends and recompositions draw
 on the CONNECT's allowances (the create-retry allowance for 10164, and
 `mqttOwnershipStepReattempts`, 4, for the rest), constructed above the `restoreSession`
 label so no re-drive replenishes them, and on the absolute ownership deadline; the

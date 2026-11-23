@@ -111,8 +111,7 @@ const (
 	// restore and dispose nothing. Deliberately unequal to the cycle cap: with the two
 	// equal, a shared counter stops after the same number of attempts as two separate
 	// ones and the mutation that merges them cannot be killed by any test.
-	mqttRecordCreateRetries   = 5
-	mqttRecordCreateRetryWait = 100 * time.Millisecond
+	mqttRecordCreateRetries = 5
 	// mqttRecordReDriveDeadline is an ADMISSION bound, not a ceiling: no new top-level
 	// re-drive cycle and no new accept-save retry is admitted after it, but an attempt
 	// already in progress runs to mqttJSA.timeout, and the nested retry loops inside

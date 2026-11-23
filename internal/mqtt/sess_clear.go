@@ -116,6 +116,14 @@ func (sess *mqttSession) clear(noWait bool) error {
 // per issue #40 unit 1 §3.7.
 var errMQTTClearDrainTimeout = errors.New("incarnation did not drain before the discard ceiling")
 
+// errMQTTTeardownClaimUnresolved reports that a discard could not establish its teardown claim: a
+// store read failed, the claim's outcome could not be established, or contention outlasted its
+// allowances. Nothing was deleted. The object was already re-minted for the claim, so nothing can
+// re-park it: if no claim committed, the record stands unmarked, and an expiry-0 one is reclaimed
+// only by a later CONNECT on its client ID (docs/CONFORMANCE.md); a claim that did commit left a
+// marker the orphan sweep finishes.
+var errMQTTTeardownClaimUnresolved = errors.New("the teardown claim could not be established")
+
 // mqttExpiryRetryAfterRetiring is how soon a session-expiry fire re-arms when it
 // meets an incarnation that is retiring: short, because the retirement either
 // completes (and the expiry is moot) or reopens (and the deadline is still owed),
@@ -618,7 +626,7 @@ func (p *mqttPreparedClear) destroyReleasing(permit mqttRetirementPermit, noWait
 	case mqttTeardownClaimSuperseded:
 		return fmt.Errorf("discarding session %q: %w", id, errMQTTClearSuperseded)
 	default:
-		return err
+		return fmt.Errorf("%w: %w", errMQTTTeardownClaimUnresolved, err)
 	}
 
 	{

@@ -75,6 +75,22 @@ type mqttOwnershipBudget struct {
 	// tally, when set, counts the requests of every view the budget hands out (deadlineView): the
 	// CONNECT's slow-CONNECT line reports them per step (connect_timeline.go).
 	tally *mqttRequestTally
+	// shared is the CONNECT's one shared-shard allowance (frozen_shared_members.go), started at the
+	// first shared-shard movement it meets and kept here so a re-drive, which keeps this budget,
+	// never replenishes it.
+	shared *mqttSharedShardAllowance
+}
+
+// sharedShardAllowance returns the CONNECT's shared-shard allowance, starting it on first use. A
+// nil budget has none, and absorbs nothing.
+func (b *mqttOwnershipBudget) sharedShardAllowance() *mqttSharedShardAllowance {
+	if b == nil {
+		return nil
+	}
+	if b.shared == nil {
+		b.shared = newMqttSharedShardAllowance()
+	}
+	return b.shared
 }
 
 // deadlineView is jsa capped at the budget's deadline and counted in its tally. A nil budget caps

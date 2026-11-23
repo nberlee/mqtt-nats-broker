@@ -89,9 +89,15 @@ func (sess *mqttSession) acceptOwnership(tok recordTx, clientID, sessEpoch strin
 	// batch PROVEN never to land because the authority moved under it (resolveAcceptance's
 	// retry), which is contention, so it draws on the announcement's derived budget and the
 	// absolute deadline, never on stepAllow; a re-send of an unchanged batch charges stepAllow
-	// inside resolveAcceptance, and a moved record returns to the CONNECT's own cycle bound.
+	// inside resolveAcceptance, and a moved record returns to the CONNECT's own cycle bound. A
+	// recomposition forced by a moved SHARED shard is another client's write, which that derived
+	// budget does not count: it spends no attempt while the CONNECT's shared-shard allowance stands
+	// (one per CONNECT, kept on its ownership budget, so no re-drive replenishes it), and the
+	// deadline is still checked before it, because the check is keyed on a composition having been
+	// sent rather than on the attempt counter.
+	composed := false
 	for attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++ {
-		if attempt > 0 {
+		if composed {
 			if rerr := mqttOwnershipStepAllowed(budget, time.Now(), "acceptance recomposition"); rerr != nil {
 				return _EMPTY_, _EMPTY_, _EMPTY_, nil, rerr
 			}
@@ -149,6 +155,7 @@ func (sess *mqttSession) acceptOwnership(tok recordTx, clientID, sessEpoch strin
 		if ca.Anchor != nil {
 			ref = &mqttWillAnchorRef{L: ca.L, Ord: ca.Anchor.Ord}
 		}
+		composed = true
 		detail, serr := sess.saveAcceptShape(jsa, tok, clientID, sessEpoch, ca.T)
 		if serr == nil {
 			sess.kickRetirementAfterAcceptance(ca.T)
@@ -161,35 +168,81 @@ func (sess *mqttSession) acceptOwnership(tok recordTx, clientID, sessEpoch strin
 		case landed:
 			sess.kickRetirementAfterAcceptance(ca.T)
 			return ca.Gen, r.Tenure, r.Nonce, ref, nil
-		case !retry:
+		case retry == mqttAcceptNoRetry:
 			return _EMPTY_, _EMPTY_, _EMPTY_, nil, serr
+		case retry == mqttAcceptRecomposeShared:
+			if budget.sharedShardAllowance().absorbs() {
+				attempt--
+			}
+			sess.authorityContentionWait()
 		}
 	}
 	return _EMPTY_, _EMPTY_, _EMPTY_, nil, fmt.Errorf("the acceptance of %q did not land within %d compositions", id, fg.budget(mqttForegroundAcquireAttempts))
 }
 
+// mqttAcceptRetry is how a failed acceptance that did not land is to be retried.
+type mqttAcceptRetry uint8
+
+const (
+	// mqttAcceptNoRetry: landed, or refused with the error returned beside it.
+	mqttAcceptNoRetry mqttAcceptRetry = iota
+	// mqttAcceptRecompose: the authority moved past the frozen batch, which can never land.
+	mqttAcceptRecompose
+	// mqttAcceptRecomposeShared: a shared shard the batch expected (its lifecycle registry shard, or
+	// a Clean Start handoff's directory shard) moved under it, so it can never land. Another
+	// client's write, which the CONNECT's derived budget does not count (frozen_shared_members.go).
+	mqttAcceptRecomposeShared
+)
+
 // resolveAcceptance classifies a failed acceptance batch: landed (adopted here), proven never
 // to land (retry with a fresh composition), or an error the CONNECT refuses on.
 func (sess *mqttSession) resolveAcceptance(jsa *mqttJSA, detail mqttSessSaveDetail, nonce string,
-	retryOK, stepAllow func() error) (landed, retry bool, err error) {
+	retryOK, stepAllow func() error) (landed bool, retry mqttAcceptRetry, err error) {
 
 	t := detail.acceptShape
 	if t == nil {
-		return false, false, detail.rawErr
+		return false, mqttAcceptNoRetry, detail.rawErr
 	}
 	a := t.Attempt
+	// sharedMoved decides a refusal under a shared member that moved: the frozen batch cannot land
+	// after the shared read, but an earlier ambiguous send may have landed before it, so the
+	// authority is read AFTER it. Ours is landed; a readable other answer recomposes; an unreadable
+	// one refuses, because it does not prove the earlier send did not land.
+	sharedMoved := func() (handled, landed bool, retry mqttAcceptRetry, err error) {
+		moved, merr := jsa.sharedMembersMoved(t)
+		if merr != nil {
+			return true, false, mqttAcceptNoRetry, fmt.Errorf("the acceptance of %q is unresolved: %w", a.ID, merr)
+		}
+		if !moved {
+			return false, false, mqttAcceptNoRetry, nil
+		}
+		al := jsa.loadOutboundAuthority(a.ID, a.Epoch)
+		switch {
+		case al.status == mqttOutboundValid && al.rec != nil && al.rec.Life != nil && al.rec.Life.Accept.Nonce == nonce:
+			sess.adoptCommittedMetadata(detail, al.seq+1)
+			return true, true, mqttAcceptNoRetry, nil
+		case al.status != mqttOutboundValid && al.status != mqttOutboundAbsent:
+			return true, false, mqttAcceptNoRetry, fmt.Errorf("the acceptance of %q is unresolved: its authority reads %v", a.ID, al.status)
+		}
+		return true, false, mqttAcceptRecomposeShared, nil
+	}
 	for {
 		// SAME-SUBJECT CONTENTION (10164) DECIDED NOTHING: the batch is atomic and a rejected
-		// send stored no member, so the SAME frozen batch is re-sent within the CONNECT's
-		// create-retry allowance, never recomposed.
+		// send stored no member. Unless a shared member it expects has moved — then it can never
+		// land — the SAME frozen batch is re-sent within the CONNECT's create-retry allowance, after
+		// the contention backoff so the competing proposal can apply, never recomposed.
 		if mqttIsMetadataContention(detail.rawErr) {
-			if rerr := retryOK(); rerr != nil {
-				return false, false, rerr
+			if handled, ok, rt, serr := sharedMoved(); handled {
+				return ok, rt, serr
 			}
+			if rerr := retryOK(); rerr != nil {
+				return false, mqttAcceptNoRetry, rerr
+			}
+			sess.authorityContentionWait()
 			authSeq, cerr := jsa.commitAuthorityTransition(t)
 			if cerr == nil {
 				sess.adoptCommittedMetadata(detail, authSeq+1)
-				return true, false, nil
+				return true, mqttAcceptNoRetry, nil
 			}
 			detail.rawErr = cerr
 			continue
@@ -199,32 +252,39 @@ func (sess *mqttSession) resolveAcceptance(jsa *mqttJSA, detail mqttSessSaveDeta
 		case al.status == mqttOutboundValid && al.rec != nil && al.rec.Life != nil && al.rec.Life.Accept.Nonce == nonce:
 			// LANDED. The record is the batch's last member, right after the authority.
 			sess.adoptCommittedMetadata(detail, al.seq+1)
-			return true, false, nil
+			return true, mqttAcceptNoRetry, nil
 		case al.status != mqttOutboundValid && al.status != mqttOutboundAbsent:
-			return false, false, fmt.Errorf("the acceptance of %q is unresolved: its authority reads %v", a.ID, al.status)
+			return false, mqttAcceptNoRetry, fmt.Errorf("the acceptance of %q is unresolved: its authority reads %v", a.ID, al.status)
 		}
 		stale := (t.Prev == nil) != (al.status == mqttOutboundAbsent) || (t.Prev != nil && al.seq != t.PrevSeq)
 		if stale {
 			// The frozen batch expects an authority that no longer stands, so it can never land.
 			// If its record CAS was what refused it, the record moved too.
 			if ce := jsAPIError(detail.rawErr); ce != nil && mqttIsRecordCASRejection(ce) && sess.recordMovedFrom(jsa, detail) {
-				return false, false, errMQTTAcceptRecordMoved
+				return false, mqttAcceptNoRetry, errMQTTAcceptRecordMoved
 			}
-			return false, true, nil
+			return false, mqttAcceptRecompose, nil
+		}
+		// The authority stands as frozen. A shared member that moved is decided before the record:
+		// a CAS rejection means the record moved only when nothing shared did.
+		if handled, ok, rt, serr := sharedMoved(); handled {
+			return ok, rt, serr
 		}
 		if ce := jsAPIError(detail.rawErr); ce != nil && mqttIsRecordCASRejection(ce) {
-			// The authority stands as frozen and the batch was refused: the record moved.
-			return false, false, errMQTTAcceptRecordMoved
+			// The authority and the shared members stand as frozen and the batch was refused: the
+			// record moved.
+			return false, mqttAcceptNoRetry, errMQTTAcceptRecordMoved
 		}
 		// The authority stands as frozen and the outcome is unknown: re-send the SAME batch,
 		// which lands or is refused, and decide again.
 		if rerr := stepAllow(); rerr != nil {
-			return false, false, rerr
+			return false, mqttAcceptNoRetry, rerr
 		}
+		sess.authorityContentionWait()
 		authSeq, cerr := jsa.commitAuthorityTransition(t)
 		if cerr == nil {
 			sess.adoptCommittedMetadata(detail, authSeq+1)
-			return true, false, nil
+			return true, mqttAcceptNoRetry, nil
 		}
 		detail.rawErr = cerr
 	}

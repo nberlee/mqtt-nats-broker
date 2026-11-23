@@ -975,9 +975,9 @@ store, R3) logged over five days on `780fd9d` and during its rollout to v0.1.0-a
 Ordered by severity. The evidence and the source reading are in each issue; none is
 reproduced yet.
 
-- [ ] A teardown claim resends its frozen batch after a cross-client directory-shard move,
-  and the failed discard strands the session's record, authority and consumers; a creation
-  resends against a moved registry shard the same way
+- [x] A frozen batch whose shared directory or registry shard moved is recomposed rather than
+  re-sent, after resolving an earlier commit, within a shared-shard allowance; an indeterminate
+  claim is the stated reconnect residual. Done 2026-11-22
   ([issue #186](https://github.com/nberlee/mqtt-nats-broker/issues/186)).
 
 - [ ] A JetStream timeout creating a subscription's consumer refuses the filter with

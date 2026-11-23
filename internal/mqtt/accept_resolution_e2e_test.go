@@ -49,17 +49,18 @@ func testComposeCreation(t *testing.T, e *testOutboundEnv, id, txn string) *mqtt
 // lands. Current: a lost acknowledgement of a landed creation is adopted with no second write.
 // NotCurrent: a competing creator took the client, so the frozen batch can never land and the
 // CONNECT recomposes against what stands. Gone: the authority it expected is absent but the
-// registry it CASed moved, so every re-send is refused and the CONNECT is refused with nothing
-// landed. Unreadable: no replay, the CONNECT refuses.
+// registry it CASed moved, so the frozen batch can never land: the resolver asks for a shared-shard
+// recomposition (issue #186), and that composition refuses the registry naming a lifecycle with no
+// authority, with nothing landed. Unreadable: no replay, the CONNECT refuses.
 //
-// (The plan's resolver read the registry for NotCurrent, Gone and Inconsistent; the implemented
-// one reads the authority alone and lets the registry CAS refuse a resend, DECISIONS.md step 6.)
+// (#133's resolver read the authority alone and let the registry CAS refuse every re-send; issue
+// #186 reads the shared shards too, because a peer's creation in the same registry shard moves it.)
 func TestACreationIsResolvedFromWhatItInstalls(t *testing.T) {
 	e, done := testNewEnv(t, "creation-resolution")
 	defer done()
 	lost := errors.New("test: the acknowledgement was lost")
 	allow := func() error { return nil }
-	resolve := func(id string, tr *mqttAuthorityTransition, step func() error) (bool, bool, error) {
+	resolve := func(id string, tr *mqttAuthorityTransition, step func() error) (bool, mqttAcceptRetry, error) {
 		sess, _, err := e.asm.createOrRestoreSession(id, e.asm.server().getOpts())
 		if err != nil {
 			t.Fatalf("a session object for %q: %v", id, err)
@@ -70,7 +71,7 @@ func TestACreationIsResolvedFromWhatItInstalls(t *testing.T) {
 
 	// UNLANDED SO FAR, then CURRENT.
 	a := testComposeCreation(t, e, "res-unlanded", "txn-a")
-	if landed, retry, err := resolve("res-unlanded", a, allow); !landed || retry || err != nil {
+	if landed, retry, err := resolve("res-unlanded", a, allow); !landed || retry != mqttAcceptNoRetry || err != nil {
 		t.Fatalf("an unlanded creation resolved landed=%v retry=%v err=%v, want the re-send landed", landed, retry, err)
 	}
 	before := e.asm.jsa.loadOutboundAuthority("res-unlanded", e.epoch)
@@ -90,7 +91,7 @@ func TestACreationIsResolvedFromWhatItInstalls(t *testing.T) {
 	if _, err := e.asm.jsa.commitAuthorityTransition(rival); err != nil {
 		t.Fatalf("the rival creation: %v", err)
 	}
-	if landed, retry, err := resolve("res-competed", frozen, allow); landed || !retry || err != nil {
+	if landed, retry, err := resolve("res-competed", frozen, allow); landed || retry != mqttAcceptRecompose || err != nil {
 		t.Fatalf("a creation beaten by a rival resolved landed=%v retry=%v err=%v, want a fresh composition", landed, retry, err)
 	}
 
@@ -112,8 +113,19 @@ func TestACreationIsResolvedFromWhatItInstalls(t *testing.T) {
 		}
 		return nil
 	}
-	if landed, _, err := resolve("res-gone", gone, budget); landed || err == nil {
-		t.Fatalf("a creation over a retired client resolved landed=%v err=%v, want refused with nothing landed", landed, err)
+	if landed, retry, err := resolve("res-gone", gone, budget); landed || retry != mqttAcceptRecomposeShared || err != nil {
+		t.Fatalf("a creation whose registry moved resolved landed=%v retry=%v err=%v, want a shared-shard recomposition", landed, retry, err)
+	}
+	if steps != 0 {
+		t.Fatalf("a creation whose registry moved spent %d re-send(s): a moved shard is never re-sent against", steps)
+	}
+	// The recomposition the resolver asked for is refused by the composition, with nothing landed.
+	reg := e.asm.jsa.loadLifecycleRegistryShard(e.epoch, mqttLifecycleRegistryShardFor(getHash("res-gone")))
+	if _, cerr := e.asm.jsa.composeAcceptance(mqttAcceptRequest{
+		ID: "res-gone", Epoch: e.epoch, Txn: "txn-gone-2", Tenure: "tenure-gone-2", Nonce: "intent-gone-2",
+		At: time.Now().UnixNano(),
+	}, e.asm.jsa.loadOutboundAuthority("res-gone", e.epoch), reg); cerr == nil {
+		t.Fatal("the recomposition over a registry naming a lifecycle with no authority was composed, want refused")
 	}
 	if al := e.asm.jsa.loadOutboundAuthority("res-gone", e.epoch); al.status != mqttOutboundAbsent {
 		t.Fatalf("a refused re-send left an authority (%v)", al.status)
@@ -124,7 +136,7 @@ func TestACreationIsResolvedFromWhatItInstalls(t *testing.T) {
 	if _, err := e.asm.jsa.storeMsg(mqttOutboundAuthoritySubject(getHash("res-unreadable")), 0, []byte(`{"id":`)); err != nil {
 		t.Fatalf("planting an unreadable authority: %v", err)
 	}
-	if landed, retry, err := resolve("res-unreadable", bad, allow); landed || retry || err == nil {
+	if landed, retry, err := resolve("res-unreadable", bad, allow); landed || retry != mqttAcceptNoRetry || err == nil {
 		t.Fatalf("a creation over an unreadable authority resolved landed=%v retry=%v err=%v, want unresolved", landed, retry, err)
 	}
 }

@@ -198,12 +198,16 @@ func (c mqttTeardownClaim) String() string {
 //
 // Every rejection is resolved by RE-READING both the record and the authority, never classified
 // from the error (isQoS2CASRejection): our marker on the record is Landed; the record at our base
-// with the authority at ours is contention or our own batch in process, so the same frozen batch
-// is re-sent; the record at our base with the authority past ours means the frozen batch can
-// never land, so it is recomposed ONCE against the fresh authority, which must still serve this
-// generation under the same ownership; the record past our base without our marker is the
-// existing supersession; anything unreadable is Indeterminate. Re-sends and the recomposition
-// share the claim's bounded allowance.
+// with the authority at ours and the directory shard where the batch expected it is contention or
+// our own batch in process, so the same frozen batch is re-sent after the contention backoff; the
+// shard moved under it (another client's closing, a recovery pass) means the frozen batch can never
+// land, so once the record is read again and still shows no marker of ours it is recomposed
+// against the same authority (frozen_shared_members.go); the record at our base with the authority
+// past ours means the same, so it is recomposed ONCE against the fresh authority, which must still
+// serve this generation under the same ownership; the record past our base without our marker is
+// the existing supersession; anything unreadable is Indeterminate. Re-sends and recompositions
+// share the claim's bounded allowance, except that a shard-forced recomposition spends none while
+// the shared-shard allowance stands.
 //
 // ps must be the record content as it stands, so the marker preserves it: any broker must be able
 // to finish this teardown, and the orphan sweep must keep reading the durables it names.
@@ -291,6 +295,42 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 				fmt.Errorf("unable to recompose the teardown claim of session %q: %w", ps.ID, cerr)
 		}
 	}
+	// THE RECORD DECIDES FIRST: our marker on it is a landed batch whatever else moved; the record
+	// past our base or under another marker is a supersession; anything unreadable is Indeterminate.
+	// done is false only for a record still at our base with no marker of ours.
+	readRecord := func() (done bool, markerSeq uint64, outcome mqttTeardownClaim, err error) {
+		smsg, lerr := sess.jsa.loadSessionMsg(sess.domainTk, sess.idHash)
+		if lerr != nil {
+			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
+				return true, 0, mqttTeardownClaimIndeterminate,
+					fmt.Errorf("unable to resolve the teardown claim of session %q: %w", ps.ID, lerr)
+			}
+			// The record is gone, so this session was already released — by what, an absence
+			// cannot say. There is nothing to claim and nothing to delete on its behalf.
+			return true, 0, mqttTeardownClaimSuperseded, nil
+		}
+		cur := &mqttPersistedSession{}
+		if uerr := json.Unmarshal(smsg.Data, cur); uerr != nil {
+			return true, 0, mqttTeardownClaimIndeterminate,
+				fmt.Errorf("unable to parse the session record of %q while resolving its teardown claim: %w", ps.ID, uerr)
+		}
+		switch {
+		case cur.Teardown != nil && cur.Teardown.Nonce == nonce:
+			// Our batch landed; only the response was lost. The batch is atomic, so the
+			// authority carries our entry with it.
+			return true, smsg.Sequence, mqttTeardownClaimWon, nil
+		case cur.Teardown != nil, smsg.Sequence != seq:
+			// The record moved past our base, or another teardown's marker holds it. Whoever wrote
+			// it — or the next reader that can interpret it — finishes it; we delete nothing.
+			return true, 0, mqttTeardownClaimSuperseded, nil
+		}
+		return false, 0, 0, nil
+	}
+	// SHARED-SHARD MOVEMENT IS ANOTHER CLIENT'S WRITE (issue #186): the directory shard this batch
+	// allocates in is moved by every closing in the shard and every broker's recovery pass, which
+	// the derived budget does not count. While this allowance stands a recomposition it forces
+	// spends no attempt; once it is spent, it counts like any other.
+	shared := newMqttSharedShardAllowance()
 	var lastErr error
 	for attempt := 0; attempt < fg.budget(mqttForegroundAcquireAttempts); attempt++ {
 		mqttTeardownClaimPoint(ps.ID, "before-send")
@@ -301,30 +341,8 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 		}
 		lastErr = err
 
-		smsg, lerr := sess.jsa.loadSessionMsg(sess.domainTk, sess.idHash)
-		if lerr != nil {
-			if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
-				return 0, nonce, mqttTeardownClaimIndeterminate,
-					fmt.Errorf("unable to resolve the teardown claim of session %q: %w", ps.ID, lerr)
-			}
-			// The record is gone, so this session was already released — by what, an absence
-			// cannot say. There is nothing to claim and nothing to delete on its behalf.
-			return 0, nonce, mqttTeardownClaimSuperseded, nil
-		}
-		cur := &mqttPersistedSession{}
-		if uerr := json.Unmarshal(smsg.Data, cur); uerr != nil {
-			return 0, nonce, mqttTeardownClaimIndeterminate,
-				fmt.Errorf("unable to parse the session record of %q while resolving its teardown claim: %w", ps.ID, uerr)
-		}
-		switch {
-		case cur.Teardown != nil && cur.Teardown.Nonce == nonce:
-			// Our batch landed; only the response was lost. The batch is atomic, so the
-			// authority carries our entry with it.
-			return smsg.Sequence, nonce, mqttTeardownClaimWon, nil
-		case cur.Teardown != nil, smsg.Sequence != seq:
-			// The record moved past our base, or another teardown's marker holds it. Whoever wrote
-			// it — or the next reader that can interpret it — finishes it; we delete nothing.
-			return 0, nonce, mqttTeardownClaimSuperseded, nil
+		if done, mseq, oc, rerr := readRecord(); done {
+			return mseq, nonce, oc, rerr
 		}
 		// The record is still at our base: the authority decides.
 		fresh := sess.jsa.loadOutboundAuthority(ps.ID, sess.asm.sessStreamEpoch)
@@ -333,7 +351,35 @@ func (sess *mqttSession) claimTeardown(tok recordTx, ps *mqttPersistedSession, s
 			return 0, nonce, mqttTeardownClaimIndeterminate,
 				fmt.Errorf("unable to resolve the teardown claim of session %q: its authority reads %v", ps.ID, fresh.status)
 		case fresh.seq == t.PrevSeq:
-			// Contention, or our own batch still in process: the same frozen batch.
+			// The authority stands as frozen: did a shared member move under the batch?
+			moved, merr := sess.jsa.sharedMembersMoved(t)
+			if merr != nil {
+				return 0, nonce, mqttTeardownClaimIndeterminate,
+					fmt.Errorf("unable to resolve the teardown claim of session %q: %w", ps.ID, merr)
+			}
+			if !moved {
+				// Contention, or our own batch still in process: the same frozen batch, after the
+				// contention backoff so the competing proposal can apply.
+				sess.authorityContentionWait()
+				continue
+			}
+			// MOVEMENT PROVES THE FUTURE, NOT THE PAST. From the shared read on, the frozen batch can
+			// never land; an earlier ambiguous send may have landed before it, so the record is read
+			// again before the batch is abandoned.
+			if done, mseq, oc, rerr := readRecord(); done {
+				return mseq, nonce, oc, rerr
+			}
+			if shared.absorbs() {
+				attempt--
+			}
+			sess.authorityContentionWait()
+			// Recompose against the SAME authority, under a new transition: the closing members are
+			// read afresh, so the root takes the moved header's next ordinal.
+			req.Txn = mqttNewInflightNonce()
+			if t, cerr = sess.jsa.composeTeardownClaim(req); cerr != nil {
+				return 0, nonce, mqttTeardownClaimIndeterminate,
+					fmt.Errorf("unable to recompose the teardown claim of session %q: %w", ps.ID, cerr)
+			}
 			continue
 		case fresh.rec.State != mqttAuthorityServing || fresh.rec.Gen != ret.Gen ||
 			fresh.rec.Tenure != ret.Tenure || fresh.rec.OwnerTxn != ret.OwnerTxn:
