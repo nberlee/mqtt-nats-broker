@@ -985,9 +985,10 @@ reproduced yet.
   claim is the stated reconnect residual. Done 2026-11-22
   ([issue #186](https://github.com/nberlee/mqtt-nats-broker/issues/186)).
 
-- [ ] A JetStream timeout creating a subscription's consumer refuses the filter with
-  SUBACK 0x80 on an open connection and nothing retries, so a client that does not retry
-  stays deaf on it ([issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187)).
+- [x] A SUBSCRIBE filter refused while JetStream did not answer closes the connection after
+  the packet's own outcome (v5 DISCONNECT 0x89), classified by the account assistant's
+  unanswered-request sequence per filter, with the over-attribution stated. Done 2026-11-24
+  ([issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187)).
 
 - [ ] Fourteen clients on one pod disposed with 0x89 within 26 s, with nothing logged:
   decide whether the session records' absence was real or the store misreported it

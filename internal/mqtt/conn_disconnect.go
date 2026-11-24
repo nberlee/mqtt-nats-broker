@@ -296,6 +296,10 @@ func mqttDisconnectReasonFromErr(err error) byte {
 		// 0x8E: a takeover nobody proved must not be announced as one. See
 		// sess_rejected_write.go.
 		return mqttReasonServerBusy
+	case errors.Is(err, errMQTTSubscribeJetStreamUnanswered):
+		// JetStream did not answer a filter's provisioning: "try again later". See
+		// sub_jetstream_unanswered.go.
+		return mqttReasonServerBusy
 	}
 	return mqttReasonUnspecifiedError
 }

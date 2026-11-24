@@ -709,6 +709,9 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 			continue
 		}
 
+		// This filter's unanswered window opens here, before its first JetStream work. See
+		// sub_jetstream_unanswered.go.
+		window := sess.jsa.unansweredMark()
 		if f.qos == 2 {
 			err := sess.ensurePubRelConsumerSubscription(c)
 			if err == nil {
@@ -718,6 +721,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				c.Errorf("failed to initialize PUBREL processing: %v", err)
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
+				facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 				continue
 			}
 			// A SHARED QoS 2 subscription additionally needs this session's affine
@@ -753,6 +757,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 					c.Errorf("failed to initialize session-affine QoS 2 delivery: %v", err)
 					f.qos = mqttSubAckFailure
 					f.reasonStr = err.Error()
+					facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 					continue
 				}
 			}
@@ -979,6 +984,10 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		if f.qos >= mqttSubAckFailure {
 			continue
 		}
+		// This filter's unanswered window for the second pass: a fresh mark, so neither the first
+		// pass, the retained preload between the two, nor an earlier filter classifies a refusal
+		// below. See sub_jetstream_unanswered.go.
+		window := sess.jsa.unansweredMark()
 		subject := f.filter
 		bsubject := []byte(subject)
 		sid := f.sessionKey()
@@ -1039,6 +1048,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				if aerr != nil {
 					f.qos = mqttSubAckFailure
 					f.reasonStr = aerr.Error()
+					facts.noteRefusal(f, aerr, sess.jsa.unansweredSince(window))
 					if acquired != nil {
 						// Something LANDED and the filter still fails: the acquisition is owed a
 						// release verdict, written and executed by the same compensation a
@@ -1093,6 +1103,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				}
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
+				facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 				// update() mutated the in-memory maps before its save failed; revert
 				// them so a later save in this packet cannot persist a phantom
 				// membership. Spec5 [4.8.2].
@@ -1200,6 +1211,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
+			facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 			cancelFilterDeferred()
 			doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorM, priorRap, priorSubID)
 			if rbCAS {
@@ -1251,6 +1263,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		if err != nil {
 			f.qos = mqttSubAckFailure
 			f.reasonStr = err.Error()
+			facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 			cancelFilterDeferred()
 			doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorM, priorRap, priorSubID)
 			if rbCAS {
@@ -1298,6 +1311,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
+				facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 				cancelFilterDeferred()
 				doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorM, priorRap, priorSubID)
 				if rbCAS {
@@ -1346,6 +1360,7 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 				// c.processSub already called c.Errorf(), so no need here.
 				f.qos = mqttSubAckFailure
 				f.reasonStr = err.Error()
+				facts.noteRefusal(f, err, sess.jsa.unansweredSince(window))
 				cancelFilterDeferred()
 				doCleanup, rbCAS, rerr := sess.rollbackSharedSub(c, tok, f, fromSubProto, priorExisted, priorM, priorRap, priorSubID)
 				if rbCAS {
@@ -1614,6 +1629,14 @@ func (as *mqttAccountSessionManager) processSubs(sess *mqttSession, c *client, t
 		}
 	}
 
+	// A filter JetStream did not answer turns the SUBACK into a close [MQTT-4.8.0-2] — only
+	// here, after the packet's own outcome is settled and its success tail has run, and never
+	// over an error the packet already returns. The restore refuses the CONNECT on its own. See
+	// sub_jetstream_unanswered.go.
+	if fromSubProto && err == nil && facts.jsUnanswered != nil {
+		c.Warnf("MQTT: closing the connection of %q: %v", sess.id, facts.jsUnanswered.packetError())
+		err = facts.jsUnanswered.packetError()
+	}
 	return subs, facts, err
 }
 func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFilter, error) {
@@ -1879,6 +1902,9 @@ func (c *client) mqttProcessSubs(filters []*mqttFilter) (subs []*subscription, a
 
 	var facts mqttSubPacketFacts
 	subs, facts, err = asm.processSubs(sess, c, tok, filters, true, trace, nil)
+	if h := mqttTestSubPacketFactsHookV.Load(); h != nil {
+		(*h)(facts, err)
+	}
 	if err != nil {
 		// The packet already failed and its own error is what closes the connection. It
 		// owes no ownership proof, and the gate stays WITHHELD so nothing it installed

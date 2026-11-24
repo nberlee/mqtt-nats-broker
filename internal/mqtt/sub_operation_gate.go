@@ -164,6 +164,11 @@ type mqttSubPacketFacts struct {
 	// subscriptions would deliver and acknowledge under a membership this broker can no
 	// longer speak for.
 	recordCASRejected bool
+	// jsUnanswered is the first filter of this packet refused while JetStream was not
+	// answering, with the refusal that qualified it; nil when there was none. It never changes
+	// a filter's own disposition: it turns the packet's SUBACK into a close once the packet's
+	// own outcome is settled. See sub_jetstream_unanswered.go.
+	jsUnanswered *mqttUnansweredRefusal
 }
 
 // ownershipQuestionRaised reports whether this packet must prove it still owns the

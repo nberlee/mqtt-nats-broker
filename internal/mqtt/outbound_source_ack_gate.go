@@ -286,6 +286,8 @@ func (p *mqttPreparedAck) wait() error {
 		return ErrServerNotRunning
 	case <-t.C:
 		p.jsa.replies.Delete(p.reply)
+		// The confirmation's own timer, outside requestTimeout: the same silence, observed here.
+		p.jsa.observeUnanswered()
 		return fmt.Errorf("timeout after %v: acknowledgement confirmation on %q", p.jsa.timeout, p.subj)
 	}
 }

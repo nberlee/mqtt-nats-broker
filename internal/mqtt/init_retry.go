@@ -63,9 +63,15 @@ func (e *mqttJSATimeoutError) Unwrap() []error {
 	return []error{errMQTTJSARequestTimeout, e.cause}
 }
 
-// requestTimeout builds the error for a wait that ran out of time.
+// requestTimeout builds the error for a wait that ran out of time, and observes it as a request
+// JetStream did not answer — unless the wait was cut by the view's ownership deadline, which is
+// the protocol's own budget running out, not JetStream's silence (sub_jetstream_unanswered.go).
 func (jsa *mqttJSA) requestTimeout(cause error) error {
-	return jsa.timeoutError(&mqttJSATimeoutError{cause: cause})
+	err := jsa.timeoutError(&mqttJSATimeoutError{cause: cause})
+	if !errors.Is(err, errMQTTOwnershipDeadline) {
+		jsa.observeUnanswered()
+	}
+	return err
 }
 
 // startupAbandonCh is the startup cancellation this assistant's waits observe, or nil (a
@@ -254,17 +260,24 @@ func mqttStartupRetryable(err error) bool {
 		return true
 	}
 	if ae := jsAPIError(err); ae != nil {
-		// No responders: the transport status mqttJSAReplyStatus reports, with no
-		// JetStream error code. A nonzero code is JetStream's own answer and is judged by
-		// it, never by its HTTP-style status.
-		if ae.ErrCode == 0 {
-			return ae.Code == 503
-		}
-		// Not 10194/10195 (offline with a reason): the server also uses those for assets
-		// it does not support.
-		return IsNatsErr(ae, JSClusterNotAvailErr, JSStreamOfflineErr, JSConsumerOfflineErr)
+		return mqttJSAPIUnavailable(ae)
 	}
 	return false
+}
+
+// mqttJSAPIUnavailable reports a JetStream API reply that is not an answer: the request reached
+// no responder, or the asset it names has no serving leader. The one definition both startup's
+// retries and a SUBSCRIBE's close read (sub_jetstream_unanswered.go).
+func mqttJSAPIUnavailable(ae *ApiError) bool {
+	// No responders: the transport status mqttJSAReplyStatus reports, with no JetStream error
+	// code. A nonzero code is JetStream's own answer and is judged by it, never by its
+	// HTTP-style status.
+	if ae.ErrCode == 0 {
+		return ae.Code == 503
+	}
+	// Not 10194/10195 (offline with a reason): the server also uses those for assets it does
+	// not support.
+	return IsNatsErr(ae, JSClusterNotAvailErr, JSStreamOfflineErr, JSConsumerOfflineErr)
 }
 
 // mqttDefiniteLocalRefusal reports a publish error nats.go returns before writing anything.

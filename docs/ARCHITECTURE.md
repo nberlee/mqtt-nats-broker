@@ -2269,8 +2269,11 @@ out (`errMQTTJSARequestTimeout`, which every reply wait's timeout matches, its m
 unchanged); a subscription flush that timed out or ran during a reconnect; a transport
 no-responders status (503 with no JetStream code); JetStream 10008, 10118 and 10119 (no
 meta leader, stream or consumer offline) — not 10194/10195, which the server also uses for
-assets it does not support; and the two observer-occupant answers below. A request the
-connection refuses to publish before writing anything (`ErrMaxPayload`, `ErrBadSubject`,
+assets it does not support; and the two observer-occupant answers below. The no-responders
+status and the three codes are one definition, `mqttJSAPIUnavailable`, which a SUBSCRIBE's
+unanswered-request observation reads too (see "A SUBSCRIBE filter refused while JetStream
+did not answer closes the connection"). A request the connection refuses to publish before
+writing anything (`ErrMaxPayload`, `ErrBadSubject`,
 `ErrHeadersNotSupported`) ends startup: the sender records that refusal on the startup
 window itself, so it ends startup whether or not the request's waiter is still waiting;
 any other publish error is as ambiguous as the timeout it ends in. A service
@@ -6350,6 +6353,87 @@ overtaken while it waits, and its first transmission carries `DUP=0` because
 [issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76) moved
 that derivation off the JetStream delivery count onto the unsent marker. Both are stated in
 `docs/CONFORMANCE.md`.
+
+## A SUBSCRIBE filter refused while JetStream did not answer closes the connection
+
+Tracked in [issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187).
+
+A filter the broker cannot provision is answered SUBACK `0x80` and the connection stays
+open. That is right for a refusal JetStream DECIDED (a permission, the MaxAckPending
+ceiling, a sealed shared tenure) and wrong for one it never answered: a consumer create
+that timed out while the meta layer caught up after a rolling restart left a client that
+does not retry a refused filter connected and deaf on it. [MQTT-4.8.0-2] closes the
+connection on a transient error while an inbound packet is processed, which the CONNECT
+restore and an unresolved SUBSCRIBE save already do. The rule:
+
+> A live SUBSCRIBE that refuses a filter while JetStream is not answering gets no SUBACK,
+> and the connection closes once the packet's own outcome is settled. A v5 client is sent
+> DISCONNECT `0x89` (Server busy).
+
+**How such a refusal is known** (`sub_jetstream_unanswered.go`). Not by its error. Between
+the request and the refusal sit status-only load results, formatted wrappers and retry
+loops that keep only their last error; a design that carried the transport cause through
+every one of them found two more helpers dropping it in each review round. The class is
+closed at its origin instead: the account's JetStream assistant advances one sequence
+whenever a request it made goes unanswered, and `processSubs` reads it around each filter.
+
+- **Origins.** A reply wait that ran out (`requestTimeout`, which every request, batch and
+  store wait reaches), except one cut by a view's ownership deadline, which is the
+  protocol's own budget; the double-ack confirmation's own timer (`mqttPreparedAck.wait`);
+  and, in `processJSAPIReplies`, a reply that is not an answer by `mqttJSAPIUnavailable`
+  (a transport 503, or a decoded 10008/10118/10119), counted once per reply. It is a
+  sequence, not a count: a multi-request wait times out once.
+- **Windows.** A mark per filter per pass: in the first pass before the PUBREL and affine
+  provisioning, in the second at the top of the filter (acquisition, membership save, raw
+  and level-up subscriptions, consumer and companion). Each error-carrying refusal site
+  compares BEFORE its own compensation runs, so a compensation that goes unanswered does
+  not reclassify a refusal the store had decided. A refusal also qualifies when its error
+  is a core-NATS flush with no PONG (`nats.ErrTimeout`, `nats.ErrConnectionReconnecting`),
+  which no assistant observes: the raw subscription's, and the flush `processSub` makes
+  when it installs a JetStream consumer's delivery subscription. A filter that SUCCEEDED
+  never qualifies. Parse rejections, the drain hold and the reserved namespace do no
+  JetStream work and are untouched.
+- **The close.** The first qualifying refusal is kept in the packet's facts and attached
+  only at `processSubs`' final return, guarded by "live SUBSCRIBE, no error already": the
+  per-filter rollback, the final save and the whole success tail (cancellation securing,
+  deferred teardowns, drain completion, retention settlement, the affine unwind) have run.
+  A definite final-save failure and every earlier hard exit keep their own error and
+  precedence. The error takes the path a definite final-save failure already takes:
+  `mqttProcessSubs` returns before arbitration with the shared operation gate withheld, no
+  SUBACK and no retained replay are sent, `mqttResolveAfterPacket` runs as for any packet,
+  and the DISCONNECT goes through the connection's one disconnect claim, so an owner
+  already established keeps its reason. The packet's successful memberships are in the
+  record, as for a SUBACK lost in transit; a purely plain packet arms no gate, so they may
+  deliver before the close.
+
+**What the window proves.** The assistant is the account's, shared by every session and by
+background work, so a moved sequence proves that some request went unanswered while this
+filter was being provisioned, not that this filter's did. Attribution is temporal, not
+causal: an earlier filter's asynchronous cleanup, or a step's own internal cleanup before
+it refuses, can land inside a window. That over-attribution is the policy, stated in
+`docs/CONFORMANCE.md`.
+
+**Unchanged.** The CONNECT restore refuses the CONNECT on any unrestored filter before the
+CONNACK ("The restore gate" below), so the client's CONNECT retry is its retry. A plain
+consumer whose create timed out hands its claimed name to the retirement owner
+(`create-failed`) asynchronously: a create that lands before the retirement is disposed of
+by it, one that lands after lands under a RETIRED name the sweep reclaims, and a crash or
+takeover in between is left to the persisted ownership, resource and duty records and the
+successor. The PUBREL, affine and shared group consumers keep their own retirement.
+
+Why these choices, each against the obvious alternative:
+
+- **No retry inside the packet.** The read loop answers no PINGREQ while it waits, so
+  retries through a one-minute meta catch-up trip client ping timeouts and drop the
+  connection anyway, with no SUBACK; and a retry of the create alone misses the PUBREL
+  consumer, the name claim and the shared acquisition and join.
+- **No close at the failing filter, nor right after the final save.** The first leaves
+  earlier filters installed but unsaved; the second skips the success tail.
+- **The failed membership is not persisted for the resume to provision.** That would
+  change the SUBSCRIBE's commit and rollback contract for plain filters only, and the save
+  may be what times out. A client that resumes and never resubscribes a refused new filter
+  stays deaf on it, stated in `docs/CONFORMANCE.md`; a refused re-SUBSCRIBE keeps the
+  membership the session already held.
 
 ## The restore gate: the CONNACK follows a complete restoration
 

@@ -92,6 +92,11 @@ type mqttJSACore struct {
 	// still being processed in this account. See mqttSubsBarrier.
 	subsBarrier mqttSubsBarrier
 
+	// unanswered advances each time a request this account's assistant made went unanswered by
+	// JetStream. A sequence, not a count: read it only to ask whether it moved. See
+	// sub_jetstream_unanswered.go.
+	unanswered atomic.Uint64
+
 	// dutyIdentities is the identifier walk's cache of validated duty identities
 	// (outbound_duty_identity_cache.go), shared by every view of this account's assistant.
 	dutyIdentities mqttDutyIdentityCache
@@ -1297,11 +1302,17 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	}
 	// A status is the transport answering, not JetStream, so nothing in it is decoded.
 	status := mqttJSAReplyStatus(pc, msg)
+	if status != nil && mqttJSAPIUnavailable(status) {
+		jsa.observeUnanswered()
+	}
 	decode := func(resp any, apiErr **ApiError) {
 		if status != nil {
 			*apiErr = status
 		} else if err := json.Unmarshal(msg, resp); err != nil {
 			*apiErr = NewJSInvalidJSONError(err)
+		} else if *apiErr != nil && mqttJSAPIUnavailable(*apiErr) {
+			// An offline asset or no meta leader: a reply, but not an answer.
+			jsa.observeUnanswered()
 		}
 		out(resp)
 	}

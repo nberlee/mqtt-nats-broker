@@ -4308,6 +4308,39 @@ guarantee:
 - The one packet the reader had already started when the pipeline failed is processed as
   before; only packets that start after it are discarded.
 
+### A SUBSCRIBE filter refused while JetStream did not answer closes the connection
+
+A live SUBSCRIBE that refuses a filter while JetStream is not answering gets no SUBACK:
+the connection closes after the packet's own outcome is settled, and a v5 client is sent
+DISCONNECT 0x89 (docs/ARCHITECTURE.md, "A SUBSCRIBE filter refused while JetStream did not
+answer closes the connection";
+[issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187)). A refusal JetStream
+decided with no unanswered request in its window keeps its per-filter SUBACK 0x80 and the
+connection: a subscribe permission denial, the MaxAckPending ceiling, a held drain, a
+sealed or superseded shared tenure. What the classification does not establish:
+
+- **It is the account's, not the filter's.** "Not answering" is read from a sequence the
+  account's JetStream assistant advances for every unanswered request: every session's and
+  the broker's background work's. A refusal JetStream decided, made while any of those
+  went unanswered, closes the connection instead of answering 0x80. During a partial or
+  lasting backend failure (one offline asset, steady background timeouts) that can repeat
+  on every reconnect, and a later attempt answers 0x80 only once its window is clean. It
+  departs from 3.1.1 section 4.8's SHOULD NOT (a transient error affecting other clients)
+  in that respect.
+- **It is temporal, not causal.** An earlier filter's asynchronous cleanup, or a step's
+  own cleanup before it refuses, can be observed inside a filter's window.
+- **A local refusal counts as silence.** A request the broker's own service connection
+  refused to publish (oversized, a bad subject) is never answered, so it counts, and a
+  defect of that kind elsewhere on the account can turn a decided refusal into a close
+  against a healthy JetStream.
+- **A resumed session does not recover a refused new filter.** The packet's successful
+  memberships are persisted before the close and resume. A refused filter the session did
+  not already hold is not persisted, so a client that resumes with Session Present and does
+  not resubscribe it stays deaf on it. A refused re-SUBSCRIBE of a filter the session already
+  held keeps its previous membership, which the resume restores.
+- **A purely plain packet is not gated.** Its successful filters may deliver between their
+  installation and the close, as they would before a SUBACK lost in transit.
+
 ### An MQTT 3.1.1 connection is resent an unacknowledged delivery every AckWait
 
 When JetStream re-offers a QoS 1 or 2 delivery that was transmitted and is still
