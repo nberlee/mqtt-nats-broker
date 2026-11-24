@@ -1355,6 +1355,13 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 		}
 	}
 
+	// The receipt driver (receipt_drive.go): settles and purges this run's receipt batches on its own
+	// clock, for every generation it wrote receipts of.
+	s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		as.runReceiptDriver(s.quitCh, closeCh)
+	})
+
 	// Re-arm session-expiry timers, without delaying the connecting client. Then
 	// re-sweep periodically: expiries catch deadlines that never got a timer (e.g.
 	// records orphaned when their owner crashed while the client was connected),

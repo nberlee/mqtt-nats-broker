@@ -19,6 +19,7 @@ package mqtt
 import (
 	"errors"
 	"slices"
+	"time"
 	"weak"
 )
 
@@ -399,6 +400,13 @@ func (sess *mqttSession) trackPublish(jsDur, jsAckSubject string, origin mqttOff
 		// bumpPI and not at the mapping below: a successful allocation retires the
 		// custody demand only when nothing is left deferred (noteAllocationSucceededLocked).
 		delete(sess.deferred, mqttDeferredKey{jsDur, sseq})
+
+		// UNDER RECEIPT PRESSURE no fresh delivery is allocated (receipt_pressure.go): withheld as at
+		// the in-flight cap, with no NAK, so the source re-offers after AckWait and the background
+		// work that returns the budget is not kept yielded.
+		if sess.receiptPressureLocked(time.Now()) {
+			return 0, false
+		}
 
 		pi = sess.bumpPI()
 		if pi == 0 {

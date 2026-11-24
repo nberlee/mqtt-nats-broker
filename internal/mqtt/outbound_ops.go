@@ -211,19 +211,37 @@ func (c *client) outboundEntitlement() (mqttOutboundEntitlement, bool) {
 // The handle is frozen BEFORE the batch is sent and is returned even when the send fails,
 // because a transport error is exactly the case where it is needed: `resolveTransitionHandle`
 // then answers LANDED, NEVER LANDED, SUPERSEDED or UNRESOLVED from the store alone.
+//
+// A RECEIPT-FREE KIND RETURNS NO HANDLE (mqttKindWritesReceipt): it writes no outcome, so there is
+// nothing to resolve or abort, and its caller reconciles from the member its batch CASes. Sent
+// says, for every kind, that the batch was composed and handed to the writer: the signal a
+// contention loop spaces on.
 type mqttOpOutcome struct {
 	Seq    uint64
 	Handle *mqttTransitionHandle
+	Sent   bool
 }
 
 // commitOp freezes the attempt's handle, sends the batch, and returns both.
+//
+// A receipted generation attempt is stamped into its receipt batch first (receipt_ledger.go): the
+// handle's digest binds the batch, and the handle points at the attempt's one record.
 func (jsa *mqttJSA) commitOp(t *mqttAuthorityTransition) (mqttOpOutcome, error) {
-	h, herr := mqttNewTransitionHandle(t)
-	if herr != nil {
-		return mqttOpOutcome{}, herr
+	var h *mqttTransitionHandle
+	if mqttKindWritesReceipt(t.Attempt.Kind) {
+		rec, perr := jsa.receipts().prepare(t)
+		if perr != nil {
+			return mqttOpOutcome{}, perr
+		}
+		var herr error
+		if h, herr = mqttNewTransitionHandle(t); herr != nil {
+			jsa.receipts().unsent(rec)
+			return mqttOpOutcome{}, herr
+		}
+		h.rec = rec
 	}
 	seq, err := jsa.commitAuthorityTransition(t)
-	return mqttOpOutcome{Seq: seq, Handle: h}, err
+	return mqttOpOutcome{Seq: seq, Handle: h, Sent: true}, err
 }
 
 // ---------------------------------------------------------------------------

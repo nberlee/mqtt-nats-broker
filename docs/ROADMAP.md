@@ -975,9 +975,9 @@ store, R3) logged over five days on `780fd9d` and during its rollout to v0.1.0-a
 Ordered by severity. The evidence and the source reading are in each issue; none is
 reproduced yet.
 
-- [ ] A serving generation's transition outcomes and action records are reclaimed only by
-  its purge, so a long-lived persistent QoS 1 subscriber grows `$MQTT_sess` by about 180k
-  records a day toward an OOM of its stream leader
+- [x] A serving generation's outcomes are reclaimed by the run that wrote them, in receipt
+  batches it purges once every attempt in them is decided and fenced; three kinds write no
+  outcome; a reclaimed position's actions go with it; format 2. Done 2026-11-24
   ([issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192)).
 
 - [x] A frozen batch whose shared directory or registry shard moved is recomposed rather than

@@ -190,7 +190,11 @@ type mqttGenerationObligations struct {
 // census uses. A subject walk is unsound here now that exchange records are deleted behind the
 // floor: its pages shift under a deletion. A position or exchange the traversal could not read is
 // counted unreadable, so a caller may not treat the generation as finished. The ACTION walk below
-// stays a subject walk: actions are never deleted, so its never-deleted argument still holds.
+// stays a per-exchange subject walk: the actions of an exchange are deleted only once the floor
+// reclaimed that exchange (issue #192), and the walk reads the actions of exchanges whose duties
+// stand in [Lo, Hi]. A walk that captured an exchange just before its reclamation sees fewer
+// actions, which its consumer reads as no evidence (abandonCurrentOutputVeto refuses), and an ended
+// exchange is refused by abandonment anyway; one exchange's deletion never shifts another's walk.
 func (as *mqttAccountSessionManager) enumerateGenerationObligations(id, epoch, gen string) (*mqttGenerationObligations, error) {
 	idHash := getHash(id)
 	out := &mqttGenerationObligations{}

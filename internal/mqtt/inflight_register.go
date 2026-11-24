@@ -5834,6 +5834,13 @@ func (sess *mqttSession) runInflightAdmission(c *client, pi uint16, qos byte, js
 				regSeq: seq, nonce: rec.Nonce, lin: rec.Lin, qos: rec.QoS}, subject, registerOnly)
 		}
 		lastErr = err
+		// A SPENT RECEIPT BUDGET ENDS THE LADDER AT ONCE (receipt_pressure.go): the refusal was definite
+		// and nothing was sent, so the allocation's identifier is freed rather than excluded, and the
+		// offer is withheld for AckWait rather than re-offered at once.
+		if errors.Is(err, errMQTTReceiptPressure) {
+			sess.releaseUnsubmittedAllocation(mqttLicenceOf(c), pi, jsDur, sseq, nonce)
+			return false
+		}
 		landedRegisterOnly := registerOnly
 		regExpect, markerExpect, registerOnly = 0, 0, false
 		// THE LINEAGE FOLLOWS THE WRITE MODE, so it is reset with the mode and not once per
@@ -7490,6 +7497,12 @@ func (sess *mqttSession) acquirePublishAction(c *client, pi uint16, tok *mqttSen
 			// that is not this connection's. Whatever an ambiguous earlier attempt left is the
 			// store's to say.
 			if errors.Is(aqerr, errMQTTEntitlementEnded) {
+				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
+				return false
+			}
+			// A SPENT RECEIPT BUDGET gives the acquisition up unsent (receipt_pressure.go): it is retried
+			// when the exchange is next owed.
+			if errors.Is(sess.relieveReceiptBudget(aqerr, ent.Gen), errMQTTReceiptPressure) {
 				sess.resolveUnacquiredPublishAction(c, tok, expectAcq, cur.Claim, cur.ClaimSeq)
 				return false
 			}

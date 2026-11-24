@@ -1479,6 +1479,9 @@ func TestMQTTInflightEveryNonceRecoverableDeleteRoutesThroughTheProperty(t *test
 		"deleteRetiredPositionsUpTo": "removes a duty entry the issue #114 floor RETIRED, never a register. A duty subject " +
 			"carries the ob class token, which no register parser can place and no void verdict can " +
 			"name; the entry is LOADED and decoded before the delete, by the exact sequence read",
+		"deleteReclaimedActions": "removes the ACTION records of an exchange the floor RECLAIMED (issue #192), never a " +
+			"register. An action subject carries the ob class token, which no register parser can place and no " +
+			"void verdict can name; each is read first and deleted by the exact sequence read",
 		"deleteReclaimedExchange": "removes an exchange record the issue #114 floor RECLAIMED, never a register. An " +
 			"exchange subject carries the ob class token, which no register parser can place and no " +
 			"void verdict can name; it is read first and deleted by the exact sequence read, and only " +

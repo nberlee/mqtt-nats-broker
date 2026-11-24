@@ -248,7 +248,7 @@ const (
 	// apply to each other's records, the live publication's Nmqtt-* envelope and the
 	// names peers derive (docs/ARCHITECTURE.md, "The broker-to-broker protocol").
 	mqttStoreFormatMetaKey = "mqtt_nats_broker_format"
-	mqttStoreFormat        = "1"
+	mqttStoreFormat        = "2"
 
 	// Stream name and subject for incoming MQTT QoS2 messages
 	mqttQoS2IncomingMsgsStreamName          = "$MQTT_qos2in"

@@ -17,6 +17,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -360,7 +361,10 @@ func (sess *mqttSession) claimPubRelNameOnce(ent mqttOutboundEntitlement, nameGe
 			"op-provision-pubrel", ent.Gen, ent.Tenure, mqttNewInflightNonce(), name,
 			mqttResourcePubRelConsumer)
 		if perr != nil {
-			return false, out.Handle, fmt.Errorf("client %q: claiming PUBREL consumer name %q: %w", id, name, perr)
+			// A spent receipt budget ends the claim (receipt_pressure.go).
+			perr = sess.relieveReceiptBudget(perr, ent.Gen)
+			done := errors.Is(perr, errMQTTReceiptPressure)
+			return done, out.Handle, fmt.Errorf("client %q: claiming PUBREL consumer name %q: %w", id, name, perr)
 		}
 		return true, nil, nil
 	case own.State != mqttNameOwnLive || own.OwnerGen != ent.Gen:
@@ -460,6 +464,10 @@ func (sess *mqttSession) claimSourceConsumerName(ent mqttOutboundEntitlement, su
 		if perr == nil {
 			claim.handles = nil
 			return claim, nil
+		}
+		// A spent receipt budget refuses the SUBSCRIBE now (receipt_pressure.go).
+		if perr = sess.relieveReceiptBudget(perr, auth.Gen); errors.Is(perr, errMQTTReceiptPressure) {
+			break
 		}
 	}
 	sess.custodyFailedClaim(claim)

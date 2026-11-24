@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -316,6 +317,15 @@ func (sess *mqttSession) attemptAdmissionBatch(c *client, gen, epoch string, aut
 			return nil, nil
 		}
 		// POSITIVELY NEVER LANDED, or refused before it was submitted.
+		// A SPENT RECEIPT BUDGET is the session's, not one delivery's: every participant is released
+		// unsubmitted rather than split into single ladders that would each meet it again
+		// (receipt_pressure.go).
+		if errors.Is(sess.relieveReceiptBudget(err, gen), errMQTTReceiptPressure) {
+			for _, it := range items {
+				sess.releaseUnsubmittedAllocation(mqttLicenceOf(c), it.pi, it.jsDur, it.sseq, it.nonce)
+			}
+			return nil, nil
+		}
 		lastErr = err
 		ext.noteWrite(err)
 		if !mqttIsStaleExpectation(err) {

@@ -235,6 +235,15 @@ func (sess *mqttSession) acquirePublishActions(secs []*mqttPublishSection) []mqt
 		} else {
 			out, acts, err = sess.jsa.opAcquireActions(reqs)
 		}
+		// A SPENT RECEIPT BUDGET is the session's: every participant gives its acquisition up unsent,
+		// without falling out to single acquisitions that would each meet it again
+		// (receipt_pressure.go).
+		if err != nil && errors.Is(sess.relieveReceiptBudget(err, ent.Gen), errMQTTReceiptPressure) {
+			for _, i := range in {
+				sess.releaseUnacquiredPublishAction(c, &secs[i].tok)
+			}
+			return parts
+		}
 		v := mqttTransitionLanded
 		if err != nil {
 			v = mqttTransitionNeverLanded

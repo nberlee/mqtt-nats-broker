@@ -291,6 +291,10 @@ func (s *Server) runShutdown() {
 	// path under it; otherwise the tokens of a connection Phase 1 closed stand for the next
 	// start's resume exactly as after a crash. Last in 3b, so nothing above launches behind it.
 	s.joinCloseCertWrites()
+	// Every receipt batch this run wrote is settled and purged while the store still answers
+	// (receipt_drive.go): last in 3b, after every holder above has decided what it could, and before
+	// Phase 4 stops the request path. What it cannot settle stays until the generation's purge.
+	s.settleReceiptsAtShutdown()
 
 	// Anything still held for a service account that never came back. Reported
 	// rather than published: the destination is still unestablished, and the whole

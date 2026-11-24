@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // The generation rules of the write boundary (issue #133), stated over the authority a
@@ -132,13 +133,22 @@ func (jsa *mqttJSA) createFencedGenRecordOnce(id, epoch, gen, subj string, body 
 		return fmt.Errorf("writing %q: generation %q reads %v, outside the window its record is written in",
 			subj, gen, s)
 	}
-	return jsa.createBesideAuthority(id, al, subj, body, subj)
+	return jsa.createBesideAuthority(id, al, subj, body, subj, nil)
 }
 
 // createBesideAuthority creates subj create-only in one batch with the authority al read,
 // rewritten unchanged at the sequence it was read at: a fence that moves no revision. label names
 // the write in an acknowledgement mismatch.
-func (jsa *mqttJSA) createBesideAuthority(id string, al mqttAuthorityLoad, subj string, body []byte, label string) error {
+//
+// rec is the receipt ledger's record when subj is the outcome of a receipted generation attempt (its
+// abort): the submission is registered immediately before it is sent and its return recorded
+// (receipt_ledger.go). Such an outcome written without its record is refused: no receipt lands in a
+// batch the run does not track.
+func (jsa *mqttJSA) createBesideAuthority(id string, al mqttAuthorityLoad, subj string, body []byte, label string,
+	rec *mqttReceiptAttempt) error {
+	if rec == nil && mqttIsBatchReceiptSubject(subj) {
+		return fmt.Errorf("writing %q: %w", subj, errMQTTReceiptUnregistered)
+	}
 	authBody, merr := json.Marshal(al.rec)
 	if merr != nil {
 		return merr
@@ -151,16 +161,33 @@ func (jsa *mqttJSA) createBesideAuthority(id string, al mqttAuthorityLoad, subj 
 	jsa.mu.Unlock()
 	rm, rh := mqttFrameBatchWrite(0, body, batchID, 1, false)
 	am, ah := mqttFrameBatchWrite(al.seq, authBody, batchID, 2, true)
-	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, []mqttBatchMsg{
+	l := jsa.receipts()
+	if rec != nil {
+		if rerr := l.register(rec, al.seq); rerr != nil {
+			return rerr
+		}
+	}
+	resp, err := jsa.sendTransitionBatch([]mqttBatchMsg{
 		{subj: subj, hdr: rh, msg: rm},
 		{subj: mqttOutboundAuthoritySubject(getHash(id)), hdr: ah, msg: am},
-	})
-	if err != nil {
-		return err
+	}, batchID, 2, label)
+	if rec != nil {
+		ack := uint64(0)
+		if err == nil {
+			ack = resp.Sequence
+		}
+		l.returned(rec, false, mqttClassifySubmission(err), al.seq, ack)
 	}
-	resp := bi.(*JSPubAckResponse)
-	if aerr := resp.ToError(); aerr != nil {
-		return aerr
+	return err
+}
+
+// mqttIsBatchReceiptSubject reports whether subj is the outcome subject of a receipted generation
+// attempt, ob.txn.<idHash>.<gen>.<batch>.<txn>, as opposed to a lifecycle one, ob.txn.<idHash>.L.<L>.<txn>.
+func mqttIsBatchReceiptSubject(subj string) bool {
+	rest, ok := strings.CutPrefix(subj, mqttOutboundRecordSubjectPrefix()+mqttOutcomeClassTk+".")
+	if !ok {
+		return false
 	}
-	return mqttCheckTransitionBatchAck(resp, batchID, 2, label)
+	toks := strings.Split(rest, ".")
+	return len(toks) == 4 && toks[1] != mqttLifecycleScopePrefix
 }

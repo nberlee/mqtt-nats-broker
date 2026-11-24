@@ -172,6 +172,8 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 				// on the reservation for the reconciler.
 				sess.recordAdmissionAttempt(gen, nonce, lin, out, err)
 				if err != nil {
+					// A spent receipt budget ends the ladder (receipt_pressure.go).
+					err = sess.relieveReceiptBudget(err, gen)
 					ext.noteWrite(err)
 					return 0, out.Handle != nil, err
 				}
@@ -224,6 +226,7 @@ func (sess *mqttSession) admitUnderReservation(c *client, gen string, pi uint16,
 				sess.hintCustody(gen, cur.Lin)
 			}
 			if rerr != nil {
+				rerr = sess.relieveReceiptBudget(rerr, gen)
 				ext.noteWrite(rerr)
 				return 0, out.Handle != nil, rerr
 			}

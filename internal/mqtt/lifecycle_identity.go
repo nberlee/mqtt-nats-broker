@@ -129,7 +129,17 @@ func mqttLifecycleScope(l uint64) (string, error) {
 // mqttParseOutcomeScope returns what an outcome scope names: the lifecycle it belongs to,
 // and the generation when it is a generation scope (gen empty for a lifecycle scope). ok is
 // false for anything neither constructor produced.
+//
+// A generation scope is the bare generation token, or that token and the RECEIPT BATCH a
+// receipted attempt was stamped into (receipt_ledger.go), <gen>.<batch>; gen is the generation
+// token either way, so every comparison with a generation is unchanged by the batch.
 func mqttParseOutcomeScope(scope string) (l uint64, gen string, ok bool) {
+	if g, b, found := strings.Cut(scope, "."); found && g != mqttLifecycleScopePrefix {
+		if !mqttValidInflightNonce(b) {
+			return 0, _EMPTY_, false
+		}
+		scope = g
+	}
 	if lt, found := strings.CutPrefix(scope, mqttLifecycleScopePrefix+"."); found {
 		if len(lt) != mqttGenTokenLifecycleWidth {
 			return 0, _EMPTY_, false
@@ -145,6 +155,20 @@ func mqttParseOutcomeScope(scope string) (l uint64, gen string, ok bool) {
 		return 0, _EMPTY_, false
 	}
 	return l, scope, true
+}
+
+// mqttOutcomeScopeBatch returns the receipt batch a generation scope names, or empty for a bare
+// generation scope or a lifecycle scope. The scope is assumed well formed (mqttParseOutcomeScope).
+func mqttOutcomeScopeBatch(scope string) string {
+	if g, b, found := strings.Cut(scope, "."); found && g != mqttLifecycleScopePrefix {
+		return b
+	}
+	return _EMPTY_
+}
+
+// mqttBatchScope returns the scope of generation gen's receipt batch.
+func mqttBatchScope(gen, batch string) string {
+	return gen + "." + batch
 }
 
 // ---------------------------------------------------------------------------

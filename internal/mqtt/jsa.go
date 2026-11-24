@@ -65,6 +65,10 @@ type mqttJSA struct {
 
 // mqttJSACore is the state every view of one account's assistant shares.
 type mqttJSACore struct {
+	// receiptLedger is what this run still needs of each receipt batch it wrote (receipt_ledger.go).
+	receiptLedger *mqttReceiptLedger
+	receiptsOnce  sync.Once
+
 	mu      sync.Mutex
 	id      string
 	c       *client

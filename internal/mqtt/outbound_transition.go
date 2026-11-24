@@ -185,10 +185,26 @@ func (jsa *mqttJSA) resolveTransitionHandle(h *mqttTransitionHandle) mqttTransit
 	if h == nil {
 		return mqttTransitionUnresolved
 	}
-	if v, ok := jsa.provedNeverLandedBySequence(h); ok {
+	// A DECIDED ATTEMPT IS NOT ASKED AGAIN (receipt_ledger.go): its batch may since have been purged.
+	l := jsa.receipts()
+	if h.rec != nil {
+		if v, ok := l.verdict(h.rec); ok {
+			return v
+		}
+	}
+	v, ok := jsa.provedNeverLandedBySequence(h)
+	if !ok {
+		v = jsa.classifyAgainstOutcome(&h.attempt, h.digest)
+	}
+	if h.rec == nil {
 		return v
 	}
-	return jsa.classifyAgainstOutcome(&h.attempt, h.digest)
+	// THE CANONICAL VERDICT, never this read's: another participant may have decided the attempt
+	// while this one read, and purged its batch since.
+	if v == mqttTransitionRetired {
+		l.observe(h.rec, 0, true)
+	}
+	return l.decide(h.rec, v)
 }
 
 // provedNeverLandedBySequence settles an attempt whose authority moved past the sequence its batch
@@ -330,6 +346,9 @@ func (jsa *mqttJSA) abortTransition(a *mqttTransitionAttempt, admit func() bool)
 	if verr := mqttValidateTransitionAttempt(a); verr != nil {
 		return fmt.Errorf("refusing to abort an unsupported transition attempt: %w", verr)
 	}
+	if !mqttKindWritesReceipt(a.Kind) {
+		return fmt.Errorf("refusing to abort a %s attempt: the kind writes no receipt to contend for", a.Kind)
+	}
 	o := &mqttTransitionOutcome{
 		ID: a.ID, Epoch: a.Epoch, Txn: a.Txn, Scope: a.Scope, Op: a.Op, Kind: a.Kind,
 		Verdict: mqttOutcomeAborted, PrevTxn: a.PrevTxn, Intent: a.Intent,
@@ -374,8 +393,16 @@ func (jsa *mqttJSA) abortFencedOnce(a *mqttTransitionAttempt, o *mqttTransitionO
 	}); berr != nil {
 		return fmt.Errorf("aborting: %w", berr)
 	}
+	// A RECEIPTED GENERATION ATTEMPT'S ABORT IS A SUBMISSION OF ITS RECORD (receipt_ledger.go),
+	// refused once the attempt is decided or its batch is being purged.
+	var rec *mqttReceiptAttempt
+	if mqttKindNeedsReceiptBatch(a.Kind) {
+		if rec = jsa.receipts().record(a); rec == nil {
+			return fmt.Errorf("aborting transition %q: %w", a.Txn, errMQTTReceiptUnregistered)
+		}
+	}
 	body, _ := json.Marshal(o)
-	return jsa.createBesideAuthority(a.ID, al, mqttTransitionOutcomeSubject(getHash(a.ID), a.Scope, a.Txn), body, a.Txn)
+	return jsa.createBesideAuthority(a.ID, al, mqttTransitionOutcomeSubject(getHash(a.ID), a.Scope, a.Txn), body, a.Txn, rec)
 }
 
 // mqttTransitionMember is one caller-supplied member of a transition batch: its subject,
@@ -452,6 +479,20 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	}
 	if h := mqttTestTransitionAttemptV.Load(); h != nil {
 		(*h)(a.ID, a.Kind, mqttAttemptAuthorityFree(a.Kind, a.Rev))
+	}
+	// A RECEIPTED GENERATION ATTEMPT IS REGISTERED IN THIS RUN'S RECEIPT LEDGER before anything reads
+	// its scope (receipt_ledger.go): stamped into its batch here when its caller keeps no handle, or
+	// found by the batch commitOp stamped. A scope naming a batch the ledger did not stamp is refused,
+	// so no receipt is written that the run does not own. A call that returns without ever sending
+	// settles the record as never landed.
+	l := jsa.receipts()
+	rec, perr := l.prepare(t)
+	if perr != nil {
+		return 0, perr
+	}
+	defer l.unsent(rec)
+	if serr := mqttCheckReceiptScope(a.Kind, a.Scope); serr != nil {
+		return 0, serr
 	}
 	idHash := getHash(a.ID)
 	// AN AUTHORITY-FREE ATTEMPT writes no authority, names no predecessor and proposes no
@@ -582,17 +623,21 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 	}
 
 	// The digest binds the receipt to THIS mutation, closure included, and is computed from
-	// the same assembled form the resolver recomputes.
-	outcome := &mqttTransitionOutcome{
-		ID: a.ID, Epoch: a.Epoch, Txn: a.Txn, Scope: a.Scope, Op: a.Op, Kind: a.Kind,
-		Verdict: mqttOutcomeCommitted, PrevTxn: a.PrevTxn, Intent: a.Intent,
-		Rev: a.Rev, Gen: a.Gen, Tenure: a.Tenure, OwnerTxn: a.OwnerTxn,
-		Digest: digest,
+	// the same assembled form the resolver recomputes. A receipt-free kind writes none.
+	receipt := mqttKindWritesReceipt(a.Kind)
+	var outcomeBody []byte
+	if receipt {
+		outcome := &mqttTransitionOutcome{
+			ID: a.ID, Epoch: a.Epoch, Txn: a.Txn, Scope: a.Scope, Op: a.Op, Kind: a.Kind,
+			Verdict: mqttOutcomeCommitted, PrevTxn: a.PrevTxn, Intent: a.Intent,
+			Rev: a.Rev, Gen: a.Gen, Tenure: a.Tenure, OwnerTxn: a.OwnerTxn,
+			Digest: digest,
+		}
+		if verr := mqttValidateTransitionOutcome(outcome, a.ID, a.Epoch, a.Txn); verr != nil {
+			return 0, fmt.Errorf("refusing to commit a transition with an unsupported outcome: %w", verr)
+		}
+		outcomeBody, _ = json.Marshal(outcome)
 	}
-	if verr := mqttValidateTransitionOutcome(outcome, a.ID, a.Epoch, a.Txn); verr != nil {
-		return 0, fmt.Errorf("refusing to commit a transition with an unsupported outcome: %w", verr)
-	}
-	outcomeBody, _ := json.Marshal(outcome)
 
 	// AN OWNERSHIP MOVE IS CHECKED AGAINST ITS METADATA HALF, which is the permanent record
 	// of whether the proposal it answers won.
@@ -746,11 +791,15 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		batchID := jsa.nuid.Next()
 		jsa.mu.Unlock()
 
-		// Member 1 is the outcome, create-only. Then the closure, also create-only. Then what
-		// the transition authorizes. The authority is last and carries the commit flag, so the
-		// PubAck names it; an authority-free batch has no authority, and its last member commits.
+		// Member 1 is the outcome, create-only, for a kind that writes one. Then the closure, also
+		// create-only. Then what the transition authorizes. The authority is last and carries the
+		// commit flag, so the PubAck names it; an authority-free batch has no authority, and its
+		// last member commits.
 		total := 2 + len(t.Extra)
 		if free {
+			total--
+		}
+		if !receipt {
 			total--
 		}
 		if closureBody != nil {
@@ -771,7 +820,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		if t.Registry != nil {
 			add(t.Registry.subj, t.Registry.expect, t.Registry.body, false)
 		}
-		add(outcomeSubject, 0, outcomeBody, false)
+		if receipt {
+			add(outcomeSubject, 0, outcomeBody, false)
+		}
 		if closureBody != nil {
 			add(mqttGenClosureSubject(idHash, t.Closure.Gen), 0, closureBody, false)
 		}
@@ -798,16 +849,23 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 				return 0, oerr
 			}
 		}
-		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
+		// THE SUBMISSION IS REGISTERED IMMEDIATELY BEFORE IT IS SENT, and its own return recorded:
+		// only what this send observed is definite (mqttSubmissionResult).
+		if rec != nil {
+			if rerr := l.register(rec, t.PrevSeq); rerr != nil {
+				return 0, rerr
+			}
+		}
+		resp, err := jsa.sendTransitionBatch(msgs, batchID, total, a.Txn)
+		if rec != nil {
+			res, ack := mqttClassifySubmission(err), uint64(0)
+			if err == nil {
+				ack = resp.Sequence
+			}
+			l.returned(rec, true, res, t.PrevSeq, ack)
+		}
 		if err != nil {
 			return 0, err
-		}
-		resp := bi.(*JSPubAckResponse)
-		if aerr := resp.ToError(); aerr != nil {
-			return 0, aerr
-		}
-		if cerr := mqttCheckTransitionBatchAck(resp, batchID, total, a.Txn); cerr != nil {
-			return 0, cerr
 		}
 		if t.Record != nil {
 			if a.Kind != mqttTransitionTeardownClaim {
@@ -823,6 +881,38 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		return (*hook)(t, send)
 	}
 	return send()
+}
+
+// sendTransitionBatch sends one transition's assembled batch and returns the store's acknowledgement
+// of exactly that batch: any error means it was not acknowledged (mqttClassifySubmission says what
+// that establishes).
+func (jsa *mqttJSA) sendTransitionBatch(msgs []mqttBatchMsg, batchID string, total int, label string) (*JSPubAckResponse, error) {
+	bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)
+	if err != nil {
+		return nil, err
+	}
+	resp := bi.(*JSPubAckResponse)
+	if aerr := resp.ToError(); aerr != nil {
+		return nil, aerr
+	}
+	if cerr := mqttCheckTransitionBatchAck(resp, batchID, total, label); cerr != nil {
+		return nil, cerr
+	}
+	return resp, nil
+}
+
+// mqttClassifySubmission is what a sent batch's return establishes: landed when acknowledged,
+// refused when the store refused it at a record CAS (an atomic batch so refused is never applied),
+// and ambiguous otherwise (a timeout, a transport error, any other error response, an
+// acknowledgement that does not match), where the batch may still land.
+func mqttClassifySubmission(err error) mqttSubmissionResult {
+	switch {
+	case err == nil:
+		return mqttSubmissionLanded
+	case mqttIsRecordCASRejection(err):
+		return mqttSubmissionRefused
+	}
+	return mqttSubmissionAmbiguous
 }
 
 // mqttCheckTransitionBatchAck binds a transition's success to the batch this broker sent:
@@ -1118,6 +1208,19 @@ func mqttCheckClosingEnrolment(a *mqttTransitionAttempt, t *mqttAuthorityTransit
 // (mqttAttemptAuthorityFree).
 func mqttKindMayOmitAuthority(k mqttTransitionKind) bool {
 	return k == mqttTransitionAdvanceExchange || k == mqttTransitionReleaseHolds
+}
+
+// mqttKindWritesReceipt reports whether a kind's commit writes an outcome (issue #192). The
+// receipt-free kinds are arbitrated by a mandatory member's CAS and no caller resolves or aborts
+// them: an acknowledgement advance and a hold release (the exchange, the changed resource or
+// duty), and a floor advance (the ledger). Every other kind writes one, and since the two
+// authority-free kinds are among these, every receipted attempt writes the authority.
+func mqttKindWritesReceipt(k mqttTransitionKind) bool {
+	switch k {
+	case mqttTransitionAdvanceExchange, mqttTransitionReleaseHolds, mqttTransitionAdvanceFloor:
+		return false
+	}
+	return true
 }
 
 // mqttAttemptAuthorityFree reports an attempt that writes no authority record, proposes no

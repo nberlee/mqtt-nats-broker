@@ -677,12 +677,13 @@ var mqttLineageSiteCounts = map[mqttLineageSite]int{
 	// authority, the permanent outcome and an optional closure, and every caller-supplied
 	// member is refused if it names an issue #107 arbitration subject. A register carried as a
 	// caller member arrives ALREADY BUILT by the deciding writer, whose lineage disposition
-	// is the one that applies. One call site, in commitAuthorityTransition.
-	{fn: "commitAuthorityTransition", sink: "newAtomicBatchRequest"}: 1,
-	// The fenced create beside the authority rewritten as read: an abort's ABORTED outcome, or a
-	// generation's evidence record (completion, readiness, close certificate). NO register body.
-	// One call site, in createBesideAuthority.
-	{fn: "createBesideAuthority", sink: "newAtomicBatchRequest"}: 1,
+	// is the one that applies. Its batch, and the fenced create's beside the authority rewritten as
+	// read (an abort's ABORTED outcome, or a generation's evidence record: completion, readiness,
+	// close certificate; NO register body), are sent by sendTransitionBatch. One call site.
+	{fn: "sendTransitionBatch", sink: "newAtomicBatchRequest"}: 1,
+	// The receipt driver's progress write (issue #192): the authority alone, rewritten as read. NO
+	// register body. One call site, in progressAuthority.
+	{fn: "progressAuthority", sink: "newAtomicBatchRequest"}: 1,
 
 	// issue #107's shared-group lifecycle writer. Reaches the batch primitive for a two-member
 	// join or release, and writes NO register body: its members are the group record and the
@@ -750,10 +751,11 @@ var mqttLineageWriterManifest = map[string]string{
 	// pass-through is audited rather than invisible: if this writer ever constructed a
 	// register body itself, the count above would change and the census would demand a
 	// disposition for it.
-	"commitAuthorityTransition": "carries: no register body of its own, so the caller's disposition applies",
-	// The fenced create writes an outcome or a generation evidence record and the authority it is
-	// fenced by, never a register.
-	"createBesideAuthority": "carries: no register body at all, only the created record and the authority as read",
+	// Its batch and the fenced create's (an outcome or a generation evidence record and the
+	// authority it is fenced by, never a register) are sent by sendTransitionBatch.
+	"sendTransitionBatch": "carries: no register body of its own, so the caller's disposition applies (a fenced create carries none at all)",
+	// The receipt driver's progress write: the authority alone, as read.
+	"progressAuthority": "carries: no register body at all, only the authority as read",
 
 	// issue #107's metadata commit: NOT A REGISTER WRITER. It commits on $MQTT_sess and has no
 	// register lineage to decide. The entry exists so the census sees it rather than a

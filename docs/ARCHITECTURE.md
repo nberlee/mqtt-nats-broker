@@ -148,7 +148,7 @@ covered by the conformance suites.
 
 Every broker-owned stream carries, in its stream metadata, the **persisted format** it was
 written in: `mqtt_nats_broker_format`, beside the recovery epoch. This build writes and
-reads format `1` and nothing else (`mqttStoreFormat`, `internal/mqtt/mqtt.go`). The value
+reads format `2` and nothing else (`mqttStoreFormat`, `internal/mqtt/mqtt.go`). The value
 is compared by string equality and never parsed or ordered: a broker cannot know whether a
 format it does not implement is compatible with its own, and an ordering invites a "higher
 is compatible" shortcut. The same value versions the broker-to-broker protocol (see "The
@@ -164,7 +164,7 @@ two keys, on the same carrier: both are set on the create configuration, by the
 writes stream metadata after the create, so a stream without the stamp is refused, never
 stamped.
 
-**What the format is.** Format 1 is, as a whole:
+**What the format is.** Format 2 is, as a whole:
 
 - the seven stream names and the configurations the provisioning table creates (subjects,
   retention, flags, metadata keys);
@@ -219,6 +219,11 @@ snapshot: a stamp edited after a manager initialized is seen at the next initial
 - **Format 1 froze at the first release**, v0.1.0-alpha.1, and its golden fixture with
   it. Before then it was rewritten in place; now a change to it is additive or bumps the
   format.
+- **Format 2** (issue #192) moved a receipted generation outcome to
+  `ob.txn.<idHash>.<gen>.<batch>.<txn>` and stopped writing the outcome of the three
+  receipt-free kinds (see "Receipt batches"). A format-1 store's generation outcomes have
+  no batch, so no run would ever reclaim them: alpha's case-by-case decision is a refusal
+  with the recreate guidance, and format 1's fixture outcome is `refuse`.
 
 **The golden fixtures.** `internal/mqtt/testdata/storeformat/<format>/` holds a
 nats-server store directory that a broker of that format's build wrote while running a
@@ -1284,7 +1289,7 @@ per-owner:
 
 | Stream | Owner does | Prerequisites beyond the shared shape | Audited non-prerequisites (reason) |
 |---|---|---|---|
-| `$MQTT_sess` | THREE record families, each in its own subject space. **Session records**: per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, and the restore's delete of an obsolete record); **one ephemeral `AckNone` session-record watch consumer per broker**, filtered to the session-record space, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); an acceptance and a teardown claim commit the record in ONE atomic batch with the authority. Every record carries `WID`/`PWID`, the write's own identity and its parent's. **In-flight and outbound records** (`$MQTT.inflight.>`, once their own stream `$MQTT_inflight`): create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; and the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) outbound authority (see "The records" under "The outbound obligation authority"): the per-client authority CAS, every authority transition as ONE atomic batch over the authority, its create-only outcome and its members (exchange, action, resource, ledger and duty, retained manifest, chunks and `rel`, closure and recovery root, the session record, the lifecycle registry shard), the name-ownership CAS keyed by physical consumer name (absent → LIVE → RETIRED, never reused), create-only completion, readiness and close certificates, exact-sequence deletes of `rel`, retained material, recovery roots, a discarded obligation's records, and the exchanges and duty entries of positions a live generation's inventory floor retired ([issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114)), and **bounded filter purges** of a retired generation's and a retired lifecycle's records ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133); see "Lifecycles and generations"). **Name ownerships, the lifecycle registry and the directory shards are never deleted within the recovery epoch; every other outbound record leaves by an exact delete or by its scope's purge**, so the stream is non-empty for an account from its first accepted CONNECT; no consumers. **Shared-group lifecycle records** (`$MQTT.shared.>`, once their own stream `$MQTT_shared`): group-record CAS (`$MQTT.shared.grp.<qkey>`) and acquisition-ledger CAS (`$MQTT.shared.shl.<hash>.<gen>`, created by a generation's first acquisition and purged with its generation), a join committing the pair in one atomic batch with the authority as read, and a group-record LISTING with point reads for the retiring-entry sweep; no message delete and no consumers, and a group record is never removed within the recovery epoch. Every CAS is per subject, so no write of one family waits behind another's expectation; what the families share is the one stream leader | **exactly three subjects** — `$MQTT.sess.<domainTk>>`, `$MQTT.inflight.>` and `$MQTT.shared.>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (an acceptance, a teardown claim, the PUBLISH-phase register and its unsent marker ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), every [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) authority transition and a shared join carry `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the authority and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently; and every terminal in-flight path deletes at an exact sequence); **`DenyPurge` fatal** (it blocks the reclamation of every retired generation and lifecycle, whose records then accumulate for the life of the account). The shared-group records' former **`DenyDelete` requirement is given up**: it made their own stream immune to the upstream `MaxMsgsPer` revival defect, and on this stream they are neighbours of records that are rewritten and deleted (`docs/known-upstream-issues.md`); no `Sources`; no `SubjectDeleteMarkerTTL`; a **well-formed account recovery epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) — this stream MINTS it, so the requirement here is well-formedness rather than equality, and every other broker-owned stream must then carry that exact value; **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
+| `$MQTT_sess` | THREE record families, each in its own subject space. **Session records**: per-subject record CAS, `loadLastMsgFor`, filtered scans, exact-sequence confirmed deletes (teardown release, expiry, and the restore's delete of an obsolete record); **one ephemeral `AckNone` session-record watch consumer per broker**, filtered to the session-record space, created under a name derived from the server run and DELETED by name when a failed attempt rolls back what it confirmably created (see "The session-record watch" and "Per-run ephemeral consumer identity"); an acceptance and a teardown claim commit the record in ONE atomic batch with the authority. Every record carries `WID`/`PWID`, the write's own identity and its parent's. **In-flight and outbound records** (`$MQTT.inflight.>`, once their own stream `$MQTT_inflight`): create-only register CAS, the register+**unsent-marker** PAIR in one atomic batch ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), exact-sequence deletes of both classes, bounded enumerate-load-classify reap per retiring incarnation (teardown, registers then markers under one watermark), bounded register walk and a separate `...<gen>.*.unsent` marker walk; and the [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) outbound authority (see "The records" under "The outbound obligation authority"): the per-client authority CAS, every authority transition as ONE atomic batch over the authority, its create-only outcome and its members (exchange, action, resource, ledger and duty, retained manifest, chunks and `rel`, closure and recovery root, the session record, the lifecycle registry shard), the name-ownership CAS keyed by physical consumer name (absent → LIVE → RETIRED, never reused), create-only completion, readiness and close certificates, exact-sequence deletes of `rel`, retained material, recovery roots, a discarded obligation's records, and the exchanges, actions and duty entries of positions a live generation's inventory floor retired ([issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114), [issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192)), and **bounded filter purges** of a retired generation's and a retired lifecycle's records and of a run's settled receipt batches ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133); see "Lifecycles and generations"). **Name ownerships, the lifecycle registry and the directory shards are never deleted within the recovery epoch; every other outbound record leaves by an exact delete or by its scope's purge**, so the stream is non-empty for an account from its first accepted CONNECT; no consumers. **Shared-group lifecycle records** (`$MQTT.shared.>`, once their own stream `$MQTT_shared`): group-record CAS (`$MQTT.shared.grp.<qkey>`) and acquisition-ledger CAS (`$MQTT.shared.shl.<hash>.<gen>`, created by a generation's first acquisition and purged with its generation), a join committing the pair in one atomic batch with the authority as read, and a group-record LISTING with point reads for the retiring-entry sweep; no message delete and no consumers, and a group record is never removed within the recovery epoch. Every CAS is per subject, so no write of one family waits behind another's expectation; what the families share is the one stream leader | **exactly three subjects** — `$MQTT.sess.<domainTk>>`, `$MQTT.inflight.>` and `$MQTT.shared.>` — compared as a SET (order-independent, duplicates refused); **`AllowAtomicPublish` required** (an acceptance, a teardown claim, the PUBLISH-phase register and its unsent marker ([issue #76](https://github.com/nberlee/mqtt-nats-broker/issues/76)), every [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) authority transition and a shared join carry `Nats-Batch-*` headers, which a stream without it rejects, failing every CONNECT — and the batch's apply-layer indivisibility is what makes the authority and the record one commit; see the atomic-batch contract above); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`DenyDelete` fatal** (the teardown delete is a record's only exit; nobody resumes a marked record, so a denied delete locks the client ID out permanently; and every terminal in-flight path deletes at an exact sequence); **`DenyPurge` fatal** (it blocks the reclamation of every retired generation and lifecycle, whose records then accumulate for the life of the account). The shared-group records' former **`DenyDelete` requirement is given up**: it made their own stream immune to the upstream `MaxMsgsPer` revival defect, and on this stream they are neighbours of records that are rewritten and deleted (`docs/known-upstream-issues.md`); no `Sources`; no `SubjectDeleteMarkerTTL`; a **well-formed account recovery epoch** in `Metadata` (validated on the same snapshot; unrelated keys accepted) — this stream MINTS it, so the requirement here is well-formedness rather than equality, and every other broker-owned stream must then carry that exact value; **`MaxConsumers` unlimited** (one watch consumer per live broker, so a finite cap eventually rejects a legitimate broker start — note a configured `0` normalizes to unlimited) | `ConsumerLimits.*` (a stream `InactiveThreshold` below the watch's requested 5 minutes, or any positive `MaxAckPending` against `AckNone`, already fails the consumer create at initialization, naming the consumer — as on `$MQTT_rmsgs`); `AllowMsgTTL` (no `Nats-TTL` header sent) |
 | `$MQTT_willq` | create-only CAS enqueue per WillID, state-advance CAS, filtered scans, exact-sequence deletes (confirmed terminal, no-wait scan cleanup); no purge, no consumers | exactly ONE subject (`$MQTT.willq.<domainTk>>`); `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1` (each per-Will subject is a single-record CAS slot); no global limits; no `Sources`; no `MaxMsgSize` cap; **`DenyDelete` fatal** with the accumulation rationale: per-WillID subjects mean deletion is the only removal, so denying it grows the outbox monotonically and every scan re-walks every Will ever fired (`done` precedes the delete, so nothing re-fires); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the seven ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyPurge`; `MaxConsumers`/`ConsumerLimits`; `AllowMsgTTL`; **`AllowAtomicPublish`** — audited and NOT required here: only the accepting session save emits batch headers, and it writes to `$MQTT_sess`. This row states its own prerequisites rather than deriving them from `$MQTT_sess`, which would import that stream's three-subject set and its atomic-publish requirement, neither of which applies |
 | `$MQTT_msgs` | plain stores with per-message TTL; durable, drained and shared queue consumers, each with an explicit `MaxAckPending`; consumer deletes; `loadMsg` by sequence; **no message delete, no purge** | **`InterestPolicy`**; `MaxMsgsPer` unlimited; no global limits; no `MaxMsgSize` cap (a review round proposed a threshold at the broker's max payload, since the PUBLISH admission preflight bounds the complete stored form; disproven — QoS 1/2 Will stores bypass that preflight, so no positive cap is provably inert); **`AllowMsgTTL` required** (every broker accepts MQTT 5.0, so any stored PUBLISH may carry a `Nats-TTL` for Message Expiry); no `Sources`; no `SubjectDeleteMarkerTTL`; `MaxConsumers` unlimited (one durable per subscription/group/drain); `ConsumerLimits.MaxAckPending` fatal when non-zero and **below** the broker's effective cap; the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the seven ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | `DenyDelete`/`DenyPurge` (no delete or purge exists); `Discard` (inert with every limit unlimited); **`ConsumerLimits.InactiveThreshold`** (runtime refusal by the drain and shared/affine guards, and by [issue #107](https://github.com/nberlee/mqtt-nats-broker/issues/107) admission, which refuses a depended-on source consumer unless the stream limit reads verified-zero and the consumer's effective threshold is zero, a snapshot at admission and not a fence; waived at startup because a limit can be imposed later; see below); `Duplicates` (best-effort narrowing only) |
 | `$MQTT_rmsgs` | per-topic store with TTL incl. empty-body tombstones (the durable deletion authority); batched `loadLastMsgForMulti` reads; **no explicit message-delete or purge API calls**; one ephemeral `AckNone` consumer per broker, with `IdleHeartbeat`, which this owner both CREATES and DELETES by name — the delete is what gives a retried initialization a fresh `DeliverAll` position, and a mid-run reset its `DeliverByStartSequence` resume at W+1 (see "Per-run ephemeral consumer identity" and "The retained index is ordered by stream sequence") | `LimitsPolicy`; `DiscardOld`; `MaxMsgsPer: 1`; no global limits; no `MaxMsgSize` cap; **`AllowMsgTTL` required** (as on `$MQTT_msgs`); no `SubjectDeleteMarkerTTL` (markers were evaluated and declined by [issue #63](https://github.com/nberlee/mqtt-nats-broker/issues/63): they require `AllowRollup`, which the shared shape refuses; a marker SOURCED in from an upstream is recognised and applied as a deletion); `MaxConsumers` unlimited (one ephemeral consumer per broker); the **account recovery epoch** in `Metadata`, required to match this account's (unrelated keys accepted) — every broker-owned stream carries it, which is what makes the seven ONE recreation unit ([issue #70](https://github.com/nberlee/mqtt-nats-broker/issues/70)) | **`DenyDelete`** (the owner issues no MESSAGE delete — the tombstone plus `MaxMsgsPer: 1` store-time replacement carry correctness, and both that eviction and TTL expiry are store-internal reaping `DenyDelete` does not gate — and the CONSUMER deletes it does issue are `CONSUMER.DELETE` requests, which `DenyDelete` does not gate either); `DenyPurge`; **`Sources`** (supported cross-account retained topology); `ConsumerLimits.*` (a hostile limit already fails the consumer create at initialization, naming the consumer) |
@@ -10178,17 +10183,20 @@ transition makes a noncurrent generation current again. The readers:
 
 ### The outcome scope
 
-A transition's permanent outcome is `ob.txn.<idHash>.<scope>.<txn>`, and the scope says
-which retirement reclaims it. A **generation scope** is the generation token, for a
-transition whose business is one generation's records (admission, acquisition, advance,
-provision, disposal, withdrawal, the floor, the custody and retained transitions, the
-fences); it names the generation the members belong to, not the one the authority serves,
-so old-generation cleanup under a successor is scoped to the old generation. A **lifecycle
-scope** is `L.<L>`, two subject tokens, for a transition that changes lifecycle-level state:
-the acceptance shapes, the bind, `accept-abandon`, the teardown claim and release, the
-anchor transition and the retirement controls. Its one-character first token can never be
-read as a 22-character generation token, so a generation's purge filter
-`ob.*.<idHash>.<g>.>` never reaches a lifecycle-scoped outcome.
+A transition's outcome is `ob.txn.<idHash>.<scope>.<txn>`, and the scope says which
+retirement reclaims it. A **generation scope** is the generation token, for a transition
+whose business is one generation's records (admission, acquisition, advance, provision,
+disposal, withdrawal, the floor, the custody and retained transitions, the fences); it
+names the generation the members belong to, not the one the authority serves, so
+old-generation cleanup under a successor is scoped to the old generation. A receipted
+generation attempt's scope also names the **receipt batch** it was stamped into,
+`<gen>.<batch>`, which the run that wrote it reclaims while the generation serves (see
+"Receipt batches"); a receipt-free kind's attempt keeps the bare generation and writes no
+outcome. A **lifecycle scope** is `L.<L>`, two subject tokens, for a transition that
+changes lifecycle-level state: the acceptance shapes, the bind, `accept-abandon`, the
+teardown claim and release, the anchor transition and the retirement controls. Its
+one-character first token can never be read as a 22-character generation token, so a
+generation's purge filter `ob.*.<idHash>.<g>.>` never reaches a lifecycle-scoped outcome.
 
 Each composer sets the attempt's scope explicitly, the handle carries it, and the outcome
 body carries it too: a body whose scope differs from its subject's reads Corrupt. The write
@@ -10196,6 +10204,89 @@ boundary (`mqttCheckOutcomeScopeMembers`, `internal/mqtt/outcome_scope.go`) refu
 whose lifecycle is not the authority's, a generation scope carrying a member of another
 generation, and a lifecycle scope carrying a member of another lifecycle's generation (the
 Clean Start's closing members are the predecessor's, of the same lifecycle).
+
+### Receipt batches
+
+A serving generation's outcomes are reclaimed while it serves, by the run that wrote them
+([issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192); before it, they stayed
+until the generation's purge, about 180k records a day for one production subscriber).
+
+**Three kinds write no outcome.** `advance-exchange`, `release-holds` and `advance-floor`
+are arbitrated by a mandatory member's CAS (the exchange; the changed resource or duty;
+the ledger), no caller resolves or aborts them, so their batch carries no outcome member,
+their operation returns no handle (`mqttOpOutcome.Sent` is the contention signal a caller
+spaces on), and `abortTransition` refuses them. The two authority-free kinds are among
+them, so **every receipted generation attempt writes the authority at a nonzero
+expectation**, and so does every abort (`createBesideAuthority`): once the authority's
+sequence stands past a submission's expectation, that submission can never land.
+
+**A generation receipt has one reader**: handles of the process that submitted it. A
+handle is built only from an in-memory transition (`mqttNewTransitionHandle`), and an
+outcome is read only under one (`resolveTransitionHandle`) or by the abort that settles
+it. A previous tenure's dispatcher on another broker holds its own handles over its own
+receipts, and a process that dies takes every reader of its receipts with it.
+
+So the run alone decides when its receipts are no longer needed
+(`internal/mqtt/receipt_ledger.go`, `receipt_drive.go`):
+
+- **One record per attempt.** `commitOp` (and `commitAuthorityTransition` for a caller that
+  keeps no handle) stamps each receipted generation attempt into its generation's open
+  batch, a 22-character token the run mints and never reuses, and creates the attempt's
+  record **before** the digest is frozen and the handle built. Every handle points at that
+  record and its one decision cell; the record is owned by the account's ledger, not by a
+  handle, so a dropped handle loses nothing. A scope naming a batch the ledger did not
+  stamp the attempt into is refused at the commit and at the abort
+  (`createBesideAuthority`), so no receipt lands in a batch the run does not track.
+- **Submissions are registered immediately before they are sent** (the commit and every
+  abort), and each one's own return recorded: an acknowledged commit decides Landed, an
+  acknowledged abort NeverLanded, a commit the store refused at a record CAS decides
+  NeverLanded only when no other copy of it can still land, a refused abort decides nothing
+  (its subject may hold the commit), and anything else is ambiguous and raises the record's
+  **fence**, the highest expectation at which a copy may still land. Registration is
+  refused once the attempt is decided or its batch is being purged.
+- **Every resolution returns the cell.** A store-derived verdict is returned only by being
+  decided into an empty cell, so a resolver that read an absent receipt after another
+  participant decided Landed and the batch was purged still returns Landed. Corrupt or
+  contradictory evidence decides nothing. A cached Landed is historical commitment, not a
+  fresh ownership check; every consumer treats Landed and Superseded alike.
+- **A record settles** when it is decided, no submission of it is in flight, and an
+  authority sequence observed since (an acknowledgement or a read) stands past its CURRENT
+  fence, or its scope is positively retired; a missing authority alone proves nothing. The
+  evidence is kept as a sequence and compared at settlement, so an abort registered after
+  it is never covered by it.
+- **A batch closes** after 256 attempts or 10 s, and a closed batch whose every record is
+  settled is **purged** with one filtered purge (`ob.txn.<idHash>.<gen>.<batch>.>`, the
+  stream's last sequence read after the batch moved to purging as the cutoff) and forgotten
+  once a fresh listing finds nothing.
+- **The driver** (`runReceiptDriver`, one per account, on its own timer: the earliest batch
+  age or record retry, never the 15-minute session ticker) settles what no holder settles:
+  it resolves first, whatever the authority's position, so a receipt at an equal fence
+  decides from its body; while the attempt is undecided and the authority still at its
+  fence it submits the attempt's own fenced abort; once it is decided with the authority
+  still at its fence (an abort whose answer was lost, on an idle session) it submits a
+  **progress write**, the authority rewritten unchanged at the sequence read, alone, no
+  receipt and no revision, refused where the abort would be. Its aborts and progress writes
+  are admitted like every background authority writer (registered per client, never while
+  foreground work is announced).
+- **A budget** of 4096 receipted attempts per client and generation in unpurged batches is
+  charged at stamping and returned only by a confirmed purge; it bounds unsettled records,
+  their settled neighbours and batches whose purge fails. A new attempt refused at a spent
+  budget is definite, nothing is sent, and it is **not** contention: the generation goes
+  under the **pressure gate** (`receipt_pressure.go`) for one AckWait, during which no fresh
+  source delivery is allocated (the offer is withheld and re-offered after AckWait), the
+  refused allocation frees its identifier when it was provably never submitted, and the
+  driver and the floor are kicked. A retained replay is not withheld: its refusal is an
+  ordinary refusal of the replay step, which skips the snapshot once its attempts are spent.
+  Settlement work never charges the budget, and a batch whose purge failed stays purging,
+  its budget charged, and is purged again after a backoff until a fresh listing confirms it.
+- **Shutdown** (`settleReceiptsAtShutdown`, before Phase 4 stops the request path) refuses
+  new attempts, closes every batch and drives the ledger, its own writes unrefused, until
+  everything is purged or the deadline passes, and reports what is left.
+
+Scope retirement keeps its own rules: a generation's and a lifecycle's purge still remove
+any run's receipts, a positively retired scope settles a record (Retired if undecided), and
+lifecycle-scoped outcomes are not batched. What a run that ends unclean leaves is stated in
+`docs/CONFORMANCE.md`.
 
 ### The write boundary's generation rules
 
@@ -12975,11 +13066,14 @@ would invalidate the cache the same way, so a restore requires every broker stop
 drops every cache. The census (`mqttTraverseGenerationInventory`) does not use the cache.
 
 `enumerateGenerationObligations` reads the same traversal
-(`mqttTraverseGenerationInventory`; its per-exchange action walk stays a subject walk:
-actions are never deleted while their generation lives). A paged subject walk is sound
-only over records that are never deleted — a deletion between pages shifts a live subject
-past the cursor — so `streamSubjectsComplete` keeps its resource and certificate callers,
-whose records are never deleted before their generation retires.
+(`mqttTraverseGenerationInventory`; its per-exchange action walk stays a subject walk: the
+actions of an exchange are deleted only after the floor reclaimed it
+(`deleteReclaimedActions`, issue #192), the walk reads the actions of exchanges whose
+duties stand in `[Lo, Hi]`, and a walk that captured an exchange just before its
+reclamation sees fewer actions, which its consumer reads as no evidence). A paged subject
+walk is sound only over records that are never deleted — a deletion between pages shifts a
+live subject past the cursor — so `streamSubjectsComplete` keeps its resource and
+certificate callers, whose records are never deleted before their generation retires.
 
 **An absence is classified, not inferred** (`classifyExchangeAbsence`, the one
 definition): an exchange that reads absent is RECLAIMED — a positive, terminal ending —

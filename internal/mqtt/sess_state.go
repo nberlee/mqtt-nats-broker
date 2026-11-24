@@ -646,10 +646,14 @@ type mqttSession struct {
 	// every ordinary exchange's Receive Maximum charge and packet identifier. Replaced
 	// wholesale with the generation (setIncarnationLocked). custodyHints, custodyPassWanted
 	// and custodyObserving drive its single-flight observer (outbound_custody_session.go).
-	custody           *mqttCustodyLedger
-	custodyHints      map[string]struct{}
-	custodyPassWanted bool
-	custodyObserving  bool
+	custody      *mqttCustodyLedger
+	custodyHints map[string]struct{}
+	// receiptPressureGen and receiptPressureUntil withhold the generation's fresh deliveries after a
+	// refusal at its spent receipt budget (receipt_pressure.go).
+	receiptPressureGen   string
+	receiptPressureUntil time.Time
+	custodyPassWanted    bool
+	custodyObserving     bool
 	// The autonomous dispatcher's own state (issue #99 WP4, outbound_custody_dispatcher.go), all
 	// protected by mu and replaced with the generation:
 	//   - custodyDemand latches a withholding gate's demand until an allocation since succeeded

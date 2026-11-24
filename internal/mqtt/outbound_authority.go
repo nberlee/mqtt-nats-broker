@@ -336,7 +336,10 @@ func mqttKindOutcomeScope(k mqttTransitionKind) mqttOutcomeScopeClass {
 	return mqttOutcomeScopeGeneration
 }
 
-// mqttCheckOutcomeScope reports whether scope is a well-formed scope of kind k's class.
+// mqttCheckOutcomeScope reports whether scope is a well-formed scope of kind k's class. A
+// receipt batch is admitted only on a receipted generation kind; whether one is REQUIRED is the
+// receipt's own rule (mqttCheckReceiptScope), since an attempt is composed over the bare
+// generation and stamped into its batch only as it is committed.
 func mqttCheckOutcomeScope(k mqttTransitionKind, scope string) error {
 	_, gen, ok := mqttParseOutcomeScope(scope)
 	switch {
@@ -346,6 +349,27 @@ func mqttCheckOutcomeScope(k mqttTransitionKind, scope string) error {
 		return fmt.Errorf("a %s attempt is generation-scoped and carries the lifecycle scope %q", k, scope)
 	case mqttKindOutcomeScope(k) == mqttOutcomeScopeLifecycle && gen != _EMPTY_:
 		return fmt.Errorf("a %s attempt is lifecycle-scoped and carries the generation scope %q", k, scope)
+	case mqttOutcomeScopeBatch(scope) != _EMPTY_ && !mqttKindWritesReceipt(k):
+		return fmt.Errorf("a %s attempt writes no receipt and carries the receipt batch scope %q", k, scope)
+	}
+	return nil
+}
+
+// mqttKindNeedsReceiptBatch reports whether a kind's receipt lives in a receipt batch: every
+// receipted generation-scoped kind.
+func mqttKindNeedsReceiptBatch(k mqttTransitionKind) bool {
+	return mqttKindWritesReceipt(k) && mqttKindOutcomeScope(k) == mqttOutcomeScopeGeneration
+}
+
+// mqttCheckReceiptScope reports whether a receipt's scope is the one its kind is written under: a
+// receipted generation kind's receipt names its batch (receipt_ledger.go), a lifecycle kind's
+// names none.
+func mqttCheckReceiptScope(k mqttTransitionKind, scope string) error {
+	if err := mqttCheckOutcomeScope(k, scope); err != nil {
+		return err
+	}
+	if mqttKindNeedsReceiptBatch(k) && mqttOutcomeScopeBatch(scope) == _EMPTY_ {
+		return fmt.Errorf("a %s receipt is generation-scoped and names no receipt batch in %q", k, scope)
 	}
 	return nil
 }
@@ -1036,7 +1060,7 @@ func mqttValidateTransitionOutcome(o *mqttTransitionOutcome, wantID, wantEpoch, 
 	if !mqttValidTransitionKind(o.Kind) {
 		return fmt.Errorf("transition outcome carries an unsupported kind %q", o.Kind)
 	}
-	if serr := mqttCheckOutcomeScope(o.Kind, o.Scope); serr != nil {
+	if serr := mqttCheckReceiptScope(o.Kind, o.Scope); serr != nil {
 		return serr
 	}
 	if o.PrevTxn != _EMPTY_ && !mqttOutboundIdentTk(o.PrevTxn) {
@@ -1204,6 +1228,10 @@ type mqttTransitionHandle struct {
 	// expectation is unknown: zero disables the sequence proof, never satisfies it. It is the
 	// frozen batch's own PrevSeq, never a sequence read later.
 	authSeq uint64
+	// rec is the attempt's record in this run's receipt ledger (receipt_ledger.go), for a receipted
+	// generation attempt; nil otherwise. Every copy of the handle shares it, and with it the one
+	// decision cell every resolution returns.
+	rec *mqttReceiptAttempt
 }
 
 // mqttNewTransitionHandle freezes a transition into the handle that can classify it later.

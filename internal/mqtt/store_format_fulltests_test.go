@@ -45,7 +45,7 @@ func TestStartupRefusesABundleOfAnotherStoreFormat(t *testing.T) {
 		stamp func(map[string]string)
 		want  string
 	}{
-		{"another format", func(m map[string]string) { m[mqttStoreFormatMetaKey] = "2" }, "Run a broker release"},
+		{"another format", func(m map[string]string) { m[mqttStoreFormatMetaKey] = "3" }, "Run a broker release"},
 		{"no stamp", func(m map[string]string) { delete(m, mqttStoreFormatMetaKey) }, "carry no"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

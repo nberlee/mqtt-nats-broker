@@ -627,6 +627,12 @@ func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint
 			return true, fmt.Errorf("retired position %d of generation %q cannot be interpreted: %w", ord, gen, derr)
 		}
 		if d.Kind == mqttDutyExchange && d.State == mqttDutyTerminal {
+			// ITS ACTIONS FIRST, then the exchange, then the duty (issue #192): the duty is the
+			// position's cleanup address, so it stands until a fresh listing of the actions is
+			// empty, and Del cannot pass a standing duty.
+			if done, err := jsa.deleteReclaimedActions(id, gen, d.Ref, mqttFloorBatchPositions); err != nil || !done {
+				return true, err
+			}
 			if err := jsa.deleteReclaimedExchange(id, epoch, gen, d.Ref); err != nil {
 				return true, err
 			}
@@ -651,6 +657,50 @@ func (jsa *mqttJSA) deleteRetiredPositionsUpTo(id, epoch, gen string, limit uint
 		return true, err
 	}
 	return end < led.Lo, nil
+}
+
+// deleteReclaimedActions removes the action records of one reclaimed exchange, at most budget of
+// them, and reports whether none remains.
+//
+// A DELETION-SAFE LOOP, never an offset walk: another broker may be deleting the same subjects, and
+// a deletion between two pages shifts an unread subject past the cursor. So it lists the FIRST page
+// of the exchange's action filter, deletes what it lists at the exact sequences it reads, and lists
+// again; only a fresh listing that is empty proves the filter empty. An action of a reclaimed
+// exchange is never written again: an acquisition needs the exchange and a register naming its
+// lineage (checkActionMembers, checkActionTokenMembers), and the floor reclaims neither while
+// either stands.
+func (jsa *mqttJSA) deleteReclaimedActions(id, gen, nonce string, budget int) (bool, error) {
+	filter := mqttActionWalkFilter(getHash(id), gen, nonce)
+	for budget > 0 {
+		subs, _, err := jsa.streamSubjects(mqttSessStreamName, filter)
+		if err != nil {
+			return false, fmt.Errorf("listing the actions of reclaimed exchange %q of generation %q: %w", nonce, gen, err)
+		}
+		if len(subs) == 0 {
+			return true, nil
+		}
+		for subj := range subs {
+			if budget == 0 {
+				return false, nil
+			}
+			budget--
+			smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
+			if lerr != nil {
+				if isErrorOtherThan(lerr, JSNoMessageFoundErr) {
+					return false, fmt.Errorf("reading action %q of a reclaimed exchange: %w", subj, lerr)
+				}
+				continue
+			}
+			if derr := jsa.deleteMsg(mqttSessStreamName, smsg.Sequence, true); derr != nil {
+				if again, aerr := jsa.loadLastMsgFor(mqttSessStreamName, subj); aerr == nil && again != nil {
+					return false, fmt.Errorf("deleting action %q of a reclaimed exchange: %w", subj, derr)
+				} else if aerr != nil && isErrorOtherThan(aerr, JSNoMessageFoundErr) {
+					return false, fmt.Errorf("deleting action %q of a reclaimed exchange was unresolved: %w", subj, aerr)
+				}
+			}
+		}
+	}
+	return false, nil
 }
 
 // deleteReclaimedExchange removes one reclaimed exchange record by the exact sequence it stands at.

@@ -89,7 +89,7 @@ func startPartialBundleServer(t *testing.T) *server.Server {
 	defer nc.Close()
 	js, _ := jetstream.New(nc)
 	if _, err := js.CreateStream(context.Background(), jetstream.StreamConfig{Name: "$MQTT_out",
-		Subjects: []string{"partial.bundle.>"}, Metadata: map[string]string{"mqtt_nats_broker_format": "1"}}); err != nil {
+		Subjects: []string{"partial.bundle.>"}, Metadata: map[string]string{"mqtt_nats_broker_format": "2"}}); err != nil {
 		t.Fatal(err)
 	}
 	return srv

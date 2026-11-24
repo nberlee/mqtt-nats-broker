@@ -494,6 +494,7 @@ var fgCensusFunnels = map[string]bool{
 	"commitAuthorityTransition":  true,
 	"commitSharedLifecycleBatch": true,
 	"createBesideAuthority":      true,
+	"progressAuthority":          true,
 }
 
 // fgCensusBackgroundRoots are the background entries that are not session workers (those admit
@@ -501,6 +502,7 @@ var fgCensusFunnels = map[string]bool{
 // connection's path and must admit every authority attempt it reaches.
 var fgCensusBackgroundRoots = map[string]string{
 	"visitAdmittedRecoveryRoot": "a recovery visit past its entry check, registered by visitRecoveryRoot",
+	"runReceiptDriver":          "the account's receipt driver, on its kicks and its own deadlines",
 	"sweepLifecycles":           "the lifecycle sweep, on the account ticker",
 	"runAnchorRemovals":         "the account's owed Will-anchor removal loop",
 	"scanWillOutbox":            "the delayed-Will outbox scan",
@@ -571,7 +573,8 @@ var fgCensusAuthorityWriters = map[string]string{
 	"outbound_ack_advance.go:(mqttJSA).opCompleteExchangeDrain":               "FOREGROUND: the PUBREL holder's drain completion; the retained action drain is the stated exclusion",
 	"outbound_pubrel_rematerialize.go:(mqttJSA).opRebindCanonical":            "FOREGROUND: the PUBREL rematerialization on its connection's path",
 	"outbound_abandon_delivery.go:(mqttJSA).opAbandonDeniedDelivery":          "EXCLUDED: the denied delivery's disposal timer step (fgCensusExclusions)",
-	"outbound_transition.go:(mqttJSA).abortFencedOnce":                        "SESSION WORKER: one attempt of abortTransition, admitted by the holder's own admission before every attempt (consult 12); foreground holders pass nil",
+	"outbound_transition.go:(mqttJSA).abortFencedOnce":                        "ADMITTED: one attempt of abortTransition, whose admit is asked before it (consult 12): the receipt driver hands it the driver's admission; every other caller is a session worker or a foreground holder, passing its own admission or nil",
+	"receipt_drive.go:(mqttJSA).driveReceipt":                                 "ADMITTED: the receipt driver's progress write, asked of its admit immediately before it (receipt_drive.go); shutdown passes nil, after every client connection closed (Phase 1)",
 	"outbound_withdraw_unsent.go:(mqttJSA).opTombstoneRegister":               "SESSION WORKER: admitted by the withdrawal licence's admit",
 	"outbound_withdraw_unsent.go:(mqttJSA).opWithdrawUnsent":                  "SESSION WORKER: admitted by the withdrawal licence's admit",
 	"pending_fence_disposal.go:(mqttSession).fenceBeforePendingFenceDisposal": "SESSION WORKER: the register reap's fence, on the session's own reap path",
@@ -609,6 +612,9 @@ var fgCensusBackgroundAdmissions = map[string]fgCensusAdmissionSite{
 	"outbound_recovery_shared_closing.go:(mqttAccountSessionManager).stepSharedClosing": {
 		admission: "cw.admit = func() bool { return as.admitRecoveryAttempt(root.ID, b) }", registeredBy: "visitRecoveryRoot"},
 	"lifecycle_retirement.go:(mqttAccountSessionManager).sweepLifecycles": {
+		admission:    "admit := func() bool { _, _, idle := as.admitForegroundOrIdle(id) return idle == nil }",
+		registration: []string{"deregister := as.registerForegroundActor(id)", "defer deregister()"}},
+	"receipt_drive.go:(mqttAccountSessionManager).driveReceiptAdmitted": {
 		admission:    "admit := func() bool { _, _, idle := as.admitForegroundOrIdle(id) return idle == nil }",
 		registration: []string{"deregister := as.registerForegroundActor(id)", "defer deregister()"}},
 	"shared_lifecycle_sweep.go:(mqttAccountSessionManager).sweepAcqReleaseVerdicts": {
@@ -653,6 +659,8 @@ var fgCensusAdmittedAttempts = map[string]fgCensusAdmittedAttempt{
 	"will_anchor_ops.go:(mqttAccountSessionManager).runAnchorTransition":     {"admit", "commitAuthorityTransition"},
 	"generation_boundary.go:(mqttJSA).createFencedGenRecord":                 {"admit", "createFencedGenRecordOnce"},
 	"outbound_floor.go:(mqttJSA).deleteRetiredPositionsUpTo":                 {"admit", "opAdvanceFloor"},
+	"receipt_drive.go:(mqttJSA).driveReceipt":                                {"admit", "progressAuthority"},
+	"outbound_transition.go:(mqttJSA).abortTransition":                       {"admit", "abortFencedOnce"},
 	"shared_lifecycle_ops.go:(mqttJSA).sealSharedLedger":                     {"admits", "commitSharedLifecycleBatch"},
 	"shared_lifecycle_ops.go:(mqttJSA).executeSharedRelease":                 {"admits", "commitSharedLifecycleBatch"},
 	"shared_release_fence.go:(mqttJSA).fenceSharedRelease":                   {"admit", "opFenceSharedRelease"},

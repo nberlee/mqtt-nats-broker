@@ -213,6 +213,8 @@ func TestOutcomeDecodeIsVerdictScoped(t *testing.T) {
 		"committed without digest":                    testWithout(t, committed, "digest"),
 		"scope absent":                                testWithout(t, committed, "scope"),
 		"lifecycle scope on a generation-scoped kind": testWith(t, committed, "scope", `"L.0000000002"`),
+		"generation receipt naming no receipt batch":  testWith(t, committed, "scope", `"`+testGen+`"`),
+		"receipt batch of the wrong shape":            testWith(t, committed, "scope", `"`+testGen+`.short"`),
 	} {
 		if _, err := mqttDecodeTransitionOutcome([]byte(body), testID, testEpoch, "txn-1"); err == nil {
 			t.Fatalf("an outcome with %s was admitted", name)
@@ -352,9 +354,14 @@ func TestDigestBindsTheWholeMutation(t *testing.T) {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+// testReceiptBatch is a well-formed receipt batch token.
+const testReceiptBatch = "BATCHBATCHBATCHBATCH01"
+
+// testAuthorityAttempt is a receipted generation attempt as stamped into its receipt batch, the
+// form its receipt carries.
 func testAuthorityAttempt() *mqttTransitionAttempt {
 	return &mqttTransitionAttempt{
-		ID: testID, Epoch: testEpoch, Txn: "txn-1", Scope: testGen, Op: "op-1",
+		ID: testID, Epoch: testEpoch, Txn: "txn-1", Scope: mqttBatchScope(testGen, testReceiptBatch), Op: "op-1",
 		Kind: mqttTransitionAdmitExchange, PrevTxn: "own-0",
 		Rev: 2, Gen: testGen, Tenure: "tenure-0", OwnerTxn: "own-0",
 	}

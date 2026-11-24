@@ -649,8 +649,8 @@ func (sess *mqttSession) recordRecoveredPubRec(ref mqttInflightSlotRef) mqttReco
 			Register: cur, RegisterSeq: smsg.Sequence,
 		}); aerr != nil {
 			// Re-read: a landed batch behind a lost response shows pubrel_intended. Spaced only
-			// when the batch reached its commit (a handle), where a same-session commit defeats it.
-			contended = out.Handle != nil
+			// when the batch reached its commit, where a same-session commit defeats it.
+			contended = out.Sent
 			continue
 		}
 		return mqttRecoveredPubRecRecorded
@@ -942,6 +942,10 @@ func (sess *mqttSession) acquirePubRelThroughAuthority(c *client, ref mqttInflig
 		}
 		if errors.Is(aerr, errMQTTEntitlementEnded) {
 			return 0, nil, false, true
+		}
+		// A SPENT RECEIPT BUDGET gives the acquisition up unsent (receipt_pressure.go).
+		if errors.Is(sess.relieveReceiptBudget(aerr, ent.Gen), errMQTTReceiptPressure) {
+			return 0, nil, false, false
 		}
 		// A handle says the batch reached its commit, where a same-session commit defeats it; a
 		// refusal before it (the phase, the completion rules, the binding) is re-attempted unspaced.
@@ -2090,9 +2094,9 @@ func (sess *mqttSession) mqttTerminalizeOnPubComp(c *client, ref mqttInflightSlo
 				Register: cur, RegisterSeq: smsg.Sequence,
 			}); aerr != nil {
 				// The next iteration's load IS the authoritative re-read: a landed batch behind
-				// a lost response shows pubrel_terminal there. A handle says the batch reached
-				// its commit (not that it was lost there); a refusal before it is re-read at once.
-				contended = out.Handle != nil
+				// a lost response shows pubrel_terminal there. Sent says the batch reached its
+				// commit (not that it was lost there); a refusal before it is re-read at once.
+				contended = out.Sent
 				continue
 			}
 			// ACKNOWLEDGED: the completion is durable. The op returns the commit member's

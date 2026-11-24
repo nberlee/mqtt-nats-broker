@@ -640,14 +640,25 @@ limits:
   floor"): a resume, a custody census, an admission's identifier-exclusivity check and a
   shared release fence read `[Lo, Hi]`, not the generation's history, and the exchange
   records and duty entries of reclaimed positions are physically deleted. What remains:
-  - **A serving generation's storage is still unbounded.** Every transition's outcome,
-    every acquisition's action record, every resource record, closure and certificate
-    stays on `$MQTT.inflight.` until its generation retires
-    ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133)); a production
-    persistent QoS 1 subscriber accumulated about 180k such records a day
-    ([issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192));
-    [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114)
-    reclaims a live generation's exchanges and duties only.
+  - **A serving generation's outcomes are reclaimed by the run that wrote them, and only
+    by it** ([issue #192](https://github.com/nberlee/mqtt-nats-broker/issues/192)). A
+    broker run that ends without its graceful shutdown leaves its unpurged receipt batches:
+    at most 4096 receipts per client and generation per such run (the open batch, its
+    settled neighbours and any attempt left undecided), reclaimed only by the generation's
+    purge. Across many unclean exits of one long-lived generation this is unbounded until
+    the generation retires; a Clean Start or session expiry ends it. A receipt the store
+    returns corrupt or contradictory decides nothing and keeps its batch (up to 256
+    receipts) and its share of the budget until the generation's purge. A generation whose
+    budget is spent has its fresh source deliveries withheld for an AckWait at a time until
+    its settled batches are purged; a retained replay is not withheld: its admission refused
+    at the spent budget is retried by the replay step and, once those attempts are spent,
+    the snapshot is SKIPPED (the retained loss disposition stated under the retained replay).
+  - **The rest of a serving generation's records still wait for its retirement**: every
+    resource record, closure and certificate, and every lifecycle-scoped outcome (about
+    four per reconnect of one lifecycle)
+    ([issue #133](https://github.com/nberlee/mqtt-nats-broker/issues/133));
+    [issue #114](https://github.com/nberlee/mqtt-nats-broker/issues/114) and issue #192
+    reclaim a live generation's exchanges, duties and actions.
   - **An obligation that never ends in a live generation is carried, not reclaimed**: a
     delivery abandoned on an ACL deny that the client never acknowledges, a shared
     delivery stuck at Publish after another member acknowledged its source, and a
