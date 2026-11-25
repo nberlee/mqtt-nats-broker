@@ -627,6 +627,9 @@ func TestAcquisitionBatchUnresolvedAttemptIsSettledBeforeItsTokensAreReleased(t 
 					subjects = append(subjects, e.subj)
 				}
 			}
+			// A request whose reply was lost was SENT: the late send below is that submission
+			// landing.
+			testLoseSubmission(t, sess.jsa, at)
 			return 0, errors.New("the batch request timed out")
 		}
 		return send()

@@ -16,6 +16,7 @@
 package mqtt
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -97,51 +98,41 @@ func TestCompletionWritesNoAuthority(t *testing.T) {
 	}
 }
 
-// An authority-free attempt's outcome is decided by its receipt alone: committed with the
-// retained digest is LANDED and stays LANDED however far the authority moves afterwards
-// (nothing it installed can be superseded); an absent receipt is UNRESOLVED (the batch may yet
-// commit); an aborted one is NEVER LANDED.
+// An acknowledgement advance writes no outcome (issue #192): it is arbitrated by its exchange
+// member's CAS, so its commit returns no handle, stores no outcome record for anyone to resolve,
+// and an abort of it is refused because it has no receipt to contend for.
 //
-// Mutation M-L1b: classify an authority-free attempt against the authority's revision like
-// every other kind -> the landed advance does not resolve LANDED once an admission moves the
-// authority.
-func TestCompletionOutcomeResolvesLanded(t *testing.T) {
-	e, done, nonce := testCompletionWorld(t, "completion-outcome")
+// Mutation: let the advance write its receipt again (mqttKindWritesReceipt true for it) -> the
+// commit returns a handle and stores an outcome.
+func TestCompletionWritesNoOutcome(t *testing.T) {
+	e, done, nonce := testCompletionWorld(t, "completion-no-outcome")
 	defer done()
 	jsa := &e.asm.jsa
 
+	var attempt mqttTransitionAttempt
+	testArmTransitionSeam(t, jsa, func(tr *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		if tr.Attempt.Kind == mqttTransitionAdvanceExchange {
+			attempt = *tr.Attempt
+		}
+		return send()
+	})
 	out, err := testAdvanceLive(t, jsa, e.id, e.epoch, testGen, nonce, mqttExchangePubRecObserved)
-	if err != nil || out.Handle == nil {
-		t.Fatalf("the PUBREC advance was refused or returned no handle: %v", err)
+	if err != nil {
+		t.Fatalf("the PUBREC advance was refused: %v", err)
 	}
-	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
-		t.Fatalf("the landed advance resolves %v, want LANDED", v)
+	if attempt.Txn == _EMPTY_ {
+		t.Fatal("fixture: the advance never reached the commit")
 	}
-	// An ADMISSION moves the authority's revision; the advance's answer does not change.
-	before := jsa.loadOutboundAuthority(e.id, e.epoch)
+	if out.Handle != nil {
+		t.Fatal("the advance returned a handle, so a caller could resolve an outcome that is never written")
+	}
+	if _, _, st := jsa.loadTransitionOutcome(e.id, e.epoch, attempt.Scope, attempt.Txn); st != mqttOutboundAbsent {
+		t.Fatalf("the advance's outcome reads %v, want absent: it writes none", st)
+	}
 	second := testAdmitOn(t, e, "txn-adm-2", 8, "inc-src")
-	if after := jsa.loadOutboundAuthority(e.id, e.epoch); after.rec.Rev == before.rec.Rev {
-		t.Fatal("fixture: the second admission did not move the authority, so nothing here is tested")
-	}
-	if v := jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
-		t.Fatalf("after an admission moved the authority the advance resolves %v, want LANDED", v)
-	}
-
-	// ABSENT: composed and frozen, never sent.
 	unsent := testComposeAck(t, e, second, mqttExchangePubRecObserved)
-	h, herr := mqttNewTransitionHandle(unsent)
-	if herr != nil {
-		t.Fatalf("freezing the unsent attempt's handle: %v", herr)
-	}
-	if v := jsa.resolveTransitionHandle(h); v != mqttTransitionUnresolved {
-		t.Fatalf("an attempt with no receipt resolves %v, want UNRESOLVED", v)
-	}
-	// ABORTED: the settlement a caller with an ambiguous send writes.
-	if aerr := jsa.abortTransition(unsent.Attempt, nil); aerr != nil {
-		t.Fatalf("aborting the unsent attempt: %v", aerr)
-	}
-	if v := jsa.resolveTransitionHandle(h); v != mqttTransitionNeverLanded {
-		t.Fatalf("an aborted attempt resolves %v, want NEVER LANDED", v)
+	if aerr := jsa.abortTransition(unsent.Attempt, nil); aerr == nil || !strings.Contains(aerr.Error(), "writes no receipt") {
+		t.Fatalf("an abort of an advance was not refused for its missing receipt: %v", aerr)
 	}
 }
 

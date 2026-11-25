@@ -539,6 +539,8 @@ func TestReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 			if tr.Attempt.Kind != mqttTransitionFencePendingDisposal {
 				return send()
 			}
+			// The advance was SENT and its reply lost, so only the store can decide it.
+			testLoseSubmission(t, &r.e.asm.jsa, tr)
 			r.e.s.willDispatchMu.Lock()
 			r.e.s.willDispatchClosed = true
 			r.e.s.willDispatchMu.Unlock()
@@ -587,8 +589,14 @@ func TestReclaimAdvanceHonoursShutdownAndForeground(t *testing.T) {
 			if tr.Attempt.Kind != mqttTransitionFencePendingDisposal {
 				return send()
 			}
-			if _, err := send(); err != nil {
-				return 0, err
+			// The reply is really lost (the batch's commit member is the authority): a reply the
+			// send observed would decide the advance Landed in the receipt ledger, and the
+			// resolution would read nothing back.
+			disarm := testLoseAcknowledgement(t, &r.e.asm.jsa, mqttOutboundAuthoritySubject(getHash(r.e.sess.id)))
+			_, err := send()
+			disarm()
+			if !errors.Is(err, errMQTTJSARequestTimeout) {
+				t.Errorf("fixture: the advance's reply was not lost: %v", err)
 			}
 			return 0, errors.New("test: the advance landed but its reply is lost")
 		}

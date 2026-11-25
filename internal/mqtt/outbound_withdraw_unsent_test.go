@@ -530,7 +530,10 @@ func TestWithdrawNeverLandedIsReattempted(t *testing.T) {
 				t.Errorf("composing: %v", err)
 				return mqttOpOutcome{}, err
 			}
-			h, _ := mqttNewTransitionHandle(tr)
+			// commitOp's handle, over an attempt that was never sent: the ledger settles it as
+			// never landed, which is what a send refused before it left this process establishes.
+			h := testFrozenHandle(t, jsa, tr)
+			jsa.receipts().unsent(h.rec)
 			return mqttOpOutcome{Handle: h}, errors.New("test: the send failed")
 		}
 		return write()

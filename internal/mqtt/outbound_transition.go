@@ -287,11 +287,6 @@ func (jsa *mqttJSA) classifyAgainstOutcome(a *mqttTransitionAttempt, wantDigest 
 	if wantDigest != o.Digest {
 		return mqttTransitionUnresolved
 	}
-	// AN AUTHORITY-FREE ATTEMPT installed no ownership, so nothing about it can have been
-	// superseded: a committed receipt whose digest matches is final.
-	if mqttAttemptAuthorityFree(a.Kind, a.Rev) {
-		return mqttTransitionLanded
-	}
 	al := jsa.loadOutboundAuthority(a.ID, a.Epoch)
 	if al.status != mqttOutboundValid {
 		return mqttTransitionUnresolved

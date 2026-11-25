@@ -581,8 +581,10 @@ func TestAdmissionBatchLostResponseSettlesEveryParticipantOnce(t *testing.T) {
 // authority revision; SUPERSEDED means it committed, so every participant is charged at once and
 // none is submitted again.
 func TestAdmissionBatchSupersededReceiptIsALanding(t *testing.T) {
-	rig := newTestBatchRig(t, "ab-super", 1, nil)
+	rig := newTestBatchRig(t, "ab-super", 1, func(o *Options) { o.MQTT.JSAPITimeout = time.Second })
 	sess := rig.sess()
+	authSubject := mqttOutboundAuthoritySubject(getHash(sess.id))
+	var lost atomic.Bool
 	var checked atomic.Int32
 	var mu *sync.Mutex
 	var evs *[]testBatchEvent
@@ -592,8 +594,17 @@ func TestAdmissionBatchSupersededReceiptIsALanding(t *testing.T) {
 		}
 	})
 	testOnFirstBatchCommit(t, sess, func(send func() (uint64, error)) (uint64, error) {
-		if _, err := send(); err != nil {
-			return 0, err
+		if !lost.CompareAndSwap(false, true) {
+			return send()
+		}
+		// THE RESPONSE IS LOST, not merely reported lost: an acknowledgement the send observed would
+		// decide the attempt Landed for good (receipt_ledger.go), and no later revision could then
+		// be read as SUPERSEDED. The batch's commit member is the authority.
+		disarm := testLoseAcknowledgement(t, sess.jsa, authSubject)
+		_, err := send()
+		disarm()
+		if !errors.Is(err, errMQTTJSARequestTimeout) {
+			t.Errorf("fixture: the batch's acknowledgement was not lost: %v", err)
 		}
 		if err := testBumpSessionAuthority(sess); err != nil {
 			t.Errorf("revising the authority: %v", err)

@@ -564,10 +564,7 @@ func TestALandingProofIsACommittedAttempt(t *testing.T) {
 	}
 
 	aborted, abortedLin := compose(4)
-	h, herr := mqttNewTransitionHandle(aborted)
-	if herr != nil {
-		t.Fatalf("freezing the handle: %v", herr)
-	}
+	h := testFrozenHandle(t, &e.asm.jsa, aborted)
 	if err := jsa.abortTransition(&h.attempt, nil); err != nil {
 		t.Fatalf("aborting: %v", err)
 	}
@@ -580,19 +577,25 @@ func TestALandingProofIsACommittedAttempt(t *testing.T) {
 	}
 
 	landed, landedLin := compose(5)
-	lh, _ := mqttNewTransitionHandle(landed)
-	if _, err := jsa.commitAuthorityTransition(landed); err != nil {
+	out, err := jsa.commitOp(landed)
+	if err != nil || out.Handle == nil {
 		t.Fatalf("committing: %v", err)
 	}
+	lh := out.Handle
 	if p := testProof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, landedLin); p != mqttLandingCommitted {
 		t.Fatalf("a LANDED attempt is not a landing proof (%d)", p)
 	}
-	// SUPERSEDED: another transition passes its revision; the attempt still happened.
-	testFloorAdmit(t, e, 6)
-	if v := jsa.resolveTransitionHandle(lh); v != mqttTransitionSuperseded {
+	// SUPERSEDED: an attempt that landed with its acknowledgement lost, so its record is undecided,
+	// and another transition passes its revision before it is resolved; the attempt still happened.
+	// (An acknowledged attempt's record keeps the Landed its commit decided, docs/ARCHITECTURE.md
+	// "Receipt batches", which is why this needs an attempt of its own.)
+	superseded, supersededLin := compose(6)
+	sh := testCommitLosingAck(t, jsa, superseded)
+	testFloorAdmit(t, e, 7)
+	if v := jsa.resolveTransitionHandle(sh); v != mqttTransitionSuperseded {
 		t.Fatalf("fixture: the attempt resolves %d, want superseded", v)
 	}
-	if p := testProof(jsa, []mqttCustodyAttempt{{handle: lh, lin: landedLin}}, landedLin); p != mqttLandingCommitted {
+	if p := testProof(jsa, []mqttCustodyAttempt{{handle: sh, lin: supersededLin}}, supersededLin); p != mqttLandingCommitted {
 		t.Fatalf("a SUPERSEDED attempt is not a landing proof (%d)", p)
 	}
 	// A proof for another lineage proves nothing about this one.

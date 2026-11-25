@@ -256,6 +256,17 @@ func testAdmitNothing(e *testOutboundEnv, prev *mqttOutboundAuthority, prevSeq u
 	}
 }
 
+// testStamp stamps a composed receipted generation attempt into its generation's receipt batch, in
+// place, exactly as commitOp does before it freezes a handle: every attempt a production caller can
+// resolve or abort was stamped first, and an unstamped generation scope is refused at both.
+func testStamp(t *testing.T, e *testOutboundEnv, tr *mqttAuthorityTransition) *mqttAuthorityTransition {
+	t.Helper()
+	if _, err := e.asm.jsa.receipts().prepare(tr); err != nil {
+		t.Fatalf("stamping transition %q: %v", tr.Attempt.Txn, err)
+	}
+	return tr
+}
+
 // testClosure composes the close of the generation a serving authority stands at, permanently:
 // the teardown claim batch over the client's standing record, which is the one act that closes
 // a generation (issue #133). Composed, not sent, so a fixture can resolve it, freeze a handle
@@ -291,39 +302,94 @@ func TestAbortAndCommitContendForOneSubject(t *testing.T) {
 		return al.rec, al.seq
 	}
 
-	// ABORT FIRST: the commit that follows must be refused, and nothing it carried may
-	// stand — including the authority, which is the member that matters. The attempt is
-	// composed over the authority as the abort left it, so only the outcome subject contends.
-	prev, prevSeq := current()
-	if err := e.asm.jsa.abortTransition(testAdmitNothing(e, prev, prevSeq, "txn-abort-first").Attempt, nil); err != nil {
-		t.Fatalf("the abort was refused: %v", err)
+	// THE RACE IS STAGED AT THE STORE. This run's receipt ledger refuses a submission of an attempt
+	// it has already decided (receipt_ledger.go), so a loser that waited for the winner's
+	// acknowledgement would be stopped here and never reach JetStream. The winner therefore lands
+	// with its acknowledgement parked: the ledger still holds it in flight, the loser is registered
+	// beside it, and only the store decides between them.
+	authSubject := mqttOutboundAuthoritySubject(getHash(e.id))
+	obs := testObserveJSA(t, &e.asm.jsa)
+	parkWinner := func() *mqttJSAReplyHold {
+		h := newMQTTJSAReplyHold(func(reply string) bool {
+			obs.mu.Lock()
+			defer obs.mu.Unlock()
+			return obs.api[reply] == authSubject // both batches commit on the authority
+		})
+		e.asm.jsa.testHoldReply.Store(h)
+		return h
 	}
+	receiptStands := func(scope, txn string) bool {
+		_, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, scope, txn)
+		return st == mqttOutboundValid
+	}
+
+	// ABORT FIRST: the commit that follows must be refused, and nothing it carried may
+	// stand — including the authority, which is the member that matters. The commit is composed
+	// over the authority as the abort left it, so only the outcome subject contends.
+	prev, prevSeq := current()
+	aborted := testStamp(t, e, testAdmitNothing(e, prev, prevSeq, "txn-abort-first"))
+	hold := parkWinner()
+	abortDone := make(chan error, 1)
+	go func() { abortDone <- e.asm.jsa.abortTransition(aborted.Attempt, nil) }()
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if !receiptStands(aborted.Attempt.Scope, aborted.Attempt.Txn) {
+			return errors.New("the abort has not landed")
+		}
+		return nil
+	})
+	e.asm.jsa.testHoldReply.CompareAndSwap(hold, nil)
 	prev, prevSeq = current()
 	tr := testAdmitNothing(e, prev, prevSeq, "txn-abort-first")
-	if _, err := e.asm.jsa.commitAuthorityTransition(tr); err == nil {
-		t.Fatalf("a transition committed after its own attempt was positively aborted")
+	tr.Attempt.Scope = aborted.Attempt.Scope // the same attempt's receipt subject, still in flight
+	_, cerr := e.asm.jsa.commitAuthorityTransition(tr)
+	if !mqttIsRecordCASRejection(cerr) {
+		t.Fatalf("a commit racing its own landed abort was not refused by the store's CAS: %v", cerr)
 	}
 	if after, _ := current(); after.Rev != prev.Rev || after.Txn != prev.Txn {
 		t.Fatalf("the refused batch moved the authority to %d/%q: the losing member must reject "+
 			"the whole batch", after.Rev, after.Txn)
+	}
+	hold.release(&e.asm.jsa, nil)
+	if err := <-abortDone; err != nil {
+		t.Fatalf("the abort was refused: %v", err)
 	}
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionNeverLanded {
 		t.Fatalf("an aborted attempt resolved %v, want NEVER LANDED", v)
 	}
 
 	// COMMIT FIRST: the abort that follows must fail, and the receipt must still say
-	// COMMITTED.
+	// COMMITTED. The abort is fenced beside the authority as the commit left it, so again only
+	// the outcome subject contends.
 	prev, prevSeq = current()
 	tr2 := testAdmitNothing(e, prev, prevSeq, "txn-commit-first")
-	seq, err := e.asm.jsa.commitAuthorityTransition(tr2)
-	if err != nil {
-		t.Fatalf("the transition was refused: %v", err)
+	hold = parkWinner()
+	type committed struct {
+		seq uint64
+		err error
 	}
+	commitDone := make(chan committed, 1)
+	go func() {
+		seq, err := e.asm.jsa.commitAuthorityTransition(tr2)
+		commitDone <- committed{seq, err}
+	}()
+	checkFor(t, 5*time.Second, 10*time.Millisecond, func() error {
+		if after, _ := current(); after.Txn != "txn-commit-first" {
+			return errors.New("the commit has not landed")
+		}
+		return nil
+	})
+	e.asm.jsa.testHoldReply.CompareAndSwap(hold, nil)
+	if err := e.asm.jsa.abortTransition(tr2.Attempt, nil); !mqttIsRecordCASRejection(err) {
+		t.Fatalf("an abort racing its own landed commit was not refused by the store's CAS: %v", err)
+	}
+	hold.release(&e.asm.jsa, nil)
+	c := <-commitDone
+	if c.err != nil {
+		t.Fatalf("the transition was refused: %v", c.err)
+	}
+	seq := c.seq
 	if seq == 0 {
 		t.Fatalf("the commit returned no authority sequence")
-	}
-	if err := e.asm.jsa.abortTransition(tr2.Attempt, nil); err == nil {
-		t.Fatalf("an attempt that had already committed was aborted afterwards")
 	}
 	if v := e.asm.jsa.resolveTransition(tr2); v != mqttTransitionLanded {
 		t.Fatalf("a committed attempt resolved %v, want LANDED", v)
@@ -515,7 +581,7 @@ func TestUnresolvedIsNotNeverLanded(t *testing.T) {
 	defer done()
 
 	base, baseSeq := e.bootstrap(t, "txn-1")
-	tr := testAdmitNothing(e, base, baseSeq, "txn-never-sent")
+	tr := testStamp(t, e, testAdmitNothing(e, base, baseSeq, "txn-never-sent"))
 	if v := e.asm.jsa.resolveTransition(tr); v != mqttTransitionUnresolved {
 		t.Fatalf("an attempt with no outcome resolved %v, want UNRESOLVED", v)
 	}
@@ -539,42 +605,39 @@ func TestAnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
 	defer done()
 
 	base, baseSeq := e.bootstrap(t, "txn-1")
-	x := testAdmitNothing(e, base, baseSeq, "txn-x")
-	h, err := mqttNewTransitionHandle(x)
-	if err != nil {
-		t.Fatalf("freezing X's handle failed: %v", err)
-	}
-	prevSeq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, x))
-	if err != nil {
-		t.Fatalf("X was refused: %v", err)
-	}
-	prevAuth := x.Auth
-	// TWO MORE AUTHORITY REVISIONS land over X.
-	for _, txn := range []string{"txn-x2", "txn-x3"} {
-		next := testAdmitNothing(e, prevAuth, prevSeq, txn)
-		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, next)); err != nil {
-			t.Fatalf("successor %s was refused: %v", txn, err)
-		}
-		prevAuth = next.Auth
-	}
-	// Control: readable, X is SUPERSEDED.
-	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionSuperseded {
-		t.Fatalf("X resolved %v after two successors, want SUPERSEDED", v)
-	}
-
-	// X's outcome subject - and only it - fails to read with an error that is not "no message".
-	hidden := mqttTransitionOutcomeSubject(getHash(e.id), x.Attempt.Scope, "txn-x")
+	x := testEnrolClosing(t, e, testAdmitNothing(e, base, baseSeq, "txn-x"))
+	// X's outcome subject - and only it - fails to read with an error that is not "no message",
+	// from before X is committed, so no resolution of X ever reads it.
+	var hidden atomic.Pointer[string]
 	var hits atomic.Int64
 	restore := setMQTTTestLoadLastMsgHook(func(_, subject string) error {
-		if subject == hidden {
+		if p := hidden.Load(); p != nil && subject == *p {
 			hits.Add(1)
 			return errors.New("test: the outcome read failed")
 		}
 		return nil
 	})
 	t.Cleanup(restore)
+	// X LANDS AND ITS ACKNOWLEDGEMENT IS LOST: this run's handle carries an undecided record, so
+	// the store alone decides X. The hidden subject is X's stamped one, set before the commit is
+	// sent.
+	stamp := testStamp(t, e, x)
+	subject := mqttTransitionOutcomeSubject(getHash(e.id), stamp.Attempt.Scope, "txn-x")
+	hidden.Store(&subject)
+	h := testCommitLosingAck(t, &e.asm.jsa, stamp)
+	prevAuth := x.Auth
+	prevSeq := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch).seq
+	// TWO MORE AUTHORITY REVISIONS land over X.
+	for _, txn := range []string{"txn-x2", "txn-x3"} {
+		next := testAdmitNothing(e, prevAuth, prevSeq, txn)
+		var err error
+		if prevSeq, err = e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, next)); err != nil {
+			t.Fatalf("successor %s was refused: %v", txn, err)
+		}
+		prevAuth = next.Auth
+	}
 	// ROUTE WITNESS: the read the classifier makes is INDETERMINATE, not absent.
-	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, x.Attempt.Scope, "txn-x"); st != mqttOutboundIndeterminate {
+	if _, _, st := e.asm.jsa.loadTransitionOutcome(e.id, e.epoch, stamp.Attempt.Scope, "txn-x"); st != mqttOutboundIndeterminate {
 		t.Fatalf("the hidden outcome reads back status %v, want INDETERMINATE", st)
 	}
 	before := hits.Load()
@@ -585,9 +648,15 @@ func TestAnUnreadableOutcomeIsNotNeverLanded(t *testing.T) {
 	if hits.Load() == before {
 		t.Fatal("fixture: the classifier never read X's outcome subject")
 	}
-	restore()
+	// Readable again, X is SUPERSEDED, and that verdict is X's record's from then on: hiding the
+	// outcome again does not take it back.
+	hidden.Store(nil)
 	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionSuperseded {
 		t.Fatalf("X resolved %v once its outcome was readable again, want SUPERSEDED", v)
+	}
+	hidden.Store(&subject)
+	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionSuperseded {
+		t.Fatalf("X's decided verdict changed to %v when its outcome became unreadable again", v)
 	}
 }
 
@@ -735,11 +804,12 @@ func TestSweepStaysBoundedOverArbitrationRecords(t *testing.T) {
 // consult 6 set.
 //
 // resolveTransition recomputes the digest from the assembled transition, so it serves a
-// caller still holding what it tried to write. A caller that RESTARTED holds none of that.
-// The handle is the form that survives: it retains the ANSWER — the immutable attempt
-// identity and the expected digest — rather than the inputs, and it must still classify
-// correctly after later transitions have overwritten the authority the original mutation
-// touched.
+// caller still holding what it tried to write. A caller that has let those inputs go holds
+// only the handle, which retains the ANSWER — the immutable attempt identity and the expected
+// digest — and, for an attempt whose acknowledgement was lost, it must still classify
+// correctly from the store after later transitions have overwritten the authority the
+// original mutation touched. (A handle does not outlive its process: a generation receipt's
+// only reader is the run that submitted it, docs/ARCHITECTURE.md "Receipt batches".)
 //
 // The test DISCARDS the original transition before resolving, which is the whole point: if
 // the handle needed those bytes it would be the same API under another name.
@@ -748,22 +818,27 @@ func TestHandleClassifiesWithoutTheOriginalInputs(t *testing.T) {
 	defer done()
 
 	base, baseSeq := e.bootstrap(t, "txn-1")
+	// LANDED: this run's handle over an acknowledged commit.
 	first := testAdmitNothing(e, base, baseSeq, "txn-h")
-	h, err := mqttNewTransitionHandle(first)
-	if err != nil {
-		t.Fatalf("freezing the handle failed: %v", err)
-	}
-	seq, err := e.asm.jsa.commitAuthorityTransition(testEnrolClosing(t, e, first))
-	if err != nil {
+	out, err := e.asm.jsa.commitOp(testEnrolClosing(t, e, first))
+	if err != nil || out.Handle == nil {
 		t.Fatalf("the transition under the handle was refused: %v", err)
 	}
-	if v := e.asm.jsa.resolveTransitionHandle(h); v != mqttTransitionLanded {
+	if v := e.asm.jsa.resolveTransitionHandle(out.Handle); v != mqttTransitionLanded {
 		t.Fatalf("a committed attempt resolved %v from its handle, want LANDED", v)
 	}
 
-	// THE ORIGINAL INPUTS GO AWAY. Everything after this point is what a restarted caller
-	// would have: the handle, and the store.
-	prevAuth, prevSeq := first.Auth, seq
+	// Two more attempts land with their acknowledgements lost, so their handles' records are
+	// undecided and only the store can classify them: H, and W, whose handle will be made to
+	// expect a different mutation.
+	h := testCommitLosingAck(t, &e.asm.jsa, testEnrolClosing(t, e, testAdmitNothing(e, first.Auth, out.Seq, "txn-h2")))
+	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	w := testCommitLosingAck(t, &e.asm.jsa, testEnrolClosing(t, e, testAdmitNothing(e, al.rec, al.seq, "txn-w")))
+
+	// THE ORIGINAL INPUTS GO AWAY. Everything after this point is what the caller holds: the
+	// handles, and the store.
+	al = e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
+	prevAuth, prevSeq := al.rec, al.seq
 	first = nil
 
 	// MULTIPLE successors, each overwriting the authority the original mutation wrote.
@@ -785,7 +860,7 @@ func TestHandleClassifiesWithoutTheOriginalInputs(t *testing.T) {
 	// A handle whose expected digest describes a different mutation is UNRESOLVED, not a
 	// match. This is the assertion that would fail if a handle were ever built by reading
 	// the receipt it is meant to check.
-	wrong := *h
+	wrong := *w
 	wrong.digest = "not-the-digest-that-was-committed"
 	if v := e.asm.jsa.resolveTransitionHandle(&wrong); v != mqttTransitionUnresolved {
 		t.Fatalf("a handle expecting a different mutation resolved %v, want UNRESOLVED", v)

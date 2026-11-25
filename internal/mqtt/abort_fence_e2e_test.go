@@ -61,11 +61,7 @@ func TestAnAbortIsFencedByItsGenerationsPhase(t *testing.T) {
 	base, baseSeq := e.bootstrap(t, "txn-1")
 	attempts := map[string]*mqttTransitionHandle{}
 	for _, txn := range []string{"txn-open", "txn-fenced", "txn-retired"} {
-		h, err := mqttNewTransitionHandle(testAdmitNothing(e, base, baseSeq, txn))
-		if err != nil {
-			t.Fatal(err)
-		}
-		attempts[txn] = h
+		attempts[txn] = testFrozenHandle(t, &e.asm.jsa, testAdmitNothing(e, base, baseSeq, txn))
 	}
 	// The generation is made noncurrent by its claim, and a successor serves.
 	al := e.asm.jsa.loadOutboundAuthority(e.id, e.epoch)
@@ -213,7 +209,7 @@ func TestEveryAbortAttemptIsAdmitted(t *testing.T) {
 	}
 
 	// ADMITTED TWICE, landed on the second.
-	x := testAdmitNothing(e, base, baseSeq, "txn-admitted")
+	x := testStamp(t, e, testAdmitNothing(e, base, baseSeq, "txn-admitted"))
 	asked := 0
 	undo := moved(t)
 	err := e.asm.jsa.abortTransition(x.Attempt, func() bool { asked++; return true })
@@ -226,7 +222,7 @@ func TestEveryAbortAttemptIsAdmitted(t *testing.T) {
 	}
 
 	// REFUSED ON THE RETRY: nothing written, the attempt still unresolved.
-	y := testAdmitNothing(e, base, baseSeq, "txn-refused")
+	y := testStamp(t, e, testAdmitNothing(e, base, baseSeq, "txn-refused"))
 	asked = 0
 	undo = moved(t)
 	err = e.asm.jsa.abortTransition(y.Attempt, func() bool { asked++; return asked == 1 })

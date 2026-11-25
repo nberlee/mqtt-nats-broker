@@ -353,6 +353,8 @@ func TestARetiredRebindDisposesOfItsCandidate(t *testing.T) {
 				a.Life.Outstanding = append(a.Life.Outstanding[:i], a.Life.Outstanding[i+1:]...)
 			}
 		})
+		// The rebind was SENT and its acknowledgement lost: only the store decides it.
+		testLoseSubmission(t, &e.asm.jsa, tr)
 		return 0, errors.New("test: the rebind's acknowledgement was lost")
 	})
 	if got := e.sess.rematerializeOnce(e.c, testRemat(t, e, subject, mqttLicenceOf(e.c))); got != mqttRematerializeDone {

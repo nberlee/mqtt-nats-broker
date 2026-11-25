@@ -237,12 +237,19 @@ func TestUnitCSourceReplySurvivesReplacement(t *testing.T) {
 	r, done := testNewReplEnv(t, "c4-reply-replacement")
 	defer done()
 	r.deleteMarker(t)
-	adm := r.replacingFor(t, mqttReplaceRegisterOnly, "txn-c4-replace")
-	adm.Register.SourceAckReply = testInflightAckSubject(r.occ.Dur, r.occ.Seq, 9)
-	tr, err := mqttReplacePublishTransition(adm)
-	if err != nil {
-		t.Fatal(err)
+	// The refused probes and the control are separate attempts: a transaction refused before it was
+	// sent is settled as never landed in this run's receipt ledger and never submitted again
+	// (receipt_ledger.go).
+	replacement := func(txn string) (*mqttAuthorityTransition, *mqttReplacingAdmission) {
+		adm := r.replacingFor(t, mqttReplaceRegisterOnly, txn)
+		adm.Register.SourceAckReply = testInflightAckSubject(r.occ.Dur, r.occ.Seq, 9)
+		tr, err := mqttReplacePublishTransition(adm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tr, adm
 	}
+	tr, adm := replacement("txn-c4-probe")
 	found := false
 	for i := range tr.Extra {
 		if tr.Extra[i].subj != r.regSubj {
@@ -265,7 +272,8 @@ func TestUnitCSourceReplySurvivesReplacement(t *testing.T) {
 	if !found {
 		t.Fatal("no replacing register member")
 	}
-	if _, err := r.asm.jsa.commitAuthorityTransition(tr); err != nil {
+	control, _ := replacement("txn-c4-replace")
+	if _, err := r.asm.jsa.commitAuthorityTransition(control); err != nil {
 		t.Fatal(err)
 	}
 }

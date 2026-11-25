@@ -52,26 +52,33 @@ func TestExchangeAdmittedOnlyWithItsRegister(t *testing.T) {
 	auth, authSeq := e.bootstrap(t, "txn-1")
 	jsa := &e.asm.jsa
 
-	x := &mqttOutboundExchange{
-		ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Nonce: mqttNewInflightNonce(),
-		PI: 7, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: "txn-adm", Tenure: auth.Tenure,
+	// Each attempt is composed afresh: a transaction refused before it was sent is settled as never
+	// landed in this run's receipt ledger and is never submitted again (receipt_ledger.go).
+	admission := func(txn string) (*mqttAuthorityTransition, *mqttOutboundExchange) {
+		x := &mqttOutboundExchange{
+			ID: e.id, Epoch: e.epoch, Gen: auth.Gen, Nonce: mqttNewInflightNonce(),
+			PI: 7, QoS: 1, Phase: mqttExchangePublish, AdmitTxn: txn, Tenure: auth.Tenure,
+		}
+		tr, err := testAdmitPublishTr(t, jsa, auth, authSeq, txn, "op-"+txn, x)
+		if err != nil {
+			t.Fatalf("composing the admission: %v", err)
+		}
+		return tr, x
 	}
-	full, err := testAdmitPublishTr(t, jsa, auth, authSeq, "txn-adm", "op-adm", x)
-	if err != nil {
-		t.Fatalf("composing the admission: %v", err)
-	}
-	bare := testWithoutSlotMembers(full)
-	if len(bare.Extra) >= len(full.Extra) {
-		t.Fatalf("fixture: no register or marker member was removed (%d of %d)", len(bare.Extra), len(full.Extra))
+	probe, px := admission("txn-bare")
+	bare := testWithoutSlotMembers(probe)
+	if len(bare.Extra) >= len(probe.Extra) {
+		t.Fatalf("fixture: no register or marker member was removed (%d of %d)", len(bare.Extra), len(probe.Extra))
 	}
 	if _, err := jsa.commitAuthorityTransition(bare); err == nil ||
 		!strings.Contains(err.Error(), "with no register beside it") {
 		t.Fatalf("an exchange admitted with no register was not refused by its own rule: %v", err)
 	}
-	if xr, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, auth.Gen, x.Nonce); xr != nil {
+	if xr, _, _ := jsa.loadOutboundExchange(e.id, e.epoch, auth.Gen, px.Nonce); xr != nil {
 		t.Fatalf("the refused admission installed its exchange: %+v", xr)
 	}
 	// The control: the same admission WITH its register and marker lands.
+	full, _ := admission("txn-adm")
 	if _, err := jsa.commitAuthorityTransition(full); err != nil {
 		t.Fatalf("the admission with its register was refused: %v", err)
 	}

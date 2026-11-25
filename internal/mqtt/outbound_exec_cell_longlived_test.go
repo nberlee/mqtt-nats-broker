@@ -730,7 +730,11 @@ var testLongLivedStandingLoops = []string{
 	"(*mqttAccountSessionManager).sendJSAPIrequests(",
 	"(*mqttAccountSessionManager).cleanupRetainedMessageCache(",
 	"(*mqttAccountSessionManager).retainedObserverLoop(",
-	"(*Server).mqttCreateAccountSessionManager.func4()",
+	"(*mqttAccountSessionManager).runReceiptDriver(",
+	// The periodic sweep loop is an anonymous closure of the constructor, so it is matched by the
+	// constructor's closure prefix rather than by its position among them, which shifts whenever a
+	// loop is added there.
+	"(*Server).mqttCreateAccountSessionManager.func",
 }
 
 // testLongLivedGoroutineID parses the id from a goroutine dump's header line ("goroutine N [...]:").

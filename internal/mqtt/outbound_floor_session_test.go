@@ -335,11 +335,7 @@ func TestAdmissionContinuityDoesNotNakAReclaimedAdmission(t *testing.T) {
 		if err != nil {
 			t.Fatalf("composing: %v", err)
 		}
-		h, herr := mqttNewTransitionHandle(tr)
-		if herr != nil {
-			t.Fatalf("freezing: %v", herr)
-		}
-		return tr, h, x.Nonce
+		return tr, testFrozenHandle(t, jsa, tr), x.Nonce
 	}
 	// The shim's own NATS connection: the NAK is published through it, and a subscription on it
 	// sees it (no echo suppression in this rig).
