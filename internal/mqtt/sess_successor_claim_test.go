@@ -367,7 +367,7 @@ func TestBoundRejectionNilRebindOwesNothing(t *testing.T) {
 	if err := e.asm.lockSession(e.sess, nil); err != nil {
 		t.Fatalf("stage the contended gate: %v", err)
 	}
-	outcome, stale := b.bc.settleBoundRejectionGated(e.asm, e.sess)
+	outcome, stale, _ := b.bc.settleBoundRejectionGated(e.asm, e.sess)
 	e.asm.unlockSession(e.sess)
 
 	if outcome != mqttBoundDisplaced {
@@ -408,7 +408,7 @@ func TestBoundRejectionLocalReplacementDiscards(t *testing.T) {
 	if err := e.asm.lockSession(e.sess, other.bc); err != nil {
 		t.Fatalf("stage the contended gate: %v", err)
 	}
-	outcome, _ := b.bc.settleBoundRejectionGated(e.asm, e.sess)
+	outcome, _, _ := b.bc.settleBoundRejectionGated(e.asm, e.sess)
 	e.asm.unlockSession(e.sess)
 
 	if outcome != mqttBoundDisplaced {

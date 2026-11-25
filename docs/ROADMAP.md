@@ -990,9 +990,11 @@ reproduced yet.
   unanswered-request sequence per filter, with the over-attribution stated. Done 2026-11-24
   ([issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187)).
 
-- [ ] Fourteen clients on one pod disposed with 0x89 within 26 s, with nothing logged:
-  decide whether the session records' absence was real or the store misreported it
-  ([issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190)).
+- [ ] Determine whether the fourteen session-record absences reported on 2026-11-18 were real
+  or misreported ([issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190)). The
+  candidate disposal routes are source-verified, and since 2026-11-25 Warn diagnostics record
+  each route's observations. The incident stays open until the owner supplies the
+  contemporaneous record and authority evidence and the first reconnects' results.
 
 - [ ] The ledger high-water refusal lacks the stale-expectation marker, so a delivery
   admission gives up at the base budget and the message is re-offered out of order

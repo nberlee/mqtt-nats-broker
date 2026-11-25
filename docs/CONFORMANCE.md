@@ -4669,11 +4669,29 @@ What it does NOT do:
     [issue #40](https://github.com/nberlee/mqtt-nats-broker/issues/40)'s
     site 3 exists to refuse. Absence is a real ownership fact — only a party that claimed
     the record at our sequence can remove it — but it is **not a successor fact**. No new
-    connection need exist, and none is asserted. The disposal is right either way and
-    the client's reconnect correctly gets a fresh session. **The disposal reports one
-    `0x89` for every route to it**: a vanished record, an unreadable one, an undecodable
-    one, a below-base one and a valid-shaped stranger all report it, and an operator
-    cannot tell an ordinary retirement from a store fault from that line;
+    connection need exist, and none is asserted. When the record really was removed, the
+    disposal is right and the client's reconnect correctly gets a fresh session. When the
+    store only failed to load it, the broker reads the absence the store reported, and the
+    fresh session is the
+    [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111) /
+    [issue #112](https://github.com/nberlee/mqtt-nats-broker/issues/112) exposure, not a
+    broker guarantee. **The disposal reports one `0x89` for every route to it**: a vanished
+    record, an unreadable one, an undecodable one, a below-base one and a valid-shaped
+    stranger all report it. Since
+    [issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190), the deleted-record
+    routes log their own observations at Warn (`docs/ARCHITECTURE.md`, "What each step
+    logs"). The arming read logs the sequence, the generation and the store's answer, once
+    per arm. The licensed retirement logs the standing its proof evaluated, the sequence
+    and the absence read before its disposal line; its refusal logs the standing it
+    evaluated, at most once per arm and none when it refused before evaluating it. The
+    bound probe logs the packet, the base sequence, the CAS rejection and the readback
+    before its disposal line, and evaluates no standing. The eviction worker, CONNECT,
+    resolver and subscription-arbitration routes still log only the vocabulary line.
+    **Even on the reporting routes, an operator cannot tell a removed record from one the
+    store could not load**: both give `wrong last sequence: 0` and "no message"
+    ([issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) /
+    [issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111)). The lines name
+    the route and the observations, not the cause;
   - **without that licence, the deleted-record shape does NOT converge a bound session
     that never sends another packet.** Unlike the moved-record shape — where the eviction
     worker disposes a bound session itself — arming the marker hands the case to the

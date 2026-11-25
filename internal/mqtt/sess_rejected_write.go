@@ -177,7 +177,7 @@ func (sess *mqttSession) settleRecordRejection(asm *mqttAccountSessionManager) m
 		// arbitrated. The marker stays armed and the next pass tries again.
 		return mqttRejectionKeep
 	}
-	verdict := sess.probeRecordRejectionInTx(tok)
+	verdict, _ := sess.probeRecordRejectionInTx(tok)
 	// Plain, never endRecordTxNewGeneration: on every arm but the landed one nothing was
 	// mutated, and the landed one is an ordinary save.
 	if terr := sess.endRecordTx(tok); terr != nil {
@@ -196,10 +196,30 @@ func (sess *mqttSession) settleRecordRejection(asm *mqttAccountSessionManager) m
 	return verdict
 }
 
-// probeRecordRejectionInTx is settleRecordRejection's body, with the fence held.
+// mqttRejectionProbeEvidence is what a probe's verdict was decided from: the base its CAS
+// named, the stream's rejection of it, and the readback. It decides nothing; a disposal
+// reports it, because the vocabulary line is the same for every route (issue #190).
+type mqttRejectionProbeEvidence struct {
+	baseSeq uint64
+	casErr  error
+	readSeq uint64 // the readback's sequence when a record was there
+	readErr error
+}
+
+// String renders the evidence for a disposal's log line, the store's answers verbatim.
+func (ev mqttRejectionProbeEvidence) String() string {
+	read := fmt.Sprintf("at sequence %d", ev.readSeq)
+	if ev.readErr != nil {
+		read = fmt.Sprintf("absent (%v)", ev.readErr)
+	}
+	return fmt.Sprintf("was rejected at sequence %d (%v) and the record then read %s", ev.baseSeq, ev.casErr, read)
+}
+
+// probeRecordRejectionInTx is settleRecordRejection's body, with the fence held. It also
+// returns what the verdict was decided from.
 //
 // No lock held on entry. Performs JetStream requests.
-func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVerdict {
+func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) (mqttRejectionVerdict, mqttRejectionProbeEvidence) {
 	// RE-READ the predicate inside the fence. The caller's pre-gate sample is a
 	// check-then-act: the fence is what serializes record writers, so only a check taken
 	// under it can see a save that landed, or an ambiguity that was armed, since.
@@ -213,7 +233,7 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 	ackWID, ackPWID := sess.wid, sess.pwid
 	sess.mu.Unlock()
 	if !pending {
-		return mqttRejectionKeep
+		return mqttRejectionKeep, mqttRejectionProbeEvidence{}
 	}
 
 	// THE PROBE: current memory, its own CAS at sess.seq. It can never overwrite a
@@ -232,6 +252,10 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 		smsg, lerr = sess.jsa.loadSessionMsg(domainTk, idHash)
 	}
 	verdict := classifyRejectedProbe(outcome, detail, smsg, lerr, ackWID, ackPWID)
+	ev := mqttRejectionProbeEvidence{baseSeq: detail.baseSeq, casErr: detail.rawErr, readErr: lerr}
+	if smsg != nil {
+		ev.readSeq = smsg.Sequence
+	}
 	if verdict == mqttRejectionForked {
 		// Inside the fence that classified, and covering BOTH rejection halves at once —
 		// which is why the mint lives here rather than in either settlement's disposal arm.
@@ -246,7 +270,7 @@ func (sess *mqttSession) probeRecordRejectionInTx(tok recordTx) mqttRejectionVer
 	if verdict == mqttRejectionKeep && err != nil {
 		sess.jsa.c.Debugf("MQTT: rejection probe for session %q established nothing: %v", sess.id, err)
 	}
-	return verdict
+	return verdict, ev
 }
 
 // errMQTTSessionOwnershipUnsettled is the sentinel the bound settlement fails closed with:
@@ -373,7 +397,7 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 		return false, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
 	}
 
-	outcome, stale := c.settleBoundRejectionGated(asm, sess)
+	outcome, stale, ev := c.settleBoundRejectionGated(asm, sess)
 	switch outcome {
 	case mqttBoundServe:
 		return true, nil
@@ -388,6 +412,10 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 			// the only one this tail can owe. It used to say taken-over, which claimed a
 			// successor the probe never found: a definite rejection proves the subject moved
 			// past our base and nothing about who moved it. issue #86.
+			//
+			// The route and what the store answered go first, because the vocabulary line
+			// is shared by every route to it (issue #190).
+			stale.Warnf("MQTT: session %q: the record probe before a %s packet %v", sess.id, mqttPacketTypeName(pt), ev)
 			stale.mqttNotifyForeignDisposal(sess.id, mqttDisposalOwnershipUnsettled)
 			stale.closeConnection(mqttDisposalOwnershipUnsettled.closeReason)
 		}
@@ -401,6 +429,31 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("session %q: %w", sess.id, errMQTTSessionOwnershipUnsettled)
+}
+
+// mqttPacketTypeName names a control packet type the rejection gate can hold, for its log line.
+func mqttPacketTypeName(pt byte) string {
+	switch pt & mqttPacketMask {
+	case mqttPacketPub:
+		return "PUBLISH"
+	case mqttPacketPubAck:
+		return "PUBACK"
+	case mqttPacketPubRec:
+		return "PUBREC"
+	case mqttPacketPubRel:
+		return "PUBREL"
+	case mqttPacketPubComp:
+		return "PUBCOMP"
+	case mqttPacketSub:
+		return "SUBSCRIBE"
+	case mqttPacketUnsub:
+		return "UNSUBSCRIBE"
+	case mqttPacketPing:
+		return "PINGREQ"
+	case mqttPacketAuth:
+		return "AUTH"
+	}
+	return fmt.Sprintf("type 0x%02x", pt&mqttPacketMask)
 }
 
 // settleBoundRejectionGated is mqttGateDispatchOnRejection's gate-held half: it claims the
@@ -432,8 +485,10 @@ func (c *client) mqttGateDispatchOnRejection(pt byte) (bool, error) {
 //   - Still ours after the spin: nothing is displacing us that we can see, so this is an
 //     ordinary no-verdict outcome and says 0x89.
 //
+// A disposal also returns the probe's evidence, for its caller's log line.
+//
 // Runs on the client's readLoop. No lock held on entry. Performs JetStream requests.
-func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess *mqttSession) (mqttBoundSettlement, *client) {
+func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess *mqttSession) (mqttBoundSettlement, *client, mqttRejectionProbeEvidence) {
 	if err := asm.lockSessionForTeardown(sess, c); err != nil {
 		sess.mu.Lock()
 		stale := sess.c
@@ -447,7 +502,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// discards. issue #86.
 		switch {
 		case stale == c:
-			return mqttBoundUnsettled, nil
+			return mqttBoundUnsettled, nil, mqttRejectionProbeEvidence{}
 		case stale != nil:
 			// A local takeover owns this connection's fate. Apply the armed half of its Will
 			// rule here, so whichever side notices the displacement first discards an armed
@@ -458,15 +513,16 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		}
 		// stale == nil: a disposal already ran, and THAT disposal owns the Will action. Doing
 		// one here too would leave two paths believing they owed it.
-		return mqttBoundDisplaced, nil
+		return mqttBoundDisplaced, nil, mqttRejectionProbeEvidence{}
 	}
 	defer asm.unlockSession(sess)
 
-	switch sess.settleRecordRejectionBound() {
+	verdict, ev := sess.settleRecordRejectionBound()
+	switch verdict {
 	case mqttRejectionOurs:
 		// The probe's CAS arbitrated ownership our way, and the advanced sequence retired
 		// the marker. This connection is served again from the fast path.
-		return mqttBoundServe, nil
+		return mqttBoundServe, nil, mqttRejectionProbeEvidence{}
 	case mqttRejectionForeign:
 		// The probe found a record that is not ours. It does NOT identify who holds it, so
 		// the Will is consumed rather than discarded — the forked arm below already refuses
@@ -481,9 +537,9 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		if !d.applied {
 			// The identity check refused: the session was rebound while this verdict was
 			// being reached, so the disposal — and the notification — are not ours.
-			return mqttBoundDisplaced, nil
+			return mqttBoundDisplaced, nil, mqttRejectionProbeEvidence{}
 		}
-		return mqttBoundDisposed, d.stale
+		return mqttBoundDisposed, d.stale, ev
 	case mqttRejectionForked:
 		// A body CLAIMING the parent of the record we were acknowledged for: our own write was
 		// erased by something not demonstrably a successor of ours, and nothing established
@@ -503,7 +559,7 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		// demonstrated takeover owns the Will's fate", when nothing there demonstrated
 		// one. issue #86 made it consume, which is what this arm always did — suppressing a
 		// Will nothing arbitrated was the defect, on either arm.
-		return mqttBoundUnsettled, nil
+		return mqttBoundUnsettled, nil, mqttRejectionProbeEvidence{}
 	case mqttRejectionKeep:
 		// Nothing was arbitrated by the probe — but the fence it took may have been
 		// waiting on a writer whose save LANDED, which settles the question without any
@@ -513,14 +569,14 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 		still := sess.recordRejectionGatesServingLocked()
 		sess.mu.Unlock()
 		if still {
-			return mqttBoundUnsettled, nil
+			return mqttBoundUnsettled, nil, mqttRejectionProbeEvidence{}
 		}
-		return mqttBoundServe, nil
+		return mqttBoundServe, nil, mqttRejectionProbeEvidence{}
 	default: // mqttRejectionUnresolved
 		// The probe's own write is ambiguous, so it established nothing either. Fail
 		// closed and let the uncertainty machinery — which now owns this session — reach
 		// a verdict on its own schedule.
-		return mqttBoundUnsettled, nil
+		return mqttBoundUnsettled, nil, mqttRejectionProbeEvidence{}
 	}
 }
 
@@ -542,18 +598,18 @@ func (c *client) settleBoundRejectionGated(asm *mqttAccountSessionManager, sess 
 // The caller holds the ownership gate, claimed as the bound client.
 //
 // No lock held on entry. Performs JetStream requests.
-func (sess *mqttSession) settleRecordRejectionBound() mqttRejectionVerdict {
+func (sess *mqttSession) settleRecordRejectionBound() (mqttRejectionVerdict, mqttRejectionProbeEvidence) {
 	// The same pre-fence window the unbound settlement fires, for the same reason: the
 	// caller's sample of the marker was taken without the fence that makes it sound. Fired
 	// here rather than inside probeRecordRejectionInTx because settleRecordRejection fires
 	// it itself, and one hook per window is what the tests key on.
 	sess.rejectionWindowHook(mqttRejectionWindowSettle)
 	tok := sess.beginRecordTx()
-	verdict := sess.probeRecordRejectionInTx(tok)
+	verdict, ev := sess.probeRecordRejectionInTx(tok)
 	// Plain, never endRecordTxNewGeneration: on every arm but the landed one nothing was
 	// mutated, and the landed one is an ordinary save.
 	if terr := sess.endRecordTx(tok); terr != nil {
 		sess.jsa.c.Errorf("MQTT: %v", terr)
 	}
-	return verdict
+	return verdict, ev
 }

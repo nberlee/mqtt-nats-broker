@@ -135,14 +135,20 @@ type mqttGoneRetireLicence struct {
 // adds for an armed ownership marker whose client will never send another packet.
 //
 // Called from reconcileResidentOwnership's GONE arm, on the periodic sweep goroutine, with
-// no lock and no gate held. Reports whether the session was disposed of.
-func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqttSession, observedSeq uint64) bool {
+// no lock and no gate held. report is set on the pass whose read ARMED the marker, and is the
+// only pass that reports a refusal on standing, so a silent client's refusal is logged at most
+// once per arm. Reports whether the session was disposed of.
+func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqttSession, observedSeq uint64, report bool) bool {
 	// 1. THE OFF-GATE PREFILTER. Cheap, and it refuses the ordinary case without ever
 	//    contending for the gate: most resident sessions are neither bound nor gone. It
 	//    establishes nothing on its own — every fact is re-proved inside the fence — so
 	//    its only job is to avoid paying for a gate hold and a drain per pass.
-	lic, ok := as.prefilterGoneRetirement(sess, observedSeq)
+	lic, standing, ok := as.prefilterGoneRetirement(sess, observedSeq)
 	if !ok {
+		if report && standing != mqttGenStandingNotEvaluated {
+			s.Warnf("MQTT deleted-record retirement: session %q stays bound: generation %q stands %s; its next "+
+				"eligible packet attempts the settlement", sess.id, lic.gen, standing)
+		}
 		return false
 	}
 
@@ -160,8 +166,11 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 	// 3. THE RETIREMENT, with the proof running after the record fence is open and
 	//    before the detach. Every error arm here has mutated nothing durable and has
 	//    left the incumbent bound.
+	var proof mqttGoneRetireProof
 	capsule, prepared, cerr := as.retireBoundIncarnationChecked(sess, func(sess *mqttSession, _ *mqttPreparedClear) error {
-		return as.proveGoneRetirement(sess, lic)
+		var perr error
+		proof, perr = as.proveGoneRetirement(sess, lic)
+		return perr
 	})
 	if cerr != nil {
 		if !errors.Is(cerr, errMQTTGoneRetireNoLicence) {
@@ -261,6 +270,10 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 			if d.stale != nil {
 				stale := d.stale
 				connTail = func() {
+					// What the proof established, ahead of the vocabulary line it shares with
+					// every other route (issue #190).
+					s.Warnf("MQTT deleted-record retirement: session %q is retired: generation %q stands %s and its "+
+						"record read absent at sequence %d (%v)", sess.id, lic.gen, proof.standing, lic.seq, proof.absence)
 					stale.mqttNotifyForeignDisposal(sess.id, voc)
 					go stale.closeConnection(voc.closeReason)
 				}
@@ -299,8 +312,11 @@ func (as *mqttAccountSessionManager) retireGoneBoundSession(s *Server, sess *mqt
 // this client for its duration, once per pass, for a session that in the common case is
 // not eligible at all.
 //
+// It also reports the standing it evaluated, or mqttGenStandingNotEvaluated when it refused
+// before asking.
+//
 // No lock held on entry; performs one JetStream read.
-func (as *mqttAccountSessionManager) prefilterGoneRetirement(sess *mqttSession, observedSeq uint64) (mqttGoneRetireLicence, bool) {
+func (as *mqttAccountSessionManager) prefilterGoneRetirement(sess *mqttSession, observedSeq uint64) (mqttGoneRetireLicence, mqttGenStanding, bool) {
 	sess.mu.Lock()
 	lic := mqttGoneRetireLicence{owner: sess.c, seq: sess.seq, gen: sess.gen}
 	uncertain, txOpen, armed := sess.seqUncertain, sess.recordTxOpen, sess.recordRejectionGatesServingLocked()
@@ -308,20 +324,33 @@ func (as *mqttAccountSessionManager) prefilterGoneRetirement(sess *mqttSession, 
 	sess.mu.Unlock()
 	switch {
 	case lic.owner == nil:
-		return lic, false // the unbound settlement already owns this shape
+		return lic, mqttGenStandingNotEvaluated, false // the unbound settlement already owns this shape
 	case uncertain || txOpen:
-		return lic, false // a write of ours is in flight or unclassified; not our question yet
+		return lic, mqttGenStandingNotEvaluated, false // a write of ours is in flight or unclassified; not our question yet
 	case !armed:
-		return lic, false // no ownership question outstanding
+		return lic, mqttGenStandingNotEvaluated, false // no ownership question outstanding
 	case lic.seq == 0 || lic.seq != observedSeq:
-		return lic, false // the sequence moved since the observation that armed the marker
+		return lic, mqttGenStandingNotEvaluated, false // the sequence moved since the observation that armed the marker
 	}
-	if standing, _ := as.genStandingByHash(idHash, lic.gen); standing != mqttGenOutstanding && standing != mqttGenRetired {
+	standing, _ := as.genStandingByHash(idHash, lic.gen)
+	if standing != mqttGenOutstanding && standing != mqttGenRetired {
 		// Current, or undecided: no licence. The marker stays armed and traffic still drives
 		// the pre-dispatch settlement. Stated residual.
-		return lic, false
+		return lic, standing, false
 	}
-	return lic, true
+	return lic, standing, true
+}
+
+// mqttGenStandingNotEvaluated is the prefilter's report for a refusal taken before it asked
+// for the generation's standing. It is not a standing: no authority or registry was read.
+const mqttGenStandingNotEvaluated mqttGenStanding = 0xff
+
+// mqttGoneRetireProof is what the in-fence proof evaluated: the standing that licensed the
+// retirement and the absence read that came last. The retirement reports it, never the
+// prefilter's earlier observation.
+type mqttGoneRetireProof struct {
+	standing mqttGenStanding
+	absence  error
 }
 
 // proveGoneRetirement is the in-fence proof, run with the record transaction open, the
@@ -337,7 +366,7 @@ func (as *mqttAccountSessionManager) prefilterGoneRetirement(sess *mqttSession, 
 // The authority is read BEFORE the final record-absence read, so the last fallible durable
 // observation is the one establishing absence. A generation's noncurrency is monotone;
 // absence is not, so absence goes last.
-func (as *mqttAccountSessionManager) proveGoneRetirement(sess *mqttSession, lic mqttGoneRetireLicence) error {
+func (as *mqttAccountSessionManager) proveGoneRetirement(sess *mqttSession, lic mqttGoneRetireLicence) (mqttGoneRetireProof, error) {
 	if h := mqttTestGoneRetireProofEntryHookV.Load(); h != nil {
 		(*h)(sess)
 	}
@@ -347,19 +376,22 @@ func (as *mqttAccountSessionManager) proveGoneRetirement(sess *mqttSession, lic 
 
 	// Durable read 1: this session's generation must still read noncurrent, outstanding or
 	// retired: a teardown or a Clean Start ended it.
-	if standing, _ := as.genStandingByHash(idHash, lic.gen); standing != mqttGenOutstanding && standing != mqttGenRetired {
-		return fmt.Errorf("%w: generation %q is not shown to be noncurrent", errMQTTGoneRetireNoLicence, lic.gen)
+	var proof mqttGoneRetireProof
+	proof.standing, _ = as.genStandingByHash(idHash, lic.gen)
+	if proof.standing != mqttGenOutstanding && proof.standing != mqttGenRetired {
+		return proof, fmt.Errorf("%w: generation %q is not shown to be noncurrent", errMQTTGoneRetireNoLicence, lic.gen)
 	}
 
 	// Durable read 2, LAST: the record is still authoritatively absent. An unreadable
 	// answer establishes nothing in either direction and refuses, as every other reader
 	// of this record does.
 	smsg, err := as.jsa.loadSessionMsg(as.domainTk, idHash)
+	proof.absence = err
 	if err != nil && isErrorOtherThan(err, JSNoMessageFoundErr) {
-		return fmt.Errorf("%w: the session record could not be read: %v", errMQTTGoneRetireNoLicence, err)
+		return proof, fmt.Errorf("%w: the session record could not be read: %v", errMQTTGoneRetireNoLicence, err)
 	}
 	if smsg != nil {
-		return fmt.Errorf("%w: a session record is present again at sequence %d",
+		return proof, fmt.Errorf("%w: a session record is present again at sequence %d",
 			errMQTTGoneRetireNoLicence, smsg.Sequence)
 	}
 
@@ -391,10 +423,10 @@ func (as *mqttAccountSessionManager) proveGoneRetirement(sess *mqttSession, lic 
 	sess.mu.Unlock()
 	as.mu.Unlock()
 	if !resident {
-		return fmt.Errorf("%w: this object is no longer the client ID's session", errMQTTGoneRetireNoLicence)
+		return proof, fmt.Errorf("%w: this object is no longer the client ID's session", errMQTTGoneRetireNoLicence)
 	}
 	if !same {
-		return fmt.Errorf("%w: the session's binding, sequence, generation or record state changed", errMQTTGoneRetireNoLicence)
+		return proof, fmt.Errorf("%w: the session's binding, sequence, generation or record state changed", errMQTTGoneRetireNoLicence)
 	}
-	return nil
+	return proof, nil
 }

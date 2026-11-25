@@ -2228,7 +2228,7 @@ func (as *mqttAccountSessionManager) reconcileResidentOwnership(s *Server, sess 
 		return
 	}
 	sess.mu.Lock()
-	idHash, ourSeq := sess.idHash, sess.seq
+	idHash, ourSeq, gen := sess.idHash, sess.seq, sess.gen
 	sess.mu.Unlock()
 	if ourSeq == 0 {
 		// Nothing was ever acknowledged for this session, so neither shape applies:
@@ -2263,10 +2263,21 @@ func (as *mqttAccountSessionManager) reconcileResidentOwnership(s *Server, sess 
 		// marker's meaning is exactly this — the ownership question is outstanding —
 		// and its point-of-use predicate still governs when a probe may run.
 		sess.mu.Lock()
+		armed := false
 		if sess.seq == ourSeq && !sess.seqUncertain {
+			// Reported only by the read that ARMS the question: a bound armed session comes
+			// back here every pass from the rejected arm, and its re-observation adds nothing.
+			armed = !sess.recordRejectionPendingLocked()
 			sess.markWriteRejectedLocked(ourSeq)
 		}
 		sess.mu.Unlock()
+		if armed {
+			// The one record of what the store answered. Every later step decides from this
+			// observation, and an absent read is the same answer whether the record was
+			// removed or the store could not load it (issue #190).
+			s.Warnf("MQTT: session %q: its record read absent at the periodic ownership check, at acknowledged "+
+				"sequence %d of generation %q (%v); its ownership is outstanding", sess.id, ourSeq, gen, err)
+		}
 		// And then CONSUME it for a bound session, which the settlement cannot: its
 		// bound half runs pre-dispatch on the connection's own readLoop and its unbound
 		// half claims the gate as nobody, so a Keep Alive 0 client that goes silent
@@ -2274,7 +2285,7 @@ func (as *mqttAccountSessionManager) reconcileResidentOwnership(s *Server, sess 
 		// absence PLUS a valid watermark whose marker landed past our own record, never
 		// by the absence alone, and it refuses rather than disposing under a live owner.
 		// An unbound session is left to settleRejectionFromSweep exactly as before.
-		as.retireGoneBoundSession(s, sess, ourSeq)
+		as.retireGoneBoundSession(s, sess, ourSeq, armed)
 		return
 	}
 	if smsg.Sequence <= ourSeq {

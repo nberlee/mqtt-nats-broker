@@ -2323,7 +2323,7 @@ restoreSession:
 				// The probe settles a rejection by RE-ATTEMPTING the write, never by reading the
 				// record back: a readback cannot tell "somebody else moved it" from "our own
 				// write landed and we lost the response".
-				switch v := es.probeRecordRejectionInTx(tok); v {
+				switch v, _ := es.probeRecordRejectionInTx(tok); v {
 				case mqttRejectionOurs:
 					return mqttForcedLeaveOwnershipOurs
 				case mqttRejectionForeign, mqttRejectionForked:

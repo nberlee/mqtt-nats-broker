@@ -160,7 +160,7 @@ func TestSessForkedBoundIsUnsettledNotDisposed(t *testing.T) {
 	testLandSibling(t, e.testInflightEnv, testMutateSibling)
 	e.rejectSave(t, e.sess)
 
-	outcome, stale := b.bc.settleBoundRejectionGated(e.asm, e.sess)
+	outcome, stale, _ := b.bc.settleBoundRejectionGated(e.asm, e.sess)
 	if outcome != mqttBoundUnsettled {
 		t.Fatalf("a forked record leaves ownership UNSETTLED: got %v", outcome)
 	}
@@ -634,7 +634,7 @@ func TestSessForkedWithALiveCompetingOwnerIsStillUnsettled(t *testing.T) {
 	b := e.bindSocketAttemptLog(t, mqttProtoLevel5)
 	e.rejectSave(t, e.sess)
 
-	outcome, stale := b.bc.settleBoundRejectionGated(e.asm, e.sess)
+	outcome, stale, _ := b.bc.settleBoundRejectionGated(e.asm, e.sess)
 	if outcome != mqttBoundUnsettled || stale != nil {
 		t.Fatalf("a body claiming our parent is UNSETTLED even with a live competing owner: got %v (stale=%v)",
 			outcome, stale)

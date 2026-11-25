@@ -9993,6 +9993,33 @@ session to the ownership backstop instead of the unbound settlement. Otherwise t
 refusal would be final: from the moment the marker is armed that branch owns the session,
 and the backstop that re-reads the record would be unreachable.
 
+**What each step logs**
+([issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190)). The disposal's
+vocabulary line is the same for every route to it, so the steps that decide it log what
+they observed, at Warn, ahead of that line. The wire reason is unchanged.
+
+- **The arming read** (`reconcileResidentOwnership`): the absent read, our acknowledged
+  sequence, the generation and the store's answer verbatim. It is logged only by the read
+  that arms the marker. A bound armed session comes back to the backstop every pass, and a
+  re-observation adds nothing.
+- **The retirement's refusal on standing**: the generation's standing as the prefilter
+  evaluated it after the arm (`current` or `unresolved`; "stands", because the standing can
+  come from the lifecycle registry rather than the authority). It is logged at most once per
+  arm, and only on the arming pass, so a refusal before the standing was evaluated on that
+  pass leaves none.
+- **The licensed retirement**: the standing the in-fence proof evaluated (not the
+  prefilter's), the sequence and the proof's final absence read, before the disposal line.
+- **The bound probe's disposal** (`mqttGateDispatchOnRejection`): the packet that drove it,
+  the base the CAS named, the stream's rejection verbatim and the readback, before the
+  disposal line. The probe evaluates no standing.
+
+These lines name the route and what the store answered, not the cause. A record that was
+removed and one the store could not load give the same answers: the server rejects the CAS
+with `wrong last sequence: 0` whenever its own last-message load fails, and answers the
+readback "no message" for any load error (`docs/known-upstream-issues.md`,
+[issue #110](https://github.com/nberlee/mqtt-nats-broker/issues/110) and
+[issue #111](https://github.com/nberlee/mqtt-nats-broker/issues/111)).
+
 ## Lifecycles and generations: acceptance, teardown and reclamation
 
 A client's metadata on `$MQTT_sess` is reclaimed when the scope it belongs to retires
