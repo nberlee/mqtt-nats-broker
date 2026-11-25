@@ -18,6 +18,8 @@ package mqtt
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -50,16 +52,131 @@ func testReceiptSubjects(t *testing.T, jsa *mqttJSA, cid string) (txn, act int) 
 	return txn, act
 }
 
-// testWaitReceipts waits until client cid holds at most maxTxn generation receipts and maxAct
-// actions, and returns what it last read.
-func testWaitReceipts(t *testing.T, jsa *mqttJSA, cid string, maxTxn, maxAct int, within time.Duration) (int, int) {
+// mqttTestFloorStallWindow is how long the at-rest wait below tolerates no forward milestone. It is a
+// test watchdog with scheduling and I/O headroom over the floor's periodic re-arm (mqttFloorTick,
+// +20%) and its backoff cap, not a protocol bound: the floor promises reclamation at rest, never a
+// drain time.
+const mqttTestFloorStallWindow = 90 * time.Second
+
+// testFloorMilestones is the forward progress the at-rest wait credits: a new maximum of the floor or
+// the deletion watermark, a scan reaching further from the same floor, the first qualification of a
+// horizon, or fewer receipts left. A horizon that resets or rescans renews nothing.
+type testFloorMilestones struct {
+	lo, del, scanBase, scanNext, qualifiedEnd uint64
+	txn                                       int
+}
+
+// advance folds one observation in and reports whether it reached a milestone.
+func (m *testFloorMilestones) advance(lo, del uint64, hz *mqttFloorHorizon, txn int) bool {
+	moved := false
+	if lo > m.lo {
+		m.lo, moved = lo, true
+	}
+	if del > m.del {
+		m.del, moved = del, true
+	}
+	if hz != nil {
+		if hz.base != m.scanBase {
+			m.scanBase, m.scanNext, m.qualifiedEnd = hz.base, hz.next, 0
+		} else if hz.next > m.scanNext {
+			m.scanNext, moved = hz.next, true
+		}
+		if hz.executing && hz.end > m.qualifiedEnd {
+			m.qualifiedEnd, moved = hz.end, true
+		}
+	}
+	if txn < m.txn {
+		m.txn, moved = txn, true
+	}
+	return moved
+}
+
+// testReclaimVerdict decides one observation of the at-rest wait. Identity comes first: a session
+// replaced, or a generation that changed, may have had its records purged by its retirement, and
+// that is not the live generation's reclamation, so it is fatal even when the counts are satisfied.
+func testReclaimVerdict(wantGen, curGen string, resident bool, txn, act, maxTxn, maxAct int) (bool, error) {
+	switch {
+	case !resident:
+		return false, fmt.Errorf("the session object was replaced while waiting for reclamation")
+	case curGen != wantGen:
+		return false, fmt.Errorf("the generation changed from %q to %q while waiting for reclamation", wantGen, curGen)
+	}
+	return txn <= maxTxn && act <= maxAct, nil
+}
+
+// TestReclaimVerdictRefusesAReplacedGeneration: counts satisfied by a different generation, or a
+// replaced session object, never end the wait as a pass.
+func TestReclaimVerdictRefusesAReplacedGeneration(t *testing.T) {
+	if done, err := testReclaimVerdict("g1", "g2", true, 0, 0, 0, 96); err == nil || done {
+		t.Fatalf("a changed generation with satisfied counts must fail: done=%v err=%v", done, err)
+	}
+	if done, err := testReclaimVerdict("g1", "g1", false, 0, 0, 0, 96); err == nil || done {
+		t.Fatalf("a replaced session with satisfied counts must fail: done=%v err=%v", done, err)
+	}
+	if done, err := testReclaimVerdict("g1", "g1", true, 0, 97, 0, 96); err != nil || done {
+		t.Fatalf("unsatisfied counts keep waiting: done=%v err=%v", done, err)
+	}
+	if done, err := testReclaimVerdict("g1", "g1", true, 0, 96, 0, 96); err != nil || !done {
+		t.Fatalf("satisfied counts of the same generation end the wait: done=%v err=%v", done, err)
+	}
+}
+
+// testWaitReceiptsReclaimed waits until client cid holds at most maxTxn generation receipts and maxAct
+// actions, and returns what it last read. It waits for as long as reclamation keeps reaching forward
+// milestones, because at rest the floor drains at the store's pace (32 positions a unit, due again at
+// once while it progresses), and fails when nothing moves for mqttTestFloorStallWindow: a floor that
+// stops is the defect, a slow one is not.
+func testWaitReceiptsReclaimed(t *testing.T, asm *mqttAccountSessionManager, cid string, maxTxn, maxAct int) (int, int) {
 	t.Helper()
-	deadline := time.Now().Add(within)
-	var txn, act int
+	asm.mu.RLock()
+	sess := asm.sessions[cid]
+	asm.mu.RUnlock()
+	if sess == nil {
+		t.Fatalf("%q is not resident", cid)
+	}
+	sess.mu.Lock()
+	gen := sess.gen
+	sess.mu.Unlock()
+	hardCap := time.Now().Add(20 * time.Minute)
+	if d, ok := t.Deadline(); ok && d.Add(-time.Minute).Before(hardCap) {
+		hardCap = d.Add(-time.Minute)
+	}
+	m := testFloorMilestones{txn: math.MaxInt}
+	lastMove := time.Now()
 	for {
-		txn, act = testReceiptSubjects(t, jsa, cid)
-		if (txn <= maxTxn && act <= maxAct) || time.Now().After(deadline) {
+		txn, act := testReceiptSubjects(t, &asm.jsa, cid)
+		// The identity is read AFTER the counts, so a count can only be credited to the generation
+		// it was waited for. The horizon is copied under the lock; the ledger is read outside it,
+		// so the wait never holds the session the floor unit needs.
+		asm.mu.RLock()
+		resident := asm.sessions[cid] == sess
+		asm.mu.RUnlock()
+		sess.mu.Lock()
+		curGen := sess.gen
+		var hz *mqttFloorHorizon
+		if sess.floorHorizon != nil {
+			h := *sess.floorHorizon
+			hz = &h
+		}
+		sess.mu.Unlock()
+		done, err := testReclaimVerdict(gen, curGen, resident, txn, act, maxTxn, maxAct)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if done {
 			return txn, act
+		}
+		led, _, lerr := asm.jsa.loadGenLedger(cid, asm.sessStreamEpoch, gen)
+		now := time.Now()
+		if lerr == nil && led != nil && m.advance(led.Lo, led.Del, hz, txn) {
+			lastMove = now
+		}
+		if now.Sub(lastMove) > mqttTestFloorStallWindow {
+			t.Fatalf("reclamation stopped for %v at %d receipts and %d actions: ledger lo=%d del=%d, horizon %+v (read error %v)",
+				mqttTestFloorStallWindow, txn, act, m.lo, m.del, hz, lerr)
+		}
+		if now.After(hardCap) {
+			t.Fatalf("reclamation was still moving at the hard cap with %d receipts and %d actions", txn, act)
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
@@ -83,11 +200,10 @@ func TestALongLivedSubscriberKeepsItsReceiptsBounded(t *testing.T) {
 	if txn, _ := testReceiptSubjects(t, &asm.jsa, "receipts-long"); txn == 0 {
 		t.Fatalf("after %d deliveries the subscriber holds no generation receipt to reclaim", n)
 	}
-	// Once the open batch has aged no batch is left unpurged, and once the floor has run its
-	// remaining steps (at most mqttFloorBatchPositions positions a step, one step a tick at rest)
-	// the reclaimed positions' actions are gone.
-	txn, act := testWaitReceipts(t, &asm.jsa, "receipts-long", 0, mqttFloorSlack+64,
-		mqttReceiptBatchAge+3*mqttFloorTick+5*time.Second)
+	// At rest no batch is left unpurged once the open batch has aged, and the floor retires the
+	// history down to its slack, deleting the reclaimed positions' actions. It does that at the store's
+	// pace, not to a deadline, so the wait follows its progress and fails on a stop.
+	txn, act := testWaitReceiptsReclaimed(t, asm, "receipts-long", 0, mqttFloorSlack+64)
 	if txn != 0 {
 		t.Fatalf("after %d deliveries and the batch age the subscriber still holds %d generation receipts", n, txn)
 	}
