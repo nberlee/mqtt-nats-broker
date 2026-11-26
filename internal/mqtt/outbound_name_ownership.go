@@ -267,11 +267,19 @@ func (jsa *mqttJSA) loadNameOwnership(id, epoch string, stream mqttOwnedStream, 
 	if err != nil || o == nil {
 		return o, seq, err
 	}
-	if o.ID != id {
-		return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q names client %q, not %q",
-			name, stream, o.ID, id)
+	if oerr := mqttCheckNameOwnershipClient(o, id); oerr != nil {
+		return nil, 0, oerr
 	}
 	return o, seq, nil
+}
+
+// mqttCheckNameOwnershipClient refuses an ownership record naming another client.
+func mqttCheckNameOwnershipClient(o *mqttNameOwnership, id string) error {
+	if o.ID != id {
+		return fmt.Errorf("the ownership of consumer name %q on %q names client %q, not %q",
+			o.Name, o.Stream, o.ID, id)
+	}
+	return nil
 }
 
 // loadNameOwnershipPhysical reads a physical name's ownership record with NO client id — the
@@ -290,16 +298,26 @@ func (jsa *mqttJSA) loadNameOwnershipPhysical(epoch string, stream mqttOwnedStre
 		}
 		return nil, 0, nil
 	}
-	o, derr := mqttDecodeNameOwnershipAnyClient(smsg.Data, epoch)
+	o, ierr := mqttInterpretNameOwnership(smsg.Data, epoch, stream, name)
+	if ierr != nil {
+		return nil, 0, ierr
+	}
+	return o, smsg.Sequence, nil
+}
+
+// mqttInterpretNameOwnership interprets the body standing on the subject for (stream, name),
+// whichever client it names.
+func mqttInterpretNameOwnership(data []byte, epoch string, stream mqttOwnedStream, name string) (*mqttNameOwnership, error) {
+	o, derr := mqttDecodeNameOwnershipAnyClient(data, epoch)
 	if derr != nil {
-		return nil, 0, fmt.Errorf("the ownership of consumer name %q on %q is unsupported: %w", name, stream, derr)
+		return nil, fmt.Errorf("the ownership of consumer name %q on %q is unsupported: %w", name, stream, derr)
 	}
 	if o.Stream != stream || o.Name != name {
-		return nil, 0, fmt.Errorf("the ownership record on the subject for %q/%q instead names %q/%q: a "+
+		return nil, fmt.Errorf("the ownership record on the subject for %q/%q instead names %q/%q: a "+
 			"name-hash collision must refuse, never alias another consumer's authorization",
 			stream, name, o.Stream, o.Name)
 	}
-	return o, smsg.Sequence, nil
+	return o, nil
 }
 
 // mqttNameOwnershipMember composes the ownership record's batch member for a transition: the

@@ -213,11 +213,8 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 
 	// RULE 4a: THE PROPOSED HEADER BODY, because an arbitrary batch never passes through the
 	// allocator. Re-read the stored header and require exactly what allocation may do to it.
-	stored, storedSeq, herr := jsa.loadDirShardAt(rootMember.shard)
-	if herr != nil {
-		return fmt.Errorf("transition %q enrols generation %q and its directory shard could not "+
-			"be read: %w", a.Txn, gen, herr)
-	}
+	// What the batch alone decides comes first; then WHERE the header stands is compared before
+	// what it holds is interpreted (errMQTTStaleExpectation).
 	proposed, derr := mqttDecodeDirShard(shardMember.body, rootMember.shard)
 	if derr != nil {
 		return fmt.Errorf("transition %q carries an unsupported directory shard on %q: %w",
@@ -227,11 +224,21 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 		return fmt.Errorf("transition %q carries its shard member on %q, which is not shard %d's "+
 			"canonical subject", a.Txn, shardMember.subj, rootMember.shard)
 	}
-	if stored == nil {
-		if shardMember.expect != 0 {
-			return fmt.Errorf("transition %q writes shard %d at sequence %d with no header "+
-				"standing there", a.Txn, rootMember.shard, shardMember.expect)
+	smsg, herr := jsa.readAtExpectation(shardMember.subj, shardMember.expect,
+		fmt.Sprintf("transition %q enrols generation %q and writes shard %d", a.Txn, gen, rootMember.shard))
+	if herr != nil {
+		return herr
+	}
+	var stored *mqttDirShard
+	if smsg != nil {
+		h, sderr := mqttDecodeDirShard(smsg.Data, rootMember.shard)
+		if sderr != nil {
+			return fmt.Errorf("transition %q enrols generation %q and its directory shard %d cannot be "+
+				"interpreted: %w", a.Txn, gen, rootMember.shard, sderr)
 		}
+		stored = h
+	}
+	if stored == nil {
 		if proposed.Hi != 1 || proposed.Next != 1 || proposed.Cycle != 1 || proposed.Horizon != 1 {
 			return fmt.Errorf("transition %q initializes shard %d as hi %d, next %d, cycle %d, "+
 				"horizon %d: a first allocation creates ordinal 1 and a first cycle over it",
@@ -242,11 +249,6 @@ func (jsa *mqttJSA) checkRecoveryEnrolment(a *mqttTransitionAttempt, t *mqttAuth
 				"first ordinal is 1", a.Txn, rootMember.ord)
 		}
 	} else {
-		if shardMember.expect != storedSeq {
-			return fmt.Errorf("transition %q writes shard %d at sequence %d, but it stands at %d: "+
-				"an allocation is decided against the header it read",
-				a.Txn, rootMember.shard, shardMember.expect, storedSeq)
-		}
 		if stored.Hi == ^uint64(0) {
 			return fmt.Errorf("transition %q allocates in shard %d, which has taken its last "+
 				"ordinal", a.Txn, rootMember.shard)

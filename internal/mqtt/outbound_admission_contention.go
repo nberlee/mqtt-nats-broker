@@ -18,14 +18,66 @@ package mqtt
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"time"
 )
 
 // errMQTTStaleExpectation marks a refusal whose only reason is that a record this batch expected
-// at one sequence has since moved: another writer committed first. It is wrapped by the write
-// boundary's stale-sequence checks that an admission reaches; every other refusal is not it.
+// at one sequence has since moved: another writer committed first.
+//
+// ONE RULE DECIDES IT: a write-boundary refusal is marked exactly when the store's
+// expected-last-subject-sequence CAS on the same member would have refused the batch — the
+// member's expectation differs from the sequence a POSITIVE read observes at its subject, a
+// positively absent subject standing at 0. The boundary refusal is the CAS rejection taken early,
+// which is why mqttIsStaleExpectation classifies both alike.
+//
+// AND THE EXPECTATION IS COMPARED FIRST among everything decided from the standing record: before
+// its body is decoded or judged, and before any rule conditioned on what was observed. A record
+// that moved is refused as moved whatever it now holds; an undecodable body, a content violation
+// or a disposition violation at exactly the expected sequence is not marked. Rules decided from
+// the batch alone may run before it, and refuse unmarked whatever stands. An indeterminate read
+// is never marked.
+//
+// Marking is safe to re-attempt on for a connection's life only because every composer whose
+// refusals reach a marker consumer recomposes each attempt from fresh reads and conditions each
+// member on the sequence it read: a mismatch proves the CAS would fail, not who moved the record.
 var errMQTTStaleExpectation = errors.New("a record the batch expected has moved")
+
+// mqttStaleExpectationf is a boundary refusal the store's CAS on the same member would have made
+// (errMQTTStaleExpectation).
+func mqttStaleExpectationf(format string, args ...any) error {
+	return fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), errMQTTStaleExpectation)
+}
+
+// mqttReadIsAbsence reports whether a read's error is the store's positive "no message" answer,
+// seen through wrapping: IsNatsErr does a bare type assertion, and several loaders wrap.
+func mqttReadIsAbsence(err error) bool {
+	ae := jsAPIError(err)
+	return ae != nil && ae.ErrCode == ApiErrors[JSNoMessageFoundErr].ErrCode
+}
+
+// readAtExpectation reads what stands at a batch member's subject and refuses, marked stale,
+// unless it stands exactly where the member expects (0: nothing stands). An indeterminate read
+// refuses unmarked. It returns the standing message, nil when positively absent.
+//
+// what names the member for the refusal ("transition %q replaces the register on %q").
+func (jsa *mqttJSA) readAtExpectation(subj string, expect uint64, what string) (*StoredMsg, error) {
+	smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, subj)
+	if err != nil && !mqttReadIsAbsence(err) {
+		return nil, fmt.Errorf("%s, which could not be read: %w", what, err)
+	}
+	var standing uint64
+	if err == nil && smsg != nil {
+		standing = smsg.Sequence
+	} else {
+		smsg = nil
+	}
+	if standing != expect {
+		return nil, mqttStaleExpectationf("%s at sequence %d, but it stands at %d", what, expect, standing)
+	}
+	return smsg, nil
+}
 
 // mqttIsStaleExpectation reports whether err is POSITIVELY a stale expectation: the boundary's own
 // stale-sequence refusal, or the store's rejection of an expected-last-subject-sequence CAS. A read

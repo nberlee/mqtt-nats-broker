@@ -620,13 +620,15 @@ func (jsa *mqttJSA) checkManifestMembers(a *mqttTransitionAttempt, prev *mqttOut
 func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mqttOutboundAuthority, extra []mqttTransitionMember,
 	next *mqttRetainedManifest, subj string, expect uint64, gen, pay string, chunksHere uint64) error {
 
-	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
-	absent := (lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) || (lerr == nil && smsg == nil)
-	if lerr != nil && !absent {
-		return fmt.Errorf("transition %q could not read the manifest of payload %q: %w", a.Txn, pay, lerr)
+	// WHERE THE MANIFEST STANDS IS COMPARED FIRST, before any rule conditioned on what stands
+	// (errMQTTStaleExpectation).
+	smsg, lerr := jsa.readAtExpectation(subj, expect,
+		fmt.Sprintf("transition %q fences the manifest of payload %q", a.Txn, pay))
+	if lerr != nil {
+		return lerr
 	}
 
-	if absent {
+	if smsg == nil {
 		// A RESERVATION IS AN ACT OF MATERIALIZING, so only a materializing kind may perform
 		// one. The chunk loop has said this since it was written — "material is written under a
 		// serving authority, and the kind is what says so" — and the branch that brings a
@@ -648,10 +650,6 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mq
 		// A MATERIALIZATION'S FIRST ACT RESERVES IT, create-only, with nothing written and its
 		// cleanup owner already named — so a crash mid-materialization leaves material a
 		// retirement worker can still find and own.
-		if expect != 0 {
-			return fmt.Errorf("transition %q conditions the manifest of payload %q on sequence "+
-				"%d, but nothing stands there", a.Txn, pay, expect)
-		}
 		if next.State != mqttManifestProvisioning {
 			return fmt.Errorf("transition %q reserves payload %q directly in state %d: a "+
 				"materialization begins provisioning and is sealed only once its material has "+
@@ -681,15 +679,6 @@ func (jsa *mqttJSA) checkManifestAgainstStore(a *mqttTransitionAttempt, prev *mq
 		// The owner may be created BY THIS BATCH, in which case rule 3 has already required its
 		// provisioning and cleanup duty entries, or it may already stand.
 		return jsa.checkManifestOwnerExists(a, extra, gen, pay, next.Inc)
-	}
-	if expect == 0 {
-		return fmt.Errorf("transition %q reserves payload %q create-only while a manifest "+
-			"already stands at sequence %d", a.Txn, pay, smsg.Sequence)
-	}
-	if smsg.Sequence != expect {
-		return fmt.Errorf("transition %q conditions the manifest of payload %q on sequence %d, "+
-			"but it stands at %d: the fence was computed against a manifest that has moved",
-			a.Txn, pay, expect, smsg.Sequence)
 	}
 	cur, derr := mqttDecodeRetainedManifest(smsg.Data, a.ID, a.Epoch, gen, pay)
 	if derr != nil {

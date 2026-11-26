@@ -738,19 +738,20 @@ func TestDutyContinuationExpectationNamesTheInspectedEntry(t *testing.T) {
 	if err := e.asm.jsa.checkInventoryMembers(attempt,
 		[]mqttTransitionMember{testDutyMember(t, e, dseq+1000, d)}); err == nil {
 		t.Fatalf("a continuation validated against a sequence nothing stands at")
-	} else if !strings.Contains(err.Error(), "no longer there") {
+	} else if !mqttIsStaleExpectation(err) || !strings.Contains(err.Error(), "but it stands at") {
 		t.Fatalf("the refusal did not come from the expectation rule: %v", err)
 	}
 
 	// AN ENTRY THAT IS NOT THERE AT ALL. Ordinal 7 was never allocated, so a continuation over
 	// it would invent the duty it claims to advance — and inventing one is how an ordinal
-	// nothing reserved acquires an occupant.
+	// nothing reserved acquires an occupant. Nothing standing is sequence 0, so this is the
+	// expectation rule too, and the store's CAS would refuse it the same way.
 	ghost := testDuty(e, 7, mqttDutyProvision, "inc-xz", mqttDutyPending)
 	if err := e.asm.jsa.checkInventoryMembers(attempt,
 		[]mqttTransitionMember{testDutyMember(t, e, 5, ghost)}); err == nil {
 		t.Fatalf("a continuation validated over an entry that does not exist")
-	} else if !strings.Contains(err.Error(), "nothing stands there") {
-		t.Fatalf("the refusal did not come from the absent-entry rule: %v", err)
+	} else if !mqttIsStaleExpectation(err) || !strings.Contains(err.Error(), "but it stands at 0") {
+		t.Fatalf("the refusal did not come from the expectation rule over an absent entry: %v", err)
 	}
 }
 

@@ -141,6 +141,11 @@ type mqttJSACore struct {
 	// nil in production.
 	testTransitionPresend atomic.Pointer[func(t *mqttAuthorityTransition)]
 
+	// testTransitionPrefetched runs once an authority transition's boundary reads have been
+	// requested together (withBoundaryPrefetch) and before any check runs: a write landed here is
+	// seen by a check's SECOND read of a subject and not by its first. nil in production.
+	testTransitionPrefetched atomic.Pointer[func(t *mqttAuthorityTransition)]
+
 	// testDropRequest, when it returns true for a request (its API subject and body), swallows
 	// it: it is never queued, so its reply never comes and the waiter runs out its wait — the
 	// store that cannot answer, which a fixture cannot otherwise produce. nil in production.

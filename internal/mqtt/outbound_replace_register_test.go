@@ -497,9 +497,14 @@ func TestReplacementExpectationNamesTheInspectedMarker(t *testing.T) {
 	// The same batch with a CREATE-ONLY marker expectation: legal as a member, accepted by
 	// the store the moment the inspected marker is deleted, and refused here because it does
 	// not name the marker this validation decided on.
+	//
+	// And it is refused as the store's CAS would refuse it, marked: the carried marker's
+	// expectation does not name where the marker stands (errMQTTStaleExpectation).
 	if err := r.asm.jsa.checkRegisterReplacements(r.attempt("txn-bind"),
 		[]mqttTransitionMember{reg, r.freshMarkerFor(t, reg, 0), admit}); err == nil {
 		t.Fatalf("a replacement validated against a standing marker while expecting none")
+	} else if !mqttIsStaleExpectation(err) {
+		t.Fatalf("a create-only marker over a standing one was refused unmarked: %v", err)
 	}
 }
 

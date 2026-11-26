@@ -11329,10 +11329,14 @@ message or error alike, exactly as the direct read returns it.
 
 **One answer per subject.** Every later read of a prefetched subject, and every read of
 any other subject, goes to the store. A comparison that re-reads to observe progress (the
-inventory traversal re-reads the ledger when it finds a position crossed, and restarts
-with the stale-expectation error the admission contention extension relies on) still
+inventory traversal re-reads the ledger when it finds a position crossed and restarts; the
+identifier census then compares the ledger it ended on with the batch's expectation, and a
+moved one is refused as a stale expectation, while exhausted restarts are not) still
 observes it, and two comparisons reading one subject see what they saw before: the first a
-read from the start of the window, the second a read from the store.
+read from the start of the window, the second a read from the store. A record another
+writer moves between the two reads is therefore seen moved only by the second, which is why
+every comparison of a member's expectation, first read or second, is marked by the same rule
+("An admission defeated only by contention keeps the subscription's order").
 
 **Why reading earlier is the same read.** A member the batch writes is fenced at
 submission by its own expectation, exactly as before. A read-only judgment (an action's
@@ -11409,23 +11413,46 @@ previous delivery's answer; the extension below covers every contention that rem
 So the delivery entrance (`admitThroughAuthority`, ordinary and shared, and the batched
 admission's attempts, `attemptAdmissionBatch`) extends the shared ladder past its budget
 (`runInflightAdmission`'s extension, `outbound_admission_contention.go`) while every
-attempt so far has failed POSITIVELY on a stale expectation: the boundary's own
-stale-sequence refusals that an admission reaches (the authority predecessor, a resource,
-an exchange, a name ownership, the identifier walk's ledger fence), which wrap
-`errMQTTStaleExpectation`, or the store's expected-last-sequence CAS rejection
-(`mqttIsStaleExpectation`). The ladder's `contended` flag is not the test: it also covers
-boundary refusals and transport failures. Each extension attempt is an ordinary one — the
-same allocation, custody reservation and attempt settlement, the same spacing before its
-fresh reads — and its write compares the standing authority with the entitlement the
-connection was accepted under, so a moved tenure refuses and ends the extension. It ends
-too on any other failure. Whether the delivery's callback may still start work (its
-incarnation not retiring, its connection open and still the session's) is no longer the
-extension's to decide: it is the callback's delivery lifecycle, checked at the head of
-every attempt after the first, inside the budget as well as past it (next section but one,
-"A retiring incarnation stops its delivery callback's work"); the ladder then abandons the
-offer exactly as before. No other entrance's budget changes. A batch defeated only by
-stale expectations keeps the whole batch's place the same way: it is re-attempted with the
-same deliveries while every slot still reads empty.
+attempt so far has failed POSITIVELY on a stale expectation: a write-boundary refusal the
+store's CAS would have made, marked `errMQTTStaleExpectation` by the rule below, or the
+store's expected-last-sequence CAS rejection itself (`mqttIsStaleExpectation`). The
+ladder's `contended` flag is not the test: it also covers boundary refusals and transport
+failures. Each extension attempt is an ordinary one — the same allocation, custody
+reservation and attempt settlement, the same spacing before its fresh reads — and its
+write compares the standing authority with the entitlement the connection was accepted
+under, so a moved tenure refuses and ends the extension. It ends too on any other failure.
+Whether the delivery's callback may still start work (its incarnation not retiring, its
+connection open and still the session's) is no longer the extension's to decide: it is the
+callback's delivery lifecycle, checked at the head of every attempt after the first,
+inside the budget as well as past it (next section but one, "A retiring incarnation stops
+its delivery callback's work"); the ladder then abandons the offer exactly as before. No
+other entrance's budget changes. A batch defeated only by stale expectations keeps the
+whole batch's place the same way: it is re-attempted with the same deliveries while every
+slot still reads empty.
+
+**A refusal the store's CAS would have made is marked stale, and only that**
+([issue #189](https://github.com/nberlee/mqtt-nats-broker/issues/189)). A write-boundary
+refusal wraps `errMQTTStaleExpectation` exactly when the member's expectation differs from
+the sequence a positive read observes at its subject, a positively absent subject standing
+at 0 (`readAtExpectation`, `outbound_admission_contention.go`). That covers every member
+the boundary reads: the authority predecessor, exchanges, resources, duty continuations,
+the generation ledger (in the allocation, the floor advance and the identifier census),
+the retained manifest, the directory shard, name ownership, a replaced register and its
+unsent marker, a re-phased or retained slot, a retained exchange's second read, and the
+lifecycle registry. The expectation is compared FIRST among everything decided from the
+standing record: before its body is decoded or judged and before any rule conditioned on
+what was observed (a materializing-kind rule over an absent manifest, a marker
+disposition), so a record that moved is refused as moved whatever it now holds. Rules
+decided from the batch alone may run before it and refuse unmarked. Not marked: an
+indeterminate read, an identifier walk that exhausted its restarts
+(`errMQTTTraversalExhausted`: it did not finish, whatever ledger its last pass read), and
+any refusal over a record standing exactly at the member's expectation (undecodable,
+sealed, re-identified, an illegal arrow). Re-attempting on the mark is safe only because
+every composer whose refusals reach a marker consumer recomposes each attempt from fresh
+reads and conditions each member on the sequence it read: a mismatch proves the CAS would
+fail, not who moved the record. The other marker consumers (`opReleaseHolds`'
+recompositions, the resume's replacement-consumer claim) re-attempt on exactly what they
+would re-attempt on when the store's CAS returned 10071 a moment later.
 
 It is bounded by the connection's life, not by time: a periodic give-up while the
 connection lives would reorder exactly as before. A subscription can therefore stall for

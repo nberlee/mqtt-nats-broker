@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -141,6 +143,187 @@ func TestAdmissionContentionKeepsTheSubscriptionsOrder(t *testing.T) {
 	}
 }
 
+// testMoveLedgerInsideTheBoundary rewrites the generation ledger of sess's first n admission
+// attempts of operation op, at the sequence it stands at and with the same body, AFTER the
+// attempt's boundary reads were prefetched and before any check runs: the identifier census then
+// reads the prefetched ledger and passes, and the allocation's second read sees it moved. An
+// attempt that creates its generation's ledger is left alone. Every attempt's commit outcome of
+// that operation is collected by a commit wrapper.
+func testMoveLedgerInsideTheBoundary(t *testing.T, sess *mqttSession, op string, n int32) (*atomic.Int32, *[]error, *sync.Mutex) {
+	t.Helper()
+	jsa := sess.jsa
+	admission := func(at *mqttAuthorityTransition) bool {
+		return at.Attempt != nil && at.Attempt.ID == sess.id && at.Attempt.Op == op
+	}
+	var moved atomic.Int32
+	window := func(at *mqttAuthorityTransition) {
+		if !admission(at) || moved.Load() >= n {
+			return
+		}
+		var ledger *mqttTransitionMember
+		for i := range at.Extra {
+			if mqttIsLedgerSubject(at.Extra[i].subj) {
+				ledger = &at.Extra[i]
+			}
+		}
+		if ledger == nil {
+			t.Errorf("fixture: admission %q carries no ledger member", at.Attempt.Txn)
+			return
+		}
+		if ledger.expect == 0 {
+			return // the generation's first allocation creates its ledger
+		}
+		prefetched := false
+		set := mqttBoundaryPrefetchSet(at.Attempt.ID, at.Extra)
+		for _, subj := range set {
+			prefetched = prefetched || subj == ledger.subj
+		}
+		if !prefetched || len(set) < 2 {
+			t.Errorf("fixture: the ledger is not among the prefetched reads %v", set)
+			return
+		}
+		// THE ORIGINAL STORE, not the attempt's prefetched view, so the census' one cached answer
+		// is left for the census.
+		smsg, err := jsa.loadLastMsgFor(mqttSessStreamName, ledger.subj)
+		if err != nil || smsg == nil || smsg.Sequence != ledger.expect {
+			t.Errorf("fixture: the ledger reads %v at the attempt's window (%v), want sequence %d", smsg, err, ledger.expect)
+			return
+		}
+		msg, hdr := mqttFrameBatchWrite(smsg.Sequence, smsg.Data, _EMPTY_, 0, false)
+		if _, err := jsa.storeMsg(ledger.subj, hdr, msg); err != nil {
+			t.Errorf("moving the ledger: %v", err)
+			return
+		}
+		moved.Add(1)
+	}
+	jsa.testTransitionPrefetched.Store(&window)
+	t.Cleanup(func() { jsa.testTransitionPrefetched.Store(nil) })
+
+	var mu sync.Mutex
+	var outcomes []error
+	commit := func(at *mqttAuthorityTransition, send func() (uint64, error)) (uint64, error) {
+		seq, err := send()
+		if admission(at) {
+			mu.Lock()
+			outcomes = append(outcomes, err)
+			mu.Unlock()
+		}
+		return seq, err
+	}
+	jsa.testTransitionCommit.Store(&commit)
+	t.Cleanup(func() { jsa.testTransitionCommit.Store(nil) })
+	return &moved, &outcomes, &mu
+}
+
+// testRequireMovedLedgerRefusals requires every collected refusal to be a stale expectation, and
+// exactly want of them to be the allocation's moved-ledger refusal. Other stale refusals are the
+// session's own concurrent writers (the store's CAS, or a census fence), which a backlog produces
+// on its own; a moved ledger refused by anything but the allocation's read is not counted, so a
+// fixture whose write lands before the prefetch fails here.
+func testRequireMovedLedgerRefusals(t *testing.T, outcomes *[]error, mu *sync.Mutex, want int) {
+	t.Helper()
+	mu.Lock()
+	defer mu.Unlock()
+	refused := 0
+	for _, err := range *outcomes {
+		if err == nil {
+			continue
+		}
+		if !mqttIsStaleExpectation(err) {
+			t.Fatalf("an admission attempt was refused by something other than contention: %v", err)
+		}
+		if strings.Contains(err.Error(), "high-water that has moved") {
+			refused++
+		}
+	}
+	if refused != want {
+		t.Fatalf("%d attempt(s) were refused by the allocation's read of the moved ledger, want %d", refused, want)
+	}
+}
+
+// TestAdmissionKeepsItsOrderWhenTheLedgerMovesInsideTheBoundary: a single admission whose
+// generation ledger moves between the boundary's prefetch and the allocation's own read — more
+// times than its budget — is refused as a stale expectation each time and extended rather than
+// abandoned, so it is delivered before anything published after it.
+func TestAdmissionKeepsItsOrderWhenTheLedgerMovesInsideTheBoundary(t *testing.T) {
+	rig := newTestAdmissionContentionRig(t, "ac-ledger")
+	// A WARM-UP DELIVERY creates the generation's ledger, so every admission below CASes it at a
+	// nonzero expectation.
+	rig.publish(t, 0)
+	testMQTTCheckPubMsg(t, rig.sc, rig.sr, "ac/t", 2, []byte("m0"))
+	const lost = 10
+	if lost <= mqttForegroundAcquireAttempts {
+		t.Fatalf("fixture: %d lost attempts do not exceed the budget of %d", lost, mqttForegroundAcquireAttempts)
+	}
+	moved, outcomes, mu := testMoveLedgerInsideTheBoundary(t, rig.sess, "op-admit-publish", lost)
+	// ONE OFFER AT A TIME, so each is admitted singly: offers pushed together are admitted in a
+	// batch (the batched route's own test below).
+	for i := 1; i < 4; i++ {
+		rig.publish(t, i)
+		testMQTTCheckPubMsg(t, rig.sc, rig.sr, "ac/t", 2, []byte(fmt.Sprintf("m%d", i)))
+	}
+	if got := moved.Load(); got != lost {
+		t.Fatalf("fixture: the ledger was moved inside %d single admission attempt(s), want %d", got, lost)
+	}
+	testRequireMovedLedgerRefusals(t, outcomes, mu, lost)
+	if n := rig.extend.Load(); n < lost-mqttForegroundAcquireAttempts {
+		t.Fatalf("the admission was extended %d time(s), want at least %d", n, lost-mqttForegroundAcquireAttempts)
+	}
+}
+
+// TestAdmissionBatchKeepsItsOrderWhenTheLedgerMovesInsideTheBoundary: the batched route's version.
+// A batch of several deliveries whose ledger moves inside the boundary more times than its budget
+// is refused as a stale expectation each time, re-attempted with the same deliveries, and the
+// whole backlog arrives in publish order.
+func TestAdmissionBatchKeepsItsOrderWhenTheLedgerMovesInsideTheBoundary(t *testing.T) {
+	rig := newTestBatchRig(t, "ab-ledger", 1, nil)
+	sess := rig.sess()
+	testCountContentionWaits(t, sess)
+	var extended atomic.Int32
+	mqttTestAdmissionExtendedHook.Set(func(s *mqttSession, _ int) {
+		if s.id == sess.id {
+			extended.Add(1)
+		}
+	})
+	t.Cleanup(func() { mqttTestAdmissionExtendedHook.Set(nil) })
+	evMu, evs := testRecordBatchOrder(t, nil)
+	lose := int32(mqttForegroundAcquireAttempts + 3)
+	moved, outcomes, mu := testMoveLedgerInsideTheBoundary(t, sess, "op-admit-publishes", lose)
+	const n = 3 * mqttAdmissionBatchMax
+	rig.backlog(n)
+	rig.readInOrder(n)
+	if got := moved.Load(); got != lose {
+		t.Fatalf("fixture: the ledger was moved inside %d batch attempt(s), want %d", got, lose)
+	}
+	testRequireMovedLedgerRefusals(t, outcomes, mu, int(lose))
+	if extended.Load() == 0 {
+		t.Fatalf("the batch was not extended past its budget of %d", mqttForegroundAcquireAttempts)
+	}
+	// EVERY REFUSED ATTEMPT CARRIED SEVERAL DELIVERIES, and the batch that lost more than its
+	// budget was re-attempted with the same ones.
+	evMu.Lock()
+	defer evMu.Unlock()
+	var parts []string
+	refused := 0
+	for _, e := range *evs {
+		if !e.attempt || e.err == nil {
+			continue
+		}
+		if len(e.nonces) < 2 {
+			t.Fatalf("fixture: a refused batch attempt carried %d delivery(ies)", len(e.nonces))
+		}
+		if parts == nil {
+			parts = e.nonces
+		}
+		if strings.Join(e.nonces, ",") == strings.Join(parts, ",") {
+			refused++
+		}
+	}
+	if refused <= mqttForegroundAcquireAttempts {
+		t.Fatalf("the contended batch was refused %d time(s), not past its budget of %d", refused, mqttForegroundAcquireAttempts)
+	}
+}
+
 // TestAdmissionExtensionEndsOnAMovedTenure: a write that moves the tenure turns the next attempt
 // into a refusal, which is not contention, so the admission is not extended past its budget and is
 // abandoned as it always was.
@@ -207,9 +390,27 @@ func TestStaleExpectationClassification(t *testing.T) {
 		"a moved entitlement":                {errors.New("the standing authority carries another tenure"), false},
 		"a timeout":                          {fmt.Errorf("committing: %w", errors.New("timeout")), false},
 		"nothing":                            {nil, false},
+		"the boundary's helper":              {mqttStaleExpectationf("transition %q moved", "t"), true},
+		"the helper, wrapped":                {fmt.Errorf("committing: %w", mqttStaleExpectationf("moved")), true},
 	} {
 		if got := mqttIsStaleExpectation(tc.err); got != tc.want {
 			t.Fatalf("%s: classified %v, want %v", name, got, tc.want)
+		}
+	}
+	// AN ABSENCE IS THE STORE'S 404, seen through the wrapping a loader adds; anything else is not.
+	notFound := ApiErrors[JSNoMessageFoundErr]
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"the store's 404":         {notFound, true},
+		"the 404, wrapped":        {fmt.Errorf("exchange %q could not be read: %w", "x", notFound), true},
+		"another JetStream error": {fmt.Errorf("reading: %w", cas), false},
+		"a transport failure":     {errors.New("timeout"), false},
+		"nothing":                 {nil, false},
+	} {
+		if got := mqttReadIsAbsence(tc.err); got != tc.want {
+			t.Fatalf("%s: read as absence %v, want %v", name, got, tc.want)
 		}
 	}
 	// AND EVERY ATTEMPT MUST QUALIFY: one attempt that failed otherwise disqualifies the extension.

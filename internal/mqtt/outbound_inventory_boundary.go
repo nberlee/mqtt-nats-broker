@@ -344,21 +344,19 @@ func (jsa *mqttJSA) checkDutyContinuation(a *mqttTransitionAttempt, e mqttTransi
 	// BOTH are refusals. An unreadable entry is not an absent one and neither licenses a
 	// rewrite — a continuation names a record it claims to be continuing, so failing to find it
 	// is never a reason to treat the member as an allocation.
-	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, e.subj)
-	if (lerr != nil && !isErrorOtherThan(lerr, JSNoMessageFoundErr)) || (lerr == nil && smsg == nil) {
-		return fmt.Errorf("transition %q continues duty %d on %q at sequence %d, but nothing "+
-			"stands there: a duty is allocated create-only and continued thereafter, and a "+
-			"continuation over an absent entry would invent the duty it claims to advance",
-			a.Txn, ord, e.subj, e.expect)
-	}
+	//
+	// AND AN ABSENT OR MOVED ENTRY IS THE STORE'S CAS REFUSAL TAKEN EARLY (errMQTTStaleExpectation):
+	// the continuation was decided against a record that is no longer there, and a recomposition
+	// reads what is.
+	smsg, lerr := jsa.readAtExpectation(e.subj, e.expect,
+		fmt.Sprintf("transition %q continues duty %d on %q", a.Txn, ord, e.subj))
 	if lerr != nil {
-		return fmt.Errorf("transition %q continues duty %d on %q, which this broker could not "+
-			"read: %w", a.Txn, ord, e.subj, lerr)
+		return lerr
 	}
-	if smsg.Sequence != e.expect {
-		return fmt.Errorf("transition %q continues duty %d on %q at sequence %d, but it stands "+
-			"at %d: the continuation was decided against a record that is no longer there",
-			a.Txn, ord, e.subj, e.expect, smsg.Sequence)
+	if smsg == nil {
+		return fmt.Errorf("transition %q continues duty %d on %q at sequence 0: a duty is allocated "+
+			"create-only and continued thereafter, and a continuation over an absent entry would "+
+			"invent the duty it claims to advance", a.Txn, ord, e.subj)
 	}
 	cur, derr := mqttDecodeDutyEntry(smsg.Data, a.ID, a.Epoch, gen, ord)
 	if derr != nil {
@@ -577,7 +575,24 @@ func (jsa *mqttJSA) checkInventoryAllocation(a *mqttTransitionAttempt,
 		}
 	}
 
+	// THE LEDGER'S EXPECTATION IS COMPARED BEFORE ANYTHING IT HOLDS (errMQTTStaleExpectation). The
+	// identifier census read this ledger from the batch's prefetch; this read goes to the store, so
+	// a ledger another writer moved in between is refused here as moved — the store's CAS would
+	// refuse it a moment later — and not as a floor, a seal or an interval the batch never saw.
 	cur, curSeq, lerr := jsa.loadGenLedger(a.ID, a.Epoch, ledger.gen)
+	if (lerr == nil || curSeq != 0) && ledger.expect != curSeq {
+		if curSeq == 0 {
+			return mqttStaleExpectationf("transition %q conditions generation %q's ledger on sequence %d, "+
+				"but no ledger stands there", a.Txn, ledger.gen, ledger.expect)
+		}
+		if ledger.expect == 0 {
+			return mqttStaleExpectationf("transition %q creates a ledger for generation %q create-only "+
+				"while one already stands at sequence %d", a.Txn, ledger.gen, curSeq)
+		}
+		return mqttStaleExpectationf("transition %q conditions generation %q's ledger on sequence %d, "+
+			"but it stands at %d: the allocation was computed against a high-water that has moved",
+			a.Txn, ledger.gen, ledger.expect, curSeq)
+	}
 	if lerr != nil {
 		return fmt.Errorf("transition %q carries a ledger CAS for generation %q, which this "+
 			"broker could not read: %w", a.Txn, ledger.gen, lerr)
@@ -594,22 +609,8 @@ func (jsa *mqttJSA) checkInventoryAllocation(a *mqttTransitionAttempt,
 			wantLo, wantDel, ledger.next.Lo, ledger.next.Del)
 	}
 	if cur == nil {
-		// A generation's FIRST allocation creates its ledger, so a create-only expectation is
-		// legitimate here; anything else names a record that is not there.
-		if ledger.expect != 0 {
-			return fmt.Errorf("transition %q conditions generation %q's ledger on sequence %d, "+
-				"but no ledger stands there", a.Txn, ledger.gen, ledger.expect)
-		}
+		// A generation's FIRST allocation creates its ledger, create-only.
 		return mqttCheckAllocationInterval(a, 0, ledger.next, allocated)
-	}
-	if ledger.expect == 0 {
-		return fmt.Errorf("transition %q creates a ledger for generation %q create-only while "+
-			"one already stands at sequence %d", a.Txn, ledger.gen, curSeq)
-	}
-	if ledger.expect != curSeq {
-		return fmt.Errorf("transition %q conditions generation %q's ledger on sequence %d, but "+
-			"it stands at %d: the allocation was computed against a high-water that has moved",
-			a.Txn, ledger.gen, ledger.expect, curSeq)
 	}
 	// SEALING FORBIDS ALLOCATION, and that is the entire fence. No exchange is rewritten by a
 	// closure; the only thing it has to stop is an ordinal being taken, and an ordinal is taken
@@ -703,7 +704,9 @@ func mqttParseDutySubject(subject, wantIDHash string) (string, uint64, error) {
 	return toks[1], ord, nil
 }
 
-// loadGenLedger reads one generation's ledger, returning a nil record when none stands.
+// loadGenLedger reads one generation's ledger, returning a nil record when none stands. A ledger
+// that stands but cannot be interpreted is reported with the sequence it stands at beside the
+// error, so a fenced caller can compare its expectation first (errMQTTStaleExpectation).
 //
 // The three outcomes are kept apart for the reason every read in this package keeps them apart:
 // ABSENT is a positive answer here — a generation that has allocated nothing has no ledger — and
@@ -723,7 +726,7 @@ func (jsa *mqttJSA) loadGenLedger(id, epoch, gen string) (*mqttGenLedger, uint64
 	}
 	l, derr := mqttDecodeGenLedger(smsg.Data, id, epoch, gen)
 	if derr != nil {
-		return nil, 0, fmt.Errorf("the ledger of generation %q cannot be interpreted: %w", gen, derr)
+		return nil, smsg.Sequence, fmt.Errorf("the ledger of generation %q cannot be interpreted: %w", gen, derr)
 	}
 	return l, smsg.Sequence, nil
 }

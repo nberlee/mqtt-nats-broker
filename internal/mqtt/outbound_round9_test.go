@@ -1547,11 +1547,20 @@ func TestATruncatedEnumerationIsNotAnAnswer(t *testing.T) {
 	if terr != nil {
 		t.Fatalf("assembling the admission failed: %v", terr)
 	}
-	if _, err := jsa.storeMsg(ledSubj, -1, []byte(`{"id":"nonsense"`)); err != nil {
-		t.Fatalf("planting the unreadable ledger: %v", err)
+	planted, perr := jsa.storeMsg(ledSubj, -1, []byte(`{"id":"nonsense"`))
+	if perr != nil {
+		t.Fatalf("planting the unreadable ledger: %v", perr)
+	}
+	// AND THE BATCH IS CONDITIONED ON THE UNREADABLE LEDGER, so it is the reading that refuses: a
+	// ledger standing anywhere else is refused as moved before the walk is consulted
+	// (errMQTTStaleExpectation), whatever it holds.
+	for i := range tr.Extra {
+		if tr.Extra[i].subj == ledSubj {
+			tr.Extra[i].expect = planted.Sequence
+		}
 	}
 	if _, err := jsa.commitAuthorityTransition(tr); err == nil ||
-		!strings.Contains(err.Error(), "could not enumerate generation") {
+		!strings.Contains(err.Error(), "could not enumerate generation") || mqttIsStaleExpectation(err) {
 		t.Fatalf("an identifier was claimed on an inventory the boundary could not read: %v", err)
 	}
 

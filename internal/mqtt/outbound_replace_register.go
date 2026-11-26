@@ -155,19 +155,24 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 			return fmt.Errorf("transition %q could not read the register it replaces on %q: %w",
 				a.Txn, e.subj, lerr)
 		}
-		if smsg == nil || cur == nil {
-			// AN UNREADABLE OR ABSENT OCCUPANT REFUSES, and it is deliberately not treated
-			// as a free subject: a record this broker cannot interpret may be the one
-			// holding the identifier. The CAS would fail anyway for an absent one; refusing
-			// here is what stops an unreadable one being replaced on the strength of a
+		// AN ABSENT OR MOVED OCCUPANT is the store's CAS refusal taken early, compared before
+		// the body is interpreted (errMQTTStaleExpectation).
+		var standing uint64
+		if smsg != nil {
+			standing = smsg.Sequence
+		}
+		if standing != e.expect {
+			return mqttStaleExpectationf("transition %q replaces the register on %q at sequence %d "+
+				"while sequence %d stands: a replacement is decided against an exact occupant",
+				a.Txn, e.subj, e.expect, standing)
+		}
+		if cur == nil {
+			// AN UNREADABLE OCCUPANT REFUSES, and it is deliberately not treated as a free
+			// subject: a record this broker cannot interpret may be the one holding the
+			// identifier. Refusing here is what stops it being replaced on the strength of a
 			// sequence that happens to match.
 			return fmt.Errorf("transition %q replaces the register on %q at sequence %d, but "+
 				"no register this broker can read stands there", a.Txn, e.subj, e.expect)
-		}
-		if smsg.Sequence != e.expect {
-			return fmt.Errorf("transition %q replaces the register on %q at sequence %d while "+
-				"sequence %d stands: a replacement is decided against an exact occupant",
-				a.Txn, e.subj, e.expect, smsg.Sequence)
 		}
 
 		if cur.Dur == rec.Dur && cur.Seq == rec.Seq && cur.SourceAckReply != rec.SourceAckReply {
@@ -353,7 +358,26 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 		// — the thing this whole conversion exists to remove. The boundary loads the marker,
 		// types it as an OBSERVATION of the occupant, and asks the same machinery
 		// storeInflightRegister asks, under the same operation.
-		mkObs := jsa.loadOccupantMarkerLoad(e.subj).observe(mqttMarkerReloaded, cur.Nonce)
+		mkLoad := jsa.loadOccupantMarkerLoad(e.subj)
+		m, paired := markers[mqttSlotKey(name)]
+		// A CARRIED MARKER MEMBER IS COMPARED WITH WHERE THE MARKER STANDS BEFORE THE DISPOSITION
+		// IS DECIDED, at every expectation including create-only, whatever the standing body
+		// holds (errMQTTStaleExpectation). Beyond the store's own CAS this establishes that the
+		// expectation names the marker this validator inspects: without it a transaction could
+		// validate PRESENCE and then commit against ABSENCE — a create-only expectation is invalid
+		// while the inspected marker stands, and becomes acceptable to the store once that marker
+		// is deleted. An indeterminate read observed no sequence and is withheld below.
+		if paired && mkLoad.kind != mqttInflightResponseIndeterminate {
+			var standing uint64
+			if mkLoad.kind == mqttInflightResponsePresent {
+				standing = mkLoad.seq
+			}
+			if m.expect != standing {
+				return mqttStaleExpectationf("transition %q replaces the unsent marker beside %q at "+
+					"sequence %d while the marker stands at %d", a.Txn, e.subj, m.expect, standing)
+			}
+		}
+		mkObs := mkLoad.observe(mqttMarkerReloaded, cur.Nonce)
 		v, verr := mqttDecideMarker(
 			mqttMarkerContext{
 				op:         mqttMarkerOpReplaceOccupant,
@@ -385,23 +409,12 @@ func (jsa *mqttJSA) checkRegisterReplacements(a *mqttTransitionAttempt, extra []
 				"withheld rather than replaced", a.Txn, e.subj)
 		}
 
-		m, paired := markers[mqttSlotKey(name)]
 		switch {
 		case mode == mqttReplacePair && !paired:
 			return fmt.Errorf("transition %q rewrites the register on %q alone while a marker "+
 				"naming its occupant stands: the occupant was PROVEN UNSENT, so its marker is "+
 				"replaced with the displacing allocation's in the same batch and no interval "+
 				"shows a marker naming a record that is gone", a.Txn, e.subj)
-		case mode == mqttReplacePair && m.expect != mkObs.seq:
-			// THE EXPECTATION MUST NAME THE MARKER THIS VALIDATOR INSPECTED, which is a
-			// different fact from the store's CAS. The CAS establishes "the marker at commit
-			// matches the expectation"; this establishes "the expectation names the body that
-			// was decided on". Without it a transaction can validate PRESENCE and then commit
-			// against ABSENCE — a create-only expectation is invalid while the inspected
-			// marker stands, and becomes acceptable to the store once that marker is deleted.
-			return fmt.Errorf("transition %q replaces the unsent marker beside %q at sequence "+
-				"%d while the marker it decided on stands at %d",
-				a.Txn, e.subj, m.expect, mkObs.seq)
 		case mode == mqttReplaceRegisterOnly && paired:
 			return fmt.Errorf("transition %q writes an unsent marker beside the register it "+
 				"replaces on %q while no marker stands for its occupant: an absent marker "+
@@ -597,18 +610,39 @@ func (jsa *mqttJSA) checkActionTokenMembers(a *mqttTransitionAttempt, extra []mq
 	return nil
 }
 
+// mqttRegisterStandsAtExpectation refuses, marked stale, a register member whose subject does not
+// stand at its expectation (0: nothing stands), as read by the caller.
+func mqttRegisterStandsAtExpectation(a *mqttTransitionAttempt, e mqttTransitionMember, smsg *StoredMsg, act string) error {
+	var standing uint64
+	if smsg != nil {
+		standing = smsg.Sequence
+	}
+	if standing != e.expect {
+		return mqttStaleExpectationf("transition %q %s on %q at sequence %d, but it stands at %d",
+			a.Txn, act, e.subj, e.expect, standing)
+	}
+	return nil
+}
+
 // checkRetainedAckPredecessor applies the retained pair verdict to an acknowledgement advance's
 // standing register and the exchange it advances, read at the member's expected sequence.
 func (jsa *mqttJSA) checkRetainedAckPredecessor(a *mqttTransitionAttempt, cur, rec *mqttInflightRecord,
 	gen, nonce string, expect uint64) error {
-	x, xSeq, xerr := jsa.loadOutboundExchange(a.ID, a.Epoch, gen, nonce)
+	// WHERE THE EXCHANGE STANDS IS COMPARED FIRST (errMQTTStaleExpectation): this is a second read,
+	// and the exchange may have moved since checkExchangeOverwrites read it.
+	smsg, rerr := jsa.readAtExpectation(mqttExchangeSubject(getHash(a.ID), gen, nonce), expect,
+		fmt.Sprintf("transition %q advances retained exchange %q", a.Txn, nonce))
+	if rerr != nil {
+		return rerr
+	}
+	var x *mqttOutboundExchange
+	var xerr error
+	if smsg != nil {
+		x, xerr = mqttDecodeOutboundExchange(smsg.Data, a.ID, a.Epoch, gen, nonce)
+	}
 	if xerr != nil || x == nil {
 		return fmt.Errorf("transition %q advances retained exchange %q whose standing record cannot be read (%v)",
 			a.Txn, nonce, xerr)
-	}
-	if xSeq != expect {
-		return fmt.Errorf("transition %q advances retained exchange %q from sequence %d, which no longer stands (%d)",
-			a.Txn, nonce, expect, xSeq)
 	}
 	canon := mqttCanonicalRequired
 	if rec.State == mqttInflightPubRelReady && cur.State != mqttInflightPubRelReady {
@@ -713,7 +747,12 @@ func (jsa *mqttJSA) checkAckPhaseAdvanceMembers(a *mqttTransitionAttempt, extra 
 		if lerr != nil {
 			return fmt.Errorf("transition %q could not read the slot it re-phases on %q: %w", a.Txn, e.subj, lerr)
 		}
-		if smsg == nil || cur == nil {
+		// A SLOT THAT MOVED SINCE THE REPLACEMENT CHECK READ IT is the store's CAS refusal taken
+		// early, compared before its state is judged (errMQTTStaleExpectation).
+		if err := mqttRegisterStandsAtExpectation(a, e, smsg, "re-phases the slot"); err != nil {
+			return err
+		}
+		if cur == nil {
 			return fmt.Errorf("transition %q re-phases the slot on %q, but no slot this broker can read stands there",
 				a.Txn, e.subj)
 		}

@@ -990,15 +990,16 @@ reproduced yet.
   unanswered-request sequence per filter, with the over-attribution stated. Done 2026-11-24
   ([issue #187](https://github.com/nberlee/mqtt-nats-broker/issues/187)).
 
+- [x] Every write-boundary refusal the store's CAS would have made is marked a stale
+  expectation, compared before anything the standing record holds, so a ledger moved inside
+  the boundary keeps a delivery's admission extended and in order. Done 2026-11-25
+  ([issue #189](https://github.com/nberlee/mqtt-nats-broker/issues/189)).
+
 - [ ] Determine whether the fourteen session-record absences reported on 2026-11-18 were real
   or misreported ([issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190)). The
   candidate disposal routes are source-verified, and since 2026-11-25 Warn diagnostics record
   each route's observations. The incident stays open until the owner supplies the
   contemporaneous record and authority evidence and the first reconnects' results.
-
-- [ ] The ledger high-water refusal lacks the stale-expectation marker, so a delivery
-  admission gives up at the base budget and the message is re-offered out of order
-  ([issue #189](https://github.com/nberlee/mqtt-nats-broker/issues/189)).
 
 - [ ] `/readyz` stays ready while JetStream cannot serve the broker's requests
   ([issue #188](https://github.com/nberlee/mqtt-nats-broker/issues/188)).

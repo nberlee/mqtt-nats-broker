@@ -136,7 +136,13 @@ func (jsa *mqttJSA) checkRetireLifecycleRegistry(t *mqttAuthorityTransition) err
 	a := t.Attempt
 	h := getHash(a.ID)
 	reg := jsa.loadLifecycleRegistryShard(a.Epoch, mqttLifecycleRegistryShardFor(h))
-	if reg.status != mqttOutboundValid || reg.seq != t.Registry.expect {
+	// WHERE THE SHARD STANDS IS COMPARED FIRST (errMQTTStaleExpectation): a shard that moved, or
+	// went, is the store's CAS refusal taken early, whatever it now holds.
+	if reg.status != mqttOutboundIndeterminate && reg.seq != t.Registry.expect {
+		return mqttStaleExpectationf("transition %q retires lifecycle %d over a registry shard that reads "+
+			"%v at %d, not at %d", a.Txn, t.Prev.Life.L, reg.status, reg.seq, t.Registry.expect)
+	}
+	if reg.status != mqttOutboundValid {
 		return fmt.Errorf("transition %q retires lifecycle %d over a registry shard that reads %v at %d, not at %d",
 			a.Txn, t.Prev.Life.L, reg.status, reg.seq, t.Registry.expect)
 	}

@@ -666,6 +666,9 @@ func (jsa *mqttJSA) commitAuthorityTransition(t *mqttAuthorityTransition) (uint6
 		// The comparisons below re-read what the transition overwrites and the exchanges its
 		// actions name: those reads are requested together first (outbound_boundary_prefetch.go).
 		jsa := jsa.withBoundaryPrefetch(a.ID, t.Extra)
+		if hook := jsa.testTransitionPrefetched.Load(); hook != nil {
+			(*hook)(t)
+		}
 		if t.Prev != nil {
 			if err := jsa.checkPredecessorAgainstStore(a, t.Prev, t.PrevSeq); err != nil {
 				return 0, err
@@ -2233,14 +2236,10 @@ func (jsa *mqttJSA) checkExchangeOverwrites(a *mqttTransitionAttempt,
 		}
 		gen, nonce := toks[2], toks[3]
 
-		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, e.subj)
+		smsg, lerr := jsa.readAtExpectation(e.subj, e.expect,
+			fmt.Sprintf("transition %q advances exchange %q", a.Txn, nonce))
 		if lerr != nil {
-			return nil, fmt.Errorf("transition %q advances exchange %q, which could not be read: %w",
-				a.Txn, nonce, lerr)
-		}
-		if smsg.Sequence != e.expect {
-			return nil, fmt.Errorf("transition %q advances exchange %q at sequence %d but it stands at %d: %w",
-				a.Txn, nonce, e.expect, smsg.Sequence, errMQTTStaleExpectation)
+			return nil, lerr
 		}
 		cur, derr := mqttDecodeOutboundExchange(smsg.Data, a.ID, a.Epoch, gen, nonce)
 		if derr != nil {
@@ -2770,6 +2769,13 @@ func (jsa *mqttJSA) checkPairBindings(a *mqttTransitionAttempt, extra []mqttTran
 // generation's inventory [Lo, Hi] (issue #114), fenced by the ledger CAS this same batch carries, and
 // it reads the exchange of every duty that names a claimed identifier and no other: a walk that
 // read every exchange made each admission cost as much as the generation's unreclaimed history.
+// mqttIdentifierWalkMovedFrom reports whether an identifier walk observed the generation ledger
+// standing somewhere other than expect: the store's CAS refusal taken early
+// (errMQTTStaleExpectation). An unobserved ledger and an exhausted walk are not.
+func mqttIdentifierWalkMovedFrom(walk *mqttIdentifierWalk, werr error, expect uint64) bool {
+	return walk != nil && walk.ledgerSeq != expect && !errors.Is(werr, errMQTTTraversalExhausted)
+}
+
 func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra []mqttTransitionMember) error {
 	resulting, rerr := jsa.batchExchangeState(a, extra)
 	if rerr != nil {
@@ -2828,15 +2834,21 @@ func (jsa *mqttJSA) checkIdentifierExclusivity(a *mqttTransitionAttempt, extra [
 		// is bound to its exchange where both are created (mqttCheckExchangeDutyIdentifiers) and
 		// never moves, so an exchange whose duty names another identifier cannot hold this one.
 		// Every duty is still read and validated, so an unreadable position still refuses.
+		//
+		// THE LEDGER'S SEQUENCE IS COMPARED BEFORE THE WALK'S FAILURE IS REPORTED: a ledger that
+		// moved is refused as moved whatever the walk then made of it, an undecodable body
+		// included (errMQTTStaleExpectation). A walk returns no observation only when its ledger read
+		// was indeterminate, and then reports its failure. A walk that EXHAUSTED its restarts did
+		// not finish, and reports that unmarked whatever ledger its last pass read.
 		census, cerr := mqttTraverseInventoryForIdentifiers(jsa, a.ID, a.Epoch, gen, pis)
+		if mqttIdentifierWalkMovedFrom(census, cerr, ledgerExpect) {
+			return mqttStaleExpectationf("transition %q enumerated generation %q's obligations at ledger "+
+				"sequence %d but CASes %d: the identifier was shown free in an inventory this batch is "+
+				"not conditioned on", a.Txn, gen, census.ledgerSeq, ledgerExpect)
+		}
 		if cerr != nil {
 			return fmt.Errorf("transition %q could not enumerate generation %q's obligations, "+
 				"so the identifier it claims cannot be shown to be free: %w", a.Txn, gen, cerr)
-		}
-		if census.ledgerSeq != ledgerExpect {
-			return fmt.Errorf("transition %q enumerated generation %q's obligations at ledger sequence "+
-				"%d but CASes %d: the identifier was shown free in an inventory this batch is not "+
-				"conditioned on: %w", a.Txn, gen, census.ledgerSeq, ledgerExpect, errMQTTStaleExpectation)
 		}
 		if len(census.uncertain) != 0 {
 			// AN OBLIGATION THIS BROKER CANNOT READ may be the one holding the identifier.
@@ -2982,14 +2994,23 @@ func (jsa *mqttJSA) checkNameOwnershipMembers(a *mqttTransitionAttempt, extra []
 				"provision-resource (claim LIVE) or a dispose-resource (retire) transition may",
 				a.Txn, a.Kind, next.Name)
 		}
-		prev, prevSeq, lerr := jsa.loadNameOwnership(a.ID, a.Epoch, next.Stream, next.Name)
+		// The claim must CAS the exact record it read, so WHERE the record stands is compared before
+		// what it holds is interpreted (errMQTTStaleExpectation).
+		smsg, lerr := jsa.readAtExpectation(mqttNameOwnershipSubject(next.Stream, next.Name), e.expect,
+			fmt.Sprintf("transition %q writes ownership of %q", a.Txn, next.Name))
 		if lerr != nil {
-			return fmt.Errorf("transition %q: %w", a.Txn, lerr)
+			return lerr
 		}
-		if e.expect != prevSeq {
-			return fmt.Errorf("transition %q writes ownership of %q at expectation %d, but it stands at %d: "+
-				"the claim must CAS the exact record it read: %w", a.Txn, next.Name, e.expect, prevSeq,
-				errMQTTStaleExpectation)
+		var prev *mqttNameOwnership
+		if smsg != nil {
+			o, ierr := mqttInterpretNameOwnership(smsg.Data, a.Epoch, next.Stream, next.Name)
+			if ierr == nil {
+				ierr = mqttCheckNameOwnershipClient(o, a.ID)
+			}
+			if ierr != nil {
+				return fmt.Errorf("transition %q: %w", a.Txn, ierr)
+			}
+			prev = o
 		}
 		if terr := mqttNameOwnershipTransitionLegal(prev, next); terr != nil {
 			return fmt.Errorf("transition %q: %w", a.Txn, terr)
@@ -3184,21 +3205,20 @@ func (jsa *mqttJSA) checkActionMembers(a *mqttTransitionAttempt, extra []mqttTra
 func (jsa *mqttJSA) checkPredecessorAgainstStore(a *mqttTransitionAttempt,
 	prev *mqttOutboundAuthority, prevSeq uint64) error {
 
-	smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, mqttOutboundAuthoritySubject(getHash(a.ID)))
+	// A PRE-SUBMIT contention window: an authority that moved (or went) between the op's read and
+	// this check no longer holds the transition's expected-last-sequence, and no batch is
+	// submitted. A frequent authority writer settles it the same way it settles the JetStream
+	// 10071 the batch CAS would have returned a moment later: a bounded re-attempt on ANY error
+	// after an authoritative re-read (the admission-ladder contract). It is marked a stale
+	// expectation all the same, because the delivery entrance re-attempts PAST its bound only on
+	// that (outbound_admission_contention.go).
+	smsg, lerr := jsa.readAtExpectation(mqttOutboundAuthoritySubject(getHash(a.ID)), prevSeq,
+		fmt.Sprintf("transition %q is conditioned on the authority", a.Txn))
 	if lerr != nil {
-		return fmt.Errorf("transition %q names a predecessor authority that could not be read: %w",
-			a.Txn, lerr)
+		return lerr
 	}
-	if smsg.Sequence != prevSeq {
-		// A PRE-SUBMIT contention window: the authority moved between the op's read and this
-		// check, so the transition's expected-last-sequence no longer holds and no batch is
-		// submitted. A frequent authority writer settles it the same way it settles the
-		// JetStream 10071 the batch CAS would have returned a moment later: a bounded re-attempt
-		// on ANY error after an authoritative re-read (the admission-ladder contract). It is
-		// marked a stale expectation all the same, because the delivery entrance re-attempts PAST
-		// its bound only on that (outbound_admission_contention.go).
-		return fmt.Errorf("transition %q is conditioned on the authority at sequence %d but it "+
-			"stands at %d: %w", a.Txn, prevSeq, smsg.Sequence, errMQTTStaleExpectation)
+	if smsg == nil {
+		return fmt.Errorf("transition %q names a predecessor authority at sequence 0", a.Txn)
 	}
 	stored, derr := mqttDecodeOutboundAuthority(smsg.Data, a.ID, a.Epoch)
 	if derr != nil {
@@ -3445,14 +3465,10 @@ func (jsa *mqttJSA) checkResourceOverwrites(a *mqttTransitionAttempt, extra []mq
 		}
 		gen, inc := toks[2], toks[3]
 
-		smsg, lerr := jsa.loadLastMsgFor(mqttSessStreamName, e.subj)
+		smsg, lerr := jsa.readAtExpectation(e.subj, e.expect,
+			fmt.Sprintf("transition %q mutates resource %q", a.Txn, inc))
 		if lerr != nil {
-			return fmt.Errorf("transition %q mutates resource %q, which could not be read: %w",
-				a.Txn, inc, lerr)
-		}
-		if smsg.Sequence != e.expect {
-			return fmt.Errorf("transition %q mutates resource %q at sequence %d but it stands at %d: %w",
-				a.Txn, inc, e.expect, smsg.Sequence, errMQTTStaleExpectation)
+			return lerr
 		}
 		cur, derr := mqttDecodeOutboundResource(smsg.Data, a.ID, a.Epoch, gen, inc)
 		if derr != nil {

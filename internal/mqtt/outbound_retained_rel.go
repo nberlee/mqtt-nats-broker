@@ -147,6 +147,12 @@ func (jsa *mqttJSA) checkRetainedRelMembers(a *mqttTransitionAttempt, extra []mq
 			continue
 		}
 		cur, smsg, lerr := jsa.loadInflightRecord(e.subj)
+		if lerr == nil {
+			// A slot that moved is the store's CAS refusal taken early (errMQTTStaleExpectation).
+			if err := mqttRegisterStandsAtExpectation(a, e, smsg, "advances the retained slot"); err != nil {
+				return err
+			}
+		}
 		if lerr != nil || smsg == nil || cur == nil {
 			return fmt.Errorf("transition %q could not read the retained slot it advances on %q (%v)", a.Txn, e.subj, lerr)
 		}

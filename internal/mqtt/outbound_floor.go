@@ -410,14 +410,21 @@ func (jsa *mqttJSA) checkFloorAdvance(a *mqttTransitionAttempt, extra []mqttTran
 	if derr != nil {
 		return fmt.Errorf("transition %q carries an unsupported generation ledger: %w", a.Txn, derr)
 	}
+	// WHERE THE LEDGER STANDS IS COMPARED FIRST (errMQTTStaleExpectation); a floor advance over no
+	// ledger at all, conditioned on none, is a malformed batch rather than a moved record.
 	cur, curSeq, lerr := jsa.loadGenLedger(a.ID, a.Epoch, gen)
+	if (lerr == nil || curSeq != 0) && lm.expect != curSeq {
+		return mqttStaleExpectationf("transition %q advances the floor of generation %q against ledger "+
+			"sequence %d, but it stands at %d: a floor advance continues the ledger it read",
+			a.Txn, gen, lm.expect, curSeq)
+	}
 	if lerr != nil {
 		return fmt.Errorf("transition %q advances the floor of generation %q, whose ledger could not "+
 			"be read: %w", a.Txn, gen, lerr)
 	}
-	if cur == nil || lm.expect == 0 || lm.expect != curSeq {
-		return fmt.Errorf("transition %q advances the floor of generation %q against ledger sequence %d, "+
-			"but it stands at %d: a floor advance continues the ledger it read", a.Txn, gen, lm.expect, curSeq)
+	if cur == nil {
+		return fmt.Errorf("transition %q advances the floor of generation %q, which has no ledger: a "+
+			"floor advance continues the ledger it read", a.Txn, gen)
 	}
 	if next.State != cur.State {
 		return fmt.Errorf("transition %q moves generation %q's ledger from state %d to %d: a floor "+
@@ -494,7 +501,20 @@ func (jsa *mqttJSA) checkFloorAdvance(a *mqttTransitionAttempt, extra []mqttTran
 	// EVERY RETIRED POSITION, re-decided against the store.
 	for ord := cur.Lo; ord < next.Lo; ord++ {
 		subj := mqttDutySubject(idHash, gen, ord)
-		smsg, rerr := jsa.loadLastMsgFor(mqttSessStreamName, subj)
+		mk, carried := markers[ord]
+		var smsg *StoredMsg
+		var rerr error
+		if carried {
+			// A CARRIED MARKER CASes the position, so where it stands is compared first
+			// (errMQTTStaleExpectation).
+			smsg, rerr = jsa.readAtExpectation(subj, mk.expect,
+				fmt.Sprintf("transition %q relocates position %d", a.Txn, ord))
+			if rerr != nil {
+				return rerr
+			}
+		} else {
+			smsg, rerr = jsa.loadLastMsgFor(mqttSessStreamName, subj)
+		}
 		if rerr != nil || smsg == nil {
 			return fmt.Errorf("transition %q retires position %d of generation %q, which could not be "+
 				"read: a position inside the inventory exists, and retiring one this broker cannot see "+
@@ -505,11 +525,7 @@ func (jsa *mqttJSA) checkFloorAdvance(a *mqttTransitionAttempt, extra []mqttTran
 			return fmt.Errorf("transition %q retires position %d of generation %q, whose entry cannot be "+
 				"interpreted: %w", a.Txn, ord, gen, sderr)
 		}
-		if mk, carried := markers[ord]; carried {
-			if mk.expect != smsg.Sequence {
-				return fmt.Errorf("transition %q relocates position %d at sequence %d, but it stands at %d",
-					a.Txn, ord, mk.expect, smsg.Sequence)
-			}
+		if carried {
 			if standing.State == mqttDutyRelocated {
 				return fmt.Errorf("transition %q relocates position %d, which is already a relocation marker",
 					a.Txn, ord)

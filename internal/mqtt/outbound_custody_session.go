@@ -14,6 +14,7 @@
 package mqtt
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -655,8 +656,13 @@ func mqttTraverseInventoryRestarting(jsa *mqttJSA, as *mqttAccountSessionManager
 	}
 	// EXHAUSTED: INCOMPLETE, which every caller already treats as withholding.
 	return last, fmt.Errorf("reading the inventory of %q/%q: the floor moved under %d consecutive "+
-		"traversals", id, gen, mqttTraversalRestarts+1)
+		"traversals: %w", id, gen, mqttTraversalRestarts+1, errMQTTTraversalExhausted)
 }
+
+// errMQTTTraversalExhausted marks a traversal that gave up because the floor kept crossing it. The
+// census it returns names the ledger of its last pass, which is not a stale expectation of the
+// caller's: the walk did not finish, and the floor's progress is what stopped it.
+var errMQTTTraversalExhausted = errors.New("the inventory traversal exhausted its restarts")
 
 // mqttTraversalRestarts bounds the restarts one traversal takes for a floor that crossed it.
 const mqttTraversalRestarts = 8
@@ -711,10 +717,17 @@ func mqttTraverseInventoryOnce(jsa *mqttJSA, as *mqttAccountSessionManager,
 	wanted func(d *mqttDutyEntry) bool, identities bool) (*mqttCustodyCensus, bool, error) {
 
 	led, ledSeq, lerr := jsa.loadGenLedger(id, epoch, gen)
+	out := &mqttCustodyCensus{named: map[string]struct{}{}}
 	if lerr != nil {
+		// A ledger that stands but cannot be interpreted is still an observation of WHERE it
+		// stands, which a fenced caller compares before anything else (errMQTTStaleExpectation);
+		// an indeterminate read observed nothing.
+		if ledSeq != 0 {
+			out.ledgerSeq = ledSeq
+			return out, false, fmt.Errorf("reading the inventory of %q/%q: %w", id, gen, lerr)
+		}
 		return nil, false, fmt.Errorf("reading the inventory of %q/%q: %w", id, gen, lerr)
 	}
-	out := &mqttCustodyCensus{named: map[string]struct{}{}}
 	if led == nil {
 		out.complete = true
 		return out, false, nil
