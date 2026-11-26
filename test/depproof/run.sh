@@ -454,14 +454,15 @@ accept_run() {
       '			m, h := mqttFrameBatchWrite(expect, body, batchID, seq, commit)' \
       '			m, h := mqttFrameBatchWrite(expect, body, _EMPTY_, seq, commit)'
     # ... and the store issues them one after the other instead of committing them
-    # together. The helper is inserted into the sentinel file, where the
-    # counterfactual sits next to the assertion it must break.
+    # together, at the transition's send, where the transition is in scope. The helper
+    # is inserted into the sentinel file, where the counterfactual sits next to the
+    # assertion it must break.
     edit "$dest/internal/mqtt/outbound_transition.go" 1 \
-      '		bi, err := jsa.newAtomicBatchRequest(mqttJSAMsgStore, msgs)' \
-      '		bi, err := jsa.acceptCommitSplit(batchID, msgs, t)'
+      '		resp, err := jsa.sendTransitionBatch(msgs, batchID, total, a.Txn)' \
+      '		resp, err := jsa.acceptCommitSplit(batchID, msgs, t, total, a.Txn)'
     edit "$dest/$accept_file" 1 \
       '// MUTATION ANCHOR: test/depproof/run.sh inserts the m-accept-split-write helper here' \
-      'func (jsa *mqttJSA) acceptCommitSplit(batchID string, msgs []mqttBatchMsg, t *mqttAuthorityTransition) (any, error) {
+      'func (jsa *mqttJSA) acceptCommitSplit(batchID string, msgs []mqttBatchMsg, t *mqttAuthorityTransition, total int, txn string) (*JSPubAckResponse, error) {
 	var resp *JSPubAckResponse
 	for i, m := range msgs {
 		// The counterfactual phase suppresses the record, which commits last, so the tear is
@@ -486,8 +487,12 @@ accept_run() {
 		resp = rr
 	}
 	// Presented as an acknowledgement of the batch, so the transition writer cannot tell
-	// separate writes from one commit.
+	// separate writes from one commit, and held to the check the production send applies:
+	// the row proves a tear the broker would accept as a commit.
 	resp.BatchId, resp.BatchSize, resp.Stream = batchID, uint64(len(msgs)), mqttSessStreamName
+	if cerr := mqttCheckTransitionBatchAck(resp, batchID, total, txn); cerr != nil {
+		return nil, cerr
+	}
 	return resp, nil
 }
 
@@ -511,7 +516,7 @@ accept_run() {
     fi
   elif ! grep -qE '^\s*--- PASS: TestMQTTAcceptBatchReplicatedIndivisible' "$log"; then
     outcome=BROKEN
-  elif grep -qF 'ACCEPT-BATCH-TORN' "$log"; then
+  elif grep -qE 'ACCEPT-BATCH-TORN|ACCEPT-SPLIT-PHASE-FIRED' "$log"; then
     # A clean row that printed the marker at all is not clean, whatever go test made
     # of it: the marker is only ever written by an assertion that observed the tear.
     outcome=OFFTARGET

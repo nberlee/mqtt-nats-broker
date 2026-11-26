@@ -42,6 +42,10 @@ import (
 // kill that came from a broken cluster or a refused CONNECT is not counted.
 const acceptBatchTornMarker = "ACCEPT-BATCH-TORN"
 
+// acceptSplitPhaseMarker reports that the split-write phase fired at all. It is not the tear:
+// only the store's readback is, so the mutation row is never scored on this one.
+const acceptSplitPhaseMarker = "ACCEPT-SPLIT-PHASE-FIRED"
+
 // mqttAcceptStoreSplitRecordPending is the counterfactual phase: the acceptance's
 // authority has been INDEPENDENTLY acknowledged and the session record has not been written yet.
 //
@@ -113,41 +117,74 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 				return nil
 			}
 
-			// The session record, at the sequence the acknowledgement named --
-			// which is the claim the caller acts on when it adopts resp.Sequence.
+			// Both members read back BEFORE anything is judged, and only a definite reading
+			// counts. A record read answering 404 is not absence by itself: the server reports
+			// any store load failure that way (issue #111). Absence is corroborated by the
+			// stream's subject count, taken once its last sequence covers the acknowledgement.
 			smsg, lerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, obs.RecSubj)
-			switch {
-			case lerr != nil || smsg == nil:
-				t.Errorf("%s: the acceptance batch was acknowledged at sequence %d, but no session "+
-					"record is on %q: the acceptance committed without it (%v)",
-					acceptBatchTornMarker, obs.Seq, obs.RecSubj, lerr)
-			case smsg.Sequence != obs.Seq:
-				t.Errorf("%s: the acceptance batch was acknowledged at sequence %d, but the session "+
-					"record on %q is at %d: the acknowledged sequence does not name the record",
-					acceptBatchTornMarker, obs.Seq, obs.RecSubj, smsg.Sequence)
-			case mqttRecordDigest(smsg.Data) != obs.RecDigest:
-				t.Errorf("%s: the session record at the acknowledged sequence %d on %q is not the "+
-					"body this attempt sent", acceptBatchTornMarker, obs.Seq, obs.RecSubj)
+			recAbsent := false
+			if lerr != nil && IsNatsErr(lerr, JSNoMessageFoundErr) {
+				counts, last, cerr := asm.jsa.streamSubjects(mqttSessStreamName, obs.RecSubj)
+				recAbsent = cerr == nil && last >= obs.Seq && counts[obs.RecSubj] == 0
+				if !recAbsent {
+					t.Errorf("the readback after the acknowledgement at sequence %d was inconclusive: "+
+						"the record read on %q answered %v, and the subject count did not confirm its "+
+						"absence (count %d, last sequence %d, %v)", obs.Seq, obs.RecSubj, lerr,
+						counts[obs.RecSubj], last, cerr)
+					return nil
+				}
+			} else if lerr == nil && smsg == nil {
+				t.Errorf("the record read on %q answered neither a message nor an error", obs.RecSubj)
+				return nil
+			}
+			if obs.RecptSubj == "" {
+				t.Errorf("the acknowledged accept batch carried no authority member: the accept " +
+					"path is not the acceptance-commit path")
+				return nil
+			}
+			rmsg, rerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, obs.RecptSubj)
+			authPresent := rerr == nil && rmsg != nil
+			if (lerr != nil && !recAbsent) || (rerr != nil && !IsNatsErr(rerr, JSNoMessageFoundErr)) || (rerr == nil && rmsg == nil) {
+				t.Errorf("the readback after the acknowledgement at sequence %d was inconclusive: "+
+					"record %q: %v; authority %q: %v", obs.Seq, obs.RecSubj, lerr, obs.RecptSubj, rerr)
+				return nil
 			}
 
-			// And the authority, the member that carries the acceptance: it commits with
-			// the record or not at all. An authority without its record would be an
-			// acceptance of a session the record never took.
-			switch obs.RecptSubj {
-			case "":
-				t.Errorf("%s: the acknowledged accept batch carried no authority "+
-					"member: the accept path is not the acceptance-commit path", acceptBatchTornMarker)
-			default:
-				rmsg, rerr := asm.jsa.loadLastMsgFor(mqttSessStreamName, obs.RecptSubj)
-				switch {
-				case rerr != nil || rmsg == nil:
-					t.Errorf("%s: the accept batch was acknowledged at sequence %d, but no "+
-						"authority is on %q: the record committed without it (%v)",
-						acceptBatchTornMarker, obs.Seq, obs.RecptSubj, rerr)
-				case mqttRecordDigest(rmsg.Data) != obs.RecptDigest:
-					t.Errorf("%s: the authority on %q is not the body this attempt sent",
-						acceptBatchTornMarker, obs.RecptSubj)
-				}
+			// THE TEAR, the one failure this sentinel is evidence about: the authority this
+			// attempt sent is durable at the sequence the acknowledgement named, and the
+			// first-ever session record its batch was supposed to carry is not there.
+			if recAbsent && authPresent && rmsg.Sequence == obs.Seq &&
+				mqttRecordDigest(rmsg.Data) == obs.RecptDigest {
+				t.Errorf("%s: the acceptance batch was acknowledged at sequence %d, carrying the "+
+					"authority on %q, but no session record is on %q: the acceptance committed "+
+					"without it", acceptBatchTornMarker, obs.Seq, obs.RecptSubj, obs.RecSubj)
+				return nil
+			}
+
+			// Anything else that departs from one indivisible commit still fails, unmarked.
+			switch {
+			case recAbsent:
+				t.Errorf("the acceptance batch was acknowledged at sequence %d, but no session "+
+					"record is on %q, and the authority on %q is not this attempt's at that "+
+					"sequence", obs.Seq, obs.RecSubj, obs.RecptSubj)
+			case smsg.Sequence != obs.Seq:
+				t.Errorf("the acceptance batch was acknowledged at sequence %d, but the session "+
+					"record on %q is at %d: the acknowledged sequence does not name the record",
+					obs.Seq, obs.RecSubj, smsg.Sequence)
+			case mqttRecordDigest(smsg.Data) != obs.RecDigest:
+				t.Errorf("the session record at the acknowledged sequence %d on %q is not the "+
+					"body this attempt sent", obs.Seq, obs.RecSubj)
+			case !authPresent:
+				t.Errorf("the accept batch was acknowledged at sequence %d, but no authority is "+
+					"on %q: the record committed without it", obs.Seq, obs.RecptSubj)
+			case mqttRecordDigest(rmsg.Data) != obs.RecptDigest:
+				t.Errorf("the authority on %q is not the body this attempt sent", obs.RecptSubj)
+			case rmsg.Sequence != obs.Seq-1:
+				// An atomic batch's members are stored at consecutive sequences, and the writer
+				// takes the authority's sequence to be the acknowledged one less one.
+				t.Errorf("the authority on %q is at %d, not directly before the record at the "+
+					"acknowledged sequence %d: the members were not stored as one batch",
+					obs.RecptSubj, rmsg.Sequence, obs.Seq)
 			}
 			return nil
 		}
@@ -178,7 +215,7 @@ func TestMQTTAcceptBatchReplicatedIndivisible(t *testing.T) {
 	}
 	if gotSuppressed != 0 {
 		t.Errorf("%s: the production accept path fired the split-write phase %d time(s); it has "+
-			"no such moment", acceptBatchTornMarker, gotSuppressed)
+			"no such moment", acceptSplitPhaseMarker, gotSuppressed)
 	}
 
 	testMQTTDisconnect(t, mc, nil)
