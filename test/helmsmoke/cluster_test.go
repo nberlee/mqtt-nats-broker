@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -195,10 +196,11 @@ func namespace(t *testing.T) string {
 	kubectl(t, "create", "namespace", ns)
 	t.Cleanup(func() {
 		if t.Failed() {
-			out, _ := run(context.Background(), nil, env.kubectl, "-n", ns, "get", "pods,events", "-o", "wide")
-			t.Logf("namespace %s:\n%s", ns, out)
+			dumpNamespace(t, ns)
 		}
-		_, _ = run(context.Background(), nil, env.kubectl, "delete", "namespace", ns, "--wait=false")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_, _ = run(ctx, nil, env.kubectl, "delete", "namespace", ns, "--wait=false")
 	})
 	kubectl(t, "label", "namespace", ns,
 		"pod-security.kubernetes.io/enforce=restricted", "pod-security.kubernetes.io/enforce-version=latest")
@@ -208,6 +210,126 @@ func namespace(t *testing.T) string {
 	kubectl(t, "-n", ns, "create", "secret", "generic", "mqtt-nats-broker-routes",
 		"--from-literal=user=route", "--from-literal=password="+randSuffix()+randSuffix())
 	return ns
+}
+
+// diagnosticsCall bounds each kubectl process a failed test's namespace dump runs, retries
+// included. There is no budget across them: every container's evidence gets its own attempt,
+// whatever an earlier one cost. A dump is at most a few calls per container, on a test that has
+// already failed.
+const diagnosticsCall = 30 * time.Second
+
+// termination is a container instance's end as its status records it.
+type termination struct {
+	Reason   string `json:"reason"`
+	ExitCode int    `json:"exitCode"`
+}
+
+func (t *termination) String() string {
+	if t == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%s/%d", t.Reason, t.ExitCode)
+}
+
+// containerState is the part of a pod's container status the dump reads: an OOM kill writes no
+// final log line, and the namespace's deletion discards the status that records it.
+type containerState struct {
+	Name         string `json:"name"`
+	RestartCount int    `json:"restartCount"`
+	State        struct {
+		Terminated *termination `json:"terminated"`
+	} `json:"state"`
+	LastState struct {
+		Terminated *termination `json:"terminated"`
+	} `json:"lastState"`
+}
+
+// podSnapshot is what the dump reads of each pod: its containers by spec, and their statuses.
+type podSnapshot struct {
+	Items []struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Spec struct {
+			Containers []struct {
+				Name string `json:"name"`
+			} `json:"containers"`
+		} `json:"spec"`
+		Status struct {
+			ContainerStatuses []containerState `json:"containerStatuses"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+// dumpNamespace logs what a failed test's namespace shows, most telling first: every
+// container's status, the previous instance's log of every container that restarted (a
+// crash-looping container says why only in its own log, and a restart replaces it), pods and
+// events, then every container's current log. Each kubectl call has its own deadline.
+func dumpNamespace(t *testing.T, ns string) {
+	t.Helper()
+	kubectl := func(args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), diagnosticsCall)
+		defer cancel()
+		return run(ctx, nil, env.kubectl, append([]string{"-n", ns}, args...)...)
+	}
+	var pods podSnapshot
+	snapshot := func() error {
+		out, err := kubectl("get", "pods", "-o", "json")
+		if err == nil {
+			err = json.Unmarshal([]byte(out), &pods)
+		}
+		return err
+	}
+	logStatuses := func() {
+		for _, pod := range pods.Items {
+			for _, c := range pod.Status.ContainerStatuses {
+				t.Logf("pod/%s container %s: restarts=%d terminated=%s last-terminated=%s", pod.Metadata.Name,
+					c.Name, c.RestartCount, c.State.Terminated, c.LastState.Terminated)
+			}
+		}
+	}
+	readPrevious := func(pod, container string) {
+		out, err := kubectl("logs", pod, "-c", container, "--previous", "--tail=200")
+		t.Logf("pod/%s container %s previous log (err=%v):\n%s", pod, container, err, out)
+	}
+	err := snapshot()
+	if err != nil {
+		err = snapshot()
+	}
+	if err != nil {
+		t.Logf("namespace %s: reading the pods: %v", ns, err)
+	} else {
+		logStatuses()
+		for _, pod := range pods.Items {
+			for _, c := range pod.Status.ContainerStatuses {
+				if c.RestartCount > 0 {
+					readPrevious(pod.Metadata.Name, c.Name)
+				}
+			}
+		}
+	}
+	out, listErr := kubectl("get", "pods,events", "-o", "wide")
+	t.Logf("namespace %s (err=%v):\n%s", ns, listErr, out)
+	if err != nil && snapshot() == nil {
+		// The API answered again: the pods the failed snapshot could not name.
+		logStatuses()
+	}
+	for _, pod := range pods.Items {
+		for _, c := range pod.Spec.Containers {
+			out, err := kubectl("logs", pod.Metadata.Name, "-c", c.Name, "--tail=200")
+			t.Logf("pod/%s container %s log (err=%v):\n%s", pod.Metadata.Name, c.Name, err, out)
+			// Again for every container, whatever was read above: it may have restarted since,
+			// the early read may have failed, or the snapshot came late. None is expected.
+			readPrevious(pod.Metadata.Name, c.Name)
+		}
+	}
+	// Last, the statuses again: a container killed during the reads above (an OOM kill writes no
+	// final line) is recorded only here.
+	if err := snapshot(); err != nil {
+		t.Logf("namespace %s: reading the pods after their logs: %v", ns, err)
+	} else {
+		logStatuses()
+	}
 }
 
 // install installs the chart (or the NATS chart archive) as a fresh release and waits
