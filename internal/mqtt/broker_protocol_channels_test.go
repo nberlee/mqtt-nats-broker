@@ -101,6 +101,7 @@ var classifiedNATSObjects = map[string]natsUseClass{
 	"(*github.com/nats-io/nats.go.Conn).Drain":                   natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).Flush":                   natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).IsConnected":             natsUseLifecycle,
+	"(*github.com/nats-io/nats.go.Conn).Stats":                   natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).LastError":               natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).ConnectedClusterName":    natsUseLifecycle,
 	"(*github.com/nats-io/nats.go.Conn).ConnectedServerName":     natsUseLifecycle,

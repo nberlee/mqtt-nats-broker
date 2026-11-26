@@ -6200,12 +6200,32 @@ The probes, the exit status and the frozen records are one definition
 - **Every other record's text can change in any release**, the MQTT core's per-connection
   records included: they are printf text with the client label (`cid:N`) inside `msg`,
   and a `text` field's wording (an error, a reason) is not frozen either.
-- **`/readyz` reports connectivity, not identity.** A service connection that reconnected
-  and could not be identified answers `200 ready` while every auth-passthrough CONNECT is
-  refused; only the `could not be identified` and `refusing CONNECT: the service
+- **`/readyz` reports connectivity and a JetStream observation, not identity.** A service
+  connection that reconnected and could not be identified answers `200 ready` again once
+  a JetStream observation begun after the reconnect succeeds, while every auth-passthrough
+  CONNECT is refused; only the `could not be identified` and `refusing CONNECT: the service
   connection's account is not currently established` records show it.
 - **No record reports the service connection's disconnect or reconnect** as such; `/readyz`
-  answers `503 nats disconnected` while it is down.
+  answers `503 nats disconnected` while it is down. The two readiness-probe records report
+  the probe's outcomes, not the connection.
+- **A blocked stdout write can stall graceful shutdown.** The JSON handler serializes
+  writes, so while one record is blocked, later records wait even if they would fit in the
+  pipe. The broker logs the receipt of SIGTERM before it begins the MQTT shutdown, and any
+  writer can hold the handler at that moment: the NATS error and reconnect callbacks, the
+  MQTT connections' records, and the readiness observer's, which can be the one on an
+  otherwise idle broker. If the write stays blocked, the orchestrator's SIGKILL at the
+  grace deadline ends the process.
+- **The JetStream observation behind `/readyz` proves less than "JetStream can serve the
+  broker"** ([issue #188](https://github.com/nberlee/mqtt-nats-broker/issues/188)). Account
+  info and the session stream's info being answered say nothing about write latency, about
+  a consumer create being applied and placed, or about the other streams' leaders. The
+  embedded meta check passes a meta replica that is catching up, and the external topology
+  has no local meta check at all, since the broker does not own the server. nats-server
+  2.15.2 serves info requests behind other API requests, so under heavy API load a probe
+  can time out and withdraw a pod whose own requests are being served. The handler's answer
+  can wait on nats.go's connection mutex during a reconnect, as the connection check
+  already did. Readiness only steers the Service: a client that reaches a withdrawn broker
+  directly meets the same timeouts as before.
 - **A stop during startup is exit 0 only once a step observes it.** The NATS dial and the
   first service-identity request are bounded but do not observe the signal; a failure of
   their own while it is pending is reported as exit 1.

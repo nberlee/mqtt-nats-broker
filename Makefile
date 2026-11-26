@@ -85,9 +85,9 @@ test-shard: ## Run shard SHARD of SHARDS of the tagged suite (TEST_TAGS) under -
 experimental-shared-qos2-tests: ## Run the parked, non-gating shared-QoS2 suite.
 	go test -tags 'mqtt_fulltests mqtt_experimental_shared_qos2' ./internal/mqtt/
 
-cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, the v2 acknowledgement-layout witness, the replicated bundle's network restore and cold copy, and an embedded-NATS cluster forming from a staggered start.
+cluster-failover-tests: ## Run the 3-node JetStream tests (nodes run js_ack_fc_v2): Will-outbox failover, takeover arbitration, shared group ownership, the cross-broker orphan sweep, the v2 acknowledgement-layout witness, the replicated bundle's network restore and cold copy, an embedded-NATS cluster forming from a staggered start, and readiness following a lost and regained meta quorum.
 	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -tags mqtt_fulltests -race -run '^(TestMQTTWillOutboxReplicated|TestMQTTTakeover.*Replicated|TestMQTTSharedGroup.*Replicated|TestMQTTQoS0Downgrade.*Replicated|TestMQTTAckReplyLayoutV2Replicated|TestNetworkRestoreOfAReplicatedBundle|TestColdStoreCopyOfAReplicatedBundle)' ./internal/mqtt/
-	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -race -run '^TestEmbeddedClusterFormsAfterFirstProbeFails$$' ./cmd/mqtt-nats-broker/
+	MQTTNB_CLUSTER_FAILOVER_TESTS=1 go test -race -run '^(TestEmbeddedClusterFormsAfterFirstProbeFails|TestEmbeddedServerHealthAnswersTheMetaReplica|TestReadinessFollowsTheMetaLeaderWhileServing)$$' ./cmd/mqtt-nats-broker/
 
 backup-cli-test: ## Run the documented backup and restore commands with the pinned natscli against a broker
 	GOBIN=$(CURDIR)/bin go install github.com/nats-io/natscli/nats@$(NATSCLI_VERSION)

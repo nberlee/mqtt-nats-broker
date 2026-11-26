@@ -14,6 +14,7 @@ type (
 	CreateConsumerRequest       = server.CreateConsumerRequest
 	ErrorIdentifier             = server.ErrorIdentifier
 	PubAck                      = server.PubAck
+	JSApiAccountInfoResponse    = server.JSApiAccountInfoResponse
 	JSApiConsumerCreateResponse = server.JSApiConsumerCreateResponse
 	JSApiConsumerDeleteResponse = server.JSApiConsumerDeleteResponse
 	JSApiConsumerInfoResponse   = server.JSApiConsumerInfoResponse
@@ -60,6 +61,7 @@ const (
 	FileStorage           = server.FileStorage
 	InterestPolicy        = server.InterestPolicy
 	JETSTREAM             = server.JETSTREAM
+	JSApiAccountInfo      = server.JSApiAccountInfo
 	JSApiConsumerCreateT  = server.JSApiConsumerCreateT
 	JSApiConsumerDeleteT  = server.JSApiConsumerDeleteT
 	JSApiConsumerInfoT    = server.JSApiConsumerInfoT

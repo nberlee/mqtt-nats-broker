@@ -105,6 +105,36 @@ func TestUnansweredObservationOrigins(t *testing.T) {
 			testDeliverJSAPIReply(t, asm, mqttJSAConsumerLookup, body, 0)
 		})
 	}
+	// The readiness probe's account info (jetstream_readiness_probe.go) is decoded and classified
+	// like every other kind.
+	advanced("a no-responders status on an account info", true, func() {
+		r := testDeliverJSAPIReply(t, asm, mqttJSAAccountInfo, noResponders, len(noResponders))
+		if r.value.(*JSApiAccountInfoResponse).ToError() == nil {
+			t.Error("a no-responders account info decoded as an answer")
+		}
+	})
+	advanced("a decoded unavailable account info", true, func() {
+		body := []byte(`{"type":"io.nats.jetstream.api.v1.account_info_response","error":{"code":503,"err_code":10008,"description":"JetStream system temporarily unavailable"}}`)
+		if testDeliverJSAPIReply(t, asm, mqttJSAAccountInfo, body, 0).value.(*JSApiAccountInfoResponse).ToError() == nil {
+			t.Error("an unavailable account info decoded as an answer")
+		}
+	})
+	advanced("a decoded definite account info refusal", false, func() {
+		body := []byte(`{"type":"io.nats.jetstream.api.v1.account_info_response","error":{"code":503,"err_code":10039,"description":"jetstream not enabled for account"}}`)
+		if testDeliverJSAPIReply(t, asm, mqttJSAAccountInfo, body, 0).value.(*JSApiAccountInfoResponse).ToError() == nil {
+			t.Error("a refused account info decoded as an answer")
+		}
+	})
+	advanced("a malformed account info", false, func() {
+		if testDeliverJSAPIReply(t, asm, mqttJSAAccountInfo, []byte("{"), 0).value.(*JSApiAccountInfoResponse).ToError() == nil {
+			t.Error("a malformed account info decoded as an answer")
+		}
+	})
+	advanced("an answered account info", false, func() {
+		if err := jsa.accountInfo(); err != nil {
+			t.Errorf("the account info failed: %v", err)
+		}
+	})
 	advanced("a decoded definite answer", false, func() {
 		body := []byte(`{"type":"io.nats.jetstream.api.v1.consumer_info_response","error":{"code":404,"err_code":10014,"description":"consumer not found"}}`)
 		testDeliverJSAPIReply(t, asm, mqttJSAConsumerLookup, body, 0)

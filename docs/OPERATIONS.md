@@ -24,14 +24,29 @@ cannot be bound stops startup (exit 1).
 |---|---|
 | `503 draining` | a shutdown signal has been received, whether or not the broker served |
 | `503 starting` | the broker has not served yet: the JetStream wait, the dial, the stream checks, the MQTT initialization and its retries, and a failed start's unwinding |
-| `200 ready` | the broker serves and its NATS service connection is connected |
 | `503 nats disconnected` | the broker serves and its NATS service connection is down |
+| `503 jetstream not answering` | the broker serves, its NATS service connection is connected, and its last completed JetStream round failed, began before the connection's last reconnect, or is older than its bound, or no round has completed yet |
+| `200 ready` | the broker serves, its NATS service connection is connected, and its last completed JetStream round succeeded, began after the connection's last reconnect, and is within its bound |
 
-Readiness reflects the broker's own NATS connection, not its identity: a client's
-per-connection NATS link going down does not change it, and a service connection that
-reconnected but could not be identified answers `200 ready` while every auth-passthrough
-CONNECT is refused (the `could not be identified` record below says so). There is no
-metrics endpoint.
+Readiness reflects the broker's own NATS connection and whether JetStream answers it, not
+its identity. While it serves, the broker observes JetStream in rounds, each starting 2 s
+after the previous one ended (so at least 7 s apart while a request times out). Each round
+asks JetStream for its account's info (answered by the meta leader) and its session
+stream's info, which must name the stream's leader, and, with the embedded server, runs
+that server's own health check: clustered, its meta replica; standalone, its stored
+streams, so a stream that failed to recover or has a recorded write error, the broker's or
+another's, withdraws the broker, named in `err` (a write the server refuses without
+recording an error, such as one over a storage limit, does not); the probe only reads the
+last result. Each request waits at most 5 s. A failed round withdraws the pod at once, a
+success counts for 13 s from when its requests began (2 s plus two 5 s waits plus 1 s) and
+only if that round began after the service connection's last reconnect, and the pod
+returns without any client traffic once a round succeeds. The two `JetStream readiness
+probe` records below report the rounds' changes. A client's per-connection NATS link going
+down does not change readiness, and a service connection that reconnected but could not be
+identified can answer `200 ready` while every auth-passthrough CONNECT is refused (the
+`could not be identified` record below says so). Readiness only steers the Service: a
+CONNECT that reaches a withdrawn broker is served or refused on its own requests. There is
+no metrics endpoint.
 
 ## Startup
 
@@ -55,7 +70,8 @@ In order; a failure stops the process with `fatal: <reason>` on stderr and exit 
    streams ([below](#the-seven-streams)), waiting up to 30 s on a partial set, and creates
    any that do not exist yet. An initialization JetStream does not answer yet is retried
    with no overall timeout.
-8. TLS reloading starts, and `/readyz` turns `200 ready`.
+8. TLS reloading starts, the broker starts observing JetStream, and `/readyz` turns
+   `200 ready` once the first observation succeeds.
 
 ## Exit status
 
@@ -81,8 +97,10 @@ Then the broker closes its listeners and drains: every connected client gets a s
 DISCONNECT with reason code 0x8B (server shutting down) if it speaks MQTT 5.0, and its
 socket is closed; writing that takes at most 10 s. The broker then stops dispatching
 Wills and waits for the Will publications already running, owed work gets its last
-attempt while JetStream still answers, and the broker releases its
-NATS state and closes its service connection, waiting at most 20 s for it to flush. In
+attempt while JetStream still answers, and the broker releases its NATS state. A
+readiness round still inside the embedded server's health check or the connection's
+statistics is waited for here; it has no budget of its own. The broker then closes its
+service connection, waiting at most 20 s for it to flush. In
 the embedded topology the NATS server stops last. The phases have no overall timeout of
 their own: the orchestrator's termination grace is the final bound, and the exit status
 of a completed shutdown is 0 ([details](ARCHITECTURE.md#resource-lifetime-and-shutdown-release)).
@@ -334,7 +352,9 @@ release.
 | `shutdown signal received, draining` | `INFO` | none | once, at the first shutdown signal after the broker served |
 | `draining, waiting for endpoint deregistration` | `INFO` | `delay` (duration) | once, with `-drain-delay` |
 | `NATS service connection error` | `WARN` | `err` (text) | per asynchronous error the service connection reports |
-| `MQTT: the service connection reconnected but could not be identified; no CONNECT is accepted` | `ERROR` | `err` (text) | per reconnect whose identity request fails; `/readyz` still answers `200 ready` |
+| `JetStream readiness probe failed` | `WARN` | `check` (string), `err` (text) | per change, while the broker serves, from a readiness probe that succeeded (or none yet) to one that failed; `check` is `account info`, `session stream info` or `embedded server health`, and `err` says whether it went unanswered, was refused or was not answered by the stream's leader |
+| `JetStream readiness probe succeeded again` | `INFO` | none | per change back to a readiness probe that succeeded |
+| `MQTT: the service connection reconnected but could not be identified; no CONNECT is accepted` | `ERROR` | `err` (text) | per reconnect whose identity request fails; `/readyz` can answer `200 ready` once a JetStream observation begun after the reconnect succeeds |
 | `MQTT: the service connection dropped while it was being re-identified; the account stays unknown` | `WARN` | none | per occurrence |
 | `MQTT: the service connection reconnected into another account; disconnecting every auth-passthrough client` | `ERROR` | `account` (string), `previous_account` (string) | per occurrence |
 | `MQTT: refusing CONNECT: the service connection's account is not currently established` | `WARN` | none | per CONNECT refused for it |

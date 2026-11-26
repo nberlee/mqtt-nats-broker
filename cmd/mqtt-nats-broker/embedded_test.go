@@ -37,6 +37,9 @@ func TestMain(m *testing.M) {
 		if os.Getenv(embeddedFatalEnv) == "1" {
 			runEmbeddedFatal()
 		}
+		if path := os.Getenv(embeddedHealthFailFileEnv); path != "" {
+			failEmbeddedServerHealthWhile(path)
+		}
 		main()
 		os.Exit(0)
 	}

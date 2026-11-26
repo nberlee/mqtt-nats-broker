@@ -46,10 +46,14 @@ All seven streams carry the same count; `$MQTT_sess`, `$MQTT_msgs`, `$MQTT_out` 
 
 The broker answers `/healthz` and `/readyz` on its health port (`-http-addr`, default
 `:8080`), which no Service should expose. Readiness turns 503 at the first SIGTERM, and
-the broker waits `-drain-delay` (chart `broker.drainDelay`, default 10 s in the chart)
-for the endpoint to leave the Service before it disconnects clients. The pod's
-termination grace must cover that wait plus the broker's shutdown budgets; the chart
-sets 60 s, 75 s embedded ([Operations](OPERATIONS.md#shutdown)).
+the broker waits `-drain-delay` (chart `broker.drainDelay`, default 10 s in the chart) for
+the endpoint to leave the Service before it disconnects clients. While it serves,
+readiness is also 503 when the broker's JetStream readiness probe fails, which holds a
+rolling update on a pod whose embedded server health check fails (a replica still catching
+up but making progress can pass it before it is fully current)
+([Operations](OPERATIONS.md#health-and-readiness)). The pod's termination grace must cover
+that wait plus the broker's shutdown budgets; the chart sets 60 s, 75 s embedded
+([Operations](OPERATIONS.md#shutdown)).
 
 ## Backups and upgrades
 

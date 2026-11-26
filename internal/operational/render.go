@@ -17,9 +17,11 @@ func Render() string {
 	for _, r := range []Readiness{Starting, Serving} {
 		for _, stopped := range []bool{false, true} {
 			for _, connected := range []bool{false, true} {
-				status, body := Readyz(r, stopped, connected)
-				fmt.Fprintf(&b, "readyz %s state=%s stopped=%t connected=%t %d %q\n",
-					ReadyzPath, readinessName(r), stopped, connected, status, body)
+				for _, jetStream := range []bool{false, true} {
+					status, body := Readyz(r, stopped, constant(connected), constant(jetStream))
+					fmt.Fprintf(&b, "readyz %s state=%s stopped=%t connected=%t jetstream=%t %d %q\n",
+						ReadyzPath, readinessName(r), stopped, connected, jetStream, status, body)
+				}
 			}
 		}
 	}
@@ -45,6 +47,8 @@ func Render() string {
 	}
 	return b.String()
 }
+
+func constant(v bool) func() bool { return func() bool { return v } }
 
 func readinessName(r Readiness) string {
 	if r == Serving {

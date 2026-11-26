@@ -167,6 +167,8 @@ var producers = map[string][]string{
 	"ShutdownSignalReceived":                   {"cmd/mqtt-nats-broker.runContext"},
 	"DrainDelayWaiting":                        {"cmd/mqtt-nats-broker.runContext"},
 	"ServiceConnectionError":                   {"internal/backend.Connect"},
+	"JetStreamProbeFailed":                     {"cmd/mqtt-nats-broker.(*jetStreamReadiness).commit"},
+	"JetStreamProbeSucceeded":                  {"cmd/mqtt-nats-broker.(*jetStreamReadiness).commit"},
 	"ServiceConnectionUnidentified":            {"internal/mqtt.(*Server).armServiceIdentityHandlers"},
 	"ServiceConnectionDroppedWhileIdentifying": {"internal/mqtt.(*Server).armServiceIdentityHandlers"},
 	"ServiceAccountChanged":                    {"internal/mqtt.(*Server).armServiceIdentityHandlers"},

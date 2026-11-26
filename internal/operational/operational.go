@@ -39,35 +39,41 @@ const (
 
 // readyzRule is one /readyz answer and the condition it is given under. Readyz answers
 // the first rule that matches, and docs/OPERATIONS.md's readiness table is these rules.
+// connected and jetStream are called only by the rules that need them, so a stopped or
+// starting broker answers without waiting on its NATS connection.
 type readyzRule struct {
 	when   string
-	match  func(r Readiness, stopped, connected bool) bool
+	match  func(r Readiness, stopped bool, connected, jetStream func() bool) bool
 	status int
 	body   string
 }
 
 var readyzRules = []readyzRule{
 	{"a shutdown signal has been received, whether or not the broker served",
-		func(_ Readiness, stopped, _ bool) bool { return stopped },
+		func(_ Readiness, stopped bool, _, _ func() bool) bool { return stopped },
 		http.StatusServiceUnavailable, "draining"},
 	{"the broker has not served yet: the JetStream wait, the dial, the stream checks, the MQTT initialization and its retries, and a failed start's unwinding",
-		func(r Readiness, _, _ bool) bool { return r == Starting },
+		func(r Readiness, _ bool, _, _ func() bool) bool { return r == Starting },
 		http.StatusServiceUnavailable, "starting"},
-	{"the broker serves and its NATS service connection is connected",
-		func(_ Readiness, _, connected bool) bool { return connected },
-		http.StatusOK, "ready"},
 	{"the broker serves and its NATS service connection is down",
-		func(_ Readiness, _, _ bool) bool { return true },
+		func(_ Readiness, _ bool, connected, _ func() bool) bool { return !connected() },
 		http.StatusServiceUnavailable, "nats disconnected"},
+	{"the broker serves, its NATS service connection is connected, and its last completed JetStream round failed, began before the connection's last reconnect, or is older than its bound, or no round has completed yet",
+		func(_ Readiness, _ bool, _, jetStream func() bool) bool { return !jetStream() },
+		http.StatusServiceUnavailable, "jetstream not answering"},
+	{"the broker serves, its NATS service connection is connected, and its last completed JetStream round succeeded, began after the connection's last reconnect, and is within its bound",
+		func(_ Readiness, _ bool, _, _ func() bool) bool { return true },
+		http.StatusOK, "ready"},
 }
 
 // Readyz is /readyz's answer. stopped is a shutdown signal having been received;
-// connected is consulted only once the broker serves. 200 ready claims the listener is up,
-// no stop was requested and the service connection is connected, not that the service
+// connected and jetStream are consulted only once the broker serves, in that order.
+// 200 ready claims the listener is up, no stop was requested, the service connection is
+// connected and the broker's JetStream observation is current, not that the service
 // identity is known.
-func Readyz(r Readiness, stopped, connected bool) (status int, body string) {
+func Readyz(r Readiness, stopped bool, connected, jetStream func() bool) (status int, body string) {
 	for _, rule := range readyzRules {
-		if rule.match(r, stopped, connected) {
+		if rule.match(r, stopped, connected, jetStream) {
 			return rule.status, rule.body
 		}
 	}
@@ -258,8 +264,12 @@ var (
 		fields("delay", Duration), "once, with `-drain-delay`"}
 	ServiceConnectionError = Record{"NATS service connection error", slog.LevelWarn,
 		fields("err", Text), "per asynchronous error the service connection reports"}
+	JetStreamProbeFailed = Record{"JetStream readiness probe failed", slog.LevelWarn,
+		fields("check", String, "err", Text), "per change, while the broker serves, from a readiness probe that succeeded (or none yet) to one that failed; `check` is `account info`, `session stream info` or `embedded server health`, and `err` says whether it went unanswered, was refused or was not answered by the stream's leader"}
+	JetStreamProbeSucceeded = Record{"JetStream readiness probe succeeded again", slog.LevelInfo,
+		nil, "per change back to a readiness probe that succeeded"}
 	ServiceConnectionUnidentified = Record{"MQTT: the service connection reconnected but could not be identified; no CONNECT is accepted", slog.LevelError,
-		fields("err", Text), "per reconnect whose identity request fails; `/readyz` still answers `200 ready`"}
+		fields("err", Text), "per reconnect whose identity request fails; `/readyz` can answer `200 ready` once a JetStream observation begun after the reconnect succeeds"}
 	ServiceConnectionDroppedWhileIdentifying = Record{"MQTT: the service connection dropped while it was being re-identified; the account stays unknown", slog.LevelWarn,
 		nil, "per occurrence"}
 	ServiceAccountChanged = Record{"MQTT: the service connection reconnected into another account; disconnecting every auth-passthrough client", slog.LevelError,
@@ -289,7 +299,8 @@ var Records = []*Record{
 	&MQTTInitializationRetry, &StartupStopped,
 	&MQTTListenerStarted, &WebSocketListenerStarted,
 	&ShutdownSignalReceived, &DrainDelayWaiting,
-	&ServiceConnectionError, &ServiceConnectionUnidentified,
+	&ServiceConnectionError, &JetStreamProbeFailed, &JetStreamProbeSucceeded,
+	&ServiceConnectionUnidentified,
 	&ServiceConnectionDroppedWhileIdentifying, &ServiceAccountChanged,
 	&ConnectRefusedAccountUnknown, &ConnectRefused,
 	&TLSReloaded, &TLSReloadRefused, &TLSCertificateExpired,

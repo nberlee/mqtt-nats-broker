@@ -995,14 +995,17 @@ reproduced yet.
   the boundary keeps a delivery's admission extended and in order. Done 2026-11-25
   ([issue #189](https://github.com/nberlee/mqtt-nats-broker/issues/189)).
 
+- [x] `/readyz` answers `503 jetstream not answering` while a serving broker's JetStream
+  observation fails: account info and session stream info through its own assistant in
+  rounds 2 s apart, plus the embedded server's own health; the handler reads the result,
+  and what it does not prove is stated. Done 2026-11-26
+  ([issue #188](https://github.com/nberlee/mqtt-nats-broker/issues/188)).
+
 - [ ] Determine whether the fourteen session-record absences reported on 2026-11-18 were real
   or misreported ([issue #190](https://github.com/nberlee/mqtt-nats-broker/issues/190)). The
   candidate disposal routes are source-verified, and since 2026-11-25 Warn diagnostics record
   each route's observations. The incident stays open until the owner supplies the
   contemporaneous record and authority evidence and the first reconnects' results.
-
-- [ ] `/readyz` stays ready while JetStream cannot serve the broker's requests
-  ([issue #188](https://github.com/nberlee/mqtt-nats-broker/issues/188)).
 
 - [ ] One small change for the passthrough connections: a structured error handler, a
   denied `$SYS.REQ.USER.INFO` refused without waiting out 2 s, and log labels that name

@@ -486,19 +486,74 @@ its pin and its documentation are rendered.
 
 **The probes.** `/healthz` answers `200 ok` whenever the health server serves: it is bound
 first, before the embedded server starts and NATS is dialed (see "Startup retries"), and
-shut down last. `/readyz` is a function of three inputs, `operational.Readyz`: the stored
+shut down last. `/readyz` is a function of four inputs, `operational.Readyz`: the stored
 readiness (`Starting` from the bind, `Serving` once the MQTT listener is up and TLS
-reloading has started), whether the signal context has ended, and whether the service
-connection is connected, consulted only once the broker serves. A stop answers
-`503 draining`; not yet served, `503 starting`; serving, `200 ready` or
-`503 nats disconnected`. The stop is not stored: the probe reads the signal context
-itself, so no write can order itself before or after the signal, and a context that ends
-at the moment `Start` succeeds never answers `200 ready`. A failed start's unwinding,
-which `Start` completes before returning, answers `starting`: the broker has not served.
-`200 ready` claims connectivity, not identity: a service connection that reconnected and
-could not be identified answers it while every auth-passthrough CONNECT is refused (the
-residual in `docs/CONFORMANCE.md`, "Only the named records are an operational
-interface").
+reloading has started), whether the signal context has ended, whether the service
+connection is connected, and whether the broker's JetStream observation is current; the
+last two are functions the rules call only once the broker serves, so a stop or a broker
+that has not served answers without waiting on nats.go's connection mutex. A stop answers
+`503 draining`; not yet served, `503 starting`; serving, `503 nats disconnected`,
+`503 jetstream not answering` or `200 ready`, in that order. The stop is not stored: the
+probe reads the signal context itself, so no write can order itself before or after the
+signal, and a context that ends at the moment `Start` succeeds never answers `200 ready`.
+A failed start's unwinding, which `Start` completes before returning, answers `starting`:
+the broker has not served. `200 ready` claims connectivity and a current JetStream
+observation, not identity: a service connection that reconnected and could not be
+identified answers it again once an observation begun after the reconnect succeeds, while
+every auth-passthrough CONNECT is refused (the residual in `docs/CONFORMANCE.md`, "Only the
+named records are an operational interface").
+
+**The JetStream observation**
+([issue #188](https://github.com/nberlee/mqtt-nats-broker/issues/188)).
+Startup proves JetStream answered once; a pod whose embedded server came back from a
+restart with its meta replica behind used to turn ready on the meta leader's answer and
+stay ready, so the Service routed clients to it and a rolling update advanced past it
+while its consumer creates and session writes timed out. From the moment the broker serves
+until the signal, a loop (`cmd/mqtt-nats-broker/jetstream_readiness.go`) observes, one
+round at a time, each starting 2 s after the previous one ended:
+
+- the core's `ProbeJetStream`, through the account's own assistant (its reply prefix,
+  domain and request timeout, 5 s): account info, which only the meta leader answers in a
+  cluster, then the session stream's info, which must name the stream's leader, since a
+  member of a leaderless group answers it from its own state with no leader named
+  (`jsStreamInfoRequest`'s `isGroupLeaderless` arm). Only such an answer counts: a
+  timeout, no responders, a leaderless or offline asset and a definite refusal (a missing
+  session stream, an account without JetStream) all fail it;
+- with the embedded server, its own `Healthz` with `JSMetaOnly` (check `embedded server
+  health`). Clustered: a meta leader is known, the local replica is current or still
+  closing its gap (raft `Healthy` passes a follower whose commit-to-applied gap shrinks
+  while it looks), and it has no meta write or apply error and is not recovering. It is
+  the only input that sees a lagging local replica: the two requests are answered by
+  leaders elsewhere, and an R1 consumer can still be placed on the lagging peer.
+  Standalone, there is no meta layer and the same call walks the store's accounts and
+  streams instead (the `cc == nil` branch of `healthz`): a stream that was not recovered
+  or has a recorded write error fails it, whether it is the broker's or not, and `err`
+  names it; a write the server refuses without recording an error (one over a storage
+  limit) does not.
+
+The `/readyz` handler only reads the result, because the kubelet's one-second probe
+timeout is shorter than one request's. A round's success dates from when its requests began,
+after the reconnect count it is judged under was read, so a call that stalls after the
+requests were answered cannot make their answers look newer;
+it counts while it is no older than the interval plus the assistant's two reply waits plus
+1 s (13 s), and only when the round began under the service connection's current
+reconnect count; a failed round withdraws at once;
+before the first round completes the answer is `jetstream not answering`. A round's
+outcome changes are logged, after the observation's mutex is released so a slow log never
+holds the probe, as `JetStream readiness probe failed` (with the `check` that failed and
+why) and `JetStream readiness probe succeeded again`; they report probe outcomes, not the
+HTTP answer, which also depends on freshness, the reconnect count and the connection. A
+round that ends after the loop has observed the signal is discarded, stored and logged
+nowhere; a signal in the instant after a check can let one round start or one commit land,
+which `draining` covers. The loop is joined only after the MQTT shutdown lifecycle has
+completed: by then a reply wait has returned, but a round inside the embedded `Healthz` or
+the connection's statistics delays the dependency teardown until it returns, the
+orchestrator's SIGKILL being the final bound; no named shutdown budget changes. A probe
+request JetStream leaves unanswered advances the account's unanswered sequence like any
+background request, so a SUBSCRIBE filter refused definitively in that window closes its
+connection (see "A SUBSCRIBE filter refused while JetStream did not answer closes the
+connection"). Readiness is routing advice only: a CONNECT is never refused for it, and
+every CONNECT still fails closed on its own requests.
 
 **The exit status.** 0 for a stop the broker completed, 1 for a failure with
 `fatal: <reason>` on stderr; the embedded server's own `Fatalf` exits 1 after an `ERROR`
@@ -17515,13 +17570,16 @@ kubelet's SIGKILL is the final bound for a phase that does not finish.
 
 **Readiness and the drain delay.** `/readyz` turns 503 when the signal arrives, and the
 readiness probe withdraws the endpoint after one failure (period 2 s, failure threshold
-1). The drain delay that follows is a best-effort allowance for the endpoint to leave
-the Service and the load balancer. Nothing proves propagation has finished. Liveness is
+1). The drain delay that follows is a best-effort allowance for the endpoint to leave the
+Service and the load balancer. Nothing proves propagation has finished. Liveness is
 `/healthz`. There is no startup probe: the health server is bound before NATS is dialed
 (see "Startup retries"), so `/healthz` answers from the process's first moments and
-`/readyz` stays 503 `starting` until the broker serves, through the
-JetStream probe, the stream-bundle preflight and the MQTT initialization's retries; no
-probe restarts a pod for any of them.
+`/readyz` stays 503 `starting` until the broker serves, through the JetStream probe, the
+stream-bundle preflight and the MQTT initialization's retries; no probe restarts a pod for
+any of them. Once serving, it answers 503 `jetstream not answering` while the broker's
+JetStream observation fails (see "The operational interface"), which also holds a rolling
+update on a pod whose embedded server health check fails; a replica still catching up but
+making progress can pass it before it is fully current.
 
 **Security.** The pod meets the Restricted Pod Security standard: `runAsNonRoot` with
 the image's uid and gid 65532, the RuntimeDefault seccomp profile, all capabilities

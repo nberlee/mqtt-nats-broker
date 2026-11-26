@@ -2,14 +2,22 @@
 # Regenerate with `make operational-interface-fixture`; never edit by hand.
 
 healthz /healthz 200 "ok"
-readyz /readyz state=starting stopped=false connected=false 503 "starting"
-readyz /readyz state=starting stopped=false connected=true 503 "starting"
-readyz /readyz state=starting stopped=true connected=false 503 "draining"
-readyz /readyz state=starting stopped=true connected=true 503 "draining"
-readyz /readyz state=serving stopped=false connected=false 503 "nats disconnected"
-readyz /readyz state=serving stopped=false connected=true 200 "ready"
-readyz /readyz state=serving stopped=true connected=false 503 "draining"
-readyz /readyz state=serving stopped=true connected=true 503 "draining"
+readyz /readyz state=starting stopped=false connected=false jetstream=false 503 "starting"
+readyz /readyz state=starting stopped=false connected=false jetstream=true 503 "starting"
+readyz /readyz state=starting stopped=false connected=true jetstream=false 503 "starting"
+readyz /readyz state=starting stopped=false connected=true jetstream=true 503 "starting"
+readyz /readyz state=starting stopped=true connected=false jetstream=false 503 "draining"
+readyz /readyz state=starting stopped=true connected=false jetstream=true 503 "draining"
+readyz /readyz state=starting stopped=true connected=true jetstream=false 503 "draining"
+readyz /readyz state=starting stopped=true connected=true jetstream=true 503 "draining"
+readyz /readyz state=serving stopped=false connected=false jetstream=false 503 "nats disconnected"
+readyz /readyz state=serving stopped=false connected=false jetstream=true 503 "nats disconnected"
+readyz /readyz state=serving stopped=false connected=true jetstream=false 503 "jetstream not answering"
+readyz /readyz state=serving stopped=false connected=true jetstream=true 200 "ready"
+readyz /readyz state=serving stopped=true connected=false jetstream=false 503 "draining"
+readyz /readyz state=serving stopped=true connected=false jetstream=true 503 "draining"
+readyz /readyz state=serving stopped=true connected=true jetstream=false 503 "draining"
+readyz /readyz state=serving stopped=true connected=true jetstream=true 503 "draining"
 
 exit 0 "the broker stopped as asked: a shutdown signal, at any phase after its handlers are registered, and the shutdown or the startup's unwinding returned; also `-h`. Not a promise that every buffered publication reached NATS: the service connection's close is bounded"
 exit 1 "the broker could not start, or the embedded NATS server stopped it: `fatal: <reason>` on stderr, except the embedded server's own fatal error, which is an `ERROR` record with `component: nats-server`. A startup step that does not observe a signal (the NATS dial, the first service-identity request, both bounded) reports its own failure here"
@@ -86,9 +94,15 @@ record "draining, waiting for endpoint deregistration" level=INFO
 record "NATS service connection error" level=WARN
   field err text
   when "per asynchronous error the service connection reports"
+record "JetStream readiness probe failed" level=WARN
+  field check string
+  field err text
+  when "per change, while the broker serves, from a readiness probe that succeeded (or none yet) to one that failed; `check` is `account info`, `session stream info` or `embedded server health`, and `err` says whether it went unanswered, was refused or was not answered by the stream's leader"
+record "JetStream readiness probe succeeded again" level=INFO
+  when "per change back to a readiness probe that succeeded"
 record "MQTT: the service connection reconnected but could not be identified; no CONNECT is accepted" level=ERROR
   field err text
-  when "per reconnect whose identity request fails; `/readyz` still answers `200 ready`"
+  when "per reconnect whose identity request fails; `/readyz` can answer `200 ready` once a JetStream observation begun after the reconnect succeeds"
 record "MQTT: the service connection dropped while it was being re-identified; the account stays unknown" level=WARN
   when "per occurrence"
 record "MQTT: the service connection reconnected into another account; disconnecting every auth-passthrough client" level=ERROR

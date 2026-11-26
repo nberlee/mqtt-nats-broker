@@ -360,6 +360,7 @@ const (
 	// processJSAPIReplies reads only the kind, at mqttJSATokenPos, and correlates
 	// on the whole subject; the nuid alone makes it unique.
 	mqttJSATokenPos       = 4
+	mqttJSAAccountInfo    = "AI"
 	mqttJSAStreamCreate   = "SC"
 	mqttJSAStreamLookup   = "SL"
 	mqttJSAStreamPurge    = "SPU"

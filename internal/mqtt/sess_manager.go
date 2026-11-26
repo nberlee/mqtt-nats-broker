@@ -1093,10 +1093,7 @@ func (s *Server) mqttCreateAccountSessionManager(acc *Account, quitCh chan struc
 	// host name, which may carry dots.
 	runID, _ := s.ephemeralIdentity()
 
-	mqttJSAPITimeout := opts.MQTT.JSAPITimeout
-	if mqttJSAPITimeout == 0 {
-		mqttJSAPITimeout = mqttDefaultJSAPITimeout
-	}
+	mqttJSAPITimeout := mqttJSAPITimeoutOf(opts)
 	// The delayed-Will claim protocol depends on no single request being able to consume
 	// a whole ownership window: the publish worker deliberately does not renew, so a
 	// request timeout at or above the lease lets a licensing ack arrive after a peer

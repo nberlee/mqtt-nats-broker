@@ -118,9 +118,11 @@ func runContext(parent context.Context, args []string) error {
 	// A requested stop is ctx ending, which /readyz reads itself, so a load balancer / k8s
 	// Service deregisters this instance from the signal on, in every phase, before its
 	// connections are drained. backendRef is the backend once it is connected, for
-	// /readyz's connection check; nil before.
+	// /readyz's connection check; nil before. jetStream is the broker's JetStream observation
+	// once it serves, for /readyz's JetStream check; nil before.
 	var readiness atomic.Int32
 	var backendRef atomic.Pointer[backend.Backend]
+	var jetStream atomic.Pointer[jetStreamReadiness]
 
 	// The health endpoint is bound BEFORE the embedded server starts, synchronously so a
 	// taken port fails startup here: /healthz then answers through local store recovery,
@@ -129,7 +131,7 @@ func runContext(parent context.Context, args []string) error {
 	// There is no metrics endpoint.
 	var httpSrv *http.Server
 	if cfg.HTTPAddr != "" {
-		httpSrv, err = startHTTP(ctx, cfg.HTTPAddr, &backendRef, &readiness, log)
+		httpSrv, err = startHTTP(ctx, cfg.HTTPAddr, &backendRef, &readiness, &jetStream, log)
 		if err != nil {
 			return err
 		}
@@ -187,6 +189,12 @@ func runContext(parent context.Context, args []string) error {
 		tlsSrc.Start(cfg.TLSReloadInterval)
 		defer tlsSrc.Stop()
 	}
+	// JetStream is observed from here until the signal: /readyz answers ready only on an
+	// observation that succeeded (issue #188). Installed before Serving, so the handler never
+	// sees a serving broker without it.
+	observer := newJetStreamReadiness(srv, be, ns, log)
+	jetStream.Store(observer)
+	go observer.run(ctx)
 	readiness.Store(int32(operational.Serving))
 
 	<-ctx.Done()
@@ -220,8 +228,20 @@ func runContext(parent context.Context, args []string) error {
 	// grace deadline is the final bound.
 	done := srv.BeginShutdown()
 	<-done
+	if testLifecycleCompleted != nil {
+		testLifecycleCompleted()
+	}
+	// Joined only now: a round that ends after the signal is discarded, so nothing above waits
+	// for one. A reply wait has returned with the lifecycle; a round inside the embedded
+	// server's health check or the connection's statistics delays the teardown below until it
+	// returns, the orchestrator's SIGKILL being the final bound.
+	<-observer.done
 	return nil
 }
+
+// testLifecycleCompleted runs once the MQTT shutdown lifecycle has completed, before the JetStream
+// observation is joined. Nil in production.
+var testLifecycleCompleted func()
 
 // waitDrainGrace blocks for delay so a Service/LB can deregister this instance,
 // returning early if a signal arrives on sigCh (a genuine second SIGTERM/SIGINT
@@ -256,7 +276,7 @@ func newLogger(level string) *slog.Logger {
 // startHTTP binds the health endpoint synchronously and serves it in the background: a
 // port that cannot be bound is a startup error, not a log line, so "the health port is
 // answering" holds from the moment this returns. stop is the signal context.
-func startHTTP(stop context.Context, addr string, be *atomic.Pointer[backend.Backend], readiness *atomic.Int32, log *slog.Logger) (*http.Server, error) {
+func startHTTP(stop context.Context, addr string, be *atomic.Pointer[backend.Backend], readiness *atomic.Int32, observer *atomic.Pointer[jetStreamReadiness], log *slog.Logger) (*http.Server, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("health server: %w", err)
@@ -265,7 +285,11 @@ func startHTTP(stop context.Context, addr string, be *atomic.Pointer[backend.Bac
 		b := be.Load()
 		return b != nil && b.Conn().IsConnected()
 	}
-	srv := &http.Server{Addr: addr, Handler: healthMux(stop, readiness, connected), ReadHeaderTimeout: 5 * time.Second}
+	jetStream := func() bool {
+		j := observer.Load()
+		return j != nil && j.answering()
+	}
+	srv := &http.Server{Addr: addr, Handler: healthMux(stop, readiness, connected, jetStream), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		operational.HealthServerListening.Log(log, operational.Addr(l.Addr()))
 		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -277,8 +301,8 @@ func startHTTP(stop context.Context, addr string, be *atomic.Pointer[backend.Bac
 
 // healthMux serves the probe endpoints from the operational interface's definition:
 // /healthz whenever the server serves, /readyz from readiness, whether stop has ended,
-// and connected, which is consulted only once the broker serves.
-func healthMux(stop context.Context, readiness *atomic.Int32, connected func() bool) *http.ServeMux {
+// connected and jetStream, which are consulted only once the broker serves.
+func healthMux(stop context.Context, readiness *atomic.Int32, connected, jetStream func() bool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc(operational.HealthzPath, func(w http.ResponseWriter, _ *http.Request) {
 		status, body := operational.Healthz()
@@ -286,7 +310,7 @@ func healthMux(stop context.Context, readiness *atomic.Int32, connected func() b
 		_, _ = w.Write([]byte(body))
 	})
 	mux.HandleFunc(operational.ReadyzPath, func(w http.ResponseWriter, _ *http.Request) {
-		status, body := operational.Readyz(operational.Readiness(readiness.Load()), stop.Err() != nil, connected())
+		status, body := operational.Readyz(operational.Readiness(readiness.Load()), stop.Err() != nil, connected, jetStream)
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	})

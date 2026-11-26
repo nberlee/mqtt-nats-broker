@@ -129,7 +129,7 @@ jobs:
       - name: test (embedded-NATS cluster)
         env:
           MQTTNB_CLUSTER_FAILOVER_TESTS: '1'
-        run: go test -race -run '^TestEmbeddedClusterFormsAfterFirstProbeFails$' ./cmd/mqtt-nats-broker/
+        run: go test -race -run '^(TestEmbeddedClusterFormsAfterFirstProbeFails|TestEmbeddedServerHealthAnswersTheMetaReplica|TestReadinessFollowsTheMetaLeaderWhileServing)$' ./cmd/mqtt-nats-broker/
 
   depproof:
     name: dependency canary (JetStream terminal-write routes)

@@ -551,6 +551,16 @@ func (jsa *mqttJSA) createStream(cfg *StreamConfig) (*StreamInfo, bool, error) {
 	return scr.StreamInfo, scr.DidCreate, scr.ToError()
 }
 
+// accountInfo asks for the account's JetStream usage. Only the meta leader answers it in a
+// cluster, so an answer proves a meta leader serves this account's API requests.
+func (jsa *mqttJSA) accountInfo() error {
+	aii, err := jsa.newRequest(mqttJSAAccountInfo, JSApiAccountInfo, 0, nil)
+	if err != nil {
+		return err
+	}
+	return aii.(*JSApiAccountInfoResponse).ToError()
+}
+
 func (jsa *mqttJSA) lookupStream(name string) (*StreamInfo, error) {
 	slri, err := jsa.newRequest(mqttJSAStreamLookup, fmt.Sprintf(JSApiStreamInfoT, name), 0, nil)
 	if err != nil {
@@ -1324,6 +1334,9 @@ func (as *mqttAccountSessionManager) processJSAPIReplies(_ *subscription, pc *cl
 	switch token {
 	case mqttJSAStreamCreate:
 		resp := &JSApiStreamCreateResponse{}
+		decode(resp, &resp.Error)
+	case mqttJSAAccountInfo:
+		resp := &JSApiAccountInfoResponse{}
 		decode(resp, &resp.Error)
 	case mqttJSAStreamLookup:
 		resp := &JSApiStreamInfoResponse{}
